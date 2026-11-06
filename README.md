@@ -11,20 +11,29 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | 工具 | 作用 |
 | --- | --- |
 | `codex_run` | 把任务交给 WSL 里的 Codex 并等待结果。必填 `task` 和 `acceptance`（1–20 条验收标准）；可选 `write`、`scope`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
-| `codex_status` | 继续等待或查询后台任务；仍在执行时返回距 Codex 上次活动的秒数和它最近的动作 |
+| `codex_status` | 查询或继续等待任务；仍在执行时返回距 Codex 上次活动的秒数和它最近的动作。已登记为 DSH 后台任务的不必调用 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树 |
 
 - 交接时自动附加执行约束：不扩大范围；只改 `scope` 里的路径；任务与现状不符或验收标准互相冲突时不自行取舍，标为 `blocked` 并说明；不为通过验收去改验收脚本或判据。
 - 要求 Codex 按 [`report.schema.json`](report.schema.json) 逐条回报（met / not_met / blocked、证据、改动文件、偏离计划、未解决）。结果里会标出它自报未满足或受阻的条目、偏离计划的地方，以及超出 `scope` 的改动。
-- 可写任务前后对任务目录做快照，列出新增、修改、删除的文件；目录大到 20 秒内扫不完时，改用 Codex 自报的改动，并注明来源。
+- 任务目录：传了 `cwd` 就用它；否则会话工作区落在某个带 `cwd` 的 `workspaces` 条目里时，用该条目的 `cwd`（有多条时取路径最长的那条）；再否则用会话工作区。只在 `task` 里写目录不会切换任务目录。
+- 可写任务前后对任务目录做快照，列出新增、修改、删除的文件（`files_changed_source` 为 `snapshot`）。目录大到 20 秒内扫不完时，runner 把它记在 `runnerHome` 的 `snapshot-too-big.json` 里，7 天内同一目录不再整树扫描：给了 `scope` 就只快照 `scope` 里的路径，`scope` 之外的改动取 Codex 自报的记录（`scope_snapshot+codex_events`）；没给 `scope` 就只用 Codex 自报的改动（`codex_events`）。Codex 自报只覆盖它自己的改文件工具，不含 shell 写入。
 - 任务在 WSL 后台运行，DSH 这边断开等待不影响任务；重试、超时、断线检测和同目录写锁由随包的 [`runner/codex_runner.py`](runner/codex_runner.py) 处理。
+- 结束通知：`codex_run` 或 `codex_status` 等到点时任务仍在执行，且 agent 的 preset 提供 DSH 后台任务（jobs）服务，插件就把它登记为一个后台任务，结果里带 `background_job_id`。Codex 结束后，DSH 把与工具结果相同的文字（含逐条汇报和下一步）作为任务通知送回会话，agent 自行继续，不用轮询。同一个 runner 任务只登记一个后台任务（按 DSH 任务表判断，插件重载后也不重复）；对已登记的任务调用 `codex_status` 或 `codex_cancel` 会经 DSH 任务表等待，结果不会再作为通知重复送一次。后台等待本身出错时送回 `monitor_failed`，提示 Codex 任务可能仍在运行、先用 `codex_status` 查询。没有 jobs 服务、登记失败或没有 agent 时，照旧用 `codex_status` 轮询。
 
 **护栏（按工作区开启）**
 
 会话工作区在 `workspaces` 里时：
 
 - 拒绝直接写文件或执行任意代码的工具：`write`、`edit`、`pwsh`、`run_code`、`subagent_codex`，以及 `wsl-write`、`wsl-edit`、`wsl-term`、`wsl-bootstrap`、`actions_run`、`actions_configure`；MCP 工具按动作名拒绝（`write`、`edit`、`replace`、`insert`、`delete`、`execute` 等）。
-- shell 工具（`wsl`、`bash`、`ops_bash`）只放行只读核验命令：`git status/diff/log/show`、`ls`、`cat`、`grep`、`find`、`wc`、`sha256sum`、`pytest`、`npm test`、`pwsh -File tests/*.ps1`、`bash -n` 等；可以用 `|`、`&&`、`for`、`if` 和只读的 `$(...)`；拒绝写重定向（`/dev/null` 除外）、反引号和 heredoc。
+- shell 工具（`wsl`、`bash`、`ops_bash`）只放行只读核验命令：`git status/diff/log/show`、`ls`、`cat`、`grep`、`find`、`wc`、`sha256sum`、`pytest`、`npm test`、`pwsh -File tests/*.ps1`、`bash -n` 等；可以用 `|`、`&&`、`for`、`if` 和只读的 `$(...)`；拒绝写重定向（`/dev/null` 除外）、反引号和 heredoc。`pwsh` / `powershell` 必须写成字面命令或路径，`$PWSH` 这类变量不放行。
+- PowerShell 语法检查用随包的 [`tools/Test-PsSyntax.ps1`](tools/Test-PsSyntax.ps1)：只用 PowerShell 解析器解析、不执行，逐个输出 `PARSE-OK <文件> tokens=N`，或 `PARSE-FAIL <文件>` 加若干 `行号: 错误`；退出码 0 全部通过，1 有语法错误，2 没给文件或文件不存在。护栏只放行这一种形式：
+
+  ```text
+  pwsh.exe -NoProfile -File '<插件目录>\tools\Test-PsSyntax.ps1' 'D:\path\a.ps1' ['D:\path\b.ps1' …]
+  ```
+
+  脚本路径必须是插件安装目录里的这一份（Windows 路径或 `/mnt/...` 形式都行）；后面至少跟一个文件，且不能有 `-` 开头的参数；`-File` 之前只允许 `-NoProfile`、`-NonInteractive`、`-NoLogo`、`-ExecutionPolicy <值>`，`-Command`、`-c`、`-EncodedCommand` 都会被拒绝。被拒时的提示里给出本机的完整路径。
 - 通过 `tool_call` 间接调用的工具同样受限；子代理会话按它自己的工作区判断。
 - 防虚报：回合结束时 agent 声称“已派 Codex”或“Codex 正在做”，但这一轮没有调用 `codex_*`，也没有由 `codex_run` 启动且仍在运行的任务，插件会提醒它一次，让它补上调用或更正说法。
 
@@ -57,19 +66,23 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
   config:
     workspaces:
       - 'D:\work\my-project'
+      - path: 'D:\work\monorepo'
+        cwd: 'D:\work\monorepo\app'
     effort: high
+    readOnlyEffort: medium
     serviceTier: fast
 ```
 
 | 配置 | 默认 | 说明 |
 | --- | --- | --- |
-| `workspaces` | `[]` | 启用护栏的工作区（Windows 路径或 `/mnt/...`），子目录同样生效 |
+| `workspaces` | `[]` | 启用护栏的工作区，子目录同样生效。条目可以是路径字符串（Windows 路径或 `/mnt/...`），也可以是 `{path, cwd}`：`path` 用于护栏判断，`cwd` 是会话工作区在 `path` 内时 `codex_run` 的默认任务目录 |
 | `distro` | WSL 默认发行版 | 运行 Codex 的发行版 |
 | `codexBin` | 自动查找 | WSL 内 codex 的路径；默认先查 PATH（跳过 `/mnt/` 下的 Windows 版），再查 `~/.npm-global/bin`、`~/.local/bin`、`/usr/local/bin` |
 | `codexHome` | Codex 默认 | 传给 Codex 的 `CODEX_HOME` |
 | `runnerHome` | `~/.local/state/codex-runner` | 任务记录和日志目录 |
 | `model` | Codex 配置 | 默认模型 |
 | `effort` | Codex 配置 | 默认推理强度，`codex_run` 的 `effort` 可单次覆盖 |
+| `readOnlyEffort` | 同 `effort` | 只读任务（`write` 不为 `true`）的默认推理强度，留空时用 `effort` |
 | `serviceTier` | Codex 配置 | 例如 `fast`（Codex 的 Fast 模式） |
 | `waitSeconds` | `1500` | `codex_run` 默认等待秒数，到时任务转后台 |
 | `allowCommands` | `[]` | 额外放行的命令，正则逐段匹配（按 `\|`、`&&`、`;` 切开后的每一段），建议写成锚定正则 |
@@ -81,13 +94,13 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 ## 单独使用 runner
 
 ```text
-python3 runner/codex_runner.py run    --cwd DIR [--sandbox workspace-write] < prompt.txt
-python3 runner/codex_runner.py start  --cwd DIR [--sandbox workspace-write] < prompt.txt
+python3 runner/codex_runner.py run    --cwd DIR [--sandbox workspace-write] [--scope PATH ...] < prompt.txt
+python3 runner/codex_runner.py start  --cwd DIR [--sandbox workspace-write] [--scope PATH ...] < prompt.txt
 python3 runner/codex_runner.py status JOB_ID [--wait SECONDS]
 python3 runner/codex_runner.py cancel JOB_ID
 ```
 
-每条命令只在 stdout 输出一个 JSON 对象，原始事件写入日志目录。
+每条命令只在 stdout 输出一个 JSON 对象，原始事件写入日志目录。`--scope` 可重复，写相对 `--cwd` 的路径或绝对路径，只在目录太大、无法整树快照时用来缩小快照范围；插件把 `codex_run` 的 `scope` 逐条传入。
 
 ## 注意
 
@@ -102,14 +115,19 @@ node --test test.mjs
 python3 runner/test_codex_runner.py
 ```
 
-runner 的测试使用模拟的 Codex，不消耗模型额度。
+两组测试都不需要 DSH、WSL 或真实的 Codex：runner 的测试使用模拟的 Codex，不消耗模型额度，在 Windows 上用 `python` 运行时只能在 Linux 跑的一项会跳过；`test.mjs` 里检查 `Test-PsSyntax.ps1` 退出码的用例需要 `pwsh`，没有时跳过。
+
+[`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
 
 A DeepSeek Harness plugin that lets the DSH agent plan and verify while Codex CLI in WSL does the coding.
 
-- `codex_run` / `codex_status` / `codex_cancel` run Codex through the bundled runner (retries, timeouts, idle and reconnect detection, per-directory write lock, resume by thread id). `codex_run` requires acceptance criteria, adds execution constraints to the hand-off, and asks Codex for a per-criterion JSON report; results flag unmet or blocked criteria, deviations, and changes outside `scope`. Writer tasks report changed files from a before/after snapshot.
-- In configured `workspaces`, the agent's own file-writing tools are denied and shell tools only run read-only verification commands. A turn that claims Codex was dispatched without calling `codex_*` gets one reminder.
+- `codex_run` / `codex_status` / `codex_cancel` run Codex through the bundled runner (retries, timeouts, idle and reconnect detection, per-directory write lock, resume by thread id). `codex_run` requires acceptance criteria, adds execution constraints to the hand-off, and asks Codex for a per-criterion JSON report; results flag unmet or blocked criteria, deviations, and changes outside `scope`. Writer tasks report changed files from a before/after snapshot. A tree too big to walk in 20 s is remembered for 7 days; for it only the `scope` paths are snapshotted and Codex's own change events cover the rest (`scope_snapshot+codex_events`).
+- Without `cwd`, Codex runs in the `cwd` of the most specific `workspaces` entry (`{path, cwd}`) that contains the session workspace, else in the session workspace. `readOnlyEffort` sets the default effort for read-only tasks.
+- If a task is still running when the wait ends and the agent's preset offers DSH background jobs, it is registered as one background job and the result returns to the session as a job notification; otherwise poll with `codex_status`.
+- In configured `workspaces`, the agent's own file-writing tools are denied and shell tools only run read-only verification commands. PowerShell syntax checks go through the bundled `tools/Test-PsSyntax.ps1` (`pwsh -NoProfile -File <that script> a.ps1 ...`). A turn that claims Codex was dispatched without calling `codex_*` gets one reminder.
+- Tests: `node --test test.mjs` and `python3 runner/test_codex_runner.py`; GitHub Actions runs both on Ubuntu and Windows.
 - Requires Windows with WSL2, Codex CLI and `python3` inside WSL, and DSH `>=0.2.1-rc.2 <0.3.0`. Install with `github:xiaobaifly7/dsh-codex-conductor`.
 
 ## License

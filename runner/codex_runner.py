@@ -1,7 +1,7 @@
 """Run Codex CLI tasks for an agent harness behind a stable JSON contract (Linux / WSL).
 
-    python codex_runner.py run    --cwd DIR [--sandbox workspace-write] < prompt.txt
-    python codex_runner.py start  --cwd DIR [--sandbox workspace-write] < prompt.txt
+    python codex_runner.py run    --cwd DIR [--sandbox workspace-write] [--scope PATH ...] < prompt.txt
+    python codex_runner.py start  --cwd DIR [--sandbox workspace-write] [--scope PATH ...] < prompt.txt
     python codex_runner.py status JOB_ID [--wait SECONDS]
     python codex_runner.py cancel JOB_ID
 
@@ -297,37 +297,108 @@ def classify(state, run_dir):
 SNAPSHOT_SKIP = {".git", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
 # A 10k-file tree on /mnt took 47s to walk; past this budget fall back to Codex's own file_change events.
 SNAPSHOT_BUDGET = 20
+# Trees that blew the budget are remembered, so later writers skip the doomed 20s walk.
+TOO_BIG_FILE = "snapshot-too-big.json"
+TOO_BIG_TTL = 7 * 86400
 
 
-def snapshot(root, budget=SNAPSHOT_BUDGET):
-    """Map relative path -> (size, mtime_ns) under root, or None when the walk exceeds the budget."""
+def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
+    """Map path relative to root -> (size, mtime_ns) under root, or only under the scope files/directories;
+    None when the walk exceeds the budget."""
     deadline = time.time() + budget
     files = {}
-    for dirpath, dirnames, filenames in os.walk(root):
-        if time.time() > deadline:
-            return None
-        dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
-        for name in filenames:
-            path = os.path.join(dirpath, name)
-            try:
-                st = os.stat(path, follow_symlinks=False)
-            except OSError:
-                continue
-            files[os.path.relpath(path, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns)
+
+    def add(path):
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            return
+        files[os.path.relpath(path, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns)
+
+    for top in scope or [root]:
+        if not os.path.isdir(top):
+            add(top)  # a scoped file, or one that does not exist yet
+            continue
+        for dirpath, dirnames, filenames in os.walk(top):
+            if time.time() > deadline:
+                return None
+            dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
+            for name in filenames:
+                add(os.path.join(dirpath, name))
     return files
 
 
-def files_changed(root, before, event_changes, limit=300):
+def too_big_trees():
+    try:
+        data = json.loads((HOME / TOO_BIG_FILE).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    now = time.time()
+    return {k: v for k, v in data.items() if isinstance(v, (int, float)) and now - v < TOO_BIG_TTL} \
+        if isinstance(data, dict) else {}
+
+
+def tree_key(cwd):
+    return os.path.normcase(os.path.abspath(cwd))
+
+
+def remember_too_big(cwd):
+    # Only an optimisation: losing a concurrent update or failing to write must never fail the task.
+    try:
+        data = {**too_big_trees(), tree_key(cwd): time.time()}
+        HOME.mkdir(parents=True, exist_ok=True)
+        tmp = HOME / f"{TOO_BIG_FILE}.{os.getpid()}.tmp"
+        tmp.write_text(json.dumps(data), "utf-8")
+        os.replace(tmp, HOME / TOO_BIG_FILE)
+    except OSError:
+        pass
+
+
+def scope_path(cwd, scope):
+    path = local_path(scope)
+    if not IS_WIN:
+        path = path.replace("\\", "/")  # a relative Windows path such as src\lib, read as index.mjs normPath reads it
+    path, base = os.path.normpath(os.path.join(cwd, path)), os.path.normpath(cwd)
+    head, rest = path[:len(base)], path[len(base):]
+    # /mnt/<drive> ignores case: a scope naming cwd in another case would otherwise key its files as ../.. paths.
+    if head != base and head.lower() == base.lower() and rest[:1] in ("", os.sep):
+        try:
+            if os.path.samefile(head, base):
+                path = base + rest
+        except OSError:
+            pass
+    return path
+
+
+def snapshot_before(cwd, scope_args):
+    """Snapshot cwd, or only the --scope paths when cwd is too big. Returns (before, scope); scope is None
+    for a full snapshot, and before is None when only Codex's events can be used."""
+    if tree_key(cwd) not in too_big_trees():
+        before = snapshot(cwd)
+        if before is not None:
+            return before, None
+        remember_too_big(cwd)
+    scope = [scope_path(cwd, s) for s in scope_args or []]
+    return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
+
+
+def files_changed(root, before, event_changes, scope=None, limit=300):
     """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool."""
-    after = snapshot(root) if before is not None else None
+    after = snapshot(root, scope=scope) if before is not None else None
+    rel = lambda p: os.path.relpath(os.path.join(root, p), root).replace(os.sep, "/")
+    events = list(dict.fromkeys((rel(p), k) for p, k in event_changes if p))
     if after is not None:
         changes = [(p, "added") for p in after.keys() - before.keys()]
         changes += [(p, "deleted") for p in before.keys() - after.keys()]
         changes += [(p, "modified") for p in before.keys() & after.keys() if before[p] != after[p]]
         source = "snapshot"
+        if scope:
+            inside = [rel(s) for s in scope]
+            changes += [(p, k) for p, k in events
+                        if not any(s in (".", p) or p.startswith(s + "/") for s in inside)]
+            source = "scope_snapshot+codex_events"
     else:
-        rel = lambda p: os.path.relpath(p, root).replace(os.sep, "/") if os.path.isabs(p) else p
-        changes = list(dict.fromkeys((rel(p), k) for p, k in event_changes if p))
+        changes = events
         source = "codex_events"
     changes.sort()
     return {"files_changed": [{"path": p, "change": c} for p, c in changes[:limit]],
@@ -339,17 +410,18 @@ def execute(args, prompt, run_dir):
     base = {"cwd": os.path.abspath(args.cwd), "sandbox": args.sandbox, "log_dir": str(run_dir)}
     started = time.time()
     lock = None
-    before = None
+    before = scope = None
     event_changes = []
     if args.sandbox != "read-only":
         lock = acquire_write_lock(args.cwd)
         if lock is None:
             return {**base, "status": "failed", "error_kind": "busy", "retryable": True, "attempts": 0,
                     "error": "Another Codex writer holds this directory. Wait, or use a separate worktree."}
-        before = snapshot(args.cwd)
+        # Jobs queued before --scope existed have no scope in args.json.
+        before, scope = snapshot_before(args.cwd, getattr(args, "scope", None))
 
     def changes():
-        return files_changed(args.cwd, before, event_changes) if args.sandbox != "read-only" else {}
+        return files_changed(args.cwd, before, event_changes, scope) if args.sandbox != "read-only" else {}
 
     thread_id = args.resume
     attempt = 0
@@ -402,6 +474,8 @@ def add_task_arguments(p):
     p.add_argument("--service-tier", help='Codex service tier, e.g. "fast" for Fast mode; omitted keeps the config value')
     p.add_argument("--schema")
     p.add_argument("--resume", help="Continue an existing thread id")
+    p.add_argument("--scope", action="append",
+                   help="File or directory (relative to --cwd) to snapshot when cwd is too big to walk; repeatable")
     p.add_argument("--use-user-config", action="store_true", help="Inherit ~/.codex/config.toml, MCP servers and hooks")
     p.add_argument("--timeout", type=float, default=3600)
     # The Windows sandbox setup alone was silent for about 60s, so keep this well above that.

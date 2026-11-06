@@ -5,7 +5,8 @@
 //   · 结构化派活：codex_run 的任务、必填验收标准、执行约束和允许范围经 stdin 交给 runner，
 //     要求 Codex 按 report.schema.json 逐条回报；结果里标出自报未满足、偏离计划和范围外的改动
 //   · 等待与取消：start 之后用有界的 `status --wait` 等结果，仍在执行时带回最近动作；
-//     中途停止时在 WSL 里 cancel，Linux 侧进程树由 runner 自己清理（taskkill wsl.exe 清不到）
+//     中途停止时在 WSL 里 cancel，Linux 侧进程树由 runner 自己清理（taskkill wsl.exe 清不到）；
+//     等到点仍在执行时登记 DSH 后台任务，Codex 结束后结果自动送回会话（没有 jobs 服务就照旧轮询）
 //   · 护栏：config.workspaces 内的会话，写文件类工具一律拒绝，shell 只放行只读核验命令
 //   · 防虚报：回合结束时声称已派 Codex、却没调用 codex_* 也没有在跑的任务，就提醒它补上或更正
 //
@@ -32,6 +33,8 @@ const DEFAULTS = {
   runnerHome: '',
   model: '',
   effort: '',
+  // 只读任务的推理强度，留空与 effort 相同
+  readOnlyEffort: '',
   serviceTier: '',
   waitSeconds: 1500,
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
@@ -77,14 +80,20 @@ const GIT_READ = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-file
 const GIT_BRANCH_READ = new Set(['-a', '-r', '-v', '-vv', '--list', '--all', '--show-current', '--no-color']);
 const FIND_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls']);
 // 项目自带的验证脚本视同 pytest：只放行 -File 指向 tests 目录下的 .ps1，不放行 -Command
-const PWSH = /^(\$\{?PWSH\}?|(.*[\\/])?(pwsh|powershell)(\.exe)?)$/i;
+// 只认字面的 pwsh 路径：$PWSH 之类的变量可以先被单独赋值成任意命令，展开后按空白切开执行
+const PWSH = /^([^$]*[\\/])?(pwsh|powershell)(\.exe)?$/i;
 const TEST_SCRIPT = /(^|[\\/])tests[\\/][^\\/]+\.ps1$/i;
 const PWSH_FLAGS = new Set(['-noprofile', '-noninteractive', '-nologo']);
+// 随包的只读语法检查脚本；护栏只认这一个路径（/mnt 形式和 Windows 形式都行）
+const PS_SYNTAX_WIN = fileURLToPath(new URL('./tools/Test-PsSyntax.ps1', import.meta.url));
+export const PS_SYNTAX = wslPath(PS_SYNTAX_WIN);
 const SED_PRINT = /^((\d+|\$)(,(\d+|\$))?|\/[^/]*\/(,\/[^/]*\/)?)p$/;
 
 const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex_run 交给 Codex；你只做只读核验：read / glob / grep 等读工具，' +
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、pytest、npm test 等，' +
-  '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号或 heredoc）。';
+  '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号或 heredoc）。' +
+  `检查 PowerShell 语法不能用 -Command，改用随包脚本：pwsh.exe -NoProfile -File '${PS_SYNTAX_WIN}' 'D:\\path\\a.ps1' …` +
+  `（Windows 的 pwsh.exe 用 Windows 路径；WSL 里的 pwsh 用 ${PS_SYNTAX}），输出 PARSE-OK / PARSE-FAIL 和出错行。`;
 
 export function normPath(p) {
   if (typeof p !== 'string' || !p.trim()) return '';
@@ -139,7 +148,8 @@ export function splitCommand(command, inner = () => false) {
     }
     if (quote === '"') {
       if (ch === '"') quote = null;
-      else if (ch === '\\' && next !== undefined) { word += next; i++; } else word += ch;
+      // 和 bash 一样，双引号里的 \ 只转义 $ ` " \ 和换行，Windows 路径 "C:\x" 保持原样
+      else if (ch === '\\' && next !== undefined && '$`"\\\n'.includes(next)) { if (next !== '\n') word += next; i++; } else word += ch;
       continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; started = true; continue; }
@@ -188,7 +198,11 @@ function gitAllowed(args) {
 
 function pwshTestAllowed(args) {
   const file = args.findIndex((a) => /^-f(ile)?$/i.test(a));
-  if (file < 0 || !TEST_SCRIPT.test(args[file + 1] ?? '')) return false;
+  const script = args[file + 1] ?? '';
+  // 语法检查脚本后面只能跟待检查的文件，不放行任何开关
+  const helper = normPath(script) === normPath(PS_SYNTAX) &&
+    args.length > file + 2 && args.slice(file + 2).every((a) => !a.startsWith('-'));
+  if (file < 0 || script.includes('$') || !(helper || TEST_SCRIPT.test(script))) return false;
   for (let i = 0; i < file; i++) {
     if (/^-ExecutionPolicy$/i.test(args[i])) i++;
     else if (!PWSH_FLAGS.has(args[i].toLowerCase())) return false;
@@ -201,7 +215,8 @@ function segmentAllowed(words, extra) {
   while (words.length && LEAD_KEYWORDS.has(words[0])) words = words.slice(1);
   while (words.length && CLOSE_KEYWORDS.has(words.at(-1))) words = words.slice(0, -1);
   if (!words.length) return true;
-  if (words[0] === 'for') return words.length <= 2 || words[2] === 'in';
+  // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
+  if (words[0] === 'for') return (words.length <= 2 || words[2] === 'in') && words.slice(3).every((w) => !w.startsWith('-'));
   // timeout 只是给后面的命令限时，剥掉后检查真正执行的命令
   if (words[0] === 'timeout') {
     let i = 1;
@@ -209,8 +224,9 @@ function segmentAllowed(words, extra) {
     if (!/^\d+(\.\d+)?[smhd]?$/.test(words[i] ?? '')) return false;
     return words.length > i + 1 && segmentAllowed(words.slice(i + 1), extra);
   }
-  // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行
-  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) return words.length === 1;
+  // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行。
+  // 值不能以 - 开头或含空白，免得展开后变成参数（X=-delete; find . $X）
+  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) return words.length === 1 && /^[A-Za-z_][A-Za-z0-9_]*=(?!-)\S*$/.test(words[0]);
   if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
   const positional = args.filter((a) => !a.startsWith('-')).length;
@@ -318,7 +334,7 @@ export function createConductor(cfg, run = runRunner) {
 
   async function start(args, cwd, signal) {
     const argv = ['start', '--cwd', cwd];
-    const effort = args.effort ?? cfg.effort;
+    const effort = args.effort ?? (args.write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort);
     if (effort) argv.push('--effort', effort);
     if (cfg.model) argv.push('--model', cfg.model);
     if (cfg.serviceTier) argv.push('--service-tier', cfg.serviceTier);
@@ -326,6 +342,7 @@ export function createConductor(cfg, run = runRunner) {
     if (args.resume) argv.push('--resume', args.resume);
     if (args.use_user_config === true) argv.push('--use-user-config');
     if (cfg.reportSchema) argv.push('--schema', cfg.reportSchema);
+    for (const s of args.scope ?? []) argv.push('--scope', s);
     const started = await run(cfg, argv, { stdin: composePrompt(args.task, args.acceptance, args.scope), signal });
     if (started.status !== 'running' || !started.job_id) return started;
     return waitJob(started.job_id, args.wait_seconds ?? cfg.waitSeconds, signal);
@@ -446,19 +463,37 @@ export function turnSummary(log, turn) {
 const OUTPUT = { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => render(value) };
 const sessionCwd = (exec) => exec?.agent?.session?.header?.cwd;
 
+// 任务目录：显式 cwd > 包含会话工作区的 workspaces 条目的 cwd（最具体的那条）> 会话工作区
+export function taskCwd(args, session, workspaces) {
+  if (args.cwd) return args.cwd;
+  const hits = workspaces.filter((w) => w.cwd && inWorkspace(session, [w.root]));
+  return hits.sort((a, b) => b.root.length - a.root.length)[0]?.cwd ?? session;
+}
+
 function settings(config) {
+  // workspaces 的条目可以是路径字符串，也可以是 {path, cwd}
+  const workspaces = (Array.isArray(config.workspaces) ? config.workspaces : [])
+    .map((w) => typeof w === 'string' ? { root: normPath(w) }
+      : { root: normPath(w?.path), cwd: typeof w?.cwd === 'string' && w.cwd.trim() ? w.cwd.trim() : undefined })
+    .filter((w) => w.root);
   return {
     ...DEFAULTS,
     ...Object.fromEntries(Object.entries(config).filter(([k, v]) => k in DEFAULTS && v !== undefined && v !== '')),
-    roots: (Array.isArray(config.workspaces) ? config.workspaces : []).map(normPath).filter(Boolean),
+    workspaces,
+    roots: workspaces.map((w) => w.root),
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),
     allowCommands: (Array.isArray(config.allowCommands) ? config.allowCommands : []).map((s) => new RegExp(s)),
   };
 }
 
-export function apply(ctx, config = {}) {
+const BG_WAIT = 300;
+// runner 取消后会立即写下结果，后台循环一秒内就能看到，这里只是上限
+const CANCEL_SETTLE_MS = 30_000;
+const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
+
+export function apply(ctx, config = {}, run = runRunner) {
   const cfg = settings(config);
-  const conductor = createConductor(cfg);
+  const conductor = createConductor(cfg, run);
   // codex_run 启动、尚未结束的任务；有它们时说「Codex 正在做」是真话
   const activeJobs = new Set();
   const track = (value) => {
@@ -467,6 +502,66 @@ export function apply(ctx, config = {}) {
     else activeJobs.delete(value.job_id);
     return value;
   };
+
+  // 这个 runner 任务仍在进行的 DSH 后台任务。按 DSH 任务表查而不记在插件内存里：
+  // 插件热重载后旧的后台任务和它的等待循环仍在，内存记录却清空了，会重复登记、重复送回结果
+  function liveBackground(jobId, exec) {
+    const owner = exec?.agent?.id;
+    const jobs = owner === undefined ? undefined : ctx.get?.('jobs');
+    const job = jobs?.list(owner).find((j) => j.kind === 'codex' && j.label === `Codex ${jobId}` &&
+      (j.status === 'running' || j.status === 'stopping'));
+    return job && { jobs, id: job.id, owner };
+  }
+
+  // 后台循环：有界地反复 `status --wait`，结束时把与工具结果相同的文字交给 DSH 送回会话
+  async function watch(jobId, handle, finish) {
+    try {
+      for (;;) {
+        const value = withReport(await conductor.waitJob(jobId, BG_WAIT));
+        if (value.status === 'running') {
+          handle.updateProgress(`Codex 执行中，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`);
+          continue;
+        }
+        // wsl.exe 本身出错不代表任务结束
+        if (value.error_kind === 'bridge_error') throw new Error(value.error);
+        const done = finish(track(value));
+        return { status: JOB_STATUS[done.status] ?? 'failed',
+          detail: `Codex 任务 ${jobId} 结束：${done.status}${done.error_kind ? `（${done.error_kind}）` : ''}`,
+          result: render(done)[0].text };
+      }
+    } catch (error) {
+      activeJobs.delete(jobId);
+      const lost = { job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error),
+        next: `后台等待出错，底层 Codex 任务可能仍在运行：先用 codex_status 查询 ${jobId}，不要直接重派。` };
+      return { status: 'failed', detail: `无法继续等待 Codex 任务 ${jobId}`, result: render(lost)[0].text };
+    }
+  }
+
+  // 仍在执行时登记 DSH 后台任务（同一个 runner 任务只登记一个），结束后由 DSH 把结果送回会话；
+  // 没有 jobs 服务或登记失败就照旧轮询
+  function notifyOnDone(value, exec, finish) {
+    if (value.status !== 'running' || !value.job_id || !exec?.agent) return value;
+    let id;
+    try {
+      id = liveBackground(value.job_id, exec)?.id;
+      if (id === undefined) {
+        const jobs = ctx.get?.('jobs');
+        if (!jobs) return value;
+        id = jobs.start({
+          owner: exec.agent.id, kind: 'codex', label: `Codex ${value.job_id}`, outputLimitBytes: 65536,
+          run: (handle) => ({
+            done: watch(value.job_id, handle, finish),
+            cancel: () => { Promise.resolve(conductor.cancel(value.job_id)).catch(() => {}); },
+          }),
+        });
+      }
+    } catch {
+      return value;
+    }
+    return { ...value, background_job_id: id,
+      note: `已登记为后台任务 ${id}：Codex 结束后，结果（含逐条汇报和下一步）会自动送回本会话，不必用 codex_status 轮询。`,
+      next: '等待自动送回的结果；在此之前不要自己动手补做，也不要重复派同一个任务。' };
+  }
 
   ctx.tools.register({
     name: 'codex_run',
@@ -481,30 +576,37 @@ export function apply(ctx, config = {}) {
         acceptance: { type: 'array', items: { type: 'string' }, description: '验收标准，1–20 条，每条写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
         write: { type: 'boolean', description: 'true 允许 Codex 修改任务目录里的文件（workspace-write 沙箱）；默认 false 只读。' },
         scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。给了就写进约束，完成后在 out_of_scope 里列出范围外的改动。' },
-        cwd: { type: 'string', description: '任务目录，默认当前会话工作区；Windows 路径或 /mnt/... 都可以。' },
+        cwd: { type: 'string', description: '任务目录（Codex 在这里运行，write=true 时只能改这里的文件），Windows 路径或 /mnt/... 都可以。' +
+          '不传时：会话工作区属于配置里带 cwd 的 workspaces 条目，就用那个 cwd，否则用当前会话工作区。' +
+          '只在 task 里写目标目录不会切换任务目录，要处理哪个目录就传哪个 cwd。' },
         resume: { type: 'string', description: '在上一次返回的 thread_id 上继续（返工、追问时用）。' },
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
-        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度，默认 ${cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
-        wait_seconds: { type: 'integer', description: `最多等待秒数，默认 ${cfg.waitSeconds}；到时任务在后台继续，用 codex_status 接着等。` },
+        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
+          `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
+        wait_seconds: { type: 'integer', description: `最多等待秒数，默认 ${cfg.waitSeconds}；到时任务转入后台继续，` +
+          '登记为后台任务时结果会自动送回本会话，否则用 codex_status 接着等。' },
       },
       required: ['task', 'acceptance'],
     },
     output: OUTPUT,
     async execute(args, exec) {
       validateRun(args);
-      const cwd = args.cwd ?? sessionCwd(exec);
+      const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
       if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
-      const result = track(withReport(await conductor.start(args, cwd, exec?.signal)));
-      const outside = outOfScope(result, cwd, args.scope);
-      const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
-      return { ...value, next: nextStep(value, args.acceptance) };
+      const finish = (result) => {
+        const outside = outOfScope(result, cwd, args.scope);
+        const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
+        return { ...value, next: nextStep(value, args.acceptance) };
+      };
+      return notifyOnDone(finish(track(withReport(await conductor.start(args, cwd, exec?.signal)))), exec, finish);
     },
   });
 
   ctx.tools.register({
     name: 'codex_status',
-    description: '查询或继续等待 codex_run 返回的后台任务。仍在执行时返回 seconds_since_last_event（距 Codex 上次活动的秒数）' +
-      '和 last_activity（它最近在做什么），不必再去翻日志；建议每次等 300–600 秒，不要频繁轮询。',
+    description: '查询或继续等待 codex_run 返回的任务。已登记为后台任务（结果带 background_job_id）的，结束后结果会自动送回，' +
+      '不必调用本工具；没登记的才用它等，仍在执行时返回 last_activity（它最近在做什么）和距上次活动的秒数，' +
+      '不必再去翻日志；建议每次等 300–600 秒，不要频繁轮询。',
     parameters: {
       type: 'object',
       properties: {
@@ -516,8 +618,24 @@ export function apply(ctx, config = {}) {
     output: OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_status: job_id 必须是非空字符串');
-      const value = track(withReport(await conductor.waitJob(args.job_id, args.wait_seconds ?? 600, exec?.signal)));
-      return { ...value, next: nextStep(value) };
+      const finish = (value) => ({ ...value, next: nextStep(value) });
+      const seconds = args.wait_seconds ?? 600;
+      const bg = liveBackground(args.job_id, exec);
+      let value;
+      if (bg) {
+        // 经 DSH 任务表等：结束时这次结算算作已被等到，DSH 就不会再把同一结果作为通知补发一遍
+        let view;
+        try {
+          view = await bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, exec?.signal);
+        } catch (error) {
+          if (exec?.signal?.aborted) bg.jobs.kill(bg.id, bg.owner);
+          throw error;
+        }
+        if (view.status === 'running' || view.status === 'stopping') value = { job_id: args.job_id, status: 'running', last_activity: view.progress };
+      }
+      // 后台任务已结算时 runner 的结果文件已在，只查一次取完整结果
+      value ??= withReport(await conductor.waitJob(args.job_id, bg ? 0 : seconds, exec?.signal));
+      return notifyOnDone(finish(track(value)), exec, finish);
     },
   });
 
@@ -530,10 +648,18 @@ export function apply(ctx, config = {}) {
       required: ['job_id'],
     },
     output: OUTPUT,
-    async execute(args) {
+    async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_cancel: job_id 必须是非空字符串');
       activeJobs.delete(args.job_id);
-      return conductor.cancel(args.job_id);
+      const bg = liveBackground(args.job_id, exec);
+      // 取消前先挂上等待：后台循环随后看到任务结束并结算，算作已被等到，DSH 不再另发一条结束通知。
+      // wsl.exe 出错时取消没执行，撤掉等待，免得它吞掉任务之后真正结束时的通知
+      const stop = new AbortController();
+      const settled = bg?.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner, stop.signal).catch(() => {});
+      const value = await conductor.cancel(args.job_id);
+      if (value.error_kind === 'bridge_error') stop.abort();
+      await settled;
+      return value;
     },
   });
 
@@ -565,8 +691,9 @@ export function apply(ctx, config = {}) {
   }
   ctx.logger?.info?.(`[codex-conductor] active: codex_run/codex_status/codex_cancel；护栏工作区 ${cfg.roots.join(', ') || '(未配置)'}`);
   // 桌面宿主日志不落盘，留一个加载标记，便于确认插件是否在运行中的 DSH 里生效
-  try {
-    const dir = path.join(process.env.LOCALAPPDATA ?? '', 'dsh-codex-conductor');
+  // 没有 LOCALAPPDATA（Linux 上跑测试）时不写，免得落到当前目录
+  if (process.env.LOCALAPPDATA) try {
+    const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'loaded.json'),
       JSON.stringify({ loadedAt: new Date().toISOString(), pid: process.pid, workspaces: cfg.roots }, null, 1));
