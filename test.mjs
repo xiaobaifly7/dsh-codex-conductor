@@ -167,6 +167,9 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], false), /不要带 resume/);
   assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], true), /有 thread_id 时带 resume/);
   assert.doesNotMatch(nextStep(withReport({ status: 'completed', thread_id: 'T' }), ['A']), /自报/);
+  // 沙箱外的任务续跑也要带 host_access，否则会回到沙箱
+  assert.match(nextStep({ status: 'completed', sandbox: 'danger-full-access', thread_id: 'H' }, ['A']), /resume="H" 和 host_access=true/);
+  assert.doesNotMatch(next, /host_access/);
   // Codex 没按 JSON 汇报：按完成处理，不当成失败
   const loose = withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false, final_message: 'done' });
   assert.equal(loose.status, 'completed');
@@ -415,6 +418,51 @@ test('read-only tasks use readOnlyEffort, writer tasks use effort; scope entries
   await other.tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
   assert.equal(effort(other.calls.at(-1)), 'high');
   assert.match(other.tools.codex_run.parameters.properties.effort.description, /只读时 high/);
+});
+
+test('composePrompt adds the host-access lines only with host_access, the read-only line only without write', () => {
+  const prompt = (opts) => composePrompt('做事情做事情', ['甲条件成立'], ['src'], opts);
+  const base = composePrompt('做事情做事情', ['甲条件成立'], ['src']);
+  assert.equal(prompt({ write: true }), base);
+  assert.doesNotMatch(base, /沙箱外|只读调查/);
+  const rw = prompt({ hostAccess: true, write: true });
+  assert.match(rw, /只允许改动[\s\S]*沙箱外运行[\s\S]*pwsh\.exe、ssh\.exe、Hyper-V cmdlet[\s\S]*不要删除、停止、重建或改配置。\n[\s\S]*## 最后汇报/);
+  assert.doesNotMatch(rw, /只读调查/);
+  assert.match(prompt({ hostAccess: true }), /不要删除、停止、重建或改配置。\n- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n/);
+});
+
+test('host_access runs Codex with danger-full-access, and only when allowHostAccess is on', async () => {
+  const calls = [];
+  const c = createConductor({}, (_cfg, argv, opts) => {
+    calls.push({ argv, stdin: opts?.stdin });
+    return Promise.resolve({ job_id: 'J', status: 'completed' });
+  });
+  for (const write of [true, false]) {
+    await c.start({ ...RUN, host_access: true, write }, 'F:\\proj');
+    const { argv, stdin } = calls.at(-1);
+    assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--sandbox'), ['danger-full-access'], argv.join(' '));
+    assert.match(stdin, /沙箱外运行/);
+    (write ? assert.doesNotMatch : assert.match)(stdin, /只读调查/);
+  }
+
+  const done = { startResult: { job_id: 'J', status: 'completed' } };
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const off = harness({ config: done });
+  await assert.rejects(off.tools.codex_run.execute({ ...RUN, host_access: true }, exec), /allowHostAccess/);
+  assert.equal(off.calls.length, 0);
+  assert.equal(off.tools.codex_run.parameters.properties.host_access, undefined);
+  assert.match(off.tools.codex_run.description, /启动不了 Windows 程序[^。]*这类检查你自己跑/);
+
+  const on = harness({ config: { ...done, allowHostAccess: true } });
+  assert.equal(on.tools.codex_run.parameters.properties.host_access.type, 'boolean');
+  // write=false 在提示里也禁止改虚拟机状态，参数说明必须告诉 DeepSeek
+  assert.match(on.tools.codex_run.parameters.properties.host_access.description, /启动\/停止\/新建虚拟机[^。]*write=true/);
+  assert.match(on.tools.codex_run.description, /传 host_access=true；不传时 WSL 里的 Codex 启动不了 Windows 程序/);
+  assert.doesNotMatch(on.tools.codex_run.description, /你自己跑/);
+  await on.tools.codex_run.execute({ ...RUN, host_access: true }, exec);
+  assert.match(on.calls.at(-1).join(' '), /--sandbox danger-full-access/);
+  await on.tools.codex_run.execute({ ...RUN, write: true }, exec);
+  assert.match(on.calls.at(-1).join(' '), /--sandbox workspace-write/);
 });
 
 test('a running job is registered once as a DSH background job and reports back on completion', async () => {

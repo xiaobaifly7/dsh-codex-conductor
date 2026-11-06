@@ -37,6 +37,8 @@ const DEFAULTS = {
   readOnlyEffort: '',
   serviceTier: '',
   waitSeconds: 1500,
+  // 允许 codex_run 传 host_access=true，让 Codex 在沙箱外运行（能启动 Windows 程序）；默认关闭
+  allowHostAccess: false,
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
   reportSchema: here('./report.schema.json'),
 };
@@ -367,12 +369,15 @@ export function createConductor(cfg, run = runRunner) {
     if (effort) argv.push('--effort', effort);
     if (cfg.model) argv.push('--model', cfg.model);
     if (cfg.serviceTier) argv.push('--service-tier', cfg.serviceTier);
-    if (args.write === true) argv.push('--sandbox', 'workspace-write');
+    // host_access 不管 write 都在沙箱外运行，write=false 的只读只靠提示约束
+    if (args.host_access === true) argv.push('--sandbox', 'danger-full-access');
+    else if (args.write === true) argv.push('--sandbox', 'workspace-write');
     if (args.resume) argv.push('--resume', args.resume);
     if (args.use_user_config === true) argv.push('--use-user-config');
     if (cfg.reportSchema) argv.push('--schema', cfg.reportSchema);
     for (const s of args.scope ?? []) argv.push('--scope', s);
-    const started = await run(cfg, argv, { stdin: composePrompt(args.task, args.acceptance, args.scope), signal });
+    const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: args.host_access === true, write: args.write === true });
+    const started = await run(cfg, argv, { stdin: prompt, signal });
     if (started.status !== 'running' || !started.job_id) return started;
     return waitJob(started.job_id, args.wait_seconds ?? cfg.waitSeconds, signal);
   }
@@ -380,12 +385,15 @@ export function createConductor(cfg, run = runRunner) {
   return { start, waitJob, cancel: (jobId) => run(cfg, ['cancel', jobId]) };
 }
 
-export function composePrompt(task, acceptance, scope = []) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
+    (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
+      '只做任务需要的事；任务没有点名的虚拟机、文件和网络设置，不要删除、停止、重建或改配置。\n' : '') +
+    (hostAccess && !write ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
     '- 任务与现状不符、验收标准之间互相冲突，或者按计划做不到时，不要自行改方案或取舍：做完能做的部分，' +
     '在 deviations 里写清冲突和原因，并把对应验收标准标为 blocked。\n' +
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
@@ -454,7 +462,9 @@ export function nextStep(value, acceptance, resumed) {
   const list = (acceptance ?? []).map((a, i) => `${i + 1}. ${a}`).join('\n');
   return (alerts.length ? `${alerts.join('\n')}\n偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。\n` : '') +
     'Codex 的答复不是完成证据。用只读检查逐条核验下面的验收标准，给出每条的证据；' +
-    `有任何一条不通过，就写清差距，${resumable ? `用 codex_run 带 resume="${value.thread_id ?? ''}" 派回修正`
+    // resume 不继承沙箱：漏传 host_access 会回到沙箱，Codex 又启动不了 Windows 程序
+    `有任何一条不通过，就写清差距，${resumable ? `用 codex_run 带 resume="${value.thread_id ?? ''}"` +
+      `${value.sandbox === 'danger-full-access' ? ' 和 host_access=true' : ''} 派回修正`
       : '用 codex_run 重新派一个写全背景的完整任务（只读任务不留会话，不能 resume）'}。${list ? `\n${list}` : ''}`;
 }
 
@@ -608,13 +618,18 @@ export function apply(ctx, config = {}, run = runRunner) {
       'write=true 才允许它改文件，默认只读用于调查；scope 限定允许改动的路径。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
       '不通过就带 resume=thread_id 派回修正。汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
-      'WSL 里的 Codex 启动不了 Windows 程序（pwsh.exe、Hyper-V 命令等），不要把需要 Windows 运行时的检查写进 task/acceptance，这类检查你自己跑。',
+      (cfg.allowHostAccess === true
+        ? '任务需要启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令等）或连接 Hyper-V 虚拟机时传 host_access=true；不传时 WSL 里的 Codex 启动不了 Windows 程序。'
+        : 'WSL 里的 Codex 启动不了 Windows 程序（pwsh.exe、Hyper-V 命令等），不要把需要 Windows 运行时的检查写进 task/acceptance，这类检查你自己跑。'),
     parameters: {
       type: 'object',
       properties: {
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
         acceptance: { type: 'array', items: { type: 'string' }, description: '验收标准，1–20 条，每条写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
         write: { type: 'boolean', description: 'true 允许 Codex 修改任务目录里的文件（workspace-write 沙箱）；默认 false 只读。' },
+        ...(cfg.allowHostAccess === true ? { host_access: { type: 'boolean', description: 'true 时 Codex 在沙箱外运行（danger-full-access），' +
+          '可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令）、连接 Hyper-V 虚拟机；write 仍决定能否改动（文件、虚拟机、网络和系统状态）：' +
+          '要启动/停止/新建虚拟机，或运行会建、改虚拟机的脚本，也要传 write=true，否则 Codex 只做只读调查。不再有沙箱，只靠提示约束。只在任务需要时传。' } } : {}),
         scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。给了就写进约束，完成后在 out_of_scope 里列出范围外的改动。' },
         cwd: { type: 'string', description: '任务目录（Codex 在这里运行，write=true 时只能改这里的文件），Windows 路径或 /mnt/... 都可以。' +
           '不传时：会话工作区属于配置里带 cwd 的 workspaces 条目，就用那个 cwd，否则用当前会话工作区。' +
@@ -631,6 +646,9 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: OUTPUT,
     async execute(args, exec) {
       validateRun(args);
+      if (args.host_access === true && cfg.allowHostAccess !== true) {
+        throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
+      }
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
       if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
       const finish = (result) => {

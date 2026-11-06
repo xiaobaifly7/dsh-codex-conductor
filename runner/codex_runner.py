@@ -489,8 +489,8 @@ def execute(args, prompt, run_dir):
 
 def add_task_arguments(p):
     p.add_argument("--cwd", required=True)
-    # danger-full-access is deliberately absent: nobody is watching these runs.
-    p.add_argument("--sandbox", choices=["read-only", "workspace-write"], default="read-only")
+    # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
+    p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
     p.add_argument("--model", help="Model override; omitted keeps the Codex config default")
     p.add_argument("--effort", default="medium")
     p.add_argument("--service-tier", help='Codex service tier, e.g. "fast" for Fast mode; omitted keeps the config value')

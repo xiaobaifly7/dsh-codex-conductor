@@ -225,10 +225,16 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.calls()[0]["prompt"], prompt)
         self.assertEqual(self.calls()[0]["argv"][-1], "-")
 
-    def test_full_access_is_refused(self):
-        r = self.invoke("--sandbox", "danger-full-access")
-        self.assertEqual(r["error_kind"], "bad_arguments")
-        self.assertEqual(self.calls(), [])
+    def test_full_access_runs_as_a_writer(self):
+        r = self.invoke("--sandbox", "danger-full-access", mode="transient_then_ok")
+        self.assertEqual(r["status"], "completed")
+        self.assertEqual(r["thread_id"], "thread-1")
+        first, second = self.calls()
+        self.assertIn("resume", second["argv"])
+        self.assertIn("thread-1", second["argv"])
+        for call in (first, second):
+            self.assertIn('sandbox_mode="danger-full-access"', call["argv"])
+            self.assertNotIn("--ephemeral", call["argv"])
 
     def test_second_writer_in_same_directory_is_rejected(self):
         args = [sys.executable, str(RUNNER), "run", "--cwd", str(self.cwd), "--sandbox", "workspace-write"]
