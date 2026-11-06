@@ -442,6 +442,11 @@ export function withReport(value) {
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 export function nextStep(value, acceptance, resumed) {
   if (value.status === 'running') return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
+  // runner 的取消结果不带改动清单和沙箱，可写任务可能已改了一半
+  if (value.status === 'cancelled') {
+    return 'Codex 任务已取消（用户停止、会话归档或调用中止）：不要自行续跑或重派，先问用户。' +
+      '如果这是可写任务，取消前可能已改了部分文件且没有改动清单，核验前先用 git status 或对比文件确认现状。';
+  }
   // 只读任务用 --ephemeral 运行、不留会话记录，自己的 thread_id 续不上；只有它续跑的写任务线程还能续
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
@@ -520,6 +525,32 @@ export function turnSummary(log, turn) {
 }
 
 const OUTPUT = { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => render(value) };
+
+// 工具卡片和任务表用的短标题：任务的第一行，截到 n 个字
+export function taskLine(args, n) {
+  const line = typeof args?.task === 'string' ? args.task.trim().split('\n')[0].trim() : '';
+  return line.length > n ? `${line.slice(0, n)}…` : line;
+}
+// 结果第一行里 job_id 之前的一行摘要
+const resultSummary = (result) =>
+  (result?.content?.find((c) => c?.type === 'text')?.text ?? '').split('\n')[0].split('  job_id')[0].trim();
+// 聊天里 codex_* 调用卡片的标题：进行中显示派了什么，结束后换成一行摘要；只依赖参数和结果，重放时也一样
+const PRESENT = {
+  codex_run: {
+    presentCall: (a) => ({ card: 'generic', kind: a?.write === true || a?.host_access === true ? 'execute' : 'read', rawInput: a,
+      title: [`${a?.resume ? 'Codex 返工' : 'Codex'}${a?.host_access === true ? '（主机）' : ''}`, taskLine(a, 60)].filter(Boolean).join(' · ') }),
+    presentResult: (a, r) => r?.isError || !resultSummary(r) ? undefined
+      : { card: 'generic', title: [`Codex ${resultSummary(r)}`, taskLine(a, 40)].filter(Boolean).join(' · ') },
+  },
+  codex_status: {
+    presentCall: (a) => ({ card: 'generic', kind: 'read', title: `Codex 状态 ${a?.job_id ?? ''}` }),
+    presentResult: (a, r) => r?.isError || !resultSummary(r) ? undefined
+      : { card: 'generic', title: `Codex 状态 ${a?.job_id ?? ''} · ${resultSummary(r)}` },
+  },
+  codex_cancel: {
+    presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `取消 Codex ${a?.job_id ?? ''}` }),
+  },
+};
 const sessionCwd = (exec) => exec?.agent?.session?.header?.cwd;
 
 // 任务目录：显式 cwd > 包含会话工作区的 workspaces 条目的 cwd（最具体的那条）> 会话工作区
@@ -568,7 +599,9 @@ export function apply(ctx, config = {}, run = runRunner) {
   function liveBackground(jobId, exec) {
     const owner = exec?.agent?.id;
     const jobs = owner === undefined ? undefined : ctx.get?.('jobs');
-    const job = jobs?.list(owner).find((j) => j.kind === 'codex' && j.label === `Codex ${jobId}` &&
+    // 标签是「Codex <job_id>」或后面再跟「 · 任务摘要」
+    const base = `Codex ${jobId}`;
+    const job = jobs?.list(owner).find((j) => j.kind === 'codex' && (j.label === base || j.label?.startsWith(`${base} · `)) &&
       (j.status === 'running' || j.status === 'stopping'));
     return job && { jobs, id: job.id, owner };
   }
@@ -597,7 +630,8 @@ export function apply(ctx, config = {}, run = runRunner) {
 
   // 登记 DSH 后台任务（同一个 runner 任务只登记一个），结束后由 DSH 把结果送回会话；
   // 没有 jobs 服务、没有 agent 或登记失败时返回 undefined，调用方照旧轮询
-  function background(jobId, exec, finish) {
+  // label：任务表里这一行的标题，带上任务摘要才看得出是哪件事；codex_status 补登记时不知道任务，只用 job_id
+  function background(jobId, exec, finish, label = `Codex ${jobId}`) {
     if (!exec?.agent) return undefined;
     try {
       const live = liveBackground(jobId, exec);
@@ -606,7 +640,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (!jobs) return undefined;
       const owner = exec.agent.id;
       const id = jobs.start({
-        owner, kind: 'codex', label: `Codex ${jobId}`, outputLimitBytes: 65536,
+        owner, kind: 'codex', label, outputLimitBytes: 65536,
         run: (handle) => ({
           done: watch(jobId, handle, finish),
           cancel: () => { Promise.resolve(conductor.cancel(jobId)).catch(() => {}); },
@@ -632,7 +666,10 @@ export function apply(ctx, config = {}, run = runRunner) {
         }
         throw error;
       }
-      if (view.status === 'running' || view.status === 'stopping') return { job_id: jobId, status: 'running', last_activity: view.progress };
+      // 第一次刷新进度（约 20 秒）前 progress 还没有；DSH 要求工具结果是无损 JSON，不能带值为 undefined 的字段
+      if (view.status === 'running' || view.status === 'stopping') {
+        return { job_id: jobId, status: 'running', ...(view.progress ? { last_activity: view.progress } : {}) };
+      }
       // 结算时存下的是 codex_run 渲染好的完整结果（含 acceptance 和 out_of_scope），runner 重查拿不到这些；
       // 这次等待已算作被等到，DSH 不会再作为通知送回，所以在这里原样交回（结果只给一次，再读就回退到 runner）
       const rendered = bg.jobs.read?.(bg.id, bg.owner)?.result;
@@ -654,6 +691,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   }
 
   ctx.tools.register({
+    ...PRESENT.codex_run,
     name: 'codex_run',
     description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准；' +
       'write=true 才允许它改文件，默认只读用于调查；scope 限定允许改动的路径。Codex 会按验收标准逐条回报 ' +
@@ -697,16 +735,25 @@ export function apply(ctx, config = {}, run = runRunner) {
         const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
         return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume)) };
       };
+      // 启动不随中止打断：runner 在打印 job_id 前就拉起了 Codex，这时杀掉 wsl.exe 会让 Codex 在 WSL 里没人管地跑下去；
+      // 等拿到 job_id 再按中止取消它
+      exec?.signal?.throwIfAborted();
+      const started = await conductor.start(args, cwd);
+      if (exec?.signal?.aborted) {
+        if (started.job_id) await conductor.cancel(started.job_id);
+        exec.signal.throwIfAborted();
+      }
       // 启动后立即登记后台任务（任务表里看得到进度），再经任务表等到 wait_seconds；没有后台任务时直接等 runner
-      const started = await conductor.start(args, cwd, exec?.signal);
+      const label = `Codex ${started.job_id} · ${taskLine(args, 40)}`;
       const value = started.status === 'running' && started.job_id
-        ? await collect(started.job_id, background(started.job_id, exec, finish), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
+        ? await collect(started.job_id, background(started.job_id, exec, finish, label), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
         : withReport(started);
       return value.rendered ? track(value) : notifyOnDone(finish(track(value)), exec, finish);
     },
   });
 
   ctx.tools.register({
+    ...PRESENT.codex_status,
     name: 'codex_status',
     description: '查询或继续等待 codex_run 返回的任务。已登记为后台任务（结果带 background_job_id）的，结束时会收到 DSH 任务通知，' +
       '用 job_output 读完整结果，不必调用本工具；没登记的才用它等，仍在执行时返回 last_activity（它最近在做什么）和距上次活动的秒数，' +
@@ -729,6 +776,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   });
 
   ctx.tools.register({
+    ...PRESENT.codex_cancel,
     name: 'codex_cancel',
     description: '取消 codex_run 启动的任务，连同 WSL 里的 Codex 进程一起结束。',
     parameters: {

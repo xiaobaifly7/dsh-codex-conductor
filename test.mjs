@@ -573,7 +573,8 @@ test('codex_run registers the DSH job at start and returns its stored result whe
   await tick();
   // 还在等的时候任务表里已经有这一行，进度随后台循环刷新
   assert.equal(jobs.started.length, 1);
-  assert.equal(jobs.started[0].spec.label, 'Codex J1');
+  // 任务表那一行带上任务摘要，看得出是哪件事
+  assert.equal(jobs.started[0].spec.label, 'Codex J1 · 在 a.py 里修好 bug');
   await answer('J1', { status: 'running', seconds_since_last_event: 2, last_activity: 'ran: ls' });
   await answer('J1', { job_id: 'J1', status: 'completed', thread_id: 'T', duration_s: 12, files_changed: [{ path: 'README.md' }],
     structured: { summary: 's', criteria: [{ criterion: 'pytest 通过', status: 'met', evidence: 'e' }], files_changed: [], deviations: [], unresolved: [] } });
@@ -686,4 +687,59 @@ test('after a plugin reload the live background job is reused, not registered ag
   assert.equal(jobs.started.length, 1);
   await before.answer('J1', { status: 'completed' });
   await jobs.started[0].done;
+});
+
+test('codex_* cards show a short title while pending and the one-line summary when done', () => {
+  const { tools } = harness({ jobs: fakeJobs() });
+  const run = tools.codex_run;
+  const call = run.presentCall({ task: '修好登录页的报错\n细节……', acceptance: ['a'], write: true });
+  assert.equal(call.card, 'generic');
+  assert.equal(call.kind, 'execute');
+  assert.equal(call.title, 'Codex · 修好登录页的报错');
+  assert.equal(run.presentCall({ task: 'x'.repeat(80), acceptance: ['a'] }).kind, 'read');
+  assert.match(run.presentCall({ task: 'x'.repeat(80) }).title, /^Codex · x{60}…$/);
+  assert.equal(run.presentCall({ task: '再查一次', resume: 'T', host_access: true }).title, 'Codex 返工（主机） · 再查一次');
+  // 重放时可能拿到任意参数，不能抛错
+  assert.equal(run.presentCall(undefined).title, 'Codex');
+  const done = { isError: false, content: [{ type: 'text', text: 'completed · 2 met / 1 blocked · 3 files · 148 s  job_id: J1  thread_id: T\n--- Codex 逐条汇报 ---' }] };
+  assert.equal(run.presentResult({ task: '修好登录页的报错' }, done).title, 'Codex completed · 2 met / 1 blocked · 3 files · 148 s · 修好登录页的报错');
+  assert.equal(run.presentResult({}, { isError: true, content: [{ type: 'text', text: 'Error: x' }] }), undefined);
+  assert.equal(tools.codex_status.presentCall({ job_id: 'J1' }).title, 'Codex 状态 J1');
+  assert.equal(tools.codex_status.presentResult({ job_id: 'J1' }, done).title, 'Codex 状态 J1 · completed · 2 met / 1 blocked · 3 files · 148 s');
+  assert.equal(tools.codex_cancel.presentCall({ job_id: 'J1' }).title, '取消 Codex J1');
+});
+
+test('a run still starting at the deadline returns no undefined fields (DSH needs lossless JSON)', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer } = harness({ jobs });
+  const value = await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  assert.equal(value.status, 'running');
+  assert.ok(!('last_activity' in value));
+  assert.ok(Object.values(value).every((v) => v !== undefined));
+  await answer('J1', { status: 'completed' });
+  await jobs.started[0].done;
+});
+
+test('an abort before or during start never leaves Codex running unattended', async () => {
+  const jobs = fakeJobs();
+  const { tools, calls } = harness({ jobs });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const early = new AbortController();
+  early.abort();
+  await assert.rejects(tools.codex_run.execute(RUN, { ...exec, signal: early.signal }));
+  assert.equal(calls.length, 0);
+  // start 还没返回时中止：拿到 job_id 后取消它，不登记后台任务
+  const late = new AbortController();
+  const pending = tools.codex_run.execute(RUN, { ...exec, signal: late.signal });
+  late.abort();
+  await assert.rejects(pending);
+  assert.deepEqual(calls.map((a) => a[0]), ['start', 'cancel']);
+  assert.equal(jobs.started.length, 0);
+});
+
+test('a cancelled run is not reported as a failure and warns about half-applied edits', () => {
+  const next = nextStep({ status: 'cancelled', retryable: false }, ['A']);
+  assert.match(next, /已取消[\s\S]*先问用户/);
+  assert.match(next, /git status/);
+  assert.doesNotMatch(next, /不可重试/);
 });
