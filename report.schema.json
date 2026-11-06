@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "criteria", "files_changed", "deviations", "unresolved"],
+  "properties": {
+    "summary": { "type": "string" },
+    "criteria": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["criterion", "status", "evidence"],
+        "properties": {
+          "criterion": { "type": "string" },
+          "status": { "type": "string", "enum": ["met", "not_met", "blocked"] },
+          "evidence": { "type": "string" }
+        }
+      }
+    },
+    "files_changed": { "type": "array", "items": { "type": "string" } },
+    "deviations": { "type": "array", "items": { "type": "string" } },
+    "unresolved": { "type": "array", "items": { "type": "string" } }
+  }
+}
