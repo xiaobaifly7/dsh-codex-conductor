@@ -4,9 +4,9 @@
 // 按 thread 续跑、改动快照都在那里）。本插件负责：
 //   · 结构化派活：codex_run 的任务、必填验收标准、执行约束和允许范围经 stdin 交给 runner，
 //     要求 Codex 按 report.schema.json 逐条回报；结果里标出自报未满足、偏离计划和范围外的改动
-//   · 等待与取消：start 之后用有界的 `status --wait` 等结果，仍在执行时带回最近动作；
-//     中途停止时在 WSL 里 cancel，Linux 侧进程树由 runner 自己清理（taskkill wsl.exe 清不到）；
-//     等到点仍在执行时登记 DSH 后台任务，Codex 结束后结果自动送回会话（没有 jobs 服务就照旧轮询）
+//   · 等待与取消：start 后立即登记 DSH 后台任务（任务表里看得到进度和结束摘要），经任务表等结果；
+//     到点仍在执行就留在后台，Codex 结束后 DSH 发任务通知，agent 再读结果（没有 jobs 服务就用有界的 `status --wait` 照旧轮询）；
+//     中途停止时在 WSL 里 cancel，Linux 侧进程树由 runner 自己清理（taskkill wsl.exe 清不到）
 //   · 护栏：config.workspaces 内的会话，写文件类工具一律拒绝，shell 只放行只读核验命令
 //   · 防虚报：回合结束时声称已派 Codex、却没调用 codex_* 也没有在跑的任务，就提醒它补上或更正
 //
@@ -377,9 +377,7 @@ export function createConductor(cfg, run = runRunner) {
     if (cfg.reportSchema) argv.push('--schema', cfg.reportSchema);
     for (const s of args.scope ?? []) argv.push('--scope', s);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: args.host_access === true, write: args.write === true });
-    const started = await run(cfg, argv, { stdin: prompt, signal });
-    if (started.status !== 'running' || !started.job_id) return started;
-    return waitJob(started.job_id, args.wait_seconds ?? cfg.waitSeconds, signal);
+    return run(cfg, argv, { stdin: prompt, signal });
   }
 
   return { start, waitJob, cancel: (jobId) => run(cfg, ['cancel', jobId]) };
@@ -470,10 +468,22 @@ export function nextStep(value, acceptance, resumed) {
 
 const MARK = { met: '✓', not_met: '✗', blocked: '⛔' };
 
+// 一行摘要，任务表的 detail 和结果第一行都以它开头，如 completed · 12 met / 1 blocked · 3 files · 148 s
+function summaryLine(value) {
+  const criteria = value.report?.criteria ?? [];
+  const counts = Object.keys(MARK).map((s) => [s, criteria.filter((c) => c.status === s).length])
+    .filter(([, n]) => n).map(([s, n]) => `${n} ${s}`).join(' / ');
+  const files = value.files_changed_total ?? value.files_changed?.length;
+  const done = value.status === 'completed';
+  return [String(value.status), done ? counts : value.error_kind, done && files !== undefined && `${files} files`,
+    typeof value.duration_s === 'number' && `${Math.round(value.duration_s)} s`].filter(Boolean).join(' · ');
+}
+
 function render(value) {
   // 后台任务结算时存下的成品文字，原样交回
   if (typeof value?.rendered === 'string') return [{ type: 'text', text: value.rendered }];
-  const { final_message: answer, report, next, ...rest } = value ?? {};
+  // acceptance 不放进详细字段：下一步里已逐条列出
+  const { final_message: answer, report, next, acceptance: _acceptance, ...rest } = value ?? {};
   const reportLines = report ? [
     '--- Codex 逐条汇报 ---', `概述：${report.summary ?? ''}`,
     ...(report.criteria ?? []).map((c, i) => `${MARK[c.status] ?? '?'} ${i + 1}. ${c.criterion} —— ${c.evidence}`),
@@ -482,7 +492,7 @@ function render(value) {
     `未解决：${report.unresolved?.join('；') || '无'}`,
   ] : [];
   return [{ type: 'text', text: [
-    `status: ${rest.status}${rest.job_id ? `  job_id: ${rest.job_id}` : ''}${rest.thread_id ? `  thread_id: ${rest.thread_id}` : ''}`,
+    `${summaryLine(value ?? {})}${rest.job_id ? `  job_id: ${rest.job_id}` : ''}${rest.thread_id ? `  thread_id: ${rest.thread_id}` : ''}`,
     ...(report ? reportLines : answer ? ['--- Codex 最终答复 ---', answer] : []),
     '--- 详细字段 ---', JSON.stringify(rest, null, 2),
     ...(next ? ['--- 下一步 ---', next] : []),
@@ -535,7 +545,8 @@ function settings(config) {
   };
 }
 
-const BG_WAIT = 300;
+// 后台循环每次 `status --wait` 的秒数，只决定任务表进度行多久刷新一次
+const BG_WAIT = 20;
 // runner 取消后会立即写下结果，后台循环一秒内就能看到，这里只是上限
 const CANCEL_SETTLE_MS = 30_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
@@ -574,9 +585,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         // wsl.exe 本身出错不代表任务结束
         if (value.error_kind === 'bridge_error') throw new Error(value.error);
         const done = finish(track(value));
-        return { status: JOB_STATUS[done.status] ?? 'failed',
-          detail: `Codex 任务 ${jobId} 结束：${done.status}${done.error_kind ? `（${done.error_kind}）` : ''}`,
-          result: render(done)[0].text };
+        return { status: JOB_STATUS[done.status] ?? 'failed', detail: summaryLine(done), result: render(done)[0].text };
       }
     } catch (error) {
       activeJobs.delete(jobId);
@@ -586,30 +595,62 @@ export function apply(ctx, config = {}, run = runRunner) {
     }
   }
 
-  // 仍在执行时登记 DSH 后台任务（同一个 runner 任务只登记一个），结束后由 DSH 把结果送回会话；
-  // 没有 jobs 服务或登记失败就照旧轮询
-  function notifyOnDone(value, exec, finish) {
-    if (value.status !== 'running' || !value.job_id || !exec?.agent) return value;
-    let id;
+  // 登记 DSH 后台任务（同一个 runner 任务只登记一个），结束后由 DSH 把结果送回会话；
+  // 没有 jobs 服务、没有 agent 或登记失败时返回 undefined，调用方照旧轮询
+  function background(jobId, exec, finish) {
+    if (!exec?.agent) return undefined;
     try {
-      id = liveBackground(value.job_id, exec)?.id;
-      if (id === undefined) {
-        const jobs = ctx.get?.('jobs');
-        if (!jobs) return value;
-        id = jobs.start({
-          owner: exec.agent.id, kind: 'codex', label: `Codex ${value.job_id}`, outputLimitBytes: 65536,
-          run: (handle) => ({
-            done: watch(value.job_id, handle, finish),
-            cancel: () => { Promise.resolve(conductor.cancel(value.job_id)).catch(() => {}); },
-          }),
-        });
-      }
+      const live = liveBackground(jobId, exec);
+      if (live) return live;
+      const jobs = ctx.get?.('jobs');
+      if (!jobs) return undefined;
+      const owner = exec.agent.id;
+      const id = jobs.start({
+        owner, kind: 'codex', label: `Codex ${jobId}`, outputLimitBytes: 65536,
+        run: (handle) => ({
+          done: watch(jobId, handle, finish),
+          cancel: () => { Promise.resolve(conductor.cancel(jobId)).catch(() => {}); },
+        }),
+      });
+      return { jobs, id, owner };
     } catch {
-      return value;
+      return undefined;
     }
+  }
+
+  // 等 runner 任务的结果。有后台任务时经 DSH 任务表等：结算时这次等待算作已被等到，DSH 就不会再把同一结果作为通知补发
+  async function collect(jobId, bg, seconds, signal) {
+    if (bg) {
+      let view;
+      try {
+        view = await bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, signal);
+      } catch (error) {
+        // 中途停止：结束后台任务（它的 cancel 会取消 runner 任务），等它结算完再抛出，免得之后又冒出一条结束通知
+        if (signal?.aborted) {
+          bg.jobs.kill(bg.id, bg.owner, 'tool call aborted');
+          await bg.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner);
+        }
+        throw error;
+      }
+      if (view.status === 'running' || view.status === 'stopping') return { job_id: jobId, status: 'running', last_activity: view.progress };
+      // 结算时存下的是 codex_run 渲染好的完整结果（含 acceptance 和 out_of_scope），runner 重查拿不到这些；
+      // 这次等待已算作被等到，DSH 不会再作为通知送回，所以在这里原样交回（结果只给一次，再读就回退到 runner）
+      const rendered = bg.jobs.read?.(bg.id, bg.owner)?.result;
+      // 后台监控自己出错时存的只是「先查询」的提示，改查 runner 拿真实状态（仍在运行会重新登记）
+      if (typeof rendered === 'string' && !rendered.startsWith('monitor_failed')) return { job_id: jobId, status: /^\S+/.exec(rendered)?.[0], rendered };
+    }
+    // 后台任务已结算时 runner 的结果文件已在，只查一次取完整结果
+    return withReport(await conductor.waitJob(jobId, bg ? 0 : seconds, signal));
+  }
+
+  // 仍在执行时交给后台任务，结束后 DSH 只发一条带摘要的任务通知，完整结果要用 job_output 读；没有后台任务就照旧轮询
+  function notifyOnDone(value, exec, finish) {
+    if (value.status !== 'running' || !value.job_id) return value;
+    const id = background(value.job_id, exec, finish)?.id;
+    if (id === undefined) return value;
     return { ...value, background_job_id: id,
-      note: `已登记为后台任务 ${id}：Codex 结束后，结果（含逐条汇报和下一步）会自动送回本会话，不必用 codex_status 轮询。`,
-      next: '等待自动送回的结果；在此之前不要自己动手补做，也不要重复派同一个任务。' };
+      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），届时用 job_output 读取 ${id} 的完整结果（含逐条汇报和下一步），在此之前不必轮询。`,
+      next: '等 DSH 的任务通知，再用 job_output 读取完整结果；在此之前不要自己动手补做，也不要重复派同一个任务。' };
   }
 
   ctx.tools.register({
@@ -639,7 +680,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
           `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
         wait_seconds: { type: 'integer', description: `最多等待秒数，默认 ${cfg.waitSeconds}；到时任务转入后台继续，` +
-          '登记为后台任务时结果会自动送回本会话，否则用 codex_status 接着等。' },
+          '登记为后台任务时，Codex 结束后会收到任务通知，再用 job_output 读取完整结果；否则用 codex_status 接着等。' },
       },
       required: ['task', 'acceptance'],
     },
@@ -656,14 +697,19 @@ export function apply(ctx, config = {}, run = runRunner) {
         const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
         return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume)) };
       };
-      return notifyOnDone(finish(track(withReport(await conductor.start(args, cwd, exec?.signal)))), exec, finish);
+      // 启动后立即登记后台任务（任务表里看得到进度），再经任务表等到 wait_seconds；没有后台任务时直接等 runner
+      const started = await conductor.start(args, cwd, exec?.signal);
+      const value = started.status === 'running' && started.job_id
+        ? await collect(started.job_id, background(started.job_id, exec, finish), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
+        : withReport(started);
+      return value.rendered ? track(value) : notifyOnDone(finish(track(value)), exec, finish);
     },
   });
 
   ctx.tools.register({
     name: 'codex_status',
-    description: '查询或继续等待 codex_run 返回的任务。已登记为后台任务（结果带 background_job_id）的，结束后结果会自动送回，' +
-      '不必调用本工具；没登记的才用它等，仍在执行时返回 last_activity（它最近在做什么）和距上次活动的秒数，' +
+    description: '查询或继续等待 codex_run 返回的任务。已登记为后台任务（结果带 background_job_id）的，结束时会收到 DSH 任务通知，' +
+      '用 job_output 读完整结果，不必调用本工具；没登记的才用它等，仍在执行时返回 last_activity（它最近在做什么）和距上次活动的秒数，' +
       '不必再去翻日志；建议每次等 300–600 秒，不要频繁轮询。',
     parameters: {
       type: 'object',
@@ -677,30 +723,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_status: job_id 必须是非空字符串');
       const finish = (value) => ({ ...value, next: nextStep(value) });
-      const seconds = args.wait_seconds ?? 600;
-      const bg = liveBackground(args.job_id, exec);
-      let value;
-      if (bg) {
-        // 经 DSH 任务表等：结束时这次结算算作已被等到，DSH 就不会再把同一结果作为通知补发一遍
-        let view;
-        try {
-          view = await bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, exec?.signal);
-        } catch (error) {
-          if (exec?.signal?.aborted) bg.jobs.kill(bg.id, bg.owner);
-          throw error;
-        }
-        if (view.status === 'running' || view.status === 'stopping') value = { job_id: args.job_id, status: 'running', last_activity: view.progress };
-        else {
-          // 结算时存下的是 codex_run 渲染好的完整结果（含 acceptance 和 out_of_scope），runner 重查拿不到这些；
-          // 这次等待已算作被等到，DSH 不会再作为通知送回，所以在这里原样交回（结果只给一次，再读就回退到 runner）
-          const rendered = bg.jobs.read?.(bg.id, bg.owner)?.result;
-          // 后台监控自己出错时存的只是「先查询」的提示，改查 runner 拿真实状态（仍在运行会重新登记）
-          if (typeof rendered === 'string' && !rendered.startsWith('status: monitor_failed')) return track({ job_id: args.job_id, status: /^status: (\S+)/.exec(rendered)?.[1], rendered });
-        }
-      }
-      // 后台任务已结算时 runner 的结果文件已在，只查一次取完整结果
-      value ??= withReport(await conductor.waitJob(args.job_id, bg ? 0 : seconds, exec?.signal));
-      return notifyOnDone(finish(track(value)), exec, finish);
+      const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
+      return value.rendered ? track(value) : notifyOnDone(finish(track(value)), exec, finish);
     },
   });
 
