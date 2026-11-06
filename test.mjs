@@ -71,7 +71,27 @@ test('writing or arbitrary commands are refused', () => {
     // 变量当 pwsh 或脚本路径：可以先被赋值成任意命令，展开后按空白切开执行
     "PWSH='sh -c id'; $PWSH -f tests/a.ps1", 'PWSH=bash; "${PWSH}" -NoProfile -File tests/a.ps1',
     "X='usr/bin/env sh -c id;'; /$X/pwsh.exe -File tests/a.ps1", "X='-Command id #'; pwsh -File $X/tests/a.ps1",
+    // GNU sed 在打印地址后面仍会接受 -i / -e / -f，以及借转义斜杠藏进地址的 e 命令
+    'sed -n 1p -i f', 'sed -n 1p f -i', 'sed -n 1p --in-place=.bak f', 'sed -n 1p -f s.sed f',
+    "sed -n 1p -e 'w out' f", "sed -n '1p' -e '1e touch X' f", "sed -n '/a\\/,/e echo X;: /p' f",
+    // sed 脚本或文件参数里的变量、命令替换、花括号展开后可以变成 e/w 命令或开关
+    'p=1wW; sed -n $p f', 'sed -n "$p" f', 'sed -n "1,$p" f', "v=x; sed -n \"/$v/p\" f", 'sed -n "/$(printf x)/p" f',
+    'sed -n 1p {-i,f}', 'sed -n 1p $(printf -- -i) f', "printf -v p '1e touch X'",
+    // 算术求值会递归展开变量值里的 a[$(...)]
+    'echo $(( cat ))', "cat='a[$(touch X)]'; echo $(( cat ))", "cat='a[$(touch X)]'; [[ cat -eq 0 ]]",
+    "printf -v cat 'a[$(touch X)]'; [[ cat -eq 0 ]]",
   ]) assert.equal(readOnlyCommand(c), false, c);
+  assert.equal(readOnlyCommand('D=$(pwd); printf "%s\\n" "$D"'), true);
+  assert.equal(readOnlyCommand("sed -n '/start/,/end/p' a.txt b.txt"), true);
+});
+
+test('guard denials name the part that was refused', () => {
+  const why = (command) => decide(call('wsl', { command }), cfg);
+  assert.match(why(`git status && ${'ls a; '.repeat(60)}timeout 30 rm -rf x`), /不放行的是「rm -rf x」/);
+  assert.match(why(`${'cat a; '.repeat(60)}echo $((1+2))`), /含不放行的结构：[^。]*\$\(\(\.\.\.\)\) 算术/);
+  assert.match(why('cat a > b'), /重定向/);
+  assert.match(why(''), /命令为空/);
+  assert.match(why('rm x'), /pwsh -NoProfile -File '<\.\.\.\\tests\\xxx\.ps1>'/);
 });
 
 test('splitCommand keeps quoted operators inside words', () => {
@@ -115,6 +135,7 @@ test('codex_run validation requires acceptance criteria', () => {
   const prompt = composePrompt('做事情做事情', ['甲条件成立'], ['src/a.py', 'tests/']);
   assert.match(prompt, /## 验收标准[\s\S]*1\. 甲条件成立[\s\S]*## 执行约束[\s\S]*只允许改动这些路径：src\/a\.py、tests\/[\s\S]*blocked[\s\S]*## 最后汇报[\s\S]*JSON/);
   assert.doesNotMatch(composePrompt('做事情做事情', ['甲条件成立']), /只允许改动/);
+  assert.match(prompt, /单独的结论行）写进 summary 即算满足[\s\S]*不要因此标 blocked/);
 });
 
 test('scope check flags changes outside the allowed paths', () => {
@@ -133,6 +154,18 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.equal(value.structured, undefined);
   const next = nextStep({ ...value, out_of_scope: ['README.md'] }, ['A', 'B']);
   assert.match(next, /1 条未满足或受阻：B（blocked）[\s\S]*偏离计划：归档与要求冲突[\s\S]*超出 scope：README\.md[\s\S]*resume="T"/);
+  assert.match(next, /其他进程写的文件[\s\S]*不算 Codex 越界，也不用请用户决定/);
+  // 只读任务不留会话：自己的 thread_id 不能续跑，续跑过的写任务线程可以
+  const ro = { status: 'completed', sandbox: 'read-only', thread_id: 'W' };
+  assert.match(nextStep(ro, ['A'], true), /resume="W"/);
+  // codex_status 不传 resumed：只读任务带回 thread_id 说明续跑过写任务线程
+  assert.match(nextStep(ro, ['A']), /resume="W"/);
+  for (const n of [nextStep(ro, ['A'], false), nextStep({ ...ro, thread_id: null }, ['A'])]) {
+    assert.doesNotMatch(n, /resume="/);
+    assert.match(n, /重新派一个写全背景的完整任务/);
+  }
+  assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], false), /不要带 resume/);
+  assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], true), /有 thread_id 时带 resume/);
   assert.doesNotMatch(nextStep(withReport({ status: 'completed', thread_id: 'T' }), ['A']), /自报/);
   // Codex 没按 JSON 汇报：按完成处理，不当成失败
   const loose = withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false, final_message: 'done' });
@@ -191,6 +224,7 @@ test('apply registers three tools, a guard and the false-dispatch check', () => 
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; } },
     { workspaces: ['F:\\work\\项目'] });
   assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel']);
+  assert.match(tools[0].description, /固定为 JSON[\s\S]*启动不了 Windows 程序/);
   assert.equal(guards.length, 1);
   assert.match(guards[0](call('edit')), /已拒绝/);
   assert.match(tools[0].output.render({}, { status: 'completed', final_message: '完成', next: '核验' })[0].text,
@@ -309,6 +343,7 @@ function fakeJobs({ fail = false } = {}) {
       const job = { spec, handle, id: `bg${this.started.length + 1}`, status: 'running', waiters: new Set(), ...spec.run(handle) };
       job.done.then((outcome) => {
         job.status = outcome.status;
+        job.result = outcome.result;
         if (!job.waiters.size) this.unawaited.push(job.id);
         for (const w of job.waiters) w();
       });
@@ -317,6 +352,13 @@ function fakeJobs({ fail = false } = {}) {
     },
     view: (j) => ({ id: j.id, kind: j.spec.kind, label: j.spec.label, owner: j.spec.owner, status: j.status, progress: j.handle.progress.at(-1) }),
     list(owner) { return this.started.filter((j) => j.spec.owner === owner).map(this.view); },
+    // 和 DSH 一样：结算后的结果只随第一次 read 交出
+    read(id) {
+      const job = this.started.find((j) => j.id === id);
+      const result = job.delivered ? undefined : job.result;
+      job.delivered ||= result !== undefined;
+      return { chunks: [], ...(result !== undefined ? { result } : {}), job: this.view(job) };
+    },
     wait(id, ms, _owner, signal) {
       const job = this.started.find((j) => j.id === id);
       if (job.status !== 'running' && job.status !== 'stopping') return Promise.resolve(this.view(job));
@@ -452,17 +494,31 @@ test('without a jobs service, a failing start() or an agent, codex_run keeps pol
 
 test('codex_status and codex_cancel on a background job wait through DSH, so no second notice is sent', async () => {
   const jobs = fakeJobs();
-  const { tools, calls, answer, finals } = harness({ jobs });
+  const { tools, calls, answer } = harness({ jobs });
   const exec = { agent: agentAt('F:\\work\\项目') };
-  await tools.codex_run.execute(RUN, exec);
-  const status = tools.codex_status.execute({ job_id: 'J1', wait_seconds: 600 }, exec);
-  finals.J1 = { job_id: 'J1', status: 'completed', thread_id: 'T' };
-  await answer('J1', finals.J1);
+  // 交回的是后台任务存下的完整结果：codex_run 那次的 out_of_scope 和验收标准都在，不再查 runner
+  await tools.codex_run.execute({ ...RUN, scope: ['src'] }, exec);
+  const sent = calls.length;
+  const status =tools.codex_status.execute({ job_id: 'J1', wait_seconds: 600 }, exec);
+  await answer('J1', { job_id: 'J1', status: 'completed', thread_id: 'T', files_changed: [{ path: 'README.md' }] });
   const value = await status;
   assert.equal(value.status, 'completed');
-  assert.equal(value.thread_id, 'T');
-  assert.ok(!calls.some((a) => a.join(' ') === 'status J1 --wait 600'));
+  const text = tools.codex_status.output.render({}, value)[0].text;
+  assert.equal(text, jobs.started[0].result);
+  assert.match(text, /thread_id: T[\s\S]*超出 scope：README\.md[\s\S]*1\. pytest 通过/);
+  assert.ok(calls.slice(sent).every((a) => a[3] === '300'));
   assert.deepEqual(jobs.unawaited, []);
+
+  // jobs 服务交不出结果时退回 runner 查询
+  const plain = fakeJobs();
+  plain.read = undefined;
+  const h = harness({ jobs: plain });
+  await h.tools.codex_run.execute(RUN, exec);
+  const fallback = h.tools.codex_status.execute({ job_id: 'J1', wait_seconds: 600 }, exec);
+  h.finals.J1 = { job_id: 'J1', status: 'completed', thread_id: 'T' };
+  await h.answer('J1', h.finals.J1);
+  assert.equal((await fallback).thread_id, 'T');
+  assert.ok(!h.calls.some((a) => a.join(' ') === 'status J1 --wait 600'));
 
   await tools.codex_run.execute(RUN, exec);
   const cancel = tools.codex_cancel.execute({ job_id: 'J2' }, exec);
@@ -479,6 +535,14 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   assert.equal(jobs.started[2].status, 'stopping');
   assert.deepEqual(calls.at(-1), ['cancel', 'J3']);
   await answer('J3', { status: 'cancelled' });
+
+  // 后台监控自己出错时存的只是提示，不原样交回：改查 runner，仍在运行就重新登记
+  await tools.codex_run.execute(RUN, exec);
+  const relost = tools.codex_status.execute({ job_id: 'J4', wait_seconds: 600 }, exec);
+  await answer('J4', { status: 'failed', error_kind: 'bridge_error', error: 'wsl gone' });
+  const back = await relost;
+  assert.equal(back.status, 'running');
+  assert.equal(back.background_job_id, 'bg5');
 });
 
 test('a failed cancel does not leave a wait that swallows the later completion notice', async () => {

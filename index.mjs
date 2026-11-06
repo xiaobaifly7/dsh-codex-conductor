@@ -87,11 +87,13 @@ const PWSH_FLAGS = new Set(['-noprofile', '-noninteractive', '-nologo']);
 // 随包的只读语法检查脚本；护栏只认这一个路径（/mnt 形式和 Windows 形式都行）
 const PS_SYNTAX_WIN = fileURLToPath(new URL('./tools/Test-PsSyntax.ps1', import.meta.url));
 export const PS_SYNTAX = wslPath(PS_SYNTAX_WIN);
-const SED_PRINT = /^((\d+|\$)(,(\d+|\$))?|\/[^/]*\/(,\/[^/]*\/)?)p$/;
+// 地址里不放行 \/：转义的斜杠会让后面的 e/w 命令混进地址；也不放行 $：变量或命令替换展开后同样能混进 e/w（末行用 tail）
+const SED_PRINT = /^(\d+(,\d+)?|\/[^/\\$]*\/(,\/[^/\\$]*\/)?)p$/;
 
 const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex_run 交给 Codex；你只做只读核验：read / glob / grep 等读工具，' +
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、pytest、npm test 等，' +
-  '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号或 heredoc）。' +
+  '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号、heredoc 或 $((...)) 算术）。' +
+  "项目 tests 目录下的验证脚本可以直接跑：pwsh -NoProfile -File '<...\\tests\\xxx.ps1>'。" +
   `检查 PowerShell 语法不能用 -Command，改用随包脚本：pwsh.exe -NoProfile -File '${PS_SYNTAX_WIN}' 'D:\\path\\a.ps1' …` +
   `（Windows 的 pwsh.exe 用 Windows 路径；WSL 里的 pwsh 用 ${PS_SYNTAX}），输出 PARSE-OK / PARSE-FAIL 和出错行。`;
 
@@ -139,9 +141,12 @@ export function splitCommand(command, inner = () => false) {
     if (quote === "'") { if (ch === "'") quote = null; else word += ch; continue; }
     if (ch === '`') return null;
     if (ch === '$' && next === '(') {
+      // $((...)) 是算术：会把变量值当表达式递归求值，值里的 a[$(...)] 就能执行命令
+      if (command[i + 2] === '(') return null;
       const end = closingParen(command, i + 2);
       if (end < 0 || !inner(command.slice(i + 2, end))) return null;
-      word += 'X';
+      // 保留 $，让后面的检查（sed 脚本、pwsh 路径）看得出这里展开过
+      word += '$X';
       started = true;
       i = end;
       continue;
@@ -210,23 +215,32 @@ function pwshTestAllowed(args) {
   return true;
 }
 
-function segmentAllowed(words, extra) {
-  if (extra.some((rx) => rx.test(words.join(' ')))) return true;
-  while (words.length && LEAD_KEYWORDS.has(words[0])) words = words.slice(1);
-  while (words.length && CLOSE_KEYWORDS.has(words.at(-1))) words = words.slice(0, -1);
+// 剥掉流程关键字和 timeout 前缀（它只是给后面的命令限时），剩下真正执行的命令；
+// timeout 的时长不合法或后面没有命令时保留原样，按 timeout 本身判定（不放行）
+function core(words) {
+  for (;;) {
+    while (words.length && LEAD_KEYWORDS.has(words[0])) words = words.slice(1);
+    while (words.length && CLOSE_KEYWORDS.has(words.at(-1))) words = words.slice(0, -1);
+    if (words[0] !== 'timeout') return words;
+    let i = 1;
+    while (words[i]?.startsWith('-')) i += ['-s', '-k', '--signal', '--kill-after'].includes(words[i]) ? 2 : 1;
+    if (!/^\d+(\.\d+)?[smhd]?$/.test(words[i] ?? '') || words.length <= i + 1) return words;
+    words = words.slice(i + 1);
+  }
+}
+
+function segmentAllowed(raw, extra) {
+  const words = core(raw);
+  if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
   // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
   if (words[0] === 'for') return (words.length <= 2 || words[2] === 'in') && words.slice(3).every((w) => !w.startsWith('-'));
-  // timeout 只是给后面的命令限时，剥掉后检查真正执行的命令
-  if (words[0] === 'timeout') {
-    let i = 1;
-    while (words[i]?.startsWith('-')) i += ['-s', '-k', '--signal', '--kill-after'].includes(words[i]) ? 2 : 1;
-    if (!/^\d+(\.\d+)?[smhd]?$/.test(words[i] ?? '')) return false;
-    return words.length > i + 1 && segmentAllowed(words.slice(i + 1), extra);
-  }
   // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行。
-  // 值不能以 - 开头或含空白，免得展开后变成参数（X=-delete; find . $X）
-  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) return words.length === 1 && /^[A-Za-z_][A-Za-z0-9_]*=(?!-)\S*$/.test(words[0]);
+  // 值不能以 - 开头或含空白，免得展开后变成参数（X=-delete; find . $X）；
+  // 也不能含字面的 $(，否则 [[ X -eq 0 ]] 之类的算术求值会执行它
+  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
+    return words.length === 1 && /^[A-Za-z_][A-Za-z0-9_]*=(?!-)\S*$/.test(words[0]) && !words[0].includes('$(');
+  }
   if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
   const positional = args.filter((a) => !a.startsWith('-')).length;
@@ -238,8 +252,12 @@ function segmentAllowed(words, extra) {
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
     case 'sort': return !args.some((a) => a.startsWith('--output') || /^-[^-]*o/.test(a));
     case 'uniq': return positional <= 1;
+    // printf -v 能给任意变量赋任意值
+    case 'printf': return !args[0]?.startsWith('-v');
     case 'tree': return !args.some((a) => a === '-o');
-    case 'sed': return args[0] === '-n' && args.length >= 2 && SED_PRINT.test(args[1]);
+    // 后面再出现开关（-i、--in-place、-e、-f）就可能写文件或执行命令；
+    // 文件参数里的 $ 和 { 也不放行：$(printf -- -i)、{-i,f} 展开后同样变成开关
+    case 'sed': return args[0] === '-n' && args.length >= 2 && SED_PRINT.test(args[1]) && args.slice(2).every((a) => !/^-|[{$]/.test(a));
     case 'python': case 'python3': return args[0] === '-m' && ['pytest', 'unittest'].includes(args[1]);
     case 'npm': case 'pnpm': case 'yarn': return args[0] === 'test' || (args[0] === 'run' && /^test/.test(args[1] ?? ''));
     case 'node': return args[0] === '--test' || args[0] === '--check';
@@ -253,6 +271,16 @@ export function readOnlyCommand(command, extra = []) {
   if (typeof command !== 'string' || !command.trim()) return false;
   const segments = splitCommand(command, (sub) => readOnlyCommand(sub, extra));
   return segments !== null && segments.length > 0 && segments.every((w) => segmentAllowed(w, extra));
+}
+
+// 拒绝原因：整条命令截断后看不到真正卡住的地方，所以指出不放行的结构或第一段不放行的命令
+function refusedPart(command, extra) {
+  const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra)) : [];
+  if (segments === null) {
+    return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
+  }
+  const bad = segments.find((w) => !segmentAllowed(w, extra));
+  return bad ? `不放行的是「${core(bad).join(' ').slice(0, 200)}」` : '命令为空';
 }
 
 const present = (v) => v !== undefined && v !== null && v !== false && v !== '' &&
@@ -273,7 +301,7 @@ export function decide(exec, cfg) {
   const used = blocked.filter((k) => present(args[k]));
   if (used.length) return deny(`${tool} 带了 ${used.join(' / ')} 参数，已拒绝`);
   if (!readOnlyCommand(args.command, cfg.allowCommands)) {
-    return deny(`这条命令不在只读核验范围内：${String(args.command ?? '').slice(0, 200)}`);
+    return deny(`这条命令不在只读核验范围内，${refusedPart(args.command, cfg.allowCommands)}`);
   }
   return undefined;
 }
@@ -293,7 +321,8 @@ function runRunner(cfg, args, { stdin, signal } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawn('wsl.exe', runnerArgv(cfg, args), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      // 不设 WSL_UTF8 时 wsl.exe 自己的报错是 UTF-16LE，按 UTF-8 读出来是乱码
+      child = spawn('wsl.exe', runnerArgv(cfg, args), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, WSL_UTF8: '1' } });
     } catch (error) {
       resolve({ status: 'failed', error_kind: 'bridge_error', error: String(error?.message ?? error), retryable: true });
       return;
@@ -362,7 +391,8 @@ export function composePrompt(task, acceptance, scope = []) {
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
     '\n## 最后汇报\n最终答复只输出符合给定 JSON 格式的对象：summary 概述结果；criteria 按上面的顺序逐条给出 ' +
     'status（met / not_met / blocked）和 evidence（具体证据：命令与输出、文件与行号）；files_changed 列出改动的文件；' +
-    'deviations 列出与计划不一致的地方及原因（没有就空数组）；unresolved 列出没解决的问题。\n';
+    'deviations 列出与计划不一致的地方及原因（没有就空数组）；unresolved 列出没解决的问题。\n' +
+    '任务或验收标准里对最终答复版式的要求（如单独的结论行）写进 summary 即算满足，不算偏离，也不要因此标 blocked。\n';
 }
 
 // 不在 scope 内的改动；没给 scope 或 runner 没给出改动清单时返回 undefined
@@ -403,27 +433,36 @@ export function withReport(value) {
   return structured && typeof structured === 'object' ? { ...rest, report: structured } : rest;
 }
 
-export function nextStep(value, acceptance) {
+// resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
+export function nextStep(value, acceptance, resumed) {
   if (value.status === 'running') return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
+  // 只读任务用 --ephemeral 运行、不留会话记录，自己的 thread_id 续不上；只有它续跑的写任务线程还能续
+  const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
-    return value.retryable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。' : '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
+    if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
+    return resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
+      : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。';
   }
   const report = value.report ?? {};
   const flagged = (report.criteria ?? []).filter((c) => c.status !== 'met');
   const alerts = [
     flagged.length ? `Codex 自报有 ${flagged.length} 条未满足或受阻：${flagged.map((c) => `${c.criterion}（${c.status}）`).join('；')}` : '',
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',
-    value.out_of_scope?.length ? `改动超出 scope：${value.out_of_scope.join('、')}，先核实这些改动是否应保留` : '',
+    value.out_of_scope?.length ? `改动超出 scope：${value.out_of_scope.join('、')}。这份清单来自目录快照，可能含同时段其他进程写的文件（如定期日志）；` +
+      '不在 Codex 自报 files_changed 里、明显来自其他进程的，只需一句说明，不算 Codex 越界，也不用请用户决定；其余的先核实是否应保留' : '',
   ].filter(Boolean);
   const list = (acceptance ?? []).map((a, i) => `${i + 1}. ${a}`).join('\n');
   return (alerts.length ? `${alerts.join('\n')}\n偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。\n` : '') +
     'Codex 的答复不是完成证据。用只读检查逐条核验下面的验收标准，给出每条的证据；' +
-    `有任何一条不通过，就写清差距，用 codex_run 带 resume="${value.thread_id ?? ''}" 派回修正。${list ? `\n${list}` : ''}`;
+    `有任何一条不通过，就写清差距，${resumable ? `用 codex_run 带 resume="${value.thread_id ?? ''}" 派回修正`
+      : '用 codex_run 重新派一个写全背景的完整任务（只读任务不留会话，不能 resume）'}。${list ? `\n${list}` : ''}`;
 }
 
 const MARK = { met: '✓', not_met: '✗', blocked: '⛔' };
 
 function render(value) {
+  // 后台任务结算时存下的成品文字，原样交回
+  if (typeof value?.rendered === 'string') return [{ type: 'text', text: value.rendered }];
   const { final_message: answer, report, next, ...rest } = value ?? {};
   const reportLines = report ? [
     '--- Codex 逐条汇报 ---', `概述：${report.summary ?? ''}`,
@@ -568,7 +607,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准；' +
       'write=true 才允许它改文件，默认只读用于调查；scope 限定允许改动的路径。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
-      '不通过就带 resume=thread_id 派回修正。',
+      '不通过就带 resume=thread_id 派回修正。汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
+      'WSL 里的 Codex 启动不了 Windows 程序（pwsh.exe、Hyper-V 命令等），不要把需要 Windows 运行时的检查写进 task/acceptance，这类检查你自己跑。',
     parameters: {
       type: 'object',
       properties: {
@@ -596,7 +636,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const finish = (result) => {
         const outside = outOfScope(result, cwd, args.scope);
         const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
-        return { ...value, next: nextStep(value, args.acceptance) };
+        return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume)) };
       };
       return notifyOnDone(finish(track(withReport(await conductor.start(args, cwd, exec?.signal)))), exec, finish);
     },
@@ -632,6 +672,13 @@ export function apply(ctx, config = {}, run = runRunner) {
           throw error;
         }
         if (view.status === 'running' || view.status === 'stopping') value = { job_id: args.job_id, status: 'running', last_activity: view.progress };
+        else {
+          // 结算时存下的是 codex_run 渲染好的完整结果（含 acceptance 和 out_of_scope），runner 重查拿不到这些；
+          // 这次等待已算作被等到，DSH 不会再作为通知送回，所以在这里原样交回（结果只给一次，再读就回退到 runner）
+          const rendered = bg.jobs.read?.(bg.id, bg.owner)?.result;
+          // 后台监控自己出错时存的只是「先查询」的提示，改查 runner 拿真实状态（仍在运行会重新登记）
+          if (typeof rendered === 'string' && !rendered.startsWith('status: monitor_failed')) return track({ job_id: args.job_id, status: /^status: (\S+)/.exec(rendered)?.[1], rendered });
+        }
       }
       // 后台任务已结算时 runner 的结果文件已在，只查一次取完整结果
       value ??= withReport(await conductor.waitJob(args.job_id, bg ? 0 : seconds, exec?.signal));
@@ -696,6 +743,6 @@ export function apply(ctx, config = {}, run = runRunner) {
     const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'loaded.json'),
-      JSON.stringify({ loadedAt: new Date().toISOString(), pid: process.pid, workspaces: cfg.roots }, null, 1));
+      JSON.stringify({ loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots }, null, 1));
   } catch {}
 }

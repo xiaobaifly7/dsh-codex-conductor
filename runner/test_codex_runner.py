@@ -129,7 +129,16 @@ class RunnerTests(unittest.TestCase):
         r = self.invoke()
         self.assertEqual(r["status"], "completed")
         self.assertEqual(r["final_message"], "done")
-        self.assertEqual(r["thread_id"], "thread-1")
+        # A read-only run is --ephemeral, so its own thread cannot be resumed and is not advertised.
+        self.assertIsNone(r["thread_id"])
+        self.assertNotIn("usage_scope", r)
+        self.assertEqual(self.invoke("--sandbox", "workspace-write")["thread_id"], "thread-1")
+
+    def test_read_only_resume_keeps_the_writer_thread_and_marks_usage_as_thread_total(self):
+        r = self.invoke("--resume", "writer-9")
+        self.assertEqual(r["thread_id"], "writer-9")
+        self.assertEqual(r["usage_scope"], "thread_total")
+        self.assertIn("writer-9", self.calls()[0]["argv"])
 
     def test_retry_notice_does_not_fail_the_run(self):
         self.assertEqual(self.invoke(mode="retry_notice_then_ok")["status"], "completed")
@@ -192,11 +201,18 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("resume", self.calls()[1]["argv"])
         self.assertEqual(self.calls()[1]["prompt"], "do it")
 
+    def test_reader_retry_after_resume_does_not_claim_thread_total_usage(self):
+        r = self.invoke("--resume", "writer-9", mode="transient_then_ok")
+        self.assertEqual(r["attempts"], 2)
+        self.assertNotIn("resume", self.calls()[1]["argv"])
+        self.assertNotIn("usage_scope", r)
+
     def test_permanent_failure_is_not_retried(self):
         r = self.invoke(mode="permanent")
         self.assertEqual(r["error_kind"], "permanent")
         self.assertEqual(r["attempts"], 1)
         self.assertFalse(r["retryable"])
+        self.assertIsNone(r["thread_id"])
 
     def test_router_down_never_spawns_codex(self):
         r = self.invoke("--retries", "0", env={"CODEX_RUNNER_ROUTER_URL": "http://127.0.0.1:9/x"})
@@ -289,6 +305,29 @@ class RunnerTests(unittest.TestCase):
         del args.service_tier
         cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
         self.assertFalse(any("service_tier" in part for part in cmd))
+
+    def test_user_mcp_servers_are_disabled_one_by_one(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import argparse
+        import codex_runner
+
+        home = Path(self.tmp.name) / "codex-home"
+        home.mkdir()
+        (home / "config.toml").write_text('[mcp_servers.alpha]\ncommand = "a"\n\n[mcp_servers."a b"]\ncommand = "b"\n\n[mcp_servers."my.server"]\ncommand = "c"\n')
+        args = argparse.Namespace(use_user_config=False, model=None, effort="medium", sandbox="read-only", schema=None)
+        with mock.patch.dict(os.environ, {"CODEX_HOME": str(home)}):
+            cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
+            mcp = [part for part in cmd if "mcp_servers" in part]
+            self.assertEqual(mcp, ["mcp_servers.alpha.enabled=false", "mcp_servers.a b.enabled=false"])
+            self.assertEqual(cmd[cmd.index(mcp[0]) - 1], "-c")
+            self.assertIn("hooks", cmd)
+            args.use_user_config = True
+            cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
+            self.assertFalse(any("mcp_servers" in part for part in cmd))
+            args.use_user_config = False
+            (home / "config.toml").write_text("not = [valid toml")
+            cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
+            self.assertFalse(any("mcp_servers" in part for part in cmd))
 
     def test_writer_changes_come_from_a_snapshot_diff_or_codex_events(self):
         sys.path.insert(0, str(RUNNER.parent))

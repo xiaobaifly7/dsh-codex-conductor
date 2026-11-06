@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import time
+import tomllib
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -33,7 +34,7 @@ else:
 
 # Codex keeps its own provider config and credentials, so only sandbox, approval and effort are pinned;
 # its MCP servers and hooks stay off unless --use-user-config.
-STRIP_USER_EXTRAS = ["-c", "mcp_servers={}", "--disable", "hooks"]
+STRIP_USER_EXTRAS = ["--disable", "hooks"]
 
 HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
@@ -150,6 +151,21 @@ def local_path(path):
     return f"/mnt/{m.group(1).lower()}/" + m.group(2).replace("\\", "/")
 
 
+def disable_user_mcp_servers():
+    """`-c mcp_servers={}` is a no-op in Codex 0.154, so turn off each server named in config.toml.
+    Plugin-provided MCP servers are not listed there and are not covered."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    try:
+        servers = tomllib.loads((home / "config.toml").read_text("utf-8")).get("mcp_servers")
+    except (OSError, ValueError):
+        return []
+    out = []
+    for name in servers if isinstance(servers, dict) else []:
+        if "." not in name:  # Codex splits -c keys on '.' and ignores TOML quotes, so dotted names cannot be turned off
+            out += ["-c", f"mcp_servers.{name}.enabled=false"]
+    return out
+
+
 def build_command(args, run_dir, thread_id):
     prefix, env = launcher()
     cmd = [*prefix, "exec"]
@@ -157,7 +173,7 @@ def build_command(args, run_dir, thread_id):
         cmd.append("resume")
     cmd += ["--json", "--skip-git-repo-check", "-o", str(run_dir / "last_message.txt")]
     if not args.use_user_config:
-        cmd += STRIP_USER_EXTRAS
+        cmd += STRIP_USER_EXTRAS + disable_user_mcp_servers()
     cmd += ["-c", 'approval_policy="never"']
     if args.model:
         cmd += ["-m", args.model]
@@ -423,6 +439,8 @@ def execute(args, prompt, run_dir):
     def changes():
         return files_changed(args.cwd, before, event_changes, scope) if args.sandbox != "read-only" else {}
 
+    # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
+    resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
     thread_id = args.resume
     attempt = 0
     while True:
@@ -431,6 +449,7 @@ def execute(args, prompt, run_dir):
             state = {"end_reason": "router_down", "error": "Local model router is not reachable", "thread_id": thread_id}
             kind, retryable = "router_down", True
         else:
+            resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
             state = run_attempt(args, prompt, run_dir, thread_id)
             thread_id = state["thread_id"]
             event_changes += state["file_changes"]
@@ -441,7 +460,7 @@ def execute(args, prompt, run_dir):
         can_retry = retryable and attempt <= args.retries and (args.sandbox == "read-only" or thread_id or kind == "router_down")
         if not can_retry:
             return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
-                    "attempts": attempt, "thread_id": thread_id, "duration_s": round(time.time() - started, 1),
+                    "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
                     **changes()}
         time.sleep(min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2))
         if thread_id and args.sandbox != "read-only":
@@ -453,9 +472,12 @@ def execute(args, prompt, run_dir):
     message_file = run_dir / "last_message.txt"
     final = message_file.read_text("utf-8", "replace").strip() if message_file.exists() else ""
     final = final or state["last_text"] or ""
-    result = {**base, "status": "completed", "attempts": attempt, "thread_id": thread_id, "final_message": final[:8000],
+    result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
+              "final_message": final[:8000],
               "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
               "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes()}
+    if args.resume and resumed:
+        result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
     if args.schema:
         try:
             result["structured"] = json.loads(final)
