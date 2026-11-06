@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-conductor",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "DeepSeek Harness plugin: hand coding tasks to Codex CLI in WSL with acceptance criteria and per-criterion reports, and keep the agent itself to planning and read-only verification.",
   "type": "module",
   "main": "./index.mjs",

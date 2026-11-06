@@ -14,11 +14,12 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const name = 'codex-conductor';
+// systemPrompt 不列为依赖（这里的 inject 每一项都是必需的），用 ctx.get 取：有就注入规划要求，没有照样能用其余功能
 export const inject = ['tools'];
 
 const here = (file) => wslPath(fileURLToPath(new URL(file, import.meta.url)));
@@ -41,7 +42,33 @@ const DEFAULTS = {
   allowHostAccess: false,
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
   reportSchema: here('./report.schema.json'),
+  // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
+  plannerPromptFile: '',
 };
+
+const PLANNER_TEMPLATE = `<!--
+DeepSeek 派活给 Codex 前的规划要求（dsh-codex-conductor）。
+
+写在这段注释下面的内容，会作为系统提示词的一段注入给 DeepSeek，每一步都带着；
+它是给 DeepSeek 自己规划用的（怎么拆任务、写 task 和验收标准时要注意什么），不会原样发给 Codex。
+保存后下一步就生效，不用重载插件。只留这段注释（或清空文件）就不注入任何内容。
+-->
+`;
+
+// 规划要求文件的有效内容：去掉 HTML 注释；文件不存在或读不了就当没有
+export function plannerPrompt(file) {
+  try {
+    return readFileSync(file, 'utf8').replace(/<!--[\s\S]*?-->/g, '').trim();
+  } catch {
+    return '';
+  }
+}
+
+export function plannerSection(text) {
+  return text ? '## 派活给 Codex 前的规划要求（用户设定）\n' +
+    '每次用 codex_run 派活前，都按下面的要求规划、写 task 和 acceptance。这是用户给你的规划要求，不要原样抄进给 Codex 的 task。\n\n' +
+    text : '';
+}
 
 function wslPath(p) {
   const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
@@ -585,6 +612,25 @@ const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 export function apply(ctx, config = {}, run = runRunner) {
   const cfg = settings(config);
   const conductor = createConductor(cfg, run);
+
+  // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
+  const plannerFile = cfg.plannerPromptFile ||
+    (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'planner-prompt.md') : '');
+  if (plannerFile && !existsSync(plannerFile)) try {
+    mkdirSync(path.dirname(plannerFile), { recursive: true });
+    writeFileSync(plannerFile, PLANNER_TEMPLATE);
+  } catch {}
+  // 经 ctx.get 取服务（没列进 inject 时 ctx.systemPrompt 取不到），登记随插件卸载自动撤销。
+  // 同名段已登记（新旧实例同时在）会抛错，这时只放弃注入，不连累其余功能；
+  // 组装出错会让所有请求失败，所以 text 里不抛错（plannerPrompt 读不了就返回空）
+  let plannerInjected = false;
+  if (plannerFile) try {
+    ctx.get?.('systemPrompt')?.section({ name: 'codex-conductor:planner', order: 10100, interpolate: false,
+      text: () => plannerSection(plannerPrompt(plannerFile)) });
+    plannerInjected = Boolean(ctx.get?.('systemPrompt'));
+  } catch (error) {
+    ctx.logger?.warn?.(`[codex-conductor] 规划要求没能注入系统提示词：${error?.message ?? error}`);
+  }
   // codex_run 启动、尚未结束的任务；有它们时说「Codex 正在做」是真话
   const activeJobs = new Set();
   const track = (value) => {
@@ -733,7 +779,10 @@ export function apply(ctx, config = {}, run = runRunner) {
       const finish = (result) => {
         const outside = outOfScope(result, cwd, args.scope);
         const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
-        return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume)) };
+        // 每轮结果都提醒一次规划要求：DeepSeek 正要据此规划下一次派活
+        const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
+          ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
+        return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume)) + reminder };
       };
       // 启动不随中止打断：runner 在打印 job_id 前就拉起了 Codex，这时杀掉 wsl.exe 会让 Codex 在 WSL 里没人管地跑下去；
       // 等拿到 job_id 再按中止取消它
@@ -833,6 +882,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'loaded.json'),
-      JSON.stringify({ loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots }, null, 1));
+      JSON.stringify({ loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
+        plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
   } catch {}
 }

@@ -2,12 +2,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, nextStep, withReport, turnSummary, runnerArgv, PS_SYNTAX } from './index.mjs';
+
+// apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
+process.env.LOCALAPPDATA = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
 
 test('assignments and loop lists cannot smuggle flags into allowed commands', () => {
   for (const c of ['X=-delete; find . $X', 'X="a -delete"\nfind . $X', 'for f in -delete; do find . $f; done']) {
@@ -735,6 +738,46 @@ test('an abort before or during start never leaves Codex running unattended', as
   await assert.rejects(pending);
   assert.deepEqual(calls.map((a) => a[0]), ['start', 'cancel']);
   assert.equal(jobs.started.length, 0);
+});
+
+test('the planner prompt file starts as a template and is injected as a system prompt section, read fresh each time', () => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), 'planner-')), 'sub', 'planner-prompt.md');
+  const sections = [];
+  const systemPrompt = { section: (s) => sections.push(s) };
+  const ctx = { tools: { register: () => {}, guard: () => {} }, on: () => {}, get: (k) => (k === 'systemPrompt' ? systemPrompt : undefined) };
+  apply(ctx, { workspaces: [], plannerPromptFile: file });
+  // 新建的模板只有注释：不注入任何内容
+  assert.match(readFileSync(file, 'utf8'), /^<!--[\s\S]*-->\s*$/);
+  assert.equal(sections.length, 1);
+  assert.equal(sections[0].name, 'codex-conductor:planner');
+  assert.equal(sections[0].interpolate, false);
+  assert.equal(sections[0].text(), '');
+  // 改完文件下一次组装就生效；注释去掉，{{…}} 原样保留
+  writeFileSync(file, '<!-- 说明 -->\n先列依赖，一次派一件。\n{{literal}}');
+  assert.match(sections[0].text(), /^## 派活给 Codex 前的规划要求（用户设定）\n[\s\S]*\n\n先列依赖，一次派一件。\n\{\{literal\}\}$/);
+  // 已有文件不会被模板覆盖；文件被删也不抛错
+  apply(ctx, { workspaces: [], plannerPromptFile: file });
+  assert.match(readFileSync(file, 'utf8'), /先列依赖/);
+  rmSync(file);
+  assert.equal(sections[0].text(), '');
+  // 宿主没有 systemPrompt 服务、或同名段已登记（登记抛错）时照常加载其余功能
+  const tools = {};
+  const base = { tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {} };
+  assert.doesNotThrow(() => apply(base, { workspaces: [], plannerPromptFile: file }));
+  assert.doesNotThrow(() => apply({ ...base, get: () => ({ section() { throw new Error('already registered'); } }) },
+    { workspaces: [], plannerPromptFile: file }));
+  assert.ok(tools.codex_run && tools.codex_status && tools.codex_cancel);
+});
+
+test('a completed codex_run reminds the planner of the requirements only when some are set', async () => {
+  const file = path.join(mkdtempSync(path.join(tmpdir(), 'planner-')), 'planner-prompt.md');
+  const run = async (text) => {
+    writeFileSync(file, text);
+    const { tools } = harness({ config: { startResult: { job_id: 'J', status: 'completed' }, plannerPromptFile: file } });
+    return (await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') })).next;
+  };
+  assert.match(await run('一次派一件。'), /再对照系统提示词里的「派活给 Codex 前的规划要求」/);
+  assert.doesNotMatch(await run('<!-- 只有注释 -->'), /规划要求/);
 });
 
 test('a cancelled run is not reported as a failure and warns about half-applied edits', () => {
