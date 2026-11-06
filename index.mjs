@@ -705,10 +705,12 @@ export function apply(ctx, config = {}, run = runRunner) {
       try {
         view = await bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, signal);
       } catch (error) {
-        // 中途停止：结束后台任务（它的 cancel 会取消 runner 任务），等它结算完再抛出，免得之后又冒出一条结束通知
+        // 中途停止：结束后台任务（它的 cancel 会取消 runner 任务），等它结算完再抛出，免得之后又冒出一条结束通知。
+        // 抛一条明确的错误：jobs.wait 的中止拒绝直接抛出会被 DSH 渲染成 Error: [object Object]
         if (signal?.aborted) {
           bg.jobs.kill(bg.id, bg.owner, 'tool call aborted');
-          await bg.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner);
+          await bg.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner).catch(() => {});
+          throw new Error('Codex 任务的等待已被中止');
         }
         throw error;
       }

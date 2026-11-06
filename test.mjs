@@ -608,7 +608,8 @@ test('stopping codex_run mid-wait kills the DSH job and waits for it to settle b
   assert.deepEqual(calls.at(-1), ['cancel', 'J1']);
   assert.equal(rejected, false);
   await answer('J1', { status: 'cancelled' });
-  await assert.rejects(pending, /aborted/);
+  // 中止抛明确的错误，而不是 jobs.wait 原始拒绝（会渲染成 Error: [object Object]）
+  await assert.rejects(pending, /已被中止/);
   assert.equal(jobs.started[0].status, 'killed');
   assert.deepEqual(jobs.unawaited, []);
 });
@@ -656,7 +657,7 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   assert.equal(jobs.started[2].status, 'stopping');
   assert.deepEqual(calls.at(-1), ['cancel', 'J3']);
   await answer('J3', { status: 'cancelled' });
-  await assert.rejects(aborted, /aborted/);
+  await assert.rejects(aborted, /已被中止/);
   assert.deepEqual(jobs.unawaited, []);
 
   // 后台监控自己出错时存的只是提示，不原样交回：改查 runner，仍在运行就重新登记
