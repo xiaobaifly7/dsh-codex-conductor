@@ -164,7 +164,7 @@ function closingParen(s, start) {
 
 // 按未加引号的 && || | ; & 和换行切段，段内按空白切词并去掉引号。$(...) 交给 inner 判定，通过后当作一个普通词。
 // 返回 null 表示出现了不放行的结构：反引号、未通过的命令替换、进程替换、heredoc、写到 /dev/null 以外的重定向。
-export function splitCommand(command, inner = () => false, braceSegments = new Set()) {
+export function splitCommand(command, inner = () => false, braceSegments = new Set(), expansions = new Map()) {
   const segments = [];
   let words = [];
   let word = '';
@@ -174,6 +174,8 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
   let valid = true;
   let syntax = '';
   let expanded = false;
+  let glob = false;
+  let fieldSplit = false;
   const endWord = () => {
     if (started) {
       if (redirect) {
@@ -182,6 +184,11 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       } else {
         words.push(word);
         expanded ||= /\{(?:[^{}]*,[^{}]*|(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?)\}/.test(syntax);
+        const pattern = /[*?]|\[[^\]]+\]/.test(syntax);
+        glob ||= pattern;
+        // test 的额外词可能变成操作符；固定字母/路径前缀的 glob 无法生成 -v、! 等词。
+        fieldSplit ||= /\$(?![?#])/.test(syntax) ||
+          (pattern && !/^[A-Za-z0-9_./]/.test(word) && !intOperand(word));
       }
     }
     word = ''; started = false; syntax = '';
@@ -189,8 +196,12 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
   const endSegment = () => {
     endWord();
     if (redirect) valid = false;
-    if (words.length) { if (expanded) braceSegments.add(words); segments.push(words); }
-    words = []; expanded = false;
+    if (words.length) {
+      if (expanded) braceSegments.add(words);
+      expansions.set(words, { glob, fieldSplit });
+      segments.push(words);
+    }
+    words = []; expanded = false; glob = false; fieldSplit = false;
   };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
@@ -204,11 +215,13 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       if (end < 0 || !inner(command.slice(i + 2, end))) return null;
       // 保留 $，让后面的检查（sed 脚本、pwsh 路径）看得出这里展开过
       word += '$X';
+      if (!quote) syntax += '$';
       started = true;
       i = end;
       continue;
     }
     if (quote === '"') {
+      if (ch === '$' && /^\$(?:@|\{(?:@|[A-Za-z_][A-Za-z0-9_]*\[@\]))/.test(command.slice(i))) fieldSplit = true;
       if (ch === '"') quote = null;
       // 和 bash 一样，双引号里的 \ 只转义 $ ` " \ 和换行，Windows 路径 "C:\x" 保持原样
       else if (ch === '\\' && next !== undefined && '$`"\\\n'.includes(next)) { if (next !== '\n') word += next; i++; } else word += ch;
@@ -305,6 +318,34 @@ const intOperand = (a) => /^-?\d+$/.test(a) || a === '$?' || a === '$#';
 // -v/-R 和 read 的目标必须是字面变量名；数组下标会算术求值，只允许整数及 @ / *。
 // 单引号挡不住：bash 在求值时才解析下标里的 $(...)，所以这里按词形判断
 const safeSub = (a) => /^[A-Za-z_][A-Za-z0-9_]*(?:\[(?:@|\*|-?\d+)\])?$/.test(a);
+const TEST_UNARY = new Set('-a -b -c -d -e -f -g -G -h -k -L -n -N -O -p -r -R -s -S -t -u -v -w -x -z'.split(' '));
+const TEST_BINARY = new Set(['=', '==', '!=', '<', '>', '-ef', '-nt', '-ot', ...ARITH_OP]);
+
+// test/[ 在运行时识别操作符；只接受静态谓词，不能让展开的 -v/-eq 改变操作数用途。
+function testAllowed(args) {
+  let i = 0;
+  const predicate = () => {
+    while (args[i] === '!') i++;
+    const [a, op, b] = args.slice(i, i + 3);
+    if (a === undefined) return false;
+    if (TEST_BINARY.has(op)) {
+      i += 3;
+      return b !== undefined && (!ARITH_OP.has(op) || (intOperand(a) && intOperand(b)));
+    }
+    if (TEST_UNARY.has(a)) {
+      i += 2;
+      return op !== undefined && (!['-v', '-R'].includes(a) || safeSub(op));
+    }
+    i++;
+    return true;
+  };
+  if (!args.length) return true;
+  if (!predicate()) return false;
+  while (i < args.length) {
+    if (!['-a', '-o'].includes(args[i++]) || !predicate()) return false;
+  }
+  return i === args.length;
+}
 
 function readAllowed(args) {
   let i = 0;
@@ -357,7 +398,7 @@ function braceExpansionsSafe(word) {
   return true;
 }
 
-function segmentAllowed(raw, extra, braceExpansion = false) {
+function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   const words = core(raw);
   if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
@@ -379,17 +420,18 @@ function segmentAllowed(raw, extra, braceExpansion = false) {
   const positional = args.filter((a) => !a.startsWith('-')).length;
   switch (cmd) {
     case 'git': return gitAllowed(args);
-    case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && args.slice(1).every((a) => !a.startsWith('-'));
+    case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && !braceExpansion && !expansion.glob &&
+      args.slice(1).every((a) => !/^[+-]/.test(a) && !a.includes('$'));
     case 'iconv': return !args.some((a) => /^-[cs]*o/.test(a) ||
       (a.startsWith('--') && a !== '--' && '--output'.startsWith(a.split('=')[0])));
     case 'find': return !args.some((a) => FIND_ACTIONS.has(a));
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
     case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
       ['--output', '--compress-program', '--random-source'].some((flag) => flag.startsWith(a.split('=')[0]))));
-    case 'uniq': return positional <= 1;
+    case 'uniq': return !expansion.glob && positional <= 1;
     // printf -v 能给任意变量赋任意值
     case 'printf': return !args[0]?.startsWith('-v') && !args[0]?.includes('$');
-    case 'tree': return !args.some((a) => a === '-o');
+    case 'tree': return !args.some((a) => /^-[^-]*o/.test(a));
     // 后面再出现开关（-i、--in-place、-e、-f）就可能写文件或执行命令；
     // 文件参数里的 $ 和 { 也不放行：$(printf -- -i)、{-i,f} 展开后同样变成开关
     case 'sed': return args[0] === '-n' && args.length >= 2 && SED_PRINT.test(args[1]) && args.slice(2).every((a) => !/^-|[{$]/.test(a));
@@ -400,7 +442,10 @@ function segmentAllowed(raw, extra, braceExpansion = false) {
     case 'cargo': case 'make': return ['test', 'check'].includes(args[0]);
     // 算术比较（-eq 等）两侧必须是字面整数：否则操作数的运行时值（文件内容、变量、命令输出）会被当算术表达式求值并执行其中的 $(...)。
     // 只有 -v / -R 的操作数会对 name[下标] 做算术求值；=~、== 的模式和文件测试里的 name[..] 不求值，照常放行（真有 $(...) 由 splitCommand 拦）
-    case 'test': case '[': case '[[':
+    case 'test': case '[':
+      return !braceExpansion && !expansion.fieldSplit &&
+        (cmd !== '[' || args.at(-1) === ']') && testAllowed(cmd === '[' ? args.slice(0, -1) : args);
+    case '[[':
       return args.every((a, i) => ((args[i - 1] !== '-v' && args[i - 1] !== '-R') || safeSub(a)) &&
         (!ARITH_OP.has(a) || (intOperand(args[i - 1] ?? '') && intOperand(args[i + 1] ?? ''))));
     // read 把输入赋给 name[下标] 目标时会算术求值下标（单引号也挡不住），和 -v 同类
@@ -412,18 +457,20 @@ function segmentAllowed(raw, extra, braceExpansion = false) {
 export function readOnlyCommand(command, extra = []) {
   if (typeof command !== 'string' || !command.trim()) return false;
   const braceSegments = new Set();
-  const segments = splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments);
-  return segments !== null && segments.length > 0 && segments.every((w) => segmentAllowed(w, extra, braceSegments.has(w)));
+  const expansions = new Map();
+  const segments = splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments, expansions);
+  return segments !== null && segments.length > 0 && segments.every((w) => segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
 }
 
 // 拒绝原因：整条命令截断后看不到真正卡住的地方，所以指出不放行的结构或第一段不放行的命令
 function refusedPart(command, extra) {
   const braceSegments = new Set();
-  const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments) : [];
+  const expansions = new Map();
+  const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments, expansions) : [];
   if (segments === null) {
     return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
   }
-  const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w)));
+  const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
   return bad ? `不放行的是「${core(bad).join(' ').slice(0, 200)}」` : '命令为空';
 }
 
@@ -463,6 +510,8 @@ export function runnerArgv(cfg, args) {
 // 跑一个命令，返回它输出的最后一行 JSON。timeoutMs 到了还没结束（WSL 卡死或起不来）就结束它并按 bridge_error 返回，
 // 不等 close：进程树没收干净时 close 可能一直不来
 export function runProcess(command, argv, { stdin, signal, timeoutMs, env } = {}) {
+  if (signal?.aborted) return Promise.resolve({ status: 'failed', error_kind: 'bridge_error',
+    error: `${command} 调用前已被中止`, retryable: true });
   return new Promise((resolve) => {
     let child;
     try {
@@ -522,7 +571,8 @@ export function createConductor(cfg, run = runRunner) {
   async function waitJob(jobId, seconds, signal) {
     // 夹在 1 天内：既防超大值让底层 status 等上几十天，也让 timeoutMs 远小于 2^31
     const wait = Math.min(Math.max(0, seconds), 86_400);
-    const value = await run(cfg, ['status', jobId, '--wait', String(wait)], { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS });
+    const value = signal?.aborted ? undefined
+      : await run(cfg, ['status', jobId, '--wait', String(wait)], { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS });
     if (signal?.aborted) {
       await cancel(jobId, signal);
       signal.throwIfAborted();
@@ -619,10 +669,12 @@ export function validateRun(args) {
   if (args.writable_roots?.length && args.write !== true) throw new Error('codex_run: writable_roots 需要 write=true');
 }
 
-// runner 把合法的 JSON 汇报放在 structured 里，统一改名为 report。
+// 将 runner 的规范化路径用于范围检查，并把 structured 汇报改名为 report。
 // Codex 没按 JSON 汇报时 runner 记为 schema_invalid 失败，但活已经干完，按完成处理并提示以实际文件为准。
 export function withReport(value) {
   const { structured, ...rest } = value;
+  const outside = outOfScope(rest, rest.cwd, rest.scope_paths);
+  if (outside) rest.out_of_scope = outside;
   if (rest.status === 'failed' && rest.error_kind === 'schema_invalid') {
     const { error_kind: _kind, error: _error, retryable: _retryable, ...done } = rest;
     return { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' };
@@ -1024,7 +1076,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
       if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
       const finish = (result) => {
-        const outside = outOfScope(result, cwd, args.scope);
+        const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);
         const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
         // 每轮结果都提醒一次规划要求：DeepSeek 正要据此规划下一次派活
         const reminder = value.status === 'completed' && plannerPrompt(plannerFile)

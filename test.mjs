@@ -263,6 +263,85 @@ test('variable tests and read destinations must be literal while read prompts ma
   ]) assert.equal(readOnlyCommand(command), true, command);
 });
 
+test('shell syntax checks cannot restore execution with +n or expanded options', () => {
+  for (const command of [
+    "printf 'printf EXECUTED' | bash -n +n /dev/stdin", 'sh -n +n script.sh',
+    'bash -n "+n" script.sh', 'bash -n $(printf -- +n) script.sh',
+    'sh -n "$options" script.sh', 'bash -n ${options} script.sh',
+    'bash -n {+n,script.sh}', 'bash -n scripts/*.sh',
+  ]) {
+    assert.equal(readOnlyCommand(command), false, command);
+    assert.match(decide(call('wsl', { command }), cfg), /不放行的是/);
+  }
+  for (const command of [
+    'bash -n build.sh', 'sh -n a.sh b.sh', "bash -n 'script with spaces.sh'",
+    'timeout 30 bash -n build.sh', "bash -n 'file[0].sh'", String.raw`sh -n file\*.sh`,
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('test and [ need static predicate operators but retain quoted variable operands', () => {
+  for (const command of [
+    "read 'a[0]' < /etc/hostname; test \"$(printf -- -v)\" 'a[$(printf DYNAMIC_TEST >&2)0]'",
+    'test "$op" "$target"', '[ "${op}" "$target" ]', 'test "$a" "$op" "$b"',
+    'test ! "$op" "$target"', 'test -n x -a "$op" "$target"',
+    "[ -[v] 'a[$(printf DYNAMIC_TEST >&2)0]' ]", 'test -{v,n} name',
+    'test -n $value', '[ -f $(cat filename.txt) ]', 'test "$@"', 'test "${values[@]}"',
+    'test -f *', '[ -n ? ]',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+  for (const command of [
+    'test -f "$file"', '[ -d "${dir}" ]', '[ -e "$file" ]', 'test -n "$text"',
+    '[ "$a" = "$b" ]', '[ "$a" != "$b" ]', 'test "$a" -nt "$b"',
+    'test ! -f "$file"', '[ ! -n "$text" ]', 'test -f "$file" -a -r "$file"',
+    'test -z "$a" -o -n "$b"', 'test "$text"', '[ ]', 'test',
+    'test -v name', "[ -v 'arr[0]' ]", '[ $? -eq 0 ]', '[ $# -gt 0 ]',
+    '[ -f "$(printf filename.txt)" ]', '[ -f a[0-9] ]',
+    "test '$@'", "test '${values[@]}'", 'test -n "$*"',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('uniq cannot turn an unquoted glob into an output operand', () => {
+  for (const command of ['uniq runner/*.py', 'uniq runner/?.py', 'uniq runner/[ct]*.py', 'uniq -c runner/*.py']) {
+    assert.equal(readOnlyCommand(command), false, command);
+  }
+  for (const command of ['uniq input.txt', 'uniq -c input.txt', 'uniq', "uniq 'runner/*.py'",
+    'uniq "runner/[ct]*.py"', String.raw`uniq runner/\*.py`, 'uniq /dev/null']) {
+    assert.equal(readOnlyCommand(command), true, command);
+  }
+});
+
+test('tree rejects output options inside short-option clusters', () => {
+  for (const command of ['tree -ao /dev/null -L 1 tools', 'tree -nao out.txt tools', 'tree -o out.txt tools']) {
+    assert.equal(readOnlyCommand(command), false, command);
+  }
+  for (const command of ['tree -a -L 2 tools', 'tree --sort=name tools', "tree -P '*.mjs' tools", 'tree -df tools']) {
+    assert.equal(readOnlyCommand(command), true, command);
+  }
+});
+
+test('guard regressions match Bash semantics using only printed markers and /dev/null', (t) => {
+  const executable = process.platform === 'win32' ? 'wsl.exe' : 'bash';
+  const prefix = process.platform === 'win32' ? ['-e', 'bash'] : [];
+  const bash = (script) => spawnSync(executable, [...prefix, '--noprofile', '--norc', '-c', script],
+    { encoding: 'utf8', timeout: 10_000 });
+  const available = bash('exit 0');
+  if (available.error || available.status !== 0) return t.skip('Bash/WSL unavailable');
+  const shell = bash("printf 'printf EXECUTED' | bash -n +n /dev/stdin; printf 'printf UNEXPECTED' | bash -n /dev/stdin");
+  assert.equal(shell.status, 0, shell.stderr);
+  assert.equal(shell.stdout, 'EXECUTED');
+  const dynamic = bash("read 'a[0]' < /etc/hostname; test \"$(printf -- -v)\" 'a[$(printf DYNAMIC_TEST >&2)0]'");
+  assert.equal(dynamic.status, 0, dynamic.stderr);
+  assert.equal(dynamic.stderr, 'DYNAMIC_TEST');
+  const glob = bash("printf '<%s>\\n' runner/*.py; uniq /dev/null /dev/null");
+  assert.equal(glob.status, 0, glob.stderr);
+  assert.equal(glob.stdout, '<runner/codex_runner.py>\n<runner/test_codex_runner.py>\n');
+  const tree = bash('command -v tree >/dev/null || exit 77; tree -ao /dev/null -L 1 tools');
+  if (tree.status === 77) t.diagnostic('tree unavailable; classification tests still run');
+  else {
+    assert.equal(tree.status, 0, tree.stderr);
+    assert.equal(tree.stdout, '');
+  }
+});
+
 test('an invalid allowCommands pattern leaves the tools and guard installed', () => {
   const tools = [];
   const guards = [];
@@ -1460,4 +1539,33 @@ test('dispatch reminders use jobs owned by the agent and survive a plugin reload
   await jobs.started[0].done;
   after.handlers['agent/turn-stopping']({ agent: owner, turn: 7 });
   assert.equal(nudges.length, count + 2);
+});
+
+test('a pre-aborted signal skips execution and status polling but still cancels the known job', async () => {
+  const stop = new AbortController();
+  stop.abort();
+  const value = await runProcess(process.execPath, ['-e', 'console.log(JSON.stringify({ unexpected: true }))'], { signal: stop.signal });
+  assert.equal(value.error_kind, 'bridge_error');
+  assert.match(value.error, /调用前已被中止/);
+  const { tools, calls, finals } = harness({ get: false });
+  finals.J9 = { job_id: 'J9', status: 'running' };
+  await assert.rejects(tools.codex_status.execute({ job_id: 'J9', wait_seconds: 600 }, { signal: stop.signal }), { name: 'AbortError' });
+  assert.deepEqual(calls, [['cancel', 'J9']]);
+});
+
+test('canonical runner paths keep alias scopes consistent for run, status and cancel', async () => {
+  const done = { status: 'completed', job_id: 'J', thread_id: 'T', sandbox: 'workspace-write',
+    cwd: '/home/user/real', scope_paths: ['/home/user/real/src'],
+    files_changed: [{ path: 'src/a.py', change: 'modified' }, { path: 'other.txt', change: 'modified' }] };
+  const { tools, finals } = harness({ get: false, config: { startResult: done, cancelResult: done } });
+  const run = await tools.codex_run.execute({ ...RUN, write: true, cwd: '/home/user/alias', scope: ['/home/user/alias/src'] }, {});
+  finals.J = done;
+  const status = await tools.codex_status.execute({ job_id: 'J', wait_seconds: 0 }, {});
+  const cancel = await tools.codex_cancel.execute({ job_id: 'J' }, {});
+  for (const value of [run, status, cancel]) {
+    assert.deepEqual(value.out_of_scope, ['other.txt']);
+    assert.match(value.next, /超出 scope：other\.txt/);
+  }
+  const inScope = withReport({ ...done, files_changed: [done.files_changed[0]] });
+  assert.deepEqual(inScope.out_of_scope, []);
 });

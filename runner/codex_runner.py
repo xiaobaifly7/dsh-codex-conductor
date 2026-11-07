@@ -8,6 +8,7 @@
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
 """
 import argparse
+from contextlib import suppress
 import hashlib
 import json
 import os
@@ -143,6 +144,22 @@ def router_reachable():
         return False
 
 
+def acquire_file_lock(path, blocking=False):
+    handle = open(path, "a+b")
+    handle.seek(0)
+    try:
+        if IS_WIN:
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+        else:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+    except OSError:
+        handle.close()
+        if blocking:
+            raise
+        return None
+    return handle
+
+
 def acquire_write_lock(cwd):
     """Hold a per-directory lock so a retry can never overlap another writer. The OS frees it if we die."""
     locks = HOME / "locks"
@@ -151,17 +168,7 @@ def acquire_write_lock(cwd):
     if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path):
         path = path.lower()  # Windows-backed paths ignore case, unlike native Linux paths.
     key = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
-    handle = open(locks / f"{key}.lock", "a+b")
-    handle.seek(0)
-    try:
-        if IS_WIN:
-            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        return None
-    return handle
+    return acquire_file_lock(locks / f"{key}.lock")
 
 
 def local_path(path):
@@ -225,120 +232,139 @@ def run_attempt(args, prompt, run_dir, thread_id):
              "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
              "file_changes": []}
     start = time.time()
-    with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
-        try:
-            proc = subprocess.Popen(cmd, cwd=args.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                    stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
-        except OSError as e:
-            state["end_reason"] = "spawn_failed"
-            state["error"] = str(e)
-            return state
-        (run_dir / "codex.pid").write_text(str(proc.pid))
-        stdin_done = threading.Event()
-        stdin_errors = []
-
-        def send_prompt():
-            # A child that stops reading must not block the timeout monitor.
+    proc = reader = writer = None
+    startup = acquire_file_lock(run_dir / "process.lock", blocking=True)
+    try:
+        with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
             try:
-                proc.stdin.write(prompt.encode("utf-8"))
-                proc.stdin.close()
+                proc = subprocess.Popen(cmd, cwd=args.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
             except OSError as e:
-                stdin_errors.append(e)
+                state["end_reason"] = "spawn_failed"
+                state["error"] = str(e)
+                return state
+            (run_dir / "codex.pid").write_text(str(proc.pid))
+            startup.close()
+            stdin_done = threading.Event()
+            stdin_errors = []
+
+            def send_prompt():
+                # A child that stops reading must not block the timeout monitor.
                 try:
+                    proc.stdin.write(prompt.encode("utf-8"))
                     proc.stdin.close()
-                except OSError:
-                    pass  # Closing can flush the same broken pipe again.
-            finally:
-                stdin_done.set()
+                except OSError as e:
+                    stdin_errors.append(e)
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass  # Closing can flush the same broken pipe again.
+                finally:
+                    stdin_done.set()
 
-        lines = queue.Queue()
+            lines = queue.Queue()
 
-        def pump():
-            try:
-                for raw in proc.stdout:
-                    lines.put(raw)
-            finally:
-                proc.stdout.close()
-                lines.put(None)
+            def pump():
+                try:
+                    for raw in proc.stdout:
+                        lines.put(raw)
+                finally:
+                    proc.stdout.close()
+                    lines.put(None)
 
-        reader = threading.Thread(target=pump, daemon=True)
-        reader.start()
-        writer = threading.Thread(target=send_prompt, daemon=True)
-        writer.start()
-        last_event = time.time()
-        reconnecting_since = None
-        completed_at = None
-        stdout_done = False
-        while True:
-            now = time.time()
-            if stdin_errors:
-                state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
-                kill_tree(proc.pid)
-                break
-            if stdout_done and stdin_done.is_set():
-                break
-            if completed_at and now - completed_at > args.exit_grace:
-                state["forced_exit"] = True
-                kill_tree(proc.pid)
-                break
-            # With the router down, Codex kept reconnecting for a full 240s test and never failed the turn.
-            if not completed_at and reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
-                state["end_reason"] = "reconnect_timeout"
-                kill_tree(proc.pid)
-                break
-            if not completed_at and now - start > args.timeout:
-                state["end_reason"] = "timeout"
-                kill_tree(proc.pid)
-                break
-            if not completed_at and now - last_event > args.idle_timeout:
-                state["end_reason"] = "idle_timeout"
-                kill_tree(proc.pid)
-                break
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
+            writer = threading.Thread(target=send_prompt, daemon=True)
+            writer.start()
+            last_event = time.time()
+            reconnecting_since = None
+            completed_at = None
+            stdout_done = False
+            while True:
+                now = time.time()
+                if stdin_errors:
+                    state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
+                    kill_tree(proc.pid)
+                    break
+                if stdout_done and stdin_done.is_set():
+                    break
+                if completed_at and now - completed_at > args.exit_grace:
+                    state["forced_exit"] = True
+                    kill_tree(proc.pid)
+                    break
+                # With the router down, Codex kept reconnecting for a full 240s test and never failed the turn.
+                if not completed_at and reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
+                    state["end_reason"] = "reconnect_timeout"
+                    kill_tree(proc.pid)
+                    break
+                if not completed_at and now - start > args.timeout:
+                    state["end_reason"] = "timeout"
+                    kill_tree(proc.pid)
+                    break
+                if not completed_at and now - last_event > args.idle_timeout:
+                    state["end_reason"] = "idle_timeout"
+                    kill_tree(proc.pid)
+                    break
+                try:
+                    raw = lines.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if raw is None:
+                    stdout_done = True
+                    continue
+                event_log.write(raw)
+                event_log.flush()
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                kind = ev.get("type")
+                item = ev.get("item") or {}
+                # Reconnect notices are not progress, so they must not refresh the idle timer.
+                if kind == "error":
+                    reconnecting_since = reconnecting_since or time.time()
+                else:
+                    reconnecting_since = None
+                    last_event = time.time()
+                if kind == "thread.started":
+                    state["thread_id"] = ev.get("thread_id") or state["thread_id"]
+                elif kind == "turn.completed":
+                    state["completed"] = True
+                    state["usage"] = ev.get("usage")
+                    completed_at = time.time()
+                elif kind == "turn.failed":
+                    state["failed"] = True
+                    state["error"] = (ev.get("error") or {}).get("message") or json.dumps(ev, ensure_ascii=False)
+                elif kind == "error":
+                    # Retry notices also arrive as top-level errors, so this alone does not end the turn.
+                    state["error"] = ev.get("message") or state["error"]
+                elif kind == "item.completed" and item.get("type") == "agent_message":
+                    state["last_text"] = item.get("text")
+                elif kind == "item.completed" and item.get("type") == "command_execution":
+                    state["commands"] += 1
+                elif kind == "item.completed" and item.get("type") == "file_change":
+                    state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
             try:
-                raw = lines.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if raw is None:
-                stdout_done = True
-                continue
-            event_log.write(raw)
-            event_log.flush()
-            try:
-                ev = json.loads(raw)
-            except ValueError:
-                continue
-            kind = ev.get("type")
-            item = ev.get("item") or {}
-            # Reconnect notices are not progress, so they must not refresh the idle timer.
-            if kind == "error":
-                reconnecting_since = reconnecting_since or time.time()
-            else:
-                reconnecting_since = None
-                last_event = time.time()
-            if kind == "thread.started":
-                state["thread_id"] = ev.get("thread_id") or state["thread_id"]
-            elif kind == "turn.completed":
-                state["completed"] = True
-                state["usage"] = ev.get("usage")
-                completed_at = time.time()
-            elif kind == "turn.failed":
-                state["failed"] = True
-                state["error"] = (ev.get("error") or {}).get("message") or json.dumps(ev, ensure_ascii=False)
-            elif kind == "error":
-                # Retry notices also arrive as top-level errors, so this alone does not end the turn.
-                state["error"] = ev.get("message") or state["error"]
-            elif kind == "item.completed" and item.get("type") == "agent_message":
-                state["last_text"] = item.get("text")
-            elif kind == "item.completed" and item.get("type") == "command_execution":
-                state["commands"] += 1
-            elif kind == "item.completed" and item.get("type") == "file_change":
-                state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            kill_tree(proc.pid)
-        writer.join(timeout=1)
-        reader.join(timeout=1)
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                kill_tree(proc.pid)
+    except BaseException:
+        if proc is not None:
+            # Preserve the original failure even if process cleanup also fails.
+            with suppress(Exception):
+                kill_tree(proc.pid)
+            with suppress(Exception):
+                proc.wait(timeout=10)
+        raise
+    finally:
+        startup.close()
+        for thread, pipe in ((writer, proc.stdin if proc else None), (reader, proc.stdout if proc else None)):
+            if thread is not None:
+                with suppress(RuntimeError):
+                    thread.join(timeout=1)
+            elif pipe is not None:
+                with suppress(OSError):
+                    pipe.close()
     return state
 
 
@@ -441,12 +467,13 @@ def scope_path(cwd, scope):
                 path = base + rest
         except OSError:
             pass
-    return path
+    return os.path.realpath(path)
 
 
 def snapshot_before(cwd, scope_args):
     """Snapshot cwd, or only the --scope paths when cwd is too big. Returns (before, scope); scope is None
     for a full snapshot, and before is None when only Codex's events can be used."""
+    cwd = os.path.realpath(cwd)
     if tree_key(cwd) not in too_big_trees():
         before = snapshot(cwd)
         if before is not None:
@@ -459,8 +486,10 @@ def snapshot_before(cwd, scope_args):
 def files_changed(root, before, event_changes, scope=None, ignore=None):
     """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool.
     Paths matching an ignore regex (files other processes keep writing) are dropped before the 300-entry cap."""
+    root = os.path.realpath(root)
+    scope = [os.path.realpath(s) for s in scope] if scope else scope
     after = snapshot(root, scope=scope) if before is not None else None
-    rel = lambda p: os.path.relpath(os.path.join(root, p), root).replace(os.sep, "/")
+    rel = lambda p: os.path.relpath(os.path.realpath(os.path.join(root, p)), root).replace(os.sep, "/")
     events = list(dict.fromkeys((rel(p), k) for p, k in event_changes if p))
     if after is not None:
         changes = [(p, "added") for p in after.keys() - before.keys()]
@@ -489,70 +518,78 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
 
 def execute(args, prompt, run_dir):
     run_dir.mkdir(parents=True, exist_ok=True)
-    base = {"cwd": os.path.abspath(args.cwd), "sandbox": args.sandbox, "log_dir": str(run_dir)}
+    args.cwd = os.path.realpath(args.cwd)
+    scope_args = [scope_path(args.cwd, s) for s in getattr(args, "scope", None) or []]
+    base = {"cwd": args.cwd, "sandbox": args.sandbox, "log_dir": str(run_dir)}
+    if scope_args:
+        base["scope_paths"] = scope_args
     started = time.time()
     lock = None
     before = scope = None
     event_changes = []
-    if args.sandbox != "read-only":
-        lock = acquire_write_lock(args.cwd)
-        if lock is None:
-            return {**base, "status": "failed", "error_kind": "busy", "retryable": True, "attempts": 0,
-                    "error": "Another Codex writer holds this directory. Wait, or use a separate worktree."}
-        # Jobs queued before --scope existed have no scope in args.json.
-        before, scope = snapshot_before(args.cwd, getattr(args, "scope", None))
+    try:
+        if args.sandbox != "read-only":
+            lock = acquire_write_lock(args.cwd)
+            if lock is None:
+                return {**base, "status": "failed", "error_kind": "busy", "retryable": True, "attempts": 0,
+                        "error": "Another Codex writer holds this directory. Wait, or use a separate worktree."}
+            # Jobs queued before --scope existed have no scope in args.json.
+            before, scope = snapshot_before(args.cwd, scope_args)
 
-    # Jobs queued before --ignore existed have no ignore in args.json.
-    def changes():
-        return files_changed(args.cwd, before, event_changes, scope, getattr(args, "ignore", None)) \
-            if args.sandbox != "read-only" else {}
+        # Jobs queued before --ignore existed have no ignore in args.json.
+        def changes():
+            return files_changed(args.cwd, before, event_changes, scope, getattr(args, "ignore", None)) \
+                if args.sandbox != "read-only" else {}
 
-    # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
-    resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
-    thread_id = args.resume
-    attempt = 0
-    while True:
-        attempt += 1
-        if not router_reachable():
-            state = {"end_reason": "router_down", "error": "Local model router is not reachable", "thread_id": thread_id}
-            kind, retryable = "router_down", True
-        else:
-            resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
-            state = run_attempt(args, prompt, run_dir, thread_id)
-            thread_id = state["thread_id"]
-            event_changes += state["file_changes"]
-            if state["completed"] and not state["failed"]:
-                break
-            kind, retryable = classify(state, run_dir)
-        # Read-only runs are ephemeral and safe to restart. A writer that started a thread must resume it.
-        can_retry = retryable and attempt <= args.retries and (args.sandbox == "read-only" or thread_id or kind == "router_down")
-        if not can_retry:
-            return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
-                    "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
-                    **changes()}
-        time.sleep(min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2))
-        if thread_id and args.sandbox != "read-only":
-            prompt = ("The previous attempt was interrupted. Inspect the current state of the workspace, "
-                      "then finish the original task without repeating completed work.")
-        elif args.sandbox == "read-only":
-            thread_id = None
+        # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
+        resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
+        thread_id = args.resume
+        attempt = 0
+        while True:
+            attempt += 1
+            if not router_reachable():
+                state = {"end_reason": "router_down", "error": "Local model router is not reachable", "thread_id": thread_id}
+                kind, retryable = "router_down", True
+            else:
+                resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
+                state = run_attempt(args, prompt, run_dir, thread_id)
+                thread_id = state["thread_id"]
+                event_changes += state["file_changes"]
+                if state["completed"] and not state["failed"]:
+                    break
+                kind, retryable = classify(state, run_dir)
+            # Read-only runs are ephemeral and safe to restart. A writer that started a thread must resume it.
+            can_retry = retryable and attempt <= args.retries and (args.sandbox == "read-only" or thread_id or kind == "router_down")
+            if not can_retry:
+                return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
+                        "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
+                        **changes()}
+            time.sleep(min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2))
+            if thread_id and args.sandbox != "read-only" and kind != "router_down":
+                prompt = ("The previous attempt was interrupted. Inspect the current state of the workspace, "
+                          "then finish the original task without repeating completed work.")
+            elif args.sandbox == "read-only":
+                thread_id = None
 
-    message_file = run_dir / "last_message.txt"
-    final = message_file.read_text("utf-8", "replace").strip() if message_file.exists() else ""
-    final = final or state["last_text"] or ""
-    result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
-              "final_message": final[:8000],
-              "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
-              "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes()}
-    if resumed:
-        result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
-    if args.schema:
-        try:
-            result["structured"] = json.loads(final)
-        except ValueError:
-            result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON",
-                          retryable=False)
-    return result
+        message_file = run_dir / "last_message.txt"
+        final = message_file.read_text("utf-8", "replace").strip() if message_file.exists() else ""
+        final = final or state["last_text"] or ""
+        result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
+                  "final_message": final[:8000],
+                  "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
+                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes()}
+        if resumed:
+            result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
+        if args.schema:
+            try:
+                result["structured"] = json.loads(final)
+            except ValueError:
+                result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON",
+                              retryable=False)
+        return result
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def add_task_arguments(p):
@@ -761,14 +798,18 @@ def main():
         if (job_dir / "result.json").exists() or not pid_file.exists() or not same_boot(job_dir):
             emit(job_status(args.job_id))
             return
-        kill_tree(int(pid_file.read_text()))
-        codex_pid = job_dir / "codex.pid"
-        if codex_pid.exists():
-            # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
-            kill_tree(int(codex_pid.read_text()))
-        # The worker may have published its result after the initial check, before it was killed.
-        if not (job_dir / "result.json").exists():
-            write_result(job_dir, {"status": "cancelled", "retryable": False, "log_dir": str(job_dir)})
+        with acquire_file_lock(job_dir / "process.lock", blocking=True):
+            if (job_dir / "result.json").exists():
+                emit(job_status(args.job_id))
+                return
+            kill_tree(int(pid_file.read_text()))
+            codex_pid = job_dir / "codex.pid"
+            if codex_pid.exists():
+                # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
+                kill_tree(int(codex_pid.read_text()))
+            # The worker may have published its result after the initial check, before it was killed.
+            if not (job_dir / "result.json").exists():
+                write_result(job_dir, {"status": "cancelled", "retryable": False, "log_dir": str(job_dir)})
         emit(job_status(args.job_id))
 
 

@@ -1,4 +1,5 @@
 """Fault-injection tests for codex_runner.py. They use a fake Codex, so they spend no model quota."""
+import errno
 import io
 import json
 import os
@@ -22,7 +23,7 @@ FAKE_CODEX = textwrap.dedent(r"""
     calls = len(list(state.glob("call-*.json")))
     mode = os.environ["FAKE_MODE"]
     if mode == "stall_before_stdin":
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         time.sleep(6)
     prompt = sys.stdin.buffer.read()
@@ -35,6 +36,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         say(type="item.completed", item={"type": "agent_message", "text": "done"})
         say(type="turn.completed", usage={"input_tokens": 1})
 
+    if mode == "fault_logging":
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
+        (state / "child.pid").write_text(str(child.pid))
     say(type="thread.started", thread_id="thread-1")
     say(type="turn.started")
     if mode == "warnings_then_ok":
@@ -45,12 +49,14 @@ FAKE_CODEX = textwrap.dedent(r"""
         sys.exit(1)
     elif mode == "exit0_without_completion":
         sys.exit(0)
+    elif mode == "fault_logging":
+        time.sleep(300)
     elif mode == "hang_with_child":
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         time.sleep(300)
     elif mode == "hang_after_completed":
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         finish()
         time.sleep(300)
@@ -67,7 +73,7 @@ FAKE_CODEX = textwrap.dedent(r"""
         say(type="error", message="Reconnecting... 1/5")
         finish()
     elif mode == "reconnect_forever":
-        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         while True:
             say(type="error", message="Reconnecting... waiting for network")
@@ -75,7 +81,8 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "scoped_write":
         Path("keep/a.txt").write_text("changed by a shell command")
         say(type="item.completed", item={"type": "file_change",
-                                         "changes": [{"path": os.path.join(os.getcwd(), "other.txt"), "kind": "update"}]})
+                                         "changes": [{"path": os.path.join(os.getcwd(), "keep", "a.txt"), "kind": "update"},
+                                                     {"path": os.path.join(os.getcwd(), "other.txt"), "kind": "update"}]})
         finish()
     elif mode == "slow_ok":
         time.sleep(float(os.environ.get("FAKE_SLEEP", "4")))
@@ -90,7 +97,7 @@ def alive(pid):
         except ProcessLookupError:
             return False
         try:
-            return open(f"/proc/{pid}/stat").read().split()[2] != "Z"  # a killed, unreaped child is gone
+            return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"  # a killed, unreaped child is gone
         except OSError:
             return False
     out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"], capture_output=True, text=True, errors="replace").stdout
@@ -106,8 +113,13 @@ class RunnerTests(unittest.TestCase):
         self.state = root / "state"
         self.cwd = root / "work"
         self.cwd.mkdir()
+        (root / "isolated-codex-home").mkdir()
         self.env = dict(os.environ, CODEX_RUNNER_HOME=str(root / "home"), FAKE_STATE=str(self.state),
-                        CODEX_RUNNER_CMD=json.dumps([sys.executable, str(self.fake)]), CODEX_RUNNER_ROUTER_URL="")
+                        CODEX_RUNNER_CMD=json.dumps([sys.executable, "-B", str(self.fake)]), CODEX_RUNNER_ROUTER_URL="",
+                        CODEX_HOME=str(root / "isolated-codex-home"), PYTHONDONTWRITEBYTECODE="1")
+        environment = mock.patch.dict(os.environ, self.env)
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def tearDown(self):
         child = self.state / "child.pid"
@@ -122,7 +134,7 @@ class RunnerTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def invoke(self, *extra, mode="warnings_then_ok", prompt="do it", command="run", env=None):
-        args = [sys.executable, str(RUNNER), command, "--cwd", str(self.cwd), "--backoff", "0.1", *extra]
+        args = [sys.executable, "-B", str(RUNNER), command, "--cwd", str(self.cwd), "--backoff", "0.1", *extra]
         p = subprocess.run(args, input=prompt.encode("utf-8"), capture_output=True, timeout=60,
                            env={**self.env, "FAKE_MODE": mode, **(env or {})})
         return json.loads(p.stdout.decode("utf-8"))
@@ -214,6 +226,185 @@ class RunnerTests(unittest.TestCase):
         for call in (first, second):
             self.assertEqual(call["argv"].count(override), 1)
             self.assertEqual(call["argv"][call["argv"].index(override) - 1], "-c")
+
+    def test_router_recovery_keeps_the_unsent_resume_task(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for sandbox in ("workspace-write", "danger-full-access"):
+            with self.subTest(sandbox=sandbox), mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "warnings_then_ok"}), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
+                    mock.patch.object(codex_runner, "router_reachable", side_effect=[False, True]):
+                parser = codex_runner.Parser()
+                codex_runner.add_task_arguments(parser)
+                args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", sandbox,
+                                          "--resume", "writer-9", "--backoff", "0"])
+                result = codex_runner.execute(args, "NEW TASK: fix the CSV parser", Path(self.tmp.name) / sandbox)
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["attempts"], 2)
+                self.assertEqual(result["usage_scope"], "thread_total")
+                self.assertEqual(self.calls()[-1]["prompt"], "NEW TASK: fix the CSV parser")
+
+    def test_pid_and_event_write_errors_reap_the_process_and_preserve_the_error(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd)])
+        real_open, real_write = open, Path.write_text
+        for operation in ("pid", "write", "flush"):
+            with self.subTest(operation=operation):
+                run_dir = Path(self.tmp.name) / operation
+                run_dir.mkdir()
+                failure = OSError(errno.ENOSPC, "injected " + operation + " failure")
+                spawned = []
+                real_popen = subprocess.Popen
+
+                def spawn(*a, **kw):
+                    proc = real_popen(*a, **kw)
+                    spawned.append(proc)
+                    return proc
+
+                def write_pid(path, *a, **kw):
+                    if operation == "pid" and path == run_dir / "codex.pid":
+                        raise failure
+                    return real_write(path, *a, **kw)
+
+                def open_log(path, *a, **kw):
+                    f = real_open(path, *a, **kw)
+                    if path == run_dir / "events.jsonl" and operation != "pid":
+                        wrapped = mock.MagicMock(wraps=f)
+                        wrapped.__enter__.return_value = wrapped
+                        wrapped.__exit__.side_effect = lambda *exc: f.close()
+                        getattr(wrapped, operation).side_effect = failure
+                        return wrapped
+                    return f
+
+                try:
+                    with mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "fault_logging"}), \
+                            mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
+                            mock.patch.object(Path, "write_text", write_pid), \
+                            mock.patch.object(codex_runner, "open", open_log, create=True):
+                        with self.assertRaises(OSError) as stopped:
+                            codex_runner.run_attempt(args, "do it", run_dir, None)
+                    self.assertIs(stopped.exception, failure)
+                    self.assertIsNotNone(spawned[0].returncode)
+                    self.assertFalse(alive(spawned[0].pid))
+                    self.assertTrue(spawned[0].stdin.closed)
+                    self.assertTrue(spawned[0].stdout.closed)
+                    child_file = self.state / "child.pid"
+                    if child_file.exists():
+                        self.assertFalse(alive(int(child_file.read_text())))
+                finally:
+                    for proc in spawned:
+                        if alive(proc.pid):
+                            codex_runner.kill_tree(proc.pid)
+                        proc.wait(timeout=10)
+
+    def test_cancel_waits_for_pid_publication_before_killing_the_worker(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.tmp.name) / "home"
+        jd = home / "jobs" / "starting"
+        jd.mkdir(parents=True)
+        gate, reached = Path(self.tmp.name) / "release", Path(self.tmp.name) / "publishing"
+        worker_script = Path(self.tmp.name) / "worker.py"
+        worker_script.write_text(textwrap.dedent("""\
+            import importlib.util, sys, time
+            from pathlib import Path
+            spec = importlib.util.spec_from_file_location('runner', sys.argv[1])
+            runner = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(runner)
+            job_dir, work, gate, reached = map(Path, sys.argv[2:])
+            real_write = Path.write_text
+            def delayed_write(path, text, *a, **kw):
+                if path == job_dir / 'codex.pid':
+                    real_write(reached, text)
+                    deadline = time.monotonic() + 10
+                    while not gate.exists() and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    if not gate.exists():
+                        raise RuntimeError('test barrier timed out')
+                return real_write(path, text, *a, **kw)
+            Path.write_text = delayed_write
+            parser = runner.Parser()
+            runner.add_task_arguments(parser)
+            args = parser.parse_args(['--cwd', str(work), '--sandbox', 'danger-full-access'])
+            runner.execute(args, 'do it', job_dir)
+            """), "utf-8")
+        worker = subprocess.Popen([sys.executable, "-B", str(worker_script), str(RUNNER), str(jd),
+                                   str(self.cwd), str(gate), str(reached)],
+                                  env={**self.env, "FAKE_MODE": "hang_with_child"},
+                                  start_new_session=os.name != "nt", creationflags=codex_runner.NO_WINDOW,
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        (jd / "worker.pid").write_text(str(worker.pid))
+        cancel = None
+        child = None
+        try:
+            deadline = time.monotonic() + 5
+            while not reached.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+            self.assertTrue(reached.exists())
+            child = int(reached.read_text())
+            cancel = subprocess.Popen([sys.executable, "-B", str(RUNNER), "cancel", "starting"],
+                                      env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(.2)
+            self.assertIsNone(cancel.poll(), "cancel must wait for the startup lock")
+            self.assertTrue(alive(worker.pid))
+            gate.write_text("go")
+            stdout, stderr = cancel.communicate(timeout=20)
+            self.assertEqual(cancel.returncode, 0, stderr.decode())
+            self.assertEqual(json.loads(stdout)["status"], "cancelled")
+            worker.wait(timeout=10)
+            self.assertFalse(alive(child))
+        finally:
+            gate.touch()
+            for proc in (cancel, worker):
+                if proc is not None:
+                    if alive(proc.pid):
+                        if proc is worker:
+                            codex_runner.kill_tree(proc.pid)
+                        else:
+                            proc.kill()
+                    proc.wait(timeout=10)
+                    for pipe in (proc.stdout, proc.stderr):
+                        if pipe is not None:
+                            pipe.close()
+            if child is not None:
+                codex_runner.kill_tree(child)
+
+    def test_symlink_cwd_reports_one_change_for_relative_and_absolute_scopes(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        alias = Path(self.tmp.name) / "alias"
+        try:
+            alias.symlink_to(self.cwd, target_is_directory=True)
+        except OSError as e:
+            if os.name == "nt":
+                self.skipTest(f"directory symlink is unavailable: {e}")
+            raise
+        (self.cwd / "keep").mkdir()
+        target = self.cwd / "keep" / "a.txt"
+        home = Path(self.tmp.name) / "home"
+        with mock.patch.object(codex_runner, "HOME", home):
+            codex_runner.remember_too_big(str(self.cwd))
+            codex_runner.remember_too_big(str(alias))
+        for scope in ("keep", str(alias / "keep"), str(self.cwd / "keep"),
+                      "keep/a.txt", str(alias / "keep" / "a.txt"), str(target)):
+            with self.subTest(scope=scope):
+                target.unlink(missing_ok=True)
+                result = self.invoke("--cwd", str(alias), "--sandbox", "danger-full-access", "--scope", scope,
+                                     mode="scoped_write")
+                self.assertEqual(result["status"], "completed")
+                self.assertEqual(result["cwd"], os.path.realpath(self.cwd))
+                self.assertEqual(result["scope_paths"], [os.path.realpath(codex_runner.scope_path(str(alias), scope))])
+                expected = [{"path": "keep/a.txt", "change": "added"},
+                            {"path": "other.txt", "change": "update"}]
+                self.assertEqual(result["files_changed"], expected)
+                self.assertEqual(result["files_changed_total"], 2)
 
     def test_writable_roots_round_trip_through_run_and_start(self):
         roots = [r"E:\task data\密钥", "E:/task-output", str(self.cwd / "extra")]
@@ -310,7 +501,7 @@ class RunnerTests(unittest.TestCase):
             self.assertNotIn("--ephemeral", call["argv"])
 
     def test_second_writer_in_same_directory_is_rejected(self):
-        args = [sys.executable, str(RUNNER), "run", "--cwd", str(self.cwd), "--sandbox", "workspace-write"]
+        args = [sys.executable, "-B", str(RUNNER), "run", "--cwd", str(self.cwd), "--sandbox", "workspace-write"]
         first = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env={**self.env, "FAKE_MODE": "slow_ok"})
         first.stdin.write(b"one")
         first.stdin.close()
@@ -320,6 +511,7 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(r["retryable"])
         self.assertEqual(json.loads(first.stdout.read().decode("utf-8"))["status"], "completed")
         first.wait()
+        first.stdout.close()
 
     def test_writer_lock_serializes_windows_path_case_aliases(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -422,7 +614,7 @@ class RunnerTests(unittest.TestCase):
         proc.stdout.close.assert_not_called()
 
     def control(self, *args):
-        p = subprocess.run([sys.executable, str(RUNNER), *args], capture_output=True, timeout=60, env=self.env)
+        p = subprocess.run([sys.executable, "-B", str(RUNNER), *args], capture_output=True, timeout=60, env=self.env)
         return json.loads(p.stdout.decode("utf-8"))
 
     def test_start_outlives_the_caller_and_status_returns_the_result(self):
