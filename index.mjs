@@ -1146,7 +1146,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
     description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准和 write：' +
-      '要改文件、做修复或建备份传 write=true，只读调查传 false；scope 限定允许改动的路径。' +
+      '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
       '不通过就带 resume=thread_id 派回修正。汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
@@ -1162,7 +1162,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         acceptance: { type: 'array', items: { type: 'string' }, description: '验收标准，1–20 条，每条写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
         write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（使用沙箱时为 workspace-write）；' +
           'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
-          `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。要改文件、做修复或建备份就传 true。` },
+          `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。测试/部署若会生成或删除文件、改变远端状态，也属于写入；须按用户授权设置 true 并在 scope/task 写明目标，不能同时要求这些操作和禁止任何写入。` },
         ...(cfg.allowHostAccess === true ? { host_access: { type: 'boolean', default: cfg.defaultHostAccess === true,
           description: 'true 时 Codex 在沙箱外运行（danger-full-access），' +
           '可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令）、连接 Hyper-V 虚拟机；write 仍决定能否改动（文件、虚拟机、网络和系统状态）：' +
