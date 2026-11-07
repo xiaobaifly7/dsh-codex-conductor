@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
-  outOfScope, nextStep, withReport, turnSummary, runnerArgv, PS_SYNTAX } from './index.mjs';
+  outOfScope, nextStep, withReport, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
 process.env.LOCALAPPDATA = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
@@ -152,6 +152,53 @@ test('multiple sed print expressions and read-only git forms pass without enabli
     'git remote add other example.com', 'git remote -v add other example.com',
     'git tag new-tag', 'git tag -l -d old-tag', 'git stash drop', 'git stash list --output=out',
   ]) assert.equal(readOnlyCommand(c), false, c);
+});
+
+test('arithmetic comparisons in [ ] / [[ ]] / test need literal-integer operands, so a planted value is never evaluated', () => {
+  for (const c of [
+    // 操作数的运行时值会被算术求值；$(cat f)、read 进来的 $v、循环变量 $f 都可能夹带 $(...)
+    '[[ $(cat f.txt) -eq 0 ]]', 'read -r v < f.txt; [[ $v -eq 0 ]]', 'for f in *; do [[ $f -eq 1 ]]; done',
+    'test $(cat f) -eq 1', '[ $(grep -c x f) -gt 0 ]', '[[ $x -ne 5 ]]', '[ "$n" -le 10 ]',
+    'if [[ $(cat f) -eq 0 ]]; then echo x; fi', '[[ ${arr[0]} -eq 0 ]]',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of [
+    // 字面整数、恒为整数的 $?/$#，以及不触发算术求值的文件测试和字符串比较照常放行
+    '[[ 1 -eq 1 ]]', '[ 3 -gt 2 ]', 'test 0 -eq 0', '[ -5 -lt 0 ]', '[ $? -eq 0 ]', '[[ $# -gt 0 ]]',
+    'pytest -q && [ $? -eq 0 ]', '[ -f foo ]', '[[ -n "$x" ]]', '[ "$a" = "$b" ]', '[[ "$x" == pat* ]]',
+    'test -d src', 'if [ -e a.txt ]; then cat a.txt; fi',
+  ]) assert.equal(readOnlyCommand(c), true, c);
+});
+
+test('${...} arithmetic positions (array subscript, substring offset, indirect) cannot evaluate planted values', () => {
+  for (const c of [
+    // 下标被当算术表达式求值：变量名、$变量、折叠后的 $X（来自 $(cat f)）都可能夹带 $(...)
+    'echo "${a[$y]}"', 'echo "${a[y]}"', 'cat "${a[$(cat f)]}"', 'read -r y < f; echo "${a[$y]}"',
+    'echo "${z:$y}"', 'echo "${z:0:$y}"', 'echo "${!y}"', 'ls "${arr[$i]}"',
+    'echo "${a[${b}]}"', 'v=${a[$y]}', 'for k in "${a[$y]}"; do echo "$k"; done',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of [
+    // 普通展开、默认值、长度、删减、替换、大小写、字面整数下标/偏移、整组 @ / * 照常放行
+    'echo "${x}"', 'cat "${f}"', 'grep "${pat}" file', 'echo "${x:-default}" "${y:=d}" "${z:?msg}" "${w:+v}"',
+    'echo "${#arr[@]}" "${#s}"', 'printf "%s\\n" "${arr[@]}" "${arr[*]}" "${arr[0]}"', 'echo "${sha:0:8}"',
+    'echo "${p##*/}" "${p%/*}" "${name/foo/bar}" "${u^^}"', 'echo "${1}" "${@}" "${*}"', 'echo "${v: -3}"',
+  ]) assert.equal(readOnlyCommand(c), true, c);
+});
+
+test('the ${var@P} transform and -v array-subscript operands cannot smuggle command substitution past the guard', () => {
+  for (const c of [
+    // @P 对变量值做提示符展开并执行其中的 $(...)；其余 @ 变换一并 err-closed
+    'echo "${x@P}"', 'read -r v < report.txt; echo "${v@P}"', 'printf "%s" "${x@P}"', 'echo "${x@A}"', 'echo "${x@a}"',
+    // -v / test 的 name[下标] 操作数会算术求值；单引号挡不住
+    "[[ -v 'a[$(touch X)]' ]]", "[ -v 'a[$(touch X)]' ]", "test -v 'a[$(touch X)]'", "[[ -v 'a[$y]' ]]", "[[ -R 'a[$(id)]' ]]",
+    // read 把输入赋给 name[下标] 目标，同样算术求值下标
+    "read 'a[$(touch X)]'", "read -r 'a[$(touch X)]' < f", "read 'a[$y]'", "echo x | read 'arr[$(id)]'",
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of [
+    // 整组/位置参数、字面整数下标、普通 -v 变量名、字面下标文件测试照常放行
+    'echo "${@}" "${*}" "${arr[@]}"', '[[ -v arr[0] ]]', '[[ -v name ]]', '[ -v PATH ]', "[ -f 'a[0]' ]", '[[ -n "${x}" ]]',
+    // 普通 read；=~ 正则、== 通配、文件测试里的字符类 name[..] 不做算术求值，照常放行（真有 $(...) 由 splitCommand 拦）
+    'read -r line', 'read -r a b c', "read 'a[0]'", '[[ $x =~ foo[0-9] ]]', '[[ $f == backup[0-9] ]]', '[ -f a[0-9] ]', '[[ "$line" == "cfg[key]" ]]',
+  ]) assert.equal(readOnlyCommand(c), true, c);
 });
 
 test('an invalid allowCommands pattern leaves the tools and guard installed', () => {
@@ -662,7 +709,8 @@ test('background job maps cancel, failure and lost monitoring', async () => {
   assert.match(failed.result, /^failed · timeout · 30 s {2}job_id: J2\n/);
 
   await tools.codex_run.execute(RUN, exec);
-  await answer('J3', { status: 'failed', error_kind: 'bridge_error', error: 'wsl gone' });
+  // status 是只读的：连续 3 次 bridge_error 才放弃（电脑睡眠唤醒、发行版重启瞬间的一两次不算）
+  for (let i = 0; i < 3; i++) await answer('J3', { status: 'failed', error_kind: 'bridge_error', error: 'wsl gone' });
   const lost = await jobs.started[2].done;
   assert.equal(lost.status, 'failed');
   assert.match(lost.result, /monitor_failed[\s\S]*wsl gone[\s\S]*可能仍在运行/);
@@ -794,7 +842,7 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   // 后台监控自己出错时存的只是提示，不原样交回：改查 runner，仍在运行就重新登记
   await tools.codex_run.execute(RUN, exec);
   const relost = tools.codex_status.execute({ job_id: 'J4', wait_seconds: 600 }, exec);
-  await answer('J4', { status: 'failed', error_kind: 'bridge_error', error: 'wsl gone' });
+  for (let i = 0; i < 3; i++) await answer('J4', { status: 'failed', error_kind: 'bridge_error', error: 'wsl gone' });
   const back = await relost;
   assert.equal(back.status, 'running');
   assert.equal(back.background_job_id, 'bg5');
@@ -1071,4 +1119,152 @@ test('a report that breaks the schema still renders, and clipping never leaves h
   const text = render({ criteria: [{ criterion: 'c', status: 'met', evidence: `${'a'.repeat(799)}😀尾巴` }] });
   assert.match(text, /—— a{799}…（已截断，全文见 \/j\/last_message\.txt）/);
   assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(text));
+});
+
+test('runProcess returns the last JSON line, passes stdin, and turns a hung or missing command into a bridge error', async () => {
+  assert.deepEqual(await runProcess(process.execPath, ['-e', 'console.log("noise"); console.log(JSON.stringify({ status: "running", job_id: "J" }))']),
+    { status: 'running', job_id: 'J' });
+  assert.deepEqual(await runProcess(process.execPath, ['-e', 'process.stdin.pipe(process.stdout)'], { stdin: '{"echo":1}' }), { echo: 1 });
+  const started = Date.now();
+  const hung = await runProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { timeoutMs: 1000 });
+  assert.equal(hung.error_kind, 'bridge_error');
+  assert.match(hung.error, /超过 1 秒没有返回/);
+  assert.ok(Date.now() - started < 10_000);
+  assert.equal((await runProcess('dsh-conductor-no-such-command', [])).error_kind, 'bridge_error');
+});
+
+test('every runner call has an upper bound: status gets its wait plus slack, start and cancel 120 s', async () => {
+  const seen = [];
+  const run = (_cfg, argv, opts) => {
+    seen.push([argv[0], opts?.timeoutMs]);
+    if (argv[0] === 'status' && opts?.signal) {
+      return new Promise((r) => opts.signal.addEventListener('abort', () => r({ status: 'failed', error_kind: 'bridge_error' })));
+    }
+    return Promise.resolve({ job_id: 'J', status: 'running' });
+  };
+  const c = createConductor({}, run);
+  await c.start({ ...RUN, write: true }, 'F:\\proj');
+  await c.waitJob('J', 30);
+  await c.cancel('J');
+  const ac = new AbortController();
+  const pending = c.waitJob('J', 600, ac.signal);
+  ac.abort();
+  await assert.rejects(pending);
+  assert.deepEqual(seen, [['start', 120000], ['status', 90000], ['cancel', 120000], ['status', 660000], ['cancel', 120000]]);
+});
+
+test('a bridge error on a known job says to query it before sending the task again', () => {
+  assert.match(nextStep({ job_id: 'J7', status: 'failed', error_kind: 'bridge_error', retryable: true }),
+    /J7 可能仍在运行[^\n]*codex_status[^\n]*不要直接重派/);
+  // 启动时就出错（还没有 job_id）照旧按可重试处理
+  assert.match(nextStep({ status: 'failed', error_kind: 'bridge_error', retryable: true }), /这次失败可重试/);
+});
+
+test('codex_cancel on a finished job returns its report and next step; a failed cancel says to query first', async () => {
+  const structured = { summary: 's', criteria: [{ criterion: 'A', status: 'met', evidence: 'e' }], files_changed: [], deviations: [], unresolved: [] };
+  const { tools } = harness({ config: { cancelResult: { job_id: 'J', status: 'completed', thread_id: 'T', sandbox: 'workspace-write', structured } } });
+  const value = await tools.codex_cancel.execute({ job_id: 'J' }, {});
+  assert.equal(value.report, structured);
+  assert.equal(value.structured, undefined);
+  assert.match(value.next, /逐条核验/);
+  assert.match(tools.codex_cancel.output.render({}, value)[0].text, /逐条汇报[\s\S]*✓ 1\. A —— e/);
+  const failed = harness({ config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'x', retryable: true } } });
+  assert.match((await failed.tools.codex_cancel.execute({ job_id: 'J2' }, {})).next, /J2 可能仍在运行/);
+});
+
+test('a single transient bridge_error does not end background monitoring; the next poll settles the job', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer } = harness({ jobs });
+  await tools.codex_run.execute(RUN, { agent: agentAt('F:\work\项目') });
+  await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'blip' });
+  await answer('J1', { status: 'completed', duration_s: 5 });
+  const done = await jobs.started[0].done;
+  assert.equal(done.status, 'completed');
+  assert.doesNotMatch(done.result, /monitor_failed/);
+});
+
+test('runProcess times out by 1 s ticks (host-sleep safe) and never overflows setTimeout; it forwards env and aborts', async () => {
+  // 真正超时：1 秒刻度，很快到点
+  const started = Date.now();
+  const hung = await runProcess(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { timeoutMs: 1500 });
+  assert.equal(hung.error_kind, 'bridge_error');
+  assert.ok(Date.now() - started < 8000, `${Date.now() - started}`);
+  // 超大 timeoutMs 不会被 Node 夹成 1ms 立刻触发：子进程 1.2 秒就正常返回
+  const ok = await runProcess(process.execPath, ['-e', 'setTimeout(() => console.log(JSON.stringify({ ok: 1 })), 1200)'], { timeoutMs: 2 ** 31 + 10 ** 7 });
+  assert.deepEqual(ok, { ok: 1 });
+  // env 真的传进去（用独特变量名，避免继承环境里的 WSL_UTF8 混淆）
+  assert.deepEqual(await runProcess(process.execPath, ['-e', 'console.log(JSON.stringify({ v: process.env.DSH_CONDUCTOR_PROBE ?? null }))'],
+    { env: { ...process.env, DSH_CONDUCTOR_PROBE: 'x' } }), { v: 'x' });
+  // 中止：一个 8 秒的子进程被 200ms 后的 abort 结束，远早于自然退出
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 200);
+  const t0 = Date.now();
+  const aborted = await runProcess(process.execPath, ['-e', 'setTimeout(() => {}, 8000)'], { signal: ac.signal });
+  assert.equal(aborted.error_kind, 'bridge_error');
+  assert.ok(Date.now() - t0 < 5000, `${Date.now() - t0}`);
+});
+
+test('runRunner forwards argv, stdin, signal, timeoutMs and WSL_UTF8 to the executor (not only to the fake run)', () => {
+  let seen;
+  const ac = new AbortController();
+  runRunner({ distro: '', python: 'python3', runner: '/r.py', codexHome: '', codexBin: '', runnerHome: '' },
+    ['start', '--cwd', 'F:\p'], { stdin: 'P', signal: ac.signal, timeoutMs: 5 }, (...a) => { seen = a; return { status: 'running' }; });
+  assert.equal(seen[0], 'wsl.exe');
+  assert.deepEqual(seen[1], ['-e', 'env', 'python3', '/r.py', 'start', '--cwd', 'F:\p']);
+  assert.equal(seen[2].stdin, 'P');
+  assert.equal(seen[2].signal, ac.signal);
+  assert.equal(seen[2].timeoutMs, 5);
+  assert.equal(seen[2].env.WSL_UTF8, '1');
+});
+
+test('codex_status validates wait_seconds and waitJob clamps it so the timeout cannot overflow', async () => {
+  const { tools } = harness({ jobs: fakeJobs() });
+  await assert.rejects(tools.codex_status.execute({ job_id: 'J', wait_seconds: -1 }, {}), /wait_seconds/);
+  await assert.rejects(tools.codex_status.execute({ job_id: 'J', wait_seconds: 1.5 }, {}), /wait_seconds/);
+  let seenMs;
+  const c = createConductor({}, (_cfg, argv, opts) => { seenMs = opts?.timeoutMs; return Promise.resolve({ status: 'running' }); });
+  await c.waitJob('J', 3_000_000);
+  assert.equal(seenMs, 86_400 * 1000 + 60_000);
+  assert.ok(seenMs < 2 ** 31 - 1);
+});
+
+test('codex_cancel on a job that had already ended does not tell the agent to send it again', async () => {
+  const ended = (error_kind) => harness({ config: { cancelResult: { job_id: 'J', status: 'failed', error_kind, retryable: true,
+    sandbox: 'workspace-write', thread_id: 'T', error: 'e' } } });
+  for (const kind of ['worker_died', 'idle_timeout']) {
+    const next = (await ended(kind).tools.codex_cancel.execute({ job_id: 'J' }, {})).next;
+    assert.match(next, new RegExp(`在取消前已经结束（${kind}）`), kind);
+    assert.doesNotMatch(next, /再派一次|resume=/, kind);
+  }
+  // 取消没赶上、任务已完成：提示先告知用户，再接完成后的核验下一步
+  const doneCfg = { cancelResult: { job_id: 'J', status: 'completed', thread_id: 'T', sandbox: 'workspace-write',
+    structured: { summary: 's', criteria: [{ criterion: 'A', status: 'met', evidence: 'e' }], files_changed: [], deviations: [], unresolved: [] } } };
+  const completed = await harness({ config: doneCfg }).tools.codex_cancel.execute({ job_id: 'J' }, {});
+  assert.match(completed.next, /取消没有生效：任务在取消前已经完成[\s\S]*逐条核验/);
+  // 正常取消：警告可写任务可能改了一半
+  const cancelled = await harness({ config: { cancelResult: { job_id: 'J', status: 'cancelled', retryable: false } } }).tools.codex_cancel.execute({ job_id: 'J' }, {});
+  assert.match(cancelled.next, /已按本次调用取消[\s\S]*git status/);
+});
+
+test('a dead writer is told its edits may be partial and unlisted; a read-only dead job is not', () => {
+  const dead = (sandbox) => ({ status: 'failed', error_kind: 'worker_died', retryable: true, sandbox, thread_id: sandbox === 'read-only' ? null : 'T' });
+  assert.match(nextStep(dead('workspace-write')), /可能已改了部分文件且没有改动清单/);
+  assert.match(nextStep(dead('danger-full-access')), /可能已改了部分文件且没有改动清单/);
+  assert.doesNotMatch(nextStep(dead('read-only')), /可能已改了部分文件/);
+});
+
+test('a running poll resets the consecutive bridge_error count, so blips spread across activity do not end monitoring', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer } = harness({ jobs });
+  await tools.codex_run.execute(RUN, { agent: agentAt('F:\work\项目') });
+  // 两次 bridge_error 后来一次 running（计数清零），再两次 bridge_error：从没有连续 3 次，任务照常完成
+  await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'blip' });
+  await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'blip' });
+  await answer('J1', { status: 'running', seconds_since_last_event: 1, last_activity: 'ran: pytest' });
+  await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'blip' });
+  await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'blip' });
+  await answer('J1', { status: 'completed', duration_s: 5 });
+  const done = await jobs.started[0].done;
+  assert.equal(done.status, 'completed');
+  assert.doesNotMatch(done.result, /monitor_failed/);
 });

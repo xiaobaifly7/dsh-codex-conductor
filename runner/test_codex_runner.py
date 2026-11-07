@@ -658,6 +658,88 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(codex_runner, "pid_alive", worker_exits_after_writing_result):
             self.assertEqual(codex_runner.job_status("raced")["status"], "completed")
 
+    def old_job(self, args):
+        """A job whose worker pid is alive but was recorded in an earlier boot (WSL restarted since)."""
+        job_dir = Path(self.tmp.name) / "home" / "jobs" / f"old-{len(list(Path(self.tmp.name).glob('home/jobs/*')))}"
+        job_dir.mkdir(parents=True)
+        (job_dir / "args.json").write_text(json.dumps(args))
+        (job_dir / "events.jsonl").write_text("not json\n" + json.dumps({"type": "thread.started", "thread_id": "T-old"}) + "\n")
+        (job_dir / "worker.pid").write_text(str(os.getpid()))
+        (job_dir / "boot_id").write_text("an-earlier-boot")
+        return job_dir
+
+    def test_a_worker_from_before_a_restart_is_dead_keeps_its_thread_and_cancel_kills_nothing(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            job_dir = self.old_job({"sandbox": "workspace-write", "resume": None})
+            status = codex_runner.job_status(job_dir.name)
+            self.assertEqual((status["status"], status["error_kind"], status["retryable"], status["thread_id"], status["sandbox"]),
+                             ("failed", "worker_died", True, "T-old", "workspace-write"))
+            with mock.patch.object(sys, "argv", [str(RUNNER), "cancel", job_dir.name]), \
+                    mock.patch.object(codex_runner, "kill_tree") as kill, \
+                    mock.patch.object(codex_runner, "emit") as emit:
+                codex_runner.main()
+            kill.assert_not_called()
+            self.assertEqual(emit.call_args.args[0]["error_kind"], "worker_died")
+            self.assertFalse((job_dir / "result.json").exists())
+            # Jobs started before boot ids were recorded keep the plain pid check.
+            (job_dir / "boot_id").unlink()
+            self.assertEqual(codex_runner.job_status(job_dir.name)["status"], "running")
+
+    def test_a_dead_read_only_worker_offers_only_the_writer_thread_it_resumed(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        cases = (
+            ({"sandbox": "read-only"}, None),                       # read-only: --ephemeral, own thread cannot resume
+            ({"sandbox": "read-only", "resume": "W"}, "W"),         # resumed a writer thread -> still resumable
+            ({"sandbox": "workspace-write"}, "T-old"),              # writer: thread.started from events
+            ({"sandbox": "danger-full-access"}, "T-old"),          # host_access writer keeps its thread too
+        )
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            for args, expected in cases:
+                with self.subTest(args=args):
+                    status = codex_runner.job_status(self.old_job(args).name)
+                    self.assertEqual((status["error_kind"], status["thread_id"]), ("worker_died", expected))
+            # Writer that died before Codex printed thread.started (during the lock/snapshot/backoff): fall back to --resume.
+            jd = self.old_job({"sandbox": "workspace-write", "resume": "W"})
+            (jd / "events.jsonl").unlink()
+            s = codex_runner.job_status(jd.name)
+            self.assertEqual((s["error_kind"], s["thread_id"]), ("worker_died", "W"))
+
+    @unittest.skipIf(os.name == "nt", "boot ids come from Linux /proc")
+    def test_start_records_the_boot_id(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        job = self.invoke(command="start", mode="slow_ok", env={"FAKE_SLEEP": "1"})
+        job_dir = Path(self.tmp.name) / "home" / "jobs" / job["job_id"]
+        self.assertEqual((job_dir / "boot_id").read_text(), codex_runner.boot_id())
+        self.assertEqual(self.control("status", job["job_id"], "--wait", "30")["status"], "completed")
+
+    def test_start_prunes_only_long_finished_job_and_run_dirs(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            old_job = codex_runner.HOME / "jobs" / "old"
+            fresh_job = codex_runner.HOME / "jobs" / "fresh"
+            old_run = codex_runner.HOME / "runs" / "old"
+            for d in (old_job, fresh_job, old_run):
+                d.mkdir(parents=True)
+                (d / "result.json").write_text("{}")
+            stale = time.time() - codex_runner.PRUNE_TTL - 86400
+            for d in (old_job, old_run):
+                os.utime(d, (stale, stale))
+            codex_runner.prune_old("jobs")
+            codex_runner.prune_old("runs")
+            self.assertFalse(old_job.exists())
+            self.assertFalse(old_run.exists())
+            self.assertTrue(fresh_job.exists())
+            codex_runner.prune_old("missing")  # absent subdir is a no-op, not an error
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
