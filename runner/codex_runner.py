@@ -147,7 +147,7 @@ def acquire_write_lock(cwd):
     """Hold a per-directory lock so a retry can never overlap another writer. The OS frees it if we die."""
     locks = HOME / "locks"
     locks.mkdir(parents=True, exist_ok=True)
-    path = os.path.normcase(os.path.abspath(local_path(cwd)))
+    path = os.path.normcase(os.path.realpath(local_path(cwd)))
     if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path):
         path = path.lower()  # Windows-backed paths ignore case, unlike native Linux paths.
     key = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
@@ -234,35 +234,49 @@ def run_attempt(args, prompt, run_dir, thread_id):
             state["error"] = str(e)
             return state
         (run_dir / "codex.pid").write_text(str(proc.pid))
-        # Closing stdin gives Codex its EOF, and the prompt skips cmd quoting and command-line limits.
-        try:
-            proc.stdin.write(prompt.encode("utf-8"))
-            proc.stdin.close()
-        except OSError as e:
-            kill_tree(proc.pid)
-            proc.wait()
+        stdin_done = threading.Event()
+        stdin_errors = []
+
+        def send_prompt():
+            # A child that stops reading must not block the timeout monitor.
             try:
+                proc.stdin.write(prompt.encode("utf-8"))
                 proc.stdin.close()
-            except OSError:
-                pass  # Closing can flush the same broken pipe again.
-            proc.stdout.close()
-            state["end_reason"] = "spawn_failed"
-            state["error"] = str(e)
-            return state
+            except OSError as e:
+                stdin_errors.append(e)
+                try:
+                    proc.stdin.close()
+                except OSError:
+                    pass  # Closing can flush the same broken pipe again.
+            finally:
+                stdin_done.set()
 
         lines = queue.Queue()
 
         def pump():
-            for raw in proc.stdout:
-                lines.put(raw)
-            lines.put(None)
+            try:
+                for raw in proc.stdout:
+                    lines.put(raw)
+            finally:
+                proc.stdout.close()
+                lines.put(None)
 
-        threading.Thread(target=pump, daemon=True).start()
+        reader = threading.Thread(target=pump, daemon=True)
+        reader.start()
+        writer = threading.Thread(target=send_prompt, daemon=True)
+        writer.start()
         last_event = time.time()
         reconnecting_since = None
         completed_at = None
+        stdout_done = False
         while True:
             now = time.time()
+            if stdin_errors:
+                state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
+                kill_tree(proc.pid)
+                break
+            if stdout_done and stdin_done.is_set():
+                break
             if completed_at and now - completed_at > args.exit_grace:
                 state["forced_exit"] = True
                 kill_tree(proc.pid)
@@ -285,7 +299,8 @@ def run_attempt(args, prompt, run_dir, thread_id):
             except queue.Empty:
                 continue
             if raw is None:
-                break
+                stdout_done = True
+                continue
             event_log.write(raw)
             event_log.flush()
             try:
@@ -322,6 +337,8 @@ def run_attempt(args, prompt, run_dir, thread_id):
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             kill_tree(proc.pid)
+        writer.join(timeout=1)
+        reader.join(timeout=1)
     return state
 
 
@@ -356,7 +373,7 @@ TOO_BIG_TTL = 7 * 86400
 
 
 def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
-    """Map path relative to root -> (size, mtime_ns) under root, or only under the scope files/directories;
+    """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
     None when the walk exceeds the budget."""
     deadline = time.time() + budget
     files = {}
@@ -366,9 +383,11 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
             st = os.stat(path, follow_symlinks=False)
         except OSError:
             return
-        files[os.path.relpath(path, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns)
+        files[os.path.relpath(path, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns, st.st_mode)
 
     for top in scope or [root]:
+        if time.time() > deadline:
+            return None
         if not os.path.isdir(top):
             add(top)  # a scoped file, or one that does not exist yet
             continue
@@ -377,8 +396,10 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
                 return None
             dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
             for name in filenames:
+                if time.time() > deadline:
+                    return None
                 add(os.path.join(dirpath, name))
-    return files
+    return files if time.time() <= deadline else None
 
 
 def too_big_trees():
@@ -523,7 +544,7 @@ def execute(args, prompt, run_dir):
               "final_message": final[:8000],
               "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
               "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes()}
-    if args.resume and resumed:
+    if resumed:
         result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
     if args.schema:
         try:

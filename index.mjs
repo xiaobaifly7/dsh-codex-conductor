@@ -134,7 +134,9 @@ export function normPath(p) {
   let s = p.trim().replace(/\\/g, '/');
   const m = /^\/mnt\/([a-z])(\/.*)?$/i.exec(s);
   if (m) s = `${m[1]}:${m[2] ?? '/'}`;
-  return path.posix.normalize(s).replace(/\/+$/, '').toLowerCase();
+  const windows = /^[A-Za-z]:/.test(s) || s.startsWith('//');
+  s = path.posix.normalize(s).replace(/\/+$/, '');
+  return windows ? s.toLowerCase() : s;
 }
 
 const under = (p, r) => p === r || p.startsWith(`${r}/`);
@@ -162,14 +164,34 @@ function closingParen(s, start) {
 
 // 按未加引号的 && || | ; & 和换行切段，段内按空白切词并去掉引号。$(...) 交给 inner 判定，通过后当作一个普通词。
 // 返回 null 表示出现了不放行的结构：反引号、未通过的命令替换、进程替换、heredoc、写到 /dev/null 以外的重定向。
-export function splitCommand(command, inner = () => false) {
+export function splitCommand(command, inner = () => false, braceSegments = new Set()) {
   const segments = [];
   let words = [];
   let word = '';
   let started = false;
   let quote = null;
-  const endWord = () => { if (started) words.push(word); word = ''; started = false; };
-  const endSegment = () => { endWord(); if (words.length) segments.push(words); words = []; };
+  let redirect = null;
+  let valid = true;
+  let syntax = '';
+  let expanded = false;
+  const endWord = () => {
+    if (started) {
+      if (redirect) {
+        if ((redirect !== '<' && word !== '/dev/null') || !braceExpansionsSafe(word)) valid = false;
+        redirect = null;
+      } else {
+        words.push(word);
+        expanded ||= /\{(?:[^{}]*,[^{}]*|(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?)\}/.test(syntax);
+      }
+    }
+    word = ''; started = false; syntax = '';
+  };
+  const endSegment = () => {
+    endWord();
+    if (redirect) valid = false;
+    if (words.length) { if (expanded) braceSegments.add(words); segments.push(words); }
+    words = []; expanded = false;
+  };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     const next = command[i + 1];
@@ -200,16 +222,15 @@ export function splitCommand(command, inner = () => false) {
     }
     if (ch === ' ' || ch === '\t') { endWord(); continue; }
     if (ch === '>' || ch === '<' || (ch === '&' && next === '>')) {
-      if (/^\d+$/.test(word)) { word = ''; started = false; } else endWord();
+      if (!redirect && /^\d+$/.test(word)) { word = ''; started = false; syntax = ''; } else endWord();
+      if (redirect) return null;
       let j = ch === '&' ? i + 2 : i + 1;
       if (ch === '<' && (command[j] === '<' || command[j] === '(')) return null;
       if (ch === '>' && command[j] === '(') return null;
       if (ch === '>' && command[j] === '>') j++;
       if (ch === '>' && command[j] === '&' && /\d/.test(command[j + 1] ?? '')) { i = j + 1; continue; }
-      while (command[j] === ' ' || command[j] === '\t') j++;
-      let target = '';
-      while (j < command.length && !/[\s;&|<>]/.test(command[j])) target += command[j++];
-      if (!target || (ch !== '<' && target !== '/dev/null')) return null;
+      // 重定向目标也走正常分词和命令替换检查，不作为命令参数保留。
+      redirect = ch;
       i = j - 1;
       continue;
     }
@@ -219,11 +240,12 @@ export function splitCommand(command, inner = () => false) {
       continue;
     }
     word += ch;
+    syntax += ch;
     started = true;
   }
   if (quote) return null;
   endSegment();
-  return segments;
+  return valid && !redirect ? segments : null;
 }
 
 function gitAllowed(args) {
@@ -280,9 +302,23 @@ function core(words) {
 const ARITH_OP = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
 // 算术操作数只放行字面整数，以及恒为整数、无法夹带 $( 的 $? / $#；变量、命令替换结果、read 进来的值一律不放行
 const intOperand = (a) => /^-?\d+$/.test(a) || a === '$?' || a === '$#';
-// name[下标] 形式的词：下标会被算术求值（test -v/-R 的操作数、read 的赋值目标），非字面整数（@ / * 除外）一律拒绝。
+// -v/-R 和 read 的目标必须是字面变量名；数组下标会算术求值，只允许整数及 @ / *。
 // 单引号挡不住：bash 在求值时才解析下标里的 $(...)，所以这里按词形判断
-const safeSub = (a) => { const m = /^#?[A-Za-z_][A-Za-z0-9_]*\[(.*)\]$/s.exec(a); return !m || m[1] === '@' || m[1] === '*' || /^-?\d+$/.test(m[1]); };
+const safeSub = (a) => /^[A-Za-z_][A-Za-z0-9_]*(?:\[(?:@|\*|-?\d+)\])?$/.test(a);
+
+function readAllowed(args) {
+  let i = 0;
+  for (; i < args.length && args[i].startsWith('-'); i++) {
+    if (args[i] === '--') { i++; break; }
+    const option = /^-[ersE]*(?:([adinNptu])(.*))?$/.exec(args[i]);
+    if (!option) return false;
+    if (option[1]) {
+      const value = option[2] || args[++i];
+      if (value === undefined || (option[1] === 'a' && !safeSub(value))) return false;
+    }
+  }
+  return args.slice(i).every(safeSub);
+}
 
 // 单个 ${...} 体是否不触发算术求值。放行普通 ${name}、默认值 :-/:=/:?/:+、长度 ${#..}、删减 %/#、
 // 替换 /、大小写 ^/,，以及字面整数下标和 @ / * 整组；数组下标非整数、子串偏移/长度非整数、${!..} 一律拒绝。
@@ -321,7 +357,7 @@ function braceExpansionsSafe(word) {
   return true;
 }
 
-function segmentAllowed(raw, extra) {
+function segmentAllowed(raw, extra, braceExpansion = false) {
   const words = core(raw);
   if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
@@ -339,12 +375,13 @@ function segmentAllowed(raw, extra) {
   const [cmd, ...args] = words;
   // 展开后的词可能变成被过滤的开关，不能把它当成普通文件参数。
   if (/^(git|iconv|find|rg|sort|uniq|tree|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
-      args.some((a) => a.includes('$'))) return false;
+      (braceExpansion || args.some((a) => a.includes('$')))) return false;
   const positional = args.filter((a) => !a.startsWith('-')).length;
   switch (cmd) {
     case 'git': return gitAllowed(args);
     case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && args.slice(1).every((a) => !a.startsWith('-'));
-    case 'iconv': return !args.some((a) => a === '-o' || a.startsWith('--output'));
+    case 'iconv': return !args.some((a) => /^-[cs]*o/.test(a) ||
+      (a.startsWith('--') && a !== '--' && '--output'.startsWith(a.split('=')[0])));
     case 'find': return !args.some((a) => FIND_ACTIONS.has(a));
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
     case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
@@ -367,24 +404,26 @@ function segmentAllowed(raw, extra) {
       return args.every((a, i) => ((args[i - 1] !== '-v' && args[i - 1] !== '-R') || safeSub(a)) &&
         (!ARITH_OP.has(a) || (intOperand(args[i - 1] ?? '') && intOperand(args[i + 1] ?? ''))));
     // read 把输入赋给 name[下标] 目标时会算术求值下标（单引号也挡不住），和 -v 同类
-    case 'read': return args.every(safeSub);
+    case 'read': return readAllowed(args);
     default: return READERS.has(cmd);
   }
 }
 
 export function readOnlyCommand(command, extra = []) {
   if (typeof command !== 'string' || !command.trim()) return false;
-  const segments = splitCommand(command, (sub) => readOnlyCommand(sub, extra));
-  return segments !== null && segments.length > 0 && segments.every((w) => segmentAllowed(w, extra));
+  const braceSegments = new Set();
+  const segments = splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments);
+  return segments !== null && segments.length > 0 && segments.every((w) => segmentAllowed(w, extra, braceSegments.has(w)));
 }
 
 // 拒绝原因：整条命令截断后看不到真正卡住的地方，所以指出不放行的结构或第一段不放行的命令
 function refusedPart(command, extra) {
-  const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra)) : [];
+  const braceSegments = new Set();
+  const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments) : [];
   if (segments === null) {
     return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
   }
-  const bad = segments.find((w) => !segmentAllowed(w, extra));
+  const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w)));
   return bad ? `不放行的是「${core(bad).join(' ').slice(0, 200)}」` : '命令为空';
 }
 
@@ -485,7 +524,7 @@ export function createConductor(cfg, run = runRunner) {
     const wait = Math.min(Math.max(0, seconds), 86_400);
     const value = await run(cfg, ['status', jobId, '--wait', String(wait)], { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS });
     if (signal?.aborted) {
-      await cancel(jobId);
+      await cancel(jobId, signal);
       signal.throwIfAborted();
     }
     const note = value.status === 'running' ? { note: `等了 ${seconds} 秒仍在执行，任务在后台继续；用 codex_status 接着等。` } : {};
@@ -514,8 +553,12 @@ export function createConductor(cfg, run = runRunner) {
     return run(cfg, argv, { stdin: prompt, signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
 
-  function cancel(jobId) {
-    return run(cfg, ['cancel', jobId], { timeoutMs: BRIDGE_TIMEOUT_MS });
+  async function cancel(jobId, signal) {
+    const value = await run(cfg, ['cancel', jobId], { timeoutMs: BRIDGE_TIMEOUT_MS });
+    if (signal?.aborted && value.error_kind === 'bridge_error') {
+      throw new Error(`Codex 任务 ${jobId} 的取消未确认：${value.error ?? '连接 WSL 失败'}。任务可能仍在运行，用 codex_status 查询 ${jobId}，不要重派。`);
+    }
+    return value;
   }
 
   return { start, waitJob, cancel };
@@ -584,7 +627,14 @@ export function withReport(value) {
     const { error_kind: _kind, error: _error, retryable: _retryable, ...done } = rest;
     return { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' };
   }
-  return structured && typeof structured === 'object' ? { ...rest, report: structured } : rest;
+  if (structured === undefined) return rest;
+  const lists = ['criteria', 'files_changed', 'deviations', 'unresolved'];
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured) ||
+      lists.some((key) => structured[key] !== undefined && !Array.isArray(structured[key])) ||
+      (structured.criteria ?? []).some((c) => !c || typeof c !== 'object' || Array.isArray(c))) {
+    return { ...rest, report_note: 'Codex 汇报字段格式不正确，核验时以 final_message 和实际文件为准。' };
+  }
+  return { ...rest, report: structured };
 }
 
 // 受阻条目里提到这些，可能是沙箱里的 Codex 启动不了 Windows 程序
@@ -817,24 +867,21 @@ export function apply(ctx, config = {}, run = runRunner) {
   } catch (error) {
     ctx.logger?.warn?.(`[codex-conductor] 规划要求没能注入系统提示词：${error?.message ?? error}`);
   }
-  // 只记录有后台监控负责清理的任务，轮询回退不能保证跨轮状态仍有效。
-  const activeJobs = new Set();
-
   // 这个 runner 任务仍在进行的 DSH 后台任务。按 DSH 任务表查而不记在插件内存里：
   // 插件热重载后旧的后台任务和它的等待循环仍在，内存记录却清空了，会重复登记、重复送回结果
+  // 省略 jobId 时查询当前 agent 的任一 Codex 任务。
   function liveBackground(jobId, exec) {
     const owner = exec?.agent?.id;
     const jobs = owner === undefined ? undefined : ctx.get?.('jobs');
     // 标签是「Codex <job_id>」或后面再跟「 · 任务摘要」
     const base = `Codex ${jobId}`;
-    const job = jobs?.list(owner).find((j) => j.kind === 'codex' && (j.label === base || j.label?.startsWith(`${base} · `)) &&
+    const job = jobs?.list(owner).find((j) => j.kind === 'codex' && (!jobId || j.label === base || j.label?.startsWith(`${base} · `)) &&
       (j.status === 'running' || j.status === 'stopping'));
     return job && { jobs, id: job.id, owner };
   }
 
   // 后台循环：有界地反复 `status --wait`，结束时把与工具结果相同的文字交给 DSH 送回会话
   async function watch(jobId, handle, finish) {
-    activeJobs.add(jobId);
     try {
       let bridgeErrors = 0;
       for (;;) {
@@ -856,8 +903,6 @@ export function apply(ctx, config = {}, run = runRunner) {
       const lost = { job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error),
         next: `后台等待出错，底层 Codex 任务可能仍在运行：先用 codex_status 查询 ${jobId}，不要直接重派。` };
       return { status: 'failed', detail: `无法继续等待 Codex 任务 ${jobId}`, result: render(lost)[0].text };
-    } finally {
-      activeJobs.delete(jobId);
     }
   }
 
@@ -896,8 +941,10 @@ export function apply(ctx, config = {}, run = runRunner) {
         // 抛一条明确的错误：jobs.wait 的中止拒绝直接抛出会被 DSH 渲染成 Error: [object Object]
         if (signal?.aborted) {
           bg.jobs.kill(bg.id, bg.owner, 'tool call aborted');
-          await bg.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner).catch(() => {});
-          throw new Error('Codex 任务的等待已被中止');
+          const settled = await bg.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner).catch(() => undefined);
+          const ended = settled?.status === 'killed' || settled?.status === 'completed';
+          throw new Error(`Codex 任务 ${jobId} 的等待已被中止；` + (ended ? '任务已结束。'
+            : `取消未确认，任务可能仍在运行，用 codex_status 查询 ${jobId}，不要重派。`));
         }
         throw error;
       }
@@ -990,7 +1037,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       exec?.signal?.throwIfAborted();
       const started = await conductor.start(args, cwd);
       if (exec?.signal?.aborted) {
-        if (started.job_id) await conductor.cancel(started.job_id);
+        if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
         exec.signal.throwIfAborted();
       }
       // 启动后立即登记后台任务（任务表里看得到进度），再经任务表等到 wait_seconds；没有后台任务时直接等 runner
@@ -1047,7 +1094,6 @@ export function apply(ctx, config = {}, run = runRunner) {
       const settled = bg?.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner, stop.signal).catch(() => {});
       const value = await conductor.cancel(args.job_id);
       if (value.error_kind === 'bridge_error') stop.abort();
-      else activeJobs.delete(args.job_id);
       await settled;
       // 下一步要贴合「取消」这件事，不能套用重派话术
       const done = withReport({ job_id: args.job_id, ...value });
@@ -1070,7 +1116,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   const nudged = new Set();
   ctx.on('agent/turn-stopping', ({ agent, turn }) => {
     try {
-      if (!inWorkspace(agent?.session?.header?.cwd, cfg.roots) || activeJobs.size) return;
+      if (!inWorkspace(agent?.session?.header?.cwd, cfg.roots) || liveBackground(undefined, { agent })) return;
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
       const { text, tools } = turnSummary(agent.session.log ?? [], turn);

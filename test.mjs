@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
-  outOfScope, nextStep, withReport, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
+  outOfScope, taskCwd, nextStep, withReport, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
 process.env.LOCALAPPDATA = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
@@ -100,6 +100,53 @@ test('guard denials name the part that was refused', () => {
 test('splitCommand keeps quoted operators inside words', () => {
   assert.deepEqual(splitCommand("grep -E 'a|b;c' x | wc -l"), [['grep', '-E', 'a|b;c', 'x'], ['wc', '-l']]);
   assert.deepEqual(splitCommand('cat "C:\\x\\y" "a\\"b\\\\"'), [['cat', 'C:\\x\\y', 'a"b\\']]);
+});
+
+test('redirection targets get the same substitution checks as command arguments', () => {
+  for (const command of [
+    'cat <$(touch${IFS}/tmp/guard-marker)', 'cat <`touch${IFS}/tmp/guard-marker`',
+    'cat <"$(touch /tmp/guard-marker)"', 'cat <${target@P}', 'cat <${a[$target]}',
+    'cat <$(cat <$(touch${IFS}/tmp/guard-marker))', 'cat <', 'cat <; ls',
+  ]) {
+    assert.equal(readOnlyCommand(command), false, command);
+    assert.match(decide(call('wsl', { command }), cfg), /已拒绝|不在只读核验范围/);
+  }
+  for (const command of [
+    'cat < input.txt', 'cat < "input file.txt"', 'cat < "$file"', 'cat < "${file}"',
+    'cat <$(printf input.txt)', "cat < '$(literal)'", 'cat < input.txt 2>/dev/null',
+    'cat < input.txt > /dev/null', 'cat >"/dev/null" <input.txt',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+  assert.deepEqual(splitCommand('cat < "input file.txt" 2>/dev/null'), [['cat']]);
+});
+
+test('unquoted brace expansion cannot generate filtered flags, but quoted braces stay literal', () => {
+  for (const command of [
+    'find . -{delete,print}', 'find . {-delete,-print}', 'find . -{de""lete,print}',
+    'find . -{delete,{print,ls}}', 'git diff --{output=out,stat}',
+    'sort -{o,n} out input', 'iconv -{o,c}out input',
+  ]) {
+    assert.equal(readOnlyCommand(command), false, command);
+    assert.match(decide(call('wsl', { command }), cfg), /不放行的是/);
+  }
+  for (const command of [
+    "find . -name '{a,b}'", 'find . -name "{a,b}"', String.raw`find . -name \{a,b\}`,
+    "rg 'a{2,3}' src", 'rg a{2} src', 'cat src/{a,b}.txt', 'echo {a..z}',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('iconv rejects attached output paths without rejecting attached encoding arguments', () => {
+  for (const command of [
+    'iconv -o/tmp/guard-marker input.txt', 'iconv -co/tmp/guard-marker input.txt',
+    'iconv -f UTF-8 -t UTF-8 -o/tmp/guard-marker input.txt',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+  for (const flag of ['--o', '--ou', '--out', '--outp', '--outpu', '--output']) {
+    for (const command of [`iconv ${flag}=/dev/null input.txt`, `iconv ${flag} /dev/null input.txt`]) {
+      assert.equal(readOnlyCommand(command), false, command);
+    }
+  }
+  for (const command of ['iconv -fUTF-8 -tUTF-16 input.txt', 'iconv -cs -f UTF-8 input.txt', 'iconv -- input.txt']) {
+    assert.equal(readOnlyCommand(command), true, command);
+  }
 });
 
 test('extra allowCommands extend the list', () => {
@@ -201,6 +248,21 @@ test('the ${var@P} transform and -v array-subscript operands cannot smuggle comm
   ]) assert.equal(readOnlyCommand(c), true, c);
 });
 
+test('variable tests and read destinations must be literal while read prompts may expand', () => {
+  for (const command of [
+    'read -r target < report.txt; [[ -v $target ]]', '[[ -R "${target}" ]]',
+    'test -v $(cat report.txt)', '[ -v "$target" ]',
+    'read -r target < report.txt; echo x | read "$target"',
+    'read -r -- "$target"', 'read -a "$target"', 'read -ra"$target"',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+  for (const command of [
+    '[[ -v arr[0] ]]', '[[ -R name ]]', "read -r 'arr[0]'", 'read', 'read -- line',
+    'read -r -p "$prompt" line', 'read -rp "$prompt" line', 'read -p"$prompt" line',
+    "read -r -p 'name[$x]' line", 'read -d : -n 3 -t 2 -u 0 line',
+    'read -e -i "$initial" line', 'read -ra values', 'read -a values line',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
 test('an invalid allowCommands pattern leaves the tools and guard installed', () => {
   const tools = [];
   const guards = [];
@@ -266,6 +328,21 @@ test('scope check flags changes outside the allowed paths', () => {
   assert.deepEqual(outOfScope(value, '/mnt/f/proj', ['src', 'tests/']), ['README.md']);
   assert.equal(outOfScope(value, 'F:\\proj', undefined), undefined);
   assert.equal(outOfScope({}, 'F:\\proj', ['src']), undefined);
+});
+
+test('native Linux paths keep case for scope, workspace guards and default task directories', () => {
+  const cwd = '/home/user/project';
+  assert.notEqual(normPath(`${cwd}/Src`), normPath(`${cwd}/src`));
+  assert.equal(normPath(String.raw`C:\Work\Project`), normPath('/mnt/c/work/project'));
+  assert.equal(normPath(String.raw`\\SERVER\Share\Project`), normPath(String.raw`\\server\share\project`));
+  assert.deepEqual(outOfScope({ files_changed: [{ path: 'src/a.js' }, { path: 'Src/b.js' }] }, cwd, ['Src']), ['src/a.js']);
+  assert.deepEqual(outOfScope({ files_changed: [{ path: 'src/a.js' }] }, String.raw`C:\Project`, [String.raw`C:\Project\SRC`]), []);
+  const linux = { ...cfg, roots: [normPath('/home/user/Project')] };
+  assert.equal(decide(call('write', {}, cwd), linux), undefined);
+  assert.match(decide(call('write', {}, '/home/user/Project/sub'), linux), /已拒绝/);
+  const workspaces = [{ root: normPath('/home/user/Project'), cwd: '/home/user/other' }];
+  assert.equal(taskCwd({}, cwd, workspaces), cwd);
+  assert.equal(taskCwd({}, '/home/user/Project/sub', workspaces), '/home/user/other');
 });
 
 test('report is surfaced and self-reported problems are flagged first', () => {
@@ -1308,4 +1385,79 @@ test('a running poll resets the consecutive bridge_error count, so blips spread 
   const done = await jobs.started[0].done;
   assert.equal(done.status, 'completed');
   assert.doesNotMatch(done.result, /monitor_failed/);
+});
+
+test('an aborted start or poll keeps the job id when cancellation fails', async () => {
+  for (const phase of ['start', 'status']) {
+    const stop = new AbortController();
+    const calls = [];
+    const run = async (_cfg, argv) => {
+      calls.push(argv[0]);
+      if (argv[0] === phase) stop.abort();
+      return argv[0] === 'cancel'
+        ? { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' }
+        : { job_id: 'J7', status: 'running' };
+    };
+    let pending;
+    if (phase === 'start') {
+      const tools = {};
+      apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {} }, {}, run);
+      pending = tools.codex_run.execute({ ...RUN, cwd: 'F:\\proj' }, { signal: stop.signal });
+    } else pending = createConductor({}, run).waitJob('J7', 1, stop.signal);
+    await assert.rejects(pending, /J7[^\n]*取消未确认[\s\S]*WSL unavailable[\s\S]*codex_status 查询 J7/);
+    assert.deepEqual(calls, [phase, 'cancel']);
+  }
+});
+
+test('an aborted background wait distinguishes unconfirmed cancellation from a stopped task', async () => {
+  const jobs = fakeJobs();
+  const wait = jobs.wait.bind(jobs);
+  jobs.wait = (id, ms, ...rest) => ms === 30_000 && jobs.started[0].status === 'stopping'
+    ? Promise.resolve(jobs.view(jobs.started[0])) : wait(id, ms, ...rest);
+  const { tools, answer } = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' } } });
+  const stop = new AbortController();
+  const pending = tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, { agent: agentAt('F:\\work\\项目'), signal: stop.signal });
+  const rejected = assert.rejects(pending, /J1[^\n]*已被中止[\s\S]*取消未确认[\s\S]*codex_status 查询 J1/);
+  await tick();
+  stop.abort();
+  await rejected;
+  await answer('J1', { status: 'completed' });
+  await jobs.started[0].done;
+  assert.deepEqual(jobs.unawaited, ['bg1']);
+});
+
+test('malformed report containers fall back to the original reply without hiding task status', async () => {
+  for (const structured of [{ criteria: {} }, { criteria: [], deviations: 'unexpected' },
+    { criteria: [], files_changed: 'a.py' }, { criteria: [null] }, []]) {
+    const final_message = JSON.stringify(structured);
+    const { tools } = harness({ config: { startResult: { status: 'completed', sandbox: 'read-only', structured, final_message } } });
+    const value = await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+    assert.equal(value.status, 'completed');
+    assert.equal(value.report, undefined);
+    assert.match(value.report_note, /字段格式不正确/);
+    const text = tools.codex_run.output.render({}, value)[0].text;
+    assert.ok(text.includes(final_message));
+    assert.match(text, /Codex 最终答复[\s\S]*核验/);
+  }
+  const failed = withReport({ status: 'failed', error_kind: 'timeout', error: 'timed out', structured: { criteria: {} } });
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.error_kind, 'timeout');
+});
+
+test('dispatch reminders use jobs owned by the agent and survive a plugin reload', async () => {
+  const jobs = fakeJobs();
+  const before = harness({ jobs });
+  const claim = [{ type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } }];
+  const owner = agentAt('F:\\work\\项目', claim);
+  await before.tools.codex_run.execute(RUN, { agent: owner });
+  const count = nudges.length;
+  before.handlers['agent/turn-stopping']({ agent: { ...owner, id: 'OTHER' }, turn: 7 });
+  assert.equal(nudges.length, count + 1);
+  const after = harness({ jobs });
+  after.handlers['agent/turn-stopping']({ agent: owner, turn: 7 });
+  assert.equal(nudges.length, count + 1);
+  await before.answer('J1', { status: 'completed' });
+  await jobs.started[0].done;
+  after.handlers['agent/turn-stopping']({ agent: owner, turn: 7 });
+  assert.equal(nudges.length, count + 2);
 });

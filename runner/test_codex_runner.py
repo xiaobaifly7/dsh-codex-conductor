@@ -20,9 +20,13 @@ FAKE_CODEX = textwrap.dedent(r"""
     state = Path(os.environ["FAKE_STATE"])
     state.mkdir(exist_ok=True)
     calls = len(list(state.glob("call-*.json")))
+    mode = os.environ["FAKE_MODE"]
+    if mode == "stall_before_stdin":
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(300)"])
+        (state / "child.pid").write_text(str(child.pid))
+        time.sleep(6)
     prompt = sys.stdin.buffer.read()
     (state / f"call-{calls}.json").write_text(json.dumps({"argv": sys.argv[1:], "prompt": prompt.decode("utf-8")}))
-    mode = os.environ["FAKE_MODE"]
 
     def say(**ev):
         print(json.dumps(ev), flush=True)
@@ -177,6 +181,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["error_kind"], "timeout")
         self.assertEqual(r["attempts"], 1)
 
+    def test_timeout_while_child_is_not_reading_a_large_prompt(self):
+        start = time.monotonic()
+        r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0",
+                        mode="stall_before_stdin", prompt="x" * 1048576)
+        self.assertEqual(r["error_kind"], "timeout")
+        self.assertEqual(r["attempts"], 1)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertFalse(alive(int((self.state / "child.pid").read_text())))
+
     def test_process_that_hangs_after_completion_still_succeeds(self):
         start = time.time()
         r = self.invoke("--exit-grace", "2", mode="hang_after_completed")
@@ -191,6 +204,7 @@ class RunnerTests(unittest.TestCase):
                         mode="transient_then_ok")
         self.assertEqual(r["status"], "completed")
         self.assertEqual(r["attempts"], 2)
+        self.assertEqual(r["usage_scope"], "thread_total")
         first, second = self.calls()
         self.assertNotIn("resume", first["argv"])
         self.assertIn("resume", second["argv"])
@@ -322,6 +336,21 @@ class RunnerTests(unittest.TestCase):
                     with self.subTest(alias=alias):
                         self.assertIsNone(codex_runner.acquire_write_lock(alias))
 
+    def test_writer_lock_serializes_symlink_aliases(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        alias = Path(self.tmp.name) / "alias"
+        try:
+            alias.symlink_to(self.cwd, target_is_directory=True)
+        except OSError as e:
+            if os.name == "nt":
+                self.skipTest(f"directory symlink is unavailable: {e}")
+            raise
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            with codex_runner.acquire_write_lock(str(self.cwd)):
+                self.assertIsNone(codex_runner.acquire_write_lock(str(alias)))
+
     @unittest.skipIf(os.name == "nt", "native Linux paths are case-sensitive")
     def test_writer_lock_keeps_native_linux_paths_case_sensitive(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -343,6 +372,8 @@ class RunnerTests(unittest.TestCase):
             for error_type in (BrokenPipeError, OSError):
                 with self.subTest(operation=operation, error=error_type.__name__):
                     proc = mock.Mock(pid=123)
+                    proc.stdout = mock.MagicMock()
+                    proc.stdout.__iter__.return_value = iter(())
                     getattr(proc.stdin, operation).side_effect = error_type("stdin failed")
                     with mock.patch.dict(os.environ, self.env), \
                             mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
@@ -362,10 +393,33 @@ class RunnerTests(unittest.TestCase):
                         self.assertEqual(result["attempts"], 1)
                         popen.assert_called_once()
                         kill.assert_called_once_with(proc.pid)
-                        proc.wait.assert_called_once_with()
+                        proc.wait.assert_called_once_with(timeout=10)
                         proc.stdin.close.assert_called()
                         proc.stdout.close.assert_called_once_with()
                         self.assertTrue(popen.call_args.kwargs["stderr"].closed)
+
+    def test_timeout_cleanup_does_not_wait_indefinitely_for_pipe_threads(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import argparse
+        import codex_runner
+
+        proc = mock.Mock(pid=123)
+        proc.wait.side_effect = subprocess.TimeoutExpired("fake", 10)
+        reader, writer = mock.Mock(), mock.Mock()
+        args = argparse.Namespace(cwd=str(self.cwd), sandbox="read-only", use_user_config=True,
+                                  model=None, effort=None, schema=None, timeout=-1,
+                                  idle_timeout=30, reconnect_timeout=30, exit_grace=1)
+        with mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(codex_runner.threading, "Thread", side_effect=[reader, writer]), \
+                mock.patch.object(codex_runner, "kill_tree") as kill:
+            result = codex_runner.run_attempt(args, "large prompt", Path(self.tmp.name), None)
+        self.assertEqual(result["end_reason"], "timeout")
+        self.assertEqual(kill.call_args_list, [mock.call(proc.pid), mock.call(proc.pid)])
+        proc.wait.assert_called_once_with(timeout=10)
+        for thread in (reader, writer):
+            thread.join.assert_called_once_with(timeout=1)
+        proc.stdin.close.assert_not_called()
+        proc.stdout.close.assert_not_called()
 
     def control(self, *args):
         p = subprocess.run([sys.executable, str(RUNNER), *args], capture_output=True, timeout=60, env=self.env)
@@ -515,6 +569,44 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(report["files_changed_source"], "codex_events")
         self.assertEqual(report["files_changed"], [{"path": "keep/a.txt", "change": "update"}])
         self.assertIsNone(codex_runner.snapshot(str(root), budget=-1))
+
+    @unittest.skipIf(os.name == "nt", "Windows chmod does not expose Unix executable bits")
+    def test_snapshot_reports_permission_only_changes(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        script = self.cwd / "tool.sh"
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o644)
+        before = codex_runner.snapshot(str(self.cwd))
+        script.chmod(0o755)
+        self.assertEqual(before["tool.sh"][:2], codex_runner.snapshot(str(self.cwd))["tool.sh"][:2])
+        report = codex_runner.files_changed(str(self.cwd), before, [(str(script), "update")])
+        self.assertEqual(report["files_changed"], [{"path": "tool.sh", "change": "modified"}])
+
+    def test_snapshot_budget_covers_flat_directories_and_scoped_files(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        first = self.cwd / "a.txt"
+        first.write_text("a")
+        (self.cwd / "b.txt").write_text("b")
+        real_stat = os.stat
+        for scope in (None, [str(first)]):
+            with self.subTest(scope=scope):
+                clock = [0]
+                scanned = []
+
+                def slow_stat(path, *args, **kwargs):
+                    if kwargs.get("follow_symlinks") is False:
+                        scanned.append(path)
+                        clock[0] += 2
+                    return real_stat(path, *args, **kwargs)
+
+                with mock.patch.object(codex_runner.time, "time", side_effect=lambda: clock[0]), \
+                        mock.patch.object(codex_runner.os, "stat", side_effect=slow_stat):
+                    self.assertIsNone(codex_runner.snapshot(str(self.cwd), budget=1, scope=scope))
+                self.assertEqual(len(scanned), 1)
 
     def big_tree(self):
         sys.path.insert(0, str(RUNNER.parent))
