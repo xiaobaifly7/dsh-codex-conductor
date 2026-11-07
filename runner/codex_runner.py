@@ -439,7 +439,7 @@ def too_big_trees():
 
 
 def tree_key(cwd):
-    return os.path.normcase(os.path.abspath(cwd))
+    return os.path.normcase(os.path.realpath(cwd))
 
 
 def remember_too_big(cwd):

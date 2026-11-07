@@ -390,7 +390,7 @@ class RunnerTests(unittest.TestCase):
         target = self.cwd / "keep" / "a.txt"
         home = Path(self.tmp.name) / "home"
         with mock.patch.object(codex_runner, "HOME", home):
-            codex_runner.remember_too_big(str(self.cwd))
+            self.assertEqual(codex_runner.tree_key(str(alias)), codex_runner.tree_key(str(self.cwd)))
             codex_runner.remember_too_big(str(alias))
         for scope in ("keep", str(alias / "keep"), str(self.cwd / "keep"),
                       "keep/a.txt", str(alias / "keep" / "a.txt"), str(target)):
