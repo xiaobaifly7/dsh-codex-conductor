@@ -361,13 +361,13 @@ export function runnerArgv(cfg, args) {
   return [...(cfg.distro ? ['-d', cfg.distro] : []), '-e', 'env', ...env, cfg.python, cfg.runner, ...args];
 }
 
-// 调用 WSL 里的 runner，返回它输出的最后一行 JSON。
-function runRunner(cfg, args, { stdin, signal } = {}) {
+// 跑一个命令，返回它输出的最后一行 JSON。timeoutMs 到了还没结束（WSL 卡死或起不来）就结束它并按 bridge_error 返回，
+// 不等 close：进程树没收干净时 close 可能一直不来
+export function runProcess(command, argv, { stdin, signal, timeoutMs, env } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
-      // 不设 WSL_UTF8 时 wsl.exe 自己的报错是 UTF-16LE，按 UTF-8 读出来是乱码
-      child = spawn('wsl.exe', runnerArgv(cfg, args), { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, WSL_UTF8: '1' } });
+      child = spawn(command, argv, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env });
     } catch (error) {
       resolve({ status: 'failed', error_kind: 'bridge_error', error: String(error?.message ?? error), retryable: true });
       return;
@@ -378,8 +378,23 @@ function runRunner(cfg, args, { stdin, signal } = {}) {
     child.stderr.on('data', (d) => err.push(d));
     const onAbort = () => child.kill();
     signal?.addEventListener('abort', onAbort, { once: true });
-    child.on('error', (error) => resolve({ status: 'failed', error_kind: 'bridge_error', error: error.message, retryable: true }));
+    // 用 1 秒一跳的 interval，而不是一个长 setTimeout：Windows 上 libuv 计时走 QueryPerformanceCounter，含睡眠时间，
+    // 一个长 setTimeout 会在电脑睡眠唤醒后立刻判超时、误杀在飞的 status；interval 睡眠期间只补一跳（约 1 秒），不会误杀，
+    // 也不会因 timeoutMs 超过 2^31 而被 Node 夹成 1 毫秒立刻触发。
+    let ticks = 0;
+    const timer = timeoutMs && setInterval(() => {
+      if (++ticks * 1000 < timeoutMs) return;
+      clearInterval(timer);
+      child.kill();
+      resolve({ status: 'failed', error_kind: 'bridge_error', retryable: true,
+        error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束它（WSL 可能卡住或正在启动）` });
+    }, 1000);
+    child.on('error', (error) => {
+      clearInterval(timer);
+      resolve({ status: 'failed', error_kind: 'bridge_error', error: error.message, retryable: true });
+    });
     child.on('close', (code) => {
+      clearInterval(timer);
       signal?.removeEventListener('abort', onAbort);
       const lines = Buffer.concat(out).toString('utf8').trim().split('\n');
       try {
@@ -394,12 +409,23 @@ function runRunner(cfg, args, { stdin, signal } = {}) {
   });
 }
 
+// 调用 WSL 里的 runner。不设 WSL_UTF8 时 wsl.exe 自己的报错是 UTF-16LE，按 UTF-8 读出来是乱码
+// exec 可注入，默认 runProcess；测试据此验证超时/stdin/signal/env 真的传到了 spawn，而不是只在假 run 上验证
+export const runRunner = (cfg, args, opts = {}, exec = runProcess) =>
+  exec('wsl.exe', runnerArgv(cfg, args), { ...opts, env: { ...process.env, WSL_UTF8: '1' } });
+
+// start / cancel 正常几秒就返回，冷启动 WSL 也用不了这么久；status 在它自己的等待之外再留这么多余量
+const BRIDGE_TIMEOUT_MS = 120_000;
+const BRIDGE_SLACK_MS = 60_000;
+
 export function createConductor(cfg, run = runRunner) {
   // 每次等待是一个有界的 `status --wait` 进程，到点即退出；仍在执行时 runner 会带回空闲秒数和最近动作
   async function waitJob(jobId, seconds, signal) {
-    const value = await run(cfg, ['status', jobId, '--wait', String(Math.max(0, seconds))], { signal });
+    // 夹在 1 天内：既防超大值让底层 status 等上几十天，也让 timeoutMs 远小于 2^31
+    const wait = Math.min(Math.max(0, seconds), 86_400);
+    const value = await run(cfg, ['status', jobId, '--wait', String(wait)], { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS });
     if (signal?.aborted) {
-      await run(cfg, ['cancel', jobId]);
+      await cancel(jobId);
       signal.throwIfAborted();
     }
     const note = value.status === 'running' ? { note: `等了 ${seconds} 秒仍在执行，任务在后台继续；用 codex_status 接着等。` } : {};
@@ -424,10 +450,14 @@ export function createConductor(cfg, run = runRunner) {
     for (const rx of cfg.ignoreChanges ?? []) argv.push('--ignore', rx.source);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: args.host_access === true, write: args.write === true,
       ignore: (cfg.ignoreChanges ?? []).map((rx) => rx.source) });
-    return run(cfg, argv, { stdin: prompt, signal });
+    return run(cfg, argv, { stdin: prompt, signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
 
-  return { start, waitJob, cancel: (jobId) => run(cfg, ['cancel', jobId]) };
+  function cancel(jobId) {
+    return run(cfg, ['cancel', jobId], { timeoutMs: BRIDGE_TIMEOUT_MS });
+  }
+
+  return { start, waitJob, cancel };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
@@ -522,9 +552,16 @@ export function nextStep(value, acceptance, resumed, { hostAccess = false, readO
   // 只读任务用 --ephemeral 运行、不留会话记录，自己的 thread_id 续不上；只有它续跑的写任务线程还能续
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
+    // wsl.exe 出错只说明这次没查到或没取消成功，任务本身可能还在跑；重派会多出一个同样的任务
+    if (value.error_kind === 'bridge_error' && value.job_id) {
+      return `连接 WSL 出错，Codex 任务 ${value.job_id} 可能仍在运行：先用 codex_status 查询，不要直接重派。`;
+    }
     if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
-    return resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
-      : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。';
+    // worker_died 的可写任务：退出前可能已改了部分文件，续跑后的改动清单也不含这些
+    const partial = value.error_kind === 'worker_died' && !readOnly
+      ? '退出前 Codex 可能已改了部分文件且没有改动清单，续跑后的清单也不含它们，核验前先用 git status 或对比文件确认现状。' : '';
+    return (resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
+      : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。') + partial;
   }
   const report = value.report ?? {};
   const original = sameCriteria(report, acceptance);
@@ -738,14 +775,19 @@ export function apply(ctx, config = {}, run = runRunner) {
   async function watch(jobId, handle, finish) {
     activeJobs.add(jobId);
     try {
+      let bridgeErrors = 0;
       for (;;) {
         const value = withReport(await conductor.waitJob(jobId, BG_WAIT));
         if (value.status === 'running') {
+          bridgeErrors = 0;
           handle.updateProgress(`Codex 执行中，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`);
           continue;
         }
-        // wsl.exe 本身出错不代表任务结束
-        if (value.error_kind === 'bridge_error') throw new Error(value.error);
+        // status 是只读的：一次 wsl.exe 出错（含电脑睡眠唤醒、发行版重启瞬间）不代表任务结束，连续多次才放弃
+        if (value.error_kind === 'bridge_error') {
+          if (++bridgeErrors < 3) continue;
+          throw new Error(value.error);
+        }
         const done = finish(value);
         return { status: JOB_STATUS[done.status] ?? 'failed', detail: summaryLine(done), result: render(done)[0].text };
       }
@@ -911,6 +953,9 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_status: job_id 必须是非空字符串');
+      if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
+        throw new Error('codex_status: wait_seconds 必须是非负整数');
+      }
       const finish = (value) => ({ ...value, next: nextStep(value, undefined, undefined, { hostAccess: cfg.allowHostAccess === true }) });
       const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
       return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
@@ -938,7 +983,20 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (value.error_kind === 'bridge_error') stop.abort();
       else activeJobs.delete(args.job_id);
       await settled;
-      return value;
+      // 下一步要贴合「取消」这件事，不能套用重派话术
+      const done = withReport({ job_id: args.job_id, ...value });
+      let next;
+      if (done.error_kind === 'bridge_error') {
+        next = `这次 wsl.exe 调用出错，取消可能没执行，Codex 任务 ${args.job_id} 可能仍在运行：稍后再调用一次 codex_cancel（任务已结束时它会直接返回结果），不要重派；再出错就把 error 原样告诉用户。`;
+      } else if (done.status === 'completed') {
+        // 取消没赶上：任务已经完成，改动已经留下，按完成处理
+        next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done, undefined, undefined, { hostAccess: cfg.allowHostAccess === true })}`;
+      } else if (done.status === 'cancelled') {
+        next = '已按本次调用取消。可写任务可能已改了一部分且没有改动清单，核验或重派前先用 git status 或对比文件确认现状。';
+      } else {
+        next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
+      }
+      return { ...done, next };
     },
   });
 

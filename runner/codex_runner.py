@@ -112,6 +112,24 @@ def pid_alive(pid):
     return f'"{pid}"' in out
 
 
+def boot_id():
+    """Identifies this distro instance: the kernel boot id plus when this PID namespace's init (pid 1) started.
+    The kernel boot id alone misses `wsl --terminate <distro>` or a distro auto-stop while the VM stays up — the
+    kernel does not reboot but pids start over, so a bare pid could then name an unrelated process. init's start
+    time (field 22 of /proc/1/stat, ticks since kernel boot) changes on every distro restart. None where no /proc."""
+    try:
+        init_start = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()[19]
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + init_start
+    except (OSError, IndexError):
+        return None
+
+
+def same_boot(job_dir):
+    """Pids recorded before a WSL VM, distro or Windows restart may now belong to unrelated processes."""
+    recorded = job_dir / "boot_id"
+    return not recorded.exists() or recorded.read_text().strip() == boot_id()
+
+
 def router_reachable():
     # Opt-in: set CODEX_RUNNER_ROUTER_URL when Codex talks to a local proxy, so a dead proxy fails fast.
     target = os.environ.get("CODEX_RUNNER_ROUTER_URL", "")
@@ -593,7 +611,7 @@ def job_status(job_id):
     if result.exists():
         return {"job_id": job_id, **json.loads(result.read_text("utf-8"))}
     pid_file = job_dir / "worker.pid"
-    if pid_file.exists() and pid_alive(int(pid_file.read_text())):
+    if pid_file.exists() and same_boot(job_dir) and pid_alive(int(pid_file.read_text())):
         events = job_dir / "events.jsonl"
         idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
         return {"job_id": job_id, "status": "running", "seconds_since_last_event": idle,
@@ -602,9 +620,57 @@ def job_status(job_id):
     if result.exists():
         return {"job_id": job_id, **json.loads(result.read_text("utf-8"))}
     # start may still be publishing the worker pid, so give a just-started job a moment.
-    if time.time() - job_dir.stat().st_ctime < 5:
+    if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
         return {"job_id": job_id, "status": "running", "seconds_since_last_event": None}
-    return {"job_id": job_id, "status": "failed", "error_kind": "worker_died", "retryable": True, "log_dir": str(job_dir)}
+    return worker_died(job_id, job_dir)
+
+
+def worker_died(job_id, job_dir):
+    """The worker exited without a result (WSL restart, crash). A writer can still be resumed from its thread;
+    a read-only run is --ephemeral, so only a writer thread it resumed can be."""
+    try:
+        task = json.loads((job_dir / "args.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        task = {}
+    thread = task.get("resume")
+    if task.get("sandbox") != "read-only":
+        thread = started_thread(job_dir / "events.jsonl") or thread
+    return {"job_id": job_id, "status": "failed", "error_kind": "worker_died", "retryable": True,
+            "error": "The runner worker exited without writing a result (WSL restart or crash).",
+            "sandbox": task.get("sandbox"), "thread_id": thread, "log_dir": str(job_dir)}
+
+
+def started_thread(events):
+    try:
+        with open(events, "rb") as f:
+            for raw in f:
+                try:
+                    ev = json.loads(raw)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("type") == "thread.started" and ev.get("thread_id"):
+                    return ev["thread_id"]
+    except OSError:
+        pass
+    return None
+
+
+PRUNE_TTL = 30 * 86400
+
+
+def prune_old(subdir):
+    """Best-effort: delete finished job/run dirs older than PRUNE_TTL so HOME does not grow without bound.
+    A running job keeps a recent mtime (events.jsonl), so only long-finished dirs are old enough to match."""
+    root = HOME / subdir
+    if not root.is_dir():
+        return
+    cutoff = time.time() - PRUNE_TTL
+    for d in root.iterdir():
+        try:
+            if d.is_dir() and d.stat().st_mtime < cutoff:
+                shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
 
 
 def main():
@@ -628,12 +694,18 @@ def main():
         sys.exit(0 if result["status"] == "completed" else 1)
 
     if args.command == "start":
+        prune_old("jobs")
+        prune_old("runs")
         job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         job_dir = HOME / "jobs" / job_id
         job_dir.mkdir(parents=True)
         (job_dir / "prompt.txt").write_text(read_prompt(), "utf-8")
         task = {k: v for k, v in vars(args).items() if k != "command"}
         (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
+        # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
+        boot = boot_id()
+        if boot:
+            (job_dir / "boot_id").write_text(boot)
         worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
@@ -664,7 +736,8 @@ def main():
     if args.command == "cancel":
         job_dir = HOME / "jobs" / args.job_id
         pid_file = job_dir / "worker.pid"
-        if (job_dir / "result.json").exists() or not pid_file.exists():
+        # After a restart the worker is gone and its recorded pids may name other processes: kill nothing.
+        if (job_dir / "result.json").exists() or not pid_file.exists() or not same_boot(job_dir):
             emit(job_status(args.job_id))
             return
         kill_tree(int(pid_file.read_text()))
