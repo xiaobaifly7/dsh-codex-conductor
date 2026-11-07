@@ -117,7 +117,8 @@ const PWSH_FLAGS = new Set(['-noprofile', '-noninteractive', '-nologo']);
 const PS_SYNTAX_WIN = fileURLToPath(new URL('./tools/Test-PsSyntax.ps1', import.meta.url));
 export const PS_SYNTAX = wslPath(PS_SYNTAX_WIN);
 // 地址里不放行 \/：转义的斜杠会让后面的 e/w 命令混进地址；也不放行 $：变量或命令替换展开后同样能混进 e/w（末行用 tail）
-const SED_PRINT = /^(\d+(,\d+)?|\/[^/\\$]*\/(,\/[^/\\$]*\/)?)p$/;
+const SED_ADDRESS = String.raw`(?:\d+(?:,\d+)?|/[^/\\$]*/(?:,/[^/\\$]*/)?)`;
+const SED_PRINT = new RegExp(String.raw`^\s*${SED_ADDRESS}p(?:\s*;\s*${SED_ADDRESS}p)*\s*;?\s*$`);
 
 const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex_run 交给 Codex；你只做只读核验：read / glob / grep 等读工具，' +
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、pytest、npm test 等，' +
@@ -134,9 +135,11 @@ export function normPath(p) {
   return path.posix.normalize(s).replace(/\/+$/, '').toLowerCase();
 }
 
+const under = (p, r) => p === r || p.startsWith(`${r}/`);
+
 function inWorkspace(cwd, roots) {
   const c = normPath(cwd);
-  return c !== '' && roots.some((r) => c === r || c.startsWith(`${r}/`));
+  return c !== '' && roots.some((r) => under(c, r));
 }
 
 // `$(` 之后找到配对的 `)`，跳过引号内的括号；找不到返回 -1。
@@ -226,7 +229,16 @@ function gitAllowed(args) {
   const sub = args[i];
   const rest = args.slice(i + 1);
   if (rest.some((a) => /^--(output|ext-diff|textconv)/.test(a))) return false;
+  // -ePATTERN/-fFILE 等会吞掉后面的字母，其中的 O 不是 pager 开关。
+  if (sub === 'grep' && rest.some((a) => /^-[^-efmCBA]*O/.test(a) || (a.startsWith('--') && a !== '--' &&
+    '--open-files-in-pager'.startsWith(a.split('=')[0])))) return false;
   if (sub === 'branch') return rest.every((a) => GIT_BRANCH_READ.has(a));
+  if (sub === 'config') return (rest.length === 1 && ['-l', '--list'].includes(rest[0])) ||
+    (rest[0] === '--get' && rest.length > 1 && rest.slice(1).every((a) => !a.startsWith('-')));
+  if (sub === 'remote') return rest.every((a) => ['-v', '--verbose'].includes(a));
+  if (sub === 'tag') return rest.length === 0 ||
+    (['-l', '--list'].includes(rest[0]) && rest.slice(1).every((a) => !a.startsWith('-')));
+  if (sub === 'stash') return rest.length === 1 && rest[0] === 'list';
   return GIT_READ.has(sub);
 }
 
@@ -272,6 +284,9 @@ function segmentAllowed(raw, extra) {
   }
   if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
+  // 展开后的词可能变成被过滤的开关，不能把它当成普通文件参数。
+  if (/^(git|iconv|find|rg|sort|uniq|tree|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
+      args.some((a) => a.includes('$'))) return false;
   const positional = args.filter((a) => !a.startsWith('-')).length;
   switch (cmd) {
     case 'git': return gitAllowed(args);
@@ -279,10 +294,11 @@ function segmentAllowed(raw, extra) {
     case 'iconv': return !args.some((a) => a === '-o' || a.startsWith('--output'));
     case 'find': return !args.some((a) => FIND_ACTIONS.has(a));
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
-    case 'sort': return !args.some((a) => a.startsWith('--output') || /^-[^-]*o/.test(a));
+    case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
+      ['--output', '--compress-program', '--random-source'].some((flag) => flag.startsWith(a.split('=')[0]))));
     case 'uniq': return positional <= 1;
     // printf -v 能给任意变量赋任意值
-    case 'printf': return !args[0]?.startsWith('-v');
+    case 'printf': return !args[0]?.startsWith('-v') && !args[0]?.includes('$');
     case 'tree': return !args.some((a) => a === '-o');
     // 后面再出现开关（-i、--in-place、-e、-f）就可能写文件或执行命令；
     // 文件参数里的 $ 和 { 也不放行：$(printf -- -i)、{-i,f} 展开后同样变成开关
@@ -290,7 +306,7 @@ function segmentAllowed(raw, extra) {
     case 'python': case 'python3': return args[0] === '-m' && ['pytest', 'unittest'].includes(args[1]);
     case 'npm': case 'pnpm': case 'yarn': return args[0] === 'test' || (args[0] === 'run' && /^test/.test(args[1] ?? ''));
     case 'node': return args[0] === '--test' || args[0] === '--check';
-    case 'go': return ['test', 'vet'].includes(args[0]);
+    case 'go': return ['test', 'vet'].includes(args[0]) && !args.some((a) => /^--?(exec|toolexec|vettool)(=|$)/.test(a));
     case 'cargo': case 'make': return ['test', 'check'].includes(args[0]);
     default: return READERS.has(cmd);
   }
@@ -434,7 +450,7 @@ export function outOfScope(value, cwd, scope) {
   const abs = (p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd.replace(/[\\/]+$/, '')}/${p}`);
   const roots = scope.map(abs);
   return value.files_changed.map((f) => f.path)
-    .filter((p) => { const a = abs(p); return !roots.some((r) => a === r || a.startsWith(`${r}/`)); });
+    .filter((p) => { const a = abs(p); return !roots.some((r) => under(a, r)); });
 }
 
 export function validateRun(args) {
@@ -587,19 +603,27 @@ export function taskCwd(args, session, workspaces) {
   return hits.sort((a, b) => b.root.length - a.root.length)[0]?.cwd ?? session;
 }
 
-function settings(config) {
+function settings(config, logger) {
   // workspaces 的条目可以是路径字符串，也可以是 {path, cwd}
   const workspaces = (Array.isArray(config.workspaces) ? config.workspaces : [])
     .map((w) => typeof w === 'string' ? { root: normPath(w) }
       : { root: normPath(w?.path), cwd: typeof w?.cwd === 'string' && w.cwd.trim() ? w.cwd.trim() : undefined })
     .filter((w) => w.root);
+  const allowCommands = [];
+  for (const pattern of Array.isArray(config.allowCommands) ? config.allowCommands : []) {
+    try {
+      allowCommands.push(new RegExp(pattern));
+    } catch (error) {
+      logger?.warn?.(`[codex-conductor] 忽略无效的 allowCommands 正则 ${pattern}：${error.message}`);
+    }
+  }
   return {
     ...DEFAULTS,
     ...Object.fromEntries(Object.entries(config).filter(([k, v]) => k in DEFAULTS && v !== undefined && v !== '')),
     workspaces,
     roots: workspaces.map((w) => w.root),
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),
-    allowCommands: (Array.isArray(config.allowCommands) ? config.allowCommands : []).map((s) => new RegExp(s)),
+    allowCommands,
   };
 }
 
@@ -610,7 +634,7 @@ const CANCEL_SETTLE_MS = 30_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 
 export function apply(ctx, config = {}, run = runRunner) {
-  const cfg = settings(config);
+  const cfg = settings(config, ctx.logger);
   const conductor = createConductor(cfg, run);
 
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
@@ -631,14 +655,8 @@ export function apply(ctx, config = {}, run = runRunner) {
   } catch (error) {
     ctx.logger?.warn?.(`[codex-conductor] 规划要求没能注入系统提示词：${error?.message ?? error}`);
   }
-  // codex_run 启动、尚未结束的任务；有它们时说「Codex 正在做」是真话
+  // 只记录有后台监控负责清理的任务，轮询回退不能保证跨轮状态仍有效。
   const activeJobs = new Set();
-  const track = (value) => {
-    if (!value?.job_id) return value;
-    if (value.status === 'running') activeJobs.add(value.job_id);
-    else activeJobs.delete(value.job_id);
-    return value;
-  };
 
   // 这个 runner 任务仍在进行的 DSH 后台任务。按 DSH 任务表查而不记在插件内存里：
   // 插件热重载后旧的后台任务和它的等待循环仍在，内存记录却清空了，会重复登记、重复送回结果
@@ -654,6 +672,7 @@ export function apply(ctx, config = {}, run = runRunner) {
 
   // 后台循环：有界地反复 `status --wait`，结束时把与工具结果相同的文字交给 DSH 送回会话
   async function watch(jobId, handle, finish) {
+    activeJobs.add(jobId);
     try {
       for (;;) {
         const value = withReport(await conductor.waitJob(jobId, BG_WAIT));
@@ -663,14 +682,15 @@ export function apply(ctx, config = {}, run = runRunner) {
         }
         // wsl.exe 本身出错不代表任务结束
         if (value.error_kind === 'bridge_error') throw new Error(value.error);
-        const done = finish(track(value));
+        const done = finish(value);
         return { status: JOB_STATUS[done.status] ?? 'failed', detail: summaryLine(done), result: render(done)[0].text };
       }
     } catch (error) {
-      activeJobs.delete(jobId);
       const lost = { job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error),
         next: `后台等待出错，底层 Codex 任务可能仍在运行：先用 codex_status 查询 ${jobId}，不要直接重派。` };
       return { status: 'failed', detail: `无法继续等待 Codex 任务 ${jobId}`, result: render(lost)[0].text };
+    } finally {
+      activeJobs.delete(jobId);
     }
   }
 
@@ -799,7 +819,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const value = started.status === 'running' && started.job_id
         ? await collect(started.job_id, background(started.job_id, exec, finish, label), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
         : withReport(started);
-      return value.rendered ? track(value) : notifyOnDone(finish(track(value)), exec, finish);
+      return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
     },
   });
 
@@ -822,7 +842,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_status: job_id 必须是非空字符串');
       const finish = (value) => ({ ...value, next: nextStep(value) });
       const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
-      return value.rendered ? track(value) : notifyOnDone(finish(track(value)), exec, finish);
+      return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
     },
   });
 
@@ -838,7 +858,6 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_cancel: job_id 必须是非空字符串');
-      activeJobs.delete(args.job_id);
       const bg = liveBackground(args.job_id, exec);
       // 取消前先挂上等待：后台循环随后看到任务结束并结算，算作已被等到，DSH 不再另发一条结束通知。
       // wsl.exe 出错时取消没执行，撤掉等待，免得它吞掉任务之后真正结束时的通知
@@ -846,6 +865,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const settled = bg?.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner, stop.signal).catch(() => {});
       const value = await conductor.cancel(args.job_id);
       if (value.error_kind === 'bridge_error') stop.abort();
+      else activeJobs.delete(args.job_id);
       await settled;
       return value;
     },

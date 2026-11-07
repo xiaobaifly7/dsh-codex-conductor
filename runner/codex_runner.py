@@ -32,7 +32,7 @@ else:
     import fcntl
     import signal
 
-# Codex keeps its own provider config and credentials, so only sandbox, approval and effort are pinned;
+# Codex keeps its own provider config and credentials, so only sandbox and approval are pinned;
 # its MCP servers and hooks stay off unless --use-user-config.
 STRIP_USER_EXTRAS = ["--disable", "hooks"]
 
@@ -112,14 +112,14 @@ def pid_alive(pid):
     return f'"{pid}"' in out
 
 
-def router_reachable(timeout=2):
+def router_reachable():
     # Opt-in: set CODEX_RUNNER_ROUTER_URL when Codex talks to a local proxy, so a dead proxy fails fast.
     target = os.environ.get("CODEX_RUNNER_ROUTER_URL", "")
     if target == "":
         return True
     url = urlparse(target)
     try:
-        with socket.create_connection((url.hostname, url.port or 443), timeout=timeout):
+        with socket.create_connection((url.hostname, url.port or 443), timeout=2):
             return True
     except OSError:
         return False
@@ -129,7 +129,10 @@ def acquire_write_lock(cwd):
     """Hold a per-directory lock so a retry can never overlap another writer. The OS frees it if we die."""
     locks = HOME / "locks"
     locks.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha1(os.path.normcase(os.path.abspath(cwd)).encode("utf-8")).hexdigest()[:16]
+    path = os.path.normcase(os.path.abspath(local_path(cwd)))
+    if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path):
+        path = path.lower()  # Windows-backed paths ignore case, unlike native Linux paths.
+    key = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
     handle = open(locks / f"{key}.lock", "a+b")
     handle.seek(0)
     try:
@@ -177,7 +180,8 @@ def build_command(args, run_dir, thread_id):
     cmd += ["-c", 'approval_policy="never"']
     if args.model:
         cmd += ["-m", args.model]
-    cmd += ["-c", f'model_reasoning_effort="{args.effort}"']
+    if args.effort:
+        cmd += ["-c", f'model_reasoning_effort="{args.effort}"']
     # Jobs queued before this option existed have no service_tier in args.json.
     if getattr(args, "service_tier", None):
         cmd += ["-c", f'service_tier="{args.service_tier}"']
@@ -197,7 +201,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
     """Run one Codex process to a verdict. turn.completed decides success, not the exit code."""
     cmd, env = build_command(args, run_dir, thread_id)
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
-             "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None, "exit_code": None,
+             "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
              "file_changes": []}
     start = time.time()
     with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
@@ -210,8 +214,20 @@ def run_attempt(args, prompt, run_dir, thread_id):
             return state
         (run_dir / "codex.pid").write_text(str(proc.pid))
         # Closing stdin gives Codex its EOF, and the prompt skips cmd quoting and command-line limits.
-        proc.stdin.write(prompt.encode("utf-8"))
-        proc.stdin.close()
+        try:
+            proc.stdin.write(prompt.encode("utf-8"))
+            proc.stdin.close()
+        except OSError as e:
+            kill_tree(proc.pid)
+            proc.wait()
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass  # Closing can flush the same broken pipe again.
+            proc.stdout.close()
+            state["end_reason"] = "spawn_failed"
+            state["error"] = str(e)
+            return state
 
         lines = queue.Queue()
 
@@ -282,7 +298,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
             elif kind == "item.completed" and item.get("type") == "file_change":
                 state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
         try:
-            state["exit_code"] = proc.wait(timeout=10)
+            proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
             kill_tree(proc.pid)
     return state
@@ -398,7 +414,7 @@ def snapshot_before(cwd, scope_args):
     return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
 
 
-def files_changed(root, before, event_changes, scope=None, limit=300):
+def files_changed(root, before, event_changes, scope=None):
     """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool."""
     after = snapshot(root, scope=scope) if before is not None else None
     rel = lambda p: os.path.relpath(os.path.join(root, p), root).replace(os.sep, "/")
@@ -417,7 +433,7 @@ def files_changed(root, before, event_changes, scope=None, limit=300):
         changes = events
         source = "codex_events"
     changes.sort()
-    return {"files_changed": [{"path": p, "change": c} for p, c in changes[:limit]],
+    return {"files_changed": [{"path": p, "change": c} for p, c in changes[:300]],
             "files_changed_total": len(changes), "files_changed_source": source}
 
 
@@ -492,7 +508,7 @@ def add_task_arguments(p):
     # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
     p.add_argument("--model", help="Model override; omitted keeps the Codex config default")
-    p.add_argument("--effort", default="medium")
+    p.add_argument("--effort", help="Reasoning effort override; omitted keeps the Codex config default")
     p.add_argument("--service-tier", help='Codex service tier, e.g. "fast" for Fast mode; omitted keeps the config value')
     p.add_argument("--schema")
     p.add_argument("--resume", help="Continue an existing thread id")
@@ -522,11 +538,11 @@ def write_result(job_dir, result):
     os.replace(tmp, job_dir / "result.json")
 
 
-def last_activity(events, tail_bytes=65536):
+def last_activity(events):
     """Describe the newest meaningful Codex item so a poller can see progress, not just 'running'."""
     try:
         with open(events, "rb") as f:
-            f.seek(max(0, events.stat().st_size - tail_bytes))
+            f.seek(max(0, events.stat().st_size - 65536))
             lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return None
@@ -568,7 +584,7 @@ def job_status(job_id):
     # The worker may have finished between the result check above and the pid check.
     if result.exists():
         return {"job_id": job_id, **json.loads(result.read_text("utf-8"))}
-    # The worker writes its pid before anything else, so give a just-started job a moment.
+    # start may still be publishing the worker pid, so give a just-started job a moment.
     if time.time() - job_dir.stat().st_ctime < 5:
         return {"job_id": job_id, "status": "running", "seconds_since_last_event": None}
     return {"job_id": job_id, "status": "failed", "error_kind": "worker_died", "retryable": True, "log_dir": str(job_dir)}
@@ -612,7 +628,6 @@ def main():
     if args.command == "_worker":
         job_dir = HOME / "jobs" / args.job_id
         task = argparse.Namespace(**json.loads((job_dir / "args.json").read_text("utf-8")))
-        (job_dir / "worker.pid").write_text(str(os.getpid()))
         try:
             result = execute(task, (job_dir / "prompt.txt").read_text("utf-8"), job_dir)
         except Exception as e:
@@ -640,7 +655,9 @@ def main():
         if codex_pid.exists():
             # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
             kill_tree(int(codex_pid.read_text()))
-        write_result(job_dir, {"status": "cancelled", "retryable": False, "log_dir": str(job_dir)})
+        # The worker may have published its result after the initial check, before it was killed.
+        if not (job_dir / "result.json").exists():
+            write_result(job_dir, {"status": "cancelled", "retryable": False, "log_dir": str(job_dir)})
         emit(job_status(args.job_id))
 
 

@@ -106,6 +106,70 @@ test('extra allowCommands extend the list', () => {
   assert.equal(readOnlyCommand('./verify.sh --check', [/^\.\/verify\.sh --check$/]), true);
 });
 
+test('filtered arguments cannot hide flags in command substitutions', () => {
+  for (const c of [
+    'find . $(echo -delete)', "find . $(echo -exec) sh -c 'id' \\;",
+    'git diff $(echo --output=pwned)', 'sort $(echo -o pwned) f',
+    'uniq $(echo input output)', 'iconv $(echo -o out) in', 'rg $(echo --pre=sh) x',
+    'tree $(echo -o out)', 'printf $(echo -v) target value',
+    'node --check $(echo --eval=code)', 'go test $(echo -exec=sh) ./...',
+    'cargo test $(echo --config=runner)', 'make test $(echo --eval=code)',
+    'npm test $(echo --script-shell=sh)', 'pnpm test $(echo --script-shell=sh)',
+    'yarn test $(echo --use=code)',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of ['cat $(ls)', 'printf "%s\\n" "$f" "$(wc -c < f)"', 'printf -- "$(echo -v)"']) {
+    assert.equal(readOnlyCommand(c), true, c);
+  }
+});
+
+test('verification commands refuse caller-selected programs and sort sources', () => {
+  for (const c of [
+    'git grep --open-files-in-pager=vi x', 'git grep -Ovi x', 'git grep -nOvi x',
+    'git grep --open-files=vi x', 'git grep --open-files-in=vi x',
+    'git grep --no-index -Ovi x /etc/passwd',
+    'go test -exec sh ./...', 'go test -exec=sh ./...', 'go test --exec=sh ./...',
+    'go test -toolexec=sh ./...', 'go vet -vettool=/bin/sh ./...', 'go vet --vettool /bin/sh ./...',
+    'sort --compress-program=sh f', 'sort --compress-program sh f', 'sort --random-source=f f',
+    'sort --compress-prog=sh f', 'sort --random-s=f f', 'sort --out=out f',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of ['git grep -n x', 'git grep -eFOO', 'git grep -neFOO', 'git log -Oorderfile',
+    'go test ./...', 'go vet ./...', 'sort -nr f', 'sort -- f', 'sort -']) {
+    assert.equal(readOnlyCommand(c), true, c);
+  }
+});
+
+test('multiple sed print expressions and read-only git forms pass without enabling writes', () => {
+  for (const c of [
+    "sed -n '1,5p;20,25p' f", "sed -n ' 1p ; /start/,/end/p; ' f",
+    "sed -n '/a;b/p' f", "sed -n '/a;b/p;20p' f",
+    'git config --get user.name', 'git config -l', 'git config --list',
+    'git remote', 'git remote -v', 'git remote --verbose',
+    'git tag -l', 'git tag --list v1', 'git stash list',
+  ]) assert.equal(readOnlyCommand(c), true, c);
+  for (const c of [
+    "sed -n '1p;2w out' f", "sed -n '1p;2e id' f", "sed -n '1p;;2p' f",
+    'git config user.name changed', 'git config --get user.name --edit', 'git config -l --add user.name x',
+    'git remote add other example.com', 'git remote -v add other example.com',
+    'git tag new-tag', 'git tag -l -d old-tag', 'git stash drop', 'git stash list --output=out',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+});
+
+test('an invalid allowCommands pattern leaves the tools and guard installed', () => {
+  const tools = [];
+  const guards = [];
+  const warnings = [];
+  apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: () => {},
+    logger: { warn: (s) => warnings.push(s) } },
+  { workspaces: ['F:\\work\\项目'], allowCommands: ['[', '^\\./verify\\.sh --check$'] });
+  assert.equal(tools.length, 3);
+  assert.equal(guards.length, 1);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /allowCommands/);
+  assert.match(guards[0](call('edit')), /已拒绝/);
+  assert.match(guards[0](call('wsl', { command: 'rm x' })), /不放行的是「rm x」/);
+  assert.equal(guards[0](call('wsl', { command: './verify.sh --check' })), undefined);
+});
+
 test('guard denies writes only inside configured workspaces', () => {
   assert.match(decide(call('write', { path: 'a' }), cfg), /codex_run/);
   assert.match(decide(call('wsl-edit'), cfg), /已拒绝/);
@@ -550,13 +614,17 @@ test('background job maps cancel, failure and lost monitoring', async () => {
 
 test('without a jobs service, a failing start() or an agent, codex_run keeps polling', async () => {
   for (const setup of [{ jobs: undefined }, { get: false }, { jobs: fakeJobs({ fail: true }) }]) {
-    const { tools, calls } = harness(setup);
+    const { tools, calls, handlers } = harness(setup);
     const value = await tools.codex_run.execute({ ...RUN, wait_seconds: 5 }, { agent: agentAt('F:\\work\\项目') });
     assert.equal(value.status, 'running');
     assert.equal(value.background_job_id, undefined);
     assert.match(value.note, /等了 5 秒[\s\S]*codex_status/);
     // 照旧直接等 runner wait_seconds 秒
     assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '5']]);
+    const before = nudges.length;
+    const claim = [{ type: 'assistant/message', data: { turn: 4, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } }];
+    handlers['agent/turn-stopping']({ agent: agentAt('F:\\work\\项目', claim), turn: 4 });
+    assert.equal(nudges.length, before + 1);
   }
   // 没有 agent 也不登记
   const noAgent = fakeJobs();
@@ -671,10 +739,14 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
 
 test('a failed cancel does not leave a wait that swallows the later completion notice', async () => {
   const jobs = fakeJobs();
-  const { tools, answer } = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'x' } } });
+  const { tools, answer, handlers } = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'x' } } });
   const exec = { agent: agentAt('F:\\work\\项目') };
   await tools.codex_run.execute(RUN, exec);
   assert.equal((await tools.codex_cancel.execute({ job_id: 'J1' }, exec)).error_kind, 'bridge_error');
+  const before = nudges.length;
+  const claim = [{ type: 'assistant/message', data: { turn: 4, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } }];
+  handlers['agent/turn-stopping']({ agent: agentAt('F:\\work\\项目', claim), turn: 4 });
+  assert.equal(nudges.length, before);
   await answer('J1', { status: 'completed' });
   await jobs.started[0].done;
   assert.deepEqual(jobs.unawaited, ['bg1']);

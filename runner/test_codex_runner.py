@@ -1,4 +1,5 @@
 """Fault-injection tests for codex_runner.py. They use a fake Codex, so they spend no model quota."""
+import io
 import json
 import os
 import subprocess
@@ -248,6 +249,66 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(json.loads(first.stdout.read().decode("utf-8"))["status"], "completed")
         first.wait()
 
+    def test_writer_lock_serializes_windows_path_case_aliases(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        paths = [r"F:\Work\Project", r"f:\work\project"]
+        if os.name != "nt":
+            paths += ["/mnt/f/work/PROJECT", "/mnt/F/WORK/Project"]
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            lock = codex_runner.acquire_write_lock(paths[0])
+            self.assertIsNotNone(lock)
+            with lock:
+                for alias in paths[1:]:
+                    with self.subTest(alias=alias):
+                        self.assertIsNone(codex_runner.acquire_write_lock(alias))
+
+    @unittest.skipIf(os.name == "nt", "native Linux paths are case-sensitive")
+    def test_writer_lock_keeps_native_linux_paths_case_sensitive(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            for path in (str(self.cwd / "Project"), "/mnt/data/Project"):
+                with self.subTest(path=path):
+                    with codex_runner.acquire_write_lock(path):
+                        other = codex_runner.acquire_write_lock(path.lower())
+                        self.assertIsNotNone(other)
+                        other.close()
+
+    def test_stdin_errors_return_spawn_failed_and_clean_up(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for operation in ("write", "close"):
+            for error_type in (BrokenPipeError, OSError):
+                with self.subTest(operation=operation, error=error_type.__name__):
+                    proc = mock.Mock(pid=123)
+                    getattr(proc.stdin, operation).side_effect = error_type("stdin failed")
+                    with mock.patch.dict(os.environ, self.env), \
+                            mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
+                            mock.patch.object(sys, "argv", [str(RUNNER), "run", "--cwd", str(self.cwd)]), \
+                            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
+                            mock.patch.object(codex_runner, "read_prompt", return_value="do it"), \
+                            mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc) as popen, \
+                            mock.patch.object(codex_runner, "kill_tree") as kill:
+                        with self.assertRaises(SystemExit) as stopped:
+                            codex_runner.main()
+                        self.assertEqual(stopped.exception.code, 1)
+                        result = json.loads(output.getvalue())
+                        self.assertEqual(result["status"], "failed")
+                        self.assertEqual(result["error_kind"], "spawn_failed")
+                        self.assertEqual(result["error"], "stdin failed")
+                        self.assertFalse(result["retryable"])
+                        self.assertEqual(result["attempts"], 1)
+                        popen.assert_called_once()
+                        kill.assert_called_once_with(proc.pid)
+                        proc.wait.assert_called_once_with()
+                        proc.stdin.close.assert_called()
+                        proc.stdout.close.assert_called_once_with()
+                        self.assertTrue(popen.call_args.kwargs["stderr"].closed)
+
     def control(self, *args):
         p = subprocess.run([sys.executable, str(RUNNER), *args], capture_output=True, timeout=60, env=self.env)
         return json.loads(p.stdout.decode("utf-8"))
@@ -270,6 +331,33 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.control("cancel", job["job_id"])["status"], "cancelled")
         time.sleep(1)
         self.assertFalse(alive(int(child.read_text())))
+
+    def test_cancel_preserves_a_result_published_during_killing(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.tmp.name) / "home"
+        job_dir = home / "jobs" / "raced"
+        job_dir.mkdir(parents=True)
+        (job_dir / "worker.pid").write_text("123")
+        (job_dir / "codex.pid").write_text("456")
+        completed = {"status": "completed", "final_message": "done", "usage": {"input_tokens": 1}}
+        for finishing_pid in (123, 456):
+            with self.subTest(finishing_pid=finishing_pid):
+                (job_dir / "result.json").unlink(missing_ok=True)
+
+                def finish_during_kill(pid):
+                    if pid == finishing_pid:
+                        codex_runner.write_result(job_dir, completed)
+
+                with mock.patch.object(codex_runner, "HOME", home), \
+                        mock.patch.object(sys, "argv", [str(RUNNER), "cancel", "raced"]), \
+                        mock.patch.object(codex_runner, "kill_tree", side_effect=finish_during_kill) as kill, \
+                        mock.patch.object(codex_runner, "emit") as emit:
+                    codex_runner.main()
+                    self.assertEqual(kill.call_args_list, [mock.call(123), mock.call(456)])
+                    emit.assert_called_once_with({"job_id": "raced", **completed})
+                    self.assertEqual(json.loads((job_dir / "result.json").read_text("utf-8")), completed)
 
     def test_windows_cwd_is_mapped_only_inside_wsl(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -311,6 +399,15 @@ class RunnerTests(unittest.TestCase):
         del args.service_tier
         cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
         self.assertFalse(any("service_tier" in part for part in cmd))
+
+    def test_omitted_effort_leaves_codex_config_in_control(self):
+        for command in ("run", "start"):
+            with self.subTest(command=command):
+                result = self.invoke(command=command)
+                if command == "start":
+                    result = self.control("status", result["job_id"], "--wait", "30")
+                self.assertEqual(result["status"], "completed")
+                self.assertFalse(any("model_reasoning_effort" in part for part in self.calls()[-1]["argv"]))
 
     def test_user_mcp_servers_are_disabled_one_by_one(self):
         sys.path.insert(0, str(RUNNER.parent))

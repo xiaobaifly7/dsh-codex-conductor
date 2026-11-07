@@ -35,7 +35,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 - 拒绝直接写文件或执行任意代码的工具：`write`、`edit`、`pwsh`、`run_code`、`subagent_codex`，以及 `wsl-write`、`wsl-edit`、`wsl-term`、`wsl-bootstrap`、`actions_run`、`actions_configure`；MCP 工具按动作名拒绝（`write`、`edit`、`replace`、`insert`、`delete`、`execute` 等）。
 - shell 工具（`wsl`、`bash`、`ops_bash`）只放行只读核验命令：`git status/diff/log/show`、`ls`、`cat`、`grep`、`find`、`wc`、`sha256sum`、`pytest`、`npm test`、`pwsh -File tests/*.ps1`、`bash -n` 等；可以用 `|`、`&&`、`for`、`if` 和只读的 `$(...)`；拒绝写重定向（`/dev/null` 除外）、反引号、heredoc 和 `$((...))` 算术。`pwsh` / `powershell` 必须写成字面命令或路径，`$PWSH` 这类变量不放行。
-- `sed` 只放行 `sed -n '<地址>p' 文件…`：地址是行号、`N,M` 或 `/正则/`（可带第二个 `/正则/`），正则里不能有 `\` 和 `$`；后面的参数不能以 `-` 开头（`-i`、`--in-place`、`-e`、`-f` 都不行），也不能含 `$` 或 `{`。取末行用 `tail`。`printf -v` 不放行。
+- `sed` 只放行 `sed -n '<地址>p' 文件…`，支持用 `;` 分隔多段打印（如 `1,5p;20,25p`）：地址是行号、`N,M` 或 `/正则/`（可带第二个 `/正则/`），正则里不能有 `\` 和 `$`；后面的参数不能以 `-` 开头（`-i`、`--in-place`、`-e`、`-f` 都不行），也不能含 `$` 或 `{`。取末行用 `tail`。`printf -v` 和含 `$` 的首参数不放行，其余输出参数仍可用变量和只读命令替换。
+- 有参数过滤的命令（`git`、`find`、`sort`、`uniq`、`iconv`、`rg`、`tree`、`node`、`go`、`cargo`、`make`、`npm/pnpm/yarn`）不接受含 `$` 的参数，防止展开后变成写入或执行开关；`cat $(ls)` 这类读取仍可用。`git grep -O/--open-files-in-pager`、Go 的 `-exec/-toolexec/-vettool`、`sort --compress-program/--random-source` 不放行。Git 另支持 `config --get/-l/--list`、`remote [-v/--verbose]`、`tag -l/--list` 和 `stash list` 这些只读形式。
 - 拒绝时说明原因：命令结构本身不放行时，列出不放行的结构（写到 `/dev/null` 以外的重定向、反引号、heredoc、`$((...))`、进程替换、`$(...)` 里的非只读命令、未闭合引号）；否则指出第一段不放行的命令（去掉流程关键字和 `timeout N` 前缀后，截取前 200 字）。
 - PowerShell 语法检查用随包的 [`tools/Test-PsSyntax.ps1`](tools/Test-PsSyntax.ps1)：只用 PowerShell 解析器解析、不执行，逐个输出 `PARSE-OK <文件> tokens=N`，或 `PARSE-FAIL <文件>` 加若干 `行号: 错误`；退出码 0 全部通过，1 有语法错误，2 没给文件或文件不存在。护栏只放行这一种形式：
 
@@ -45,7 +46,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
   脚本路径必须是插件安装目录里的这一份（Windows 路径或 `/mnt/...` 形式都行）；后面至少跟一个文件，且不能有 `-` 开头的参数；`-File` 之前只允许 `-NoProfile`、`-NonInteractive`、`-NoLogo`、`-ExecutionPolicy <值>`，`-Command`、`-c`、`-EncodedCommand` 都会被拒绝。被拒时的提示里给出本机的完整路径。
 - 通过 `tool_call` 间接调用的工具同样受限；子代理会话按它自己的工作区判断。
-- 防虚报：回合结束时 agent 声称“已派 Codex”或“Codex 正在做”，但这一轮没有调用 `codex_*`，也没有由 `codex_run` 启动且仍在运行的任务，插件会提醒它一次，让它补上调用或更正说法。
+- 防虚报：回合结束时 agent 声称“已派 Codex”或“Codex 正在做”，但这一轮没有调用 `codex_*`，也没有由本插件后台监控确认仍在运行的任务，插件会提醒它一次，让它补上调用或更正说法。没有 jobs 服务时不跨轮缓存轮询状态；取消失败时继续保留后台任务的执行状态。
 
 ## 要求
 
@@ -97,7 +98,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `waitSeconds` | `1500` | `codex_run` 默认等待秒数，到时任务转后台 |
 | `allowHostAccess` | `false` | 为 `true` 时 `codex_run` 才提供 `host_access` 参数，允许 Codex 不带沙箱（`danger-full-access`）运行、启动 Windows 程序（见上文） |
 | `plannerPromptFile` | `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` | 规划要求文件（Markdown，HTML 注释不算内容），注入 agent 的系统提示词（见上文） |
-| `allowCommands` | `[]` | 额外放行的命令，正则逐段匹配（按 `\|`、`&&`、`;` 切开后的每一段），建议写成锚定正则 |
+| `allowCommands` | `[]` | 额外放行的命令，正则逐段匹配（按 `\|`、`&&`、`;` 切开后的每一段），建议写成锚定正则；非法正则会警告并跳过，护栏和其余条目照常生效 |
 | `denyTools` | `[]` | 额外拒绝的工具名 |
 | `python` | `python3` | WSL 内运行 runner 的解释器 |
 
@@ -141,7 +142,7 @@ A DeepSeek Harness plugin that lets the DSH agent plan and verify while Codex CL
 - Without `cwd`, Codex runs in the `cwd` of the most specific `workspaces` entry (`{path, cwd}`) that contains the session workspace, else in the session workspace. `readOnlyEffort` sets the default effort for read-only tasks.
 - When the agent's preset offers DSH background jobs, every `codex_run` registers one background job as soon as Codex starts, so the run shows up in the DSH task list at once with a progress line (refreshed about every 20 s: seconds since Codex's last event and its latest action). A run that ends within `wait_seconds` returns its result directly; a longer one keeps running in the background; when it ends, DSH posts a one-line job notification and the agent reads the full result (report and next step) with `job_output`. A finished run's task-list row and the first line of its result start with a one-line summary such as `completed · 12 met / 1 blocked · 3 files · 148 s` (failed or cancelled runs: status, error kind, duration). The row is titled `Codex <job_id> · <first line of the task>`; in the chat, the `codex_run` card shows `Codex · <first line of the task>` while running and the summary once done. A cancelled run is not treated as a failure: the next step says to ask the user and warns that a writer may have left partial, unlisted edits. Finished rows stay in the task list; archiving a session can cancel a running Codex job, and aborting the tool call cancels Codex without a later notice. Without a jobs service, poll with `codex_status`.
 - Planner requirements: standing instructions for the agent itself (how to split work and write task and acceptance criteria) live in `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` (config `plannerPromptFile`; `loaded.json` shows the real path). The plugin creates a comment-only template; everything outside HTML comments is injected as a system-prompt section on every step, survives context compaction, takes effect on the next step after saving, and is never sent to Codex verbatim. When it is set, each completed `codex_run` next step also reminds the agent to check it.
-- In configured `workspaces`, the agent's own file-writing tools are denied and shell tools only run read-only verification commands (`sed` only as `sed -n '<addr>p' file...`; no `$((...))`). A denial names the refused structure or the first refused command segment. PowerShell syntax checks go through the bundled `tools/Test-PsSyntax.ps1` (`pwsh -NoProfile -File <that script> a.ps1 ...`). A turn that claims Codex was dispatched without calling `codex_*` gets one reminder.
+- In configured `workspaces`, the agent's own file-writing tools are denied and shell tools only run read-only verification commands (`sed` only as `sed -n '<addr>p[;<addr>p…]' file...`; no `$((...))`). Argument-filtered commands reject `$` expansions; caller-selected Git pagers, Go execution tools and sort compression programs/random sources are refused. Read-only Git config, remote, tag and stash forms are supported. Invalid `allowCommands` regexes are warned about and skipped without disabling the guard. A denial names the refused structure or the first refused command segment. PowerShell syntax checks go through the bundled `tools/Test-PsSyntax.ps1` (`pwsh -NoProfile -File <that script> a.ps1 ...`). Dispatch reminders only trust background jobs with an active monitor across turns; a failed cancel keeps that state.
 - Tests: `node --test test.mjs` and `python3 runner/test_codex_runner.py`; GitHub Actions runs both on Ubuntu and Windows.
 - Requires Windows with WSL2, Codex CLI and `python3` (3.11+) inside WSL, and DSH `>=0.2.1-rc.2 <0.3.0`. Install with `github:xiaobaifly7/dsh-codex-conductor`.
 
