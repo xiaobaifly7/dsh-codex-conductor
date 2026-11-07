@@ -650,6 +650,47 @@ test('host_access runs Codex with danger-full-access, and only when allowHostAcc
   assert.match(on.calls.at(-1).join(' '), /--sandbox workspace-write/);
 });
 
+test('defaultHostAccess covers read, write and resume while explicit false restores the sandbox', async () => {
+  const config = { allowHostAccess: true, defaultHostAccess: true, startResult: { job_id: 'J', status: 'completed' } };
+  const { tools, calls } = harness({ config });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const starts = [];
+  const c = createConductor(config, (_cfg, argv, opts) => {
+    starts.push({ argv, stdin: opts?.stdin });
+    return Promise.resolve(config.startResult);
+  });
+  assert.equal(tools.codex_run.parameters.properties.host_access.default, true);
+  assert.match(tools.codex_run.description, /默认[^。]*danger-full-access[^。]*省略 host_access/);
+  assert.match(tools.codex_run.description, /resume 同样生效/);
+  assert.match(tools.codex_run.description, /host_access=false[^。]*恢复沙箱/);
+
+  for (const mode of [{}, { write: true }, { resume: 'T9' }]) {
+    for (const access of [{}, { host_access: false }]) {
+      const args = { ...RUN, ...mode, ...access };
+      const host = args.host_access !== false;
+      const sandbox = host ? ['danger-full-access'] : args.write ? ['workspace-write'] : [];
+      await c.start(args, 'F:\\proj');
+      const { argv, stdin } = starts.at(-1);
+      assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--sandbox'), sandbox);
+      assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--resume'), args.resume ? ['T9'] : []);
+      (host ? assert.match : assert.doesNotMatch)(stdin, /沙箱外运行/);
+      (host && !args.write ? assert.match : assert.doesNotMatch)(stdin, /只读调查/);
+      if (host) assert.match(stdin, /不要删除、停止、重建或改配置/);
+
+      await tools.codex_run.execute(args, exec);
+      assert.deepEqual(calls.at(-1).filter((a, i, all) => all[i - 1] === '--sandbox'), sandbox);
+      assert.deepEqual(calls.at(-1).filter((a, i, all) => all[i - 1] === '--resume'), args.resume ? ['T9'] : []);
+      const card = tools.codex_run.presentCall(args);
+      assert.equal(card.kind, host || args.write ? 'execute' : 'read');
+      (host ? assert.match : assert.doesNotMatch)(card.title, /（主机）/);
+    }
+  }
+
+  const off = harness({ config: { ...config, allowHostAccess: false } });
+  await assert.rejects(off.tools.codex_run.execute(RUN, exec), /allowHostAccess/);
+  assert.equal(off.calls.length, 0);
+});
+
 test('a running job is registered once as a DSH background job and reports back on completion', async () => {
   const jobs = fakeJobs();
   const { tools, handlers, calls, answer } = harness({ jobs });
