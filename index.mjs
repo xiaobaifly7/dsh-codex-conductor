@@ -569,6 +569,10 @@ export const runRunner = (cfg, args, opts = {}, exec = runProcess) =>
 const BRIDGE_TIMEOUT_MS = 120_000;
 const BRIDGE_SLACK_MS = 60_000;
 
+const unknownState = (value) => ['bridge_error', 'unknown_job', 'invalid_record'].includes(value.error_kind) ||
+  ['monitor_failed', 'unknown'].includes(value.status);
+const cancelUnconfirmed = (value) => unknownState(value) || !['cancelled', 'completed', 'failed'].includes(value.status);
+
 export function createConductor(cfg, run = runRunner) {
   // 每次等待是一个有界的 `status --wait` 进程，到点即退出；仍在执行时 runner 会带回空闲秒数和最近动作
   async function waitJob(jobId, seconds, signal) {
@@ -609,8 +613,9 @@ export function createConductor(cfg, run = runRunner) {
 
   async function cancel(jobId, signal) {
     const value = await run(cfg, ['cancel', jobId], { timeoutMs: BRIDGE_TIMEOUT_MS });
-    if (signal?.aborted && value.error_kind === 'bridge_error') {
-      throw new Error(`Codex 任务 ${jobId} 的取消未确认：${value.error ?? '连接 WSL 失败'}。任务可能仍在运行，用 codex_status 查询 ${jobId}，不要重派。`);
+    if (signal?.aborted && cancelUnconfirmed(value)) {
+      throw new Error(`Codex 任务 ${jobId} 的取消未确认：${value.error ?? value.error_kind ?? value.status}。` +
+        `任务可能仍在运行，用 codex_jobs 核对正确 job_id，再用 codex_status 查询 ${jobId}，不要重派。`);
     }
     return value;
   }
@@ -699,9 +704,10 @@ export function reviewState(value) {
     ['files_changed', 'deviations', 'unresolved'].every((key) => Array.isArray(report[key]) && report[key].every((s) => typeof s === 'string')) &&
     criteria.every((c) => c && typeof c.criterion === 'string' && typeof c.evidence === 'string' && Object.hasOwn(counts, c.status) &&
       Object.keys(c).every((key) => ['criterion', 'status', 'evidence'].includes(key)));
-  const execution = value.error_kind === 'schema_invalid' ? 'completed' : value.status;
+  const unknown = unknownState(value);
+  const execution = unknown ? 'unknown' : value.error_kind === 'schema_invalid' ? 'completed' : value.status;
   const pending = execution === 'running';
-  const reportStatus = pending ? 'pending' : value.error_kind === 'schema_invalid' || value.report_status === 'invalid' ? 'invalid'
+  const reportStatus = unknown ? 'missing' : pending ? 'pending' : value.error_kind === 'schema_invalid' || value.report_status === 'invalid' ? 'invalid'
     : report === undefined ? 'missing' : valid ? 'valid' : 'invalid';
   const expected = value.acceptance ?? value.context?.acceptance;
   const attention = execution !== 'completed' || reportStatus !== 'valid' || counts.not_met > 0 || counts.blocked > 0 ||
@@ -751,6 +757,13 @@ function sameCriteria(report, acceptance) {
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
 export function nextStep(value, acceptance, resumed, { hostAccess = false, readOnly = value.context?.write === false || value.sandbox === 'read-only' } = {}) {
   acceptance ??= value.acceptance ?? value.context?.acceptance;
+  if (!value.job_id && unknownState(value)) {
+    return '这次未取得任务编号，无法确认 Codex 是否已经启动。先用 codex_jobs 按相同任务目录和原任务核对近期记录，找回 job_id 后再查状态，不要直接重派。';
+  }
+  if (value.job_id && unknownState(value)) {
+    return `当前未取得可信状态或报告，Codex 任务 ${value.job_id} 可能仍在运行。` +
+      `用 codex_jobs 核对正确 job_id；先用 codex_status 查询，不要直接重派。`;
+  }
   if (value.status === 'running') return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
   // 取消会保留恢复信息，但不会重建中断前的改动清单。
   if (value.status === 'cancelled') {
@@ -760,10 +773,6 @@ export function nextStep(value, acceptance, resumed, { hostAccess = false, readO
   // 只读任务用 --ephemeral 运行、不留会话记录，自己的 thread_id 续不上；只有它续跑的写任务线程还能续
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
-    // wsl.exe 出错只说明这次没查到或没取消成功，任务本身可能还在跑；重派会多出一个同样的任务
-    if (value.error_kind === 'bridge_error' && value.job_id) {
-      return `连接 WSL 出错，Codex 任务 ${value.job_id} 可能仍在运行：先用 codex_status 查询，不要直接重派。`;
-    }
     if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
     // worker_died 的可写任务：退出前可能已改了部分文件，续跑后的改动清单也不含这些
     const partial = value.error_kind === 'worker_died' && !readOnly
@@ -1011,6 +1020,9 @@ export function apply(ctx, config = {}, run = runRunner) {
       for (;;) {
         const value = withReport(await conductor.waitJob(jobId, BG_WAIT));
         if (value.log_dir) state.logDir = value.log_dir;
+        if (unknownState(value) && value.error_kind !== 'bridge_error') {
+          throw new Error([value.error_kind ?? value.status, value.error].filter(Boolean).join(': '));
+        }
         if (value.status === 'running') {
           bridgeErrors = 0;
           const phase = { router_check: '检查路由', codex_running: 'Codex 执行中', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
@@ -1035,8 +1047,8 @@ export function apply(ctx, config = {}, run = runRunner) {
         return publish(finish(value));
       }
     } catch (error) {
-      const lost = { job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error),
-        next: `后台等待出错，底层 Codex 任务可能仍在运行：先用 codex_status 查询 ${jobId}，不要直接重派。` };
+      const lost = withReport({ job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error) });
+      lost.next = nextStep(lost);
       return publish(lost);
     } finally {
       state.settled = true;
@@ -1061,7 +1073,8 @@ export function apply(ctx, config = {}, run = runRunner) {
           const cancelNotice = (reason) => {
             if (state.settled) return;
             state.cancelNotice = `取消未确认 · runner job_id: ${jobId}：${reason}；` +
-              `任务可能仍在运行，用 codex_status 查询 ${jobId}，或 codex_cancel 再取消 ${jobId}，不要重派。`;
+              `任务可能仍在运行，用 codex_jobs 核对正确 job_id，再用 codex_status 查询 ${jobId}，` +
+              `或 codex_cancel 再取消 ${jobId}，不要重派。`;
             handle.updateProgress([state.cancelNotice, state.progress].filter(Boolean).join('\n'));
             handle.append(`${state.cancelNotice}\n`, { channel: 'log' });
           };
@@ -1070,7 +1083,7 @@ export function apply(ctx, config = {}, run = runRunner) {
             cancel: () => {
               cancelNotice('正在请求 runner 取消');
               return conductor.cancel(jobId).then((value) => {
-                if (value.error_kind === 'bridge_error' || !['cancelled', 'completed', 'failed'].includes(value.status)) {
+                if (cancelUnconfirmed(value)) {
                   cancelNotice([value.error_kind ?? value.status, value.error].filter(Boolean).join(': '));
                 }
               }).catch((error) => cancelNotice(String(error?.message ?? error)));
@@ -1250,17 +1263,19 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_cancel: job_id 必须是非空字符串');
       const bg = liveBackground(args.job_id, exec);
       // 取消前先挂上等待：后台循环随后看到任务结束并结算，算作已被等到，DSH 不再另发一条结束通知。
-      // wsl.exe 出错时取消没执行，撤掉等待，免得它吞掉任务之后真正结束时的通知
+      // 取消未确认时撤掉等待，免得吞掉任务之后真正结束时的通知。
       const stop = new AbortController();
       const settled = bg?.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner, stop.signal).catch(() => {});
       const value = await conductor.cancel(args.job_id);
-      if (value.error_kind === 'bridge_error') stop.abort();
+      const unconfirmed = cancelUnconfirmed(value);
+      if (unconfirmed) stop.abort();
       await settled;
       // 下一步要贴合「取消」这件事，不能套用重派话术
       const done = withReport({ job_id: args.job_id, ...value });
       let next;
-      if (done.error_kind === 'bridge_error') {
-        next = `这次 wsl.exe 调用出错，取消可能没执行，Codex 任务 ${args.job_id} 可能仍在运行：稍后再调用一次 codex_cancel（任务已结束时它会直接返回结果），不要重派；再出错就把 error 原样告诉用户。`;
+      if (unconfirmed) {
+        next = `取消未确认（${done.error_kind ?? done.status}），Codex 任务 ${args.job_id} 可能仍在运行：` +
+          `用 codex_jobs 核对正确 job_id，再用 codex_status 查询 ${args.job_id}；需要取消时可再调用 codex_cancel，不要重派。`;
       } else if (done.status === 'completed') {
         // 取消没赶上：任务已经完成，改动已经留下，按完成处理
         next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done, undefined, undefined, { hostAccess: cfg.allowHostAccess === true })}`;
@@ -1284,7 +1299,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       properties: {
         cwd: { type: 'string', description: '任务工作目录，省略且未指定会话时使用当前工作区。' },
         session_id: { type: 'string', description: 'Harness 会话 ID；current 表示当前会话。' },
-        status: { type: 'string', enum: ['running', 'completed', 'cancelled', 'failed'], description: '按执行状态筛选。' },
+        status: { type: 'string', enum: ['running', 'completed', 'cancelled', 'failed', 'unknown'], description: '按执行状态筛选。' },
         needs_attention: { type: 'boolean', description: '仅列出失败、取消、报告异常、受阻或有未解决事项的任务。' },
         limit: { type: 'integer', minimum: 1, maximum: 100, description: '每页条数，默认 20。' },
         offset: { type: 'integer', minimum: 0, description: '分页起点，默认 0。' },
@@ -1295,7 +1310,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       for (const key of ['cwd', 'session_id']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !args[key].trim())) {
         throw new Error(`codex_jobs: ${key} 必须是非空字符串`);
       }
-      if (args.status !== undefined && !['running', 'completed', 'cancelled', 'failed'].includes(args.status)) throw new Error('codex_jobs: status 无效');
+      if (args.status !== undefined && !['running', 'completed', 'cancelled', 'failed', 'unknown'].includes(args.status)) throw new Error('codex_jobs: status 无效');
       if (args.needs_attention !== undefined && typeof args.needs_attention !== 'boolean') throw new Error('codex_jobs: needs_attention 必须是布尔值');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new Error('codex_jobs: limit 必须是 1–100 的整数');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_jobs: offset 必须是非负整数');

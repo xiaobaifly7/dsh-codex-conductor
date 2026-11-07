@@ -1534,8 +1534,8 @@ test('every runner call has an upper bound: status gets its wait plus slack, sta
 test('a bridge error on a known job says to query it before sending the task again', () => {
   assert.match(nextStep({ job_id: 'J7', status: 'failed', error_kind: 'bridge_error', retryable: true }),
     /J7 可能仍在运行[^\n]*codex_status[^\n]*不要直接重派/);
-  // 启动时就出错（还没有 job_id）照旧按可重试处理
-  assert.match(nextStep({ status: 'failed', error_kind: 'bridge_error', retryable: true }), /这次失败可重试/);
+  // 未取得 job_id 时也不能断言尚未启动，先从历史找回，避免重复派发。
+  assert.match(nextStep({ status: 'failed', error_kind: 'bridge_error', retryable: true }), /codex_jobs[\s\S]*不要直接重派/);
 });
 
 test('codex_cancel on a finished job returns its report and next step; a failed cancel says to query first', async () => {
@@ -1949,4 +1949,140 @@ test('plugin and real runner preserve context, full Unicode output and execution
     if (id && !ended) await bridge({}, ['cancel', id]);
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+const unconfirmedCancels = [
+  ...['bridge_error', 'unknown_job', 'invalid_record'].map((error_kind) => ({ status: 'failed', error_kind, error: `mock ${error_kind}` })),
+  { status: 'running' }, { status: 'stopping' }, { status: 'unknown' },
+];
+
+test('unconfirmed cancel responses release the native wait and never claim that the task ended', async () => {
+  for (const cancelResult of unconfirmedCancels) {
+    const jobs = fakeJobs();
+    const h = harness({ jobs, config: { cancelResult } });
+    const exec = { agent: agentAt('/mock/work') };
+    await h.tools.codex_run.execute(RUN, exec);
+    const pending = h.tools.codex_cancel.execute({ job_id: 'J1' }, exec);
+    await tick();
+    try {
+      assert.equal(jobs.started[0].waiters.size, 0, JSON.stringify(cancelResult));
+      const value = await pending;
+      assert.equal(value.status, cancelResult.status);
+      assert.equal(value.job_id, 'J1');
+      assert.match(value.next, /取消未确认[\s\S]*J1[\s\S]*codex_jobs[\s\S]*codex_status[\s\S]*codex_cancel[\s\S]*不要重派/);
+      assert.doesNotMatch(value.next, /已经结束|已按本次调用取消|没有结束任何进程|再派一次|resume=/);
+    } finally {
+      await h.answer('J1', { status: 'completed' });
+      await jobs.started[0].done;
+      await pending;
+    }
+    assert.deepEqual(jobs.unawaited, ['bg1']);
+  }
+});
+
+test('native cancel keeps unknown records and nonterminal replies unconfirmed across progress updates', async () => {
+  for (const cancelResult of unconfirmedCancels) {
+    const jobs = fakeJobs();
+    const h = harness({ jobs, config: { cancelResult } });
+    await h.tools.codex_run.execute(RUN, { agent: agentAt('/mock/work') });
+    assert.equal(jobs.kill('bg1', 'S1'), 'requested');
+    await tick();
+    const progress = jobs.get('bg1', 'S1').progress;
+    assert.ok(progress.includes(cancelResult.error_kind ?? cancelResult.status));
+    assert.match(progress, /取消未确认[\s\S]*J1[\s\S]*codex_jobs[\s\S]*codex_status/);
+    await h.answer('J1', { status: 'running', phase: 'codex_running', attempt: 1 });
+    await tick();
+    assert.equal(jobs.get('bg1', 'S1').status, 'stopping');
+    assert.match(jobs.get('bg1', 'S1').progress, /取消未确认[\s\S]*J1/);
+    await h.answer('J1', { status: 'cancelled' });
+    await jobs.started[0].done;
+    assert.equal(jobs.get('bg1', 'S1').status, 'killed');
+  }
+});
+
+test('an aborted start or poll preserves its job id for every unconfirmed cancel response', async () => {
+  for (const cancelResult of unconfirmedCancels) {
+    for (const phase of ['start', 'status']) {
+      const stop = new AbortController();
+      const calls = [];
+      const run = async (_cfg, argv) => {
+        calls.push(argv[0]);
+        if (argv[0] === phase) stop.abort();
+        return argv[0] === 'cancel' ? cancelResult : { job_id: 'J-uncertain', status: 'running' };
+      };
+      let pending;
+      if (phase === 'start') {
+        const tools = {};
+        apply({ tools: { register: (t) => { tools[t.name] = t; }, guard() {} }, on() {} }, {}, run);
+        pending = tools.codex_run.execute({ ...RUN, cwd: '/mock/work' }, { signal: stop.signal });
+      } else pending = createConductor({}, run).waitJob('J-uncertain', 0, stop.signal);
+      await assert.rejects(pending, (error) => {
+        assert.match(error.message, /J-uncertain[^\n]*取消未确认[\s\S]*可能仍在运行[\s\S]*codex_jobs[\s\S]*codex_status[\s\S]*不要重派/);
+        assert.ok(error.message.includes(cancelResult.error ?? cancelResult.status));
+        return true;
+      });
+      assert.deepEqual(calls, [phase, 'cancel']);
+    }
+  }
+  for (const result of [{ status: 'cancelled' }, { status: 'completed' }, { status: 'failed', error_kind: 'idle_timeout' }]) {
+    const stop = new AbortController();
+    stop.abort();
+    const c = createConductor({}, async () => result);
+    assert.equal(await c.cancel('J-confirmed', stop.signal), result);
+    await assert.rejects(c.waitJob('J-confirmed', 0, stop.signal), { name: 'AbortError' });
+  }
+});
+
+test('unknown or invalid runner records end monitoring with unknown execution and retained recovery entries', async () => {
+  for (const error_kind of ['unknown_job', 'invalid_record']) {
+    const jobs = fakeJobs();
+    const h = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind, error: `mock ${error_kind}` } } });
+    await h.tools.codex_run.execute(RUN, { agent: agentAt('/mock/work') });
+    await h.answer('J1', { status: 'running', log_dir: '/mock/runner/jobs/J1', phase: 'codex_running', attempt: 1 });
+    await tick();
+    jobs.kill('bg1', 'S1');
+    await tick();
+    const polls = h.calls.filter((a) => a[0] === 'status').length;
+    await h.answer('J1', { status: 'failed', error_kind, error: `mock ${error_kind}` });
+    const done = await jobs.started[0].done;
+    assert.equal(h.calls.filter((a) => a[0] === 'status').length, polls);
+    assert.equal(done.status, 'failed'); // DSH 的监控任务失败，不是 Codex 执行失败。
+    assert.match(done.result, /^monitor_failed/);
+    assert.match(done.result, /"execution_status": "unknown"[\s\S]*"report_status": "missing"[\s\S]*"review_status": "needs_attention"/);
+    assert.match(done.result, /codex_jobs[\s\S]*codex_status[\s\S]*取消未确认[\s\S]*J1[\s\S]*完整结果入口[\s\S]*\/mock\/runner\/jobs\/J1\/result\.json[\s\S]*codex_output/);
+    assert.ok(done.result.includes(error_kind));
+    assert.doesNotMatch(done.result, /"execution_status": "failed"|在取消前已经结束/);
+  }
+});
+
+test('unavailable observations mean unknown execution and currently missing report without changing raw status', () => {
+  const values = [
+    ...['bridge_error', 'unknown_job', 'invalid_record'].map((error_kind) => ({ status: 'failed', error_kind })),
+    { status: 'monitor_failed' }, { status: 'unknown' },
+  ];
+  for (const input of values) {
+    const value = withReport({ job_id: 'J-state', retryable: true, ...input });
+    assert.equal(value.status, input.status);
+    assert.equal(value.execution_status, 'unknown');
+    assert.equal(value.report_status, 'missing');
+    assert.equal(value.review_status, 'needs_attention');
+    assert.match(nextStep(value), /当前未取得可信状态或报告[\s\S]*J-state[\s\S]*可能仍在运行[\s\S]*codex_jobs[\s\S]*codex_status[\s\S]*不要直接重派/);
+    assert.doesNotMatch(nextStep(value), /失败可重试|再派一次|已经结束/);
+  }
+});
+
+test('a start observation failure without a job id directs recovery through history instead of redispatch', async () => {
+  const h = harness({ config: { startResult: { status: 'failed', error_kind: 'bridge_error', error: 'bridge timeout', retryable: true } } });
+  const value = await h.tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  assert.equal(value.execution_status, 'unknown');
+  assert.match(value.next, /未取得任务编号[\s\S]*codex_jobs[\s\S]*不要直接重派/);
+  assert.doesNotMatch(value.next, /同样的参数再派/);
+  assert.equal(h.calls.filter((a) => a[0] === 'start').length, 1);
+});
+
+test('history accepts and forwards the unknown execution filter', async () => {
+  const h = harness({ config: { listResult: { jobs: [], total: 0 } } });
+  assert.ok(h.tools.codex_jobs.parameters.properties.status.enum.includes('unknown'));
+  await h.tools.codex_jobs.execute({ cwd: '/mock/work', status: 'unknown' }, {});
+  assert.deepEqual(h.calls, [['list', '--limit', '20', '--offset', '0', '--cwd', '/mock/work', '--status', 'unknown']]);
 });

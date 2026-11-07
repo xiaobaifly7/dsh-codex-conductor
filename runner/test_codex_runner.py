@@ -1066,6 +1066,79 @@ class RunnerTests(unittest.TestCase):
                    "files_changed": [{"path": "other.txt", "change": "modified"}]}
         self.assertEqual(codex_runner.review_summary(outside)["review_status"], "needs_attention")
 
+    def test_review_query_errors_leave_execution_unknown(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for raw_status, kind in (("failed", "invalid_record"), ("failed", "unknown_job"),
+                                 ("failed", "bridge_error"), ("monitor_failed", None)):
+            value = {"status": raw_status, "error_kind": kind}
+            summary = codex_runner.review_summary(value)
+            self.assertEqual(summary["execution_status"], "unknown")
+            self.assertEqual(summary["review_status"], "needs_attention")
+            self.assertEqual(summary["report_status"], "missing")
+            self.assertEqual(value["status"], raw_status)
+        missing = self.control("status", "no-such-job")
+        self.assertEqual(missing["status"], "failed")
+        self.assertEqual(missing["execution_status"], "unknown")
+        self.assertEqual(self.control("output", "no-such-job")["execution_status"], "unknown")
+        bad = self.stored_job("bad-record", {"status": "completed"})
+        (bad / "args.json").write_text("[]")
+        result = self.control("status", bad.name)
+        self.assertEqual(result["error_kind"], "invalid_record")
+        self.assertEqual(result["execution_status"], "unknown")
+        listing = self.control("list", "--status", "unknown")
+        self.assertEqual([j["job_id"] for j in listing["jobs"]], [bad.name])
+        self.assertEqual(listing["jobs"][0]["status"], "failed")
+
+    def test_review_paths_do_not_follow_symlinks_created_after_the_run(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        allowed = self.cwd / "allowed"
+        allowed.mkdir()
+        changed = allowed / "file.txt"
+        changed.write_text("original")
+        outside = Path(self.tmp.name) / "outside.txt"
+        outside.write_text("external")
+        value = {"status": "completed", "structured": self.sample_report(), "cwd": str(self.cwd),
+                 "scope_paths": [str(allowed)], "files_changed": [{"path": "allowed/file.txt", "change": "modified"}]}
+        before = codex_runner.review_summary(value)
+        self.assertEqual(before["review_status"], "needs_verification")
+        changed.unlink()
+        try:
+            changed.symlink_to(outside)
+        except OSError as e:
+            if os.name == "nt":
+                self.skipTest(f"file symlink is unavailable: {e}")
+            raise
+        self.assertEqual(codex_runner.review_summary(value), before)
+
+    def test_review_windows_backed_paths_compare_lexically_without_fs_lookups(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        value = {"status": "completed", "structured": self.sample_report(), "cwd": "/mnt/c/Work/Project",
+                 "scope_paths": ["/mnt/C/work/PROJECT/src"],
+                 "files_changed": [{"path": "SRC/./a.py", "change": "modified"}]}
+        with mock.patch.object(codex_runner.os.path, "realpath", side_effect=AssertionError("historical path was resolved")):
+            self.assertEqual(codex_runner.review_summary(value)["review_status"], "needs_verification")
+            value["files_changed"][0]["path"] = "src/../../outside.py"
+            self.assertEqual(codex_runner.review_summary(value)["review_status"], "needs_attention")
+
+    @unittest.skipIf(os.name == "nt", "native Linux path case belongs to the Linux runner")
+    def test_review_native_linux_paths_keep_case_sensitive_scope(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for cwd in ("/srv/Project", "/mnt/data/Project"):
+            with self.subTest(cwd=cwd):
+                value = {"status": "completed", "structured": self.sample_report(), "cwd": cwd,
+                         "scope_paths": [cwd + "/src"], "files_changed": [{"path": "SRC/a.py", "change": "modified"}]}
+                self.assertEqual(codex_runner.review_summary(value)["review_status"], "needs_attention")
+                value["files_changed"][0]["path"] = "src/a.py"
+                self.assertEqual(codex_runner.review_summary(value)["review_status"], "needs_verification")
+
     def test_list_filters_owner_cwd_execution_attention_and_paginates(self):
         context = self.sample_context()
         self.stored_job("owned", {"status": "completed", "structured": self.sample_report()}, context=context)

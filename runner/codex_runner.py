@@ -768,6 +768,8 @@ def valid_report(report):
 
 def review_summary(value):
     status = "completed" if value.get("error_kind") == "schema_invalid" else value.get("status")
+    if value.get("error_kind") in ("bridge_error", "unknown_job", "invalid_record") or value.get("status") == "monitor_failed":
+        status = "unknown"
     report = value.get("structured")
     present = "structured" in value
     if status == "running":
@@ -785,17 +787,22 @@ def review_summary(value):
                 counts[criterion["status"]] += 1
     outside = bool(value.get("out_of_scope"))
     if value.get("cwd") and value.get("scope_paths"):
+        def report_path(path):
+            # These paths were resolved during execution; later symlinks must not change the review.
+            path = os.path.normcase(os.path.normpath(path))
+            return path.lower() if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path) else path
+
         root = value["cwd"]
-        roots = [tree_key(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
+        roots = [report_path(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
         for change in value.get("files_changed") or []:
             if isinstance(change, dict) and isinstance(change.get("path"), str):
-                path = tree_key(os.path.join(root, change["path"]))
+                path = report_path(os.path.join(root, change["path"]))
                 outside |= not any(path == r.rstrip(os.sep) or path.startswith(r) for r in roots)
     context = value.get("context")
     uncovered = (isinstance(context, dict) and isinstance(context.get("acceptance"), list) and
                  isinstance(report, dict) and isinstance(report.get("criteria"), list) and
                  len(context["acceptance"]) != len(report["criteria"]))
-    flagged = (uncovered or status in ("failed", "cancelled") or report_status in ("invalid", "missing") or
+    flagged = (uncovered or status in ("failed", "cancelled", "unknown") or report_status in ("invalid", "missing") or
                counts["not_met"] or counts["blocked"] or outside or
                (isinstance(report, dict) and (report.get("unresolved") or report.get("deviations"))))
     return {"execution_status": status, "report_status": report_status,
@@ -843,7 +850,8 @@ def job_status(job_id):
     try:
         job_dir = job_directory(job_id)
         if not job_dir.exists():
-            return {"job_id": job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
+            value = {"job_id": job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
+            return {**value, **review_summary(value)}
         result = job_dir / "result.json"
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
@@ -859,8 +867,9 @@ def job_status(job_id):
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None})
         return enriched_status(job_id, job_dir, worker_died(job_id, job_dir))
     except (OSError, ValueError, TypeError) as e:
-        return {"job_id": job_id, "status": "failed", "error_kind": "invalid_record",
-                "error": str(e), "retryable": False}
+        value = {"job_id": job_id, "status": "failed", "error_kind": "invalid_record",
+                 "error": str(e), "retryable": False}
+        return {**value, **review_summary(value)}
 
 
 def list_jobs(args):
@@ -905,7 +914,8 @@ def list_jobs(args):
 def job_output(args):
     job_dir = job_directory(args.job_id)
     if not job_dir.exists():
-        return {"job_id": args.job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
+        value = {"job_id": args.job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
+        return {**value, **review_summary(value)}
     source = job_dir / {"report": "last_message.txt", "result": "result.json", "context": "args.json"}[args.artifact]
     value = job_status(args.job_id)
     base = {"job_id": args.job_id, "artifact": args.artifact, "execution_status": value.get("execution_status", value["status"]),
@@ -999,7 +1009,7 @@ def main():
     listing = sub.add_parser("list")
     listing.add_argument("--cwd")
     listing.add_argument("--owner")
-    listing.add_argument("--status", choices=["running", "completed", "failed", "cancelled"])
+    listing.add_argument("--status", choices=["running", "completed", "failed", "cancelled", "unknown"])
     listing.add_argument("--needs-attention", action="store_true")
     listing.add_argument("--job-id", action="append", type=job_identifier)
     listing.add_argument("--limit", type=int, default=20)
@@ -1017,7 +1027,8 @@ def main():
         try:
             emit(list_jobs(args) if args.command == "list" else job_output(args))
         except (OSError, ValueError) as e:
-            emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
+            value = {"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False}
+            emit({**value, **review_summary(value)})
         return
     if args.command in ("run", "start"):
         args.cwd = local_path(args.cwd)
