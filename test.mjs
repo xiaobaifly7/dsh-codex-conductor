@@ -299,12 +299,14 @@ test('test and [ need static predicate operators but retain quoted variable oper
   ]) assert.equal(readOnlyCommand(command), true, command);
 });
 
-test('uniq cannot turn an unquoted glob into an output operand', () => {
-  for (const command of ['uniq runner/*.py', 'uniq runner/?.py', 'uniq runner/[ct]*.py', 'uniq -c runner/*.py']) {
+test('uniq cannot turn expansion or file operands into an output argument', () => {
+  for (const command of ['uniq runner/*.py', 'uniq runner/?.py', 'uniq runner/[ct]*.py', 'uniq -c runner/*.py',
+    'uniq - output.txt', 'uniq -- -input -output']) {
     assert.equal(readOnlyCommand(command), false, command);
   }
   for (const command of ['uniq input.txt', 'uniq -c input.txt', 'uniq', "uniq 'runner/*.py'",
-    'uniq "runner/[ct]*.py"', String.raw`uniq runner/\*.py`, 'uniq /dev/null']) {
+    'uniq "runner/[ct]*.py"', String.raw`uniq runner/\*.py`, 'uniq /dev/null', 'uniq -', 'uniq -- -input',
+    'uniq input.txt -', 'uniq - -', 'uniq -- -input -']) {
     assert.equal(readOnlyCommand(command), true, command);
   }
 });

@@ -417,7 +417,6 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   // 展开后的词可能变成被过滤的开关，不能把它当成普通文件参数。
   if (/^(git|iconv|find|rg|sort|uniq|tree|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
       (braceExpansion || args.some((a) => a.includes('$')))) return false;
-  const positional = args.filter((a) => !a.startsWith('-')).length;
   switch (cmd) {
     case 'git': return gitAllowed(args);
     case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && !braceExpansion && !expansion.glob &&
@@ -428,7 +427,11 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
     case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
       ['--output', '--compress-program', '--random-source'].some((flag) => flag.startsWith(a.split('=')[0]))));
-    case 'uniq': return !expansion.glob && positional <= 1;
+    case 'uniq': {
+      const end = args.indexOf('--');
+      const files = args.filter((a, i) => a === '-' || !a.startsWith('-') || (end >= 0 && i > end));
+      return !expansion.glob && (files.length <= 1 || (files.length === 2 && files[1] === '-'));
+    }
     // printf -v 能给任意变量赋任意值
     case 'printf': return !args[0]?.startsWith('-v') && !args[0]?.includes('$');
     case 'tree': return !args.some((a) => /^-[^-]*o/.test(a));
