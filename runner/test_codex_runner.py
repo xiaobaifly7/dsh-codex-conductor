@@ -605,6 +605,31 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["files_changed"], [{"path": "keep/a.txt", "change": "modified"},
                                               {"path": "other.txt", "change": "update"}])
 
+    def test_ignored_paths_are_dropped_before_the_change_list_is_capped(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root = Path(self.tmp.name) / "ws"
+        (root / ".cache").mkdir(parents=True)
+        (root / "src").mkdir()
+        before = codex_runner.snapshot(str(root))
+        for i in range(400):  # sorts before src/, so it would fill the 300-entry list
+            (root / ".cache" / f"c{i}.bin").write_text("x")
+        (root / "src" / "a.py").write_text("a")
+        (root / "run.log").write_text("log")
+        # "(?<bad" is rejected by Python too, so it is skipped instead of failing the task
+        report = codex_runner.files_changed(str(root), before, [], ignore=[r"^\.cache/", r"\.log$", "(?<bad"])
+        self.assertEqual(report["files_changed"], [{"path": "src/a.py", "change": "added"}])
+        self.assertEqual(report["files_changed_total"], 1)
+
+    def test_ignore_reaches_the_worker_through_start(self):
+        (self.cwd / "keep").mkdir()
+        (self.cwd / "keep" / "a.txt").write_text("a")
+        job = self.invoke("--sandbox", "workspace-write", "--ignore", "^keep/", command="start", mode="scoped_write")
+        r = self.control("status", job["job_id"], "--wait", "30")
+        self.assertEqual(r["status"], "completed")
+        self.assertEqual((r["files_changed"], r["files_changed_total"]), ([], 0))
+
     @unittest.skipIf(os.name == "nt", "the /mnt/ rule only applies inside WSL")
     def test_codex_lookup_skips_the_windows_build_under_mnt(self):
         sys.path.insert(0, str(RUNNER.parent))

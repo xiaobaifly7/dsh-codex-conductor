@@ -417,8 +417,9 @@ def snapshot_before(cwd, scope_args):
     return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
 
 
-def files_changed(root, before, event_changes, scope=None):
-    """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool."""
+def files_changed(root, before, event_changes, scope=None, ignore=None):
+    """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool.
+    Paths matching an ignore regex (files other processes keep writing) are dropped before the 300-entry cap."""
     after = snapshot(root, scope=scope) if before is not None else None
     rel = lambda p: os.path.relpath(os.path.join(root, p), root).replace(os.sep, "/")
     events = list(dict.fromkeys((rel(p), k) for p, k in event_changes if p))
@@ -435,6 +436,13 @@ def files_changed(root, before, event_changes, scope=None):
     else:
         changes = events
         source = "codex_events"
+    patterns = []
+    for pattern in ignore or []:
+        try:
+            patterns.append(re.compile(pattern))
+        except re.error:
+            pass  # the plugin already warned about patterns JavaScript rejects; the few only Python rejects are skipped
+    changes = [(p, k) for p, k in changes if not any(rx.search(p) for rx in patterns)]
     changes.sort()
     return {"files_changed": [{"path": p, "change": c} for p, c in changes[:300]],
             "files_changed_total": len(changes), "files_changed_source": source}
@@ -455,8 +463,10 @@ def execute(args, prompt, run_dir):
         # Jobs queued before --scope existed have no scope in args.json.
         before, scope = snapshot_before(args.cwd, getattr(args, "scope", None))
 
+    # Jobs queued before --ignore existed have no ignore in args.json.
     def changes():
-        return files_changed(args.cwd, before, event_changes, scope) if args.sandbox != "read-only" else {}
+        return files_changed(args.cwd, before, event_changes, scope, getattr(args, "ignore", None)) \
+            if args.sandbox != "read-only" else {}
 
     # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
     resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
@@ -519,6 +529,8 @@ def add_task_arguments(p):
                    help="File or directory (relative to --cwd) to snapshot when cwd is too big to walk; repeatable")
     p.add_argument("--writable-root", dest="writable_roots", action="append",
                    help="Additional writable directory for workspace-write; repeatable")
+    p.add_argument("--ignore", action="append",
+                   help="Regex for cwd-relative paths other processes write; such changes are left out; repeatable")
     p.add_argument("--use-user-config", action="store_true", help="Inherit ~/.codex/config.toml, MCP servers and hooks")
     p.add_argument("--timeout", type=float, default=3600)
     # The Windows sandbox setup alone was silent for about 60s, so keep this well above that.

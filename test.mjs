@@ -197,8 +197,11 @@ test('codex_run validation requires acceptance criteria', () => {
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常' }), /acceptance/);
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: [] }), /acceptance/);
   assert.throws(() => validateRun({ task: 'short', acceptance: ['pytest 全部通过'] }), /task/);
-  validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest tests/test_login.py 全部通过'] });
-  assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest 通过'], scope: [''] }), /scope/);
+  validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest tests/test_login.py 全部通过'], write: true });
+  // write 必须明说：不传或传成字符串都拒绝，免得默认只读白跑一轮
+  assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest tests/test_login.py 全部通过'] }), /write/);
+  assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest tests/test_login.py 全部通过'], write: 'true' }), /write/);
+  assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest 通过'], write: false, scope: [''] }), /scope/);
   const writable = { task: '将结果保存到指定的 E 盘目录', acceptance: ['目标文件写入成功'], write: true };
   assert.throws(() => validateRun({ ...writable, writable_roots: [''] }), /writable_roots/);
   assert.throws(() => validateRun({ ...writable, writable_roots: 'E:\\results' }), /writable_roots/);
@@ -225,7 +228,8 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.equal(value.report, report);
   assert.equal(value.structured, undefined);
   const next = nextStep({ ...value, out_of_scope: ['README.md'] }, ['A', 'B']);
-  assert.match(next, /1 条未满足或受阻：B（blocked）[\s\S]*偏离计划：归档与要求冲突[\s\S]*超出 scope：README\.md[\s\S]*resume="T"/);
+  // 条数和编号对得上时按编号指出：逐条汇报里显示的是验收标准原文
+  assert.match(next, /1 条未满足或受阻：第 2 条（blocked）[\s\S]*偏离计划：归档与要求冲突[\s\S]*超出 scope：README\.md[\s\S]*resume="T"/);
   assert.match(next, /其他进程写的文件[\s\S]*不算 Codex 越界，也不用请用户决定/);
   // 只读任务不留会话：自己的 thread_id 不能续跑，续跑过的写任务线程可以
   const ro = { status: 'completed', sandbox: 'read-only', thread_id: 'W' };
@@ -246,6 +250,38 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   const loose = withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false, final_message: 'done' });
   assert.equal(loose.status, 'completed');
   assert.match(loose.report_note, /JSON/);
+});
+
+test('flagged criteria point to write=true in read-only runs and to host_access for blocked Windows programs', () => {
+  const rep = (...criteria) => ({ summary: 's', criteria: criteria.map(([criterion, status, evidence]) => ({ criterion, status, evidence })),
+    files_changed: [], deviations: [], unresolved: [] });
+  const RO = /这是只读任务[^\n]*write=true/;
+  const ro = { status: 'completed', sandbox: 'read-only', report: rep(['A', 'blocked', '只读沙箱里不能写备份']) };
+  assert.match(nextStep(ro, ['A']), RO);
+  assert.match(nextStep({ ...ro, report: rep(['A', 'not_met', '没有写入备份']) }, ['A']), RO);
+  assert.doesNotMatch(nextStep({ ...ro, report: rep(['A', 'met', 'e']) }, ['A']), /write=true/);
+  // 续跑写任务线程的只读追问也提示，照旧可以 resume
+  assert.match(nextStep({ ...ro, thread_id: 'W' }, ['A'], true), /这是只读任务[^\n]*write=true[\s\S]*resume="W"/);
+  // host_access=true、write=false 的只读调查沙箱是 danger-full-access，由调用方告知
+  const host = { status: 'completed', sandbox: 'danger-full-access', thread_id: 'H', report: rep(['A', 'blocked', '只读调查不能建备份']) };
+  assert.match(nextStep(host, ['A'], false, { readOnly: true }), RO);
+  assert.doesNotMatch(nextStep(host, ['A']), /write=true/);
+  // 沙箱里受阻且提到 Windows 程序：开了 allowHostAccess 提示 host_access=true，否则提示自己跑
+  const WIN = /受阻条目提到 Windows 程序[^\n]*host_access=true/;
+  const ww = { status: 'completed', sandbox: 'workspace-write', thread_id: 'T' };
+  for (const [criterion, evidence] of [['A', '/mnt/c/tools/pwsh.exe 没有任何输出'], ['pwsh.exe -File tests\\Verify.ps1 输出 PASS', '沙箱里无法执行'],
+    ['A', 'WSL Interop 被挡住'], ['A', '无法连接 Hyper-V 虚拟机'], ['A', 'Get-VM Cmdlet 不可用'], ['A', '需要启动 Windows 程序'], ['A', 'C:\\Tools\\PWSH.EXE 报错']]) {
+    assert.match(nextStep({ ...ww, report: rep([criterion, 'blocked', evidence]) }, ['A'], false, { hostAccess: true }), WIN, `${criterion} ${evidence}`);
+  }
+  const win = { ...ww, report: rep(['A', 'blocked', '/mnt/c/tools/pwsh.exe 没有任何输出']) };
+  assert.match(nextStep(win, ['A']), /受阻条目提到 Windows 程序[^\n]*这类检查你自己跑/);
+  assert.match(nextStep({ ...win, sandbox: 'read-only' }, ['A'], false, { hostAccess: true }), WIN);
+  assert.doesNotMatch(nextStep({ ...win, sandbox: 'danger-full-access' }, ['A'], false, { hostAccess: true }), /Windows 程序/);
+  // not_met 多是结果不对（比如产出 .exe 的编译失败了），met 的条目更不算
+  for (const report of [rep(['go build 产出 bin/tool.exe', 'not_met', 'main.go:12: undefined: foo']),
+    rep(['构建产物', 'met', 'dist/app.exe 已生成'], ['B', 'not_met', '测试失败']), rep(['A', 'blocked', '目标文件不存在'])]) {
+    assert.doesNotMatch(nextStep({ ...ww, report }, report.criteria.map((c) => c.criterion), false, { hostAccess: true }), /Windows 程序|这是只读任务/);
+  }
 });
 
 test('turn summary reads the last reply and the tools of one turn', () => {
@@ -302,6 +338,7 @@ test('apply registers three tools, a guard and the false-dispatch check', () => 
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; } },
     { workspaces: ['F:\\work\\项目'] });
   assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel']);
+  assert.deepEqual(tools[0].parameters.required, ['task', 'acceptance', 'write']);
   assert.match(tools[0].description, /固定为 JSON[\s\S]*启动不了 Windows 程序/);
   assert.equal(guards.length, 1);
   assert.match(guards[0](call('edit')), /已拒绝/);
@@ -413,7 +450,7 @@ function harness({ config = {}, jobs, get = true } = {}) {
 const tick = () => new Promise((r) => setImmediate(r));
 const nudges = [];
 const agentAt = (cwd, log = []) => ({ id: 'S1', session: { header: { cwd }, log }, steer: (m) => nudges.push(m) });
-const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], wait_seconds: 0 };
+const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: false, wait_seconds: 0 };
 
 // 按 DSH 任务表的约定：结算时有 wait() 在等就算已送达，否则记进 unawaited（DSH 会为它另发通知）
 function fakeJobs({ fail = false } = {}) {
@@ -876,4 +913,154 @@ test('a cancelled run is not reported as a failure and warns about half-applied 
   assert.match(next, /已取消[\s\S]*先问用户/);
   assert.match(next, /git status/);
   assert.doesNotMatch(next, /不可重试/);
+});
+
+test('a completed result shows the original criteria, clipped evidence and one-line details; other results keep every field', () => {
+  const { tools } = harness();
+  const render = (v) => tools.codex_run.output.render({}, v)[0].text;
+  const report = { summary: 's', criteria: [{ criterion: '1. 改写过的甲', status: 'met', evidence: 'x'.repeat(900) },
+    { criterion: '乙（改写）', status: 'blocked', evidence: 'e' }], files_changed: ['a.py'], deviations: [], unresolved: [] };
+  const value = { status: 'completed', job_id: 'J', thread_id: 'T', cwd: '/mnt/f/p', log_dir: '/home/u/jobs/J', sandbox: 'workspace-write',
+    attempts: 1, usage: { input_tokens: 9 }, forced_exit: false, truncated: true, duration_s: 12, commands_run: 3,
+    files_changed: [{ path: 'a.py', change: 'modified' }], files_changed_total: 1, files_changed_source: 'snapshot', report, acceptance: ['甲原文', '乙原文'] };
+  value.next = nextStep(value, value.acceptance);
+  const text = render(value);
+  assert.match(text, /\n✓ 1\. 甲原文 —— x{800}…（已截断，全文见 \/home\/u\/jobs\/J\/last_message\.txt）\n⛔ 2\. 乙原文 —— e\n/);
+  assert.match(text, /\n--- 详细字段 ---\n任务目录：\/mnt\/f\/p\n改动文件（snapshot，共 1 个）：a\.py\(modified\)\n--- 下一步 ---\n/);
+  assert.doesNotMatch(text, /input_tokens|forced_exit|truncated|commands_run|attempts|log_dir/);
+  // 验收标准原文已在逐条汇报里，下一步按编号指出、不再重复列出
+  assert.match(value.next, /第 2 条（blocked）[\s\S]*上面逐条汇报里的验收标准/);
+  assert.doesNotMatch(value.next, /甲原文/);
+  // 编号对不上（Codex 改了顺序）时显示 Codex 写的条目，下一步照旧列出原文
+  const shifted = { ...value, report: { ...report, criteria: [{ ...report.criteria[0], criterion: '2. 甲' }, report.criteria[1]] } };
+  shifted.next = nextStep(shifted, shifted.acceptance);
+  assert.match(render(shifted), /\n✓ 1\. 2\. 甲 —— /);
+  assert.match(shifted.next, /下面的验收标准[\s\S]*\n1\. 甲原文\n2\. 乙原文$/);
+  // 失败的结果保留全部字段，便于排查
+  assert.match(render({ status: 'failed', error_kind: 'timeout', error: 'boom', log_dir: '/home/u/jobs/K', attempts: 2, retryable: false }),
+    /--- 详细字段 ---\n\{[\s\S]*"error": "boom"[\s\S]*"log_dir": "\/home\/u\/jobs\/K"/);
+});
+
+test('ignoreChanges reaches the runner as --ignore and tells Codex the matching files change on their own', async () => {
+  const calls = [];
+  const c = createConductor({ ignoreChanges: [/^logs\//, /\.tmp$/] }, (_cfg, argv, opts) => {
+    calls.push({ argv, stdin: opts.stdin });
+    return Promise.resolve({ job_id: 'J', status: 'running' });
+  });
+  // 只读和主机访问任务也带上：其他进程写的文件同样会让 Codex 核验时误判
+  for (const args of [{ ...RUN, write: true }, { ...RUN, write: false }, { ...RUN, write: false, host_access: true }]) {
+    await c.start(args, 'F:\\proj');
+    const { argv, stdin } = calls.at(-1);
+    assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--ignore'), ['^logs\\/', '\\.tmp$']);
+    assert.match(stdin, /其他进程持续写入：\^logs\\\/、\\\.tmp\$。[^\n]*不要因此把验收标准标为 blocked；任务或验收标准本身要求查看或修改这些文件时照常处理/);
+  }
+  assert.doesNotMatch(composePrompt('做事情做事情', ['甲条件成立']), /其他进程持续写入/);
+  // 配置里的正则：非法的警告后跳过，其余照常传给 runner
+  const warnings = [];
+  const tools = {};
+  const argvs = [];
+  apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {}, logger: { warn: (s) => warnings.push(s) } },
+    { workspaces: [], ignoreChanges: ['^logs/', '['] }, (_cfg, argv) => { argvs.push(argv); return Promise.resolve({ job_id: 'J', status: 'completed' }); });
+  await tools.codex_run.execute({ ...RUN, write: true, cwd: 'F:\\proj' }, {});
+  assert.match(warnings[0], /ignoreChanges/);
+  assert.deepEqual(argvs[0].filter((a, i) => argvs[0][i - 1] === '--ignore'), ['^logs\\/']);
+});
+
+test('running, cancelled and failed results keep every field in the details', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer } = harness({ jobs });
+  const render = (v) => tools.codex_run.output.render({}, v)[0].text;
+  const bg = await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  assert.match(render(bg), /--- 详细字段 ---\n\{[\s\S]*"background_job_id": "bg1"[\s\S]*"note": "已登记为后台任务 bg1/);
+  await answer('J1', { status: 'completed' });
+  await jobs.started[0].done;
+  const h = harness({ get: false });
+  h.finals.J9 = { job_id: 'J9', status: 'running', seconds_since_last_event: 7, last_activity: 'ran: pytest' };
+  h.finals.J8 = { job_id: 'J8', status: 'cancelled', retryable: false, log_dir: '/j/J8' };
+  assert.match(render(await h.tools.codex_status.execute({ job_id: 'J9', wait_seconds: 0 }, {})),
+    /--- 详细字段 ---\n\{[\s\S]*"seconds_since_last_event": 7[\s\S]*"last_activity": "ran: pytest"/);
+  assert.match(render(await h.tools.codex_status.execute({ job_id: 'J8', wait_seconds: 0 }, {})), /--- 详细字段 ---\n\{[\s\S]*"log_dir": "\/j\/J8"/);
+});
+
+test('count or numbering mismatches show Codex labels and keep the acceptance list', () => {
+  const { tools } = harness();
+  const render = (v) => tools.codex_run.output.render({}, v)[0].text;
+  const rep = (labels) => ({ summary: 's', criteria: labels.map((criterion, i) => ({ criterion, status: i ? 'blocked' : 'met', evidence: `e${i + 1}` })),
+    files_changed: [], deviations: [], unresolved: [] });
+  for (const [labels, acceptance] of [[['甲', '乙', '丙'], ['甲原文', '乙原文']], [['甲和乙', '丙'], ['甲原文', '乙原文', '丙原文']],
+    [['2、乙', '1、甲'], ['甲原文', '乙原文']], [['2) 乙', '1) 甲'], ['甲原文', '乙原文']], [[' 2. 乙', ' 1. 甲'], ['甲原文', '乙原文']],
+    [['第2条：乙', '第1条：甲'], ['甲原文', '乙原文']], [['２．乙', '１．甲'], ['甲原文', '乙原文']], [['2：乙', '1：甲'], ['甲原文', '乙原文']]]) {
+    const value = { status: 'completed', sandbox: 'workspace-write', thread_id: 'T', report: rep(labels), acceptance };
+    value.next = nextStep(value, acceptance);
+    const text = render(value);
+    labels.forEach((l, i) => assert.ok(text.includes(`\n${i ? '⛔' : '✓'} ${i + 1}. ${l} —— e${i + 1}\n`), `${l}\n${text}`));
+    assert.ok(value.next.endsWith(`\n${acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n')}`), value.next);
+  }
+  // 编号和位置一致、或者数字后面不是编号标点（3 个测试通过）时照常显示原文
+  for (const labels of [['1. 甲', '2. 乙'], ['第1条 甲', '第2条 乙'], ['3 个测试通过', '2024 年数据已归档']]) {
+    const value = { status: 'completed', sandbox: 'workspace-write', thread_id: 'T', report: rep(labels), acceptance: ['甲原文', '乙原文'] };
+    assert.match(render(value), /\n✓ 1\. 甲原文 —— e1\n⛔ 2\. 乙原文 —— e2\n/, labels.join(' | '));
+  }
+});
+
+test('codex_run shows the acceptance text when Codex rewrites the labels, right away and from the background', async () => {
+  const acceptance = ['pytest tests/test_login.py 全部通过', 'a.py 第 40 行不再抛 NullPointer'];
+  const structured = { summary: 's', criteria: [{ criterion: '登录测试通过', status: 'met', evidence: 'e1' },
+    { criterion: '空指针修复', status: 'blocked', evidence: 'e2' }], files_changed: [], deviations: [], unresolved: [] };
+  const done = { job_id: 'J1', status: 'completed', thread_id: 'T', sandbox: 'workspace-write', structured };
+  const args = { ...RUN, acceptance, write: true };
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const now = harness({ config: { startResult: done } });
+  const value = await now.tools.codex_run.execute(args, exec);
+  const jobs = fakeJobs();
+  const later = harness({ jobs });
+  await later.tools.codex_run.execute(args, exec);
+  await later.answer('J1', done);
+  for (const text of [now.tools.codex_run.output.render({}, value)[0].text, (await jobs.started[0].done).result]) {
+    assert.match(text, /\n✓ 1\. pytest tests\/test_login\.py 全部通过 —— e1\n⛔ 2\. a\.py 第 40 行不再抛 NullPointer —— e2\n/);
+    assert.match(text, /第 2 条（blocked）[\s\S]*上面逐条汇报里的验收标准/);
+  }
+});
+
+test('allowHostAccess and a host_access read-only run reach the hints from codex_run and codex_status', async () => {
+  const structured = { summary: 's', criteria: [{ criterion: 'Verify.ps1 输出 PASS', status: 'blocked', evidence: '/mnt/c/tools/pwsh.exe 没有任何输出' }],
+    files_changed: [], deviations: [], unresolved: [] };
+  const done = { job_id: 'J', status: 'completed', thread_id: 'T', sandbox: 'workspace-write', structured };
+  for (const allowHostAccess of [true, false]) {
+    const expected = allowHostAccess ? /提到 Windows 程序[^\n]*host_access=true/ : /提到 Windows 程序[^\n]*这类检查你自己跑/;
+    const r = harness({ config: { allowHostAccess, startResult: done } });
+    assert.match((await r.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('F:\\work\\项目') })).next, expected);
+    const s = harness({ get: false, config: { allowHostAccess } });
+    s.finals.J = done;
+    assert.match((await s.tools.codex_status.execute({ job_id: 'J', wait_seconds: 0 }, {})).next, expected);
+  }
+  // host_access=true、write=false：沙箱是 danger-full-access，codex_run 按参数知道它是只读调查
+  const host = harness({ config: { allowHostAccess: true, startResult: { ...done, sandbox: 'danger-full-access',
+    structured: { ...structured, criteria: [{ criterion: '建备份', status: 'blocked', evidence: '只读调查不能写文件' }] } } } });
+  assert.match((await host.tools.codex_run.execute({ ...RUN, write: false, host_access: true }, { agent: agentAt('F:\\work\\项目') })).next,
+    /这是只读任务[^\n]*write=true[\s\S]*resume="T" 和 host_access=true/);
+});
+
+test('the slim completed view keeps the schema note, flags a truncated answer and a capped change list', () => {
+  const { tools } = harness();
+  const render = (v) => tools.codex_run.output.render({}, v)[0].text;
+  const loose = render(withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false,
+    final_message: 'done', truncated: true, log_dir: '/j' }));
+  assert.match(loose, /--- Codex 最终答复（超过 8000 字已截断，全文见 \/j\/last_message\.txt） ---\ndone\n/);
+  assert.match(loose, /--- 详细字段 ---\nCodex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。/);
+  // runner 最多列 300 条：总数照实给，并说明只列了一部分
+  const files = Array.from({ length: 300 }, (_, i) => ({ path: `src/f${i}.py`, change: 'modified' }));
+  const capped = render({ status: 'completed', files_changed_source: 'snapshot', files_changed_total: 500, files_changed: files });
+  assert.match(capped, /^completed · 500 files/);
+  assert.match(capped, /改动文件（snapshot，共 500 个，只列出前 300 个，超出 scope 的检查也只看这些，其余的到任务目录里核对）：src\/f0\.py\(modified\)/);
+});
+
+test('a report that breaks the schema still renders, and clipping never leaves half a surrogate pair', () => {
+  const { tools } = harness();
+  const render = (report) => tools.codex_run.output.render({}, { status: 'completed', log_dir: '/j', report })[0].text;
+  assert.match(render({ criteria: [{ criterion: 'c', status: 'blocked', evidence: null }, { criterion: 'd', status: 'met', evidence: 42 }] }),
+    /\n⛔ 1\. c —— \n✓ 2\. d —— 42\n/);
+  const text = render({ criteria: [{ criterion: 'c', status: 'met', evidence: `${'a'.repeat(799)}😀尾巴` }] });
+  assert.match(text, /—— a{799}…（已截断，全文见 \/j\/last_message\.txt）/);
+  assert.ok(!/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(text));
 });

@@ -420,19 +420,25 @@ export function createConductor(cfg, run = runRunner) {
     if (cfg.reportSchema) argv.push('--schema', cfg.reportSchema);
     for (const s of args.scope ?? []) argv.push('--scope', s);
     for (const root of args.writable_roots ?? []) argv.push('--writable-root', root);
-    const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: args.host_access === true, write: args.write === true });
+    // runner 在截取前 300 条改动之前就过滤，改动数和超出 scope 的检查才准
+    for (const rx of cfg.ignoreChanges ?? []) argv.push('--ignore', rx.source);
+    const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: args.host_access === true, write: args.write === true,
+      ignore: (cfg.ignoreChanges ?? []).map((rx) => rx.source) });
     return run(cfg, argv, { stdin: prompt, signal });
   }
 
   return { start, waitJob, cancel: (jobId) => run(cfg, ['cancel', jobId]) };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
+    (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
+      '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
+      '任务或验收标准本身要求查看或修改这些文件时照常处理。\n' : '') +
     (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
       '只做任务需要的事；任务没有点名的虚拟机、文件和网络设置，不要删除、停止、重建或改配置。\n' : '') +
     (hostAccess && !write ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
@@ -460,6 +466,10 @@ export function validateRun(args) {
     args.acceptance.some((a) => typeof a !== 'string' || a.trim().length < 4)) {
     throw new Error('codex_run: acceptance 必须是 1–20 条可核验的验收标准（每条至少 4 个字符）');
   }
+  // 不传就默认只读时，实际常因此白跑一整轮（只读任务又不能 resume），所以必须明说
+  if (typeof args.write !== 'boolean') {
+    throw new Error('codex_run: write 必须是布尔值 true 或 false（不能省略，也不能写成字符串）：要改文件、做修复或建备份传 true，只读调查传 false');
+  }
   for (const k of ['cwd', 'resume', 'effort']) {
     if (args[k] !== undefined && (typeof args[k] !== 'string' || !args[k].trim())) throw new Error(`codex_run: ${k} 必须是非空字符串`);
   }
@@ -486,8 +496,23 @@ export function withReport(value) {
   return structured && typeof structured === 'object' ? { ...rest, report: structured } : rest;
 }
 
+// 受阻条目里提到这些，可能是沙箱里的 Codex 启动不了 Windows 程序
+const WINDOWS_BLOCK = /\.exe\b|interop|Hyper-V|cmdlet|Windows 程序/i;
+
+// 汇报条数和验收标准一致、编号也对得上时，逐条汇报显示验收标准原文（Codex 几乎总会改写条目），下一步不再重复列出。
+// 编号认 1. / 1) / 1、 / 1: / 第1条，NFKC 先把全角数字和标点换成半角
+function sameCriteria(report, acceptance) {
+  const criteria = report?.criteria ?? [];
+  return criteria.length > 0 && acceptance?.length === criteria.length && criteria.every((c, i) => {
+    const n = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、])/.exec(String(c.criterion ?? '').normalize('NFKC'))?.[1];
+    return n === undefined || Number(n) === i + 1;
+  });
+}
+
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
-export function nextStep(value, acceptance, resumed) {
+// hostAccess：插件开了 allowHostAccess 时，Windows 程序受阻就提示带 host_access=true 派回，否则提示自己跑
+// readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
+export function nextStep(value, acceptance, resumed, { hostAccess = false, readOnly = value.sandbox === 'read-only' } = {}) {
   if (value.status === 'running') return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
   // runner 的取消结果不带改动清单和沙箱，可写任务可能已改了一半
   if (value.status === 'cancelled') {
@@ -502,16 +527,25 @@ export function nextStep(value, acceptance, resumed) {
       : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。';
   }
   const report = value.report ?? {};
-  const flagged = (report.criteria ?? []).filter((c) => c.status !== 'met');
+  const original = sameCriteria(report, acceptance);
+  const flagged = (report.criteria ?? []).map((c, i) => [c, i]).filter(([c]) => c.status !== 'met');
   const alerts = [
-    flagged.length ? `Codex 自报有 ${flagged.length} 条未满足或受阻：${flagged.map((c) => `${c.criterion}（${c.status}）`).join('；')}` : '',
+    flagged.length ? `Codex 自报有 ${flagged.length} 条未满足或受阻：` +
+      flagged.map(([c, i]) => `${original ? `第 ${i + 1} 条` : c.criterion}（${c.status}）`).join('；') : '',
+    // 只读任务改不了文件，实际受阻常因 write 传了 false
+    flagged.length && readOnly ? '这是只读任务：受阻如果是因为不能改文件或建备份，派回时传 write=true' : '',
+    // 只看 blocked：not_met 多是结果不对（比如产出 .exe 的编译失败了），不是启动不了程序
+    value.sandbox !== 'danger-full-access' && flagged.some(([c]) => c.status === 'blocked' && WINDOWS_BLOCK.test(`${c.criterion} ${c.evidence}`))
+      ? `受阻条目提到 Windows 程序：如果确实是因为沙箱里的 Codex 启动不了它们，${hostAccess ? '派回时传 host_access=true' : '这类检查你自己跑'}` : '',
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',
     value.out_of_scope?.length ? `改动超出 scope：${value.out_of_scope.join('、')}。这份清单来自目录快照，可能含同时段其他进程写的文件（如定期日志）；` +
-      '不在 Codex 自报 files_changed 里、明显来自其他进程的，只需一句说明，不算 Codex 越界，也不用请用户决定；其余的先核实是否应保留' : '',
+      '不在 Codex 自报 files_changed 里、明显来自其他进程的，只需一句说明，不算 Codex 越界，也不用请用户决定；其余的先核实是否应保留；' +
+      '总是由其他进程写的文件，可以请用户写进插件配置 ignoreChanges，以后不再列出' : '',
   ].filter(Boolean);
-  const list = (acceptance ?? []).map((a, i) => `${i + 1}. ${a}`).join('\n');
+  const list = original ? '' : (acceptance ?? []).map((a, i) => `${i + 1}. ${a}`).join('\n');
+  const where = original ? '上面逐条汇报里的验收标准' : list ? '下面的验收标准' : '验收标准';
   return (alerts.length ? `${alerts.join('\n')}\n偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。\n` : '') +
-    'Codex 的答复不是完成证据。用只读检查逐条核验下面的验收标准，给出每条的证据；' +
+    `Codex 的答复不是完成证据。用只读检查逐条核验${where}，给出每条的证据；` +
     // resume 不继承沙箱：漏传 host_access 会回到沙箱，Codex 又启动不了 Windows 程序
     `有任何一条不通过，就写清差距，${resumable ? `用 codex_run 带 resume="${value.thread_id ?? ''}"` +
       `${value.sandbox === 'danger-full-access' ? ' 和 host_access=true' : ''} 派回修正`
@@ -519,6 +553,8 @@ export function nextStep(value, acceptance, resumed) {
 }
 
 const MARK = { met: '✓', not_met: '✗', blocked: '⛔' };
+// 每条证据最多显示的字数：Codex 的答复本来就不是完成证据，全文留在 runner 任务目录的 last_message.txt
+const EVIDENCE_LIMIT = 800;
 
 // 一行摘要，任务表的 detail 和结果第一行都以它开头，如 completed · 12 met / 1 blocked · 3 files · 148 s
 function summaryLine(value) {
@@ -531,22 +567,44 @@ function summaryLine(value) {
     typeof value.duration_s === 'number' && `${Math.round(value.duration_s)} s`].filter(Boolean).join(' · ');
 }
 
+// 已完成的结果只留核验用得上的：任务目录和一行改动清单；失败、取消、仍在执行的保留全部字段，便于排查。
+// 用量、日志目录等完整字段在 runner 的 result.json（runnerHome/jobs/<job_id>/）里
+function details(rest) {
+  if (rest.status !== 'completed') return [JSON.stringify(rest, null, 2)];
+  // runner 最多列 300 条，总数照实给
+  const shown = rest.files_changed?.length;
+  const total = rest.files_changed_total ?? shown;
+  const files = Array.isArray(rest.files_changed) && `改动文件（${rest.files_changed_source ?? '来源未知'}，共 ${total} 个` +
+    `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
+    (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
+  return [rest.cwd && `任务目录：${rest.cwd}`, files, rest.report_note].filter(Boolean);
+}
+
 function render(value) {
   // 后台任务结算时存下的成品文字，原样交回
   if (typeof value?.rendered === 'string') return [{ type: 'text', text: value.rendered }];
-  // acceptance 不放进详细字段：下一步里已逐条列出
-  const { final_message: answer, report, next, acceptance: _acceptance, ...rest } = value ?? {};
+  // acceptance 不放进详细字段：逐条汇报或下一步里已列出
+  const { final_message: answer, report, next, acceptance, ...rest } = value ?? {};
+  const full = rest.log_dir ? `${rest.log_dir}/last_message.txt` : 'runner 任务目录里的 last_message.txt';
+  // 不合 schema 的汇报（如 evidence 为 null）也要能显示；截断处不留半个代理对
+  const clip = (v) => {
+    const s = typeof v === 'string' ? v : String(v ?? '');
+    return s.length > EVIDENCE_LIMIT ? `${s.slice(0, EVIDENCE_LIMIT).replace(/[\uD800-\uDBFF]$/, '')}…（已截断，全文见 ${full}）` : s;
+  };
+  const original = sameCriteria(report, acceptance);
   const reportLines = report ? [
     '--- Codex 逐条汇报 ---', `概述：${report.summary ?? ''}`,
-    ...(report.criteria ?? []).map((c, i) => `${MARK[c.status] ?? '?'} ${i + 1}. ${c.criterion} —— ${c.evidence}`),
+    ...(report.criteria ?? []).map((c, i) => `${MARK[c.status] ?? '?'} ${i + 1}. ${original ? acceptance[i] : c.criterion} —— ${clip(c.evidence)}`),
     `自报改动：${report.files_changed?.join('、') || '无'}`,
     `偏离计划：${report.deviations?.join('；') || '无'}`,
     `未解决：${report.unresolved?.join('；') || '无'}`,
   ] : [];
+  const extra = details(rest);
   return [{ type: 'text', text: [
     `${summaryLine(value ?? {})}${rest.job_id ? `  job_id: ${rest.job_id}` : ''}${rest.thread_id ? `  thread_id: ${rest.thread_id}` : ''}`,
-    ...(report ? reportLines : answer ? ['--- Codex 最终答复 ---', answer] : []),
-    '--- 详细字段 ---', JSON.stringify(rest, null, 2),
+    ...(report ? reportLines
+      : answer ? [`--- Codex 最终答复${rest.truncated ? `（超过 8000 字已截断，全文见 ${full}）` : ''} ---`, answer] : []),
+    ...(extra.length ? ['--- 详细字段 ---', ...extra] : []),
     ...(next ? ['--- 下一步 ---', next] : []),
   ].join('\n') }];
 }
@@ -613,21 +671,23 @@ function settings(config, logger) {
     .map((w) => typeof w === 'string' ? { root: normPath(w) }
       : { root: normPath(w?.path), cwd: typeof w?.cwd === 'string' && w.cwd.trim() ? w.cwd.trim() : undefined })
     .filter((w) => w.root);
-  const allowCommands = [];
-  for (const pattern of Array.isArray(config.allowCommands) ? config.allowCommands : []) {
+  // 正则列表：非法的警告后跳过，其余照常生效
+  const patterns = (key) => (Array.isArray(config[key]) ? config[key] : []).flatMap((pattern) => {
     try {
-      allowCommands.push(new RegExp(pattern));
+      return [new RegExp(pattern)];
     } catch (error) {
-      logger?.warn?.(`[codex-conductor] 忽略无效的 allowCommands 正则 ${pattern}：${error.message}`);
+      logger?.warn?.(`[codex-conductor] 忽略无效的 ${key} 正则 ${pattern}：${error.message}`);
+      return [];
     }
-  }
+  });
   return {
     ...DEFAULTS,
     ...Object.fromEntries(Object.entries(config).filter(([k, v]) => k in DEFAULTS && v !== undefined && v !== '')),
     workspaces,
     roots: workspaces.map((w) => w.root),
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),
-    allowCommands,
+    allowCommands: patterns('allowCommands'),
+    ignoreChanges: patterns('ignoreChanges'),
   };
 }
 
@@ -765,8 +825,8 @@ export function apply(ctx, config = {}, run = runRunner) {
   ctx.tools.register({
     ...PRESENT.codex_run,
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准；' +
-      'write=true 才允许它改文件，默认只读用于调查；scope 限定允许改动的路径。' +
+    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准和 write：' +
+      '要改文件、做修复或建备份传 write=true，只读调查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
       '不通过就带 resume=thread_id 派回修正。汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
@@ -778,7 +838,9 @@ export function apply(ctx, config = {}, run = runRunner) {
       properties: {
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
         acceptance: { type: 'array', items: { type: 'string' }, description: '验收标准，1–20 条，每条写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
-        write: { type: 'boolean', description: 'true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（workspace-write 沙箱）；默认 false 只读。' },
+        write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（workspace-write 沙箱）；' +
+          'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
+          `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。要改文件、做修复或建备份就传 true。` },
         ...(cfg.allowHostAccess === true ? { host_access: { type: 'boolean', description: 'true 时 Codex 在沙箱外运行（danger-full-access），' +
           '可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令）、连接 Hyper-V 虚拟机；write 仍决定能否改动（文件、虚拟机、网络和系统状态）：' +
           '要启动/停止/新建虚拟机，或运行会建、改虚拟机的脚本，也要传 write=true，否则 Codex 只做只读调查。不再有沙箱，只靠提示约束。只在任务需要时传。' } } : {}),
@@ -796,7 +858,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         wait_seconds: { type: 'integer', description: `最多等待秒数，默认 ${cfg.waitSeconds}；到时任务转入后台继续，` +
           '登记为后台任务时，Codex 结束后会收到任务通知，再用 job_output 读取完整结果；否则用 codex_status 接着等。' },
       },
-      required: ['task', 'acceptance'],
+      required: ['task', 'acceptance', 'write'],
     },
     output: OUTPUT,
     async execute(args, exec) {
@@ -812,7 +874,8 @@ export function apply(ctx, config = {}, run = runRunner) {
         // 每轮结果都提醒一次规划要求：DeepSeek 正要据此规划下一次派活
         const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
           ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
-        return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume)) + reminder };
+        return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
+          { hostAccess: cfg.allowHostAccess === true, readOnly: args.write !== true }) + reminder };
       };
       // 启动不随中止打断：runner 在打印 job_id 前就拉起了 Codex，这时杀掉 wsl.exe 会让 Codex 在 WSL 里没人管地跑下去；
       // 等拿到 job_id 再按中止取消它
@@ -848,7 +911,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_status: job_id 必须是非空字符串');
-      const finish = (value) => ({ ...value, next: nextStep(value) });
+      const finish = (value) => ({ ...value, next: nextStep(value, undefined, undefined, { hostAccess: cfg.allowHostAccess === true }) });
       const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
       return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
     },
