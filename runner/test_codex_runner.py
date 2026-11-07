@@ -626,13 +626,23 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(done["final_message"], "done")
 
     def test_cancel_kills_the_worker_and_the_tree(self):
-        job = self.invoke(command="start", mode="hang_with_child")
+        context = self.sample_context()
+        envelope = json.dumps({"prompt": "do it", "context": context})
+        job = self.invoke("--context-json", "--sandbox", "danger-full-access", "--scope", "keep",
+                          command="start", mode="hang_with_child", prompt=envelope)
         child = self.state / "child.pid"
         for _ in range(40):
             if child.exists():
                 break
             time.sleep(0.25)
-        self.assertEqual(self.control("cancel", job["job_id"])["status"], "cancelled")
+        cancelled = self.control("cancel", job["job_id"])
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["context"], context)
+        self.assertEqual(cancelled["thread_id"], "thread-1")
+        self.assertEqual(cancelled["sandbox"], "danger-full-access")
+        self.assertEqual(cancelled["scope"], ["keep"])
+        self.assertIsInstance(cancelled["duration_s"], (int, float))
+        self.assertNotIn("files_changed", cancelled)
         time.sleep(1)
         self.assertFalse(alive(int(child.read_text())))
 
@@ -660,7 +670,12 @@ class RunnerTests(unittest.TestCase):
                         mock.patch.object(codex_runner, "emit") as emit:
                     codex_runner.main()
                     self.assertEqual(kill.call_args_list, [mock.call(123), mock.call(456)])
-                    emit.assert_called_once_with({"job_id": "raced", **completed})
+                    emit.assert_called_once()
+                    published = emit.call_args.args[0]
+                    self.assertEqual({k: published[k] for k in completed}, completed)
+                    self.assertEqual(published["job_id"], "raced")
+                    self.assertIn("review_status", published)
+                    self.assertNotIn("review_summary", published)
                     self.assertEqual(json.loads((job_dir / "result.json").read_text("utf-8")), completed)
 
     def test_windows_cwd_is_mapped_only_inside_wsl(self):
@@ -922,6 +937,246 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PATH": "/mnt/c/npm:/opt/tools/bin"}), \
                 mock.patch.object(codex_runner.os, "access", return_value=True):
             self.assertEqual(codex_runner.find_codex(), "/opt/tools/bin/codex")
+
+    def sample_context(self, owner="owner-a"):
+        return {"owner": owner, "task": "Task title\nprivate task body", "acceptance": ["Criterion one"], "write": True}
+
+    def sample_report(self, **fields):
+        return {"summary": "done", "criteria": [{"criterion": "Criterion one", "status": "met", "evidence": "checked"}],
+                "files_changed": [], "deviations": [], "unresolved": [], **fields}
+
+    def stored_job(self, job_id, result, **task):
+        root = Path(self.tmp.name) / "home" / "jobs" / job_id
+        root.mkdir(parents=True)
+        args = {"cwd": str(self.cwd), "sandbox": "danger-full-access", **task}
+        (root / "args.json").write_text(json.dumps(args, ensure_ascii=False), "utf-8")
+        if result is not None:
+            (root / "result.json").write_text(json.dumps(result, ensure_ascii=False), "utf-8")
+        else:
+            (root / "worker.pid").write_text(str(os.getpid()))
+        return root
+
+    def test_context_envelope_round_trips_large_unicode_without_argv(self):
+        context = self.sample_context()
+        context["task"] += "上下文😀" * 20000
+        context["acceptance"] = ["验证完整结果" * 2000]
+        envelope = json.dumps({"prompt": "only this prompt reaches Codex", "context": context}, ensure_ascii=False)
+        for command in ("run", "start"):
+            with self.subTest(command=command):
+                result = self.invoke("--context-json", "--sandbox", "danger-full-access", prompt=envelope, command=command)
+                if command == "start":
+                    jd = Path(self.tmp.name) / "home" / "jobs" / result["job_id"]
+                    result = self.control("status", result["job_id"], "--wait", "30")
+                else:
+                    jd = Path(result["log_dir"])
+                self.assertEqual(result["context"], context)
+                if command == "start":
+                    self.assertEqual(json.loads((jd / "args.json").read_text("utf-8"))["context"], context)
+                else:
+                    self.assertFalse((jd / "args.json").exists())
+                self.assertIn("review_status", result)
+                self.assertNotIn("review_summary", result)
+                call = self.calls()[-1]
+                self.assertEqual(call["prompt"], "only this prompt reaches Codex")
+                self.assertNotIn(context["task"], call["argv"])
+                self.assertEqual(result["sandbox"], "danger-full-access")
+
+    def test_context_envelope_rejects_bad_shapes_without_spawning(self):
+        context = self.sample_context()
+        values = ["not json", "[]", json.dumps({"prompt": "do it"}),
+                  json.dumps({"prompt": 12, "context": context})]
+        for key, bad in (("owner", []), ("task", None), ("acceptance", "one"),
+                         ("acceptance", [1]), ("write", "true")):
+            values.append(json.dumps({"prompt": "do it", "context": {**context, key: bad}}))
+        for value in values:
+            with self.subTest(value=value[:25]):
+                result = self.invoke("--context-json", prompt=value)
+                self.assertEqual(result["error_kind"], "bad_arguments")
+                self.assertFalse(result["retryable"])
+        malformed = subprocess.run([sys.executable, "-B", str(RUNNER), "run", "--cwd", str(self.cwd), "--context-json"],
+                                   input=b'{"prompt":"bad \xff"}', capture_output=True, env=self.env, timeout=30)
+        self.assertEqual(json.loads(malformed.stdout)["error_kind"], "bad_arguments")
+        self.assertEqual(self.calls(), [])
+        unknown = {**context, "owner": None}
+        result = self.invoke("--context-json", prompt=json.dumps({"prompt": "do it", "context": unknown}))
+        self.assertIsNone(result["context"]["owner"])
+
+    def test_old_cancelled_status_recovers_context_without_rewriting(self):
+        cases = [("read-only", None, None), ("read-only", "writer-old", "writer-old"),
+                 ("workspace-write", None, "T-event"), ("danger-full-access", None, "T-event")]
+        for n, (sandbox, resume, expected) in enumerate(cases):
+            with self.subTest(sandbox=sandbox, resume=resume):
+                context = self.sample_context()
+                jd = self.stored_job(f"cancelled-{n}", {"status": "cancelled", "retryable": False},
+                                     sandbox=sandbox, resume=resume, scope=["keep"], context=context)
+                (jd / "events.jsonl").write_text(json.dumps({"type": "thread.started", "thread_id": "T-event"}) + "\n")
+                old = time.time() - 120
+                os.utime(jd / "args.json", (old, old))
+                original = (jd / "result.json").read_bytes()
+                for _ in range(2):
+                    value = self.control("status", jd.name)
+                    self.assertEqual(value["context"], context)
+                    self.assertEqual(value["thread_id"], expected)
+                    self.assertEqual(value["cwd"], os.path.realpath(self.cwd))
+                    self.assertEqual(value["sandbox"], sandbox)
+                    self.assertEqual(value["scope"], ["keep"])
+                    self.assertEqual(value["scope_paths"], [os.path.realpath(self.cwd / "keep")])
+                    self.assertGreaterEqual(value["duration_s"], 119)
+                    self.assertNotIn("files_changed", value)
+                    self.assertEqual(value["review_status"], "needs_attention")
+                self.assertEqual((jd / "result.json").read_bytes(), original)
+
+    def test_review_summary_matches_schema_and_keeps_execution_separate(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        valid = self.sample_report()
+        base = {"status": "completed", "structured": valid}
+        self.assertEqual(codex_runner.review_summary(base), {
+            "execution_status": "completed", "report_status": "valid", "review_status": "needs_verification",
+            "criteria_counts": {"met": 1, "not_met": 0, "blocked": 0}})
+        invalids = [[], {}, {**valid, "extra": 1}, {**valid, "summary": None},
+                    {**valid, "unresolved": [1]}, {**valid, "criteria": [None]},
+                    {**valid, "criteria": [{"criterion": "c", "status": "unknown", "evidence": "e"}]},
+                    {**valid, "criteria": [{"criterion": "c", "status": "met", "evidence": 1}]}]
+        for report in invalids:
+            summary = codex_runner.review_summary({**base, "structured": report})
+            self.assertEqual(summary["report_status"], "invalid")
+            self.assertEqual(summary["review_status"], "needs_attention")
+        for status in ("blocked", "not_met"):
+            report = self.sample_report(criteria=[{"criterion": "c", "status": status, "evidence": "e"}])
+            self.assertEqual(codex_runner.review_summary({**base, "structured": report})["criteria_counts"][status], 1)
+        for report in (self.sample_report(unresolved=["remaining"]), self.sample_report(deviations=["changed plan"])):
+            self.assertEqual(codex_runner.review_summary({**base, "structured": report})["review_status"], "needs_attention")
+        context = self.sample_context()
+        context["acceptance"] *= 2
+        summary = codex_runner.review_summary({**base, "context": context})
+        self.assertEqual(summary["report_status"], "valid")
+        self.assertEqual(summary["review_status"], "needs_attention")
+        for value in ({"status": "failed", "error_kind": "schema_invalid"},
+                      {"status": "failed", "error_kind": "schema_invalid", "structured": valid}):
+            summary = codex_runner.review_summary(value)
+            self.assertEqual(summary["execution_status"], "completed")
+            self.assertEqual(summary["report_status"], "invalid")
+        missing = codex_runner.review_summary({"status": "completed", "final_message": json.dumps(valid)})
+        self.assertEqual(missing["report_status"], "missing")
+        self.assertEqual(missing["criteria_counts"], {"met": 0, "not_met": 0, "blocked": 0})
+        self.assertEqual(codex_runner.review_summary({"status": "running"})["review_status"], "pending")
+        outside = {**base, "cwd": str(self.cwd), "scope_paths": [str(self.cwd / "src")],
+                   "files_changed": [{"path": "other.txt", "change": "modified"}]}
+        self.assertEqual(codex_runner.review_summary(outside)["review_status"], "needs_attention")
+
+    def test_list_filters_owner_cwd_execution_attention_and_paginates(self):
+        context = self.sample_context()
+        self.stored_job("owned", {"status": "completed", "structured": self.sample_report()}, context=context)
+        self.stored_job("legacy", {"status": "cancelled", "retryable": False})
+        self.stored_job("other", {"status": "completed", "structured": self.sample_report()}, context=self.sample_context("owner-b"))
+        self.stored_job("bad-report", {"status": "failed", "error_kind": "schema_invalid"}, context=context)
+        self.stored_job("elsewhere", {"status": "completed", "structured": self.sample_report()}, cwd=str(self.cwd / "elsewhere"), context=context)
+        result = self.control("list", "--owner", "owner-a", "--job-id", "legacy", "--cwd", str(self.cwd))
+        self.assertEqual({j["job_id"] for j in result["jobs"]}, {"owned", "legacy", "bad-report"})
+        old = next(j for j in result["jobs"] if j["job_id"] == "legacy")
+        self.assertIsNone(old["context"])
+        owned = next(j for j in result["jobs"] if j["job_id"] == "owned")
+        self.assertEqual(owned["context"], {"owner": "owner-a", "task": "Task title"})
+        self.assertEqual(owned["criteria_counts"], {"met": 1, "not_met": 0, "blocked": 0})
+        self.assertEqual(owned["report_status"], "valid")
+        self.assertEqual(owned["review_status"], "needs_verification")
+        self.assertNotIn("review_summary", owned)
+        self.assertNotIn("private task body", json.dumps(result))
+        result = self.control("list", "--owner", "owner-a", "--cwd", str(self.cwd), "--status", "completed", "--needs-attention")
+        self.assertEqual([j["job_id"] for j in result["jobs"]], ["bad-report"])
+        self.assertEqual(result["jobs"][0]["status"], "failed")
+        self.assertEqual(result["jobs"][0]["execution_status"], "completed")
+        first = self.control("list", "--limit", "2")
+        second = self.control("list", "--limit", "2", "--offset", str(first["next_offset"]))
+        self.assertEqual(first["total"], 5)
+        self.assertFalse(first["eof"])
+        self.assertFalse({j["job_id"] for j in first["jobs"]} & {j["job_id"] for j in second["jobs"]})
+        last = self.control("list", "--offset", "4")
+        self.assertTrue(last["eof"])
+        self.assertIsNone(last["next_offset"])
+        for extra in (("--limit", "101"), ("--offset", "-1")):
+            self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
+
+    def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
+        context = self.sample_context()
+        jd = self.stored_job("output", {"status": "completed"}, context=context)
+        content = "漢" * 3999 + "😀" + "第二页" * 1800 + "\r\nEND"
+        with open(jd / "last_message.txt", "w", encoding="utf-8", newline="") as f:
+            f.write(content)
+        pages = []
+        offset = 0
+        while True:
+            page = self.control("output", "output", "--offset", str(offset))
+            self.assertEqual(page["status"], "completed")
+            self.assertEqual(page["total_chars"], len(content))
+            self.assertEqual(self.control("output", "output", "--offset", str(offset)), page)
+            pages.append(page["text"])
+            if page["eof"]:
+                self.assertIsNone(page["next_offset"])
+                break
+            offset = page["next_offset"]
+        self.assertEqual("".join(pages), content)
+        self.assertTrue(pages[0].endswith("😀"))
+        context_page = self.control("output", "output", "--artifact", "context", "--limit", "8000")
+        self.assertEqual(json.loads(context_page["text"]), context)
+        result_page = self.control("output", "output", "--artifact", "result")
+        self.assertEqual(json.loads(result_page["text"]), {"status": "completed"})
+        self.assertEqual(self.control("output", "output", "--offset", str(len(content)))["error_kind"], "offset_out_of_range")
+        self.assertEqual(self.control("output", "../output")["error_kind"], "bad_arguments")
+        self.assertEqual(self.control("output", "output", "--limit", "8001")["error_kind"], "bad_arguments")
+
+    def test_output_distinguishes_pending_missing_empty_and_legacy_context(self):
+        pending = self.stored_job("running", None)
+        (pending / "last_message.txt").write_text("stale previous attempt")
+        self.assertEqual(self.control("output", "running")["error_kind"], "artifact_pending")
+        empty = self.stored_job("empty", {"status": "completed"})
+        self.assertEqual(self.control("output", "empty")["error_kind"], "artifact_missing")
+        (empty / "last_message.txt").write_text("")
+        self.assertEqual(self.control("output", "empty")["error_kind"], "artifact_empty")
+        self.assertEqual(self.control("output", "empty", "--artifact", "context")["error_kind"], "legacy_context_missing")
+        (empty / "args.json").write_text("[]")
+        self.assertEqual(self.control("status", "empty")["error_kind"], "invalid_record")
+
+    def test_runner_phases_expose_retry_without_changing_retry_policy(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "danger-full-access", "--resume", "W", "--backoff", "0.1"])
+        jd = self.stored_job("phases", None, resume="W")
+        waits = []
+        def observe_retry(delay):
+            status = codex_runner.job_status(jd.name)
+            waits.append(status)
+            self.assertEqual(status["phase"], "retry_wait")
+            self.assertEqual(status["attempt"], 1)
+            self.assertEqual(status["last_error_kind"], "router_down")
+            self.assertIsInstance(status["retry_at"], float)
+            self.assertGreater(delay, 0)
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
+                mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "warnings_then_ok"}), \
+                mock.patch.object(codex_runner, "router_reachable", side_effect=[False, True]), \
+                mock.patch.object(codex_runner.time, "sleep", side_effect=observe_retry):
+            result = codex_runner.execute(args, "a new resume task", jd)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(len(waits), 1)
+        self.assertEqual(self.calls()[-1]["prompt"], "a new resume task")
+        events = [json.loads(s) for s in (jd / "events.jsonl").read_text().splitlines()]
+        phases = [e for e in events if e["type"] == "runner.phase"]
+        self.assertEqual([e["phase"] for e in phases], ["router_check", "retry_wait", "router_check", "codex_running", "finalizing"])
+        activity = codex_runner.runner_activity(jd / "events.jsonl")
+        self.assertEqual(activity["attempt"], 2)
+        self.assertEqual(activity["last_error_kind"], "router_down")
+        self.assertIsNone(activity["retry_at"])
+        with (jd / "events.jsonl").open("a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "item.completed", "item": {"type": "reasoning", "text": "x" * 140000}}) + "\n")
+        self.assertEqual(codex_runner.runner_activity(jd / "events.jsonl"), activity)
+        (jd / "result.json").write_text(json.dumps({"status": "failed", "error_kind": "runner_error"}))
+        self.assertEqual(self.control("status", jd.name)["last_error_kind"], "runner_error")
 
     def test_unknown_job_is_reported(self):
         self.assertEqual(self.control("status", "nope")["error_kind"], "unknown_job")

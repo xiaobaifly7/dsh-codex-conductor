@@ -584,7 +584,7 @@ export function createConductor(cfg, run = runRunner) {
     return { job_id: jobId, ...value, ...note };
   }
 
-  async function start(args, cwd, signal) {
+  async function start(args, cwd, signal, context) {
     const argv = ['start', '--cwd', cwd];
     const hostAccess = args.host_access ?? (cfg.defaultHostAccess === true);
     const effort = args.effort ?? (args.write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort);
@@ -603,7 +603,8 @@ export function createConductor(cfg, run = runRunner) {
     for (const rx of cfg.ignoreChanges ?? []) argv.push('--ignore', rx.source);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
       ignore: (cfg.ignoreChanges ?? []).map((rx) => rx.source) });
-    return run(cfg, argv, { stdin: prompt, signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+    if (context !== undefined) argv.push('--context-json');
+    return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
 
   async function cancel(jobId, signal) {
@@ -614,7 +615,20 @@ export function createConductor(cfg, run = runRunner) {
     return value;
   }
 
-  return { start, waitJob, cancel };
+  async function list(filters = {}, signal) {
+    const argv = ['list', '--limit', String(filters.limit ?? 20), '--offset', String(filters.offset ?? 0)];
+    for (const key of ['cwd', 'owner', 'status']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
+    if (filters.needs_attention) argv.push('--needs-attention');
+    for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
+    return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  }
+
+  async function output(jobId, { artifact = 'report', offset = 0, limit = 4000 } = {}, signal) {
+    return run(cfg, ['output', jobId, '--artifact', artifact, '--offset', String(offset), '--limit', String(limit)],
+      { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  }
+
+  return { start, waitJob, cancel, list, output };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
@@ -672,12 +686,39 @@ export function validateRun(args) {
   if (args.writable_roots?.length && args.write !== true) throw new Error('codex_run: writable_roots 需要 write=true');
 }
 
+// 执行完成不等于独立验收通过；模型自报全 met 仍需规划端核验。
+export function reviewState(value) {
+  const report = Object.hasOwn(value, 'structured') ? value.structured : value.report;
+  const counts = { met: 0, not_met: 0, blocked: 0 };
+  const criteria = Array.isArray(report?.criteria) ? report.criteria : [];
+  for (const item of criteria) if (Object.hasOwn(counts, item?.status)) counts[item.status]++;
+  const fields = ['summary', 'criteria', 'files_changed', 'deviations', 'unresolved'];
+  const valid = report && typeof report === 'object' && !Array.isArray(report) &&
+    fields.every((key) => Object.hasOwn(report, key)) && Object.keys(report).every((key) => fields.includes(key)) &&
+    typeof report.summary === 'string' && Array.isArray(report.criteria) &&
+    ['files_changed', 'deviations', 'unresolved'].every((key) => Array.isArray(report[key]) && report[key].every((s) => typeof s === 'string')) &&
+    criteria.every((c) => c && typeof c.criterion === 'string' && typeof c.evidence === 'string' && Object.hasOwn(counts, c.status) &&
+      Object.keys(c).every((key) => ['criterion', 'status', 'evidence'].includes(key)));
+  const execution = value.error_kind === 'schema_invalid' ? 'completed' : value.status;
+  const pending = execution === 'running';
+  const reportStatus = pending ? 'pending' : value.error_kind === 'schema_invalid' || value.report_status === 'invalid' ? 'invalid'
+    : report === undefined ? 'missing' : valid ? 'valid' : 'invalid';
+  const expected = value.acceptance ?? value.context?.acceptance;
+  const attention = execution !== 'completed' || reportStatus !== 'valid' || counts.not_met > 0 || counts.blocked > 0 ||
+    report?.unresolved?.length > 0 || report?.deviations?.length > 0 || value.out_of_scope?.length > 0 ||
+    (Array.isArray(expected) && expected.length !== criteria.length);
+  return { execution_status: execution, report_status: reportStatus,
+    review_status: pending ? 'pending' : attention ? 'needs_attention' : 'needs_verification', criteria_counts: counts };
+}
+
 // 将 runner 的规范化路径用于范围检查，并把 structured 汇报改名为 report。
 // Codex 没按 JSON 汇报时 runner 记为 schema_invalid 失败，但活已经干完，按完成处理并提示以实际文件为准。
 export function withReport(value) {
   const { structured, ...rest } = value;
+  if (rest.context?.acceptance) rest.acceptance = rest.context.acceptance;
   const outside = outOfScope(rest, rest.cwd, rest.scope_paths);
   if (outside) rest.out_of_scope = outside;
+  Object.assign(rest, reviewState({ ...rest, ...(structured !== undefined ? { structured } : {}) }));
   if (rest.status === 'failed' && rest.error_kind === 'schema_invalid') {
     const { error_kind: _kind, error: _error, retryable: _retryable, ...done } = rest;
     return { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' };
@@ -708,9 +749,10 @@ function sameCriteria(report, acceptance) {
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // hostAccess：插件开了 allowHostAccess 时，Windows 程序受阻就提示带 host_access=true 派回，否则提示自己跑
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
-export function nextStep(value, acceptance, resumed, { hostAccess = false, readOnly = value.sandbox === 'read-only' } = {}) {
+export function nextStep(value, acceptance, resumed, { hostAccess = false, readOnly = value.context?.write === false || value.sandbox === 'read-only' } = {}) {
+  acceptance ??= value.acceptance ?? value.context?.acceptance;
   if (value.status === 'running') return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
-  // runner 的取消结果不带改动清单和沙箱，可写任务可能已改了一半
+  // 取消会保留恢复信息，但不会重建中断前的改动清单。
   if (value.status === 'cancelled') {
     return 'Codex 任务已取消（用户停止、会话归档或调用中止）：不要自行续跑或重派，先问用户。' +
       '如果这是可写任务，取消前可能已改了部分文件且没有改动清单，核验前先用 git status 或对比文件确认现状。';
@@ -767,20 +809,29 @@ function summaryLine(value) {
   const files = value.files_changed_total ?? value.files_changed?.length;
   const done = value.status === 'completed';
   return [String(value.status), done ? counts : value.error_kind, done && files !== undefined && `${files} files`,
-    typeof value.duration_s === 'number' && `${Math.round(value.duration_s)} s`].filter(Boolean).join(' · ');
+    typeof value.duration_s === 'number' && `${Math.round(value.duration_s)} s`,
+    done && value.review_status === 'needs_attention' && '待关注',
+    done && value.review_status === 'needs_verification' && '待核验',
+    done && value.report_status === 'invalid' && '报告异常'].filter(Boolean).join(' · ');
 }
 
 // 已完成的结果只留核验用得上的：任务目录和一行改动清单；失败、取消、仍在执行的保留全部字段，便于排查。
 // 用量、日志目录等完整字段在 runner 的 result.json（runnerHome/jobs/<job_id>/）里
 function details(rest) {
-  if (rest.status !== 'completed') return [JSON.stringify(rest, null, 2)];
+  if (rest.status !== 'completed') {
+    const value = { ...rest };
+    if (value.context) value.context = { owner: value.context.owner, write: value.context.write, task: taskLine(value.context, 120) };
+    return [JSON.stringify(value, null, 2)];
+  }
   // runner 最多列 300 条，总数照实给
   const shown = rest.files_changed?.length;
   const total = rest.files_changed_total ?? shown;
   const files = Array.isArray(rest.files_changed) && `改动文件（${rest.files_changed_source ?? '来源未知'}，共 ${total} 个` +
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
     (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
-  return [rest.cwd && `任务目录：${rest.cwd}`, files, rest.report_note].filter(Boolean);
+  return [rest.cwd && `任务目录：${rest.cwd}`, files,
+    rest.execution_status && `执行：${rest.execution_status}；报告：${rest.report_status}；验收：${rest.review_status}`,
+    rest.report_note].filter(Boolean);
 }
 
 function render(value) {
@@ -833,6 +884,8 @@ export function turnSummary(log, turn) {
 }
 
 const OUTPUT = { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => render(value) };
+const DATA_OUTPUT = { schema: { type: 'object', additionalProperties: true },
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 
 // 工具卡片和任务表用的短标题：任务的第一行，截到 n 个字
 export function taskLine(args, n) {
@@ -935,15 +988,43 @@ export function apply(ctx, config = {}, run = runRunner) {
     return job && { jobs, id: job.id, owner };
   }
 
-  // 后台循环：有界地反复 `status --wait`，结束时把与工具结果相同的文字交给 DSH 送回会话
-  async function watch(jobId, handle, finish) {
+  function outputEntry(jobId, logDir) {
+    const dir = (logDir || (cfg.runnerHome && `${cfg.runnerHome}/jobs/${jobId}`)).replace(/\/$/, '');
+    const paths = dir ? `完整报告：${dir}/last_message.txt\n完整结果：${dir}/result.json\n`
+      : '完整路径尚未确认；可用 codex_output 的 result 查看 runner 返回的 log_dir。\n';
+    return `\n--- 完整结果入口 ---\nrunner job_id: ${jobId}\n${paths}` +
+      `可重复分页读取：codex_output ${JSON.stringify({ job_id: jobId, artifact: 'report', offset: 0, limit: 8000 })}\n` +
+      '原始结果或原任务背景可将 artifact 改为 result 或 context；继续读取时使用返回的 next_offset。';
+  }
+
+  // log 通道只供原生面板观察，job_output 过滤它，模型只收到一次最终 result。
+  async function watch(jobId, handle, finish, state) {
+    const publish = (value) => {
+      const warning = value.status === 'monitor_failed' && state.cancelNotice ? `\n${state.cancelNotice}` : '';
+      const text = render(value)[0].text + warning + outputEntry(jobId, state.logDir);
+      handle.append(`${text}\n`, { channel: 'log' });
+      return { status: JOB_STATUS[value.status] ?? 'failed',
+        detail: `${summaryLine(value)} · runner ${jobId} · codex_output`, result: text };
+    };
     try {
       let bridgeErrors = 0;
       for (;;) {
         const value = withReport(await conductor.waitJob(jobId, BG_WAIT));
+        if (value.log_dir) state.logDir = value.log_dir;
         if (value.status === 'running') {
           bridgeErrors = 0;
-          handle.updateProgress(`Codex 执行中，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`);
+          const phase = { router_check: '检查路由', codex_running: 'Codex 执行中', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
+          const stage = [phase, value.attempt != null && `第 ${value.attempt} 轮`,
+            value.last_error_kind && `上次错误 ${value.last_error_kind}`,
+            value.retry_at != null && `约 ${Math.max(0, Math.ceil(value.retry_at - Date.now() / 1000))} 秒后重试`]
+            .filter(Boolean).join(' · ') || 'Codex 执行中';
+          state.progress = `${stage}，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`;
+          handle.updateProgress([state.cancelNotice, state.progress].filter(Boolean).join('\n'));
+          const stageKey = JSON.stringify([value.phase, value.attempt, value.last_error_kind, value.retry_at]);
+          if (stageKey !== state.lastStage) {
+            handle.append(`${stage}\n`, { channel: 'log' });
+            state.lastStage = stageKey;
+          }
           continue;
         }
         // status 是只读的：一次 wsl.exe 出错（含电脑睡眠唤醒、发行版重启瞬间）不代表任务结束，连续多次才放弃
@@ -951,13 +1032,14 @@ export function apply(ctx, config = {}, run = runRunner) {
           if (++bridgeErrors < 3) continue;
           throw new Error(value.error);
         }
-        const done = finish(value);
-        return { status: JOB_STATUS[done.status] ?? 'failed', detail: summaryLine(done), result: render(done)[0].text };
+        return publish(finish(value));
       }
     } catch (error) {
       const lost = { job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error),
         next: `后台等待出错，底层 Codex 任务可能仍在运行：先用 codex_status 查询 ${jobId}，不要直接重派。` };
-      return { status: 'failed', detail: `无法继续等待 Codex 任务 ${jobId}`, result: render(lost)[0].text };
+      return publish(lost);
+    } finally {
+      state.settled = true;
     }
   }
 
@@ -972,12 +1054,29 @@ export function apply(ctx, config = {}, run = runRunner) {
       const jobs = ctx.get?.('jobs');
       if (!jobs) return undefined;
       const owner = exec.agent.id;
+      const state = {};
       const id = jobs.start({
         owner, kind: 'codex', label, outputLimitBytes: 65536,
-        run: (handle) => ({
-          done: watch(jobId, handle, finish),
-          cancel: () => { Promise.resolve(conductor.cancel(jobId)).catch(() => {}); },
-        }),
+        run: (handle) => {
+          const cancelNotice = (reason) => {
+            if (state.settled) return;
+            state.cancelNotice = `取消未确认 · runner job_id: ${jobId}：${reason}；` +
+              `任务可能仍在运行，用 codex_status 查询 ${jobId}，或 codex_cancel 再取消 ${jobId}，不要重派。`;
+            handle.updateProgress([state.cancelNotice, state.progress].filter(Boolean).join('\n'));
+            handle.append(`${state.cancelNotice}\n`, { channel: 'log' });
+          };
+          return {
+            done: watch(jobId, handle, finish, state),
+            cancel: () => {
+              cancelNotice('正在请求 runner 取消');
+              return conductor.cancel(jobId).then((value) => {
+                if (value.error_kind === 'bridge_error' || !['cancelled', 'completed', 'failed'].includes(value.status)) {
+                  cancelNotice([value.error_kind ?? value.status, value.error].filter(Boolean).join(': '));
+                }
+              }).catch((error) => cancelNotice(String(error?.message ?? error)));
+            },
+          };
+        },
       });
       return { jobs, id, owner };
     } catch {
@@ -1023,8 +1122,10 @@ export function apply(ctx, config = {}, run = runRunner) {
     const id = background(value.job_id, exec, finish)?.id;
     if (id === undefined) return value;
     return { ...value, background_job_id: id,
-      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），届时用 job_output 读取 ${id} 的完整结果（含逐条汇报和下一步），在此之前不必轮询。`,
-      next: '等 DSH 的任务通知，再用 job_output 读取完整结果；在此之前不要自己动手补做，也不要重复派同一个任务。' };
+      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），届时用 job_output 读取 ${id} 的完整结果（含逐条汇报和下一步）；` +
+        `超长结果用 codex_output 按 runner job_id=${value.job_id} 可重复分页读取，在此之前不必轮询。`,
+      next: '等 DSH 的任务通知，再用 job_output 读取完整结果；需要全文时用 codex_output 分页。' +
+        '在此之前不要自己动手补做，也不要重复派同一个任务。' };
   }
 
   ctx.tools.register({
@@ -1081,6 +1182,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const finish = (result) => {
         const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);
         const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
+        Object.assign(value, reviewState(value));
         // 每轮结果都提醒一次规划要求：DeepSeek 正要据此规划下一次派活
         const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
           ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
@@ -1090,7 +1192,10 @@ export function apply(ctx, config = {}, run = runRunner) {
       // 启动不随中止打断：runner 在打印 job_id 前就拉起了 Codex，这时杀掉 wsl.exe 会让 Codex 在 WSL 里没人管地跑下去；
       // 等拿到 job_id 再按中止取消它
       exec?.signal?.throwIfAborted();
-      const started = await conductor.start(args, cwd);
+      const started = await conductor.start(args, cwd, undefined, {
+        owner: exec?.agent?.id ?? null,
+        task: args.task, acceptance: args.acceptance, write: args.write,
+      });
       if (exec?.signal?.aborted) {
         if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
         exec.signal.throwIfAborted();
@@ -1109,7 +1214,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     name: 'codex_status',
     description: '查询或继续等待 codex_run 返回的任务。已登记为后台任务（结果带 background_job_id）的，结束时会收到 DSH 任务通知，' +
       '用 job_output 读完整结果，不必调用本工具；没登记的才用它等，仍在执行时返回 last_activity（它最近在做什么）和距上次活动的秒数，' +
-      '不必再去翻日志；建议每次等 300–600 秒，不要频繁轮询。',
+      '同时返回当前阶段、尝试轮次和上次重试原因；原任务与验收上下文可用 codex_output artifact=context 读取。' +
+      '建议每次等 300–600 秒，不要频繁轮询；报告截断或已经读过时用 codex_output 分段重读。',
     parameters: {
       type: 'object',
       properties: {
@@ -1167,6 +1273,90 @@ export function apply(ctx, config = {}, run = runRunner) {
     },
   });
 
+  ctx.tools.register({
+    name: 'codex_jobs',
+    description: '只读列出 Codex 任务历史，找回 runner job_id、Codex thread_id 和本会话的 Harness 后台任务编号。' +
+      '默认查当前工作区，可用 session_id="current" 查当前会话，或传指定会话 ID；旧任务归属未知时按 cwd 查。' +
+      '可按执行状态或 needs_attention 筛选。completed 只表示执行结束，自报全部满足仍需独立核验。不会启动或恢复任务。',
+    presentCall: () => ({ card: 'generic', kind: 'read', title: 'Codex 任务历史' }),
+    parameters: {
+      type: 'object',
+      properties: {
+        cwd: { type: 'string', description: '任务工作目录，省略且未指定会话时使用当前工作区。' },
+        session_id: { type: 'string', description: 'Harness 会话 ID；current 表示当前会话。' },
+        status: { type: 'string', enum: ['running', 'completed', 'cancelled', 'failed'], description: '按执行状态筛选。' },
+        needs_attention: { type: 'boolean', description: '仅列出失败、取消、报告异常、受阻或有未解决事项的任务。' },
+        limit: { type: 'integer', minimum: 1, maximum: 100, description: '每页条数，默认 20。' },
+        offset: { type: 'integer', minimum: 0, description: '分页起点，默认 0。' },
+      },
+    },
+    output: DATA_OUTPUT,
+    async execute(args = {}, exec) {
+      for (const key of ['cwd', 'session_id']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !args[key].trim())) {
+        throw new Error(`codex_jobs: ${key} 必须是非空字符串`);
+      }
+      if (args.status !== undefined && !['running', 'completed', 'cancelled', 'failed'].includes(args.status)) throw new Error('codex_jobs: status 无效');
+      if (args.needs_attention !== undefined && typeof args.needs_attention !== 'boolean') throw new Error('codex_jobs: needs_attention 必须是布尔值');
+      if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new Error('codex_jobs: limit 必须是 1–100 的整数');
+      if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_jobs: offset 必须是非负整数');
+      const owner = args.session_id === 'current' ? exec?.agent?.id : args.session_id;
+      if (args.session_id && owner === undefined) throw new Error('codex_jobs: 当前调用没有会话 ID');
+      const cwd = args.cwd ?? (owner === undefined ? taskCwd({}, sessionCwd(exec), cfg.workspaces) : undefined);
+      if (cwd === undefined && owner === undefined) throw new Error('codex_jobs: 请传 cwd 或 session_id');
+      const historyOwner = owner ?? exec?.agent?.id;
+      let events = historyOwner === exec?.agent?.id ? exec?.agent?.session?.log ?? [] : [];
+      const query = owner !== undefined ? ctx.get?.('sessionQuery') : undefined;
+      const observation = query ? await query.observeSession(owner, { projectionMode: 'none', signal: exec?.signal }) : undefined;
+      let history;
+      try {
+        events = observation?.events ?? events;
+        history = events.filter((e) => e.seq >= (observation?.inheritedEventCount ?? 0) &&
+          e.type === 'job/registered' && e.data.kind === 'codex' && e.data.owner === historyOwner)
+          .map((e) => ({ id: e.data.jobId, owner: e.data.owner, kind: e.data.kind, label: e.data.label }));
+      } finally {
+        observation?.[Symbol.dispose]();
+      }
+      const native = ctx.get?.('jobs')?.list(historyOwner) ?? [];
+      const linked = new Map([...history, ...native].filter((j) => j.kind === 'codex').flatMap((j) => {
+        const match = /^Codex ([^\s·]+)/.exec(j.label ?? '');
+        return match ? [[match[1], j]] : [];
+      }));
+      const filters = { ...args, ...(cwd !== undefined ? { cwd } : {}), ...(owner !== undefined ? { owner, job_ids: [...linked.keys()] } : {}) };
+      const value = await conductor.list(filters, exec?.signal);
+      if (!Array.isArray(value.jobs)) return value;
+      return { ...value, jobs: value.jobs.map((job) => {
+        const bg = linked.get(job.job_id);
+        return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner } : {}) };
+      }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}) };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'codex_output',
+    description: '只读、可重复地分段读取 Codex 完整原始报告、runner 结果或原任务与验收上下文。' +
+      'job_output 截断或已经消费结果时，用本工具找回；不会消费报告、启动或恢复任务。' +
+      'offset 和 next_offset 按 Unicode 字符计算，按 next_offset 接着读取，直至 eof=true。',
+    presentCall: (a) => ({ card: 'generic', kind: 'read', title: `Codex 完整结果 ${a?.job_id ?? ''}` }),
+    parameters: {
+      type: 'object',
+      properties: {
+        job_id: { type: 'string', description: 'runner job_id；可用 codex_jobs 找回，不是 Harness 的 background_job_id。' },
+        artifact: { type: 'string', enum: ['report', 'result', 'context'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准。默认 report。' },
+        offset: { type: 'integer', minimum: 0, description: 'Unicode 字符起点，默认 0。' },
+        limit: { type: 'integer', minimum: 1, maximum: 8000, description: '每段最多字符数，默认 4000。' },
+      },
+      required: ['job_id'],
+    },
+    output: DATA_OUTPUT,
+    async execute(args, exec) {
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_output: job_id 无效');
+      if (args.artifact !== undefined && !['report', 'result', 'context'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
+      if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
+      if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
+      return conductor.output(args.job_id, args, exec?.signal);
+    },
+  });
+
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
   ctx.on('agent/turn-stopping', ({ agent, turn }) => {
@@ -1175,7 +1365,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
       const { text, tools } = turnSummary(agent.session.log ?? [], turn);
-      if (!DISPATCH_CLAIM.test(text) || tools.some((n) => n?.startsWith('codex_'))) return;
+      if (!DISPATCH_CLAIM.test(text) || tools.some((n) => ['codex_run', 'codex_status', 'codex_cancel'].includes(n))) return;
       if (nudged.size > 500) nudged.clear();
       nudged.add(key);
       agent.steer({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: NUDGE }], source: { kind: `plugin:${name}` } });

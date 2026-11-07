@@ -54,7 +54,8 @@ TRANSIENT = re.compile(
 
 
 def emit(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    # ASCII JSON also works with Windows pipes using a legacy encoding.
+    sys.stdout.write(json.dumps(obj, ensure_ascii=True) + "\n")
     sys.stdout.flush()
 
 
@@ -521,8 +522,10 @@ def execute(args, prompt, run_dir):
     args.cwd = os.path.realpath(args.cwd)
     scope_args = [scope_path(args.cwd, s) for s in getattr(args, "scope", None) or []]
     base = {"cwd": args.cwd, "sandbox": args.sandbox, "log_dir": str(run_dir)}
+    if getattr(args, "context", None) is not None:
+        base["context"] = args.context
     if scope_args:
-        base["scope_paths"] = scope_args
+        base.update(scope=getattr(args, "scope", None), scope_paths=scope_args)
     started = time.time()
     lock = None
     before = scope = None
@@ -545,32 +548,40 @@ def execute(args, prompt, run_dir):
         resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
         thread_id = args.resume
         attempt = 0
+        last_error_kind = None
         while True:
             attempt += 1
+            runner_event(run_dir, attempt, "router_check", last_error_kind)
             if not router_reachable():
                 state = {"end_reason": "router_down", "error": "Local model router is not reachable", "thread_id": thread_id}
                 kind, retryable = "router_down", True
             else:
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
+                runner_event(run_dir, attempt, "codex_running", last_error_kind)
                 state = run_attempt(args, prompt, run_dir, thread_id)
                 thread_id = state["thread_id"]
                 event_changes += state["file_changes"]
                 if state["completed"] and not state["failed"]:
                     break
                 kind, retryable = classify(state, run_dir)
+            last_error_kind = kind
             # Read-only runs are ephemeral and safe to restart. A writer that started a thread must resume it.
             can_retry = retryable and attempt <= args.retries and (args.sandbox == "read-only" or thread_id or kind == "router_down")
             if not can_retry:
+                runner_event(run_dir, attempt, "finalizing", kind)
                 return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
                         "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
                         **changes()}
-            time.sleep(min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2))
+            delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
+            runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
+            time.sleep(delay)
             if thread_id and args.sandbox != "read-only" and kind != "router_down":
                 prompt = ("The previous attempt was interrupted. Inspect the current state of the workspace, "
                           "then finish the original task without repeating completed work.")
             elif args.sandbox == "read-only":
                 thread_id = None
 
+        runner_event(run_dir, attempt, "finalizing", last_error_kind)
         message_file = run_dir / "last_message.txt"
         final = message_file.read_text("utf-8", "replace").strip() if message_file.exists() else ""
         final = final or state["last_text"] or ""
@@ -593,6 +604,7 @@ def execute(args, prompt, run_dir):
 
 
 def add_task_arguments(p):
+    p.add_argument("--context-json", action="store_true", help="Read a prompt/context JSON envelope from stdin")
     p.add_argument("--cwd", required=True)
     # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
@@ -617,8 +629,12 @@ def add_task_arguments(p):
     p.add_argument("--backoff", type=float, default=5)
 
 
-def read_prompt():
-    prompt = sys.stdin.buffer.read().decode("utf-8", "replace")
+def read_prompt(strict=False):
+    try:
+        prompt = sys.stdin.buffer.read().decode("utf-8", "strict" if strict else "replace")
+    except UnicodeDecodeError:
+        emit({"status": "failed", "error_kind": "bad_arguments", "error": "stdin must be UTF-8", "retryable": False})
+        sys.exit(2)
     if not prompt.strip():
         emit({"status": "failed", "error_kind": "bad_arguments", "error": "Prompt must be supplied on stdin", "retryable": False})
         sys.exit(2)
@@ -661,26 +677,265 @@ def last_activity(events):
     return None
 
 
+def task_context(value):
+    if not isinstance(value, dict) or set(value) != {"owner", "task", "acceptance", "write"}:
+        raise ValueError("context must contain owner, task, acceptance and write")
+    if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
+        raise ValueError("context.owner must be a nonempty string or null")
+    if not isinstance(value["task"], str) or not value["task"].strip():
+        raise ValueError("context.task must be a nonempty string")
+    if not isinstance(value["acceptance"], list) or not value["acceptance"] or any(
+            not isinstance(a, str) or not a.strip() for a in value["acceptance"]):
+        raise ValueError("context.acceptance must be a nonempty array of nonempty strings")
+    if not isinstance(value["write"], bool):
+        raise ValueError("context.write must be a boolean")
+    return value
+
+
+def read_task_input(args, parser):
+    prompt = read_prompt(strict=args.context_json)
+    if args.context_json:
+        try:
+            envelope = json.loads(prompt)
+            if not isinstance(envelope, dict) or set(envelope) != {"prompt", "context"}:
+                raise ValueError("stdin must contain prompt and context")
+            if not isinstance(envelope["prompt"], str) or not envelope["prompt"].strip():
+                raise ValueError("prompt must be a nonempty string")
+            args.context = task_context(envelope["context"])
+            prompt = envelope["prompt"]
+        except ValueError as e:
+            parser.error("Invalid context envelope: " + str(e))
+    return prompt
+
+
+def job_identifier(value):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", value):
+        raise argparse.ArgumentTypeError("job_id must be a runner job identifier, not a path")
+    return value
+
+
+def job_directory(job_id):
+    job_identifier(job_id)
+    root = (HOME / "jobs").resolve()
+    path = root / job_id
+    if not path.resolve().is_relative_to(root):
+        raise ValueError("job directory is outside runner jobs")
+    return path
+
+
+def task_record(job_dir):
+    path = job_dir / "args.json"
+    if not path.exists():
+        return {}
+    task = json.loads(path.read_text("utf-8"))
+    if not isinstance(task, dict):
+        raise ValueError("args.json must be an object")
+    if task.get("context") is not None:
+        task_context(task["context"])
+    return task
+
+
+def job_metadata(job_dir, task=None, finished_at=None, thread_id=None):
+    task = task_record(job_dir) if task is None else task
+    meta = {"context": task.get("context"), "sandbox": task.get("sandbox"), "scope": task.get("scope")}
+    if task.get("cwd"):
+        meta["cwd"] = os.path.realpath(local_path(task["cwd"]))
+        if task.get("scope"):
+            meta.update(scope=task["scope"], scope_paths=[scope_path(meta["cwd"], s) for s in task["scope"]])
+    thread = thread_id or task.get("resume")
+    if not thread_id and task.get("sandbox") and task["sandbox"] != "read-only":
+        thread = started_thread(job_dir / "events.jsonl") or thread
+    meta["thread_id"] = thread
+    args_file = job_dir / "args.json"
+    if finished_at is not None and args_file.exists():
+        meta["duration_s"] = round(max(0, finished_at - args_file.stat().st_mtime), 1)
+    return meta
+
+
+def valid_report(report):
+    fields = {"summary", "criteria", "files_changed", "deviations", "unresolved"}
+    if not isinstance(report, dict) or set(report) != fields or not isinstance(report["summary"], str):
+        return False
+    if any(not isinstance(report[k], list) or any(not isinstance(v, str) for v in report[k])
+           for k in ("files_changed", "deviations", "unresolved")):
+        return False
+    return isinstance(report["criteria"], list) and all(
+        isinstance(c, dict) and set(c) == {"criterion", "status", "evidence"} and
+        isinstance(c["criterion"], str) and isinstance(c["evidence"], str) and
+        isinstance(c["status"], str) and c["status"] in ("met", "not_met", "blocked")
+        for c in report["criteria"])
+
+
+def review_summary(value):
+    status = "completed" if value.get("error_kind") == "schema_invalid" else value.get("status")
+    report = value.get("structured")
+    present = "structured" in value
+    if status == "running":
+        report_status = "pending"
+    elif value.get("error_kind") == "schema_invalid":
+        report_status = "invalid"
+    elif not present:
+        report_status = "missing"
+    else:
+        report_status = "valid" if valid_report(report) else "invalid"
+    counts = {"met": 0, "not_met": 0, "blocked": 0}
+    if isinstance(report, dict) and isinstance(report.get("criteria"), list):
+        for criterion in report["criteria"]:
+            if isinstance(criterion, dict) and isinstance(criterion.get("status"), str) and criterion["status"] in counts:
+                counts[criterion["status"]] += 1
+    outside = bool(value.get("out_of_scope"))
+    if value.get("cwd") and value.get("scope_paths"):
+        root = value["cwd"]
+        roots = [tree_key(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
+        for change in value.get("files_changed") or []:
+            if isinstance(change, dict) and isinstance(change.get("path"), str):
+                path = tree_key(os.path.join(root, change["path"]))
+                outside |= not any(path == r.rstrip(os.sep) or path.startswith(r) for r in roots)
+    context = value.get("context")
+    uncovered = (isinstance(context, dict) and isinstance(context.get("acceptance"), list) and
+                 isinstance(report, dict) and isinstance(report.get("criteria"), list) and
+                 len(context["acceptance"]) != len(report["criteria"]))
+    flagged = (uncovered or status in ("failed", "cancelled") or report_status in ("invalid", "missing") or
+               counts["not_met"] or counts["blocked"] or outside or
+               (isinstance(report, dict) and (report.get("unresolved") or report.get("deviations"))))
+    return {"execution_status": status, "report_status": report_status,
+            "review_status": "pending" if status == "running" else "needs_attention" if flagged else "needs_verification",
+            "criteria_counts": counts}
+
+
+def runner_event(run_dir, attempt, phase, reason=None, retry_at=None):
+    event = {"type": "runner.phase", "attempt": attempt, "phase": phase, "reason": reason,
+             "time": time.time(), "retry_at": retry_at}
+    with open(run_dir / "events.jsonl", "ab") as f:
+        f.write((json.dumps(event) + "\n").encode("utf-8"))
+
+
+def runner_activity(events):
+    activity = {"phase": None, "attempt": None, "last_error_kind": None, "retry_at": None}
+    try:
+        with open(events, "rb") as f:
+            for raw in f:
+                if not raw.startswith(b'{"type": "runner.phase",'):
+                    continue
+                try:
+                    event = json.loads(raw)
+                except ValueError:
+                    continue
+                activity.update(phase=event.get("phase"), attempt=event.get("attempt"),
+                                last_error_kind=event.get("reason"), retry_at=event.get("retry_at"))
+    except OSError:
+        pass
+    return activity
+
+
+def enriched_status(job_id, job_dir, value):
+    finished = (job_dir / "result.json").stat().st_mtime if (job_dir / "result.json").exists() else None
+    result = {**job_metadata(job_dir, finished_at=finished, thread_id=value.get("thread_id")), **value, "job_id": job_id}
+    result.update(review_summary(result))
+    activity = runner_activity(job_dir / "events.jsonl")
+    if activity["attempt"] is None:
+        activity["attempt"] = result.get("attempts")
+    activity["last_error_kind"] = result.get("error_kind") or activity["last_error_kind"]
+    return {**result, **activity}
+
+
 def job_status(job_id):
-    job_dir = HOME / "jobs" / job_id
+    try:
+        job_dir = job_directory(job_id)
+        if not job_dir.exists():
+            return {"job_id": job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
+        result = job_dir / "result.json"
+        if result.exists():
+            return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
+        pid_file = job_dir / "worker.pid"
+        if pid_file.exists() and same_boot(job_dir) and pid_alive(int(pid_file.read_text())):
+            events = job_dir / "events.jsonl"
+            idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
+            return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": idle,
+                                                    "last_activity": last_activity(events) if events.exists() else None})
+        if result.exists():
+            return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
+        if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
+            return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None})
+        return enriched_status(job_id, job_dir, worker_died(job_id, job_dir))
+    except (OSError, ValueError, TypeError) as e:
+        return {"job_id": job_id, "status": "failed", "error_kind": "invalid_record",
+                "error": str(e), "retryable": False}
+
+
+def list_jobs(args):
+    jobs = []
+    root = HOME / "jobs"
+    for job_dir in root.iterdir() if root.exists() else []:
+        if not job_dir.is_dir():
+            continue
+        try:
+            job_identifier(job_dir.name)
+        except argparse.ArgumentTypeError:
+            continue
+        value = job_status(job_dir.name)
+        context = value.get("context")
+        if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
+                               job_dir.name in (args.job_id or [])):
+            continue
+        if args.cwd and (not value.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(value["cwd"])):
+            continue
+        review = review_summary(value)
+        if args.status and review["execution_status"] != args.status:
+            continue
+        if args.needs_attention and review["review_status"] != "needs_attention":
+            continue
+        args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+        jobs.append({"job_id": job_dir.name, "cwd": value.get("cwd"), "thread_id": value.get("thread_id"),
+                     "sandbox": value.get("sandbox"), "status": value.get("status"), "error_kind": value.get("error_kind"),
+                     "duration_s": value.get("duration_s"),
+                     "context": {"owner": context.get("owner"), "task": context["task"].strip().splitlines()[0][:160]} if context else None,
+                     "started_at": args_file.stat().st_mtime if args_file.exists() else None,
+                     "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
+                     "updated_at": max(p.stat().st_mtime for p in (job_dir, args_file, result_file, job_dir / "events.jsonl") if p.exists()),
+                     **review,
+                     **{k: value.get(k) for k in ("phase", "attempt", "last_error_kind", "retry_at")}})
+    jobs.sort(key=lambda j: (j["started_at"] or j["updated_at"], j["job_id"]), reverse=True)
+    page = jobs[args.offset:args.offset + args.limit]
+    next_offset = args.offset + len(page)
+    return {"status": "completed", "jobs": page, "total": len(jobs), "offset": args.offset, "limit": args.limit,
+            "next_offset": next_offset if next_offset < len(jobs) else None, "eof": next_offset >= len(jobs)}
+
+
+def job_output(args):
+    job_dir = job_directory(args.job_id)
     if not job_dir.exists():
-        return {"job_id": job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
-    result = job_dir / "result.json"
-    if result.exists():
-        return {"job_id": job_id, **json.loads(result.read_text("utf-8"))}
-    pid_file = job_dir / "worker.pid"
-    if pid_file.exists() and same_boot(job_dir) and pid_alive(int(pid_file.read_text())):
-        events = job_dir / "events.jsonl"
-        idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
-        return {"job_id": job_id, "status": "running", "seconds_since_last_event": idle,
-                "last_activity": last_activity(events) if events.exists() else None}
-    # The worker may have finished between the result check above and the pid check.
-    if result.exists():
-        return {"job_id": job_id, **json.loads(result.read_text("utf-8"))}
-    # start may still be publishing the worker pid, so give a just-started job a moment.
-    if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
-        return {"job_id": job_id, "status": "running", "seconds_since_last_event": None}
-    return worker_died(job_id, job_dir)
+        return {"job_id": args.job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
+    source = job_dir / {"report": "last_message.txt", "result": "result.json", "context": "args.json"}[args.artifact]
+    value = job_status(args.job_id)
+    base = {"job_id": args.job_id, "artifact": args.artifact, "execution_status": value.get("execution_status", value["status"]),
+            "source_path": str(source), "offset": args.offset, "limit": args.limit}
+    if not source.resolve().is_relative_to(job_dir.resolve()):
+        return {**base, "status": "failed", "error_kind": "invalid_artifact", "retryable": False}
+    if args.artifact in ("report", "result") and value["status"] == "running":
+        return {**base, "status": "pending", "error_kind": "artifact_pending", "retryable": True}
+    if not source.exists():
+        return {**base, "status": "failed", "error_kind": "legacy_context_missing" if args.artifact == "context" else "artifact_missing", "retryable": False}
+    try:
+        if args.artifact == "context":
+            context = task_record(job_dir).get("context")
+            if context is None:
+                return {**base, "status": "failed", "error_kind": "legacy_context_missing", "retryable": False}
+            content = json.dumps(context, ensure_ascii=False)
+        else:
+            with open(source, "r", encoding="utf-8", newline="") as f:
+                content = f.read()
+    except (OSError, ValueError):
+        return {**base, "status": "failed", "error_kind": "artifact_read_failed", "retryable": False}
+    if not content.strip():
+        return {**base, "status": "failed", "error_kind": "artifact_empty", "retryable": False}
+    if args.offset >= len(content):
+        return {**base, "status": "failed", "error_kind": "offset_out_of_range", "retryable": False,
+                "total_chars": len(content), "next_offset": None, "eof": True}
+    text = content[args.offset:args.offset + args.limit]
+    end = min(len(content), args.offset + len(text))
+    return {**base, "status": "completed", "text": text, "total_chars": len(content),
+            "next_offset": end if end < len(content) else None, "eof": end >= len(content)}
 
 
 def worker_died(job_id, job_dir):
@@ -737,17 +992,41 @@ def main():
     add_task_arguments(sub.add_parser("run"))
     add_task_arguments(sub.add_parser("start"))
     status = sub.add_parser("status")
-    status.add_argument("job_id")
+    status.add_argument("job_id", type=job_identifier)
     status.add_argument("--wait", type=float, default=0)
-    sub.add_parser("cancel").add_argument("job_id")
-    sub.add_parser("_worker").add_argument("job_id")
+    sub.add_parser("cancel").add_argument("job_id", type=job_identifier)
+    sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
+    listing = sub.add_parser("list")
+    listing.add_argument("--cwd")
+    listing.add_argument("--owner")
+    listing.add_argument("--status", choices=["running", "completed", "failed", "cancelled"])
+    listing.add_argument("--needs-attention", action="store_true")
+    listing.add_argument("--job-id", action="append", type=job_identifier)
+    listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--offset", type=int, default=0)
+    output = sub.add_parser("output")
+    output.add_argument("job_id", type=job_identifier)
+    output.add_argument("--artifact", choices=["report", "result", "context"], default="report")
+    output.add_argument("--limit", type=int, default=4000)
+    output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
+    if args.command in ("list", "output"):
+        maximum = 100 if args.command == "list" else 8000
+        if args.offset < 0 or not 1 <= args.limit <= maximum:
+            parser.error(f"offset must be nonnegative and limit between 1 and {maximum}")
+        try:
+            emit(list_jobs(args) if args.command == "list" else job_output(args))
+        except (OSError, ValueError) as e:
+            emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
+        return
     if args.command in ("run", "start"):
         args.cwd = local_path(args.cwd)
+        prompt = read_task_input(args, parser)
 
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        result = execute(args, read_prompt(), run_dir)
+        result = execute(args, prompt, run_dir)
+        result.update(review_summary(result))
         emit(result)
         sys.exit(0 if result["status"] == "completed" else 1)
 
@@ -757,7 +1036,7 @@ def main():
         job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         job_dir = HOME / "jobs" / job_id
         job_dir.mkdir(parents=True)
-        (job_dir / "prompt.txt").write_text(read_prompt(), "utf-8")
+        (job_dir / "prompt.txt").write_text(prompt, "utf-8")
         task = {k: v for k, v in vars(args).items() if k != "command"}
         (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
         # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
@@ -779,6 +1058,8 @@ def main():
             result = execute(task, (job_dir / "prompt.txt").read_text("utf-8"), job_dir)
         except Exception as e:
             result = {"status": "failed", "error_kind": "runner_error", "error": repr(e), "retryable": False}
+        result = {**job_metadata(job_dir, thread_id=result.get("thread_id")), **result}
+        result.update(review_summary(result))
         write_result(job_dir, result)
         return
 
@@ -792,7 +1073,7 @@ def main():
             time.sleep(1)
 
     if args.command == "cancel":
-        job_dir = HOME / "jobs" / args.job_id
+        job_dir = job_directory(args.job_id)
         pid_file = job_dir / "worker.pid"
         # After a restart the worker is gone and its recorded pids may name other processes: kill nothing.
         if (job_dir / "result.json").exists() or not pid_file.exists() or not same_boot(job_dir):
@@ -809,7 +1090,10 @@ def main():
                 kill_tree(int(codex_pid.read_text()))
             # The worker may have published its result after the initial check, before it was killed.
             if not (job_dir / "result.json").exists():
-                write_result(job_dir, {"status": "cancelled", "retryable": False, "log_dir": str(job_dir)})
+                result = {**job_metadata(job_dir, finished_at=time.time()), "status": "cancelled",
+                          "retryable": False, "log_dir": str(job_dir)}
+                result.update(review_summary(result))
+                write_result(job_dir, result)
         emit(job_status(args.job_id))
 
 

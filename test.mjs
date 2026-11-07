@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
-  outOfScope, taskCwd, nextStep, withReport, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
+  outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
 process.env.LOCALAPPDATA = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
@@ -351,7 +351,7 @@ test('an invalid allowCommands pattern leaves the tools and guard installed', ()
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: () => {},
     logger: { warn: (s) => warnings.push(s) } },
   { workspaces: ['F:\\work\\项目'], allowCommands: ['[', '^\\./verify\\.sh --check$'] });
-  assert.equal(tools.length, 3);
+  assert.equal(tools.length, 5);
   assert.equal(guards.length, 1);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /allowCommands/);
@@ -536,13 +536,13 @@ test('conductor start only starts; waitJob waits with a bounded status call and 
   assert.deepEqual(calls.at(-1).argv, ['cancel', 'J2']);
 });
 
-test('apply registers three tools, a guard and the false-dispatch check', () => {
+test('apply registers five tools, a guard and the false-dispatch check', () => {
   const tools = [];
   const guards = [];
   const handlers = {};
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; } },
     { workspaces: ['F:\\work\\项目'] });
-  assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel']);
+  assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output']);
   assert.deepEqual(tools[0].parameters.required, ['task', 'acceptance', 'write']);
   assert.match(tools[0].description, /固定为 JSON[\s\S]*启动不了 Windows 程序/);
   assert.equal(guards.length, 1);
@@ -626,12 +626,14 @@ function harness({ config = {}, jobs, get = true } = {}) {
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, ...pluginConfig } = config;
+  const { startResult, cancelResult, listResult, outputResult, ...pluginConfig } = config;
   const run = (_cfg, argv) => {
     calls.push(argv);
     // answer() 放弃后让后台循环出错退出，否则进程挂住不结束
     if (closed) return Promise.reject(new Error('harness closed'));
     if (argv[0] === 'start') return Promise.resolve(startResult ?? { job_id: `J${++n}`, status: 'running' });
+    if (argv[0] === 'list') return Promise.resolve(listResult ?? { jobs: [], total: 0 });
+    if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'status' && argv[3] === '20') return new Promise((r) => (waiters[argv[1]] ??= []).push(r));
     // 下一轮事件循环才答：后台循环的等待参数若不是 20，也不会只靠微任务空转、饿死 answer()
     if (argv[0] === 'status') return new Promise((r) => setImmediate(r, finals[argv[1]] ?? { job_id: argv[1], status: 'running', seconds_since_last_event: 1 }));
@@ -659,33 +661,74 @@ const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], wri
 
 // 按 DSH 任务表的约定：结算时有 wait() 在等就算已送达，否则记进 unawaited（DSH 会为它另发通知）
 function fakeJobs({ fail = false } = {}) {
+  const terminal = (job) => !['running', 'stopping'].includes(job.status);
+  const trim = (output, cap) => {
+    while (output.chunks.length > 1 && output.chunks.reduce((n, c) => n + c.bytes, 0) > cap) output.chunks.shift();
+    const only = output.chunks[0];
+    if (only?.bytes > cap) {
+      const text = utf8Tail(only.text, cap);
+      only.at += only.bytes - Buffer.byteLength(text);
+      only.text = text;
+      only.bytes = Buffer.byteLength(text);
+    }
+    output.earliest = output.chunks[0]?.at ?? output.total;
+  };
   return {
     started: [],
     unawaited: [],
     start(spec) {
       if (fail) throw new Error('no job controller');
-      const handle = { progress: [], updateProgress(t) { this.progress.push(t); } };
-      const job = { spec, handle, id: `bg${this.started.length + 1}`, status: 'running', waiters: new Set(), ...spec.run(handle) };
+      const output = { chunks: [], total: 0, earliest: 0 };
+      const handle = { progress: [], updateProgress(t) { this.progress.push(t); },
+        append(text, options = {}) {
+          const bytes = Buffer.byteLength(text);
+          if (!bytes) return;
+          output.chunks.push({ at: output.total, text, bytes, ...options });
+          output.total += bytes;
+          trim(output, 256 * 1024);
+        } };
+      const job = { spec, handle, output, cursor: 0, id: `bg${this.started.length + 1}`, status: 'running',
+        waiters: new Set(), ...spec.run(handle) };
       job.done.then((outcome) => {
         job.status = outcome.status;
+        job.detail = outcome.detail;
         job.result = outcome.result;
+        trim(output, Math.max(16 * 1024, output.total - job.cursor));
         if (!job.waiters.size) this.unawaited.push(job.id);
         for (const w of job.waiters) w();
       });
       this.started.push(job);
       return job.id;
     },
-    view: (j) => ({ id: j.id, kind: j.spec.kind, label: j.spec.label, owner: j.spec.owner, status: j.status, progress: j.handle.progress.at(-1) }),
-    list(owner) { return this.started.filter((j) => j.spec.owner === owner).map(this.view); },
-    // 和 DSH 一样：结算后的结果只随第一次 read 交出
-    read(id) {
+    view: (j) => ({ id: j.id, kind: j.spec.kind, label: j.spec.label, owner: j.spec.owner, status: j.status,
+      ...(!terminal(j) && j.handle.progress.length ? { progress: j.handle.progress.at(-1) } : {}),
+      ...(j.detail !== undefined ? { detail: j.detail } : {}), outputLimitBytes: j.spec.outputLimitBytes,
+      output: { total: j.output.total, earliest: j.output.earliest } }),
+    expect(id, owner) {
       const job = this.started.find((j) => j.id === id);
-      const result = job.delivered ? undefined : job.result;
-      job.delivered ||= result !== undefined;
-      return { chunks: [], ...(result !== undefined ? { result } : {}), job: this.view(job) };
+      if (!job) throw new Error(`unknown job ${id}`);
+      if (job.spec.owner !== undefined && job.spec.owner !== owner) throw new Error(`job ${id} belongs to another session`);
+      return job;
     },
-    wait(id, ms, _owner, signal) {
-      const job = this.started.find((j) => j.id === id);
+    list(owner) { return this.started.filter((j) => j.spec.owner === undefined || j.spec.owner === owner).map(this.view); },
+    get(id, owner) { return this.view(this.expect(id, owner)); },
+    readAt(id, from, owner) {
+      const job = this.expect(id, owner);
+      return { chunks: job.output.chunks.filter((c) => c.at + c.bytes > from).map(({ bytes, ...c }) => ({ ...c })),
+        next: job.output.total, lossy: from < job.output.earliest };
+    },
+    // 和 DSH 一样：结算后的结果只随第一次 read 交出
+    read(id, owner) {
+      const job = this.expect(id, owner);
+      const output = this.readAt(id, job.cursor, owner);
+      job.cursor = job.output.total;
+      const result = terminal(job) && !job.delivered ? job.result : undefined;
+      job.delivered ||= result !== undefined;
+      if (terminal(job)) trim(job.output, 16 * 1024);
+      return { ...output, ...(result !== undefined ? { result } : {}), job: this.view(job) };
+    },
+    wait(id, ms, owner, signal) {
+      const job = this.expect(id, owner);
       if (job.status !== 'running' && job.status !== 'stopping') return Promise.resolve(this.view(job));
       return new Promise((resolve, reject) => {
         const end = (fn) => () => { clearTimeout(timer); job.waiters.delete(settle); fn(); };
@@ -695,13 +738,31 @@ function fakeJobs({ fail = false } = {}) {
         job.waiters.add(settle);
       });
     },
-    kill(id) {
-      const job = this.started.find((j) => j.id === id);
-      job.status = 'stopping';
+    kill(id, owner) {
+      const job = this.expect(id, owner);
+      if (terminal(job)) return 'already-finished';
       job.cancel();
+      job.status = 'stopping';
       return 'requested';
     },
   };
+}
+
+function utf8Tail(text, maxBytes) {
+  const bytes = Buffer.from(text);
+  let start = Math.max(0, bytes.length - maxBytes);
+  while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
+  return bytes.subarray(start).toString('utf8');
+}
+
+// SDK job_output：过滤 log、消费一次 result，超限保留尾部和状态后缀。
+function modelJobOutput(jobs, id, owner) {
+  const read = jobs.read(id, owner);
+  const body = read.chunks.filter((c) => c.channel !== 'log').map((c) => c.text).join('') + (read.result ?? '');
+  const suffix = `\n[status: ${read.job.status}]`;
+  const max = read.job.outputLimitBytes;
+  return max && Buffer.byteLength(body + suffix) > max
+    ? utf8Tail(body, max - Buffer.byteLength(`\n[output truncated]${suffix}`)) + `\n[output truncated]${suffix}` : body + suffix;
 }
 
 test('task directory defaults to the cwd of the containing workspace entry', async () => {
@@ -742,7 +803,7 @@ test('read-only tasks use readOnlyEffort, writer tasks use effort; scope entries
   assert.equal(effort(await argv({ write: true })), 'max');
   assert.equal(effort(await argv({ effort: 'medium' })), 'medium');
   const scoped = await argv({ write: true, scope: ['src', 'tests/'] });
-  assert.deepEqual(scoped.slice(scoped.indexOf('--scope')), ['--scope', 'src', '--scope', 'tests/']);
+  assert.deepEqual(scoped.slice(scoped.indexOf('--scope')), ['--scope', 'src', '--scope', 'tests/', '--context-json']);
   assert.ok(!(await argv({})).includes('--scope'));
   const other = harness({ config: { startResult: { job_id: 'J', status: 'completed' }, effort: 'high' } });
   await other.tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
@@ -880,8 +941,8 @@ test('a running job is registered once as a DSH background job and reports back 
   assert.match(jobs.started[0].handle.progress[0], /7 秒：ran: pytest/);
   assert.equal(done.status, 'completed');
   // 任务表的 detail 和结果第一行都以一行摘要开头；文件数取 runner 的 files_changed_total
-  assert.equal(done.detail, 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s');
-  assert.equal(done.result.split('\n')[0], 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s  job_id: J1  thread_id: T');
+  assert.equal(done.detail, 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注 · runner J1 · codex_output');
+  assert.equal(done.result.split('\n')[0], 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注  job_id: J1  thread_id: T');
   assert.match(done.result, /逐条汇报[\s\S]*✗ 1\. pytest 通过 —— e[\s\S]*下一步[\s\S]*2 条未满足[\s\S]*resume="T"/);
   // 结束后不再算在执行中
   handlers['agent/turn-stopping']({ agent: exec.agent, turn: 3 });
@@ -898,13 +959,13 @@ test('background job maps cancel, failure and lost monitoring', async () => {
   await answer('J1', { status: 'cancelled' });
   const killed = await jobs.started[0].done;
   assert.equal(killed.status, 'killed');
-  assert.equal(killed.detail, 'cancelled');
+  assert.equal(killed.detail, 'cancelled · runner J1 · codex_output');
 
   await tools.codex_run.execute(RUN, exec);
   await answer('J2', { status: 'failed', error_kind: 'timeout', error: 'x', duration_s: 30.2, files_changed: [], files_changed_total: 0 });
   const failed = await jobs.started[1].done;
   assert.equal(failed.status, 'failed');
-  assert.equal(failed.detail, 'failed · timeout · 30 s');
+  assert.equal(failed.detail, 'failed · timeout · 30 s · runner J2 · codex_output');
   assert.match(failed.result, /^failed · timeout · 30 s {2}job_id: J2\n/);
 
   await tools.codex_run.execute(RUN, exec);
@@ -965,10 +1026,10 @@ test('codex_run registers the DSH job at start and returns its stored result whe
   assert.equal(value.background_job_id, undefined);
   const text = tools.codex_run.output.render({}, value)[0].text;
   assert.equal(text, jobs.started[0].result);
-  assert.match(text, /^completed · 1 met · 1 files · 12 s {2}job_id: J1 {2}thread_id: T\n[\s\S]*超出 scope：README\.md/);
+  assert.match(text, /^completed · 1 met · 1 files · 12 s · 待关注 {2}job_id: J1 {2}thread_id: T\n[\s\S]*超出 scope：README\.md/);
   // 结算时这次等待在等：算作已被等到，DSH 不另发通知；结果只交出这一次
   assert.deepEqual(jobs.unawaited, []);
-  assert.equal(jobs.read('bg1').result, undefined);
+  assert.equal(jobs.read('bg1', 'S1').result, undefined);
   assert.ok(calls.slice(1).every((a) => a.join(' ') === 'status J1 --wait 20'));
 });
 
@@ -1073,6 +1134,124 @@ test('after a plugin reload the live background job is reused, not registered ag
   assert.equal(jobs.started.length, 1);
   await before.answer('J1', { status: 'completed' });
   await jobs.started[0].done;
+});
+
+test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {
+  for (const cancelResult of [
+    { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' },
+    { then(_resolve, reject) { reject(new Error('mock cancel exception')); } },
+  ]) {
+    const jobs = fakeJobs();
+    const { tools, calls, answer } = harness({ jobs, config: { cancelResult } });
+    const exec = { agent: agentAt('F:\\work\\项目') };
+    await tools.codex_run.execute(RUN, exec);
+    assert.equal(jobs.kill('bg1', 'S1'), 'requested');
+    await tick();
+    assert.equal(jobs.get('bg1', 'S1').status, 'stopping');
+    assert.match(jobs.get('bg1', 'S1').progress, /取消未确认[\s\S]*J1[\s\S]*(WSL unavailable|mock cancel exception)/);
+    await answer('J1', { status: 'running', phase: 'executing', attempt: 1, last_activity: 'ran: pytest' });
+    await tick();
+    const value = await tools.codex_status.execute({ job_id: 'J1', wait_seconds: 0 }, exec);
+    assert.equal(value.status, 'running');
+    assert.match(value.last_activity, /取消未确认[\s\S]*J1[\s\S]*codex_status[\s\S]*codex_cancel/);
+    assert.equal(jobs.kill('bg1', 'S1'), 'requested');
+    await tick();
+    assert.equal(calls.filter((a) => a[0] === 'cancel').length, 2);
+    await answer('J1', { status: 'cancelled' });
+    await jobs.started[0].done;
+    assert.equal(jobs.get('bg1', 'S1').status, 'killed');
+    assert.equal(jobs.kill('bg1', 'S1'), 'already-finished');
+    assert.equal(calls.filter((a) => a[0] === 'cancel').length, 2);
+  }
+});
+
+test('native output is observable without consuming or duplicating the final report', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer } = harness({ jobs });
+  await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  const stage = { status: 'running', phase: 'retry_wait', attempt: 2, last_error_kind: 'transient', retry_at: Math.floor(Date.now() / 1000) + 60,
+    execution_status: 'running', report_status: 'pending', review_status: 'pending' };
+  await answer('J1', { ...stage, last_activity: 'first command', seconds_since_last_event: 1 });
+  await answer('J1', { ...stage, last_activity: 'second command', seconds_since_last_event: 2 });
+  await tick();
+  assert.match(jobs.get('bg1', 'S1').progress, /等待重试[\s\S]*第 2 轮[\s\S]*transient[\s\S]*秒后重试[\s\S]*second command/);
+  assert.equal(jobs.readAt('bg1', 0, 'S1').chunks.filter((c) => c.text.includes('等待重试')).length, 1);
+  await answer('J1', { status: 'completed', log_dir: '/tmp/mock-runner/jobs/J1',
+    structured: { summary: 'NATIVE-REPORT-ONCE', criteria: [{ criterion: 'rewritten criterion', status: 'met', evidence: 'e' }],
+      files_changed: [], deviations: [], unresolved: [] } });
+  await jobs.started[0].done;
+  const before = jobs.get('bg1', 'S1');
+  assert.equal(before.status, 'completed');
+  assert.ok(before.output.total > 0);
+  const observed = jobs.readAt('bg1', 0, 'S1');
+  assert.ok(observed.chunks.every((c) => c.channel === 'log'));
+  assert.match(observed.chunks.map((c) => c.text).join(''), /NATIVE-REPORT-ONCE[\s\S]*last_message\.txt[\s\S]*codex_output/);
+  assert.deepEqual(jobs.readAt('bg1', 0, 'S1'), observed);
+  assert.throws(() => jobs.get('bg1', 'another-session'), /another session/);
+  const text = modelJobOutput(jobs, 'bg1', 'S1');
+  assert.equal(text.split('NATIVE-REPORT-ONCE').length - 1, 1);
+  assert.match(text, /pytest 通过/);
+  assert.doesNotMatch(text, /first command|second command/);
+  assert.doesNotMatch(modelJobOutput(jobs, 'bg1', 'S1'), /NATIVE-REPORT-ONCE/);
+});
+
+test('losing monitoring does not erase an unconfirmed native cancellation', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer } = harness({ jobs,
+    config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'cancel bridge unavailable' } } });
+  await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  jobs.kill('bg1', 'S1');
+  await tick();
+  for (let i = 0; i < 3; i++) await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'status bridge unavailable' });
+  const done = await jobs.started[0].done;
+  assert.equal(done.status, 'failed');
+  assert.match(done.result, /^monitor_failed[\s\S]*取消未确认[\s\S]*J1[\s\S]*cancel bridge unavailable[\s\S]*codex_status/);
+});
+
+test('a report above the native limit keeps its complete artifact and paging entry after consumption', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conductor-native-report-'));
+  try {
+    const report = { summary: 'LARGE-REPORT-START', criteria: Array.from({ length: 20 }, (_, i) => ({
+      criterion: `${i + 1}. ${'验'.repeat(400)}`, status: 'met', evidence: '据'.repeat(800),
+    })), files_changed: [], deviations: [], unresolved: [] };
+    const original = JSON.stringify(report);
+    writeFileSync(path.join(dir, 'last_message.txt'), original);
+    const jobs = fakeJobs();
+    const { tools, answer } = harness({ jobs });
+    await tools.codex_run.execute({ ...RUN, acceptance: report.criteria.map((c) => c.criterion) }, { agent: agentAt('F:\\work\\项目') });
+    await answer('J1', { status: 'completed', log_dir: dir, structured: report });
+    await jobs.started[0].done;
+    assert.ok(Buffer.byteLength(jobs.started[0].result) > 65536);
+    const text = modelJobOutput(jobs, 'bg1', 'S1');
+    assert.ok(Buffer.byteLength(text) <= 65536);
+    assert.doesNotMatch(text, /LARGE-REPORT-START/);
+    assert.match(text, /runner job_id: J1[\s\S]*last_message\.txt[\s\S]*result\.json[\s\S]*codex_output.*"artifact":"report".*"offset":0.*"limit":8000/);
+    assert.ok(text.includes(dir));
+    assert.doesNotMatch(modelJobOutput(jobs, 'bg1', 'S1'), /LARGE-REPORT-START/);
+    // job_output 消费不影响原件；主分支 codex_output 的重复分页使用这份完整原件。
+    assert.equal(readFileSync(path.join(dir, 'last_message.txt'), 'utf8'), original);
+    assert.equal(readFileSync(path.join(dir, 'last_message.txt'), 'utf8'), original);
+    assert.match(jobs.readAt('bg1', 0, 'S1').chunks.map((c) => c.text).join(''), /codex_output/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('collect preserves a result produced by an old background monitor after reload', async () => {
+  const jobs = fakeJobs();
+  let finish;
+  jobs.start({ owner: 'S1', kind: 'codex', label: 'Codex J-old · old task',
+    run: () => ({ done: new Promise((resolve) => { finish = resolve; }), cancel() {} }) });
+  const { tools, calls } = harness({ jobs });
+  const pending = tools.codex_status.execute({ job_id: 'J-old', wait_seconds: 600 }, { agent: agentAt('F:\\work\\项目') });
+  await tick();
+  const rendered = 'completed  job_id: J-old\noriginal acceptance and out_of_scope from the old monitor';
+  finish({ status: 'completed', result: rendered });
+  const value = await pending;
+  assert.equal(value.rendered, rendered);
+  assert.equal(jobs.started.length, 1);
+  assert.deepEqual(calls, []);
+  assert.equal(jobs.read('bg1', 'S1').result, undefined);
 });
 
 test('codex_* cards show a short title while pending and the one-line summary when done', () => {
@@ -1302,7 +1481,7 @@ test('the slim completed view keeps the schema note, flags a truncated answer an
   const loose = render(withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false,
     final_message: 'done', truncated: true, log_dir: '/j' }));
   assert.match(loose, /--- Codex 最终答复（超过 8000 字已截断，全文见 \/j\/last_message\.txt） ---\ndone\n/);
-  assert.match(loose, /--- 详细字段 ---\nCodex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。/);
+  assert.match(loose, /--- 详细字段 ---\n执行：completed；报告：invalid；验收：needs_attention\nCodex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。/);
   // runner 最多列 300 条：总数照实给，并说明只列了一部分
   const files = Array.from({ length: 300 }, (_, i) => ({ path: `src/f${i}.py`, change: 'modified' }));
   const capped = render({ status: 'completed', files_changed_source: 'snapshot', files_changed_total: 500, files_changed: files });
@@ -1570,4 +1749,204 @@ test('canonical runner paths keep alias scopes consistent for run, status and ca
   }
   const inScope = withReport({ ...done, files_changed: [done.files_changed[0]] });
   assert.deepEqual(inScope.out_of_scope, []);
+});
+
+test('execution, report validity and review state stay separate and retain the original context', () => {
+  const structured = { summary: 'done', criteria: [{ criterion: '1. 检查', status: 'met', evidence: 'checked' }],
+    files_changed: [], deviations: [], unresolved: [] };
+  const context = { owner: 'S1', task: '原任务', acceptance: ['原始验收条件'], write: false };
+  const value = withReport({ status: 'completed', structured, context });
+  assert.equal(value.execution_status, 'completed');
+  assert.equal(value.report_status, 'valid');
+  assert.equal(value.review_status, 'needs_verification');
+  assert.deepEqual(value.criteria_counts, { met: 1, not_met: 0, blocked: 0 });
+  assert.deepEqual(value.acceptance, context.acceptance);
+  for (const changed of [
+    { structured: { ...structured, unresolved: ['missing evidence'] } },
+    { structured: { ...structured, deviations: ['scope changed'] } },
+    { structured: { ...structured, criteria: [] } },
+    { structured: { ...structured, criteria: [{ ...structured.criteria[0], status: 'blocked' }] } },
+    { out_of_scope: ['elsewhere.txt'] },
+  ]) assert.equal(reviewState({ status: 'completed', structured, context, ...changed }).review_status, 'needs_attention');
+  const invalid = withReport({ status: 'failed', error_kind: 'schema_invalid', final_message: 'plain text', context });
+  assert.equal(invalid.status, 'completed');
+  assert.equal(invalid.execution_status, 'completed');
+  assert.equal(invalid.report_status, 'invalid');
+  assert.equal(invalid.review_status, 'needs_attention');
+  assert.equal(reviewState(invalid).report_status, 'invalid');
+  assert.equal(withReport({ status: 'running' }).review_status, 'pending');
+  assert.equal(withReport({ status: 'completed', structured: { ...structured, extra: true } }).report_status, 'invalid');
+  assert.equal(withReport({ status: 'completed', structured: null }).report_status, 'invalid');
+});
+
+test('task context travels through stdin while direct library callers keep plain prompts', async () => {
+  const seen = [];
+  const conductor = createConductor({}, async (_cfg, argv, options) => { seen.push({ argv, ...options }); return { status: 'running', job_id: 'J' }; });
+  const args = { ...RUN, task: '原任务含引号"和换行\n'.repeat(4000) };
+  const context = { owner: 'S1', task: args.task, acceptance: args.acceptance, write: args.write };
+  await conductor.start(args, '/work', undefined, context);
+  assert.ok(seen[0].argv.includes('--context-json'));
+  assert.deepEqual(JSON.parse(seen[0].stdin).context, context);
+  assert.match(JSON.parse(seen[0].stdin).prompt, /验收标准/);
+  assert.ok(seen[0].argv.join(' ').length < 1000);
+  await conductor.start(RUN, '/work');
+  assert.equal(seen[1].argv.includes('--context-json'), false);
+  assert.match(seen[1].stdin, /^在 a.py/);
+});
+
+test('history filters preserve session links and output reads are bounded, repeatable and never cancel', async () => {
+  const jobs = { list: (owner) => owner === 'S1' ? [{ id: 'BG', owner, kind: 'codex', label: 'Codex J · task', status: 'completed' }] : [] };
+  const page = { text: '\u0000'.repeat(8000), eof: false, next_offset: 8000, source_path: '/jobs/J/last_message.txt' };
+  const h = harness({ jobs, config: { listResult: { jobs: [{ job_id: 'J', thread_id: 'T' }], total: 1 }, outputResult: page } });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const list = await h.tools.codex_jobs.execute({ session_id: 'current', needs_attention: true, limit: 10, offset: 2 }, exec);
+  assert.equal(list.jobs[0].background_job_id, 'BG');
+  assert.equal(list.jobs[0].owner, 'S1');
+  assert.deepEqual(h.calls[0], ['list', '--limit', '10', '--offset', '2', '--owner', 'S1', '--needs-attention', '--job-id', 'J']);
+  const request = { job_id: 'J', artifact: 'report', offset: 0, limit: 8000 };
+  const first = await h.tools.codex_output.execute(request, exec);
+  const second = await h.tools.codex_output.execute(request, exec);
+  assert.deepEqual(first, second);
+  const rendered = h.tools.codex_output.output.render(request, first)[0].text;
+  assert.ok(Buffer.byteLength(rendered, 'utf8') < 65536);
+  assert.deepEqual(h.calls.slice(1), Array(2).fill(['output', 'J', '--artifact', 'report', '--offset', '0', '--limit', '8000']));
+  await assert.rejects(h.tools.codex_output.execute({ job_id: '../J' }, exec), /job_id/);
+  await assert.rejects(h.tools.codex_output.execute({ job_id: 'J', limit: 8001 }, exec), /limit/);
+  await assert.rejects(h.tools.codex_jobs.execute({ status: 'accepted' }, exec), /status/);
+  await assert.rejects(h.tools.codex_jobs.execute({ offset: -1 }, exec), /offset/);
+  assert.equal(h.calls.some((a) => a[0] === 'cancel'), false);
+});
+
+test('session journal links recover old jobs after the native task table has been cleared', async () => {
+  const h = harness({ config: { listResult: { jobs: [{ job_id: 'OLD', thread_id: 'T' }], total: 1 } } });
+  const agent = agentAt('F:\\work\\项目', [{ type: 'job/registered', seq: 0, data: {
+    jobId: 'native-old', owner: 'S1', kind: 'codex', label: 'Codex OLD · 原任务',
+  } }]);
+  const value = await h.tools.codex_jobs.execute({ session_id: 'current' }, { agent });
+  assert.equal(value.jobs[0].background_job_id, 'native-old');
+  assert.ok(h.calls[0].includes('OLD'));
+  assert.equal(h.calls[0].includes('--cwd'), false);
+});
+
+test('reading task history or output does not count as dispatching a claimed task', () => {
+  const { handlers } = harness();
+  for (const [i, name] of ['codex_jobs', 'codex_output'].entries()) {
+    const turn = 3000 + i;
+    const agent = agentAt('F:\\work\\项目', [
+      { type: 'tool/call', data: { turn, name } },
+      { type: 'assistant/message', data: { turn, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } },
+    ]);
+    const count = nudges.length;
+    handlers['agent/turn-stopping']({ agent, turn });
+    assert.equal(nudges.length, count + 1);
+  }
+});
+
+test('history observes only the requested session, excludes inherited events and releases the snapshot', async () => {
+  const tools = {};
+  const calls = [];
+  let disposed = 0;
+  let fail = false;
+  const event = (seq, id) => ({ type: 'job/registered', seq, data: { jobId: id, owner: 'S1', kind: 'codex', label: `Codex ${id} · task` } });
+  const query = { async observeSession(owner, options) {
+    assert.equal(owner, 'S1');
+    assert.equal(options.projectionMode, 'none');
+    if (fail) throw new Error('journal unavailable');
+    return { events: [event(0, 'INHERITED'), event(1, 'OWN')], inheritedEventCount: 1, [Symbol.dispose]() { disposed++; } };
+  } };
+  apply({ tools: { register: (t) => { tools[t.name] = t; }, guard() {} }, on() {},
+    get: (key) => key === 'sessionQuery' ? query : undefined }, { workspaces: ['*'] }, async (_cfg, argv) => {
+    calls.push(argv);return { jobs: [{ job_id: 'OWN' }], total: 1 };
+  });
+  const value = await tools.codex_jobs.execute({ session_id: 'current' }, { agent: agentAt('/work') });
+  assert.equal(value.jobs[0].background_job_id, 'OWN');
+  assert.ok(calls[0].includes('OWN'));
+  assert.equal(calls[0].includes('INHERITED'), false);
+  assert.equal(disposed, 1);
+  fail = true;
+  await assert.rejects(tools.codex_jobs.execute({ session_id: 'current' }, { agent: agentAt('/work') }), /journal unavailable/);
+  assert.equal(calls.length, 1);
+});
+
+test('plugin and real runner preserve context, full Unicode output and execution metadata', { timeout: 30000 }, async () => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-bridge-'));
+  const python = process.env.PYTHON || (process.platform === 'win32' ? 'python' : 'python3');
+  const runner = fileURLToPath(new URL('./runner/codex_runner.py', import.meta.url));
+  const work = path.join(root, 'work');
+  const fake = path.join(root, 'fake.py');
+  const reportFile = path.join(root, 'report.json');
+  const received = path.join(root, 'received.json');
+  const { mkdirSync } = await import('node:fs');
+  mkdirSync(work);
+  const report = { summary: '跨语言验收🙂', criteria: [{ criterion: '1. self reported', status: 'met', evidence: '中文🙂'.repeat(12000) }],
+    files_changed: [], deviations: [], unresolved: [] };
+  writeFileSync(reportFile, JSON.stringify(report), 'utf8');
+  writeFileSync(fake, `import json, os, sys\nfrom pathlib import Path\nprompt = sys.stdin.buffer.read().decode('utf-8')\n` +
+    `Path(os.environ['FAKE_RECEIVED']).write_text(json.dumps({'prompt': prompt, 'argv': sys.argv[1:]}), encoding='utf-8')\n` +
+    `report = Path(os.environ['FAKE_REPORT']).read_text(encoding='utf-8')\n` +
+    `Path(sys.argv[sys.argv.index('-o') + 1]).write_text(report, encoding='utf-8')\n` +
+    `for event in [{'type': 'thread.started', 'thread_id': 'bridge-thread'}, {'type': 'turn.started'}, ` +
+    `{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': report}}, {'type': 'turn.completed', 'usage': {'input_tokens': 1}}]:\n` +
+    ` print(json.dumps(event), flush=True)\n`, 'utf8');
+  const env = { ...process.env, CODEX_HOME: path.join(root, 'codex'), CODEX_RUNNER_HOME: path.join(root, 'runner'),
+    CODEX_RUNNER_CMD: JSON.stringify([python, '-B', fake]), CODEX_RUNNER_ROUTER_URL: '', PYTHONDONTWRITEBYTECODE: '1',
+    FAKE_REPORT: reportFile, FAKE_RECEIVED: received };
+  const bridge = (_cfg, argv, options = {}) => runProcess(python, ['-I', '-B', runner, ...argv], { ...options, env });
+  const tools = {};
+  apply({ tools: { register: (t) => { tools[t.name] = t; }, guard() {} }, on() {} },
+    { workspaces: ['*'], allowHostAccess: true, defaultHostAccess: true, reportSchema: fileURLToPath(new URL('./report.schema.json', import.meta.url)) }, bridge);
+  const exec = { agent: agentAt(work) };
+  const args = { task: '原任务与换行\n' + '中文🙂'.repeat(12000), acceptance: ['原始验收条件'], write: false, cwd: work, wait_seconds: 0 };
+  let id;
+  let ended = false;
+  try {
+    const started = await tools.codex_run.execute(args, exec);
+    id = started.job_id;
+    assert.ok(id);
+    const done = await tools.codex_status.execute({ job_id: id, wait_seconds: 10 }, exec);
+    ended = done.status === 'completed';
+    assert.equal(done.status, 'completed');
+    assert.equal(done.execution_status, 'completed');
+    assert.equal(done.report_status, 'valid');
+    assert.equal(done.review_status, 'needs_verification');
+    assert.deepEqual(done.acceptance, args.acceptance);
+    const sent = JSON.parse(readFileSync(received, 'utf8'));
+    assert.ok(sent.prompt.startsWith(args.task));
+    assert.ok(sent.argv.includes('sandbox_mode="danger-full-access"'));
+    assert.ok(sent.argv.includes('approval_policy="never"'));
+    const history = await tools.codex_jobs.execute({ session_id: 'current' }, exec);
+    assert.equal(history.total, 1);
+    assert.equal(history.jobs[0].thread_id, 'bridge-thread');
+    assert.equal(history.jobs[0].review_status, 'needs_verification');
+    const read = async (artifact) => {
+      let text = '', offset = 0;
+      for (;;) {
+        const part = await tools.codex_output.execute({ job_id: id, artifact, offset, limit: 8000 }, exec);
+        assert.equal(part.status, 'completed');
+        text += part.text;
+        if (part.eof) return text;
+        assert.ok(part.next_offset > offset);
+        offset = part.next_offset;
+      }
+    };
+    assert.deepEqual(JSON.parse(await read('report')), report);
+    const context = JSON.parse(await read('context'));
+    assert.equal(context.task, args.task);
+    assert.equal(context.owner, exec.agent.id);
+    assert.deepEqual(context.acceptance, args.acceptance);
+    const first = await tools.codex_output.execute({ job_id: id, offset: 0, limit: 8000 }, exec);
+    assert.deepEqual(await tools.codex_output.execute({ job_id: id, offset: 0, limit: 8000 }, exec), first);
+    const unowned = await tools.codex_run.execute({ ...RUN, cwd: work }, {});
+    id = unowned.job_id;
+    ended = false;
+    const unownedDone = await tools.codex_status.execute({ job_id: id, wait_seconds: 10 }, {});
+    ended = unownedDone.status === 'completed';
+    assert.equal(unownedDone.status, 'completed');
+    assert.equal(unownedDone.context.owner, null);
+    const workspaceHistory = await tools.codex_jobs.execute({ cwd: work }, {});
+    assert.equal(workspaceHistory.total, 2);
+  } finally {
+    if (id && !ended) await bridge({}, ['cancel', id]);
+    rmSync(root, { recursive: true, force: true });
+  }
 });
