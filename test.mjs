@@ -199,6 +199,11 @@ test('codex_run validation requires acceptance criteria', () => {
   assert.throws(() => validateRun({ task: 'short', acceptance: ['pytest 全部通过'] }), /task/);
   validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest tests/test_login.py 全部通过'] });
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest 通过'], scope: [''] }), /scope/);
+  const writable = { task: '将结果保存到指定的 E 盘目录', acceptance: ['目标文件写入成功'], write: true };
+  assert.throws(() => validateRun({ ...writable, writable_roots: [''] }), /writable_roots/);
+  assert.throws(() => validateRun({ ...writable, writable_roots: 'E:\\results' }), /writable_roots/);
+  assert.throws(() => validateRun({ ...writable, write: false, writable_roots: ['E:\\results'] }), /write=true/);
+  validateRun({ ...writable, writable_roots: ['E:\\results'] });
   const prompt = composePrompt('做事情做事情', ['甲条件成立'], ['src/a.py', 'tests/']);
   assert.match(prompt, /## 验收标准[\s\S]*1\. 甲条件成立[\s\S]*## 执行约束[\s\S]*只允许改动这些路径：src\/a\.py、tests\/[\s\S]*blocked[\s\S]*## 最后汇报[\s\S]*JSON/);
   assert.doesNotMatch(composePrompt('做事情做事情', ['甲条件成立']), /只允许改动/);
@@ -493,6 +498,19 @@ test('read-only tasks use readOnlyEffort, writer tasks use effort; scope entries
   await other.tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
   assert.equal(effort(other.calls.at(-1)), 'high');
   assert.match(other.tools.codex_run.parameters.properties.effort.description, /只读时 high/);
+});
+
+test('additional writable roots reach the runner while retaining the workspace sandbox', async () => {
+  const { tools, calls } = harness({ config: { startResult: { job_id: 'J', status: 'completed' } } });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  await tools.codex_run.execute({ ...RUN, write: true, writable_roots: ['E:\\results', '/mnt/e/other'],
+    scope: ['src/a.py', 'E:\\results\\result.json'] }, exec);
+  const argv = calls.at(-1);
+  assert.equal(argv[argv.indexOf('--sandbox') + 1], 'workspace-write');
+  assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--writable-root'), ['E:\\results', '/mnt/e/other']);
+  assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--scope'), ['src/a.py', 'E:\\results\\result.json']);
+  await tools.codex_run.execute({ ...RUN, write: true }, exec);
+  assert.ok(!calls.at(-1).includes('--writable-root'));
 });
 
 test('composePrompt adds the host-access lines only with host_access, the read-only line only without write', () => {

@@ -419,6 +419,7 @@ export function createConductor(cfg, run = runRunner) {
     if (args.use_user_config === true) argv.push('--use-user-config');
     if (cfg.reportSchema) argv.push('--schema', cfg.reportSchema);
     for (const s of args.scope ?? []) argv.push('--scope', s);
+    for (const root of args.writable_roots ?? []) argv.push('--writable-root', root);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: args.host_access === true, write: args.write === true });
     return run(cfg, argv, { stdin: prompt, signal });
   }
@@ -465,10 +466,13 @@ export function validateRun(args) {
   if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
     throw new Error('codex_run: wait_seconds 必须是非负整数');
   }
-  if (args.scope !== undefined && (!Array.isArray(args.scope) || args.scope.length > 50 ||
-    args.scope.some((s) => typeof s !== 'string' || !s.trim()))) {
-    throw new Error('codex_run: scope 必须是不超过 50 个非空路径');
+  for (const k of ['scope', 'writable_roots']) {
+    if (args[k] !== undefined && (!Array.isArray(args[k]) || args[k].length > 50 ||
+      args[k].some((s) => typeof s !== 'string' || !s.trim()))) {
+      throw new Error(`codex_run: ${k} 必须是不超过 50 个非空路径`);
+    }
   }
+  if (args.writable_roots?.length && args.write !== true) throw new Error('codex_run: writable_roots 需要 write=true');
 }
 
 // runner 把合法的 JSON 汇报放在 structured 里，统一改名为 report。
@@ -762,7 +766,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     ...PRESENT.codex_run,
     name: 'codex_run',
     description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准；' +
-      'write=true 才允许它改文件，默认只读用于调查；scope 限定允许改动的路径。Codex 会按验收标准逐条回报 ' +
+      'write=true 才允许它改文件，默认只读用于调查；scope 限定允许改动的路径。' +
+      '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
       '不通过就带 resume=thread_id 派回修正。汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       (cfg.allowHostAccess === true
@@ -773,12 +778,15 @@ export function apply(ctx, config = {}, run = runRunner) {
       properties: {
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
         acceptance: { type: 'array', items: { type: 'string' }, description: '验收标准，1–20 条，每条写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
-        write: { type: 'boolean', description: 'true 允许 Codex 修改任务目录里的文件（workspace-write 沙箱）；默认 false 只读。' },
+        write: { type: 'boolean', description: 'true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（workspace-write 沙箱）；默认 false 只读。' },
         ...(cfg.allowHostAccess === true ? { host_access: { type: 'boolean', description: 'true 时 Codex 在沙箱外运行（danger-full-access），' +
           '可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令）、连接 Hyper-V 虚拟机；write 仍决定能否改动（文件、虚拟机、网络和系统状态）：' +
           '要启动/停止/新建虚拟机，或运行会建、改虚拟机的脚本，也要传 write=true，否则 Codex 只做只读调查。不再有沙箱，只靠提示约束。只在任务需要时传。' } } : {}),
-        scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。给了就写进约束，完成后在 out_of_scope 里列出范围外的改动。' },
-        cwd: { type: 'string', description: '任务目录（Codex 在这里运行，write=true 时只能改这里的文件），Windows 路径或 /mnt/... 都可以。' +
+        scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。须覆盖任务中所有写入目标，包括工作区外的复制目的地。' +
+          '它不增加沙箱写权限；给了就写进约束，完成后在 out_of_scope 里列出范围外的改动。' },
+        writable_roots: { type: 'array', items: { type: 'string' }, description: '本次任务在 cwd 以外需要写入的已有目录（Windows 路径或 /mnt/...）；需要 write=true。' +
+          'workspace-write 沙箱会额外允许写入这些目录，scope 仍须列出所有允许修改的目标。仅对本次调用生效；host_access=true 时已无沙箱，不需要此参数。' },
+        cwd: { type: 'string', description: '任务目录（Codex 在这里运行，write=true 时可写；沙箱内的额外可写目录用 writable_roots 指定），Windows 路径或 /mnt/... 都可以。' +
           '不传时：会话工作区属于配置里带 cwd 的 workspaces 条目，就用那个 cwd，否则用当前会话工作区。' +
           '只在 task 里写目标目录不会切换任务目录，要处理哪个目录就传哪个 cwd。' },
         resume: { type: 'string', description: '在上一次返回的 thread_id 上继续（返工、追问时用）。' },

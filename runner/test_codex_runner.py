@@ -187,7 +187,8 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
 
     def test_transient_failure_on_writer_resumes_the_same_thread(self):
-        r = self.invoke("--sandbox", "workspace-write", mode="transient_then_ok")
+        r = self.invoke("--sandbox", "workspace-write", "--writable-root", str(self.cwd / "extra"),
+                        mode="transient_then_ok")
         self.assertEqual(r["status"], "completed")
         self.assertEqual(r["attempts"], 2)
         first, second = self.calls()
@@ -195,6 +196,63 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("resume", second["argv"])
         self.assertIn("thread-1", second["argv"])
         self.assertIn("interrupted", second["prompt"])
+        override = "sandbox_workspace_write.writable_roots=" + json.dumps([str(self.cwd / "extra")])
+        for call in (first, second):
+            self.assertEqual(call["argv"].count(override), 1)
+            self.assertEqual(call["argv"][call["argv"].index(override) - 1], "-c")
+
+    def test_writable_roots_round_trip_through_run_and_start(self):
+        roots = [r"E:\task data\密钥", "E:/task-output", str(self.cwd / "extra")]
+        expected = roots if os.name == "nt" else ["/mnt/e/task data/密钥", "/mnt/e/task-output", roots[2]]
+        for command in ("run", "start"):
+            for resume in ([], ["--resume", "writer-9"]):
+                with self.subTest(command=command, resume=bool(resume)):
+                    result = self.invoke("--sandbox", "workspace-write", *resume,
+                                         "--writable-root", roots[0], "--writable-root", roots[1],
+                                         "--writable-root", roots[2], command=command)
+                    if command == "start":
+                        args_file = Path(self.tmp.name) / "home" / "jobs" / result["job_id"] / "args.json"
+                        self.assertEqual(json.loads(args_file.read_text("utf-8"))["writable_roots"], roots)
+                        result = self.control("status", result["job_id"], "--wait", "30")
+                    self.assertEqual(result["status"], "completed")
+                    argv = self.calls()[-1]["argv"]
+                    overrides = [p for p in argv if p.startswith("sandbox_workspace_write.writable_roots=")]
+                    self.assertEqual(len(overrides), 1)
+                    self.assertEqual(json.loads(overrides[0].split("=", 1)[1]), expected)
+                    self.assertEqual(argv[argv.index(overrides[0]) - 1], "-c")
+                    self.assertNotIn("--add-dir", argv)
+                    self.assertEqual("resume" in argv, bool(resume))
+                    if resume:
+                        self.assertIn("writer-9", argv)
+
+    def test_writable_roots_do_not_override_other_sandbox_modes(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import argparse
+        import codex_runner
+
+        for sandbox in ("read-only", "danger-full-access"):
+            for thread_id in (None, "writer-9"):
+                with self.subTest(sandbox=sandbox, thread_id=thread_id):
+                    args = argparse.Namespace(use_user_config=True, model=None, effort=None, sandbox=sandbox,
+                                              schema=None, writable_roots=["E:/task-output"])
+                    cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), thread_id)
+                    self.assertFalse(any("sandbox_workspace_write.writable_roots" in p for p in cmd))
+                    self.assertIn(f'sandbox_mode="{sandbox}"', cmd)
+                    self.assertEqual("--ephemeral" in cmd, sandbox == "read-only")
+
+    def test_omitted_writable_roots_preserve_config_and_old_jobs(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import argparse
+        import codex_runner
+
+        args = argparse.Namespace(use_user_config=True, model=None, effort=None, sandbox="workspace-write", schema=None)
+        for roots in ("missing", None, []):
+            if roots != "missing":
+                args.writable_roots = roots
+            for thread_id in (None, "writer-9"):
+                with self.subTest(roots=roots, thread_id=thread_id):
+                    cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), thread_id)
+                    self.assertFalse(any("sandbox_workspace_write.writable_roots" in p for p in cmd))
 
     def test_transient_failure_on_reader_restarts_fresh(self):
         r = self.invoke(mode="transient_then_ok")

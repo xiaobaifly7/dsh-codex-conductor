@@ -187,6 +187,9 @@ def build_command(args, run_dir, thread_id):
         cmd += ["-c", f'service_tier="{args.service_tier}"']
     # `exec resume` has no -s or -C, so the sandbox goes through -c and the directory through the process cwd.
     cmd += ["-c", f'sandbox_mode="{args.sandbox}"']
+    if args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
+        cmd += ["-c", "sandbox_workspace_write.writable_roots=" +
+                json.dumps([local_path(p) for p in args.writable_roots], ensure_ascii=False)]
     if args.schema:
         cmd += ["--output-schema", args.schema]
     if args.sandbox == "read-only":
@@ -514,6 +517,8 @@ def add_task_arguments(p):
     p.add_argument("--resume", help="Continue an existing thread id")
     p.add_argument("--scope", action="append",
                    help="File or directory (relative to --cwd) to snapshot when cwd is too big to walk; repeatable")
+    p.add_argument("--writable-root", dest="writable_roots", action="append",
+                   help="Additional writable directory for workspace-write; repeatable")
     p.add_argument("--use-user-config", action="store_true", help="Inherit ~/.codex/config.toml, MCP servers and hooks")
     p.add_argument("--timeout", type=float, default=3600)
     # The Windows sandbox setup alone was silent for about 60s, so keep this well above that.
