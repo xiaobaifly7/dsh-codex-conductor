@@ -139,7 +139,8 @@ const under = (p, r) => p === r || p.startsWith(`${r}/`);
 
 function inWorkspace(cwd, roots) {
   const c = normPath(cwd);
-  return c !== '' && roots.some((r) => under(c, r));
+  // '*' 匹配任何会话工作区
+  return c !== '' && roots.some((r) => r === '*' || under(c, r));
 }
 
 // `$(` 之后找到配对的 `)`，跳过引号内的括号；找不到返回 -1。

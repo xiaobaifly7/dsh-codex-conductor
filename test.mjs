@@ -518,6 +518,14 @@ test('task directory defaults to the cwd of the containing workspace entry', asy
   assert.equal(guards[0](call('write', {}, 'D:\\other')), undefined);
 });
 
+test("workspaces '*' guards every session workspace", () => {
+  const guards = [];
+  apply({ tools: { register: () => {}, guard: (g) => guards.push(g) }, on: () => {} }, { workspaces: ['*'] });
+  assert.match(guards[0](call('write', {}, 'D:\\other')), /已拒绝/);
+  assert.match(guards[0](call('write', {}, '/mnt/e/x')), /已拒绝/);
+  assert.equal(guards[0](call('write', {}, '')), undefined);
+});
+
 test('read-only tasks use readOnlyEffort, writer tasks use effort; scope entries reach the runner', async () => {
   const { tools, calls } = harness({ config: { startResult: { job_id: 'J', status: 'completed' }, effort: 'max', readOnlyEffort: 'low' } });
   const argv = async (args) => {
