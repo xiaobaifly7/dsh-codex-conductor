@@ -270,10 +270,60 @@ function core(words) {
   }
 }
 
+// bash 的算术求值会递归展开其中的变量和 $(...)，从而执行文件/变量值里夹带的命令。算术出现在：
+//   $((...))、((...))  —— splitCommand/READERS 已拦；
+//   [ ] / [[ ]] / test 的 -eq 等比较符两侧（intOperand）；
+//   ${name[下标]}、${var:偏移[:长度]}、间接引用 ${!name}（braceBodySafe）。
+const ARITH_OP = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
+// 算术操作数只放行字面整数，以及恒为整数、无法夹带 $( 的 $? / $#；变量、命令替换结果、read 进来的值一律不放行
+const intOperand = (a) => /^-?\d+$/.test(a) || a === '$?' || a === '$#';
+// name[下标] 形式的词：下标会被算术求值（test -v/-R 的操作数、read 的赋值目标），非字面整数（@ / * 除外）一律拒绝。
+// 单引号挡不住：bash 在求值时才解析下标里的 $(...)，所以这里按词形判断
+const safeSub = (a) => { const m = /^#?[A-Za-z_][A-Za-z0-9_]*\[(.*)\]$/s.exec(a); return !m || m[1] === '@' || m[1] === '*' || /^-?\d+$/.test(m[1]); };
+
+// 单个 ${...} 体是否不触发算术求值。放行普通 ${name}、默认值 :-/:=/:?/:+、长度 ${#..}、删减 %/#、
+// 替换 /、大小写 ^/,，以及字面整数下标和 @ / * 整组；数组下标非整数、子串偏移/长度非整数、${!..} 一律拒绝。
+function braceBodySafe(body) {
+  if (body[0] === '!') return false;
+  let s = body[0] === '#' ? body.slice(1) : body;
+  const name = /^([A-Za-z_][A-Za-z0-9_]*|[-@*#?$!0-9]+)/.exec(s);
+  if (!name) return true;
+  s = s.slice(name[0].length);
+  if (s[0] === '[') {
+    const close = s.indexOf(']');
+    const idx = close < 0 ? null : s.slice(1, close);
+    if (idx === null || !(idx === '@' || idx === '*' || /^-?\d+$/.test(idx))) return false;
+    s = s.slice(close + 1);
+  }
+  // ${var@P} 等变换运算符：@P 会对变量值做提示符展开并执行其中的 $(...)，其余 @ 运算也一律 err-closed（${@}/${arr[@]} 的 @ 已在上面消化掉）
+  if (s[0] === '@') return false;
+  // : 后面紧跟 - = ? + 是默认值运算（不做算术）；否则是子串偏移[:长度]，每段必须是字面整数
+  if (s[0] === ':' && !['-', '=', '?', '+'].includes(s[1])) {
+    return s.slice(1).split(':').every((p) => /^\s*[+-]?\d+\s*$/.test(p));
+  }
+  return true;
+}
+
+// 词里每个 ${...}（含嵌套、未闭合保守拒绝）都安全。$(...) 已被 splitCommand 收敛成 $X，所以这里的 $ 只会是变量
+function braceExpansionsSafe(word) {
+  for (let i = word.indexOf('${', 0); i >= 0; i = word.indexOf('${', i + 2)) {
+    let depth = 0;
+    let end = -1;
+    for (let j = i + 1; j < word.length; j++) {
+      if (word[j] === '{') depth++;
+      else if (word[j] === '}' && --depth === 0) { end = j; break; }
+    }
+    if (end < 0 || !braceBodySafe(word.slice(i + 2, end))) return false;
+  }
+  return true;
+}
+
 function segmentAllowed(raw, extra) {
   const words = core(raw);
   if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
+  // ${...} 的算术求值面与具体命令无关（任何词都可能带），放在各命令判断之前统一拦截
+  if (!words.every(braceExpansionsSafe)) return false;
   // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
   if (words[0] === 'for') return (words.length <= 2 || words[2] === 'in') && words.slice(3).every((w) => !w.startsWith('-'));
   // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行。
@@ -308,6 +358,13 @@ function segmentAllowed(raw, extra) {
     case 'node': return args[0] === '--test' || args[0] === '--check';
     case 'go': return ['test', 'vet'].includes(args[0]) && !args.some((a) => /^--?(exec|toolexec|vettool)(=|$)/.test(a));
     case 'cargo': case 'make': return ['test', 'check'].includes(args[0]);
+    // 算术比较（-eq 等）两侧必须是字面整数：否则操作数的运行时值（文件内容、变量、命令输出）会被当算术表达式求值并执行其中的 $(...)。
+    // 只有 -v / -R 的操作数会对 name[下标] 做算术求值；=~、== 的模式和文件测试里的 name[..] 不求值，照常放行（真有 $(...) 由 splitCommand 拦）
+    case 'test': case '[': case '[[':
+      return args.every((a, i) => ((args[i - 1] !== '-v' && args[i - 1] !== '-R') || safeSub(a)) &&
+        (!ARITH_OP.has(a) || (intOperand(args[i - 1] ?? '') && intOperand(args[i + 1] ?? ''))));
+    // read 把输入赋给 name[下标] 目标时会算术求值下标（单引号也挡不住），和 -v 同类
+    case 'read': return args.every(safeSub);
     default: return READERS.has(cmd);
   }
 }

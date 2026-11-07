@@ -154,6 +154,53 @@ test('multiple sed print expressions and read-only git forms pass without enabli
   ]) assert.equal(readOnlyCommand(c), false, c);
 });
 
+test('arithmetic comparisons in [ ] / [[ ]] / test need literal-integer operands, so a planted value is never evaluated', () => {
+  for (const c of [
+    // 操作数的运行时值会被算术求值；$(cat f)、read 进来的 $v、循环变量 $f 都可能夹带 $(...)
+    '[[ $(cat f.txt) -eq 0 ]]', 'read -r v < f.txt; [[ $v -eq 0 ]]', 'for f in *; do [[ $f -eq 1 ]]; done',
+    'test $(cat f) -eq 1', '[ $(grep -c x f) -gt 0 ]', '[[ $x -ne 5 ]]', '[ "$n" -le 10 ]',
+    'if [[ $(cat f) -eq 0 ]]; then echo x; fi', '[[ ${arr[0]} -eq 0 ]]',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of [
+    // 字面整数、恒为整数的 $?/$#，以及不触发算术求值的文件测试和字符串比较照常放行
+    '[[ 1 -eq 1 ]]', '[ 3 -gt 2 ]', 'test 0 -eq 0', '[ -5 -lt 0 ]', '[ $? -eq 0 ]', '[[ $# -gt 0 ]]',
+    'pytest -q && [ $? -eq 0 ]', '[ -f foo ]', '[[ -n "$x" ]]', '[ "$a" = "$b" ]', '[[ "$x" == pat* ]]',
+    'test -d src', 'if [ -e a.txt ]; then cat a.txt; fi',
+  ]) assert.equal(readOnlyCommand(c), true, c);
+});
+
+test('${...} arithmetic positions (array subscript, substring offset, indirect) cannot evaluate planted values', () => {
+  for (const c of [
+    // 下标被当算术表达式求值：变量名、$变量、折叠后的 $X（来自 $(cat f)）都可能夹带 $(...)
+    'echo "${a[$y]}"', 'echo "${a[y]}"', 'cat "${a[$(cat f)]}"', 'read -r y < f; echo "${a[$y]}"',
+    'echo "${z:$y}"', 'echo "${z:0:$y}"', 'echo "${!y}"', 'ls "${arr[$i]}"',
+    'echo "${a[${b}]}"', 'v=${a[$y]}', 'for k in "${a[$y]}"; do echo "$k"; done',
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of [
+    // 普通展开、默认值、长度、删减、替换、大小写、字面整数下标/偏移、整组 @ / * 照常放行
+    'echo "${x}"', 'cat "${f}"', 'grep "${pat}" file', 'echo "${x:-default}" "${y:=d}" "${z:?msg}" "${w:+v}"',
+    'echo "${#arr[@]}" "${#s}"', 'printf "%s\\n" "${arr[@]}" "${arr[*]}" "${arr[0]}"', 'echo "${sha:0:8}"',
+    'echo "${p##*/}" "${p%/*}" "${name/foo/bar}" "${u^^}"', 'echo "${1}" "${@}" "${*}"', 'echo "${v: -3}"',
+  ]) assert.equal(readOnlyCommand(c), true, c);
+});
+
+test('the ${var@P} transform and -v array-subscript operands cannot smuggle command substitution past the guard', () => {
+  for (const c of [
+    // @P 对变量值做提示符展开并执行其中的 $(...)；其余 @ 变换一并 err-closed
+    'echo "${x@P}"', 'read -r v < report.txt; echo "${v@P}"', 'printf "%s" "${x@P}"', 'echo "${x@A}"', 'echo "${x@a}"',
+    // -v / test 的 name[下标] 操作数会算术求值；单引号挡不住
+    "[[ -v 'a[$(touch X)]' ]]", "[ -v 'a[$(touch X)]' ]", "test -v 'a[$(touch X)]'", "[[ -v 'a[$y]' ]]", "[[ -R 'a[$(id)]' ]]",
+    // read 把输入赋给 name[下标] 目标，同样算术求值下标
+    "read 'a[$(touch X)]'", "read -r 'a[$(touch X)]' < f", "read 'a[$y]'", "echo x | read 'arr[$(id)]'",
+  ]) assert.equal(readOnlyCommand(c), false, c);
+  for (const c of [
+    // 整组/位置参数、字面整数下标、普通 -v 变量名、字面下标文件测试照常放行
+    'echo "${@}" "${*}" "${arr[@]}"', '[[ -v arr[0] ]]', '[[ -v name ]]', '[ -v PATH ]', "[ -f 'a[0]' ]", '[[ -n "${x}" ]]',
+    // 普通 read；=~ 正则、== 通配、文件测试里的字符类 name[..] 不做算术求值，照常放行（真有 $(...) 由 splitCommand 拦）
+    'read -r line', 'read -r a b c', "read 'a[0]'", '[[ $x =~ foo[0-9] ]]', '[[ $f == backup[0-9] ]]', '[ -f a[0-9] ]', '[[ "$line" == "cfg[key]" ]]',
+  ]) assert.equal(readOnlyCommand(c), true, c);
+});
+
 test('an invalid allowCommands pattern leaves the tools and guard installed', () => {
   const tools = [];
   const guards = [];
