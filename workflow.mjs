@@ -120,6 +120,9 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
     return refuse('原 scope、task_options 或 thread_id 无效，先查询完整原始记录。', []);
   }
   const continuation = { parent_job_id: value.job_id, answers: normalized, resolution };
+  // 新线程只能读到保存的 task；只累计用户决定，不把历轮报告带进下一轮。
+  const previousAnswers = context.continuation?.answers ?? [];
+  const task = previousAnswers.length ? `${context.task}\n\n规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : context.task;
   const notes = [`原任务 ${value.job_id} 的后续修正；原验收、cwd、scope 和 write 不变，以下信息不是新增权限，不得用回答扩大目录或改写验收。`];
   if (nonempty(report.summary)) notes.push(`上轮摘要：${report.summary}`);
   for (const item of report.criteria.filter((item) => item.status !== 'met')) notes.push(`上轮未满足项：${item.criterion}（${item.status}）：${item.evidence}`);
@@ -132,13 +135,13 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (normalized.length) notes.push(`规划端回答（仅补充信息）：${JSON.stringify(normalized)}`);
   if (nonempty(resolution)) notes.push(`规划端解决依据（仅补充信息）：${resolution}`);
   notes.push('只修正上轮差距，按原验收标准逐条报告；不能在原权限内完成时继续报告阻塞。');
-  const args = { task: `${context.task}\n\n## 上轮结果与本次修正\n${notes.join('\n')}`, cwd: value.cwd,
+  const args = { task: `${task}\n\n## 上轮结果与本次修正\n${notes.join('\n')}`, cwd: value.cwd,
     acceptance: [...context.acceptance], write: context.write, host_access: value.sandbox === 'danger-full-access',
     use_user_config: options.use_user_config ?? false };
   if (scope != null) args.scope = [...scope];
   if (options.writable_roots != null) args.writable_roots = [...options.writable_roots];
   if (options.effort != null) args.effort = options.effort;
   if (value.thread_id != null) args.resume = value.thread_id;
-  return { ready: true, args, continuation, blocking,
+  return { ready: true, args, task, continuation, blocking,
     next: value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
 }

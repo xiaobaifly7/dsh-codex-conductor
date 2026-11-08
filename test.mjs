@@ -136,6 +136,16 @@ test('guard denials name the part that was refused', () => {
   assert.match(why('rm x'), /pwsh -NoProfile -File '<\.\.\.\\tests\\xxx\.ps1>'/);
 });
 
+test('legacy arithmetic expansion cannot evaluate file input, while quoted and escaped text stays literal', () => {
+  for (const command of ['read -r expression < payload.txt; echo $[expression]', 'echo "$[expression]"']) {
+    assert.equal(readOnlyCommand(command), false, command);
+    assert.match(decide(call('wsl', { command }), cfg), /\$\[\.\.\.\]/);
+  }
+  for (const command of ["echo '$[expression]'", String.raw`echo \$[expression]`, String.raw`echo "\$[expression]"`]) {
+    assert.equal(readOnlyCommand(command), true, command);
+  }
+});
+
 test('splitCommand keeps quoted operators inside words', () => {
   assert.deepEqual(splitCommand("grep -E 'a|b;c' x | wc -l"), [['grep', '-E', 'a|b;c', 'x'], ['wc', '-l']]);
   assert.deepEqual(splitCommand('cat "C:\\x\\y" "a\\"b\\\\"'), [['cat', 'C:\\x\\y', 'a"b\\']]);
@@ -228,6 +238,46 @@ test('unquoted brace expansion cannot generate filtered flags, but quoted braces
     "find . -name '{a,b}'", 'find . -name "{a,b}"', String.raw`find . -name \{a,b\}`,
     "rg 'a{2,3}' src", 'rg a{2} src', 'cat src/{a,b}.txt', 'echo {a..z}',
   ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('unquoted globs cannot generate filtered options, while fixed paths and literal patterns stay read-only', () => {
+  for (const command of [
+    'find . -[d]elete', 'find . [-]delete', 'find . *', 'git diff --ext-*', 'sort -* input',
+    'file -[C] -m ./magic', 'date -[s] @0',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+  for (const command of [
+    'find ./-[d]elete -type f', 'find src/* -type f', 'find . -name "-[d]elete"',
+    "find . -name '-[d]elete'", String.raw`find . -name -\[d\]elete`,
+    'git diff src/*.mjs', 'sort ./-*.txt', 'file ./-[C]',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('file compilation and date setting are refused without treating option values as flags', () => {
+  for (const command of [
+    'file -C -m ./magic', 'file -bC -m ./magic', 'file --compile -m ./magic', 'file --comp -m ./magic',
+    'file -m ./magic -C', 'file "$flag"', 'file -{b,C} -m ./magic',
+    'date -s @0', 'date -us@0', 'date --set=@0', 'date --se @0', 'date --s=@0',
+    'date "$flag"', 'date -{u,s} @0', 'date 010112002026', 'date -u -- 010112002026',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+  for (const command of [
+    'file -b README.md', 'file --mime-type README.md', 'file -mC README.md', 'file -bmC README.md',
+    'file -m -C README.md', 'file --magic-file -C README.md', 'file --magic-f -C README.md', 'file -- -C',
+    'date', 'date -u +%s', 'date -Ins', 'date -d @0', 'date -ud@0', 'date --date=@0',
+    'date -f -s', 'date --dat -s', 'date --reference -s', 'date --rfc-3339 seconds', 'date -- +%s',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('git external diff and textconv abbreviations are refused while text output stays read-only', () => {
+  for (const flag of ['--ext', '--ext-', '--ext-d', '--ext-di', '--ext-dif', '--ext-diff',
+    '--textc', '--textco', '--textcon', '--textconv']) {
+    for (const command of [`git diff ${flag}`, `git diff --no-index ${flag} a b`]) {
+      assert.equal(readOnlyCommand(command), false, command);
+    }
+  }
+  for (const command of ['git diff --text', 'git diff --no-index --text a b',
+    'git diff --exit-code', 'git diff --no-ext-diff --no-textconv']) {
+    assert.equal(readOnlyCommand(command), true, command);
+  }
 });
 
 test('iconv rejects attached output paths without rejecting attached encoding arguments', () => {
@@ -561,6 +611,23 @@ test('native Linux paths keep case for scope, workspace guards and default task 
   const workspaces = [{ root: normPath('/home/user/Project'), cwd: '/home/user/other' }];
   assert.equal(taskCwd({}, cwd, workspaces), cwd);
   assert.equal(taskCwd({}, '/home/user/Project/sub', workspaces), '/home/user/other');
+});
+
+test('Linux root workspaces and scopes preserve the guard for the root and its descendants', () => {
+  for (const root of ['/', '///', '/tmp/..']) assert.equal(normPath(root), '/');
+  assert.equal(normPath('C:/'), 'c:');
+  const guards = [];
+  apply({ tools: { register: () => {}, guard: (g) => guards.push(g) }, on: () => {} }, { workspaces: ['/'] });
+  assert.equal(guards.length, 1);
+  for (const cwd of ['/', '/tmp/project']) {
+    assert.match(guards[0](call('edit', {}, cwd)), /已拒绝/);
+    assert.equal(guards[0](call('wsl', { command: 'git status' }, cwd)), undefined);
+  }
+  assert.equal(guards[0](call('edit', {}, 'C:/project')), undefined);
+  assert.equal(guards[0]({ name: 'edit' }), undefined);
+  const value = { files_changed: [{ path: 'src/a.js' }, { path: '/etc/config' }, { path: 'C:/outside.txt' }] };
+  assert.deepEqual(outOfScope(value, '/tmp/project', ['/']), ['C:/outside.txt']);
+  assert.deepEqual(outOfScope(value, '/', ['.']), ['C:/outside.txt']);
 });
 
 test('report is surfaced and self-reported problems are flagged first', () => {
@@ -924,6 +991,41 @@ test('codex_continue shares concurrent dispatch and reuses an existing child aft
   const query = after.calls.find((argv) => argv[0] === 'list');
   assert.equal(query[query.indexOf('--parent-job') + 1], 'PARENT');
   assert.equal(query[query.indexOf('--owner') + 1], 'S1');
+});
+
+test('codex_continue persists user decisions through two new threads and a plugin reload', async () => {
+  const source = workflowSource();
+  delete source.thread_id;
+  const exec = { agent: agentAt('/work/current') };
+  const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
+  h.finals.PARENT = source;
+  await h.tools.codex_continue.execute({ job_id: 'PARENT',
+    answers: [{ id: 'format', answer: '仅使用 Windows-1252' }], wait_seconds: 0 }, exec);
+  const first = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin);
+  const child = { ...workflowSource('environment'), job_id: 'CHILD', context: first.context };
+  delete child.thread_id;
+  child.structured.summary = '等待服务恢复';
+  child.structured.blockers[0].message = '网络不可用';
+  const after = harness({ config: { allowHostAccess: true, defaultHostAccess: true,
+    startResult: { job_id: 'GRANDCHILD', status: 'completed' } } });
+  after.finals.CHILD = child;
+  const value = await after.tools.codex_continue.execute({ job_id: 'CHILD', resolution: '健康检查返回 HTTP 200', wait_seconds: 0 }, exec);
+  assert.equal(value.job_id, 'GRANDCHILD');
+  const { argv, stdin } = after.requests.find(({ argv }) => argv[0] === 'start');
+  const envelope = JSON.parse(stdin);
+  assert.match(envelope.prompt, /仅使用 Windows-1252/);
+  assert.match(envelope.context.task, /仅使用 Windows-1252/);
+  assert.doesNotMatch(envelope.prompt, /等待确认 CSV 格式/);
+  assert.doesNotMatch(envelope.context.task, /等待服务恢复|HTTP 200/);
+  assert.deepEqual(envelope.context.acceptance, source.context.acceptance);
+  assert.equal(envelope.context.write, source.context.write);
+  assert.equal(envelope.context.owner, source.context.owner);
+  assert.equal(argv[argv.indexOf('--cwd') + 1], source.cwd);
+  assert.equal(argv[argv.indexOf('--sandbox') + 1], source.sandbox);
+  assert.equal(argv.includes('--resume'), false);
+  assert.deepEqual(argv.filter((_, i) => argv[i - 1] === '--scope'), source.scope_paths);
+  assert.deepEqual(argv.filter((_, i) => argv[i - 1] === '--writable-root'), source.task_options.writable_roots);
+  assert.deepEqual(envelope.context.continuation, { parent_job_id: 'CHILD', answers: [], resolution: '健康检查返回 HTTP 200' });
 });
 
 test('codex_review rejects other or unknown owners before recording any review', async () => {

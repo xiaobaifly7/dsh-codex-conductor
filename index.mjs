@@ -132,7 +132,7 @@ const SED_PRINT = new RegExp(String.raw`^\s*${SED_ADDRESS}p(?:\s*;\s*${SED_ADDRE
 
 const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex_run 交给 Codex；你只做只读核验：read / glob / grep 等读工具，' +
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、gzip -t、pytest、npm test 等，' +
-  '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号、heredoc 或 $((...)) 算术）。' +
+  '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号、heredoc 或 $((...)) 算术、$[...] 算术）。' +
   "项目 tests 目录下的验证脚本可以直接跑：pwsh -NoProfile -File '<...\\tests\\xxx.ps1>'。" +
   'PowerShell -Command（包括只读查询）默认不放行；Windows 执行与核验交给主机访问模式的 codex_run。' +
   `检查 PowerShell 语法用随包脚本：pwsh.exe -NoProfile -File '${PS_SYNTAX_WIN}' 'D:\\path\\a.ps1' …` +
@@ -144,11 +144,11 @@ export function normPath(p) {
   const m = /^\/mnt\/([a-z])(\/.*)?$/i.exec(s);
   if (m) s = `${m[1]}:${m[2] ?? '/'}`;
   const windows = /^[A-Za-z]:/.test(s) || s.startsWith('//');
-  s = path.posix.normalize(s).replace(/\/+$/, '');
+  s = path.posix.normalize(s).replace(/\/+$/, '') || '/';
   return windows ? s.toLowerCase() : s;
 }
 
-const under = (p, r) => p === r || p.startsWith(`${r}/`);
+const under = (p, r) => p === r || p.startsWith(r === '/' ? r : `${r}/`);
 
 function inWorkspace(cwd, roots) {
   const c = normPath(cwd);
@@ -227,6 +227,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       continue;
     }
     if (ch === '`') return null;
+    if (ch === '$' && next === '[') return null;
     if (ch === '$' && next === '(') {
       // $((...)) 是算术：会把变量值当表达式递归求值，值里的 a[$(...)] 就能执行命令
       if (command[i + 2] === '(') return null;
@@ -300,7 +301,8 @@ function gitAllowed(args) {
   while (args[i] === '--no-pager' || args[i] === '-P' || args[i] === '-C') i += args[i] === '-C' ? 2 : 1;
   const sub = args[i];
   const rest = args.slice(i + 1);
-  if (rest.some((a) => /^--(output|ext-diff|textconv)/.test(a))) return false;
+  // --no-index 接受外部程序开关的缩写；--text 本身是合法的文本比较选项。
+  if (rest.some((a) => /^--(output|ext(?:-|$)|textc)/.test(a.split('=')[0]))) return false;
   // -ePATTERN/-fFILE 等会吞掉后面的字母，其中的 O 不是 pager 开关。
   if (sub === 'grep' && rest.some((a) => /^-[^-efmCBA]*O/.test(a) || (a.startsWith('--') && a !== '--' &&
     '--open-files-in-pager'.startsWith(a.split('=')[0])))) return false;
@@ -347,7 +349,7 @@ function core(words, kinds) {
 }
 
 // bash 的算术求值会递归展开其中的变量和 $(...)，从而执行文件/变量值里夹带的命令。算术出现在：
-//   $((...))、((...))  —— splitCommand/READERS 已拦；
+//   $((...))、$[...]、((...))  —— splitCommand/READERS 已拦；
 //   [ ] / [[ ]] / test 的 -eq 等比较符两侧（intOperand）；
 //   ${name[下标]}、${var:偏移[:长度]}、间接引用 ${!name}（braceBodySafe）。
 const ARITH_OP = new Set(['-eq', '-ne', '-lt', '-le', '-gt', '-ge']);
@@ -455,8 +457,8 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
   // 展开后的词可能变成被过滤的开关，不能把它当成普通文件参数。
-  if (/^(git|iconv|find|rg|sort|uniq|tree|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
-      (braceExpansion || args.some((a) => a.includes('$')))) return false;
+  if (/^(git|iconv|find|rg|sort|uniq|tree|file|date|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
+      (braceExpansion || args.some((a) => a.includes('$')) || (expansion.glob && expansion.fieldSplit))) return false;
   switch (cmd) {
     case 'git': return gitAllowed(args);
     case 'gzip': return ['-t', '--test'].includes(args[0]);
@@ -464,6 +466,26 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       args.slice(1).every((a) => !/^[+-]/.test(a) && !a.includes('$'));
     case 'iconv': return !args.some((a) => /^-[cs]*o/.test(a) ||
       (a.startsWith('--') && a !== '--' && '--output'.startsWith(a.split('=')[0])));
+    case 'file': {
+      for (let i = 0; i < args.length && args[i] !== '--'; i++) {
+        const a = args[i];
+        if (/^-[^-efFmP]*C/.test(a) || (a.startsWith('--') && '--compile'.startsWith(a.split('=')[0]))) return false;
+        if (/^-[^-efFmP]*[efFmP]$/.test(a) || (a.startsWith('--') && !a.includes('=') &&
+            ['--exclude', '--exclude-quiet', '--files-from', '--separator', '--magic-file', '--parameter'].some((flag) => flag.startsWith(a)))) i++;
+      }
+      return true;
+    }
+    case 'date': {
+      for (let i = 0; i < args.length; i++) {
+        const a = args[i];
+        if (a === '--') return args.slice(i + 1).every((v) => v.startsWith('+'));
+        if (/^-[uR]*s/.test(a) || (a.startsWith('--') && '--set'.startsWith(a.split('=')[0]))) return false;
+        if (/^-[uR]*[dfr]$/.test(a) || (a.startsWith('--') && !a.includes('=') &&
+            ['--date', '--file', '--reference', '--rfc-3339'].some((flag) => flag.startsWith(a)))) i++;
+        else if (!a.startsWith('-') && !a.startsWith('+')) return false;
+      }
+      return true;
+    }
     case 'find': return !args.some((a) => FIND_ACTIONS.has(a));
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
     case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
@@ -512,7 +534,7 @@ function refusedPart(command, extra) {
   const expansions = new Map();
   const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments, expansions) : [];
   if (segments === null) {
-    return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
+    return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、$[...] 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
   }
   const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
   return bad ? `不放行的是「${core(bad, expansions.get(bad).kinds).words.join(' ').slice(0, 200)}」` : '命令为空';
@@ -1498,7 +1520,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         if (!plan.ready) return { ...source, continuation_ready: false, blocking: plan.blocking,
           remaining_questions: plan.remaining_questions, next: plan.next };
         return dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
-          exec, plan.continuation, source.context.task);
+          exec, plan.continuation, plan.task);
       })();
       continuations.set(key, pending);
       try { return await pending; } finally { continuations.delete(key); }

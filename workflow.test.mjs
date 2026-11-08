@@ -221,6 +221,32 @@ test('host access is preserved, legacy scope falls back, and absent threads are 
   assert.match(result.next, /完整原任务 context 开新线程/);
 });
 
+test('two continuations without a thread retain user decisions without stacking old reports', () => {
+  const value = job([blocker('encoding', 'user_input')]);
+  delete value.thread_id;
+  const before = structuredClone(value);
+  const first = plan(value, { answers: [{ id: 'encoding', answer: '仅使用 Windows-1252' }] });
+  assert.equal(first.ready, true);
+  assert.equal(first.task, value.context.task);
+  const next = { ...job([blocker('service', 'environment')]), job_id: 'job-456', thread_id: null,
+    context: { ...value.context, continuation: first.continuation } };
+  next.report.summary = '等待服务恢复';
+  const second = plan(next, { resolution: '服务健康检查返回 HTTP 200' });
+  assert.equal(second.ready, true);
+  assert.match(second.args.task, /仅使用 Windows-1252/);
+  assert.match(second.task, /仅使用 Windows-1252/);
+  assert.doesNotMatch(second.args.task, /CSV 路径已检查/);
+  assert.doesNotMatch(second.task, /等待服务恢复|HTTP 200|上轮未满足项/);
+  assert.equal(Object.hasOwn(second.args, 'resume'), false);
+  assert.deepEqual(second.continuation, { parent_job_id: 'job-456', answers: [], resolution: '服务健康检查返回 HTTP 200' });
+  assert.deepEqual(second.args.acceptance, value.context.acceptance);
+  assert.equal(second.args.cwd, value.cwd);
+  assert.equal(second.args.write, value.context.write);
+  assert.equal(second.args.host_access, false);
+  assert.deepEqual(second.args.scope, value.scope_paths);
+  assert.deepEqual(value, before);
+});
+
 test('unknown, cancelled, missing identity and incomplete original permissions never produce launch arguments', () => {
   const base = job([blocker('parser', 'implementation')]);
   for (const patch of [{ status: 'unknown' }, { status: 'cancelled' }, { execution_status: 'unknown' },
