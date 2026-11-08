@@ -888,7 +888,11 @@ test('existing-job tools reject malformed runner IDs before invoking the runner'
   for (const id of invalid) h.finals[id] = rejected;
   for (const name of ['codex_status', 'codex_cancel', 'codex_output', 'codex_continue', 'codex_review']) {
     for (const id of invalid) {
-      await assert.rejects(h.tools[name].execute({ job_id: id, wait_seconds: 0 }, exec), /job_id/);
+      const args = { job_id: id };
+      if (name === 'codex_status') args.wait_seconds = 0;
+      if (name === 'codex_review') Object.assign(args, { status: 'verified',
+        criteria: [{ index: 1, status: 'met', evidence: 'checked' }], notes: 'checked', accepted_deviations: [] });
+      await assert.rejects(h.tools[name].execute(args, exec), /job_id/);
     }
   }
   assert.equal(h.calls.length, 0);
