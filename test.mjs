@@ -858,6 +858,10 @@ test('codex_summary renders null duration and usage as unknown while retaining g
     finished_duration_s: null, usage: null, usage_scope: 'unknown' };
   const render = (item) => h.tools.codex_summary.output.render({}, { total: 1, total_jobs: 1, groups: [item] })[0].text;
   const text = render(group);
+  assert.match(text, /执行 completed · 独立核验 unreviewed/);
+  assert.match(text, /涉及文件（含历史改动）：无/);
+  assert.match(render({ ...group, latest_job: { ...group.latest_job, status: 'running', execution_status: 'running' } }),
+    /执行 running · 独立核验 unreviewed/);
   assert.match(text, /已结束轮次耗时合计：未知；用量（unknown）：未知（原始用量不完整）/);
   assert.doesNotMatch(text, /耗时合计：0 秒|用量（unknown）：null/);
   assert.equal(group.finished_duration_s, null);
