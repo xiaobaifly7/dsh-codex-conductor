@@ -1059,6 +1059,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   const cfg = settings(config, ctx.logger);
   const conductor = createConductor(cfg, run);
   let dispatching = 0;
+  let dispatchGeneration = 0;
 
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
@@ -1256,6 +1257,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     exec?.signal?.throwIfAborted();
     let started;
     dispatching++;
+    dispatchGeneration++;
     try {
       started = await conductor.start(args, cwd, undefined, {
         owner: exec?.agent?.id ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
@@ -1653,7 +1655,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   registerRuntimeTool({ ctx, conductor, moduleUrl: import.meta.url, loadedIdentity,
     profileFile: cfg.runtimeProfileFile,
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
-    activeDispatches: () => dispatching });
+    activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();

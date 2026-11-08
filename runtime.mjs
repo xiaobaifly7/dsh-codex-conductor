@@ -238,12 +238,13 @@ export async function waitForRuntimeLoad({ loadedFile, expectedModule, timeoutMs
 }
 
 
-export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity, profileFile, loadedFile, activeDispatches }) {
+export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity, profileFile, loadedFile, activeDispatches, dispatchGeneration }) {
   const label = 'Codex runtime · 等待空闲后重载';
   const snapshot = (activeTasks, active_error = null) => ({
     ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks }), active_error,
   });
   async function activeCount(signal) {
+    const generation = dispatchGeneration();
     const starting = activeDispatches();
     const ids = new Set();
     let offset = 0;
@@ -264,8 +265,8 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       for (const job of page.jobs) ids.add(job.job_id);
       offset += page.jobs.length;
     } while (offset < total);
-    // A start may obtain its runner ID during the listing; do not turn that transition into false idle.
-    return Math.max(starting, ids.size + activeDispatches());
+    // 查询期间取得 job_id 的派发仍计入在途任务，避免误判空闲。
+    return { count: Math.max(starting, ids.size + activeDispatches()), generation };
   }
   async function reload(current, signal) {
     signal?.throwIfAborted();
@@ -297,9 +298,15 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       }
       try {
         let count = null;
+        let generation;
         let active_error = null;
-        try { count = await activeCount(exec?.signal); } catch (error) {
+        try {
+          // 派发计数可能经历 0→1→0，提交空闲重载前须确认列表对应的代次未变。
+          do { ({ count, generation } = await activeCount(exec?.signal)); }
+          while (when === 'idle' && generation !== dispatchGeneration());
+        } catch (error) {
           exec?.signal?.throwIfAborted();
+          count = null;
           active_error = String(error?.message ?? error);
         }
         current = snapshot(count, active_error);
@@ -325,10 +332,12 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
             const done = (async () => {
               try {
                 let observed = current;
-                while (observed.active_tasks > 0 && observed.state !== 'synchronized') {
+                while ((observed.active_tasks > 0 || generation !== dispatchGeneration()) && observed.state !== 'synchronized') {
                   handle.updateProgress('等待 Codex 空闲，在途任务数：' + observed.active_tasks);
                   await delay(5000, undefined, { signal });
-                  observed = snapshot(await activeCount(signal));
+                  const active = await activeCount(signal);
+                  observed = snapshot(active.count);
+                  generation = active.generation;
                 }
                 const result = await reload(observed, signal);
                 return { status: result.status === 'unconfirmed' ? 'failed' : 'completed', detail: result.status,

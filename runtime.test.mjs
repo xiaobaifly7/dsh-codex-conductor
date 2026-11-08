@@ -349,12 +349,12 @@ function nativeJobs() {
 }
 
 function runtimeTool(f, { jobs, conductor = { list: async () => ({ jobs: [], total: 0 }) },
-  activeDispatches = () => 0, profileFile = f.profileFile, loadedIdentity = null } = {}) {
+  activeDispatches = () => 0, dispatchGeneration = () => 0, profileFile = f.profileFile, loadedIdentity = null } = {}) {
   let tool;
   const ctx = { tools: { register(spec) { tool = spec; return spec; } },
     get(name) { assert.equal(name, 'jobs'); return jobs; } };
   const registered = registerRuntimeTool({ ctx, conductor, moduleUrl: f.moduleUrl, loadedIdentity,
-    profileFile, loadedFile: f.loadedFile, activeDispatches });
+    profileFile, loadedFile: f.loadedFile, activeDispatches, dispatchGeneration });
   assert.equal(registered, tool);
   return tool;
 }
@@ -440,6 +440,32 @@ test('a pending start obtaining its ID during listing cannot be mistaken for idl
   assert.equal(result.active_tasks, 1);
   assert.equal(result.error_kind, 'native_jobs_unavailable');
   assert.equal(readFileSync(f.profileFile, 'utf8'), profile(f.moduleUrl));
+});
+
+test('a start completing during listing or before the idle decision forces a fresh runner count', async (t) => {
+  for (const timing of ['listing', 'handoff']) {
+    const f = fixture(t);
+    writeFileSync(f.profileFile, profile(f.moduleUrl));
+    let pending = 0;
+    let generation = 0;
+    let lists = 0;
+    const start = () => { pending++; generation++; pending--; };
+    const tool = runtimeTool(f, { activeDispatches: () => pending, dispatchGeneration: () => generation,
+      conductor: forbidCodexMutations(async () => {
+        if (++lists === 1) {
+          if (timing === 'listing') start();
+          else queueMicrotask(() => queueMicrotask(start));
+          return { jobs: [], total: 0 };
+        }
+        return { jobs: [{ job_id: 'J1' }], total: 1 };
+      }) });
+    const result = await tool.execute({ action: 'reload' }, runtimeExec);
+    assert.equal(result.active_tasks, 1, timing);
+    assert.equal(result.error_kind, 'native_jobs_unavailable', timing);
+    assert.equal(lists, 2, timing);
+    assert.equal(pending, 0);
+    assert.equal(readFileSync(f.profileFile, 'utf8'), profile(f.moduleUrl));
+  }
 });
 
 test('synchronized global marker is already_current even with a stale instance and busy runners', async (t) => {
