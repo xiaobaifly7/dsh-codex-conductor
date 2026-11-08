@@ -1087,6 +1087,26 @@ class RunnerTests(unittest.TestCase):
                 self.assertFalse(codex_runner.valid_report(self.sample_report(blockers=blockers)))
         self.assertFalse(codex_runner.valid_report(self.sample_report(unrelated=[])))
 
+    def test_duplicate_blocker_ids_cannot_be_reported_or_saved(self):
+        blockers = [self.blocker(), self.blocker("environment", question="")]
+        self.stored_job("duplicate-report", {"status": "completed", "structured": self.sample_report(blockers=blockers)},
+                        context=self.sample_context())
+        value = self.control("status", "duplicate-report")
+        self.assertEqual(value["report_status"], "invalid")
+        self.assertEqual(value["blocking"]["state"], "unclassified")
+
+        jd = self.stored_job("duplicate-review", {"status": "completed", "structured": self.sample_report()},
+                             context=self.sample_context())
+        review = self.sample_review(status="needs_changes", blockers=[blockers[0]])
+        self.assertEqual(self.submit_review(jd.name, review)["verification_status"], "needs_changes")
+        original = (jd / "reviews.json").read_bytes()
+        self.assertEqual(self.submit_review(jd.name, {**review, "blockers": blockers})["error_kind"], "bad_arguments")
+        self.assertEqual((jd / "reviews.json").read_bytes(), original)
+
+        blockers[1]["id"] = " b1 "
+        value = self.submit_review(jd.name, {**review, "blockers": blockers})
+        self.assertEqual([b["id"] for b in value["verification"]["blockers"]], ["b1", " b1 "])
+
     def test_status_and_list_classify_only_explicit_blockers(self):
         pairs = [("user_input", "needs_input", "ask_user"), ("task_conflict", "needs_input", "ask_user"),
                  ("environment", "waiting_environment", "wait_condition"), ("implementation", "needs_fix", "resume_fix")]

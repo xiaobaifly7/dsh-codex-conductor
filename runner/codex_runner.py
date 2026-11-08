@@ -789,7 +789,7 @@ def valid_blockers(blockers):
         b["id"].strip() and b["message"].strip() and
         b["kind"] in ("user_input", "task_conflict", "environment", "implementation") and
         (b["kind"] not in ("user_input", "task_conflict") or b["question"].strip())
-        for b in blockers)
+        for b in blockers) and len({b["id"] for b in blockers}) == len(blockers)
 
 
 def valid_report(report):
