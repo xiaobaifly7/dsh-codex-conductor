@@ -460,6 +460,8 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   if (/^(git|iconv|find|rg|sort|uniq|tree|file|date|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
       (braceExpansion || args.some((a) => a.includes('$')) || (expansion.glob && expansion.fieldSplit))) return false;
   switch (cmd) {
+    // 只放行直接、无参数的内建控制；timeout 后的同名外部程序仍拒绝。
+    case ':': case 'continue': return kind === 'literal' && args.length === 0;
     case 'git': return gitAllowed(args);
     case 'gzip': return ['-t', '--test'].includes(args[0]);
     case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && !braceExpansion && !expansion.glob &&

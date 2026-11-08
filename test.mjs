@@ -82,6 +82,26 @@ test('read-only commands pass', () => {
   ]) assert.equal(readOnlyCommand(c), true, c);
 });
 
+test('bare no-op and continue keep the read-only boundary', () => {
+  for (const command of [
+    ':', 'ls missing 2>/dev/null || :',
+    'for f in a.txt b.txt; do [ -f "$f" ] || continue; wc -l "$f"; done',
+    'while read -r line; do if [ -z "$line" ]; then continue; fi; printf "%s\\n" "$line"; done < list.txt',
+    'if test -f input.txt; then :; else cat input.txt; fi',
+  ]) {
+    assert.equal(readOnlyCommand(command), true, command);
+    assert.equal(decide(call('ops_bash', { command }), cfg), undefined, command);
+  }
+  for (const command of [
+    ': arg', 'continue 2', ': done', 'continue fi',
+    "':'", "'continue'", 'con""tinue', 'con\\tinue',
+    'timeout 1 :', 'timeout 1 continue', 'timeout 1 timeout 2 continue',
+    'env continue', 'command continue', '/tmp/continue', '/tmp/:',
+    ': > marker', 'continue > marker', ': $(touch marker)', ':; rm -f marker',
+    'for f in a; do continue; done; rm -f marker',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
 test('gzip integrity checks pass without allowing compression or decompression', () => {
   const actual = 'R=/mnt/d/harness; gzip -t $R/logs/harness.log.20261108-041557.gz';
   for (const command of [
