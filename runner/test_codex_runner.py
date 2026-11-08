@@ -1165,18 +1165,45 @@ class RunnerTests(unittest.TestCase):
             (root / ".cache" / f"c{i}.bin").write_text("x")
         (root / "src" / "a.py").write_text("a")
         (root / "run.log").write_text("log")
-        # "(?<bad" is rejected by Python too, so it is skipped instead of failing the task
         report = codex_runner.files_changed(str(root), before, [], ignore=[r"^\.cache/", r"\.log$", "(?<bad"])
         self.assertEqual(report["files_changed"], [{"path": "src/a.py", "change": "added"}])
         self.assertEqual(report["files_changed_total"], 1)
+        self.assertEqual(len(report["ignore_warnings"]), 1)
+        self.assertIn("(?<bad", report["ignore_warnings"][0])
+
+    def test_ignore_patterns_use_python_re_and_report_skipped_patterns(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        events = [("logs/progress.log", "update"), ("CACHE/state", "update"), ("src/a.py", "update")]
+        report = codex_runner.files_changed(str(self.cwd), None, events,
+                                           ignore=["(?P<log>^logs/)", "(?i)^cache/", "(?<log>^src/)", "["])
+        self.assertEqual(report["files_changed"], [{"path": "src/a.py", "change": "update"}])
+        self.assertEqual(report["files_changed_total"], 1)
+        self.assertEqual(len(report["ignore_warnings"]), 2)
+        self.assertIn("(?<log>^src/)", report["ignore_warnings"][0])
+        self.assertIn("'['", report["ignore_warnings"][1])
+        for warning in report["ignore_warnings"]:
+            self.assertIn("ignoreChanges", warning)
+            self.assertIn("Python re", warning)
+
+    def test_read_only_run_reports_invalid_ignore_patterns(self):
+        result = self.invoke("--ignore", "(?<log>^logs/)")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(len(result["ignore_warnings"]), 1)
+        self.assertIn("(?<log>^logs/)", result["ignore_warnings"][0])
+        self.assertIn("Python re", result["ignore_warnings"][0])
 
     def test_ignore_reaches_the_worker_through_start(self):
         (self.cwd / "keep").mkdir()
         (self.cwd / "keep" / "a.txt").write_text("a")
-        job = self.invoke("--sandbox", "workspace-write", "--ignore", "^keep/", command="start", mode="scoped_write")
+        job = self.invoke("--sandbox", "workspace-write", "--ignore", "(?P<log>^keep/)",
+                          "--ignore", "(?<log>^keep/)", command="start", mode="scoped_write")
         r = self.control("status", job["job_id"], "--wait", "30")
         self.assertEqual(r["status"], "completed")
         self.assertEqual((r["files_changed"], r["files_changed_total"]), ([], 0))
+        self.assertEqual(len(r["ignore_warnings"]), 1)
+        self.assertIn("(?<log>^keep/)", r["ignore_warnings"][0])
 
     @unittest.skipIf(os.name == "nt", "the /mnt/ rule only applies inside WSL")
     def test_codex_lookup_skips_the_windows_build_under_mnt(self):

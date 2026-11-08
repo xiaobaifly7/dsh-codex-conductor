@@ -19,7 +19,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
-const { validBlockers, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 
 const loadedIdentity = runtimeIdentity(import.meta.url);
@@ -667,9 +667,9 @@ export function createConductor(cfg, run = runRunner) {
     for (const s of args.scope ?? []) argv.push('--scope', s);
     for (const root of args.writable_roots ?? []) argv.push('--writable-root', root);
     // runner 在截取前 300 条改动之前就过滤，改动数和超出 scope 的检查才准
-    for (const rx of cfg.ignoreChanges ?? []) argv.push('--ignore', rx.source);
+    for (const pattern of cfg.ignoreChanges ?? []) argv.push('--ignore', pattern);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
-      ignore: (cfg.ignoreChanges ?? []).map((rx) => rx.source) });
+      ignore: cfg.ignoreChanges ?? [] });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -720,7 +720,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     '- 任务明确禁止某些访问或状态变更时，运行相关脚本前先只读检查是否触及这些限制；存在冲突或无法确认时，不执行相关步骤并标为 blocked。\n' +
     (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
-    (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
+    (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些 Python re 正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
       '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
       '任务或验收标准本身要求查看或修改这些文件时照常处理。\n' : '') +
     (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
@@ -778,14 +778,7 @@ export function reviewState(value) {
   const counts = { met: 0, not_met: 0, blocked: 0 };
   const criteria = Array.isArray(report?.criteria) ? report.criteria : [];
   for (const item of criteria) if (Object.hasOwn(counts, item?.status)) counts[item.status]++;
-  const fields = ['summary', 'criteria', 'files_changed', 'deviations', 'unresolved'];
-  const valid = report && typeof report === 'object' && !Array.isArray(report) &&
-    fields.every((key) => Object.hasOwn(report, key)) && Object.keys(report).every((key) => fields.includes(key) || key === 'blockers') &&
-    (!Object.hasOwn(report, 'blockers') || validBlockers(report.blockers)) &&
-    typeof report.summary === 'string' && Array.isArray(report.criteria) &&
-    ['files_changed', 'deviations', 'unresolved'].every((key) => Array.isArray(report[key]) && report[key].every((s) => typeof s === 'string')) &&
-    criteria.every((c) => c && typeof c.criterion === 'string' && typeof c.evidence === 'string' && Object.hasOwn(counts, c.status) &&
-      Object.keys(c).every((key) => ['criterion', 'status', 'evidence'].includes(key)));
+  const valid = validReport(report);
   const unknown = unknownState(value);
   const execution = unknown ? 'unknown' : value.error_kind === 'schema_invalid' ? 'completed' : value.status;
   const pending = execution === 'running';
@@ -930,6 +923,7 @@ function details(rest) {
     rest.verification?.notes && `核验说明：${rest.verification.notes}`,
     ...(rest.verification?.criteria ?? []).map((c) => `核验第 ${c.index} 条 ${c.status}：${c.evidence}`),
     rest.usage && `用量（${rest.usage_scope ?? '统计范围未知'}，不是费用）：${JSON.stringify(rest.usage)}`,
+    ...(rest.ignore_warnings ?? []),
     rest.report_note].filter(Boolean);
 }
 
@@ -1029,7 +1023,7 @@ function settings(config, logger) {
     .map((w) => typeof w === 'string' ? { root: normPath(w) }
       : { root: normPath(w?.path), cwd: typeof w?.cwd === 'string' && w.cwd.trim() ? w.cwd.trim() : undefined })
     .filter((w) => w.root);
-  // 正则列表：非法的警告后跳过，其余照常生效
+  // allowCommands 用 JavaScript 正则；ignoreChanges 交给 runner 按 Python re 验证和应用。
   const patterns = (key) => (Array.isArray(config[key]) ? config[key] : []).flatMap((pattern) => {
     try {
       return [new RegExp(pattern)];
@@ -1045,7 +1039,7 @@ function settings(config, logger) {
     roots: workspaces.map((w) => w.root),
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),
     allowCommands: patterns('allowCommands'),
-    ignoreChanges: patterns('ignoreChanges'),
+    ignoreChanges: Array.isArray(config.ignoreChanges) ? config.ignoreChanges.map(String) : [],
   };
 }
 

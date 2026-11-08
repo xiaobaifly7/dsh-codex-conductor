@@ -537,6 +537,16 @@ def snapshot_before(cwd, scope_args):
     return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
 
 
+def ignore_patterns(ignore):
+    patterns, warnings = [], []
+    for pattern in ignore or []:
+        try:
+            patterns.append(re.compile(pattern))
+        except re.error as error:
+            warnings.append(f"忽略无效的 ignoreChanges Python re 正则 {pattern!r}：{error}")
+    return patterns, warnings
+
+
 def files_changed(root, before, event_changes, scope=None, ignore=None):
     """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool.
     Paths matching an ignore regex (files other processes keep writing) are dropped before the 300-entry cap."""
@@ -561,16 +571,12 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
     else:
         changes = events
         source = "codex_events"
-    patterns = []
-    for pattern in ignore or []:
-        try:
-            patterns.append(re.compile(pattern))
-        except re.error:
-            pass  # the plugin already warned about patterns JavaScript rejects; the few only Python rejects are skipped
+    patterns, warnings = ignore_patterns(ignore)
     changes = [(p, k) for p, k in changes if not any(rx.search(p) for rx in patterns)]
     changes.sort()
     return {"files_changed": [{"path": p, "change": c} for p, c in changes[:300]],
-            "files_changed_total": len(changes), "files_changed_source": source}
+            "files_changed_total": len(changes), "files_changed_source": source,
+            **({"ignore_warnings": warnings} if warnings else {})}
 
 
 def execute(args, prompt, run_dir):
@@ -578,6 +584,9 @@ def execute(args, prompt, run_dir):
     args.cwd = os.path.realpath(args.cwd)
     scope_args = [scope_path(args.cwd, s) for s in getattr(args, "scope", None) or []]
     base = {"cwd": args.cwd, "sandbox": args.sandbox, "log_dir": str(run_dir)}
+    ignore, warnings = ignore_patterns(getattr(args, "ignore", None))
+    if warnings:
+        base["ignore_warnings"] = warnings
     if getattr(args, "context", None) is not None:
         base["context"] = args.context
     if scope_args:
@@ -616,9 +625,8 @@ def execute(args, prompt, run_dir):
             # Jobs queued before --scope existed have no scope in args.json.
             before, scope = snapshot_before(args.cwd, scope_args)
 
-        # Jobs queued before --ignore existed have no ignore in args.json.
         def changes():
-            return files_changed(args.cwd, before, event_changes, scope, getattr(args, "ignore", None)) \
+            return files_changed(args.cwd, before, event_changes, scope, ignore) \
                 if args.sandbox != "read-only" else {}
 
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.

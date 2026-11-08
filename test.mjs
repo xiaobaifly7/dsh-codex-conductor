@@ -22,7 +22,7 @@ test('entry reload queries re-evaluate both workflow and runtime helpers', async
     for (const version of ['old', 'new']) {
       writeFileSync(path.join(dir, 'workflow.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('workflow-${version}');\n` +
-        'export const validBlockers = () => true, blockingState = () => ({}), prepareContinuation = () => ({});\n');
+        'export const validReport = () => true, blockingState = () => ({}), prepareContinuation = () => ({});\n');
       writeFileSync(path.join(dir, 'runtime.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('runtime-${version}');\n` +
         'export const runtimeIdentity = () => ({}), registerRuntimeTool = () => {};\n');
@@ -1993,7 +1993,7 @@ test('a completed result shows the original criteria, clipped evidence and one-l
 
 test('ignoreChanges reaches the runner as --ignore and tells Codex the matching files change on their own', async () => {
   const calls = [];
-  const c = createConductor({ ignoreChanges: [/^logs\//, /\.tmp$/] }, (_cfg, argv, opts) => {
+  const c = createConductor({ ignoreChanges: ['^logs/', '\\.tmp$'] }, (_cfg, argv, opts) => {
     calls.push({ argv, stdin: opts.stdin });
     return Promise.resolve({ job_id: 'J', status: 'running' });
   });
@@ -2001,19 +2001,31 @@ test('ignoreChanges reaches the runner as --ignore and tells Codex the matching 
   for (const args of [{ ...RUN, write: true }, { ...RUN, write: false }, { ...RUN, write: false, host_access: true }]) {
     await c.start(args, 'F:\\proj');
     const { argv, stdin } = calls.at(-1);
-    assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--ignore'), ['^logs\\/', '\\.tmp$']);
-    assert.match(stdin, /其他进程持续写入：\^logs\\\/、\\\.tmp\$。[^\n]*不要因此把验收标准标为 blocked；任务或验收标准本身要求查看或修改这些文件时照常处理/);
+    assert.deepEqual(argv.filter((a, i) => argv[i - 1] === '--ignore'), ['^logs/', '\\.tmp$']);
+    assert.match(stdin, /Python re 正则/);
+    assert.match(stdin, /其他进程持续写入：\^logs\/、\\\.tmp\$。[^\n]*不要因此把验收标准标为 blocked；任务或验收标准本身要求查看或修改这些文件时照常处理/);
   }
   assert.doesNotMatch(composePrompt('做事情做事情', ['甲条件成立']), /其他进程持续写入/);
-  // 配置里的正则：非法的警告后跳过，其余照常传给 runner
+});
+
+test('ignoreChanges keeps Python re syntax and displays skipped patterns reported by the runner', async () => {
   const warnings = [];
   const tools = {};
+  const guards = [];
   const argvs = [];
-  apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {}, logger: { warn: (s) => warnings.push(s) } },
-    { workspaces: [], ignoreChanges: ['^logs/', '['] }, (_cfg, argv) => { argvs.push(argv); return Promise.resolve({ job_id: 'J', status: 'completed' }); });
-  await tools.codex_run.execute({ ...RUN, write: true, cwd: 'F:\\proj' }, {});
-  assert.match(warnings[0], /ignoreChanges/);
-  assert.deepEqual(argvs[0].filter((a, i) => argvs[0][i - 1] === '--ignore'), ['^logs\\/']);
+  const patterns = ['(?P<log>^logs/)', '(?i)^cache/', '(?<log>^logs/)', '['];
+  const ignore_warnings = ["忽略无效的 ignoreChanges Python re 正则 '(?<log>^logs/)'：unknown extension ?<l at position 1",
+    "忽略无效的 ignoreChanges Python re 正则 '['：unterminated character set at position 0"];
+  apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: (g) => guards.push(g) }, on: () => {}, logger: { warn: (s) => warnings.push(s) } },
+    { workspaces: ['F:\\work\\项目'], ignoreChanges: patterns, allowCommands: ['(?<cmd>^custom-check$)'] },
+    (_cfg, argv) => { argvs.push(argv); return Promise.resolve({ job_id: 'J', status: 'completed', ignore_warnings }); });
+  const value = await tools.codex_run.execute({ ...RUN, write: true, cwd: 'F:\\proj' }, {});
+  assert.deepEqual(warnings, []);
+  assert.deepEqual(argvs[0].filter((a, i) => argvs[0][i - 1] === '--ignore'), patterns);
+  assert.equal(guards[0](call('wsl', { command: 'custom-check' })), undefined);
+  assert.deepEqual(value.ignore_warnings, ignore_warnings);
+  const text = tools.codex_run.output.render({}, value)[0].text;
+  for (const warning of ignore_warnings) assert.ok(text.includes(warning), text);
 });
 
 test('running, cancelled and failed results keep every field in the details', async () => {

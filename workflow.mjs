@@ -15,7 +15,7 @@ export function validBlockers(blockers) {
     new Set(blockers.map((blocker) => blocker.id)).size === blockers.length;
 }
 
-function validReport(report) {
+export function validReport(report) {
   const fields = ['summary', 'criteria', 'files_changed', 'deviations', 'unresolved'];
   return object(report) && fields.every((key) => Object.hasOwn(report, key)) &&
     Object.keys(report).every((key) => [...fields, 'blockers'].includes(key)) &&
