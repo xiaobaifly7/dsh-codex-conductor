@@ -108,7 +108,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (activeBlockers(blocking.blockers, verificationOf(value)).some((blocker) => blocker.kind === 'environment') && !nonempty(resolution)) {
     return refuse('环境条件仍需提供非空 resolution，说明条件已满足的具体证据。', []);
   }
-  if (blocking.state === 'unclassified' && !nonempty(resolution)) return refuse('旧报告阻塞尚未分类；先查清原因，并用 resolution 说明处理依据。', []);
+  if (blocking.state === 'unclassified' && !nonempty(resolution)) return refuse('旧报告仍有待核对事项；先查清原因，对照原任务范围区分真实缺口与已说明的验证边界，并用 resolution 说明处理依据。仅验证边界应先独立核验，不因此启动修正任务。', []);
   if (blocking.next_action === 'verify') return refuse('原任务自报已满足验收，先独立核验；未发现差距时不启动修正任务。', []);
   const options = value.task_options ?? {};
   const scope = value.scope_paths ?? value.scope;

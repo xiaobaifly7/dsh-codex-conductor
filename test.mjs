@@ -639,7 +639,7 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.equal(value.report, report);
   assert.equal(value.structured, undefined);
   const next = nextStep({ ...value, out_of_scope: ['README.md'] }, ['A', 'B']);
-  assert.match(next, /阻塞原因未分类或报告不完整/);
+  assert.match(next, /报告或任务状态仍需核对/);
   assert.match(next, /范围外改动待核实：README\.md[\s\S]*其他进程写的文件/);
   assert.doesNotMatch(next, /resume=|write=true|host_access=true/);
   // 缺报告时先检查，不因存在旧线程直接续接。
@@ -1532,7 +1532,7 @@ test('a running job is registered once as a DSH background job and reports back 
   // 任务表的 detail 和结果第一行都以一行摘要开头；文件数取 runner 的 files_changed_total
   assert.equal(done.detail, 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注 · runner J1 · codex_output');
   assert.equal(done.result.split('\n')[0], 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注  job_id: J1  thread_id: T');
-  assert.match(done.result, /逐条汇报[\s\S]*✗ 1\. pytest 通过 —— e[\s\S]*下一步[\s\S]*阻塞原因未分类/);
+  assert.match(done.result, /逐条汇报[\s\S]*✗ 1\. pytest 通过 —— e[\s\S]*下一步[\s\S]*报告或任务状态仍需核对/);
   assert.doesNotMatch(done.result, /resume=/);
   // 结束后不再算在执行中
   handlers['agent/turn-stopping']({ agent: exec.agent, turn: 3 });
@@ -1656,7 +1656,7 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   assert.equal(value.status, 'completed');
   const text = tools.codex_status.output.render({}, value)[0].text;
   assert.equal(text, jobs.started[0].result);
-  assert.match(text, /thread_id: T[\s\S]*阻塞原因未分类[\s\S]*范围外改动待核实：README\.md/);
+  assert.match(text, /thread_id: T[\s\S]*报告或任务状态仍需核对[\s\S]*范围外改动待核实：README\.md/);
   assert.ok(calls.slice(sent).every((a) => a[3] === '20'));
   assert.deepEqual(jobs.unawaited, []);
 
@@ -1985,13 +1985,13 @@ test('a completed result shows the original criteria, clipped evidence and one-l
   assert.match(text, /\n--- 详细字段 ---\n任务目录：\/mnt\/f\/p\n改动文件（snapshot，共 1 个）：a\.py\(modified\)\n用量（统计范围未知，不是费用）：\{"input_tokens":9\}\n--- 下一步 ---\n/);
   assert.doesNotMatch(text, /forced_exit|truncated|commands_run|attempts|log_dir/);
   // 报告仍保留验收原文，旧 blocked 先检查原因。
-  assert.match(value.next, /阻塞原因未分类[\s\S]*先读完整报告和实际状态/);
+  assert.match(value.next, /报告或任务状态仍需核对[\s\S]*先读完整报告和实际状态/);
   assert.doesNotMatch(value.next, /甲原文/);
   // 编号对不上时显示 Codex 写的条目，仍先检查旧阻塞。
   const shifted = { ...value, report: { ...report, criteria: [{ ...report.criteria[0], criterion: '2. 甲' }, report.criteria[1]] } };
   shifted.next = nextStep(shifted, shifted.acceptance);
   assert.match(render(shifted), /\n✓ 1\. 2\. 甲 —— /);
-  assert.match(shifted.next, /阻塞原因未分类/);
+  assert.match(shifted.next, /报告或任务状态仍需核对/);
   assert.deepEqual(shifted.acceptance, ['甲原文', '乙原文']);
   // 失败的结果保留全部字段，便于排查
   assert.match(render({ status: 'failed', error_kind: 'timeout', error: 'boom', log_dir: '/home/u/jobs/K', attempts: 2, retryable: false }),
@@ -2063,7 +2063,7 @@ test('count or numbering mismatches retain Codex labels and inspect legacy block
     value.next = nextStep(value, acceptance);
     const text = render(value);
     labels.forEach((l, i) => assert.ok(text.includes(`\n${i ? '⛔' : '✓'} ${i + 1}. ${l} —— e${i + 1}\n`), `${l}\n${text}`));
-    assert.match(value.next, /阻塞原因未分类[\s\S]*先读完整报告和实际状态/);
+    assert.match(value.next, /报告或任务状态仍需核对[\s\S]*先读完整报告和实际状态/);
     assert.deepEqual(value.acceptance, acceptance);
   }
   // 编号和位置一致、或者数字后面不是编号标点（3 个测试通过）时照常显示原文
@@ -2088,7 +2088,7 @@ test('codex_run shows the acceptance text when Codex rewrites the labels, right 
   await later.answer('J1', done);
   for (const text of [now.tools.codex_run.output.render({}, value)[0].text, (await jobs.started[0].done).result]) {
     assert.match(text, /\n✓ 1\. pytest tests\/test_login\.py 全部通过 —— e1\n⛔ 2\. a\.py 第 40 行不再抛 NullPointer —— e2\n/);
-    assert.match(text, /下一步[\s\S]*阻塞原因未分类/);
+    assert.match(text, /下一步[\s\S]*报告或任务状态仍需核对/);
   }
 });
 
@@ -2097,7 +2097,7 @@ test('host access settings do not turn unclassified blockers into permission esc
     files_changed: [], deviations: [], unresolved: [] };
   const done = { job_id: 'J', status: 'completed', thread_id: 'T', sandbox: 'workspace-write', structured };
   for (const allowHostAccess of [true, false]) {
-    const expected = /阻塞原因未分类[\s\S]*先读完整报告和实际状态/;
+    const expected = /报告或任务状态仍需核对[\s\S]*先读完整报告和实际状态/;
     const r = harness({ config: { allowHostAccess, startResult: done } });
     const run = await r.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('F:\\work\\项目') });
     assert.match(run.next, expected);
@@ -2112,7 +2112,7 @@ test('host access settings do not turn unclassified blockers into permission esc
   const host = harness({ config: { allowHostAccess: true, startResult: { ...done, sandbox: 'danger-full-access',
     structured: { ...structured, criteria: [{ criterion: '建备份', status: 'blocked', evidence: '只读调查不能写文件' }] } } } });
   const readOnly = await host.tools.codex_run.execute({ ...RUN, write: false, host_access: true }, { agent: agentAt('F:\\work\\项目') });
-  assert.match(readOnly.next, /阻塞原因未分类/);
+  assert.match(readOnly.next, /报告或任务状态仍需核对/);
   assert.doesNotMatch(readOnly.next, /write=true|host_access=true|resume=/);
 });
 

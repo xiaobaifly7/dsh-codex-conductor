@@ -852,7 +852,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     if (blocking.next_action === 'ask_user') return '先向用户提出以下具体问题，取得回答后用 codex_continue 提交 answers；不要重复派活或替用户决定：\n' +
       blocking.questions.map((q) => `${q.id}: ${q.question}`).join('\n');
     if (blocking.next_action === 'wait_condition') return '当前受环境条件阻塞。先说明 blockers 中的解除条件；条件改变并取得证据后，用 codex_continue 的 resolution 说明事实再续跑，不要原样重试。';
-    if (blocking.next_action === 'inspect_report') return '阻塞原因未分类或报告不完整。先读完整报告和实际状态，查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。' +
+    if (blocking.next_action === 'inspect_report') return '报告或任务状态仍需核对。先读完整报告和实际状态，对照原任务范围区分真实缺口与已说明的验证边界；边界说明本身不自动增加补做要求。确有遗留问题时，再查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。' +
       (value.out_of_scope?.length ? `\n范围外改动待核实：${value.out_of_scope.join('、')}。快照也可能包含其他进程写的文件，先核实归属，不能仅凭快照认定 Codex 越界。` : '');
     if (blocking.next_action === 'resume_fix') return '已有明确实现差距。用 codex_continue 续接原任务，它会保留原目录、验收、write、scope 和主机权限；不得借修正扩大授权。';
   }
