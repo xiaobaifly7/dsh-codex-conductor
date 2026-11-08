@@ -500,6 +500,23 @@ test('guard denies writes only inside configured workspaces', () => {
   assert.equal(decide({ name: 'write', arguments: {} }, cfg), undefined);
 });
 
+test('guard blocks Seep arbitrary r2 commands while preserving structured queries and workspace boundaries', () => {
+  const everywhere = { ...cfg, roots: ['*'] };
+  for (const namespace of ['mcp__seep_reverse_lab__', 'mcp__seep-reverse-lab__']) {
+    const tool = `${namespace}seep_r2_cmd`;
+    for (const command of ['!printf GUARD_MARKER', 'afl']) {
+      const args = { binary_path: '/fixture/sample', command };
+      assert.match(decide(call(tool, args), cfg), /会改动文件或执行命令，已拒绝/, `${tool}: ${command}`);
+      assert.equal(decide(call(tool, args, 'F:\\work\\other'), cfg), undefined);
+      assert.match(decide(call(tool, args, 'F:\\work\\other'), everywhere), /已拒绝/, `${tool}: ${command}`);
+    }
+    for (const query of ['seep_r2_info', 'seep_status']) {
+      assert.equal(decide(call(`${namespace}${query}`), cfg), undefined);
+      assert.equal(decide(call(`${namespace}${query}`), everywhere), undefined);
+    }
+  }
+});
+
 test('codex_run validation requires acceptance criteria', () => {
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常' }), /acceptance/);
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: [] }), /acceptance/);

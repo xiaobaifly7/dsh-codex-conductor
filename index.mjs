@@ -101,7 +101,8 @@ const NUDGE = '[codex-conductor] 你刚才说已经派 Codex 去做或 Codex 正
 const DENY_TOOLS = new Set(['write', 'edit', 'wsl-write', 'wsl-edit', 'wsl-term', 'wsl-bootstrap',
   'pwsh', 'actions_run', 'actions_configure', 'run_code', 'subagent_codex']);
 // MCP 工具按动作名拦（Serena 的 replace_content / insert_after_symbol / execute_shell_command 等）
-const MCP_WRITE = /(^|_)(write|edit|replace|insert|delete|remove|rename|move|create|patch|apply|execute|exec)(_|$)/i;
+// Seep 的任意 r2 命令入口也可调用 Shell 或写文件，不能当读取工具放行。
+const MCP_WRITE = /(^|_)(write|edit|replace|insert|delete|remove|rename|move|create|patch|apply|execute|exec)(_|$)|^seep_r2_cmd$/i;
 // shell 类工具只放行只读命令；这些参数一出现就拒绝
 const SHELL_TOOLS = { wsl: ['env', 'stdin', 'asRoot', 'allowDangerous'], bash: ['env', 'stdin'], ops_bash: ['script_path'] };
 

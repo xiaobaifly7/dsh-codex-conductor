@@ -66,6 +66,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 会话工作区在 `workspaces` 里时：
 
 - 拒绝直接写文件或执行任意代码的工具：`write`、`edit`、`pwsh`、`run_code`、`subagent_codex`，以及 `wsl-write`、`wsl-edit`、`wsl-term`、`wsl-bootstrap`、`actions_run`、`actions_configure`；MCP 工具按动作名拒绝（`write`、`edit`、`replace`、`insert`、`delete`、`execute` 等）。
+- Seep 的 `seep_r2_cmd` 是任意 radare2 命令入口，在受保护工作区交给 Codex 执行；`seep_r2_info`、`seep_status` 等结构化查询仍可用于只读核验。
 - shell 工具（`wsl`、`bash`、`ops_bash`）只放行只读核验命令：`git status/diff/log/show`、`ls`、`cat`、`grep`、`find`、`wc`、`sha256sum`、`pytest`、`npm test`、`pwsh -File tests/*.ps1`、`bash -n` 等；可以用 `|`、`&&`、`for`、`if` 和只读的 `$(...)`；拒绝写重定向（`/dev/null` 除外）、反引号、heredoc 和 `$((...))` 算术。`pwsh` / `powershell` 必须写成字面命令或路径，`$PWSH` 这类变量不放行。
 - PowerShell 的 `-Command` 形式（包括只读查询）默认拒绝。需要 Windows 执行与核验时，交给主机访问模式的 Codex，或使用项目 `tests` 目录下的已有验证脚本。
 - `gzip` 只放行首参数为字面量 `-t` 或 `--test` 的压缩文件完整性检查；直接压缩、解压文件的形式仍然拒绝。
@@ -107,7 +108,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 ## 配置
 
-默认只提供三个工具，不启用护栏；Codex 用它自己的模型和登录配置，但默认不加载它配置的 MCP 和 hooks（见上文）。按插件 id 覆盖 `config`：
+默认提供十个工具，不启用护栏；Codex 用它自己的模型和登录配置，但默认不加载它配置的 MCP 和 hooks（见上文）。按插件 id 覆盖 `config`：
 
 ```yaml
 - id: codex-conductor
@@ -184,6 +185,7 @@ python3 runner/test_codex_runner.py
 A DeepSeek Harness plugin that lets the DSH agent plan and verify while Codex CLI in WSL does the coding.
 
 - Acceptance criteria have no item-count limit. The full list and its order are preserved across dispatch, continuation, reports, and independent review.
+- In guarded workspaces, Seep's arbitrary `seep_r2_cmd` console is delegated to Codex; structured queries such as `seep_r2_info` and `seep_status` remain available for verification.
 - `codex_jobs` lists task history by workspace, session, execution status or attention state. It links existing session journal entries with runner jobs and persists original task and acceptance context for new jobs, without a new database.
 - `codex_output` reads the full report, result or context repeatedly in Unicode-character pages (4000 by default, at most 8000). It recovers content after native `job_output` delivery or truncation without consuming it or restarting the task.
 - Execution status, report validity and review state are separate. A model's all-met report still needs independent verification. Native task output keeps progress and the final report visible, cancellation failures remain visible until confirmed, and runner status exposes attempt, phase, retry reason and retry time.
