@@ -216,6 +216,24 @@ test('arithmetic comparisons in [ ] / [[ ]] / test need literal-integer operands
   ]) assert.equal(readOnlyCommand(c), true, c);
 });
 
+test('quoted and escaped parameter syntax stays literal during read-only checks', () => {
+  for (const command of [
+    "printf '%s\\n' '${VALUE' | grep -F -- '${VALUE'",
+    "grep -n '^if \\[ \"\\${VALUE' script.sh",
+    "grep -F -- '${value@P}' script.sh",
+    "grep -F -- \"\\${VALUE\" script.sh",
+    "grep -F -- \\${VALUE script.sh",
+    "cat < '${VALUE'",
+    "echo '${array[$index]}'",
+  ]) assert.equal(readOnlyCommand(command), true, command);
+  for (const command of [
+    "grep -F -- \"${value@P}\" script.sh",
+    "grep -F -- \"\\\\${value@P}\" script.sh",
+    "grep -F -- \\\\${value@P} script.sh",
+    "cat < \"\\\\${value@P}\"",
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
 test('${...} arithmetic positions (array subscript, substring offset, indirect) cannot evaluate planted values', () => {
   for (const c of [
     // 下标被当算术表达式求值：变量名、$变量、折叠后的 $X（来自 $(cat f)）都可能夹带 $(...)
@@ -327,6 +345,9 @@ test('guard regressions match Bash semantics using only printed markers and /dev
     { encoding: 'utf8', timeout: 10_000 });
   const available = bash('exit 0');
   if (available.error || available.status !== 0) return t.skip('Bash/WSL unavailable');
+  const literal = bash("printf '%s\\n' '${VALUE' | grep -F -- '${VALUE'");
+  assert.equal(literal.status, 0, literal.stderr);
+  assert.equal(literal.stdout, '${VALUE\n');
   const shell = bash("printf 'printf EXECUTED' | bash -n +n /dev/stdin; printf 'printf UNEXPECTED' | bash -n /dev/stdin");
   assert.equal(shell.status, 0, shell.stderr);
   assert.equal(shell.stdout, 'EXECUTED');

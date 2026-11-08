@@ -173,16 +173,19 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
   let redirect = null;
   let valid = true;
   let syntax = '';
+  let parameterWord = ''; // 字面 $ 用 X 占位，避免去掉引号后被误认成展开。
   let expanded = false;
   let glob = false;
   let fieldSplit = false;
+  let unsafeParameter = false;
   const endWord = () => {
     if (started) {
       if (redirect) {
-        if ((redirect !== '<' && word !== '/dev/null') || !braceExpansionsSafe(word)) valid = false;
+        if ((redirect !== '<' && word !== '/dev/null') || !braceExpansionsSafe(parameterWord)) valid = false;
         redirect = null;
       } else {
         words.push(word);
+        unsafeParameter ||= !braceExpansionsSafe(parameterWord);
         expanded ||= /\{(?:[^{}]*,[^{}]*|(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?)\}/.test(syntax);
         const pattern = /[*?]|\[[^\]]+\]/.test(syntax);
         glob ||= pattern;
@@ -191,22 +194,26 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
           (pattern && !/^[A-Za-z0-9_./]/.test(word) && !intOperand(word));
       }
     }
-    word = ''; started = false; syntax = '';
+    word = ''; started = false; syntax = ''; parameterWord = '';
   };
   const endSegment = () => {
     endWord();
     if (redirect) valid = false;
     if (words.length) {
       if (expanded) braceSegments.add(words);
-      expansions.set(words, { glob, fieldSplit });
+      expansions.set(words, { glob, fieldSplit, unsafeParameter });
       segments.push(words);
     }
-    words = []; expanded = false; glob = false; fieldSplit = false;
+    words = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
   };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
     const next = command[i + 1];
-    if (quote === "'") { if (ch === "'") quote = null; else word += ch; continue; }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      else { word += ch; parameterWord += ch === '$' ? 'X' : ch; }
+      continue;
+    }
     if (ch === '`') return null;
     if (ch === '$' && next === '(') {
       // $((...)) 是算术：会把变量值当表达式递归求值，值里的 a[$(...)] 就能执行命令
@@ -215,6 +222,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       if (end < 0 || !inner(command.slice(i + 2, end))) return null;
       // 保留 $，让后面的检查（sed 脚本、pwsh 路径）看得出这里展开过
       word += '$X';
+      parameterWord += '$X';
       if (!quote) syntax += '$';
       started = true;
       i = end;
@@ -224,18 +232,21 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       if (ch === '$' && /^\$(?:@|\{(?:@|[A-Za-z_][A-Za-z0-9_]*\[@\]))/.test(command.slice(i))) fieldSplit = true;
       if (ch === '"') quote = null;
       // 和 bash 一样，双引号里的 \ 只转义 $ ` " \ 和换行，Windows 路径 "C:\x" 保持原样
-      else if (ch === '\\' && next !== undefined && '$`"\\\n'.includes(next)) { if (next !== '\n') word += next; i++; } else word += ch;
+      else if (ch === '\\' && next !== undefined && '$`"\\\n'.includes(next)) {
+        if (next !== '\n') { word += next; parameterWord += next === '$' ? 'X' : next; }
+        i++;
+      } else { word += ch; parameterWord += ch; }
       continue;
     }
     if (ch === "'" || ch === '"') { quote = ch; started = true; continue; }
     if (ch === '\\') {
-      if (next !== undefined && next !== '\n') { word += next; started = true; }
+      if (next !== undefined && next !== '\n') { word += next; parameterWord += next === '$' ? 'X' : next; started = true; }
       i++;
       continue;
     }
     if (ch === ' ' || ch === '\t') { endWord(); continue; }
     if (ch === '>' || ch === '<' || (ch === '&' && next === '>')) {
-      if (!redirect && /^\d+$/.test(word)) { word = ''; started = false; syntax = ''; } else endWord();
+      if (!redirect && /^\d+$/.test(word)) { word = ''; started = false; syntax = ''; parameterWord = ''; } else endWord();
       if (redirect) return null;
       let j = ch === '&' ? i + 2 : i + 1;
       if (ch === '<' && (command[j] === '<' || command[j] === '(')) return null;
@@ -253,6 +264,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       continue;
     }
     word += ch;
+    parameterWord += ch;
     syntax += ch;
     started = true;
   }
@@ -402,8 +414,8 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   const words = core(raw);
   if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
-  // ${...} 的算术求值面与具体命令无关（任何词都可能带），放在各命令判断之前统一拦截
-  if (!words.every(braceExpansionsSafe)) return false;
+  // 只检查实际展开；单引号和转义保护的字面文本不参与。
+  if (expansion.unsafeParameter) return false;
   // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
   if (words[0] === 'for') return (words.length <= 2 || words[2] === 'in') && words.slice(3).every((w) => !w.startsWith('-'));
   // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行。
