@@ -798,9 +798,12 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     return `当前未取得可信状态或报告，Codex 任务 ${value.job_id} 可能仍在运行。` +
       `用 codex_jobs 核对正确 job_id；先用 codex_status 查询，不要直接重派。`;
   }
-  if (value.status === 'running') return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
+  if (value.status === 'running') return value.phase === 'lock_wait'
+    ? `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。用 codex_status 等待这个 job_id，不要重复派活；需要退出队列时用 codex_cancel，只取消本任务。`
+    : `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
   // 取消会保留恢复信息，但不会重建中断前的改动清单。
   if (value.status === 'cancelled') {
+    if (value.phase === 'lock_wait') return '已取消排队，尚未启动 Codex；没有取消持锁任务。不要自行恢复或重派。';
     return 'Codex 任务已取消（用户停止、会话归档或调用中止）：不要自行续跑或重派，先问用户。' +
       '如果这是可写任务，取消前可能已改了部分文件且没有改动清单，核验前先用 git status 或对比文件确认现状。';
   }
@@ -1070,8 +1073,8 @@ export function apply(ctx, config = {}, run = runRunner) {
         }
         if (value.status === 'running') {
           bridgeErrors = 0;
-          const phase = { router_check: '检查路由', codex_running: 'Codex 执行中', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
-          const stage = [phase, value.attempt != null && `第 ${value.attempt} 轮`,
+          const phase = { lock_wait: '排队等待目录写锁', router_check: '检查路由', codex_running: 'Codex 执行中', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
+          const stage = [phase, value.attempt > 0 && `第 ${value.attempt} 轮`,
             value.last_error_kind && `上次错误 ${value.last_error_kind}`,
             value.retry_at != null && `约 ${Math.max(0, Math.ceil(value.retry_at - Date.now() / 1000))} 秒后重试`]
             .filter(Boolean).join(' · ') || 'Codex 执行中';
@@ -1232,7 +1235,8 @@ export function apply(ctx, config = {}, run = runRunner) {
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
-      '不通过就带 resume=thread_id 派回修正。汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
+      '不通过就带 resume=thread_id 派回修正。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       (cfg.allowHostAccess === true
         ? (cfg.defaultHostAccess === true
           ? '当前默认以 danger-full-access 运行：省略 host_access 也没有沙箱，可以启动 Windows 程序及访问主机网络；resume 同样生效。host_access=false 可为单次任务恢复沙箱。'
@@ -1330,7 +1334,8 @@ export function apply(ctx, config = {}, run = runRunner) {
         // 取消没赶上：任务已经完成，改动已经留下，按完成处理
         next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done)}`;
       } else if (done.status === 'cancelled') {
-        next = '已按本次调用取消。可写任务可能已改了一部分且没有改动清单，核验或重派前先用 git status 或对比文件确认现状。';
+        next = done.phase === 'lock_wait' ? nextStep(done)
+          : '已按本次调用取消。可写任务可能已改了一部分且没有改动清单，核验或重派前先用 git status 或对比文件确认现状。';
       } else {
         next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
       }

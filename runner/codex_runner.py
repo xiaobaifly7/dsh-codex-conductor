@@ -9,6 +9,7 @@ Every command prints exactly one JSON object on stdout. Raw events go to a log f
 """
 import argparse
 from contextlib import suppress
+import errno
 import hashlib
 import json
 import os
@@ -153,9 +154,9 @@ def acquire_file_lock(path, blocking=False):
             msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
-    except OSError:
+    except OSError as error:
         handle.close()
-        if blocking:
+        if blocking or error.errno not in (errno.EACCES, errno.EAGAIN):
             raise
         return None
     return handle
@@ -532,10 +533,17 @@ def execute(args, prompt, run_dir):
     event_changes = []
     try:
         if args.sandbox != "read-only":
-            lock = acquire_write_lock(args.cwd)
-            if lock is None:
-                return {**base, "status": "failed", "error_kind": "busy", "retryable": True, "attempts": 0,
-                        "error": "Another Codex writer holds this directory. Wait, or use a separate worktree."}
+            try:
+                lock = acquire_write_lock(args.cwd)
+                if lock is None:
+                    runner_event(run_dir, 0, "lock_wait")
+                    # shortcut: waiters are not FIFO; add ordered admission if task ordering is required.
+                    while lock is None:
+                        time.sleep(0.25)
+                        lock = acquire_write_lock(args.cwd)
+            except OSError as error:
+                return {**base, "status": "failed", "error_kind": "runner_error", "error": str(error),
+                        "retryable": False, "attempts": 0, "duration_s": round(time.time() - started, 1)}
             # Jobs queued before --scope existed have no scope in args.json.
             before, scope = snapshot_before(args.cwd, scope_args)
 

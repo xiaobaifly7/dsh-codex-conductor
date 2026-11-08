@@ -1481,6 +1481,34 @@ test('native cancellation failures stay visible while stopping and allow another
   }
 });
 
+test('directory lock queue tells the planner to wait and distinguishes cancellation from partial execution', () => {
+  const queued = { job_id: 'J1', status: 'running', phase: 'lock_wait', attempt: 0 };
+  assert.match(nextStep(queued), /等待同目录写锁[\s\S]*尚未启动 Codex[\s\S]*codex_status[\s\S]*不要重复派活[\s\S]*codex_cancel/);
+  const cancelled = nextStep({ ...queued, status: 'cancelled' });
+  assert.match(cancelled, /已取消排队[\s\S]*尚未启动 Codex[\s\S]*没有取消持锁任务/);
+  assert.doesNotMatch(cancelled, /可能已改|git status/);
+  assert.match(nextStep({ ...queued, status: 'failed', error_kind: 'bridge_error' }), /未取得可信状态[\s\S]*可能仍在运行/);
+});
+
+test('directory lock queue is visible in native progress and cancelling it targets only that job', async () => {
+  const jobs = fakeJobs();
+  const { tools, calls, answer } = harness({ jobs,
+    config: { allowHostAccess: true, defaultHostAccess: true, cancelResult: { status: 'cancelled', phase: 'lock_wait', attempt: 0 } } });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  await tools.codex_run.execute(RUN, exec);
+  await answer('J1', { status: 'running', phase: 'lock_wait', attempt: 0 });
+  await tick();
+  assert.match(jobs.get('bg1', 'S1').progress, /排队等待目录写锁/);
+  assert.doesNotMatch(jobs.get('bg1', 'S1').progress, /第 0 轮|Codex 执行中/);
+  const stopping = tools.codex_cancel.execute({ job_id: 'J1' }, exec);
+  await answer('J1', { status: 'cancelled', phase: 'lock_wait', attempt: 0 });
+  const result = await stopping;
+  assert.match(result.next, /已取消排队[\s\S]*尚未启动 Codex/);
+  assert.equal(jobs.get('bg1', 'S1').status, 'killed');
+  assert.deepEqual(calls.filter((argv) => argv[0] === 'cancel'), [['cancel', 'J1']]);
+  assert.equal(calls.filter((argv) => argv[0] === 'start').length, 1);
+});
+
 test('native output is observable without consuming or duplicating the final report', async () => {
   const jobs = fakeJobs();
   const { tools, answer } = harness({ jobs });

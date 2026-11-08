@@ -10,6 +10,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 RUNNER = Path(__file__).with_name("codex_runner.py")
@@ -84,6 +85,19 @@ FAKE_CODEX = textwrap.dedent(r"""
                                          "changes": [{"path": os.path.join(os.getcwd(), "keep", "a.txt"), "kind": "update"},
                                                      {"path": os.path.join(os.getcwd(), "other.txt"), "kind": "update"}]})
         finish()
+    elif mode == "gated_ok":
+        active = state / "writer-active"
+        active.mkdir()  # A second model running concurrently must fail the test.
+        try:
+            (state / f"ready-{calls}").touch()
+            deadline = time.monotonic() + 30
+            while not (state / f"release-{calls}").exists():
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("test release gate timed out")
+                time.sleep(.01)
+            finish()
+        finally:
+            active.rmdir()
     elif mode == "slow_ok":
         time.sleep(float(os.environ.get("FAKE_SLEEP", "4")))
         finish()
@@ -141,6 +155,14 @@ class RunnerTests(unittest.TestCase):
 
     def calls(self):
         return [json.loads(f.read_text()) for f in sorted(self.state.glob("call-*.json"))]
+
+    def wait_for(self, condition):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(.01)
+        self.fail("test condition did not become ready")
 
     def test_warning_items_do_not_fail_the_run(self):
         r = self.invoke()
@@ -500,18 +522,97 @@ class RunnerTests(unittest.TestCase):
             self.assertIn('sandbox_mode="danger-full-access"', call["argv"])
             self.assertNotIn("--ephemeral", call["argv"])
 
-    def test_second_writer_in_same_directory_is_rejected(self):
-        args = [sys.executable, "-B", str(RUNNER), "run", "--cwd", str(self.cwd), "--sandbox", "workspace-write"]
-        first = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env={**self.env, "FAKE_MODE": "slow_ok"})
-        first.stdin.write(b"one")
-        first.stdin.close()
-        time.sleep(2)
-        r = self.invoke("--sandbox", "workspace-write", mode="slow_ok")
-        self.assertEqual(r["error_kind"], "busy")
-        self.assertTrue(r["retryable"])
-        self.assertEqual(json.loads(first.stdout.read().decode("utf-8"))["status"], "completed")
-        first.wait()
-        first.stdout.close()
+    def test_second_writer_in_same_directory_waits_then_completes(self):
+        jobs = []
+        try:
+            first = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="one")
+            jobs.append(first["job_id"])
+            self.wait_for(lambda: (self.state / "ready-0").exists())
+            second = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="two")
+            jobs.append(second["job_id"])
+            self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait")
+            waiting = self.control("status", second["job_id"])
+            self.assertEqual((waiting["status"], waiting["phase"], waiting["attempt"]), ("running", "lock_wait", 0))
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual(self.control("status", first["job_id"])["status"], "running")
+            second_dir = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / second["job_id"]
+            self.assertFalse((second_dir / "codex.pid").exists())
+            (self.state / "release-0").touch()
+            self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
+            self.wait_for(lambda: (self.state / "ready-1").exists())
+            (self.state / "release-1").touch()
+            self.assertEqual(self.control("status", second["job_id"], "--wait", "20")["status"], "completed")
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+        finally:
+            for job_id in reversed(jobs):
+                self.control("cancel", job_id)
+
+    def test_cancel_waiting_writer_does_not_cancel_owner_or_start_a_model(self):
+        jobs = []
+        try:
+            first = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="one")
+            jobs.append(first["job_id"])
+            self.wait_for(lambda: (self.state / "ready-0").exists())
+            second = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="two")
+            jobs.append(second["job_id"])
+            self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait")
+            waiting = self.control("status", second["job_id"])
+            self.assertEqual((waiting["status"], waiting["phase"], waiting["attempt"]), ("running", "lock_wait", 0))
+            second_dir = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / second["job_id"]
+            worker_pid = int((second_dir / "worker.pid").read_text())
+            self.assertFalse((second_dir / "codex.pid").exists())
+            cancelled = self.control("cancel", second["job_id"])
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["phase"], "lock_wait")
+            self.wait_for(lambda: not alive(worker_pid))
+            self.assertEqual(self.control("status", first["job_id"])["status"], "running")
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            (self.state / "release-0").touch()
+            self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
+            self.assertEqual(self.control("status", second["job_id"])["status"], "cancelled")
+            self.assertFalse((second_dir / "codex.pid").exists())
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+        finally:
+            for job_id in reversed(jobs):
+                self.control("cancel", job_id)
+
+    def test_file_lock_only_treats_contention_errors_as_busy(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        locking = codex_runner.msvcrt if os.name == "nt" else codex_runner.fcntl
+        operation = "locking" if os.name == "nt" else "flock"
+        for error in (errno.EACCES, errno.EAGAIN, errno.EIO):
+            with self.subTest(errno=error), mock.patch.object(locking, operation, side_effect=OSError(error, "injected lock error")):
+                path = Path(self.tmp.name) / "injected.lock"
+                if error in (errno.EACCES, errno.EAGAIN):
+                    self.assertIsNone(codex_runner.acquire_file_lock(path))
+                else:
+                    with self.assertRaises(OSError) as raised:
+                        codex_runner.acquire_file_lock(path)
+                    self.assertEqual(raised.exception.errno, error)
+
+    def test_execute_returns_structured_failure_for_lock_io_errors(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for waiting in (False, True):
+            with self.subTest(waiting=waiting):
+                error = OSError(errno.EIO, "injected lock I/O error")
+                outcomes = [None, error] if waiting else [error]
+                args = SimpleNamespace(cwd=str(self.cwd), sandbox="danger-full-access")
+                run_dir = Path(self.tmp.name) / f"lock-error-{waiting}"
+                with mock.patch.object(codex_runner, "acquire_write_lock", side_effect=outcomes) as acquire, \
+                        mock.patch.object(codex_runner, "run_attempt") as attempt, \
+                        mock.patch.object(codex_runner, "snapshot_before") as snapshot, \
+                        mock.patch.object(codex_runner.time, "sleep"):
+                    result = codex_runner.execute(args, "do it", run_dir)
+                self.assertEqual({key: result[key] for key in ("status", "error_kind", "retryable", "attempts", "error")},
+                                 {"status": "failed", "error_kind": "runner_error", "retryable": False,
+                                  "attempts": 0, "error": str(error)})
+                self.assertEqual(acquire.call_count, len(outcomes))
+                attempt.assert_not_called()
+                snapshot.assert_not_called()
 
     def test_writer_lock_serializes_windows_path_case_aliases(self):
         sys.path.insert(0, str(RUNNER.parent))
