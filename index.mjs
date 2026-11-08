@@ -1510,7 +1510,13 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
       const { job_id, ...review } = args;
-      const value = withReport(await conductor.review(job_id, review, owner, exec?.signal));
+      const result = await conductor.review(job_id, review, owner, exec?.signal);
+      // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
+      if (result.error_kind === 'bad_arguments' && !result.job_id) {
+        throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
+          `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
+      }
+      const value = withReport(result);
       return { ...value, next: nextStep(value) };
     },
   });

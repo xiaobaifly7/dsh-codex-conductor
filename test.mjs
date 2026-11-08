@@ -856,6 +856,30 @@ test('codex_review sends every criterion in stdin and returns verification witho
   assert.ok(!h.calls.some((argv) => argv[0] === 'start'));
 });
 
+test('codex_review distinguishes rejected arguments from a reviewed failed execution', async () => {
+  const source = workflowSource();
+  const original = structuredClone(source);
+  const record = { status: 'needs_changes',
+    criteria: [{ index: 1, status: 'not_met', evidence: 'still fails' }], notes: 'checked', accepted_deviations: [] };
+  const review = { job_id: 'PARENT', ...record };
+  const h = harness({ config: { reviewResult: { status: 'failed', error_kind: 'bad_arguments',
+    error: 'Invalid review: invalid deviation index', retryable: false } } });
+  h.finals.PARENT = source;
+  await assert.rejects(h.tools.codex_review.execute(review, { agent: agentAt('/work/current') }),
+    /codex_review:.*复核.*invalid deviation index.*codex_status/);
+  assert.deepEqual(h.finals.PARENT, original);
+  assert.ok(h.calls.every((argv) => ['status', 'review'].includes(argv[0])));
+
+  const failed = { ...source, status: 'failed', error_kind: 'bad_arguments' };
+  const f = harness({ config: { reviewResult: { ...failed, verification_status: 'needs_changes',
+    verification: record } } });
+  f.finals.PARENT = failed;
+  const value = await f.tools.codex_review.execute(review, { agent: agentAt('/work/current') });
+  assert.equal(value.execution_status, 'failed');
+  assert.equal(value.report_status, 'valid');
+  assert.equal(value.verification_status, 'needs_changes');
+});
+
 test('codex_summary defaults to the current owner, passes thread filters and never starts Codex', async () => {
   const summary = { total: 0, total_jobs: 0, groups: [] };
   const h = harness({ config: { summaryResult: summary } });
