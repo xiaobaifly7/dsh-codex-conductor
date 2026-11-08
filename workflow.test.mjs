@@ -161,8 +161,10 @@ test('mixed environment and user blockers require complete answers AND environme
   assert.equal(value.report.blockers[0].resolution, '');
 });
 
-test('implementation can continue in the original thread with exactly the original permissions and options', () => {
+test('implementation can continue with 22 original criteria in the original thread and permissions', () => {
   const value = job([blocker('parser', 'implementation')]);
+  value.context.acceptance = Array.from({ length: 22 }, (_, i) => `验收 ${i + 1}：保留 "CSV" 原文与数据 😀`);
+  value.report.criteria = value.context.acceptance.map((criterion) => ({ ...value.report.criteria[0], criterion }));
   const before = structuredClone(value);
   const result = plan(value);
   assert.equal(result.ready, true);

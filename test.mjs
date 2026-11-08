@@ -478,6 +478,9 @@ test('guard denies writes only inside configured workspaces', () => {
 test('codex_run validation requires acceptance criteria', () => {
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常' }), /acceptance/);
   assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance: [] }), /acceptance/);
+  for (const acceptance of ['不是数组', [1], ['太短']]) {
+    assert.throws(() => validateRun({ task: '修复登录页的空指针异常', acceptance, write: false }), /acceptance/);
+  }
   assert.throws(() => validateRun({ task: 'short', acceptance: ['pytest 全部通过'] }), /task/);
   validateRun({ task: '修复登录页的空指针异常', acceptance: ['pytest tests/test_login.py 全部通过'], write: true });
   // write 必须明说：不传或传成字符串都拒绝，免得默认只读白跑一轮
@@ -814,9 +817,12 @@ test('codex_continue without answers returns the source and pending questions wi
   assert.equal(h.calls.filter((argv) => argv[0] === 'start').length, 0);
 });
 
-test('codex_continue dispatches complete answers with original context, permissions and options', async () => {
+test('codex_continue dispatches 22 original criteria with original context, permissions and options', async () => {
   for (const sandbox of ['workspace-write', 'danger-full-access', 'read-only']) {
     const source = workflowSource();
+    source.context.acceptance = Array.from({ length: 22 }, (_, i) => `验收 ${i + 1}：保留 "CSV" 原文与数据 😀`);
+    source.structured.criteria = source.context.acceptance.map((criterion) =>
+      ({ ...source.structured.criteria[0], criterion }));
     source.structured.blockers[0].id = ' format ';
     source.sandbox = sandbox;
     source.context.write = sandbox !== 'read-only';
@@ -850,6 +856,7 @@ test('codex_continue dispatches complete answers with original context, permissi
     assert.deepEqual(envelope.context, { owner: 'S1', task: source.context.task, acceptance: source.context.acceptance,
       write: source.context.write, continuation: { parent_job_id: 'PARENT', answers, resolution } });
     assert.match(envelope.prompt, /保留旧 CSV 格式/);
+    assert.ok(envelope.prompt.includes(source.context.acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
     assert.doesNotMatch(envelope.prompt, /WHOLE-HISTORY-MUST-NOT-BE-COPIED|历史处理记录/);
     assert.deepEqual(source, before);
   }
@@ -2248,6 +2255,28 @@ test('execution, report validity and review state stay separate and retain the o
   assert.equal(withReport({ status: 'running' }).review_status, 'pending');
   assert.equal(withReport({ status: 'completed', structured: { ...structured, extra: true } }).report_status, 'invalid');
   assert.equal(withReport({ status: 'completed', structured: null }).report_status, 'invalid');
+});
+
+test('codex_run dispatches 22 criteria verbatim through stdin and renders every result', async () => {
+  const acceptance = Array.from({ length: 22 }, (_, i) => `验收 ${i + 1}：保留 "CSV" 原文与数据 😀`);
+  const structured = { summary: '逐条检查完成', criteria: acceptance.map((criterion, i) =>
+    ({ criterion, status: i === 21 ? 'not_met' : 'met', evidence: `检查结果 ${i + 1}` })),
+    files_changed: [], deviations: [], unresolved: [] };
+  const h = harness({ config: { startResult: { job_id: 'J22', status: 'completed', structured } } });
+  const args = { ...RUN, acceptance };
+  const value = await h.tools.codex_run.execute(args, { agent: agentAt('F:\\work\\项目') });
+  const starts = h.requests.filter(({ argv }) => argv[0] === 'start');
+  assert.equal(starts.length, 1);
+  assert.ok(starts[0].argv.includes('--context-json'));
+  const envelope = JSON.parse(starts[0].stdin);
+  assert.deepEqual(envelope.context, { owner: 'S1', task: args.task, acceptance, write: false });
+  assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
+  assert.deepEqual(value.acceptance, acceptance);
+  assert.deepEqual(value.report, structured);
+  assert.deepEqual(value.criteria_counts, { met: 21, not_met: 1, blocked: 0 });
+  const text = h.tools.codex_run.output.render({}, value)[0].text;
+  assert.deepEqual(text.split('\n').filter((line) => /^[✓✗] \d+\./u.test(line)),
+    acceptance.map((item, i) => `${i === 21 ? '✗' : '✓'} ${i + 1}. ${item} —— 检查结果 ${i + 1}`));
 });
 
 test('task context travels through stdin while direct library callers keep plain prompts', async () => {

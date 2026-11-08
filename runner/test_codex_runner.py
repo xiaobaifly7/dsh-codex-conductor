@@ -1323,6 +1323,36 @@ class RunnerTests(unittest.TestCase):
         for identifier in ("running-review", "missing", "../coverage"):
             self.assertEqual(self.submit_review(identifier, self.sample_review())["error_kind"], "bad_arguments")
 
+    def test_22_criteria_survive_history_output_and_require_complete_review(self):
+        acceptance = [f'验收 {i}：保留 "CSV" 原文与数据 😀' for i in range(1, 23)]
+        context = {**self.sample_context(), "acceptance": acceptance}
+        report = self.sample_report(criteria=[{"criterion": item, "status": "met", "evidence": f"checked {i}"}
+                                             for i, item in enumerate(acceptance, 1)])
+        jd = self.stored_job("criteria-22", {"status": "completed", "structured": report}, context=context)
+        (jd / "last_message.txt").write_text(json.dumps(report, ensure_ascii=False), "utf-8")
+        value = self.control("status", jd.name)
+        self.assertEqual(value["context"], context)
+        self.assertEqual(value["structured"], report)
+        self.assertEqual(value["criteria_counts"], {"met": 22, "not_met": 0, "blocked": 0})
+        listed = self.control("list", "--owner", context["owner"])["jobs"]
+        self.assertEqual([item["job_id"] for item in listed], [jd.name])
+        self.assertEqual(listed[0]["criteria_counts"], value["criteria_counts"])
+        for artifact, expected in (("context", context), ("report", report)):
+            page = self.control("output", jd.name, "--artifact", artifact, "--limit", "8000")
+            self.assertTrue(page["eof"])
+            self.assertEqual(json.loads(page["text"]), expected)
+        criteria = [{"index": i, "status": "met", "evidence": f"independently checked {i}"} for i in range(1, 23)]
+        missing_last = self.sample_review(criteria=criteria[:-1])
+        self.assertEqual(self.submit_review(jd.name, missing_last)["error_kind"], "bad_arguments")
+        self.assertFalse((jd / "reviews.json").exists())
+        reviewed = self.submit_review(jd.name, self.sample_review(criteria=criteria))
+        self.assertEqual(reviewed["verification_status"], "verified")
+        self.assertEqual(reviewed["verification"]["criteria"], criteria)
+        self.assertEqual(reviewed["structured"], report)
+        page = self.control("output", jd.name, "--artifact", "review", "--limit", "8000")
+        self.assertTrue(page["eof"])
+        self.assertEqual(json.loads(page["text"])["latest"]["criteria"], criteria)
+
     def test_corrupt_review_history_never_passes_or_gets_overwritten(self):
         jd = self.stored_job("corrupt-review", {"status": "completed", "structured": self.sample_report()},
                              context=self.sample_context())

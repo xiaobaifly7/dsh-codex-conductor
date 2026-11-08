@@ -76,7 +76,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (!['completed', 'failed'].includes(executionOf(value))) return refuse('结果状态未知，先用原 job_id 查询可信结果，不重派。');
   if (!nonempty(value.job_id) || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value.job_id) ||
       !nonempty(context.task) || context.task.trim().length < 10 || !Array.isArray(context.acceptance) ||
-      !context.acceptance.length || context.acceptance.length > 20 ||
+      !context.acceptance.length ||
       !context.acceptance.every((item) => nonempty(item) && item.trim().length >= 4) ||
       typeof context.write !== 'boolean' || !nonempty(value.cwd) ||
       !['read-only', 'workspace-write', 'danger-full-access'].includes(value.sandbox) ||

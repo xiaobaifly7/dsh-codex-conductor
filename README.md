@@ -10,7 +10,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 | 工具 | 作用 |
 | --- | --- |
-| `codex_run` | 把任务交给 WSL 里的 Codex 并等待结果。必填 `task`、`acceptance`（1–20 条验收标准）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
+| `codex_run` | 把任务交给 WSL 里的 Codex 并等待结果。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
 | `codex_status` | 查询或继续等待任务；仍在执行时返回距 Codex 上次活动的秒数和它最近的动作。已登记为 DSH 后台任务的不必调用 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号 |
@@ -183,6 +183,7 @@ python3 runner/test_codex_runner.py
 
 A DeepSeek Harness plugin that lets the DSH agent plan and verify while Codex CLI in WSL does the coding.
 
+- Acceptance criteria have no item-count limit. The full list and its order are preserved across dispatch, continuation, reports, and independent review.
 - `codex_jobs` lists task history by workspace, session, execution status or attention state. It links existing session journal entries with runner jobs and persists original task and acceptance context for new jobs, without a new database.
 - `codex_output` reads the full report, result or context repeatedly in Unicode-character pages (4000 by default, at most 8000). It recovers content after native `job_output` delivery or truncation without consuming it or restarting the task.
 - Execution status, report validity and review state are separate. A model's all-met report still needs independent verification. Native task output keeps progress and the final report visible, cancellation failures remain visible until confirmed, and runner status exposes attempt, phase, retry reason and retry time.

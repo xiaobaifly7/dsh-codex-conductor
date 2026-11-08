@@ -724,9 +724,9 @@ export function outOfScope(value, cwd, scope) {
 
 export function validateRun(args) {
   if (typeof args?.task !== 'string' || args.task.trim().length < 10) throw new Error('codex_run: task 必须写清目标、相关路径和约束（至少 10 个字符）');
-  if (!Array.isArray(args.acceptance) || args.acceptance.length === 0 || args.acceptance.length > 20 ||
+  if (!Array.isArray(args.acceptance) || args.acceptance.length === 0 ||
     args.acceptance.some((a) => typeof a !== 'string' || a.trim().length < 4)) {
-    throw new Error('codex_run: acceptance 必须是 1–20 条可核验的验收标准（每条至少 4 个字符）');
+    throw new Error('codex_run: acceptance 必须是至少 1 条可核验的验收标准（每条至少 4 个字符，条数不限）');
   }
   // 不传就默认只读时，实际常因此白跑一整轮（只读任务又不能 resume），所以必须明说
   if (typeof args.write !== 'boolean') {
@@ -1267,7 +1267,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       type: 'object',
       properties: {
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
-        acceptance: { type: 'array', items: { type: 'string' }, description: '验收标准，1–20 条，每条写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
+        acceptance: { type: 'array', minItems: 1, items: { type: 'string' }, description: '验收标准，至少 1 条，不设条数上限；每条去除首尾空白后至少 4 个字符，写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
         write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（使用沙箱时为 workspace-write）；' +
           'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
           `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。测试/部署若会生成或删除文件、改变远端状态，也属于写入；须按用户授权设置 true 并在 scope/task 写明目标，不能同时要求这些操作和禁止任何写入。` },
