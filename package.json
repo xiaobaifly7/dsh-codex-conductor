@@ -11,6 +11,7 @@
   },
   "files": [
     "index.mjs",
+    "guard.mjs",
     "workflow.mjs",
     "runtime.mjs",
     "report.schema.json",

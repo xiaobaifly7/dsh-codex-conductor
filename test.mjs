@@ -20,6 +20,7 @@ test('entry reload queries re-evaluate both workflow and runtime helpers', async
   globalThis[traceKey] = [];
   try {
     writeFileSync(path.join(dir, 'index.mjs'), readFileSync(new URL('./index.mjs', import.meta.url)));
+    writeFileSync(path.join(dir, 'guard.mjs'), readFileSync(new URL('./guard.mjs', import.meta.url)));
     writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
     for (const version of ['old', 'new']) {
       writeFileSync(path.join(dir, 'workflow.mjs'),
