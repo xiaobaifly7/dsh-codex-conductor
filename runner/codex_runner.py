@@ -678,7 +678,8 @@ def last_activity(events):
 
 
 def task_context(value):
-    if not isinstance(value, dict) or set(value) != {"owner", "task", "acceptance", "write"}:
+    fields = {"owner", "task", "acceptance", "write"}
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation"}:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -689,6 +690,25 @@ def task_context(value):
         raise ValueError("context.acceptance must be a nonempty array of nonempty strings")
     if not isinstance(value["write"], bool):
         raise ValueError("context.write must be a boolean")
+    if "continuation" in value:
+        continuation = value["continuation"]
+        if not isinstance(continuation, dict) or set(continuation) != {"parent_job_id", "answers", "resolution"}:
+            raise ValueError("continuation must contain parent_job_id, answers and resolution")
+        if not isinstance(continuation["parent_job_id"], str):
+            raise ValueError("continuation.parent_job_id must be a job identifier")
+        try:
+            job_identifier(continuation["parent_job_id"])
+        except argparse.ArgumentTypeError as e:
+            raise ValueError(str(e)) from e
+        if not isinstance(continuation["resolution"], str) or not isinstance(continuation["answers"], list):
+            raise ValueError("continuation requires a resolution string and answers array")
+        ids = set()
+        for answer in continuation["answers"]:
+            if (not isinstance(answer, dict) or set(answer) != {"id", "answer"} or
+                    any(not isinstance(answer[k], str) or not answer[k].strip() for k in ("id", "answer")) or
+                    answer["id"] in ids):
+                raise ValueError("continuation answers require unique nonempty id and answer strings")
+            ids.add(answer["id"])
     return value
 
 
@@ -703,7 +723,7 @@ def read_task_input(args, parser):
                 raise ValueError("prompt must be a nonempty string")
             args.context = task_context(envelope["context"])
             prompt = envelope["prompt"]
-        except ValueError as e:
+        except (ValueError, argparse.ArgumentTypeError) as e:
             parser.error("Invalid context envelope: " + str(e))
     return prompt
 
@@ -738,6 +758,8 @@ def task_record(job_dir):
 def job_metadata(job_dir, task=None, finished_at=None, thread_id=None):
     task = task_record(job_dir) if task is None else task
     meta = {"context": task.get("context"), "sandbox": task.get("sandbox"), "scope": task.get("scope")}
+    meta["task_options"] = {"writable_roots": task.get("writable_roots"),
+                            "use_user_config": task.get("use_user_config", False), "effort": task.get("effort")}
     if task.get("cwd"):
         meta["cwd"] = os.path.realpath(local_path(task["cwd"]))
         if task.get("scope"):
@@ -752,9 +774,20 @@ def job_metadata(job_dir, task=None, finished_at=None, thread_id=None):
     return meta
 
 
+def valid_blockers(blockers):
+    fields = {"id", "kind", "message", "question", "resolution"}
+    return isinstance(blockers, list) and all(
+        isinstance(b, dict) and set(b) == fields and all(isinstance(b[k], str) for k in fields) and
+        b["id"].strip() and b["message"].strip() and
+        b["kind"] in ("user_input", "task_conflict", "environment", "implementation") and
+        (b["kind"] not in ("user_input", "task_conflict") or b["question"].strip())
+        for b in blockers)
+
+
 def valid_report(report):
     fields = {"summary", "criteria", "files_changed", "deviations", "unresolved"}
-    if not isinstance(report, dict) or set(report) != fields or not isinstance(report["summary"], str):
+    if (not isinstance(report, dict) or not fields <= set(report) or set(report) - fields - {"blockers"} or
+            not isinstance(report["summary"], str) or not valid_blockers(report.get("blockers", []))):
         return False
     if any(not isinstance(report[k], list) or any(not isinstance(v, str) for v in report[k])
            for k in ("files_changed", "deviations", "unresolved")):
@@ -764,6 +797,23 @@ def valid_report(report):
         isinstance(c["criterion"], str) and isinstance(c["evidence"], str) and
         isinstance(c["status"], str) and c["status"] in ("met", "not_met", "blocked")
         for c in report["criteria"])
+
+
+def out_of_scope_paths(value):
+    outside = list(value.get("out_of_scope") or [])
+    if value.get("cwd") and value.get("scope_paths"):
+        def report_path(path):
+            # Historical paths must not follow symlinks created after execution.
+            path = os.path.normcase(os.path.normpath(path))
+            return path.lower() if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path) else path
+
+        roots = [report_path(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
+        for change in value.get("files_changed") or []:
+            if isinstance(change, dict) and isinstance(change.get("path"), str):
+                path = report_path(os.path.join(value["cwd"], change["path"]))
+                if not any(path == r.rstrip(os.sep) or path.startswith(r) for r in roots):
+                    outside.append(change["path"])
+    return list(dict.fromkeys(outside))
 
 
 def review_summary(value):
@@ -785,29 +835,162 @@ def review_summary(value):
         for criterion in report["criteria"]:
             if isinstance(criterion, dict) and isinstance(criterion.get("status"), str) and criterion["status"] in counts:
                 counts[criterion["status"]] += 1
-    outside = bool(value.get("out_of_scope"))
-    if value.get("cwd") and value.get("scope_paths"):
-        def report_path(path):
-            # These paths were resolved during execution; later symlinks must not change the review.
-            path = os.path.normcase(os.path.normpath(path))
-            return path.lower() if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path) else path
-
-        root = value["cwd"]
-        roots = [report_path(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
-        for change in value.get("files_changed") or []:
-            if isinstance(change, dict) and isinstance(change.get("path"), str):
-                path = report_path(os.path.join(root, change["path"]))
-                outside |= not any(path == r.rstrip(os.sep) or path.startswith(r) for r in roots)
+    outside = bool(out_of_scope_paths(value))
     context = value.get("context")
     uncovered = (isinstance(context, dict) and isinstance(context.get("acceptance"), list) and
                  isinstance(report, dict) and isinstance(report.get("criteria"), list) and
                  len(context["acceptance"]) != len(report["criteria"]))
     flagged = (uncovered or status in ("failed", "cancelled", "unknown") or report_status in ("invalid", "missing") or
                counts["not_met"] or counts["blocked"] or outside or
-               (isinstance(report, dict) and (report.get("unresolved") or report.get("deviations"))))
+               (isinstance(report, dict) and (report.get("unresolved") or report.get("deviations") or
+                report.get("blockers"))))
     return {"execution_status": status, "report_status": report_status,
             "review_status": "pending" if status == "running" else "needs_attention" if flagged else "needs_verification",
             "criteria_counts": counts}
+
+
+def blocking_summary(value):
+    report = value.get("report") if "report" in value else value.get("structured")
+    valid = valid_report(report)
+    blockers = report.get("blockers", []) if valid else []
+    verification = value.get("verification")
+    verification = verification if isinstance(verification, dict) else {}
+    status = value.get("verification_status") or verification.get("status")
+    closed = status in ("verified", "accepted_deviations")
+    review_blockers = "blockers" in verification
+    invalid_blockers = review_blockers and not valid_blockers(verification["blockers"])
+    if closed or status == "needs_changes":
+        blockers = []
+    if review_blockers and not invalid_blockers and not closed:
+        blockers = verification["blockers"]
+    execution = ("unknown" if value.get("error_kind") in ("bridge_error", "unknown_job", "invalid_record") else
+                 value.get("execution_status", value.get("status")))
+    state, action = "clear", "verify"
+    if execution == "running":
+        state, action = "running", "wait"
+    elif execution not in ("completed", "failed", "cancelled") or status in ("unknown", "invalid") or invalid_blockers:
+        state, action = "unclassified", "inspect_report"
+    elif closed:
+        state, action = "clear", "done"
+    elif not valid or value.get("report_status") == "invalid":
+        state, action = "unclassified", "inspect_report"
+    elif any(b["kind"] in ("user_input", "task_conflict") for b in blockers):
+        state, action = "needs_input", "ask_user"
+    elif any(b["kind"] == "environment" for b in blockers):
+        state, action = "waiting_environment", "wait_condition"
+    elif blockers or status == "needs_changes":
+        state, action = "needs_fix", "resume_fix"
+    elif any(c["status"] == "blocked" for c in report["criteria"]):
+        state, action = "unclassified", "inspect_report"
+    elif any(c["status"] == "not_met" for c in report["criteria"]):
+        state, action = "needs_fix", "resume_fix"
+    elif (execution != "completed" or report["unresolved"] or
+          (isinstance(value.get("context"), dict) and isinstance(value["context"].get("acceptance"), list) and
+           len(report["criteria"]) != len(value["context"]["acceptance"]))):
+        state, action = "unclassified", "inspect_report"
+    return {"state": state, "blockers": blockers,
+            "questions": [{"id": b["id"], "question": b["question"]} for b in blockers
+                          if b["kind"] in ("user_input", "task_conflict")],
+            "next_action": action}
+
+
+def validate_review(review, value):
+    fields = {"status", "criteria", "notes", "accepted_deviations"}
+    if (not isinstance(review, dict) or not fields <= set(review) or set(review) - fields - {"blockers"} or
+            not isinstance(review["status"], str) or
+            review["status"] not in ("verified", "needs_changes", "accepted_deviations") or
+            not isinstance(review["notes"], str) or not valid_blockers(review.get("blockers", []))):
+        raise ValueError("Invalid review fields, status, notes or blockers")
+    report = value.get("structured")
+    context = value.get("context")
+    acceptance = context["acceptance"] if isinstance(context, dict) else (
+        report["criteria"] if valid_report(report) else None)
+    if acceptance is None:
+        raise ValueError("Review requires context acceptance or a valid legacy report")
+    criteria = review["criteria"]
+    if not isinstance(criteria, list):
+        raise ValueError("review.criteria must be an array")
+    indexes = []
+    for criterion in criteria:
+        if (not isinstance(criterion, dict) or set(criterion) != {"index", "status", "evidence"} or
+                type(criterion["index"]) is not int or not 1 <= criterion["index"] <= len(acceptance) or
+                not isinstance(criterion["status"], str) or criterion["status"] not in ("met", "not_met", "blocked") or
+                not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip()):
+            raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence")
+        indexes.append(criterion["index"])
+    if sorted(indexes) != list(range(1, len(acceptance) + 1)):
+        raise ValueError("Review must cover every acceptance criterion exactly once")
+    reported = report.get("deviations", []) if isinstance(report, dict) else []
+    if not isinstance(reported, list) or any(not isinstance(d, str) for d in reported):
+        raise ValueError("Reported deviations cannot be indexed")
+    outside = out_of_scope_paths(value)
+    expected = {("reported", i + 1) for i in range(len(reported))} | {("scope", i + 1) for i in range(len(outside))}
+    acknowledged = set()
+    if not isinstance(review["accepted_deviations"], list):
+        raise ValueError("accepted_deviations must be an array")
+    for deviation in review["accepted_deviations"]:
+        if (not isinstance(deviation, dict) or set(deviation) != {"kind", "index", "evidence"} or
+                not isinstance(deviation["kind"], str) or type(deviation["index"]) is not int or
+                (deviation["kind"], deviation["index"]) not in expected or
+                not isinstance(deviation["evidence"], str) or not deviation["evidence"].strip() or
+                (deviation["kind"], deviation["index"]) in acknowledged):
+            raise ValueError("Deviation acknowledgements require real unique indexes and nonempty evidence")
+        acknowledged.add((deviation["kind"], deviation["index"]))
+    if review["status"] != "needs_changes":
+        if (any(c["status"] != "met" for c in criteria) or acknowledged != expected or review.get("blockers")):
+            raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers")
+    return review
+
+
+def read_reviews(job_dir, value):
+    path = job_dir / "reviews.json"
+    if not path.resolve().is_relative_to(job_dir.resolve()):
+        raise ValueError("reviews artifact is outside job directory")
+    if not path.exists():
+        return {"history": [], "latest": None}
+    data = json.loads(path.read_text("utf-8"))
+    if (not isinstance(data, dict) or set(data) != {"history", "latest"} or
+            not isinstance(data["history"], list) or not data["history"] or data["latest"] != data["history"][-1]):
+        raise ValueError("Invalid review history/latest")
+    for entry in data["history"]:
+        if (not isinstance(entry, dict) or not {"reviewer", "time"} <= set(entry) or
+                not isinstance(entry["reviewer"], str) or not entry["reviewer"].strip() or
+                type(entry["time"]) not in (int, float) or not 0 <= entry["time"] < float("inf")):
+            raise ValueError("Invalid review reviewer/time")
+        validate_review({k: v for k, v in entry.items() if k not in ("reviewer", "time")}, value)
+    return data
+
+
+def verification_summary(job_dir, value):
+    try:
+        latest = read_reviews(job_dir, value)["latest"]
+        return {"verification_status": latest["status"] if latest else "unreviewed", "verification": latest}
+    except (OSError, ValueError, TypeError) as e:
+        return {"verification_status": "invalid", "verification": None, "verification_error": str(e)}
+
+
+def review_job(args, review):
+    job_dir = job_directory(args.job_id)
+    value = job_status(args.job_id)
+    if value["execution_status"] in ("running", "unknown"):
+        raise ValueError("Cannot review a running or unknown job")
+    if not isinstance(args.reviewer, str) or not args.reviewer.strip():
+        raise ValueError("reviewer must be nonempty")
+    validate_review(review, value)
+    lock_path = job_dir / "reviews.lock"
+    if not lock_path.resolve().is_relative_to(job_dir.resolve()):
+        raise ValueError("reviews lock is outside job directory")
+    with acquire_file_lock(lock_path, blocking=True):
+        data = read_reviews(job_dir, value)
+        entry = {**review, "reviewer": args.reviewer, "time": time.time()}
+        data["history"].append(entry)
+        data["latest"] = entry
+        tmp = job_dir / "reviews.json.tmp"
+        if not tmp.resolve().is_relative_to(job_dir.resolve()):
+            raise ValueError("reviews temporary artifact is outside job directory")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), "utf-8")
+        os.replace(tmp, job_dir / "reviews.json")
+    return job_status(args.job_id)
 
 
 def runner_event(run_dir, attempt, phase, reason=None, retry_at=None):
@@ -839,6 +1022,10 @@ def enriched_status(job_id, job_dir, value):
     finished = (job_dir / "result.json").stat().st_mtime if (job_dir / "result.json").exists() else None
     result = {**job_metadata(job_dir, finished_at=finished, thread_id=value.get("thread_id")), **value, "job_id": job_id}
     result.update(review_summary(result))
+    result.update(verification_summary(job_dir, result))
+    result["blocking"] = blocking_summary(result)
+    if result.get("scope_paths"):
+        result["out_of_scope"] = out_of_scope_paths(result)
     activity = runner_activity(job_dir / "events.jsonl")
     if activity["attempt"] is None:
         activity["attempt"] = result.get("attempts")
@@ -851,7 +1038,8 @@ def job_status(job_id):
         job_dir = job_directory(job_id)
         if not job_dir.exists():
             value = {"job_id": job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
-            return {**value, **review_summary(value)}
+            return {**value, **review_summary(value), "blocking": blocking_summary(value),
+                    "verification_status": "unreviewed", "verification": None}
         result = job_dir / "result.json"
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
@@ -869,10 +1057,11 @@ def job_status(job_id):
     except (OSError, ValueError, TypeError) as e:
         value = {"job_id": job_id, "status": "failed", "error_kind": "invalid_record",
                  "error": str(e), "retryable": False}
-        return {**value, **review_summary(value)}
+        return {**value, **review_summary(value), "blocking": blocking_summary(value),
+                "verification_status": "invalid", "verification": None}
 
 
-def list_jobs(args):
+def matching_jobs(args):
     jobs = []
     root = HOME / "jobs"
     for job_dir in root.iterdir() if root.exists() else []:
@@ -884,31 +1073,106 @@ def list_jobs(args):
             continue
         value = job_status(job_dir.name)
         context = value.get("context")
+        parent = (context or {}).get("continuation", {}).get("parent_job_id")
         if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
                                job_dir.name in (args.job_id or [])):
             continue
         if args.cwd and (not value.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(value["cwd"])):
             continue
+        if getattr(args, "command", None) == "summary" and not args.owner and args.job_id and job_dir.name not in args.job_id:
+            continue
+        if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
+            continue
+        if getattr(args, "parent_job", None) and parent != args.parent_job:
+            continue
         review = review_summary(value)
         if args.status and review["execution_status"] != args.status:
             continue
-        if args.needs_attention and review["review_status"] != "needs_attention":
+        verification = value.get("verification_status", "unreviewed")
+        attention = verification in ("needs_changes", "invalid") or (
+            verification == "unreviewed" and review["review_status"] == "needs_attention")
+        if args.needs_attention and not attention:
             continue
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
-        jobs.append({"job_id": job_dir.name, "cwd": value.get("cwd"), "thread_id": value.get("thread_id"),
-                     "sandbox": value.get("sandbox"), "status": value.get("status"), "error_kind": value.get("error_kind"),
-                     "duration_s": value.get("duration_s"),
-                     "context": {"owner": context.get("owner"), "task": context["task"].strip().splitlines()[0][:160]} if context else None,
+        jobs.append({**value, "parent_job_id": parent,
                      "started_at": args_file.stat().st_mtime if args_file.exists() else None,
                      "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
-                     "updated_at": max(p.stat().st_mtime for p in (job_dir, args_file, result_file, job_dir / "events.jsonl") if p.exists()),
-                     **review,
-                     **{k: value.get(k) for k in ("phase", "attempt", "last_error_kind", "retry_at")}})
+                     "updated_at": max(p.stat().st_mtime for p in (job_dir, args_file, result_file, job_dir / "events.jsonl",
+                                                                 job_dir / "reviews.json") if p.exists())})
     jobs.sort(key=lambda j: (j["started_at"] or j["updated_at"], j["job_id"]), reverse=True)
+    return jobs
+
+
+def list_jobs(args):
+    jobs = matching_jobs(args)
     page = jobs[args.offset:args.offset + args.limit]
+    fields = ("job_id", "cwd", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
+              "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
+              "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
+              "last_error_kind", "retry_at")
+    page = [{**{k: j.get(k) for k in fields},
+             "context": {"owner": j["context"].get("owner"),
+                         "task": j["context"]["task"].strip().splitlines()[0][:160]} if j.get("context") else None,
+             **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     return {"status": "completed", "jobs": page, "total": len(jobs), "offset": args.offset, "limit": args.limit,
             "next_offset": next_offset if next_offset < len(jobs) else None, "eof": next_offset >= len(jobs)}
+
+
+def summary_usage(rounds):
+    if not rounds or (len(rounds) > 1 and rounds[-1].get("usage_scope") != "thread_total"):
+        return None
+    usage = rounds[-1].get("usage")
+    return usage if isinstance(usage, dict) and usage and all(type(v) in (int, float) for v in usage.values()) else None
+
+
+def summarize_jobs(args):
+    groups = {}
+    for job in matching_jobs(args):
+        key = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
+        groups.setdefault(key, []).append(job)
+    result = []
+    for (kind, identifier), jobs in groups.items():
+        rounds = list(reversed(jobs))
+        latest = jobs[0]
+        report = latest.get("structured")
+        report = report if valid_report(report) else {}
+        verification = latest.get("verification")
+        closed = latest.get("verification_status") in ("verified", "accepted_deviations")
+        criteria = verification["criteria"] if verification else report.get("criteria", [])
+        finished = [j for j in rounds if j.get("finished_at") is not None]
+        durations = [j.get("duration_s") for j in finished]
+        files = []
+        for job in rounds:
+            for change in job.get("files_changed") or []:
+                path = change.get("path") if isinstance(change, dict) else change
+                if path and path not in files:
+                    files.append(path)
+            structured = job.get("structured")
+            for path in structured.get("files_changed", []) if valid_report(structured) else []:
+                if path not in files:
+                    files.append(path)
+        open_items = {"criteria": [c for c in criteria if c["status"] != "met"],
+                      "unresolved": report.get("unresolved", []), "deviations": report.get("deviations", []),
+                      "out_of_scope": out_of_scope_paths(latest),
+                      "blockers": latest["blocking"]["blockers"]}
+        if closed:
+            open_items = {k: [] for k in open_items}
+        result.append({"group_id": kind + ":" + identifier, "thread_id": latest.get("thread_id"),
+                       "job_ids": [j["job_id"] for j in rounds], "total_rounds": len(rounds),
+                       "rounds": [{k: j.get(k) for k in ("job_id", "parent_job_id", "status", "execution_status",
+                                   "verification_status", "started_at", "finished_at", "duration_s", "usage", "usage_scope")}
+                                  for j in jobs[:args.round_limit]],
+                       "rounds_truncated": len(rounds) > args.round_limit,
+                       "latest_job_id": latest["job_id"],
+                       "latest_job": {k: latest.get(k) for k in ("job_id", "thread_id", "parent_job_id", "status",
+                                      "execution_status", "review_status", "report_status", "blocking", "context")},
+                       "summary": report.get("summary"), "verification_status": latest.get("verification_status"),
+                       "verification": verification, "open_items": open_items, "files_changed": files,
+                       "finished_duration_s": round(sum(durations), 1) if all(type(d) in (int, float) for d in durations) else None,
+                       "usage": summary_usage(rounds), "usage_scope": "thread_total" if kind == "thread" else "job"})
+    return {"status": "completed", "groups": result, "total": len(result),
+            "total_jobs": sum(g["total_rounds"] for g in result)}
 
 
 def job_output(args):
@@ -916,7 +1180,8 @@ def job_output(args):
     if not job_dir.exists():
         value = {"job_id": args.job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
         return {**value, **review_summary(value)}
-    source = job_dir / {"report": "last_message.txt", "result": "result.json", "context": "args.json"}[args.artifact]
+    source = job_dir / {"report": "last_message.txt", "result": "result.json", "context": "args.json",
+                        "review": "reviews.json"}[args.artifact]
     value = job_status(args.job_id)
     base = {"job_id": args.job_id, "artifact": args.artifact, "execution_status": value.get("execution_status", value["status"]),
             "source_path": str(source), "offset": args.offset, "limit": args.limit}
@@ -1007,19 +1272,42 @@ def main():
     sub.add_parser("cancel").add_argument("job_id", type=job_identifier)
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     listing = sub.add_parser("list")
-    listing.add_argument("--cwd")
-    listing.add_argument("--owner")
-    listing.add_argument("--status", choices=["running", "completed", "failed", "cancelled", "unknown"])
-    listing.add_argument("--needs-attention", action="store_true")
-    listing.add_argument("--job-id", action="append", type=job_identifier)
+    summary = sub.add_parser("summary")
+    for command in (listing, summary):
+        command.add_argument("--cwd")
+        command.add_argument("--owner")
+        command.add_argument("--status", choices=["running", "completed", "failed", "cancelled", "unknown"])
+        command.add_argument("--needs-attention", action="store_true")
+        command.add_argument("--job-id", action="append", type=job_identifier)
+        command.add_argument("--thread-id")
+        command.add_argument("--parent-job", type=job_identifier)
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--offset", type=int, default=0)
+    summary.add_argument("--round-limit", type=int, default=20)
+    review = sub.add_parser("review")
+    review.add_argument("job_id", type=job_identifier)
+    review.add_argument("--reviewer", required=True)
     output = sub.add_parser("output")
     output.add_argument("job_id", type=job_identifier)
-    output.add_argument("--artifact", choices=["report", "result", "context"], default="report")
+    output.add_argument("--artifact", choices=["report", "result", "context", "review"], default="report")
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
+    if args.command == "review":
+        try:
+            decision = json.loads(read_prompt(strict=True))
+            emit(review_job(args, decision))
+        except (OSError, ValueError, argparse.ArgumentTypeError) as e:
+            parser.error("Invalid review: " + str(e))
+        return
+    if args.command == "summary":
+        if not 1 <= args.round_limit <= 1000:
+            parser.error("round-limit must be between 1 and 1000")
+        try:
+            emit(summarize_jobs(args))
+        except (OSError, ValueError) as e:
+            emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
+        return
     if args.command in ("list", "output"):
         maximum = 100 if args.command == "list" else 8000
         if args.offset < 0 or not 1 <= args.limit <= maximum:

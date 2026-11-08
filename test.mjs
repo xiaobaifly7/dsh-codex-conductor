@@ -372,7 +372,7 @@ test('an invalid allowCommands pattern leaves the tools and guard installed', ()
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: () => {},
     logger: { warn: (s) => warnings.push(s) } },
   { workspaces: ['F:\\work\\项目'], allowCommands: ['[', '^\\./verify\\.sh --check$'] });
-  assert.equal(tools.length, 5);
+  assert.equal(tools.length, 10);
   assert.equal(guards.length, 1);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /allowCommands/);
@@ -454,23 +454,21 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.equal(value.report, report);
   assert.equal(value.structured, undefined);
   const next = nextStep({ ...value, out_of_scope: ['README.md'] }, ['A', 'B']);
-  // 条数和编号对得上时按编号指出：逐条汇报里显示的是验收标准原文
-  assert.match(next, /1 条未满足或受阻：第 2 条（blocked）[\s\S]*偏离计划：归档与要求冲突[\s\S]*超出 scope：README\.md[\s\S]*resume="T"/);
-  assert.match(next, /其他进程写的文件[\s\S]*不算 Codex 越界，也不用请用户决定/);
-  // 只读任务不留会话：自己的 thread_id 不能续跑，续跑过的写任务线程可以
+  assert.match(next, /阻塞原因未分类或报告不完整/);
+  assert.match(next, /范围外改动待核实：README\.md[\s\S]*其他进程写的文件/);
+  assert.doesNotMatch(next, /resume=|write=true|host_access=true/);
+  // 缺报告时先检查，不因存在旧线程直接续接。
   const ro = { status: 'completed', sandbox: 'read-only', thread_id: 'W' };
-  assert.match(nextStep(ro, ['A'], true), /resume="W"/);
-  // codex_status 不传 resumed：只读任务带回 thread_id 说明续跑过写任务线程
-  assert.match(nextStep(ro, ['A']), /resume="W"/);
+  assert.match(nextStep(ro, ['A'], true), /先读完整报告和实际状态/);
+  assert.match(nextStep(ro, ['A']), /先读完整报告和实际状态/);
   for (const n of [nextStep(ro, ['A'], false), nextStep({ ...ro, thread_id: null }, ['A'])]) {
     assert.doesNotMatch(n, /resume="/);
-    assert.match(n, /重新派一个写全背景的完整任务/);
+    assert.match(n, /先读完整报告和实际状态/);
   }
   assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], false), /不要带 resume/);
   assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], true), /有 thread_id 时带 resume/);
   assert.doesNotMatch(nextStep(withReport({ status: 'completed', thread_id: 'T' }), ['A']), /自报/);
-  // 沙箱外的任务续跑也要带 host_access，否则会回到沙箱
-  assert.match(nextStep({ status: 'completed', sandbox: 'danger-full-access', thread_id: 'H' }, ['A']), /resume="H" 和 host_access=true/);
+  assert.match(nextStep({ status: 'completed', sandbox: 'danger-full-access', thread_id: 'H' }, ['A']), /先读完整报告和实际状态/);
   assert.doesNotMatch(next, /host_access/);
   // Codex 没按 JSON 汇报：按完成处理，不当成失败
   const loose = withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false, final_message: 'done' });
@@ -478,36 +476,27 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.match(loose.report_note, /JSON/);
 });
 
-test('flagged criteria point to write=true in read-only runs and to host_access for blocked Windows programs', () => {
+test('typed blockers drive questions, environment evidence and continuation without expanding permissions', () => {
   const rep = (...criteria) => ({ summary: 's', criteria: criteria.map(([criterion, status, evidence]) => ({ criterion, status, evidence })),
     files_changed: [], deviations: [], unresolved: [] });
-  const RO = /这是只读任务[^\n]*write=true/;
   const ro = { status: 'completed', sandbox: 'read-only', report: rep(['A', 'blocked', '只读沙箱里不能写备份']) };
-  assert.match(nextStep(ro, ['A']), RO);
-  assert.match(nextStep({ ...ro, report: rep(['A', 'not_met', '没有写入备份']) }, ['A']), RO);
-  assert.doesNotMatch(nextStep({ ...ro, report: rep(['A', 'met', 'e']) }, ['A']), /write=true/);
-  // 续跑写任务线程的只读追问也提示，照旧可以 resume
-  assert.match(nextStep({ ...ro, thread_id: 'W' }, ['A'], true), /这是只读任务[^\n]*write=true[\s\S]*resume="W"/);
-  // host_access=true、write=false 的只读调查沙箱是 danger-full-access，由调用方告知
-  const host = { status: 'completed', sandbox: 'danger-full-access', thread_id: 'H', report: rep(['A', 'blocked', '只读调查不能建备份']) };
-  assert.match(nextStep(host, ['A'], false, { readOnly: true }), RO);
-  assert.doesNotMatch(nextStep(host, ['A']), /write=true/);
-  // 沙箱里受阻且提到 Windows 程序：开了 allowHostAccess 提示 host_access=true，否则提示自己跑
-  const WIN = /受阻条目提到 Windows 程序[^\n]*host_access=true/;
-  const ww = { status: 'completed', sandbox: 'workspace-write', thread_id: 'T' };
-  for (const [criterion, evidence] of [['A', '/mnt/c/tools/pwsh.exe 没有任何输出'], ['pwsh.exe -File tests\\Verify.ps1 输出 PASS', '沙箱里无法执行'],
-    ['A', 'WSL Interop 被挡住'], ['A', '无法连接 Hyper-V 虚拟机'], ['A', 'Get-VM Cmdlet 不可用'], ['A', '需要启动 Windows 程序'], ['A', 'C:\\Tools\\PWSH.EXE 报错']]) {
-    assert.match(nextStep({ ...ww, report: rep([criterion, 'blocked', evidence]) }, ['A'], false, { hostAccess: true }), WIN, `${criterion} ${evidence}`);
+  for (const evidence of ['pwsh.exe 无法执行', 'WSL Interop 被挡住', 'Hyper-V cmdlet 不可用']) {
+    const value = { ...ro, report: rep(['A', 'blocked', evidence]) };
+    assert.match(nextStep(value, ['A']), /先读完整报告和实际状态/);
+    assert.doesNotMatch(nextStep(value, ['A']), /write=true|host_access=true|resume=/);
   }
-  const win = { ...ww, report: rep(['A', 'blocked', '/mnt/c/tools/pwsh.exe 没有任何输出']) };
-  assert.match(nextStep(win, ['A']), /受阻条目提到 Windows 程序[^\n]*这类检查你自己跑/);
-  assert.match(nextStep({ ...win, sandbox: 'read-only' }, ['A'], false, { hostAccess: true }), WIN);
-  assert.doesNotMatch(nextStep({ ...win, sandbox: 'danger-full-access' }, ['A'], false, { hostAccess: true }), /Windows 程序/);
-  // not_met 多是结果不对（比如产出 .exe 的编译失败了），met 的条目更不算
-  for (const report of [rep(['go build 产出 bin/tool.exe', 'not_met', 'main.go:12: undefined: foo']),
-    rep(['构建产物', 'met', 'dist/app.exe 已生成'], ['B', 'not_met', '测试失败']), rep(['A', 'blocked', '目标文件不存在'])]) {
-    assert.doesNotMatch(nextStep({ ...ww, report }, report.criteria.map((c) => c.criterion), false, { hostAccess: true }), /Windows 程序|这是只读任务/);
+  for (const kind of ['user_input', 'task_conflict', 'environment', 'implementation']) {
+    const blockers = [{ id: 'choice', kind, message: '待处理事项', question: '请确认保留哪个格式？', resolution: '须确认实际条件' }];
+    const value = { ...ro, report: { ...ro.report, blockers } };
+    const next = nextStep(value, ['A']);
+    assert.match(next, /codex_continue/);
+    assert.doesNotMatch(next, /write=true|host_access=true|resume=/);
+    if (['user_input', 'task_conflict'].includes(kind)) assert.match(next, /answers[\s\S]*choice: 请确认保留哪个格式？/);
+    if (kind === 'environment') assert.match(next, /环境条件[\s\S]*resolution[\s\S]*不要原样重试/);
+    if (kind === 'implementation') assert.match(next, /保留原目录、验收、write、scope 和主机权限/);
   }
+  assert.match(nextStep({ ...ro, report: rep(['A', 'not_met', '解析结果错误']) }, ['A']), /codex_continue/);
+  assert.match(nextStep({ ...ro, report: rep(['A', 'met', '测试通过']) }, ['A']), /codex_review/);
 });
 
 test('turn summary reads the last reply and the tools of one turn', () => {
@@ -557,13 +546,14 @@ test('conductor start only starts; waitJob waits with a bounded status call and 
   assert.deepEqual(calls.at(-1).argv, ['cancel', 'J2']);
 });
 
-test('apply registers five tools, a guard and the false-dispatch check', () => {
+test('apply registers ten tools in order, a guard and the false-dispatch check', () => {
   const tools = [];
   const guards = [];
   const handlers = {};
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; } },
     { workspaces: ['F:\\work\\项目'] });
-  assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output']);
+  assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output',
+    'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime']);
   assert.deepEqual(tools[0].parameters.required, ['task', 'acceptance', 'write']);
   assert.match(tools[0].description, /固定为 JSON[\s\S]*启动不了 Windows 程序/);
   assert.equal(guards.length, 1);
@@ -643,18 +633,22 @@ function harness({ config = {}, jobs, get = true } = {}) {
   const handlers = {};
   const calls = [];
   const waiters = {};
+  const requests = [];
   let n = 0;
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, listResult, outputResult, ...pluginConfig } = config;
-  const run = (_cfg, argv) => {
+  const { startResult, cancelResult, listResult, outputResult, reviewResult, summaryResult, ...pluginConfig } = config;
+  const run = (_cfg, argv, options = {}) => {
     calls.push(argv);
+    requests.push({ argv, ...options });
     // answer() 放弃后让后台循环出错退出，否则进程挂住不结束
     if (closed) return Promise.reject(new Error('harness closed'));
     if (argv[0] === 'start') return Promise.resolve(startResult ?? { job_id: `J${++n}`, status: 'running' });
     if (argv[0] === 'list') return Promise.resolve(listResult ?? { jobs: [], total: 0 });
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
+    if (argv[0] === 'review') return Promise.resolve(reviewResult);
+    if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
     if (argv[0] === 'status' && argv[3] === '20') return new Promise((r) => (waiters[argv[1]] ??= []).push(r));
     // 下一轮事件循环才答：后台循环的等待参数若不是 20，也不会只靠微任务空转、饿死 answer()
     if (argv[0] === 'status') return new Promise((r) => setImmediate(r, finals[argv[1]] ?? { job_id: argv[1], status: 'running', seconds_since_last_event: 1 }));
@@ -673,12 +667,308 @@ function harness({ config = {}, jobs, get = true } = {}) {
     }
     waiters[job].shift()(value);
   };
-  return { tools, handlers, calls, answer, finals };
+  return { tools, handlers, calls, requests, answer, finals };
 }
 const tick = () => new Promise((r) => setImmediate(r));
 const nudges = [];
 const agentAt = (cwd, log = []) => ({ id: 'S1', session: { header: { cwd }, log }, steer: (m) => nudges.push(m) });
 const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: false, wait_seconds: 0 };
+
+function workflowSource(kind = 'user_input') {
+  return { job_id: 'PARENT', status: 'completed', thread_id: 'THREAD', cwd: '/work/original', sandbox: 'workspace-write',
+    scope: ['src'], scope_paths: ['/work/original/src'],
+    context: { owner: 'S1', task: '修复 CSV 解析并保留原有数据和文件格式', acceptance: ['CSV 解析测试通过'], write: true },
+    task_options: { writable_roots: ['/work/cache'], effort: 'low', use_user_config: true },
+    structured: { summary: '等待确认 CSV 格式', criteria: [{ criterion: 'CSV 解析测试通过', status: 'blocked', evidence: '原格式存在歧义' }],
+      files_changed: [], deviations: [], unresolved: [],
+      blockers: [{ id: 'format', kind, message: 'CSV 格式待处理',
+        question: ['user_input', 'task_conflict'].includes(kind) ? '是否保留旧 CSV 格式？' : '', resolution: '保留原约束' }] } };
+}
+
+test('failed execution with typed blockers asks questions or waits for evidence before considering retries', () => {
+  for (const kind of ['user_input', 'task_conflict', 'environment']) {
+    for (const retryable of [true, false]) {
+      for (const blockerSource of ['report', 'review']) {
+        const source = { ...workflowSource(kind), status: 'failed', error_kind: 'task_failed', retryable };
+        if (blockerSource === 'review') {
+          source.verification_status = 'needs_changes';
+          source.verification = { status: 'needs_changes', blockers: source.structured.blockers };
+          source.structured.blockers = [];
+        }
+        const value = withReport(source);
+        const next = nextStep(value);
+        assert.equal(value.status, 'failed');
+        assert.equal(value.execution_status, 'failed');
+        assert.equal(value.report, source.structured);
+        if (kind === 'environment') {
+          assert.equal(value.blocking.next_action, 'wait_condition');
+          assert.match(next, /环境条件[\s\S]*codex_continue[\s\S]*resolution/);
+        } else {
+          assert.equal(value.blocking.next_action, 'ask_user');
+          assert.match(next, /codex_continue[\s\S]*answers[\s\S]*format: 是否保留旧 CSV 格式？/);
+        }
+        assert.doesNotMatch(next, /这次失败可重试|这次失败不可重试|再派一次|write=true|host_access=true|resume=/);
+      }
+    }
+  }
+});
+
+test('independent verification closes a failed round without rewriting its execution status or report', () => {
+  for (const verification_status of ['verified', 'accepted_deviations']) {
+    const source = { ...workflowSource(), status: 'failed', error_kind: 'task_failed', retryable: true,
+      verification_status, verification: { status: verification_status, blockers: [], notes: '实际产物已逐项核验通过' } };
+    const original = structuredClone(source);
+    const value = withReport(source);
+    const next = nextStep(value);
+    assert.match(next, /独立核验已记录[\s\S]*本轮已关闭[\s\S]*artifact=review/);
+    assert.doesNotMatch(next, /再派一次|codex_continue|answers|resolution|不可重试/);
+    assert.equal(value.blocking.next_action, 'done');
+    assert.equal(value.status, 'failed');
+    assert.equal(value.execution_status, 'failed');
+    assert.equal(value.error_kind, 'task_failed');
+    assert.equal(value.report, source.structured);
+    assert.deepEqual(source, original);
+  }
+});
+
+test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
+  const source = workflowSource();
+  const h = harness();
+  h.finals.PARENT = source;
+  const value = await h.tools.codex_continue.execute({ job_id: 'PARENT' }, { agent: agentAt('/work/current') });
+  assert.equal(value.continuation_ready, false);
+  assert.equal(value.report, source.structured);
+  assert.deepEqual(value.remaining_questions, [{ id: 'format', question: '是否保留旧 CSV 格式？' }]);
+  assert.equal(value.blocking.state, 'needs_input');
+  assert.equal(h.calls.filter((argv) => argv[0] === 'start').length, 0);
+});
+
+test('codex_continue dispatches complete answers with original context, permissions and options', async () => {
+  for (const sandbox of ['workspace-write', 'danger-full-access', 'read-only']) {
+    const source = workflowSource();
+    source.structured.blockers[0].id = ' format ';
+    source.sandbox = sandbox;
+    source.context.write = sandbox !== 'read-only';
+    source.task_options.use_user_config = sandbox !== 'read-only';
+    if (!source.context.write) source.task_options.writable_roots = [];
+    source.final_message = 'WHOLE-HISTORY-MUST-NOT-BE-COPIED';
+    source.context.continuation = { parent_job_id: 'GRANDPARENT', answers: [], resolution: '历史处理记录' };
+    const before = structuredClone(source);
+    const h = harness({ config: { allowHostAccess: true, defaultHostAccess: true, effort: 'max',
+      startResult: { job_id: 'CHILD', status: 'completed' } } });
+    h.finals.PARENT = source;
+    const answers = [{ id: ' format ', answer: ' 保留旧 CSV 格式 ' }];
+    const resolution = '\n    格式约束保持不变\n';
+    const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', answers, resolution, wait_seconds: 0 },
+      { agent: agentAt('/work/current') });
+    assert.equal(value.job_id, 'CHILD');
+    const starts = h.requests.filter(({ argv }) => argv[0] === 'start');
+    assert.equal(starts.length, 1);
+    const { argv, stdin } = starts[0];
+    const envelope = JSON.parse(stdin);
+    const flag = (name) => argv[argv.indexOf(name) + 1];
+    assert.equal(flag('--cwd'), source.cwd);
+    assert.equal(flag('--resume'), source.thread_id);
+    assert.equal(flag('--effort'), 'low');
+    assert.equal(argv.includes('--use-user-config'), source.task_options.use_user_config);
+    assert.ok(argv.includes('--context-json'));
+    assert.deepEqual(argv.filter((_, i) => argv[i - 1] === '--scope'), source.scope_paths);
+    assert.deepEqual(argv.filter((_, i) => argv[i - 1] === '--writable-root'), source.task_options.writable_roots);
+    if (sandbox === 'read-only') assert.ok(!argv.includes('--sandbox'));
+    else assert.equal(flag('--sandbox'), sandbox);
+    assert.deepEqual(envelope.context, { owner: 'S1', task: source.context.task, acceptance: source.context.acceptance,
+      write: source.context.write, continuation: { parent_job_id: 'PARENT', answers, resolution } });
+    assert.match(envelope.prompt, /保留旧 CSV 格式/);
+    assert.doesNotMatch(envelope.prompt, /WHOLE-HISTORY-MUST-NOT-BE-COPIED|历史处理记录/);
+    assert.deepEqual(source, before);
+  }
+});
+
+test('codex_continue shares concurrent dispatch and reuses an existing child after reload', async () => {
+  const exec = { agent: agentAt('/work/current') };
+  const args = { job_id: 'PARENT', answers: [{ id: 'format', answer: '保留旧格式' }], wait_seconds: 0 };
+  const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
+  h.finals.PARENT = workflowSource();
+  const results = await Promise.all([h.tools.codex_continue.execute(args, exec), h.tools.codex_continue.execute(args, exec)]);
+  assert.deepEqual(results[0], results[1]);
+  assert.equal(h.calls.filter((argv) => argv[0] === 'start').length, 1);
+  assert.equal(h.calls.filter((argv) => argv[0] === 'list').length, 1);
+  const after = harness({ config: { listResult: { jobs: [{ job_id: 'CHILD' }], total: 1 } } });
+  after.finals.PARENT = h.finals.PARENT;
+  after.finals.CHILD = { job_id: 'CHILD', status: 'running', context: { ...h.finals.PARENT.context,
+    continuation: { parent_job_id: 'PARENT', answers: [], resolution: '' } } };
+  const reused = await after.tools.codex_continue.execute(args, exec);
+  assert.equal(reused.reused, true);
+  assert.equal(reused.job_id, 'CHILD');
+  assert.equal(after.calls.filter((argv) => argv[0] === 'start').length, 0);
+  const query = after.calls.find((argv) => argv[0] === 'list');
+  assert.equal(query[query.indexOf('--parent-job') + 1], 'PARENT');
+  assert.equal(query[query.indexOf('--owner') + 1], 'S1');
+});
+
+test('codex_review rejects other or unknown owners before recording any review', async () => {
+  const h = harness();
+  const review = { job_id: 'PARENT', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '测试通过' }],
+    notes: '只读检查完成', accepted_deviations: [] };
+  for (const owner of ['another-owner', null, undefined]) {
+    const source = workflowSource();
+    source.context.owner = owner;
+    h.finals.PARENT = source;
+    await assert.rejects(h.tools.codex_review.execute(review, { agent: agentAt('/work/current') }), /归属未知或不属于当前会话/);
+  }
+  assert.ok(h.calls.every((argv) => argv[0] === 'status'));
+});
+
+test('codex_review sends every criterion in stdin and returns verification without rewriting the report', async () => {
+  const source = workflowSource('implementation');
+  source.context.acceptance.push('旧 CSV 文件保持不变');
+  source.structured.criteria.push({ criterion: '旧 CSV 文件保持不变', status: 'met', evidence: '前后内容一致' });
+  const review = { status: 'needs_changes', criteria: [
+    { index: 1, status: 'not_met', evidence: '空列输入仍解析错误' },
+    { index: 2, status: 'met', evidence: '只读 diff 确认原文件未改' }], notes: '仅修解析器', accepted_deviations: [],
+    blockers: source.structured.blockers };
+  const original = structuredClone(source.structured);
+  const h = harness({ config: { reviewResult: { ...source, verification_status: 'needs_changes', verification: review } } });
+  h.finals.PARENT = source;
+  const value = await h.tools.codex_review.execute({ job_id: 'PARENT', ...review }, { agent: agentAt('/work/current') });
+  const requests = h.requests.filter(({ argv }) => argv[0] === 'review');
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0].argv, ['review', 'PARENT', '--reviewer', 'S1']);
+  assert.deepEqual(JSON.parse(requests[0].stdin), review);
+  assert.deepEqual(value.verification, review);
+  assert.equal(value.verification_status, 'needs_changes');
+  assert.deepEqual(value.report, original);
+  assert.deepEqual(source.structured, original);
+  assert.ok(!h.calls.some((argv) => argv[0] === 'start'));
+});
+
+test('codex_summary defaults to the current owner, passes thread filters and never starts Codex', async () => {
+  const summary = { total: 0, total_jobs: 0, groups: [] };
+  const h = harness({ config: { summaryResult: summary } });
+  const exec = { agent: agentAt('/work/current') };
+  assert.deepEqual(await h.tools.codex_summary.execute({}, exec), summary);
+  assert.deepEqual(await h.tools.codex_summary.execute({ thread_id: 'THREAD' }, exec), summary);
+  assert.deepEqual(h.calls, [['summary', '--owner', 'S1'], ['summary', '--owner', 'S1', '--thread-id', 'THREAD']]);
+});
+
+test('codex_summary renders null duration and usage as unknown while retaining genuine zero values', () => {
+  const h = harness();
+  const group = { thread_id: 'THREAD', total_rounds: 1, latest_job_id: 'PARENT', verification_status: 'unreviewed',
+    latest_job: workflowSource(), summary: '原始统计不完整', files_changed: [], open_items: [],
+    finished_duration_s: null, usage: null, usage_scope: 'unknown' };
+  const render = (item) => h.tools.codex_summary.output.render({}, { total: 1, total_jobs: 1, groups: [item] })[0].text;
+  const text = render(group);
+  assert.match(text, /已结束轮次耗时合计：未知；用量（unknown）：未知（原始用量不完整）/);
+  assert.doesNotMatch(text, /耗时合计：0 秒|用量（unknown）：null/);
+  assert.equal(group.finished_duration_s, null);
+  assert.equal(group.usage, null);
+  assert.match(render({ ...group, finished_duration_s: 0, usage: { input_tokens: 0 }, usage_scope: 'thread_total' }),
+    /已结束轮次耗时合计：0 秒；用量（thread_total）：\{"input_tokens":0\}/);
+  assert.deepEqual(h.calls, []);
+});
+
+test('codex_watch stays quiet without changes and stopping it leaves the business task running', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const jobs = fakeJobs();
+  let finish;
+  let businessCancelled = false;
+  const business = jobs.start({ owner: 'S1', kind: 'codex', label: 'Codex LIVE · business',
+    run: () => ({ done: new Promise((resolve) => { finish = resolve; }), cancel: () => { businessCancelled = true; } }) });
+  const h = harness({ jobs });
+  const exec = { agent: agentAt('/work/current') };
+  const watching = await h.tools.codex_watch.execute({}, exec);
+  const again = await h.tools.codex_watch.execute({}, exec);
+  assert.equal(again.reused, true);
+  assert.equal(again.background_job_id, watching.background_job_id);
+  t.mock.timers.tick(1000);
+  await tick();
+  t.mock.timers.tick(1000);
+  await tick();
+  assert.deepEqual(h.calls, []);
+  assert.deepEqual(jobs.unawaited, []);
+  assert.equal(jobs.kill(watching.background_job_id, 'S1'), 'requested');
+  const watcher = jobs.started.find((job) => job.id === watching.background_job_id);
+  assert.equal((await watcher.done).status, 'killed');
+  assert.equal(jobs.get(business, 'S1').status, 'running');
+  assert.equal(businessCancelled, false);
+  assert.deepEqual(h.calls, []);
+  finish({ status: 'completed', result: 'fake business cleanup' });
+  await jobs.started[0].done;
+});
+
+test('codex_watch ignores ownerless observers and completed ownerless Codex jobs', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const jobs = fakeJobs();
+  let finishGlobalWatch;
+  let finishGlobalTask;
+  const globalWatch = jobs.start({ kind: 'codex-watch', label: 'Codex 安静观察 · attention',
+    run: () => ({ done: new Promise((resolve) => { finishGlobalWatch = resolve; }),
+      cancel() { throw new Error('must not stop the global observer'); } }) });
+  const globalTask = jobs.start({ kind: 'codex', label: 'Codex GLOBAL · global task',
+    run: () => ({ done: new Promise((resolve) => { finishGlobalTask = resolve; }),
+      cancel() { throw new Error('must not cancel the global task'); } }) });
+  const h = harness({ jobs });
+  h.finals.GLOBAL = { ...workflowSource('environment'), job_id: 'GLOBAL' };
+  const watching = await h.tools.codex_watch.execute({}, { agent: agentAt('/work/current') });
+  const watcher = jobs.started.find((job) => job.id === watching.background_job_id);
+  t.after(async () => {
+    if (watcher.spec.owner === 'S1') {
+      jobs.kill(watcher.id, 'S1');
+      await watcher.done;
+    }
+    finishGlobalWatch({ status: 'killed', result: 'fake global observer cleanup' });
+    finishGlobalTask({ status: 'completed', result: 'fake global task cleanup' });
+    await Promise.all([jobs.started[0].done, jobs.started[1].done]);
+  });
+  assert.ok(jobs.list('S1').some((job) => job.id === globalWatch));
+  assert.ok(jobs.list('S1').some((job) => job.id === globalTask));
+  assert.notEqual(watching.background_job_id, globalWatch);
+  assert.equal(watching.reused, undefined);
+  assert.equal(watcher.spec.owner, 'S1');
+  finishGlobalTask({ status: 'completed', result: 'global task finished with a blocker' });
+  await jobs.started[1].done;
+  t.mock.timers.tick(1000);
+  await tick();
+  t.mock.timers.tick(1000);
+  await tick();
+  assert.equal(jobs.get(globalTask, 'S1').status, 'completed');
+  assert.equal(jobs.get(watcher.id, 'S1').status, 'running');
+  assert.equal(watcher.result, undefined);
+  assert.equal(jobs.unawaited.includes(watcher.id), false);
+  assert.deepEqual(h.calls, []);
+});
+
+test('codex_watch notifies once for failed or blocked tasks and never cancels the runner', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const outcome of ['failed', 'blocked']) {
+    const jobs = fakeJobs();
+    let finish;
+    jobs.start({ owner: 'S1', kind: 'codex', label: 'Codex LIVE · business',
+      run: () => ({ done: new Promise((resolve) => { finish = resolve; }), cancel() { throw new Error('must not cancel business'); } }) });
+    const h = harness({ jobs });
+    const source = workflowSource('environment');
+    h.finals.LIVE = outcome === 'failed' ? { job_id: 'LIVE', status: 'failed', error_kind: 'worker_died', error: 'fake failure' }
+      : { ...source, job_id: 'LIVE' };
+    const watched = await h.tools.codex_watch.execute({}, { agent: agentAt('/work/current') });
+    finish({ status: outcome === 'failed' ? 'failed' : 'completed', result: 'fake task result' });
+    await jobs.started[0].done;
+    t.mock.timers.tick(1000);
+    await tick();
+    const watcher = jobs.started.find((job) => job.id === watched.background_job_id);
+    const result = await watcher.done;
+    assert.equal(result.status, 'completed');
+    const notice = JSON.parse(result.result);
+    assert.equal(notice.changes.length, 1);
+    assert.equal(notice.changes[0].job_id, 'LIVE');
+    if (outcome === 'blocked') assert.equal(notice.changes[0].blocking.state, 'waiting_environment');
+    assert.equal(jobs.unawaited.filter((id) => id === watched.background_job_id).length, 1);
+    assert.deepEqual(h.calls, [['status', 'LIVE', '--wait', '0']]);
+    t.mock.timers.tick(5000);
+    await tick();
+    assert.equal(h.calls.length, 1);
+    assert.equal(jobs.unawaited.filter((id) => id === watched.background_job_id).length, 1);
+  }
+});
 
 // 按 DSH 任务表的约定：结算时有 wait() 在等就算已送达，否则记进 unawaited（DSH 会为它另发通知）
 function fakeJobs({ fail = false } = {}) {
@@ -964,7 +1254,8 @@ test('a running job is registered once as a DSH background job and reports back 
   // 任务表的 detail 和结果第一行都以一行摘要开头；文件数取 runner 的 files_changed_total
   assert.equal(done.detail, 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注 · runner J1 · codex_output');
   assert.equal(done.result.split('\n')[0], 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注  job_id: J1  thread_id: T');
-  assert.match(done.result, /逐条汇报[\s\S]*✗ 1\. pytest 通过 —— e[\s\S]*下一步[\s\S]*2 条未满足[\s\S]*resume="T"/);
+  assert.match(done.result, /逐条汇报[\s\S]*✗ 1\. pytest 通过 —— e[\s\S]*下一步[\s\S]*阻塞原因未分类/);
+  assert.doesNotMatch(done.result, /resume=/);
   // 结束后不再算在执行中
   handlers['agent/turn-stopping']({ agent: exec.agent, turn: 3 });
   assert.equal(nudges.length, 1);
@@ -1087,7 +1378,7 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   assert.equal(value.status, 'completed');
   const text = tools.codex_status.output.render({}, value)[0].text;
   assert.equal(text, jobs.started[0].result);
-  assert.match(text, /thread_id: T[\s\S]*超出 scope：README\.md[\s\S]*1\. pytest 通过/);
+  assert.match(text, /thread_id: T[\s\S]*阻塞原因未分类[\s\S]*范围外改动待核实：README\.md/);
   assert.ok(calls.slice(sent).every((a) => a[3] === '20'));
   assert.deepEqual(jobs.unawaited, []);
 
@@ -1381,16 +1672,17 @@ test('a completed result shows the original criteria, clipped evidence and one-l
   value.next = nextStep(value, value.acceptance);
   const text = render(value);
   assert.match(text, /\n✓ 1\. 甲原文 —— x{800}…（已截断，全文见 \/home\/u\/jobs\/J\/last_message\.txt）\n⛔ 2\. 乙原文 —— e\n/);
-  assert.match(text, /\n--- 详细字段 ---\n任务目录：\/mnt\/f\/p\n改动文件（snapshot，共 1 个）：a\.py\(modified\)\n--- 下一步 ---\n/);
-  assert.doesNotMatch(text, /input_tokens|forced_exit|truncated|commands_run|attempts|log_dir/);
-  // 验收标准原文已在逐条汇报里，下一步按编号指出、不再重复列出
-  assert.match(value.next, /第 2 条（blocked）[\s\S]*上面逐条汇报里的验收标准/);
+  assert.match(text, /\n--- 详细字段 ---\n任务目录：\/mnt\/f\/p\n改动文件（snapshot，共 1 个）：a\.py\(modified\)\n用量（统计范围未知，不是费用）：\{"input_tokens":9\}\n--- 下一步 ---\n/);
+  assert.doesNotMatch(text, /forced_exit|truncated|commands_run|attempts|log_dir/);
+  // 报告仍保留验收原文，旧 blocked 先检查原因。
+  assert.match(value.next, /阻塞原因未分类[\s\S]*先读完整报告和实际状态/);
   assert.doesNotMatch(value.next, /甲原文/);
-  // 编号对不上（Codex 改了顺序）时显示 Codex 写的条目，下一步照旧列出原文
+  // 编号对不上时显示 Codex 写的条目，仍先检查旧阻塞。
   const shifted = { ...value, report: { ...report, criteria: [{ ...report.criteria[0], criterion: '2. 甲' }, report.criteria[1]] } };
   shifted.next = nextStep(shifted, shifted.acceptance);
   assert.match(render(shifted), /\n✓ 1\. 2\. 甲 —— /);
-  assert.match(shifted.next, /下面的验收标准[\s\S]*\n1\. 甲原文\n2\. 乙原文$/);
+  assert.match(shifted.next, /阻塞原因未分类/);
+  assert.deepEqual(shifted.acceptance, ['甲原文', '乙原文']);
   // 失败的结果保留全部字段，便于排查
   assert.match(render({ status: 'failed', error_kind: 'timeout', error: 'boom', log_dir: '/home/u/jobs/K', attempts: 2, retryable: false }),
     /--- 详细字段 ---\n\{[\s\S]*"error": "boom"[\s\S]*"log_dir": "\/home\/u\/jobs\/K"/);
@@ -1437,7 +1729,7 @@ test('running, cancelled and failed results keep every field in the details', as
   assert.match(render(await h.tools.codex_status.execute({ job_id: 'J8', wait_seconds: 0 }, {})), /--- 详细字段 ---\n\{[\s\S]*"log_dir": "\/j\/J8"/);
 });
 
-test('count or numbering mismatches show Codex labels and keep the acceptance list', () => {
+test('count or numbering mismatches retain Codex labels and inspect legacy blockers', () => {
   const { tools } = harness();
   const render = (v) => tools.codex_run.output.render({}, v)[0].text;
   const rep = (labels) => ({ summary: 's', criteria: labels.map((criterion, i) => ({ criterion, status: i ? 'blocked' : 'met', evidence: `e${i + 1}` })),
@@ -1449,7 +1741,8 @@ test('count or numbering mismatches show Codex labels and keep the acceptance li
     value.next = nextStep(value, acceptance);
     const text = render(value);
     labels.forEach((l, i) => assert.ok(text.includes(`\n${i ? '⛔' : '✓'} ${i + 1}. ${l} —— e${i + 1}\n`), `${l}\n${text}`));
-    assert.ok(value.next.endsWith(`\n${acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n')}`), value.next);
+    assert.match(value.next, /阻塞原因未分类[\s\S]*先读完整报告和实际状态/);
+    assert.deepEqual(value.acceptance, acceptance);
   }
   // 编号和位置一致、或者数字后面不是编号标点（3 个测试通过）时照常显示原文
   for (const labels of [['1. 甲', '2. 乙'], ['第1条 甲', '第2条 乙'], ['3 个测试通过', '2024 年数据已归档']]) {
@@ -1473,27 +1766,32 @@ test('codex_run shows the acceptance text when Codex rewrites the labels, right 
   await later.answer('J1', done);
   for (const text of [now.tools.codex_run.output.render({}, value)[0].text, (await jobs.started[0].done).result]) {
     assert.match(text, /\n✓ 1\. pytest tests\/test_login\.py 全部通过 —— e1\n⛔ 2\. a\.py 第 40 行不再抛 NullPointer —— e2\n/);
-    assert.match(text, /第 2 条（blocked）[\s\S]*上面逐条汇报里的验收标准/);
+    assert.match(text, /下一步[\s\S]*阻塞原因未分类/);
   }
 });
 
-test('allowHostAccess and a host_access read-only run reach the hints from codex_run and codex_status', async () => {
+test('host access settings do not turn unclassified blockers into permission escalation hints', async () => {
   const structured = { summary: 's', criteria: [{ criterion: 'Verify.ps1 输出 PASS', status: 'blocked', evidence: '/mnt/c/tools/pwsh.exe 没有任何输出' }],
     files_changed: [], deviations: [], unresolved: [] };
   const done = { job_id: 'J', status: 'completed', thread_id: 'T', sandbox: 'workspace-write', structured };
   for (const allowHostAccess of [true, false]) {
-    const expected = allowHostAccess ? /提到 Windows 程序[^\n]*host_access=true/ : /提到 Windows 程序[^\n]*这类检查你自己跑/;
+    const expected = /阻塞原因未分类[\s\S]*先读完整报告和实际状态/;
     const r = harness({ config: { allowHostAccess, startResult: done } });
-    assert.match((await r.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('F:\\work\\项目') })).next, expected);
+    const run = await r.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('F:\\work\\项目') });
+    assert.match(run.next, expected);
+    assert.doesNotMatch(run.next, /write=true|host_access=true|resume=/);
     const s = harness({ get: false, config: { allowHostAccess } });
     s.finals.J = done;
-    assert.match((await s.tools.codex_status.execute({ job_id: 'J', wait_seconds: 0 }, {})).next, expected);
+    const status = await s.tools.codex_status.execute({ job_id: 'J', wait_seconds: 0 }, {});
+    assert.match(status.next, expected);
+    assert.doesNotMatch(status.next, /write=true|host_access=true|resume=/);
   }
   // host_access=true、write=false：沙箱是 danger-full-access，codex_run 按参数知道它是只读调查
   const host = harness({ config: { allowHostAccess: true, startResult: { ...done, sandbox: 'danger-full-access',
     structured: { ...structured, criteria: [{ criterion: '建备份', status: 'blocked', evidence: '只读调查不能写文件' }] } } } });
-  assert.match((await host.tools.codex_run.execute({ ...RUN, write: false, host_access: true }, { agent: agentAt('F:\\work\\项目') })).next,
-    /这是只读任务[^\n]*write=true[\s\S]*resume="T" 和 host_access=true/);
+  const readOnly = await host.tools.codex_run.execute({ ...RUN, write: false, host_access: true }, { agent: agentAt('F:\\work\\项目') });
+  assert.match(readOnly.next, /阻塞原因未分类/);
+  assert.doesNotMatch(readOnly.next, /write=true|host_access=true|resume=/);
 });
 
 test('the slim completed view keeps the schema note, flags a truncated answer and a capped change list', () => {
@@ -1502,7 +1800,7 @@ test('the slim completed view keeps the schema note, flags a truncated answer an
   const loose = render(withReport({ status: 'failed', error_kind: 'schema_invalid', error: 'x', retryable: false,
     final_message: 'done', truncated: true, log_dir: '/j' }));
   assert.match(loose, /--- Codex 最终答复（超过 8000 字已截断，全文见 \/j\/last_message\.txt） ---\ndone\n/);
-  assert.match(loose, /--- 详细字段 ---\n执行：completed；报告：invalid；验收：needs_attention\nCodex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。/);
+  assert.match(loose, /--- 详细字段 ---\n执行：completed；报告：invalid；执行端自报检查：needs_attention\nCodex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。/);
   // runner 最多列 300 条：总数照实给，并说明只列了一部分
   const files = Array.from({ length: 300 }, (_, i) => ({ path: `src/f${i}.py`, change: 'modified' }));
   const capped = render({ status: 'completed', files_changed_source: 'snapshot', files_changed_total: 500, files_changed: files });
@@ -1766,7 +2064,7 @@ test('canonical runner paths keep alias scopes consistent for run, status and ca
   const cancel = await tools.codex_cancel.execute({ job_id: 'J' }, {});
   for (const value of [run, status, cancel]) {
     assert.deepEqual(value.out_of_scope, ['other.txt']);
-    assert.match(value.next, /超出 scope：other\.txt/);
+    assert.match(value.next, /范围外改动待核实：other\.txt/);
   }
   const inScope = withReport({ ...done, files_changed: [done.files_changed[0]] });
   assert.deepEqual(inScope.out_of_scope, []);

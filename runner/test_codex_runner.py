@@ -956,6 +956,380 @@ class RunnerTests(unittest.TestCase):
             (root / "worker.pid").write_text(str(os.getpid()))
         return root
 
+    def submit_review(self, job_id, review, reviewer="reviewer-a"):
+        p = subprocess.run([sys.executable, "-B", str(RUNNER), "review", job_id, "--reviewer", reviewer],
+                           input=json.dumps(review, ensure_ascii=False).encode("utf-8"), capture_output=True,
+                           timeout=30, env=self.env)
+        return json.loads(p.stdout)
+
+    def sample_review(self, **fields):
+        return {"status": "verified", "criteria": [{"index": 1, "status": "met", "evidence": "independently checked"}],
+                "notes": "checked", "accepted_deviations": [], **fields}
+
+    def blocker(self, kind="user_input", **fields):
+        return {"id": "b1", "kind": kind, "message": "A decision is needed", "question": "Which option?",
+                "resolution": "", **fields}
+
+    def test_reports_accept_legacy_and_strict_optional_blockers(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        self.assertTrue(codex_runner.valid_report(self.sample_report()))
+        for kind in ("user_input", "task_conflict", "environment", "implementation"):
+            blocker = self.blocker(kind)
+            self.assertTrue(codex_runner.valid_report(self.sample_report(blockers=[blocker])))
+        invalid = [None, {}, [None], [self.blocker(id=" ")], [self.blocker(message="")],
+                   [self.blocker(kind="other")], [self.blocker(question="")], [self.blocker(resolution=None)],
+                   [self.blocker(extra=True)], [{k: v for k, v in self.blocker().items() if k != "resolution"}]]
+        for blockers in invalid:
+            with self.subTest(blockers=blockers):
+                self.assertFalse(codex_runner.valid_report(self.sample_report(blockers=blockers)))
+        self.assertFalse(codex_runner.valid_report(self.sample_report(unrelated=[])))
+
+    def test_status_and_list_classify_only_explicit_blockers(self):
+        pairs = [("user_input", "needs_input", "ask_user"), ("task_conflict", "needs_input", "ask_user"),
+                 ("environment", "waiting_environment", "wait_condition"), ("implementation", "needs_fix", "resume_fix")]
+        for kind, state, action in pairs:
+            self.stored_job(kind, {"status": "completed", "structured": self.sample_report(blockers=[self.blocker(kind)])})
+            value = self.control("status", kind)
+            self.assertEqual(value["blocking"]["state"], state)
+            self.assertEqual(value["blocking"]["next_action"], action)
+            self.assertEqual(value["blocking"]["questions"],
+                             [{"id": "b1", "question": "Which option?"}] if kind in ("user_input", "task_conflict") else [])
+            self.assertEqual(value["review_status"], "needs_attention")
+        self.stored_job("legacy-blocked", {"status": "completed", "structured": self.sample_report(
+            criteria=[{"criterion": "one", "status": "blocked", "evidence": "environment user input implementation"}])})
+        legacy = self.control("status", "legacy-blocked")
+        self.assertEqual(legacy["blocking"]["state"], "unclassified")
+        self.stored_job("resolution-hint", {"status": "completed", "structured": self.sample_report(
+            blockers=[self.blocker(resolution="Choose option A or B")])})
+        self.assertEqual(self.control("status", "resolution-hint")["blocking"]["state"], "needs_input")
+        self.stored_job("active", None)
+        self.assertEqual(self.control("status", "active")["blocking"]["state"], "running")
+        listing = self.control("list")
+        for item in listing["jobs"]:
+            self.assertEqual(item["blocking"], self.control("status", item["job_id"])["blocking"])
+
+    def test_blocking_summary_closed_and_needs_changes_replace_old_blockers(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        old = self.blocker()
+        base = {"status": "completed", "structured": self.sample_report(blockers=[old])}
+        for status in ("verified", "accepted_deviations"):
+            with self.subTest(status=status):
+                value = {**base, "verification_status": status,
+                         "verification": {"status": status, "blockers": [old]}}
+                self.assertEqual(codex_runner.blocking_summary(value),
+                                 {"state": "clear", "next_action": "done", "blockers": [], "questions": []})
+        for review in ({"status": "needs_changes"}, {"status": "needs_changes", "blockers": []}):
+            self.assertEqual(codex_runner.blocking_summary({**base, "verification": review}),
+                             {"state": "needs_fix", "next_action": "resume_fix", "blockers": [], "questions": []})
+        self.assertEqual(codex_runner.blocking_summary({**base, "verification_status": "needs_changes"}),
+                         {"state": "needs_fix", "next_action": "resume_fix", "blockers": [], "questions": []})
+        blocker = self.blocker("environment", resolution="wait for service")
+        changed = codex_runner.blocking_summary({**base, "verification_status": "needs_changes",
+                                               "verification": {"blockers": [blocker]}})
+        self.assertEqual(changed, {"state": "waiting_environment", "next_action": "wait_condition",
+                                   "blockers": [blocker], "questions": []})
+
+    def test_blocking_summary_inspection_has_priority_over_typed_questions(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        base = {"status": "completed", "structured": self.sample_report(blockers=[self.blocker()])}
+        cases = [{"status": "unknown"}, {"status": "monitor_failed"}, {"execution_status": "unknown"},
+                 {"error_kind": "unknown_job"}, {"error_kind": "bridge_error"}, {"error_kind": "invalid_record"},
+                 {"verification_status": "invalid"}, {"verification_status": "unknown"},
+                 {"report_status": "invalid"}, {"verification": {"blockers": None}},
+                 {"verification_status": "verified", "execution_status": "unknown"},
+                 {"verification_status": "verified", "verification": {"blockers": None}}]
+        for changes in cases:
+            with self.subTest(changes=changes):
+                result = codex_runner.blocking_summary({**base, **changes})
+                self.assertEqual((result["state"], result["next_action"]), ("unclassified", "inspect_report"))
+        running = codex_runner.blocking_summary({**base, "status": "running"})
+        self.assertEqual((running["state"], running["next_action"]), ("running", "wait"))
+
+    def test_blocking_summary_distinguishes_unmet_and_unclassified_criteria(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for status, state, action in (("met", "clear", "verify"), ("not_met", "needs_fix", "resume_fix"),
+                                      ("blocked", "unclassified", "inspect_report")):
+            with self.subTest(status=status):
+                report = self.sample_report(criteria=[{"criterion": "one", "status": status, "evidence": "checked"}])
+                self.assertEqual(codex_runner.blocking_summary({"status": "completed", "structured": report}),
+                                 {"state": state, "next_action": action, "blockers": [], "questions": []})
+        base = {"status": "completed", "structured": self.sample_report()}
+        for changes in ({"status": "failed"}, {"status": "cancelled"}, {"structured": None},
+                        {"structured": self.sample_report(unresolved=["remaining"])},
+                        {"context": {**self.sample_context(), "acceptance": ["one", "two"]}}):
+            with self.subTest(changes=changes):
+                result = codex_runner.blocking_summary({**base, **changes})
+                self.assertEqual((result["state"], result["next_action"]), ("unclassified", "inspect_report"))
+
+    def test_blocking_summary_only_user_and_conflict_blockers_supply_questions(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        blockers = [self.blocker(kind, id=kind) for kind in ("implementation", "environment", "user_input", "task_conflict")]
+        base = {"status": "completed", "structured": self.sample_report(blockers=blockers)}
+        result = codex_runner.blocking_summary(base)
+        self.assertEqual((result["state"], result["next_action"]), ("needs_input", "ask_user"))
+        self.assertEqual(result["questions"], [{"id": b["id"], "question": b["question"]} for b in blockers[2:]])
+        for selected, state, action in ((blockers[:1], "needs_fix", "resume_fix"),
+                                        (blockers[:2], "waiting_environment", "wait_condition")):
+            result = codex_runner.blocking_summary({**base, "structured": self.sample_report(blockers=selected)})
+            self.assertEqual((result["state"], result["next_action"]), (state, action))
+            self.assertEqual(result["questions"], [])
+        self.assertEqual(codex_runner.blocking_summary({"status": "completed", "report": base["structured"]}),
+                         codex_runner.blocking_summary(base))
+
+    def test_review_summary_flags_blockers_even_when_every_criterion_is_met(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for kind in ("user_input", "task_conflict", "environment", "implementation"):
+            with self.subTest(kind=kind):
+                report = self.sample_report(blockers=[self.blocker(kind, resolution="proposed remedy")])
+                result = codex_runner.review_summary({"status": "completed", "structured": report})
+                self.assertEqual(result["criteria_counts"], {"met": 1, "not_met": 0, "blocked": 0})
+                self.assertEqual(result["review_status"], "needs_attention")
+
+    def test_continuation_retains_permissions_and_filters_without_listing_answers(self):
+        context = {**self.sample_context(), "continuation": {"parent_job_id": "parent-1",
+                   "answers": [{"id": "b1", "answer": "private answer"}], "resolution": "use option A"}}
+        envelope = json.dumps({"prompt": "continue", "context": context})
+        started = self.invoke("--context-json", "--sandbox", "danger-full-access", "--writable-root", str(self.cwd),
+                              "--use-user-config", "--effort", "high", "--resume", "thread-parent", prompt=envelope,
+                              command="start")
+        value = self.control("status", started["job_id"], "--wait", "30")
+        self.assertEqual(value["context"], context)
+        self.assertEqual(value["sandbox"], "danger-full-access")
+        self.assertEqual(value["task_options"], {"writable_roots": [str(self.cwd)], "use_user_config": True, "effort": "high"})
+        self.stored_job("unrelated", {"status": "completed", "thread_id": "different"}, context=self.sample_context())
+        listing = self.control("list", "--parent-job", "parent-1", "--thread-id", "thread-1")
+        self.assertEqual([j["job_id"] for j in listing["jobs"]], [started["job_id"]])
+        self.assertEqual(listing["jobs"][0]["parent_job_id"], "parent-1")
+        self.assertNotIn("private answer", json.dumps(listing))
+        self.assertNotIn("answers", json.dumps(listing))
+        self.assertEqual(self.control("list", "--thread-id", "missing")["total"], 0)
+        for continuation in (None, {}, {**context["continuation"], "parent_job_id": "../escape"},
+                             {**context["continuation"], "answers": [{"id": "b", "answer": ""}]},
+                             {**context["continuation"], "extra": True},
+                             {**context["continuation"], "answers": [{"id": "b", "answer": "a"}] * 2}):
+            bad = {**context, "continuation": continuation}
+            self.assertEqual(self.invoke("--context-json", prompt=json.dumps({"prompt": "x", "context": bad}))["error_kind"],
+                             "bad_arguments")
+
+    def test_independent_reviews_preserve_reports_and_close_attention(self):
+        report = self.sample_report(deviations=["Used another implementation"])
+        jd = self.stored_job("reviewed", {"status": "completed", "structured": report}, context=self.sample_context(),
+                             scope=["allowed"])
+        raw = json.loads((jd / "result.json").read_text("utf-8"))
+        raw["files_changed"] = [{"path": "outside.txt", "change": "modified"}]
+        (jd / "result.json").write_text(json.dumps(raw), "utf-8")
+        (jd / "last_message.txt").write_text(json.dumps(report), "utf-8")
+        originals = [(jd / name).read_bytes() for name in ("result.json", "last_message.txt")]
+        self.assertEqual(self.control("status", jd.name)["verification_status"], "unreviewed")
+        changes = self.sample_review(status="needs_changes", criteria=[{"index": 1, "status": "not_met", "evidence": "fails"}])
+        value = self.submit_review(jd.name, changes)
+        self.assertEqual(value["verification_status"], "needs_changes")
+        missing_scope = self.sample_review(status="accepted_deviations", accepted_deviations=[
+            {"kind": "reported", "index": 1, "evidence": "within acceptance"}])
+        self.assertEqual(self.submit_review(jd.name, missing_scope)["error_kind"], "bad_arguments")
+        passing = {**missing_scope, "accepted_deviations": [*missing_scope["accepted_deviations"],
+                   {"kind": "scope", "index": 1, "evidence": "outside file is intended"}]}
+        value = self.submit_review(jd.name, passing, reviewer="reviewer-b")
+        self.assertEqual(value["verification_status"], "accepted_deviations")
+        self.assertEqual(value["blocking"]["state"], "clear")
+        self.assertEqual(value["review_status"], "needs_attention")
+        self.assertEqual(value["structured"], report)
+        self.assertEqual(value["verification"]["reviewer"], "reviewer-b")
+        self.assertIsInstance(value["verification"]["time"], float)
+        history = json.loads((jd / "reviews.json").read_text("utf-8"))
+        self.assertEqual(len(history["history"]), 2)
+        self.assertEqual(history["latest"], value["verification"])
+        self.assertEqual([(jd / name).read_bytes() for name in ("result.json", "last_message.txt")], originals)
+        self.assertEqual(self.control("list", "--needs-attention")["total"], 0)
+        self.assertEqual(self.control("list")["jobs"][0]["verification"], value["verification"])
+
+    def test_review_blockers_drive_continuation_questions_without_rewriting_report(self):
+        report = self.sample_report()
+        self.stored_job("review-blocked", {"status": "completed", "structured": report}, context=self.sample_context())
+        review = self.sample_review(status="needs_changes", blockers=[self.blocker("task_conflict")])
+        value = self.submit_review("review-blocked", review)
+        self.assertEqual(value["blocking"]["state"], "needs_input")
+        self.assertEqual(value["blocking"]["questions"], [{"id": "b1", "question": "Which option?"}])
+        self.assertEqual(value["structured"], report)
+        self.assertEqual(value["review_status"], "needs_verification")
+        self.assertEqual(self.control("list", "--needs-attention")["total"], 1)
+        value = self.submit_review("review-blocked", self.sample_review())
+        self.assertEqual(value["blocking"]["state"], "clear")
+        self.assertEqual(value["blocking"]["questions"], [])
+
+    def test_invalid_report_cannot_hide_real_deviation_acknowledgements(self):
+        report = self.sample_report(deviations=["real deviation"], unrelated="invalidates report")
+        self.stored_job("invalid-deviations", {"status": "completed", "structured": report}, context=self.sample_context())
+        self.assertEqual(self.submit_review("invalid-deviations", self.sample_review())["error_kind"], "bad_arguments")
+        review = self.sample_review(accepted_deviations=[{"kind": "reported", "index": 1, "evidence": "assessed"}])
+        value = self.submit_review("invalid-deviations", review)
+        self.assertEqual(value["verification_status"], "verified")
+        self.assertEqual(value["report_status"], "invalid")
+
+    def test_reviews_require_real_acceptance_coverage_and_strict_decisions(self):
+        context = {**self.sample_context(), "acceptance": ["one", "two"]}
+        self.stored_job("coverage", {"status": "completed", "structured": self.sample_report()}, context=context)
+        self.assertEqual(self.submit_review("coverage", self.sample_review())["error_kind"], "bad_arguments")
+        complete = self.sample_review(criteria=[{"index": i, "status": "met", "evidence": "checked"} for i in (1, 2)])
+        invalid = [self.sample_review(criteria=[]), {**complete, "extra": True}, {**complete, "status": "pass"},
+                   {**complete, "notes": []}, {**complete, "blockers": [self.blocker()]},
+                   {**complete, "blockers": [self.blocker(resolution="need a decision")]},
+                   {**complete, "status": "accepted_deviations", "blockers": [self.blocker()]},
+                   {**complete, "status": "accepted_deviations", "blockers": [self.blocker(resolution="need a decision")]},
+                   {**complete, "accepted_deviations": [{"kind": "reported", "index": 1, "evidence": "invented"}]}]
+        for field, bad in (("index", True), ("index", 0), ("index", 3), ("status", "not_met"), ("evidence", " ")):
+            invalid.append({**complete, "criteria": [{**complete["criteria"][0], field: bad}, complete["criteria"][1]]})
+        invalid.append({**complete, "criteria": [complete["criteria"][0]] * 2})
+        for review in invalid:
+            with self.subTest(review=review):
+                self.assertEqual(self.submit_review("coverage", review)["error_kind"], "bad_arguments")
+        self.assertEqual(self.submit_review("coverage", complete)["verification_status"], "verified")
+        self.stored_job("legacy-review", {"status": "completed", "structured": self.sample_report()})
+        self.assertEqual(self.submit_review("legacy-review", self.sample_review())["verification_status"], "verified")
+        self.stored_job("running-review", None, context=self.sample_context())
+        for identifier in ("running-review", "missing", "../coverage"):
+            self.assertEqual(self.submit_review(identifier, self.sample_review())["error_kind"], "bad_arguments")
+
+    def test_corrupt_review_history_never_passes_or_gets_overwritten(self):
+        jd = self.stored_job("corrupt-review", {"status": "completed", "structured": self.sample_report()},
+                             context=self.sample_context())
+        entry = {**self.sample_review(), "reviewer": "reviewer-a", "time": time.time()}
+        bad_entry = {**entry, "criteria": []}
+        corruptions = ["not JSON", "[]", "{}", json.dumps({"history": [], "latest": entry}),
+                       json.dumps({"history": [entry], "latest": None}),
+                       json.dumps({"history": [bad_entry, entry], "latest": entry}),
+                       json.dumps({"history": [{**entry, "time": "now"}], "latest": {**entry, "time": "now"}})]
+        for content in corruptions:
+            (jd / "reviews.json").write_text(content, "utf-8")
+            with self.subTest(content=content[:70]):
+                status = self.control("status", jd.name)
+                self.assertEqual(status["status"], "completed")
+                self.assertEqual(status["verification_status"], "invalid")
+                self.assertIn("verification_error", status)
+                listing = self.control("list", "--needs-attention")
+                self.assertEqual(listing["jobs"][0]["verification_status"], "invalid")
+                self.assertEqual(self.submit_review(jd.name, self.sample_review())["error_kind"], "bad_arguments")
+                self.assertEqual((jd / "reviews.json").read_text("utf-8"), content)
+
+    def test_review_artifact_pages_unicode_and_enforces_artifact_boundary(self):
+        jd = self.stored_job("review-output", {"status": "completed", "structured": self.sample_report()})
+        self.submit_review(jd.name, self.sample_review(notes="汉😀" * 5000))
+        pages = []
+        offset = 0
+        while True:
+            page = self.control("output", jd.name, "--artifact", "review", "--offset", str(offset))
+            self.assertEqual(page["status"], "completed")
+            pages.append(page["text"])
+            if page["eof"]:
+                break
+            offset = page["next_offset"]
+        self.assertEqual(json.loads("".join(pages))["latest"]["notes"], "汉😀" * 5000)
+        outside = Path(self.tmp.name) / "external-review.json"
+        outside.write_text((jd / "reviews.json").read_text("utf-8"), "utf-8")
+        (jd / "reviews.json").unlink()
+        try:
+            (jd / "reviews.json").symlink_to(outside)
+        except OSError as e:
+            if os.name == "nt":
+                self.skipTest(f"file symlink is unavailable: {e}")
+            raise
+        self.assertEqual(self.control("output", jd.name, "--artifact", "review")["error_kind"], "invalid_artifact")
+        self.assertEqual(self.control("status", jd.name)["verification_status"], "invalid")
+        original = outside.read_bytes()
+        self.assertEqual(self.submit_review(jd.name, self.sample_review())["error_kind"], "bad_arguments")
+        self.assertEqual(outside.read_bytes(), original)
+
+    def test_summary_groups_all_rounds_and_uses_latest_cumulative_usage(self):
+        for i, tokens in enumerate((10, 25, 40), 1):
+            result = {"status": "completed", "thread_id": "shared-thread", "duration_s": i,
+                      "usage": {"input_tokens": tokens, "output_tokens": i}, "structured": self.sample_report(summary=f"round {i}"),
+                      "files_changed": [{"path": f"file-{i}.txt", "change": "modified"}]}
+            if i > 1:
+                result["usage_scope"] = "thread_total"
+            jd = self.stored_job(f"round-{i}", result, context=self.sample_context())
+            os.utime(jd / "args.json", (1000 + i, 1000 + i))
+        for name in ("threadless-a", "threadless-b"):
+            self.stored_job(name, {"status": "completed", "structured": self.sample_report()}, context=self.sample_context())
+        result = self.control("summary", "--thread-id", "shared-thread", "--round-limit", "1")
+        self.assertEqual(result["total_jobs"], 3)
+        group = result["groups"][0]
+        self.assertEqual(group["group_id"], "thread:shared-thread")
+        self.assertEqual(group["job_ids"], ["round-1", "round-2", "round-3"])
+        self.assertEqual(group["total_rounds"], 3)
+        self.assertEqual(len(group["rounds"]), 1)
+        self.assertTrue(group["rounds_truncated"])
+        self.assertEqual(group["latest_job_id"], "round-3")
+        self.assertEqual(group["summary"], "round 3")
+        self.assertEqual(group["finished_duration_s"], 6)
+        self.assertEqual(group["usage"], {"input_tokens": 40, "output_tokens": 3})
+        self.assertEqual(group["files_changed"], ["file-1.txt", "file-2.txt", "file-3.txt"])
+        all_groups = self.control("summary")["groups"]
+        self.assertEqual(len(all_groups), 3)
+        self.assertTrue(all(g["usage"] is None for g in all_groups if not g["thread_id"]))
+        self.assertEqual(self.control("summary", "--job-id", "round-2")["total_jobs"], 1)
+        self.assertEqual(self.control("summary", "--owner", "missing")["total_jobs"], 0)
+        self.assertEqual(self.control("summary", "--cwd", str(self.cwd / "elsewhere"))["total_jobs"], 0)
+        self.assertEqual(self.control("summary", "--round-limit", "0")["error_kind"], "bad_arguments")
+        latest = self.stored_job("round-4", {"status": "completed", "thread_id": "shared-thread",
+                                            "usage": {"input_tokens": 50}, "structured": self.sample_report()})
+        os.utime(latest / "args.json", (1004, 1004))
+        self.assertIsNone(self.control("summary", "--thread-id", "shared-thread")["groups"][0]["usage"])
+        self.assertEqual(self.control("summary", "--job-id", "round-4")["groups"][0]["usage"], {"input_tokens": 50})
+
+    def test_summary_usage_requires_latest_cumulative_scope_for_multiple_rounds(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        earlier = {"thread_id": "thread", "usage_scope": "thread_total", "usage": {"input_tokens": 10}}
+        latest = {"thread_id": "thread", "usage": {"input_tokens": 25}}
+        for scope in (None, "unknown", "turn"):
+            with self.subTest(scope=scope):
+                self.assertIsNone(codex_runner.summary_usage([earlier, {**latest, "usage_scope": scope}]))
+        self.assertEqual(codex_runner.summary_usage([earlier, {**latest, "usage_scope": "thread_total"}]), latest["usage"])
+        for usage in (None, {}, [], {"input_tokens": "unknown"}):
+            with self.subTest(usage=usage):
+                self.assertIsNone(codex_runner.summary_usage([
+                    earlier, {**latest, "usage_scope": "thread_total", "usage": usage}]))
+        for job in (latest, {"usage": {"input_tokens": 3}}):
+            self.assertEqual(codex_runner.summary_usage([job]), job["usage"])
+        self.assertIsNone(codex_runner.summary_usage([]))
+
+    def test_summary_unknown_usage_stays_unknown_and_review_controls_open_items(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        self.assertIsNone(codex_runner.summary_usage([{"usage": {"input_tokens": 2}},
+                                                    {"usage": {"input_tokens": 3}}]))
+        self.assertIsNone(codex_runner.summary_usage([{"usage": {"input_tokens": 2}}, {}]))
+        self.assertIsNone(codex_runner.summary_usage([{"usage": {"input_tokens": 2, "output_tokens": 1}},
+                                                    {"usage": {"input_tokens": 3}}]))
+        self.assertIsNone(codex_runner.summary_usage([{"usage_scope": "thread_total", "usage": {"input_tokens": 8}},
+                                                    {"usage_scope": "thread_total", "usage": None}]))
+        jd = self.stored_job("summary-review", {"status": "completed", "structured": self.sample_report(unresolved=["check manually"])},
+                             context=self.sample_context())
+        self.assertEqual(self.control("summary")["groups"][0]["open_items"]["unresolved"], ["check manually"])
+        blocker = self.blocker("environment", resolution="wait for service recovery")
+        self.submit_review(jd.name, self.sample_review(status="needs_changes", blockers=[blocker]))
+        group = self.control("summary")["groups"][0]
+        self.assertEqual(group["latest_job"]["blocking"]["state"], "waiting_environment")
+        self.assertEqual(group["open_items"]["blockers"], [blocker])
+        self.submit_review(jd.name, self.sample_review())
+        group = self.control("summary")["groups"][0]
+        self.assertEqual(group["verification_status"], "verified")
+        self.assertTrue(all(not items for items in group["open_items"].values()))
+
     def test_context_envelope_round_trips_large_unicode_without_argv(self):
         context = self.sample_context()
         context["task"] += "上下文😀" * 20000

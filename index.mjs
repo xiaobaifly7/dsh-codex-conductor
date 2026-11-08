@@ -3,7 +3,7 @@
 // 执行交给随包附带的 runner/codex_runner.py，在 WSL 里运行（超时、断线、重试、写锁、
 // 按 thread 续跑、改动快照都在那里）。本插件负责：
 //   · 结构化派活：codex_run 的任务、必填验收标准、执行约束和允许范围经 stdin 交给 runner，
-//     要求 Codex 按 report.schema.json 逐条回报；结果里标出自报未满足、偏离计划和范围外的改动
+//     要求 Codex 按 report.v2.schema.json 逐条回报；结果里标出自报未满足、偏离计划和范围外的改动
 //   · 等待与取消：start 后立即登记 DSH 后台任务（任务表里看得到进度和结束摘要），经任务表等结果；
 //     到点仍在执行就留在后台，Codex 结束后 DSH 发任务通知，agent 再读结果（没有 jobs 服务就用有界的 `status --wait` 照旧轮询）；
 //     中途停止时在 WSL 里 cancel，Linux 侧进程树由 runner 自己清理（taskkill wsl.exe 清不到）
@@ -17,6 +17,10 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { validBlockers, blockingState, prepareContinuation } from './workflow.mjs';
+import { runtimeIdentity, registerRuntimeTool } from './runtime.mjs';
+
+const loadedIdentity = runtimeIdentity(import.meta.url);
 
 export const name = 'codex-conductor';
 // systemPrompt 不列为依赖（这里的 inject 每一项都是必需的），用 ctx.get 取：有就注入规划要求，没有照样能用其余功能
@@ -43,9 +47,10 @@ const DEFAULTS = {
   // 省略 host_access 时默认使用主机模式，仍须开启 allowHostAccess
   defaultHostAccess: false,
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
-  reportSchema: here('./report.schema.json'),
+  reportSchema: here('./report.v2.schema.json'),
   // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
   plannerPromptFile: '',
+  runtimeProfileFile: '',
 };
 
 const PLANNER_TEMPLATE = `<!--
@@ -635,6 +640,7 @@ export function createConductor(cfg, run = runRunner) {
   async function list(filters = {}, signal) {
     const argv = ['list', '--limit', String(filters.limit ?? 20), '--offset', String(filters.offset ?? 0)];
     for (const key of ['cwd', 'owner', 'status']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
+    for (const [key, flag] of [['thread_id', '--thread-id'], ['parent_job', '--parent-job']]) if (filters[key] !== undefined) argv.push(flag, filters[key]);
     if (filters.needs_attention) argv.push('--needs-attention');
     for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
     return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
@@ -645,7 +651,20 @@ export function createConductor(cfg, run = runRunner) {
       { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
 
-  return { start, waitJob, cancel, list, output };
+  async function review(jobId, review, reviewer, signal) {
+    return run(cfg, ['review', jobId, '--reviewer', reviewer],
+      { stdin: JSON.stringify(review), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  }
+
+  async function summary(filters = {}, signal) {
+    const argv = ['summary'];
+    for (const key of ['cwd', 'owner']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
+    if (filters.thread_id !== undefined) argv.push('--thread-id', filters.thread_id);
+    for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
+    return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  }
+
+  return { start, waitJob, cancel, list, output, review, summary };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
@@ -667,6 +686,9 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '\n## 最后汇报\n最终答复只输出符合给定 JSON 格式的对象：summary 概述结果；criteria 按上面的顺序逐条给出 ' +
     'status（met / not_met / blocked）和 evidence（具体证据：命令与输出、文件与行号）；files_changed 列出改动的文件；' +
     'deviations 列出与计划不一致的地方及原因（没有就空数组）；unresolved 列出没解决的问题。\n' +
+    'blockers 列出真实阻塞，没有就 []；每项包含唯一 id、kind、message、question、resolution 五个字符串。' +
+    'kind 只用 user_input（缺用户信息）、task_conflict（任务冲突需用户取舍）、environment（环境条件未满足）、implementation（实现待修）。' +
+    '前两类必须写清 question；其余没有问题时 question 留空，resolution 写已知解除条件，不确定原因时不要猜分类。\n' +
     '任务或验收标准里对最终答复版式的要求（如单独的结论行）写进 summary 即算满足，不算偏离，也不要因此标 blocked。\n';
 }
 
@@ -712,7 +734,8 @@ export function reviewState(value) {
   for (const item of criteria) if (Object.hasOwn(counts, item?.status)) counts[item.status]++;
   const fields = ['summary', 'criteria', 'files_changed', 'deviations', 'unresolved'];
   const valid = report && typeof report === 'object' && !Array.isArray(report) &&
-    fields.every((key) => Object.hasOwn(report, key)) && Object.keys(report).every((key) => fields.includes(key)) &&
+    fields.every((key) => Object.hasOwn(report, key)) && Object.keys(report).every((key) => fields.includes(key) || key === 'blockers') &&
+    (!Object.hasOwn(report, 'blockers') || validBlockers(report.blockers)) &&
     typeof report.summary === 'string' && Array.isArray(report.criteria) &&
     ['files_changed', 'deviations', 'unresolved'].every((key) => Array.isArray(report[key]) && report[key].every((s) => typeof s === 'string')) &&
     criteria.every((c) => c && typeof c.criterion === 'string' && typeof c.evidence === 'string' && Object.hasOwn(counts, c.status) &&
@@ -724,7 +747,7 @@ export function reviewState(value) {
     : report === undefined ? 'missing' : valid ? 'valid' : 'invalid';
   const expected = value.acceptance ?? value.context?.acceptance;
   const attention = execution !== 'completed' || reportStatus !== 'valid' || counts.not_met > 0 || counts.blocked > 0 ||
-    report?.unresolved?.length > 0 || report?.deviations?.length > 0 || value.out_of_scope?.length > 0 ||
+    report?.unresolved?.length > 0 || report?.deviations?.length > 0 || report?.blockers?.length > 0 || value.out_of_scope?.length > 0 ||
     (Array.isArray(expected) && expected.length !== criteria.length);
   return { execution_status: execution, report_status: reportStatus,
     review_status: pending ? 'pending' : attention ? 'needs_attention' : 'needs_verification', criteria_counts: counts };
@@ -740,20 +763,19 @@ export function withReport(value) {
   Object.assign(rest, reviewState({ ...rest, ...(structured !== undefined ? { structured } : {}) }));
   if (rest.status === 'failed' && rest.error_kind === 'schema_invalid') {
     const { error_kind: _kind, error: _error, retryable: _retryable, ...done } = rest;
-    return { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' };
+    const value = { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' };
+    return { ...value, blocking: blockingState(value) };
   }
-  if (structured === undefined) return rest;
+  if (structured === undefined) return { ...rest, blocking: blockingState(rest) };
   const lists = ['criteria', 'files_changed', 'deviations', 'unresolved'];
   if (!structured || typeof structured !== 'object' || Array.isArray(structured) ||
       lists.some((key) => structured[key] !== undefined && !Array.isArray(structured[key])) ||
       (structured.criteria ?? []).some((c) => !c || typeof c !== 'object' || Array.isArray(c))) {
-    return { ...rest, report_note: 'Codex 汇报字段格式不正确，核验时以 final_message 和实际文件为准。' };
+    return { ...rest, blocking: blockingState(rest), report_note: 'Codex 汇报字段格式不正确，核验时以 final_message 和实际文件为准。' };
   }
-  return { ...rest, report: structured };
+  const normalized = { ...rest, report: structured };
+  return { ...normalized, blocking: blockingState(normalized) };
 }
-
-// 受阻条目里提到这些，可能是沙箱里的 Codex 启动不了 Windows 程序
-const WINDOWS_BLOCK = /\.exe\b|interop|Hyper-V|cmdlet|Windows 程序/i;
 
 // 汇报条数和验收标准一致、编号也对得上时，逐条汇报显示验收标准原文（Codex 几乎总会改写条目），下一步不再重复列出。
 // 编号认 1. / 1) / 1、 / 1: / 第1条，NFKC 先把全角数字和标点换成半角
@@ -766,9 +788,8 @@ function sameCriteria(report, acceptance) {
 }
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
-// hostAccess：插件开了 allowHostAccess 时，Windows 程序受阻就提示带 host_access=true 派回，否则提示自己跑
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
-export function nextStep(value, acceptance, resumed, { hostAccess = false, readOnly = value.context?.write === false || value.sandbox === 'read-only' } = {}) {
+export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only' } = {}) {
   acceptance ??= value.acceptance ?? value.context?.acceptance;
   if (!value.job_id && unknownState(value)) {
     return '这次未取得任务编号，无法确认 Codex 是否已经启动。先用 codex_jobs 按相同任务目录和原任务核对近期记录，找回 job_id 后再查状态，不要直接重派。';
@@ -783,7 +804,17 @@ export function nextStep(value, acceptance, resumed, { hostAccess = false, readO
     return 'Codex 任务已取消（用户停止、会话归档或调用中止）：不要自行续跑或重派，先问用户。' +
       '如果这是可写任务，取消前可能已改了部分文件且没有改动清单，核验前先用 git status 或对比文件确认现状。';
   }
-  // 只读任务用 --ephemeral 运行、不留会话记录，自己的 thread_id 续不上；只有它续跑的写任务线程还能续
+  const blocking = blockingState(value);
+  if (value.status === 'completed' || blocking.blockers.length || ['verified', 'accepted_deviations', 'needs_changes', 'invalid'].includes(value.verification_status)) {
+    if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
+    if (blocking.next_action === 'ask_user') return '先向用户提出以下具体问题，取得回答后用 codex_continue 提交 answers；不要重复派活或替用户决定：\n' +
+      blocking.questions.map((q) => `${q.id}: ${q.question}`).join('\n');
+    if (blocking.next_action === 'wait_condition') return '当前受环境条件阻塞。先说明 blockers 中的解除条件；条件改变并取得证据后，用 codex_continue 的 resolution 说明事实再续跑，不要原样重试。';
+    if (blocking.next_action === 'inspect_report') return '阻塞原因未分类或报告不完整。先读完整报告和实际状态，查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。' +
+      (value.out_of_scope?.length ? `\n范围外改动待核实：${value.out_of_scope.join('、')}。快照也可能包含其他进程写的文件，先核实归属，不能仅凭快照认定 Codex 越界。` : '');
+    if (blocking.next_action === 'resume_fix') return '已有明确实现差距。用 codex_continue 续接原任务，它会保留原目录、验收、write、scope 和主机权限；不得借修正扩大授权。';
+  }
+  // 只读任务用 --ephemeral 运行；只有它续跑的写任务线程还能续。
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
     if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
@@ -795,15 +826,7 @@ export function nextStep(value, acceptance, resumed, { hostAccess = false, readO
   }
   const report = value.report ?? {};
   const original = sameCriteria(report, acceptance);
-  const flagged = (report.criteria ?? []).map((c, i) => [c, i]).filter(([c]) => c.status !== 'met');
   const alerts = [
-    flagged.length ? `Codex 自报有 ${flagged.length} 条未满足或受阻：` +
-      flagged.map(([c, i]) => `${original ? `第 ${i + 1} 条` : c.criterion}（${c.status}）`).join('；') : '',
-    // 只读任务改不了文件，实际受阻常因 write 传了 false
-    flagged.length && readOnly ? '这是只读任务：受阻如果是因为不能改文件或建备份，派回时传 write=true' : '',
-    // 只看 blocked：not_met 多是结果不对（比如产出 .exe 的编译失败了），不是启动不了程序
-    value.sandbox !== 'danger-full-access' && flagged.some(([c]) => c.status === 'blocked' && WINDOWS_BLOCK.test(`${c.criterion} ${c.evidence}`))
-      ? `受阻条目提到 Windows 程序：如果确实是因为沙箱里的 Codex 启动不了它们，${hostAccess ? '派回时传 host_access=true' : '这类检查你自己跑'}` : '',
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',
     value.out_of_scope?.length ? `改动超出 scope：${value.out_of_scope.join('、')}。这份清单来自目录快照，可能含同时段其他进程写的文件（如定期日志）；` +
       '不在 Codex 自报 files_changed 里、明显来自其他进程的，只需一句说明，不算 Codex 越界，也不用请用户决定；其余的先核实是否应保留；' +
@@ -813,10 +836,8 @@ export function nextStep(value, acceptance, resumed, { hostAccess = false, readO
   const where = original ? '上面逐条汇报里的验收标准' : list ? '下面的验收标准' : '验收标准';
   return (alerts.length ? `${alerts.join('\n')}\n偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。\n` : '') +
     `Codex 的答复不是完成证据。用只读检查逐条核验${where}，给出每条的证据；` +
-    // resume 不继承沙箱：漏传 host_access 会回到沙箱，Codex 又启动不了 Windows 程序
-    `有任何一条不通过，就写清差距，${resumable ? `用 codex_run 带 resume="${value.thread_id ?? ''}"` +
-      `${value.sandbox === 'danger-full-access' ? ' 和 host_access=true' : ''} 派回修正`
-      : '用 codex_run 重新派一个写全背景的完整任务（只读任务不留会话，不能 resume）'}。${list ? `\n${list}` : ''}`;
+    '核验后用 codex_review 逐条记录证据：全部通过用 verified，有差距用 needs_changes，明确接受偏差用 accepted_deviations。' +
+    `有差距时先记录 needs_changes，再用 codex_continue 在原权限内修正。${list ? `\n${list}` : ''}`;
 }
 
 const MARK = { met: '✓', not_met: '✗', blocked: '⛔' };
@@ -832,8 +853,10 @@ function summaryLine(value) {
   const done = value.status === 'completed';
   return [String(value.status), done ? counts : value.error_kind, done && files !== undefined && `${files} files`,
     typeof value.duration_s === 'number' && `${Math.round(value.duration_s)} s`,
-    done && value.review_status === 'needs_attention' && '待关注',
-    done && value.review_status === 'needs_verification' && '待核验',
+    ['verified', 'accepted_deviations'].includes(value.verification_status) && `已核验 ${value.verification_status}`,
+    done && !['verified', 'accepted_deviations'].includes(value.verification_status) && value.review_status === 'needs_attention' && '待关注',
+    done && !['verified', 'accepted_deviations'].includes(value.verification_status) && value.review_status === 'needs_verification' && '待核验',
+    done && value.verification_status === 'needs_changes' && '核验待修',
     done && value.report_status === 'invalid' && '报告异常'].filter(Boolean).join(' · ');
 }
 
@@ -852,7 +875,12 @@ function details(rest) {
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
     (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
   return [rest.cwd && `任务目录：${rest.cwd}`, files,
-    rest.execution_status && `执行：${rest.execution_status}；报告：${rest.report_status}；验收：${rest.review_status}`,
+    rest.execution_status && `执行：${rest.execution_status}；报告：${rest.report_status}；执行端自报检查：${rest.review_status}`,
+    rest.verification_status && `独立核验：${rest.verification_status}${rest.verification?.reviewer ? `；核验人：${rest.verification.reviewer}` : ''}`,
+    rest.verification_error && `核验记录异常：${rest.verification_error}`,
+    rest.verification?.notes && `核验说明：${rest.verification.notes}`,
+    ...(rest.verification?.criteria ?? []).map((c) => `核验第 ${c.index} 条 ${c.status}：${c.evidence}`),
+    rest.usage && `用量（${rest.usage_scope ?? '统计范围未知'}，不是费用）：${JSON.stringify(rest.usage)}`,
     rest.report_note].filter(Boolean);
 }
 
@@ -869,18 +897,21 @@ function render(value) {
   };
   const original = sameCriteria(report, acceptance);
   const reportLines = report ? [
-    '--- Codex 逐条汇报 ---', `概述：${report.summary ?? ''}`,
+    '--- Codex 逐条汇报（保留原记录）---', `概述：${report.summary ?? ''}`,
     ...(report.criteria ?? []).map((c, i) => `${MARK[c.status] ?? '?'} ${i + 1}. ${original ? acceptance[i] : c.criterion} —— ${clip(c.evidence)}`),
     `自报改动：${report.files_changed?.join('、') || '无'}`,
     `偏离计划：${report.deviations?.join('；') || '无'}`,
     `未解决：${report.unresolved?.join('；') || '无'}`,
   ] : [];
   const extra = details(rest);
+  const blockers = value?.blocking ?? blockingState(value);
   return [{ type: 'text', text: [
     `${summaryLine(value ?? {})}${rest.job_id ? `  job_id: ${rest.job_id}` : ''}${rest.thread_id ? `  thread_id: ${rest.thread_id}` : ''}`,
     ...(report ? reportLines
       : answer ? [`--- Codex 最终答复${rest.truncated ? `（超过 8000 字已截断，全文见 ${full}）` : ''} ---`, answer] : []),
     ...(extra.length ? ['--- 详细字段 ---', ...extra] : []),
+    ...(blockers.blockers.length ? ['--- 阻塞与待回答问题 ---', ...blockers.blockers.map((b) =>
+      `${b.id} [${b.kind}] ${b.message}${b.question ? `\n需要回答：${b.question}` : ''}${b.resolution ? `\n解除条件/已有信息：${b.resolution}` : ''}`)] : []),
     ...(next ? ['--- 下一步 ---', next] : []),
   ].join('\n') }];
 }
@@ -978,6 +1009,7 @@ const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 export function apply(ctx, config = {}, run = runRunner) {
   const cfg = settings(config, ctx.logger);
   const conductor = createConductor(cfg, run);
+  let dispatching = 0;
 
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
@@ -1154,6 +1186,44 @@ export function apply(ctx, config = {}, run = runRunner) {
         '在此之前不要自己动手补做，也不要重复派同一个任务。' };
   }
 
+  async function dispatch(args, exec, continuation, originalTask = args.task) {
+    validateRun(args);
+    if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
+      throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
+    }
+    const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
+    if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
+    const finish = (result) => {
+      const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);
+      const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
+      Object.assign(value, reviewState(value));
+      value.blocking = blockingState(value);
+      const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
+        ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
+      return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
+        { readOnly: args.write !== true }) + reminder };
+    };
+    // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
+    exec?.signal?.throwIfAborted();
+    let started;
+    dispatching++;
+    try {
+      started = await conductor.start(args, cwd, undefined, {
+        owner: exec?.agent?.id ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
+        ...(continuation ? { continuation } : {}),
+      });
+    } finally { dispatching--; }
+    if (exec?.signal?.aborted) {
+      if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
+      exec.signal.throwIfAborted();
+    }
+    const label = `Codex ${started.job_id} · ${taskLine(args, 40)}`;
+    const value = started.status === 'running' && started.job_id
+      ? await collect(started.job_id, background(started.job_id, exec, finish, label), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
+      : withReport(started);
+    return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
+  }
+
   ctx.tools.register({
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
@@ -1199,41 +1269,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       required: ['task', 'acceptance', 'write'],
     },
     output: OUTPUT,
-    async execute(args, exec) {
-      validateRun(args);
-      if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
-        throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
-      }
-      const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
-      if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
-      const finish = (result) => {
-        const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);
-        const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
-        Object.assign(value, reviewState(value));
-        // 每轮结果都提醒一次规划要求：DeepSeek 正要据此规划下一次派活
-        const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
-          ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
-        return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
-          { hostAccess: cfg.allowHostAccess === true, readOnly: args.write !== true }) + reminder };
-      };
-      // 启动不随中止打断：runner 在打印 job_id 前就拉起了 Codex，这时杀掉 wsl.exe 会让 Codex 在 WSL 里没人管地跑下去；
-      // 等拿到 job_id 再按中止取消它
-      exec?.signal?.throwIfAborted();
-      const started = await conductor.start(args, cwd, undefined, {
-        owner: exec?.agent?.id ?? null,
-        task: args.task, acceptance: args.acceptance, write: args.write,
-      });
-      if (exec?.signal?.aborted) {
-        if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
-        exec.signal.throwIfAborted();
-      }
-      // 启动后立即登记后台任务（任务表里看得到进度），再经任务表等到 wait_seconds；没有后台任务时直接等 runner
-      const label = `Codex ${started.job_id} · ${taskLine(args, 40)}`;
-      const value = started.status === 'running' && started.job_id
-        ? await collect(started.job_id, background(started.job_id, exec, finish, label), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
-        : withReport(started);
-      return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
-    },
+    execute: dispatch,
   });
 
   ctx.tools.register({
@@ -1257,7 +1293,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
-      const finish = (value) => ({ ...value, next: nextStep(value, undefined, undefined, { hostAccess: cfg.allowHostAccess === true }) });
+      const finish = (value) => ({ ...value, next: nextStep(value) });
       const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
       return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
     },
@@ -1292,7 +1328,7 @@ export function apply(ctx, config = {}, run = runRunner) {
           `用 codex_jobs 核对正确 job_id，再用 codex_status 查询 ${args.job_id}；需要取消时可再调用 codex_cancel，不要重派。`;
       } else if (done.status === 'completed') {
         // 取消没赶上：任务已经完成，改动已经留下，按完成处理
-        next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done, undefined, undefined, { hostAccess: cfg.allowHostAccess === true })}`;
+        next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done)}`;
       } else if (done.status === 'cancelled') {
         next = '已按本次调用取消。可写任务可能已改了一部分且没有改动清单，核验或重派前先用 git status 或对比文件确认现状。';
       } else {
@@ -1301,6 +1337,35 @@ export function apply(ctx, config = {}, run = runRunner) {
       return { ...done, next };
     },
   });
+
+  async function historySelection(args, exec) {
+    for (const key of ['cwd', 'session_id', 'thread_id', 'parent_job']) if (args[key] !== undefined &&
+      (typeof args[key] !== 'string' || !args[key].trim())) throw new Error(`${key} 必须是非空字符串`);
+    const owner = args.session_id === 'current' ? exec?.agent?.id : args.session_id;
+    if (args.session_id && owner === undefined) throw new Error('当前调用没有会话 ID');
+    const cwd = args.cwd ?? (owner === undefined ? taskCwd({}, sessionCwd(exec), cfg.workspaces) : undefined);
+    if (cwd === undefined && owner === undefined) throw new Error('请传 cwd 或 session_id');
+    const historyOwner = owner ?? exec?.agent?.id;
+    let events = historyOwner === exec?.agent?.id ? exec?.agent?.session?.log ?? [] : [];
+    const query = owner !== undefined ? ctx.get?.('sessionQuery') : undefined;
+    const observation = query ? await query.observeSession(owner, { projectionMode: 'none', signal: exec?.signal }) : undefined;
+    let history;
+    try {
+      events = observation?.events ?? events;
+      history = events.filter((e) => e.seq >= (observation?.inheritedEventCount ?? 0) &&
+        e.type === 'job/registered' && e.data.kind === 'codex' && e.data.owner === historyOwner)
+        .map((e) => ({ id: e.data.jobId, owner: e.data.owner, kind: e.data.kind, label: e.data.label }));
+    } finally { observation?.[Symbol.dispose](); }
+    const native = ctx.get?.('jobs')?.list(historyOwner) ?? [];
+    const linked = new Map([...history, ...native].filter((j) => j.kind === 'codex').flatMap((j) => {
+      const match = /^Codex ([^\s·]+)/.exec(j.label ?? '');
+      return match ? [[match[1], j]] : [];
+    }));
+    const filters = Object.fromEntries(['status', 'needs_attention', 'limit', 'offset', 'thread_id', 'parent_job']
+      .filter((key) => args[key] !== undefined).map((key) => [key, args[key]]));
+    return { owner, linked, filters: { ...filters, ...(cwd !== undefined ? { cwd } : {}),
+      ...(owner !== undefined ? { owner, job_ids: [...linked.keys()] } : {}) } };
+  }
 
   ctx.tools.register({
     name: 'codex_jobs',
@@ -1315,6 +1380,8 @@ export function apply(ctx, config = {}, run = runRunner) {
         session_id: { type: 'string', description: 'Harness 会话 ID；current 表示当前会话。' },
         status: { type: 'string', enum: ['running', 'completed', 'cancelled', 'failed', 'unknown'], description: '按执行状态筛选。' },
         needs_attention: { type: 'boolean', description: '仅列出失败、取消、报告异常、受阻或有未解决事项的任务。' },
+        thread_id: { type: 'string', description: '仅查指定 Codex 线程。' },
+        parent_job: { type: 'string', description: '仅查从这个 runner job_id 续接的后续轮次。' },
         limit: { type: 'integer', minimum: 1, maximum: 100, description: '每页条数，默认 20。' },
         offset: { type: 'integer', minimum: 0, description: '分页起点，默认 0。' },
       },
@@ -1328,29 +1395,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (args.needs_attention !== undefined && typeof args.needs_attention !== 'boolean') throw new Error('codex_jobs: needs_attention 必须是布尔值');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new Error('codex_jobs: limit 必须是 1–100 的整数');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_jobs: offset 必须是非负整数');
-      const owner = args.session_id === 'current' ? exec?.agent?.id : args.session_id;
-      if (args.session_id && owner === undefined) throw new Error('codex_jobs: 当前调用没有会话 ID');
-      const cwd = args.cwd ?? (owner === undefined ? taskCwd({}, sessionCwd(exec), cfg.workspaces) : undefined);
-      if (cwd === undefined && owner === undefined) throw new Error('codex_jobs: 请传 cwd 或 session_id');
-      const historyOwner = owner ?? exec?.agent?.id;
-      let events = historyOwner === exec?.agent?.id ? exec?.agent?.session?.log ?? [] : [];
-      const query = owner !== undefined ? ctx.get?.('sessionQuery') : undefined;
-      const observation = query ? await query.observeSession(owner, { projectionMode: 'none', signal: exec?.signal }) : undefined;
-      let history;
-      try {
-        events = observation?.events ?? events;
-        history = events.filter((e) => e.seq >= (observation?.inheritedEventCount ?? 0) &&
-          e.type === 'job/registered' && e.data.kind === 'codex' && e.data.owner === historyOwner)
-          .map((e) => ({ id: e.data.jobId, owner: e.data.owner, kind: e.data.kind, label: e.data.label }));
-      } finally {
-        observation?.[Symbol.dispose]();
-      }
-      const native = ctx.get?.('jobs')?.list(historyOwner) ?? [];
-      const linked = new Map([...history, ...native].filter((j) => j.kind === 'codex').flatMap((j) => {
-        const match = /^Codex ([^\s·]+)/.exec(j.label ?? '');
-        return match ? [[match[1], j]] : [];
-      }));
-      const filters = { ...args, ...(cwd !== undefined ? { cwd } : {}), ...(owner !== undefined ? { owner, job_ids: [...linked.keys()] } : {}) };
+      const { filters, linked, owner } = await historySelection(args, exec);
       const value = await conductor.list(filters, exec?.signal);
       if (!Array.isArray(value.jobs)) return value;
       return { ...value, jobs: value.jobs.map((job) => {
@@ -1370,7 +1415,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: 'runner job_id；可用 codex_jobs 找回，不是 Harness 的 background_job_id。' },
-        artifact: { type: 'string', enum: ['report', 'result', 'context'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准。默认 report。' },
+        artifact: { type: 'string', enum: ['report', 'result', 'context', 'review'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准；review 独立核验历史。默认 report。' },
         offset: { type: 'integer', minimum: 0, description: 'Unicode 字符起点，默认 0。' },
         limit: { type: 'integer', minimum: 1, maximum: 8000, description: '每段最多字符数，默认 4000。' },
       },
@@ -1379,12 +1424,179 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: DATA_OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_output: job_id 无效');
-      if (args.artifact !== undefined && !['report', 'result', 'context'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
+      if (args.artifact !== undefined && !['report', 'result', 'context', 'review'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
       return conductor.output(args.job_id, args, exec?.signal);
     },
   });
+
+  const continuations = new Map();
+  ctx.tools.register({
+    name: 'codex_continue',
+    description: '在用户回答阻塞问题或环境条件已改变后续接原任务；先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
+      'answers 用阻塞问题的 id，resolution 说明环境变化或旧报告解除阻塞的事实。缺回答时只返回问题；原任务运行中、状态未知或已取消时不重派。' +
+      '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。',
+    presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
+    parameters: { type: 'object', properties: {
+      job_id: { type: 'string' },
+      answers: { type: 'array', items: { type: 'object', additionalProperties: false,
+        properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
+      resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
+      wait_seconds: { type: 'integer', minimum: 0 },
+    }, required: ['job_id'] },
+    output: OUTPUT,
+    async execute(args, exec) {
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_continue: job_id 无效');
+      const owner = exec?.agent?.id;
+      if (!owner) throw new Error('codex_continue: 当前调用没有会话 ID');
+      if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('wait_seconds 必须是非负整数');
+      const key = `${owner}:${args.job_id}`;
+      if (continuations.has(key)) return continuations.get(key);
+      const pending = (async () => {
+        const source = withReport(await conductor.waitJob(args.job_id, 0));
+        exec?.signal?.throwIfAborted();
+        if (source.context?.owner !== owner) throw new Error('codex_continue: 原任务归属未知或不属于当前会话');
+        const children = await conductor.list({ owner, parent_job: args.job_id, limit: 1 }, exec?.signal);
+        if (!Array.isArray(children.jobs)) throw new Error(`codex_continue: 无法核对已有续接：${children.error ?? children.status}`);
+        if (children.jobs.length) {
+          const child = withReport(await conductor.waitJob(children.jobs[0].job_id, 0));
+          const bg = liveBackground(child.job_id, exec);
+          return { ...child, reused: true, ...(bg ? { background_job_id: bg.id } : {}),
+            next: `原任务已有后续轮次 ${child.job_id}，没有重复派活。补充信息或修正请基于该轮次。\n${nextStep(child)}` };
+        }
+        const plan = prepareContinuation(source, args, owner);
+        if (!plan.ready) return { ...source, continuation_ready: false, blocking: plan.blocking,
+          remaining_questions: plan.remaining_questions, next: plan.next };
+        return dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
+          exec, plan.continuation, source.context.task);
+      })();
+      continuations.set(key, pending);
+      try { return await pending; } finally { continuations.delete(key); }
+    },
+  });
+
+  ctx.tools.register({
+    name: 'codex_review',
+    description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
+      'accepted_deviations=逐条通过且明确接受原报告偏差/范围外改动。不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
+    presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
+    parameters: { type: 'object', additionalProperties: false, properties: {
+      job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
+      criteria: { type: 'array', items: { type: 'object', additionalProperties: false,
+        properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
+          evidence: { type: 'string', minLength: 1 } }, required: ['index', 'status', 'evidence'] } },
+      notes: { type: 'string' },
+      accepted_deviations: { type: 'array', items: { type: 'object', additionalProperties: false,
+        properties: { kind: { type: 'string', enum: ['reported', 'scope'] }, index: { type: 'integer', minimum: 1 },
+          evidence: { type: 'string', minLength: 1 } }, required: ['kind', 'index', 'evidence'] } },
+      blockers: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
+        id: { type: 'string' }, kind: { type: 'string', enum: ['user_input', 'task_conflict', 'environment', 'implementation'] },
+        message: { type: 'string' }, question: { type: 'string' }, resolution: { type: 'string' },
+      }, required: ['id', 'kind', 'message', 'question', 'resolution'] } },
+    }, required: ['job_id', 'status', 'criteria', 'notes', 'accepted_deviations'] },
+    output: OUTPUT,
+    async execute(args, exec) {
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_review: job_id 无效');
+      const owner = exec?.agent?.id;
+      const source = await conductor.waitJob(args.job_id, 0);
+      if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
+      exec?.signal?.throwIfAborted();
+      const { job_id, ...review } = args;
+      const value = withReport(await conductor.review(job_id, review, owner, exec?.signal));
+      return { ...value, next: nextStep(value) };
+    },
+  });
+
+  ctx.tools.register({
+    name: 'codex_summary',
+    description: '只读汇总当前会话的多轮 Codex 任务；相同 thread_id 归为一组，无线程的独立列出。' +
+      '显示最新验收、待办、交付文件、累计已结束耗时和用量。thread_total 是线程累计值，不把每轮累计值重复相加。' +
+      '可传 cwd 查一个项目，或 session_id 查指定会话；不会启动或继续任务。',
+    presentCall: () => ({ card: 'generic', kind: 'read', title: 'Codex 多轮任务汇总' }),
+    parameters: { type: 'object', properties: {
+      cwd: { type: 'string' }, session_id: { type: 'string' }, thread_id: { type: 'string' },
+    } },
+    output: { schema: DATA_OUTPUT.schema, render: (_args, value) => [{ type: 'text', text: Array.isArray(value.groups)
+      ? [`Codex 汇总：${value.total} 组，${value.total_jobs} 轮；执行结束与独立验收分别显示。`, ...value.groups.map((g) =>
+        [`${g.thread_id ?? g.group_id} · ${g.total_rounds} 轮 · 最新 ${g.latest_job_id} · ${g.verification_status}`,
+          `目标：${taskLine(g.latest_job?.context, 160)}`, `最新结果：${g.summary ?? ''}`,
+          `交付文件：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
+          `已结束轮次耗时合计：${typeof g.finished_duration_s === 'number' ? `${Math.round(g.finished_duration_s)} 秒` : '未知'}；用量（${g.usage_scope}）：${g.usage == null ? '未知（原始用量不完整）' : JSON.stringify(g.usage)}`,
+          ...(g.rounds_truncated ? ['只展示最新轮次明细；总轮数、文件集合与耗时按全部匹配记录计算。'] : []),
+        ].join('\n'))].join('\n\n') : JSON.stringify(value, null, 2) }] },
+    async execute(args = {}, exec) {
+      const selected = args.cwd !== undefined || args.session_id !== undefined ? args : { session_id: 'current', ...args };
+      const { filters } = await historySelection(selected, exec);
+      return conductor.summary(filters, exec?.signal);
+    },
+  });
+
+  ctx.tools.register({
+    name: 'codex_watch',
+    description: '为当前会话登记安静的原生后台观察：attention 仅在失败、受阻、报告异常等重要变化时通知；all 也通知开始/正常完成。' +
+      '空闲时只观察 Harness 内存任务表，不反复启动 Codex 或唤醒模型。首次符合条件的变化后结束，需要继续观察可再调用。' +
+      '停止这个观察任务只停止观察，不取消 Codex。任务本身原有的结束通知仍保留。',
+    presentCall: () => ({ card: 'generic', kind: 'read', title: '安静观察 Codex' }),
+    parameters: { type: 'object', properties: { mode: { type: 'string', enum: ['attention', 'all'] } } },
+    output: DATA_OUTPUT,
+    async execute({ mode = 'attention' } = {}, exec) {
+      if (!['attention', 'all'].includes(mode)) throw new Error('codex_watch: mode 无效');
+      const jobs = ctx.get?.('jobs');
+      const owner = exec?.agent?.id;
+      if (!jobs || !owner) throw new Error('codex_watch: 需要 Harness 原生后台任务服务与当前会话 ID');
+      const label = `Codex 安静观察 · ${mode}`;
+      const existing = jobs.list(owner).find((j) => j.owner === owner && j.kind === 'codex-watch' && j.label === label && ['running', 'stopping'].includes(j.status));
+      if (existing) return { status: 'watching', background_job_id: existing.id, reused: true, mode };
+      const snapshot = () => new Map(jobs.list(owner).filter((j) => j.owner === owner && j.kind === 'codex').flatMap((j) => {
+        const id = /^Codex ([^\s·]+)/.exec(j.label ?? '')?.[1];
+        return id ? [[j.id, { job_id: id, status: j.status }]] : [];
+      }));
+      let baseline = snapshot();
+      const id = jobs.start({ owner, kind: 'codex-watch', label, outputLimitBytes: 32768,
+        run(handle) {
+          let stopped = false;
+          let timer;
+          let wake;
+          const done = (async () => {
+            handle.updateProgress('等待重要状态变化；无变化不唤醒模型');
+            while (!stopped) {
+              const current = snapshot();
+              const changes = [...current].filter(([id, item]) => baseline.get(id)?.status !== item.status);
+              for (const [id, item] of baseline) if (!current.has(id)) changes.push([id, { ...item, status: 'no_longer_listed' }]);
+              baseline = current;
+              const alerts = [];
+              for (const [backgroundId, item] of changes) {
+                if (mode === 'attention' && ['running', 'stopping'].includes(item.status)) continue;
+                // 观察中止不能传给 waitJob；它的 signal 代表取消业务任务。
+                const value = withReport(await conductor.waitJob(item.job_id, 0));
+                const closed = ['verified', 'accepted_deviations'].includes(value.verification_status);
+                const attention = !closed && (!['running', 'completed', 'cancelled'].includes(value.status) ||
+                  (value.status === 'completed' && (value.review_status === 'needs_attention' ||
+                    ['needs_changes', 'invalid'].includes(value.verification_status))));
+                if (mode === 'all' || attention) alerts.push({ job_id: item.job_id, background_job_id: backgroundId,
+                  status: value.status, summary: value.report?.summary ?? value.error ?? summaryLine(value),
+                  blocking: value.blocking, verification_status: value.verification_status, next: nextStep(value) });
+              }
+              if (stopped) break;
+              if (alerts.length) return { status: 'completed', detail: `${alerts.length} 个重要状态变化`,
+                result: JSON.stringify({ changes: alerts, note: '观察已结束；完整结果用 codex_output，多轮汇总用 codex_summary。' }, null, 2) };
+              await new Promise((resolve) => { wake = resolve; timer = setTimeout(resolve, 1000); });
+              wake = undefined;
+            }
+            return { status: 'killed', detail: '已停止观察，Codex 继续运行', result: '仅停止观察；没有取消任何 Codex 任务。' };
+          })();
+          return { done, cancel: () => { stopped = true; clearTimeout(timer); wake?.(); } };
+        },
+      });
+      return { status: 'watching', background_job_id: id, mode, note: '无变化不通知；停止该后台观察不会取消 Codex。' };
+    },
+  });
+
+  registerRuntimeTool({ ctx, conductor, moduleUrl: import.meta.url, loadedIdentity,
+    profileFile: cfg.runtimeProfileFile,
+    loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
+    activeDispatches: () => dispatching });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
@@ -1394,7 +1606,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
       const { text, tools } = turnSummary(agent.session.log ?? [], turn);
-      if (!DISPATCH_CLAIM.test(text) || tools.some((n) => ['codex_run', 'codex_status', 'codex_cancel'].includes(n))) return;
+      if (!DISPATCH_CLAIM.test(text) || tools.some((n) => ['codex_run', 'codex_continue', 'codex_status', 'codex_cancel'].includes(n))) return;
       if (nudged.size > 500) nudged.clear();
       nudged.add(key);
       agent.steer({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: NUDGE }], source: { kind: `plugin:${name}` } });
@@ -1412,14 +1624,15 @@ export function apply(ctx, config = {}, run = runRunner) {
       }
     });
   }
-  ctx.logger?.info?.(`[codex-conductor] active: codex_run/codex_status/codex_cancel；护栏工作区 ${cfg.roots.join(', ') || '(未配置)'}`);
+  ctx.logger?.info?.(`[codex-conductor] active v${loadedIdentity.version ?? '?'}；护栏工作区 ${cfg.roots.join(', ') || '(未配置)'}`);
   // 桌面宿主日志不落盘，留一个加载标记，便于确认插件是否在运行中的 DSH 里生效
   // 没有 LOCALAPPDATA（Linux 上跑测试）时不写，免得落到当前目录
   if (process.env.LOCALAPPDATA) try {
     const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'loaded.json'),
-      JSON.stringify({ loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
+      JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
+        tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime'],
         defaultHostAccess: cfg.defaultHostAccess === true,
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
   } catch {}

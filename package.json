@@ -1,6 +1,6 @@
 {
   "name": "dsh-codex-conductor",
-  "version": "0.7.1",
+  "version": "0.8.0",
   "description": "DeepSeek Harness plugin: hand coding tasks to Codex CLI in WSL with acceptance criteria and per-criterion reports, and keep the agent itself to planning and read-only verification.",
   "type": "module",
   "main": "./index.mjs",
@@ -11,7 +11,10 @@
   },
   "files": [
     "index.mjs",
+    "workflow.mjs",
+    "runtime.mjs",
     "report.schema.json",
+    "report.v2.schema.json",
     "runner/codex_runner.py",
     "tools/Test-PsSyntax.ps1",
     "cordis.patch.yml",
@@ -19,7 +22,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test.mjs && python3 runner/test_codex_runner.py"
+    "test": "node --test test.mjs workflow.test.mjs runtime.test.mjs && python3 runner/test_codex_runner.py"
   },
   "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "codex", "wsl"],
   "license": "MIT",
