@@ -330,8 +330,12 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
                     kill_tree(proc.pid)
                     break
-                if stdout_done and stdin_done.is_set() and proc.poll() is not None:
-                    break
+                if stdout_done and stdin_done.is_set():
+                    # Keep the Linux leader unreaped until group cleanup so its PID cannot be reused.
+                    exited = (proc.poll() is not None if IS_WIN else
+                              os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None)
+                    if exited:
+                        break
                 if completed_at and now - completed_at > args.exit_grace:
                     state["forced_exit"] = True
                     kill_tree(proc.pid)
@@ -388,10 +392,14 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state["commands"] += 1
                 elif kind == "item.completed" and item.get("type") == "file_change":
                     state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                kill_tree(proc.pid)
+            with acquire_file_lock(run_dir / "process.lock", blocking=True):
+                # Failed launchers can leave children behind after closing their standard streams.
+                if not IS_WIN and state["end_reason"] is None and (not state["completed"] or state["failed"]):
+                    kill_tree(proc.pid)
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    kill_tree(proc.pid)
     except BaseException:
         if proc is not None:
             # Preserve the original failure even if process cleanup also fails.
@@ -1492,14 +1500,15 @@ def main():
             if (job_dir / "result.json").exists():
                 emit(job_status(args.job_id))
                 return
-            worker_pid = recorded_pid(pid_file)
-            if worker_pid is not None:
-                kill_tree(worker_pid)
             codex_pid = job_dir / "codex.pid"
             pid = recorded_pid(codex_pid)
             if pid is not None:
                 # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
                 kill_tree(pid)
+            # Stop Codex before its worker: orphaning an exited leader can reap its recorded identity.
+            worker_pid = recorded_pid(pid_file)
+            if worker_pid is not None:
+                kill_tree(worker_pid)
             if worker_pid is None:
                 emit(job_status(args.job_id))
                 return

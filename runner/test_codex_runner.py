@@ -64,11 +64,16 @@ FAKE_CODEX = textwrap.dedent(r"""
         (state / "child.pid").write_text(str(child.pid))
         finish()
         time.sleep(300)
-    elif mode == "transient_then_ok":
+    elif mode in ("transient_then_ok", "transient_with_inherited_group_child", "success_with_inherited_group_child"):
         if calls == 0:
-            say(type="error", message="stream disconnected before completion")
-            say(type="turn.failed", error={"message": "stream disconnected before completion"})
-            sys.exit(1)
+            if mode != "transient_then_ok":
+                child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"],
+                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                (state / "child.pid").write_text(str(child.pid))
+            if mode != "success_with_inherited_group_child":
+                say(type="error", message="stream disconnected before completion")
+                say(type="turn.failed", error={"message": "stream disconnected before completion"})
+                sys.exit(1)
         finish()
     elif mode == "permanent":
         say(type="turn.failed", error={"message": "401 Unauthorized"})
@@ -813,18 +818,24 @@ class RunnerTests(unittest.TestCase):
         for finishing_pid in (123, 456):
             with self.subTest(finishing_pid=finishing_pid):
                 (job_dir / "result.json").unlink(missing_ok=True)
+                killed = []
 
                 def finish_during_kill(pid):
+                    killed.append(pid)
                     if pid == finishing_pid:
                         codex_runner.write_result(job_dir, completed)
 
+                def start(pid):
+                    # Killing the worker can let init reap its already-exited Codex leader.
+                    return "worker-start" if pid == 123 else (None if 123 in killed else "codex-start")
+
                 with mock.patch.object(codex_runner, "HOME", home), \
-                        mock.patch.object(codex_runner, "process_start", side_effect=lambda pid: {123: "worker-start", 456: "codex-start"}[pid]), \
+                        mock.patch.object(codex_runner, "process_start", side_effect=start), \
                         mock.patch.object(sys, "argv", [str(RUNNER), "cancel", "raced"]), \
                         mock.patch.object(codex_runner, "kill_tree", side_effect=finish_during_kill) as kill, \
                         mock.patch.object(codex_runner, "emit") as emit:
                     codex_runner.main()
-                    self.assertEqual(kill.call_args_list, [mock.call(123), mock.call(456)])
+                    self.assertEqual(kill.call_args_list, [mock.call(456), mock.call(123)])
                     emit.assert_called_once()
                     published = emit.call_args.args[0]
                     self.assertEqual({k: published[k] for k in completed}, completed)
@@ -871,6 +882,50 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(len(self.calls()), 1)
         finally:
             self.control("cancel", job["job_id"])
+
+    @unittest.skipIf(os.name == "nt", "requires POSIX process-group inheritance")
+    def test_cancel_during_retry_wait_kills_child_in_exited_launchers_group(self):
+        job = self.invoke("--sandbox", "workspace-write", "--backoff", "60", command="start",
+                          mode="transient_with_inherited_group_child")
+        child_file = self.state / "child.pid"
+        try:
+            self.wait_for(lambda: self.control("status", job["job_id"]).get("phase") == "retry_wait")
+            child = int(child_file.read_text())
+            self.assertEqual(self.control("cancel", job["job_id"])["status"], "cancelled")
+            jd = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / job["job_id"]
+            self.wait_for(lambda: not alive(int((jd / "worker.pid").read_text())))
+            self.assertEqual(len(self.calls()), 1)
+            self.assertFalse(alive(child), "cancelled retry left a child in the exited launcher's process group")
+        finally:
+            try:
+                self.control("cancel", job["job_id"])
+            finally:
+                if child_file.exists():
+                    child = int(child_file.read_text())
+                    try:
+                        os.kill(child, 9)
+                    except ProcessLookupError:
+                        pass
+                    self.wait_for(lambda: not alive(child))
+                    child_file.unlink()
+
+    def test_successful_task_preserves_child_in_exited_launchers_group(self):
+        child_file = self.state / "child.pid"
+        try:
+            result = self.invoke("--sandbox", "workspace-write", mode="success_with_inherited_group_child")
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["final_message"], "done")
+            self.assertFalse(result["forced_exit"])
+            self.assertTrue(alive(int(child_file.read_text())), "successful task killed its background child")
+        finally:
+            if child_file.exists():
+                child = int(child_file.read_text())
+                try:
+                    os.kill(child, 9)
+                except ProcessLookupError:
+                    pass
+                self.wait_for(lambda: not alive(child))
+                child_file.unlink()
 
     def test_windows_cwd_is_mapped_only_inside_wsl(self):
         sys.path.insert(0, str(RUNNER.parent))
