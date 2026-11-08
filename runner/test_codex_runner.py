@@ -1727,7 +1727,8 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
                 mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "warnings_then_ok"}), \
                 mock.patch.object(codex_runner, "router_reachable", side_effect=[False, True]), \
-                mock.patch.object(codex_runner.time, "sleep", side_effect=observe_retry):
+                mock.patch.object(codex_runner, "time", wraps=codex_runner.time) as runner_clock:
+            runner_clock.sleep.side_effect = observe_retry
             result = codex_runner.execute(args, "a new resume task", jd)
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], 2)
