@@ -173,7 +173,9 @@ function closingParen(s, start) {
 export function splitCommand(command, inner = () => false, braceSegments = new Set(), expansions = new Map()) {
   const segments = [];
   let words = [];
+  let kinds = [];
   let word = '';
+  let kind = 'literal';
   let started = false;
   let quote = null;
   let redirect = null;
@@ -191,6 +193,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
         redirect = null;
       } else {
         words.push(word);
+        kinds.push(kind);
         unsafeParameter ||= !braceExpansionsSafe(parameterWord);
         expanded ||= /\{(?:[^{}]*,[^{}]*|(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?)\}/.test(syntax);
         const pattern = /[*?]|\[[^\]]+\]/.test(syntax);
@@ -200,17 +203,17 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
           (pattern && !/^[A-Za-z0-9_./]/.test(word) && !intOperand(word));
       }
     }
-    word = ''; started = false; syntax = ''; parameterWord = '';
+    word = ''; kind = 'literal'; started = false; syntax = ''; parameterWord = '';
   };
   const endSegment = () => {
     endWord();
     if (redirect) valid = false;
     if (words.length) {
       if (expanded) braceSegments.add(words);
-      expansions.set(words, { glob, fieldSplit, unsafeParameter });
+      expansions.set(words, { glob, fieldSplit, unsafeParameter, kinds });
       segments.push(words);
     }
-    words = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
+    words = []; kinds = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
   };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
@@ -229,6 +232,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       // 保留 $，让后面的检查（sed 脚本、pwsh 路径）看得出这里展开过
       word += '$X';
       parameterWord += '$X';
+      if (kind === 'literal') kind = 'word';
       if (!quote) syntax += '$';
       started = true;
       i = end;
@@ -244,15 +248,23 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       } else { word += ch; parameterWord += ch; }
       continue;
     }
-    if (ch === "'" || ch === '"') { quote = ch; started = true; continue; }
+    if (ch === "'" || ch === '"') {
+      if (kind === 'literal') kind = 'word';
+      quote = ch; started = true; continue;
+    }
     if (ch === '\\') {
-      if (next !== undefined && next !== '\n') { word += next; parameterWord += next === '$' ? 'X' : next; started = true; }
+      if (next !== undefined && next !== '\n') {
+        if (kind === 'literal') kind = 'word';
+        word += next; parameterWord += next === '$' ? 'X' : next; started = true;
+      }
       i++;
       continue;
     }
     if (ch === ' ' || ch === '\t') { endWord(); continue; }
     if (ch === '>' || ch === '<' || (ch === '&' && next === '>')) {
-      if (!redirect && /^\d+$/.test(word)) { word = ''; started = false; syntax = ''; parameterWord = ''; } else endWord();
+      if (!redirect && kind === 'literal' && /^\d+$/.test(word)) {
+        word = ''; started = false; syntax = ''; parameterWord = '';
+      } else endWord();
       if (redirect) return null;
       let j = ch === '&' ? i + 2 : i + 1;
       if (ch === '<' && (command[j] === '<' || command[j] === '(')) return null;
@@ -269,6 +281,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       if ((ch === '|' || ch === '&') && next === ch) i++;
       continue;
     }
+    if (ch === '=' && kind === 'literal' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) kind = 'assignment';
     word += ch;
     parameterWord += ch;
     syntax += ch;
@@ -312,18 +325,22 @@ function pwshTestAllowed(args) {
   return true;
 }
 
-// 剥掉流程关键字和 timeout 前缀（它只是给后面的命令限时），剩下真正执行的命令；
-// timeout 的时长不合法或后面没有命令时保留原样，按 timeout 本身判定（不放行）
-function core(words) {
-  for (;;) {
-    while (words.length && LEAD_KEYWORDS.has(words[0])) words = words.slice(1);
-    while (words.length && CLOSE_KEYWORDS.has(words.at(-1))) words = words.slice(0, -1);
-    if (words[0] !== 'timeout') return words;
-    let i = 1;
-    while (words[i]?.startsWith('-')) i += ['-s', '-k', '--signal', '--kill-after'].includes(words[i]) ? 2 : 1;
-    if (!/^\d+(\.\d+)?[smhd]?$/.test(words[i] ?? '') || words.length <= i + 1) return words;
-    words = words.slice(i + 1);
+// 只剥语法位置的未引用关键字；timeout 后是程序 argv，不能再按 Shell 语法处理。
+function core(words, kinds) {
+  let start = 0;
+  let end = words.length;
+  while (start < end && kinds[start] === 'literal' && LEAD_KEYWORDS.has(words[start])) start++;
+  while (start < end && kinds[end - 1] === 'literal' && CLOSE_KEYWORDS.has(words[end - 1]) &&
+      (end - start === 1 || words[end - 1] === ')')) end--;
+  let wrapped = false;
+  while (words[start] === 'timeout') {
+    let i = start + 1;
+    while (i < end && words[i].startsWith('-')) i += ['-s', '-k', '--signal', '--kill-after'].includes(words[i]) ? 2 : 1;
+    if (!/^\d+(\.\d+)?[smhd]?$/.test(words[i] ?? '') || end <= i + 1) break;
+    start = i + 1;
+    wrapped = true;
   }
+  return { words: words.slice(start, end), kind: wrapped ? 'command' : kinds[start] };
 }
 
 // bash 的算术求值会递归展开其中的变量和 $(...)，从而执行文件/变量值里夹带的命令。算术出现在：
@@ -417,18 +434,20 @@ function braceExpansionsSafe(word) {
 }
 
 function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
-  const words = core(raw);
+  const { words, kind } = core(raw, expansion.kinds);
   if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
   // 只检查实际展开；单引号和转义保护的字面文本不参与。
   if (expansion.unsafeParameter) return false;
   // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
-  if (words[0] === 'for') return (words.length <= 2 || words[2] === 'in') && words.slice(3).every((w) => !w.startsWith('-'));
+  if (words[0] === 'for') return kind === 'literal' && (words.length <= 2 || words[2] === 'in') &&
+    words.slice(3).every((w) => !w.startsWith('-'));
   // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行。
   // 值不能以 - 开头或含空白，免得展开后变成参数（X=-delete; find . $X）；
   // 也不能含字面的 $(，否则 [[ X -eq 0 ]] 之类的算术求值会执行它
   if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
-    return words.length === 1 && /^[A-Za-z_][A-Za-z0-9_]*=(?!-)\S*$/.test(words[0]) && !words[0].includes('$(');
+    return kind === 'assignment' && words.length === 1 &&
+      /^[A-Za-z_][A-Za-z0-9_]*=(?!-)\S*$/.test(words[0]) && !words[0].includes('$(');
   }
   if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
@@ -468,7 +487,7 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       return !braceExpansion && !expansion.fieldSplit &&
         (cmd !== '[' || args.at(-1) === ']') && testAllowed(cmd === '[' ? args.slice(0, -1) : args);
     case '[[':
-      return args.every((a, i) => ((args[i - 1] !== '-v' && args[i - 1] !== '-R') || safeSub(a)) &&
+      return kind === 'literal' && args.every((a, i) => ((args[i - 1] !== '-v' && args[i - 1] !== '-R') || safeSub(a)) &&
         (!ARITH_OP.has(a) || (intOperand(args[i - 1] ?? '') && intOperand(args[i + 1] ?? ''))));
     // read 把输入赋给 name[下标] 目标时会算术求值下标（单引号也挡不住），和 -v 同类
     case 'read': return readAllowed(args);
@@ -493,7 +512,7 @@ function refusedPart(command, extra) {
     return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
   }
   const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
-  return bad ? `不放行的是「${core(bad).join(' ').slice(0, 200)}」` : '命令为空';
+  return bad ? `不放行的是「${core(bad, expansions.get(bad).kinds).words.join(' ').slice(0, 200)}」` : '命令为空';
 }
 
 const present = (v) => v !== undefined && v !== null && v !== false && v !== '' &&

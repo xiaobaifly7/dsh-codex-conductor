@@ -116,6 +116,63 @@ test('splitCommand keeps quoted operators inside words', () => {
   assert.deepEqual(splitCommand('cat "C:\\x\\y" "a\\"b\\\\"'), [['cat', 'C:\\x\\y', 'a"b\\']]);
 });
 
+test('quoted escaped and empty-quote words cannot pose as assignments or control syntax', () => {
+  for (const word of ['X=1', 'if', 'fi', 'for']) {
+    for (const command of [`'${word}'`, `"${word}"`, `\\${word}`, `${word[0]}''${word.slice(1)}`]) {
+      assert.equal(readOnlyCommand(command), false, command);
+    }
+  }
+  for (const command of ["X'='1", "'X'=1", String.raw`X\=1`, 'X""=1',
+    "'[[' -f /dev/null ]]", '"[[" -f /dev/null ]]', String.raw`\[\[ -f /dev/null ]]`]) {
+    assert.equal(readOnlyCommand(command), false, command);
+  }
+  assert.match(decide(call('wsl', { command: "'X=1'" }), cfg), /不放行的是「[^」]*X=1[^」]*」/);
+  assert.match(decide(call('wsl', { command: "'if'" }), cfg), /不放行的是「[^」]*if[^」]*」/);
+});
+
+test('timeout program names cannot pose as shell assignments or control syntax', () => {
+  for (const prefix of ['timeout 1', 'timeout 1 timeout 1']) {
+    for (const program of ['X=1', "'X=1'", 'if', "'if'", 'fi', 'for', '[[ -f /dev/null ]]']) {
+      const command = `${prefix} ${program}`;
+      assert.equal(readOnlyCommand(command), false, command);
+    }
+  }
+  assert.match(decide(call('wsl', { command: 'timeout 1 if' }), cfg), /不放行的是「[^」]*if[^」]*」/);
+  assert.match(decide(call('wsl', { command: 'timeout 1 timeout 1 X=1' }), cfg), /不放行的是「[^」]*X=1[^」]*」/);
+});
+
+test('uniq output operands named fi done or closing brace cannot disappear as shell syntax', () => {
+  for (const word of ['fi', 'done', '}']) {
+    for (const output of [word, `'${word}'`, `"${word}"`]) {
+      const command = `uniq /dev/null ${output}`;
+      assert.equal(readOnlyCommand(command), false, command);
+    }
+  }
+  assert.match(decide(call('wsl', { command: 'uniq /dev/null done' }), cfg), /不放行的是「uniq \/dev\/null done」/);
+});
+
+test('real assignments continuations control syntax and literal arguments stay read-only', () => {
+  for (const command of [
+    "D='path'; ls \"$D\"", 'X="value"; echo "$X"',
+    'X="a\'b"; echo "$X"', 'X=\'a"b\'; echo "$X"', "X=''1; echo \"$X\"",
+    'X=\\\n1; echo "$X"', 'ec\\\nho ok', 'timeout 1 \\\ncat /dev/null',
+    'for f in a b; do cat "$f"; done', 'if [ -f a ]; then cat a; else echo absent; fi',
+    'while read -r line; do echo "$line"; done < /dev/null', '{ echo ok; cat /dev/null; }',
+    'timeout 1 cat /dev/null', 'timeout 1 timeout 1 cat /dev/null',
+    'echo "if" \'X=1\'', 'grep -F "if" /dev/null', "grep -F 'X=1' /dev/null",
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
+
+test('quoted and escaped digits before redirections remain command words and file operands', () => {
+  for (const command of ["'2'>/dev/null; ls", String.raw`\2>/dev/null; ls`, "uniq /dev/null '2'>/dev/null"]) {
+    assert.equal(readOnlyCommand(command), false, command);
+    assert.match(decide(call('wsl', { command }), cfg), /不放行的是/);
+  }
+  for (const command of ['cat 2>/dev/null', "cat '2'>/dev/null", String.raw`cat \2>/dev/null`]) {
+    assert.equal(readOnlyCommand(command), true, command);
+  }
+});
+
 test('redirection targets get the same substitution checks as command arguments', () => {
   for (const command of [
     'cat <$(touch${IFS}/tmp/guard-marker)', 'cat <`touch${IFS}/tmp/guard-marker`',
