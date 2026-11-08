@@ -5,12 +5,37 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
 process.env.LOCALAPPDATA = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
+
+test('entry reload queries re-evaluate both workflow and runtime helpers', async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conductor-reload-'));
+  const traceKey = `conductor-reload-${path.basename(dir)}`;
+  globalThis[traceKey] = [];
+  try {
+    writeFileSync(path.join(dir, 'index.mjs'), readFileSync(new URL('./index.mjs', import.meta.url)));
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ type: 'module' }));
+    for (const version of ['old', 'new']) {
+      writeFileSync(path.join(dir, 'workflow.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('workflow-${version}');\n` +
+        'export const validBlockers = () => true, blockingState = () => ({}), prepareContinuation = () => ({});\n');
+      writeFileSync(path.join(dir, 'runtime.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('runtime-${version}');\n` +
+        'export const runtimeIdentity = () => ({}), registerRuntimeTool = () => {};\n');
+      const entry = pathToFileURL(path.join(dir, 'index.mjs'));
+      entry.search = `?reload=${version}`;
+      await import(entry.href);
+    }
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+  } finally {
+    delete globalThis[traceKey];
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('assignments and loop lists cannot smuggle flags into allowed commands', () => {
   for (const c of ['X=-delete; find . $X', 'X="a -delete"\nfind . $X', 'for f in -delete; do find . $f; done']) {

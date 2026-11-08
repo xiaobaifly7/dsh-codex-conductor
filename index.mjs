@@ -17,8 +17,10 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { validBlockers, blockingState, prepareContinuation } from './workflow.mjs';
-import { runtimeIdentity, registerRuntimeTool } from './runtime.mjs';
+// helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
+const reloadQuery = new URL(import.meta.url).search;
+const { validBlockers, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+const { runtimeIdentity, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 
 const loadedIdentity = runtimeIdentity(import.meta.url);
 
