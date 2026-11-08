@@ -1016,11 +1016,13 @@ class RunnerTests(unittest.TestCase):
         path = self.cwd / "a.txt"
         path.write_text("still exists")
         before = codex_runner.snapshot(str(self.cwd))
+        # files_changed 先 realpath 根目录；Windows CI 的临时目录是 8.3 短路径，须按展开后的路径匹配。
+        target = os.path.normcase(os.path.realpath(path))
         real_stat = os.stat
         for failure in (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "I/O failure")):
             with self.subTest(error=type(failure).__name__):
                 def fail_stat(p, *args, **kwargs):
-                    if os.fspath(p) == str(path):
+                    if os.path.normcase(os.fspath(p)) == target:
                         raise failure
                     return real_stat(p, *args, **kwargs)
                 with mock.patch.object(codex_runner.os, "stat", side_effect=fail_stat):
@@ -1037,9 +1039,10 @@ class RunnerTests(unittest.TestCase):
         path = folder / "a.txt"
         path.write_text("still exists")
         before = codex_runner.snapshot(str(self.cwd))
+        target = os.path.normcase(os.path.realpath(folder))
         real_scandir = os.scandir
         def fail_scandir(p):
-            if os.fspath(p) == str(folder):
+            if os.path.normcase(os.fspath(p)) == target:
                 raise PermissionError(errno.EACCES, "denied")
             return real_scandir(p)
         with mock.patch.object(codex_runner.os, "scandir", side_effect=fail_scandir):
