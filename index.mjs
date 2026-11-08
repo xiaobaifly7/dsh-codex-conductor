@@ -131,7 +131,8 @@ const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、gzip -t、pytest、npm test 等，' +
   '可以用 | && for/if 组合，$(...) 里也只能是只读命令；不能写重定向（/dev/null 除外）、反引号、heredoc 或 $((...)) 算术）。' +
   "项目 tests 目录下的验证脚本可以直接跑：pwsh -NoProfile -File '<...\\tests\\xxx.ps1>'。" +
-  `检查 PowerShell 语法不能用 -Command，改用随包脚本：pwsh.exe -NoProfile -File '${PS_SYNTAX_WIN}' 'D:\\path\\a.ps1' …` +
+  'PowerShell -Command（包括只读查询）默认不放行；Windows 执行与核验交给主机访问模式的 codex_run。' +
+  `检查 PowerShell 语法用随包脚本：pwsh.exe -NoProfile -File '${PS_SYNTAX_WIN}' 'D:\\path\\a.ps1' …` +
   `（Windows 的 pwsh.exe 用 Windows 路径；WSL 里的 pwsh 用 ${PS_SYNTAX}），输出 PARSE-OK / PARSE-FAIL 和出错行。`;
 
 export function normPath(p) {
