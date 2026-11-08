@@ -55,6 +55,20 @@ test('read-only commands pass', () => {
   ]) assert.equal(readOnlyCommand(c), true, c);
 });
 
+test('gzip integrity checks pass without allowing compression or decompression', () => {
+  const actual = 'R=/mnt/d/harness; gzip -t $R/logs/harness.log.20261108-041557.gz';
+  for (const command of [
+    actual, 'gzip -t archive.gz', 'gzip --test "archive file.gz"',
+    'gzip -t "$R"/logs/*.gz', 'gzip -t < archive.gz', 'timeout 30 gzip -t archive.gz 2>/dev/null',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+  assert.equal(decide(call('ops_bash', { command: actual }), cfg), undefined);
+  for (const command of [
+    'gzip file', 'gzip -f file', 'gzip -d archive.gz', 'gzip -- -t file',
+    'gzip -S -t file', 'gzip --suffix=-t file', 'gzip "$flag" archive.gz',
+    'gzip -t archive.gz > result', 'gzip -t $(touch marker)', 'gzip -t archive.gz && gzip file',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
 test('writing or arbitrary commands are refused', () => {
   for (const c of [
     'echo x > a.txt', 'cat a >> b', 'sed -i s/a/b/ f', 'rm -rf x', 'git commit -am x', 'git checkout .',
