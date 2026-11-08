@@ -1,5 +1,5 @@
 // node --test test.mjs
-import test from 'node:test';
+import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -10,7 +10,9 @@ import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePr
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
-process.env.LOCALAPPDATA = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
+const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
+process.env.LOCALAPPDATA = localAppData;
+after(() => rmSync(localAppData, { recursive: true, force: true }));
 
 test('entry reload queries re-evaluate both workflow and runtime helpers', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'conductor-reload-'));
@@ -793,8 +795,9 @@ test('the bundled PowerShell syntax helper is allowed only via -File with file a
 });
 
 const pwshMissing = spawnSync('pwsh', ['-NoProfile', '-Command', 'exit 0']).status !== 0;
-test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissing && 'pwsh not installed' }, () => {
+test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissing && 'pwsh not installed' }, (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), 'pssyntax-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
   const good = path.join(dir, 'good.ps1');
   const bad = path.join(dir, 'bad.ps1');
   writeFileSync(good, 'Get-Date\n');
@@ -1917,8 +1920,10 @@ test('an abort before or during start never leaves Codex running unattended', as
   assert.equal(jobs.started.length, 0);
 });
 
-test('the planner prompt file starts as a template and is injected as a system prompt section, read fresh each time', () => {
-  const file = path.join(mkdtempSync(path.join(tmpdir(), 'planner-')), 'sub', 'planner-prompt.md');
+test('the planner prompt file starts as a template and is injected as a system prompt section, read fresh each time', (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'planner-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'sub', 'planner-prompt.md');
   const sections = [];
   const systemPrompt = { section: (s) => sections.push(s) };
   const ctx = { tools: { register: () => {}, guard: () => {} }, on: () => {}, get: (k) => (k === 'systemPrompt' ? systemPrompt : undefined) };
@@ -1946,8 +1951,10 @@ test('the planner prompt file starts as a template and is injected as a system p
   assert.ok(tools.codex_run && tools.codex_status && tools.codex_cancel);
 });
 
-test('a completed codex_run reminds the planner of the requirements only when some are set', async () => {
-  const file = path.join(mkdtempSync(path.join(tmpdir(), 'planner-')), 'planner-prompt.md');
+test('a completed codex_run reminds the planner of the requirements only when some are set', async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'planner-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const file = path.join(root, 'planner-prompt.md');
   const run = async (text) => {
     writeFileSync(file, text);
     const { tools } = harness({ config: { startResult: { job_id: 'J', status: 'completed' }, plannerPromptFile: file } });

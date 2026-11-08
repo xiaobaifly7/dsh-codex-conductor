@@ -1,5 +1,5 @@
 # dsh-codex-conductor 的 bundle 层：安装后挂载插件。
-# workspaces 为空时只提供 codex_run / codex_status / codex_cancel，不启用护栏；
+# 始终提供十个工具；workspaces 为空时不启用护栏。
 # 在 DSH 的插件设置或 profile 的 cordis.patch.yml 里按 id 覆盖 config 即可开启。
 - insert:
     - id: codex-conductor
