@@ -25,6 +25,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 原生任务面板会记录进度和最终报告，完成后也可展开。取消请求未确认时持续显示失败原因和任务编号；取消结果保留目录、权限模式和已有可续跑线程信息，仍由用户决定是否恢复，不自动重派，也不将缺少改动清单解释为没有改动。
 
 - 交接时自动附加执行约束：不扩大范围；只改 `scope` 里的路径；任务与现状不符或验收标准互相冲突时不自行取舍，标为 `blocked` 并说明；不为通过验收去改验收脚本或判据。`scope` 只接受具体文件或目录，不展开通配符；动态命名的备份须在派活前确定具体文件名并列入。
+- 任务明确禁止某些访问或状态变更时，交接提示要求执行端在运行相关脚本前先只读检查其行为；有冲突或无法确认时，不执行对应步骤并标为 `blocked`。
 - 要求 Codex 按 [`report.schema.json`](report.schema.json) 逐条回报（met / not_met / blocked、证据、改动文件、偏离计划、未解决）。结果里会标出它自报未满足或受阻的条目、偏离计划的地方，以及超出 `scope` 的改动。最终答复的版式由插件固定为这份 JSON：`task` / `acceptance` 里对版式的要求（如单独的末行结论行）写进 `summary` 就算满足，Codex 不会因此标 `blocked`；工具说明也让 agent 不要再规定这类版式。
 - 已完成的结果只给核验用得上的内容：汇报条数和编号与验收标准对得上时，逐条汇报显示验收标准原文（Codex 几乎总会改写条目），下一步按编号指出未满足的条目、不再重复列出验收标准；每条证据最多显示 800 字，全文在 `log_dir` 下的 `last_message.txt`；详细字段只留任务目录和一行改动清单（改动超过 300 个时只列前 300 个，并注明超出 `scope` 的检查也只覆盖这些）。失败、取消和仍在执行的结果照旧给出全部字段；用量、日志目录等完整字段在 runner 的 `result.json`（`runnerHome/jobs/<job_id>/`）里。只读任务（包括 `host_access=true`、`write=false` 的只读调查）有条目未满足或受阻时，下一步提示派回时传 `write=true`；沙箱内的任务有 blocked 条目提到 Windows 程序时，开启了 `allowHostAccess` 就提示确有需要时传 `host_access=true`，否则提示 agent 自己跑。
 - Codex 的沙箱（只读和 `workspace-write` 都是）挡住了 WSL interop，Codex 在沙箱里启动不了 Windows 程序（`pwsh.exe`、Hyper-V 命令等）。默认情况下需要 Windows 运行时的检查不要写进 `task` / `acceptance`，由 agent 自己跑。

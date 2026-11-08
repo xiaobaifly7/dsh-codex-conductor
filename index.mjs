@@ -641,6 +641,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
+    '- 任务明确禁止某些访问或状态变更时，运行相关脚本前先只读检查是否触及这些限制；存在冲突或无法确认时，不执行相关步骤并标为 blocked。\n' +
     (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
     (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
       '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
