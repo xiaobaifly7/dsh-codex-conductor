@@ -880,6 +880,27 @@ test('codex_review distinguishes rejected arguments from a reviewed failed execu
   assert.equal(value.verification_status, 'needs_changes');
 });
 
+test('existing-job tools reject malformed runner IDs before invoking the runner', async () => {
+  const rejected = { status: 'failed', error_kind: 'bad_arguments', error: 'invalid job_id', retryable: false };
+  const h = harness({ config: { cancelResult: rejected } });
+  const exec = { agent: agentAt('/work/current') };
+  const invalid = ['bad id', '../escape', 'J/1', 'bg:J', '-J', 'J1\n', 'J1\r\n', '', ' ', null, 42];
+  for (const id of invalid) h.finals[id] = rejected;
+  for (const name of ['codex_status', 'codex_cancel', 'codex_output', 'codex_continue', 'codex_review']) {
+    for (const id of invalid) {
+      await assert.rejects(h.tools[name].execute({ job_id: id, wait_seconds: 0 }, exec), /job_id/);
+    }
+  }
+  assert.equal(h.calls.length, 0);
+
+  const id = 'J-1_2';
+  const good = harness({ config: { cancelResult: { job_id: id, status: 'cancelled' } } });
+  good.finals[id] = { job_id: id, status: 'completed' };
+  assert.equal((await good.tools.codex_status.execute({ job_id: id, wait_seconds: 0 }, {})).execution_status, 'completed');
+  assert.equal((await good.tools.codex_cancel.execute({ job_id: id }, {})).status, 'cancelled');
+  assert.deepEqual(good.calls, [['status', id, '--wait', '0'], ['cancel', id]]);
+});
+
 test('codex_summary defaults to the current owner, passes thread filters and never starts Codex', async () => {
   const summary = { total: 0, total_jobs: 0, groups: [] };
   const h = harness({ config: { summaryResult: summary } });

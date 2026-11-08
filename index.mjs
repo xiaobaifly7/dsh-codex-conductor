@@ -1295,7 +1295,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_status: job_id 必须是非空字符串');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_status: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
@@ -1316,7 +1316,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !args.job_id.trim()) throw new Error('codex_cancel: job_id 必须是非空字符串');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_cancel: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       const bg = liveBackground(args.job_id, exec);
       // 取消前先挂上等待：后台循环随后看到任务结束并结算，算作已被等到，DSH 不再另发一条结束通知。
       // 取消未确认时撤掉等待，免得吞掉任务之后真正结束时的通知。
