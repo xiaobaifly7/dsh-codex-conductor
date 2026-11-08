@@ -50,6 +50,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         sys.exit(1)
     elif mode == "exit0_without_completion":
         sys.exit(0)
+    elif mode == "close_stdout_then_hang":
+        os.close(sys.stdout.fileno())
+        time.sleep(300)
     elif mode == "fault_logging":
         time.sleep(300)
     elif mode == "hang_with_child":
@@ -215,6 +218,13 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["error_kind"], "timeout")
         self.assertEqual(r["attempts"], 1)
 
+    def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
+        start = time.monotonic()
+        r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0", mode="close_stdout_then_hang")
+        self.assertEqual(r["error_kind"], "timeout")
+        self.assertEqual(r["attempts"], 1)
+        self.assertLess(time.monotonic() - start, 5)
+
     def test_timeout_while_child_is_not_reading_a_large_prompt(self):
         start = time.monotonic()
         r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0",
@@ -361,7 +371,7 @@ class RunnerTests(unittest.TestCase):
                                   env={**self.env, "FAKE_MODE": "hang_with_child"},
                                   start_new_session=os.name != "nt", creationflags=codex_runner.NO_WINDOW,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        (jd / "worker.pid").write_text(str(worker.pid))
+        codex_runner.record_pid(jd / "worker.pid", worker.pid)
         cancel = None
         child = None
         try:
@@ -576,6 +586,47 @@ class RunnerTests(unittest.TestCase):
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
 
+    def test_writers_in_different_directories_share_the_writable_root_lock(self):
+        shared = Path(self.tmp.name) / "shared"
+        other = Path(self.tmp.name) / "other-work"
+        shared.mkdir()
+        other.mkdir()
+        jobs = []
+        try:
+            first = self.invoke("--sandbox", "workspace-write", "--writable-root", str(shared),
+                                "--writable-root", str(shared / "."), command="start", mode="gated_ok", prompt="one")
+            jobs.append(first["job_id"])
+            self.wait_for(lambda: (self.state / "ready-0").exists())
+            second = self.invoke("--cwd", str(other), "--sandbox", "workspace-write", "--writable-root", "../shared",
+                                 command="start", mode="gated_ok", prompt="two")
+            jobs.append(second["job_id"])
+            self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait")
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            (self.state / "release-0").touch()
+            self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
+            self.wait_for(lambda: (self.state / "ready-1").exists())
+            (self.state / "release-1").touch()
+            self.assertEqual(self.control("status", second["job_id"], "--wait", "20")["status"], "completed")
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+        finally:
+            for job_id in reversed(jobs):
+                self.control("cancel", job_id)
+
+    def test_waiting_for_a_writable_root_releases_partial_locks(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        held = mock.Mock()
+        error = OSError(errno.EIO, "injected lock error")
+        args = SimpleNamespace(cwd=str(self.cwd), sandbox="workspace-write", writable_roots=["../shared"])
+        with mock.patch.object(codex_runner, "acquire_write_lock", side_effect=[held, None, error]), \
+                mock.patch.object(codex_runner.time, "sleep", side_effect=lambda delay: held.close.assert_called_once()), \
+                mock.patch.object(codex_runner, "run_attempt") as attempt:
+            result = codex_runner.execute(args, "do it", Path(self.tmp.name) / "waiting")
+        self.assertEqual(result["error_kind"], "runner_error")
+        held.close.assert_called_once()
+        attempt.assert_not_called()
+
     def test_file_lock_only_treats_contention_errors_as_busy(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -756,6 +807,8 @@ class RunnerTests(unittest.TestCase):
         job_dir.mkdir(parents=True)
         (job_dir / "worker.pid").write_text("123")
         (job_dir / "codex.pid").write_text("456")
+        (job_dir / "worker.start").write_text("worker-start")
+        (job_dir / "codex.start").write_text("codex-start")
         completed = {"status": "completed", "final_message": "done", "usage": {"input_tokens": 1}}
         for finishing_pid in (123, 456):
             with self.subTest(finishing_pid=finishing_pid):
@@ -766,6 +819,7 @@ class RunnerTests(unittest.TestCase):
                         codex_runner.write_result(job_dir, completed)
 
                 with mock.patch.object(codex_runner, "HOME", home), \
+                        mock.patch.object(codex_runner, "process_start", side_effect=lambda pid: {123: "worker-start", 456: "codex-start"}[pid]), \
                         mock.patch.object(sys, "argv", [str(RUNNER), "cancel", "raced"]), \
                         mock.patch.object(codex_runner, "kill_tree", side_effect=finish_during_kill) as kill, \
                         mock.patch.object(codex_runner, "emit") as emit:
@@ -777,7 +831,46 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(published["job_id"], "raced")
                     self.assertIn("review_status", published)
                     self.assertNotIn("review_summary", published)
-                    self.assertEqual(json.loads((job_dir / "result.json").read_text("utf-8")), completed)
+                    saved = json.loads((job_dir / "result.json").read_text("utf-8"))
+                    self.assertEqual({k: saved[k] for k in completed}, completed)
+
+    def test_status_and_cancel_check_process_start_within_the_same_boot(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for reused in (123, 456):
+            with self.subTest(reused=reused):
+                jd = self.stored_job(f"reused-{reused}", None)
+                (jd / "worker.pid").write_text("123")
+                (jd / "codex.pid").write_text("456")
+                (jd / "worker.start").write_text("original-123")
+                (jd / "codex.start").write_text("original-456")
+                (jd / "boot_id").write_text("same-boot")
+                start = lambda pid: "reused" if pid == reused else f"original-{pid}"
+                with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
+                        mock.patch.object(codex_runner, "boot_id", return_value="same-boot"), \
+                        mock.patch.object(codex_runner, "process_start", side_effect=start), \
+                        mock.patch.object(codex_runner, "kill_tree") as kill, \
+                        mock.patch.object(sys, "argv", [str(RUNNER), "cancel", jd.name]), \
+                        mock.patch.object(codex_runner, "emit") as emit:
+                    status = codex_runner.job_status(jd.name)
+                    self.assertEqual(status["status"], "failed" if reused == 123 else "running")
+                    codex_runner.main()
+                    self.assertEqual(kill.call_args_list, [mock.call(456 if reused == 123 else 123)])
+                    self.assertEqual(emit.call_args.args[0]["status"], "failed" if reused == 123 else "cancelled")
+
+    def test_cancel_during_retry_wait_has_no_stale_codex_pid(self):
+        job = self.invoke("--sandbox", "workspace-write", "--backoff", "30", command="start", mode="transient_then_ok")
+        try:
+            self.wait_for(lambda: self.control("status", job["job_id"]).get("phase") == "retry_wait")
+            jd = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / job["job_id"]
+            self.assertFalse((jd / "codex.pid").exists())
+            self.assertFalse((jd / "codex.start").exists())
+            self.assertEqual(self.control("cancel", job["job_id"])["status"], "cancelled")
+            self.wait_for(lambda: not alive(int((jd / "worker.pid").read_text())))
+            self.assertEqual(len(self.calls()), 1)
+        finally:
+            self.control("cancel", job["job_id"])
 
     def test_windows_cwd_is_mapped_only_inside_wsl(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -916,6 +1009,44 @@ class RunnerTests(unittest.TestCase):
                     self.assertIsNone(codex_runner.snapshot(str(self.cwd), budget=1, scope=scope))
                 self.assertEqual(len(scanned), 1)
 
+    def test_snapshot_stat_errors_fall_back_to_events_instead_of_reporting_deletion(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        path = self.cwd / "a.txt"
+        path.write_text("still exists")
+        before = codex_runner.snapshot(str(self.cwd))
+        real_stat = os.stat
+        for failure in (PermissionError(errno.EACCES, "denied"), OSError(errno.EIO, "I/O failure")):
+            with self.subTest(error=type(failure).__name__):
+                def fail_stat(p, *args, **kwargs):
+                    if os.fspath(p) == str(path):
+                        raise failure
+                    return real_stat(p, *args, **kwargs)
+                with mock.patch.object(codex_runner.os, "stat", side_effect=fail_stat):
+                    report = codex_runner.files_changed(str(self.cwd), before, [(str(path), "update")])
+                self.assertEqual(report["files_changed_source"], "codex_events")
+                self.assertEqual(report["files_changed"], [{"path": "a.txt", "change": "update"}])
+
+    def test_snapshot_walk_errors_fall_back_to_events_instead_of_reporting_deletion(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        folder = self.cwd / "blocked"
+        folder.mkdir()
+        path = folder / "a.txt"
+        path.write_text("still exists")
+        before = codex_runner.snapshot(str(self.cwd))
+        real_scandir = os.scandir
+        def fail_scandir(p):
+            if os.fspath(p) == str(folder):
+                raise PermissionError(errno.EACCES, "denied")
+            return real_scandir(p)
+        with mock.patch.object(codex_runner.os, "scandir", side_effect=fail_scandir):
+            report = codex_runner.files_changed(str(self.cwd), before, [(str(path), "update")])
+        self.assertEqual(report["files_changed_source"], "codex_events")
+        self.assertEqual(report["files_changed"], [{"path": "blocked/a.txt", "change": "update"}])
+
     def big_tree(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -961,6 +1092,23 @@ class RunnerTests(unittest.TestCase):
                                                    {"path": "keep/new.txt", "change": "added"},
                                                    {"path": "other.txt", "change": "update"},
                                                    {"path": "single.txt", "change": "modified"}])
+
+    def test_full_snapshot_merges_events_outside_cwd_and_keeps_snapshot_precedence(self):
+        codex_runner, root = self.big_tree()
+        extra = Path(self.tmp.name) / "extra-output"
+        extra.mkdir()
+        before = codex_runner.snapshot(str(root))
+        (root / "keep" / "a.txt").write_text("changed")
+        (extra / "out.txt").write_text("outside cwd")
+        events = [(str(extra / "out.txt"), "update"), ("../extra-output/out.txt", "update"),
+                  ("keep/a.txt", "update"), ("other.txt", "update")]
+        report = codex_runner.files_changed(str(root), before, events)
+        self.assertEqual(report["files_changed_source"], "snapshot+codex_events")
+        self.assertEqual(report["files_changed_total"], 2)
+        self.assertEqual(report["files_changed"], [{"path": "../extra-output/out.txt", "change": "update"},
+                                                 {"path": "keep/a.txt", "change": "modified"}])
+        self.assertEqual(codex_runner.out_of_scope_paths({"cwd": str(root), "scope_paths": [str(root)], **report}),
+                         ["../extra-output/out.txt"])
 
     def test_scope_with_backslashes_is_a_relative_directory(self):
         codex_runner, root = self.big_tree()
@@ -1697,6 +1845,26 @@ class RunnerTests(unittest.TestCase):
         for extra in (("--limit", "101"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
+    def test_list_filters_metadata_before_reading_job_events(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for job_id, owner, cwd in (("keep", "owner-a", self.cwd), ("other-owner", "owner-b", self.cwd),
+                                   ("other-cwd", "owner-a", self.cwd / "elsewhere"), ("explicit", "owner-b", self.cwd)):
+            self.stored_job(job_id, {"status": "completed", "thread_id": "W"},
+                            context=self.sample_context(owner), cwd=str(cwd))
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=str(self.cwd), job_id=["explicit"],
+                               status=None, needs_attention=False, offset=0, limit=20)
+        activity = codex_runner.runner_activity
+        def read_activity(events):
+            self.assertIn(events.parent.name, ("keep", "explicit"))
+            return activity(events)
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
+                mock.patch.object(codex_runner, "runner_activity", side_effect=read_activity) as read:
+            result = codex_runner.list_jobs(args)
+        self.assertEqual({j["job_id"] for j in result["jobs"]}, {"keep", "explicit"})
+        self.assertEqual(read.call_count, 2)
+
     def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
         context = self.sample_context()
         jd = self.stored_job("output", {"status": "completed"}, context=context)
@@ -1779,6 +1947,47 @@ class RunnerTests(unittest.TestCase):
 
     def test_unknown_job_is_reported(self):
         self.assertEqual(self.control("status", "nope")["error_kind"], "unknown_job")
+
+    def test_runner_activity_reads_only_the_tail_on_repeated_queries(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        phase = {"type": "runner.phase", "phase": "retry_wait", "attempt": 2, "reason": "transient", "retry_at": 123}
+        history = (json.dumps({"type": "item.completed", "item": {"text": "x" * 1000}}) + "\n").encode() * 4096
+        payload = history + (json.dumps(phase) + "\nnot json\n").encode()
+        sizes = []
+        class Counted(io.BytesIO):
+            def read(self, *args):
+                data = super().read(*args)
+                sizes.append(len(data))
+                return data
+            def readline(self, *args):
+                data = super().readline(*args)
+                sizes.append(len(data))
+                return data
+            def __next__(self):
+                data = self.readline()
+                if not data:
+                    raise StopIteration
+                return data
+        with mock.patch.object(codex_runner, "open", side_effect=lambda *a, **kw: Counted(payload), create=True):
+            for _ in range(2):
+                self.assertEqual(codex_runner.runner_activity(Path("events.jsonl")),
+                                 {"phase": "retry_wait", "attempt": 2, "last_error_kind": "transient", "retry_at": 123})
+        self.assertLessEqual(sum(sizes), 2 * 65536)
+
+    def test_finished_status_uses_the_saved_phase_without_reading_events(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("finished-phase", {"status": "completed"}, sandbox="read-only")
+        codex_runner.runner_event(jd, 2, "finalizing", "transient")
+        codex_runner.write_result(jd, {"status": "completed", "attempts": 2})
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
+                mock.patch.object(codex_runner, "runner_activity", side_effect=AssertionError("reread finished events")):
+            status = codex_runner.job_status(jd.name)
+        self.assertEqual((status["phase"], status["attempt"], status["last_error_kind"], status["retry_at"]),
+                         ("finalizing", 2, "transient", None))
 
     def test_worker_finishing_during_status_check_is_not_reported_dead(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -1870,6 +2079,7 @@ class RunnerTests(unittest.TestCase):
                 (d / "result.json").write_text("{}")
             stale = time.time() - codex_runner.PRUNE_TTL - 86400
             for d in (old_job, old_run):
+                os.utime(d / "result.json", (stale, stale))
                 os.utime(d, (stale, stale))
             codex_runner.prune_old("jobs")
             codex_runner.prune_old("runs")
@@ -1877,6 +2087,26 @@ class RunnerTests(unittest.TestCase):
             self.assertFalse(old_run.exists())
             self.assertTrue(fresh_job.exists())
             codex_runner.prune_old("missing")  # absent subdir is a no-op, not an error
+
+    def test_prune_keeps_old_unfinished_dirs_and_recent_results(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            stale = time.time() - codex_runner.PRUNE_TTL - 86400
+            for subdir in ("jobs", "runs"):
+                for name in ("running", "queued", "recently-finished"):
+                    d = codex_runner.HOME / subdir / name
+                    d.mkdir(parents=True)
+                    if name == "recently-finished":
+                        (d / "result.json").write_text("{}")
+                    else:
+                        (d / "worker.pid").write_text(str(os.getpid()))
+                        (d / "events.jsonl").write_text("active")
+                    os.utime(d, (stale, stale))
+                codex_runner.prune_old(subdir)
+                self.assertEqual(sorted(d.name for d in (codex_runner.HOME / subdir).iterdir()),
+                                 ["queued", "recently-finished", "running"])
 
 
 if __name__ == "__main__":

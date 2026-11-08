@@ -115,6 +115,45 @@ def pid_alive(pid):
     return f'"{pid}"' in out
 
 
+def process_start(pid):
+    if not IS_WIN:
+        try:
+            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+        except (OSError, IndexError):
+            return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    handle = wintypes.HANDLE(kernel.OpenProcess(0x1000, False, pid))
+    if not handle:
+        return None
+    times = (wintypes.FILETIME * 4)()
+    try:
+        if kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+    finally:
+        kernel.CloseHandle(handle)
+    return None
+
+
+def record_pid(path, pid):
+    path.with_suffix(".start").write_text(process_start(pid) or "")
+    path.write_text(str(pid))
+
+
+def recorded_pid(path):
+    if not path.exists() or not same_boot(path.parent):
+        return None
+    pid = int(path.read_text())
+    start = path.with_suffix(".start")
+    if start.exists():
+        return pid if process_start(pid) == start.read_text() else None
+    # 升级前启动的任务没有创建时刻记录，沿用同次启动内的存活判断，保证仍能查询和取消。
+    return pid if pid_alive(pid) else None
+
+
 def boot_id():
     """Identifies this distro instance: the kernel boot id plus when this PID namespace's init (pid 1) started.
     The kernel boot id alone misses `wsl --terminate <distro>` or a distro auto-stop while the VM stays up — the
@@ -162,15 +201,18 @@ def acquire_file_lock(path, blocking=False):
     return handle
 
 
+def write_lock_key(cwd):
+    path = os.path.normcase(os.path.realpath(local_path(cwd)))
+    if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path):
+        path = path.lower()  # Windows-backed paths ignore case, unlike native Linux paths.
+    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+
+
 def acquire_write_lock(cwd):
     """Hold a per-directory lock so a retry can never overlap another writer. The OS frees it if we die."""
     locks = HOME / "locks"
     locks.mkdir(parents=True, exist_ok=True)
-    path = os.path.normcase(os.path.realpath(local_path(cwd)))
-    if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path):
-        path = path.lower()  # Windows-backed paths ignore case, unlike native Linux paths.
-    key = hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
-    return acquire_file_lock(locks / f"{key}.lock")
+    return acquire_file_lock(locks / f"{write_lock_key(cwd)}.lock")
 
 
 def local_path(path):
@@ -245,7 +287,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
                 state["end_reason"] = "spawn_failed"
                 state["error"] = str(e)
                 return state
-            (run_dir / "codex.pid").write_text(str(proc.pid))
+            record_pid(run_dir / "codex.pid", proc.pid)
             startup.close()
             stdin_done = threading.Event()
             stdin_errors = []
@@ -288,7 +330,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
                     kill_tree(proc.pid)
                     break
-                if stdout_done and stdin_done.is_set():
+                if stdout_done and stdin_done.is_set() and proc.poll() is not None:
                     break
                 if completed_at and now - completed_at > args.exit_grace:
                     state["forced_exit"] = True
@@ -360,6 +402,9 @@ def run_attempt(args, prompt, run_dir, thread_id):
         raise
     finally:
         startup.close()
+        with acquire_file_lock(run_dir / "process.lock", blocking=True):
+            (run_dir / "codex.pid").unlink(missing_ok=True)
+            (run_dir / "codex.start").unlink(missing_ok=True)
         for thread, pipe in ((writer, proc.stdin if proc else None), (reader, proc.stdout if proc else None)):
             if thread is not None:
                 with suppress(RuntimeError):
@@ -409,24 +454,31 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
     def add(path):
         try:
             st = os.stat(path, follow_symlinks=False)
-        except OSError:
+        except FileNotFoundError:
             return
         files[os.path.relpath(path, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns, st.st_mode)
 
-    for top in scope or [root]:
-        if time.time() > deadline:
-            return None
-        if not os.path.isdir(top):
-            add(top)  # a scoped file, or one that does not exist yet
-            continue
-        for dirpath, dirnames, filenames in os.walk(top):
+    def onerror(error):
+        if not isinstance(error, FileNotFoundError):
+            raise error
+
+    try:
+        for top in scope or [root]:
             if time.time() > deadline:
                 return None
-            dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
-            for name in filenames:
+            if not os.path.isdir(top):
+                add(top)  # a scoped file, or one that does not exist yet
+                continue
+            for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
                 if time.time() > deadline:
                     return None
-                add(os.path.join(dirpath, name))
+                dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
+                for name in filenames:
+                    if time.time() > deadline:
+                        return None
+                    add(os.path.join(dirpath, name))
+    except OSError:
+        return None
     return files if time.time() <= deadline else None
 
 
@@ -498,11 +550,14 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
         changes += [(p, "deleted") for p in before.keys() - after.keys()]
         changes += [(p, "modified") for p in before.keys() & after.keys() if before[p] != after[p]]
         source = "snapshot"
+        inside = [rel(s) for s in scope] if scope else ["."]
+        outside = [(p, k) for p, k in events if not any(
+            (s == "." and p != ".." and not p.startswith("../")) or s == p or p.startswith(s + "/") for s in inside)]
+        changes += outside
         if scope:
-            inside = [rel(s) for s in scope]
-            changes += [(p, k) for p, k in events
-                        if not any(s in (".", p) or p.startswith(s + "/") for s in inside)]
             source = "scope_snapshot+codex_events"
+        elif outside:
+            source = "snapshot+codex_events"
     else:
         changes = events
         source = "codex_events"
@@ -528,19 +583,33 @@ def execute(args, prompt, run_dir):
     if scope_args:
         base.update(scope=getattr(args, "scope", None), scope_paths=scope_args)
     started = time.time()
-    lock = None
+    locks = []
     before = scope = None
     event_changes = []
     try:
         if args.sandbox != "read-only":
             try:
-                lock = acquire_write_lock(args.cwd)
-                if lock is None:
-                    runner_event(run_dir, 0, "lock_wait")
+                roots = [args.cwd]
+                if args.sandbox == "workspace-write":
+                    roots += [os.path.join(args.cwd, local_path(p)) for p in getattr(args, "writable_roots", None) or []]
+                roots = {write_lock_key(p): p for p in roots}
+                waiting = False
+                while True:
+                    for key in sorted(roots):
+                        lock = acquire_write_lock(roots[key])
+                        if lock is None:
+                            break
+                        locks.append(lock)
+                    else:
+                        break
+                    for lock in locks:
+                        lock.close()
+                    locks.clear()
+                    if not waiting:
+                        runner_event(run_dir, 0, "lock_wait")
+                        waiting = True
                     # shortcut: waiters are not FIFO; add ordered admission if task ordering is required.
-                    while lock is None:
-                        time.sleep(0.25)
-                        lock = acquire_write_lock(args.cwd)
+                    time.sleep(0.25)
             except OSError as error:
                 return {**base, "status": "failed", "error_kind": "runner_error", "error": str(error),
                         "retryable": False, "attempts": 0, "duration_s": round(time.time() - started, 1)}
@@ -607,7 +676,7 @@ def execute(args, prompt, run_dir):
                               retryable=False)
         return result
     finally:
-        if lock is not None:
+        for lock in reversed(locks):
             lock.close()
 
 
@@ -651,7 +720,7 @@ def read_prompt(strict=False):
 
 def write_result(job_dir, result):
     tmp = job_dir / "result.json.tmp"
-    tmp.write_text(json.dumps(result, ensure_ascii=False), "utf-8")
+    tmp.write_text(json.dumps({**result, **runner_activity(job_dir / "events.jsonl")}, ensure_ascii=False), "utf-8")
     os.replace(tmp, job_dir / "result.json")
 
 
@@ -1012,15 +1081,24 @@ def runner_activity(events):
     activity = {"phase": None, "attempt": None, "last_error_kind": None, "retry_at": None}
     try:
         with open(events, "rb") as f:
-            for raw in f:
-                if not raw.startswith(b'{"type": "runner.phase",'):
-                    continue
-                try:
-                    event = json.loads(raw)
-                except ValueError:
-                    continue
-                activity.update(phase=event.get("phase"), attempt=event.get("attempt"),
-                                last_error_kind=event.get("reason"), retry_at=event.get("retry_at"))
+            position = f.seek(0, os.SEEK_END)
+            pending = b""
+            while position:
+                size = min(position, 65536)
+                position -= size
+                f.seek(position)
+                lines = (f.read(size) + pending).split(b"\n")
+                pending = lines.pop(0) if position else b""
+                for raw in reversed(lines):
+                    if not raw.startswith(b'{"type": "runner.phase",'):
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except ValueError:
+                        continue
+                    activity.update(phase=event.get("phase"), attempt=event.get("attempt"),
+                                    last_error_kind=event.get("reason"), retry_at=event.get("retry_at"))
+                    return activity
     except OSError:
         pass
     return activity
@@ -1034,7 +1112,8 @@ def enriched_status(job_id, job_dir, value):
     result["blocking"] = blocking_summary(result)
     if result.get("scope_paths"):
         result["out_of_scope"] = out_of_scope_paths(result)
-    activity = runner_activity(job_dir / "events.jsonl")
+    keys = ("phase", "attempt", "last_error_kind", "retry_at")
+    activity = {k: value[k] for k in keys} if all(k in value for k in keys) else runner_activity(job_dir / "events.jsonl")
     if activity["attempt"] is None:
         activity["attempt"] = result.get("attempts")
     activity["last_error_kind"] = result.get("error_kind") or activity["last_error_kind"]
@@ -1052,7 +1131,7 @@ def job_status(job_id):
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
         pid_file = job_dir / "worker.pid"
-        if pid_file.exists() and same_boot(job_dir) and pid_alive(int(pid_file.read_text())):
+        if recorded_pid(pid_file) is not None:
             events = job_dir / "events.jsonl"
             idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": idle,
@@ -1079,6 +1158,22 @@ def matching_jobs(args):
             job_identifier(job_dir.name)
         except argparse.ArgumentTypeError:
             continue
+        if getattr(args, "command", None) == "summary" and not args.owner and args.job_id and job_dir.name not in args.job_id:
+            continue
+        if args.owner or args.cwd:
+            try:
+                record = task_record(job_dir)
+                result = job_dir / "result.json"
+                if result.exists():
+                    record = {**record, **json.loads(result.read_text("utf-8"))}
+            except (OSError, ValueError, TypeError):
+                record = {}
+            context = record.get("context")
+            if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
+                                   job_dir.name in (args.job_id or [])):
+                continue
+            if args.cwd and (not record.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(local_path(record["cwd"]))):
+                continue
         value = job_status(job_dir.name)
         context = value.get("context")
         parent = (context or {}).get("continuation", {}).get("parent_job_id")
@@ -1086,8 +1181,6 @@ def matching_jobs(args):
                                job_dir.name in (args.job_id or [])):
             continue
         if args.cwd and (not value.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(value["cwd"])):
-            continue
-        if getattr(args, "command", None) == "summary" and not args.owner and args.job_id and job_dir.name not in args.job_id:
             continue
         if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
             continue
@@ -1255,15 +1348,15 @@ PRUNE_TTL = 30 * 86400
 
 
 def prune_old(subdir):
-    """Best-effort: delete finished job/run dirs older than PRUNE_TTL so HOME does not grow without bound.
-    A running job keeps a recent mtime (events.jsonl), so only long-finished dirs are old enough to match."""
+    """仅尽力清理结果已超过 PRUNE_TTL 的任务目录。"""
     root = HOME / subdir
     if not root.is_dir():
         return
     cutoff = time.time() - PRUNE_TTL
     for d in root.iterdir():
         try:
-            if d.is_dir() and d.stat().st_mtime < cutoff:
+            result = d / "result.json"
+            if d.is_dir() and result.is_file() and result.stat().st_mtime < cutoff:
                 shutil.rmtree(d, ignore_errors=True)
         except OSError:
             pass
@@ -1334,6 +1427,7 @@ def main():
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         result = execute(args, prompt, run_dir)
         result.update(review_summary(result))
+        write_result(run_dir, result)
         emit(result)
         sys.exit(0 if result["status"] == "completed" else 1)
 
@@ -1354,7 +1448,7 @@ def main():
                                   stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
                                   start_new_session=not IS_WIN, close_fds=True)
-        (job_dir / "worker.pid").write_text(str(worker.pid))
+        record_pid(job_dir / "worker.pid", worker.pid)
         emit({"job_id": job_id, "status": "running"})
         return
 
@@ -1390,11 +1484,17 @@ def main():
             if (job_dir / "result.json").exists():
                 emit(job_status(args.job_id))
                 return
-            kill_tree(int(pid_file.read_text()))
+            worker_pid = recorded_pid(pid_file)
+            if worker_pid is not None:
+                kill_tree(worker_pid)
             codex_pid = job_dir / "codex.pid"
-            if codex_pid.exists():
+            pid = recorded_pid(codex_pid)
+            if pid is not None:
                 # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
-                kill_tree(int(codex_pid.read_text()))
+                kill_tree(pid)
+            if worker_pid is None:
+                emit(job_status(args.job_id))
+                return
             # The worker may have published its result after the initial check, before it was killed.
             if not (job_dir / "result.json").exists():
                 result = {**job_metadata(job_dir, finished_at=time.time()), "status": "cancelled",
