@@ -902,6 +902,12 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
     if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
+    if (value.error_kind === 'reconnect_timeout' || value.error_kind === 'router_down') {
+      const attempts = value.attempts ?? value.attempt;
+      const cause = value.error_kind === 'reconnect_timeout' ? 'Codex 重连超时' : 'Codex 本地路由不可达';
+      return `${cause}${attempts ? `（已尝试 ${attempts} 次）` : ''}。先确认 Codex 到模型服务的连接恢复，恢复前不要重派。` +
+        `连接恢复后，用 codex_run 沿用原任务和授权${resumable && value.thread_id ? '，把原 thread_id 填入 resume 续跑。' : '再派。'}`;
+    }
     // worker_died 的可写任务：退出前可能已改了部分文件，续跑后的改动清单也不含这些
     const partial = value.error_kind === 'worker_died' && !readOnly
       ? '退出前 Codex 可能已改了部分文件且没有改动清单，续跑后的清单也不含它们，核验前先用 git status 或对比文件确认现状。' : '';

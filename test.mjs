@@ -1855,6 +1855,19 @@ test('reattaches pending owned jobs on reload or agent creation without redispat
   }
 });
 
+test('terminal connection failures tell the planner to wait for recovery before dispatching again', async () => {
+  const { tools, finals } = harness();
+  finals.RECONNECT = { job_id: 'RECONNECT', status: 'failed', error_kind: 'reconnect_timeout',
+    retryable: true, attempts: 3, sandbox: 'danger-full-access', thread_id: 'THREAD' };
+  const timeout = await tools.codex_status.execute({ job_id: 'RECONNECT', wait_seconds: 0 });
+  assert.match(timeout.next, /重连超时（已尝试 3 次）[\s\S]*恢复前不要重派[\s\S]*thread_id 填入 resume/);
+
+  finals.ROUTER = { ...finals.RECONNECT, job_id: 'ROUTER', error_kind: 'router_down', thread_id: null };
+  const router = await tools.codex_status.execute({ job_id: 'ROUTER', wait_seconds: 0 });
+  assert.match(router.next, /本地路由不可达[\s\S]*恢复前不要重派[\s\S]*沿用原任务和授权再派/);
+  assert.doesNotMatch(router.next, /resume/);
+});
+
 test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {
   for (const cancelResult of [
     { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' },
