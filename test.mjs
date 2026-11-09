@@ -1929,6 +1929,11 @@ test('native output is observable without consuming or duplicating the final rep
   const jobs = fakeJobs();
   const { tools, answer } = harness({ jobs });
   await tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  const reconnect = { job_id: 'J1', status: 'running', phase: 'codex_reconnecting', attempt: 1 };
+  await answer('J1', reconnect);
+  await tick();
+  assert.match(jobs.get('bg1', 'S1').progress, /正在重连模型服务/);
+  assert.match(nextStep(reconnect), /正在重连模型服务[\s\S]*不要重复派活/);
   const stage = { status: 'running', phase: 'retry_wait', attempt: 2, last_error_kind: 'transient', retry_at: Math.floor(Date.now() / 1000) + 60,
     execution_status: 'running', report_status: 'pending', review_status: 'pending' };
   await answer('J1', { ...stage, last_activity: 'first command', seconds_since_last_event: 1 });

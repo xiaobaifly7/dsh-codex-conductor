@@ -748,11 +748,17 @@ def last_activity(events):
             lines = f.read().decode("utf-8", "replace").splitlines()
     except OSError:
         return None
+    newest = True
     for line in reversed(lines):
         try:
             ev = json.loads(line)
         except ValueError:
             continue
+        if newest:
+            newest = False
+            message = ev.get("message")
+            if ev.get("type") == "error" and isinstance(message, str) and message.startswith("Reconnecting"):
+                return "reconnecting"
         item = ev.get("item") or {}
         kind = item.get("type")
         started = ev.get("type") == "item.started"
@@ -1133,6 +1139,8 @@ def enriched_status(job_id, job_dir, value):
     if activity["attempt"] is None:
         activity["attempt"] = result.get("attempts")
     activity["last_error_kind"] = result.get("error_kind") or activity["last_error_kind"]
+    if activity["phase"] == "codex_running" and result.get("last_activity") == "reconnecting":
+        activity["phase"] = "codex_reconnecting"
     return {**result, **activity}
 
 

@@ -2049,6 +2049,24 @@ class RunnerTests(unittest.TestCase):
     def test_unknown_job_is_reported(self):
         self.assertEqual(self.control("status", "nope")["error_kind"], "unknown_job")
 
+    def test_running_status_reports_current_reconnect(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.tmp.name) / "home"
+        jd = home / "jobs" / "live-reconnect"
+        jd.mkdir(parents=True)
+        codex_runner.runner_event(jd, 1, "codex_running")
+        with mock.patch.object(codex_runner, "HOME", home), mock.patch.object(codex_runner, "recorded_pid", return_value=os.getpid()):
+            events = jd / "events.jsonl"
+            with events.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "error", "message": "Reconnecting... 1/5 (timed out)"}) + "\n")
+            status = codex_runner.job_status(jd.name)
+            self.assertEqual((status["status"], status["phase"]), ("running", "codex_reconnecting"))
+            with events.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": "true"}}) + "\n")
+            self.assertEqual(codex_runner.job_status(jd.name)["phase"], "codex_running")
+
     def test_runner_activity_reads_only_the_tail_on_repeated_queries(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

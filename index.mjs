@@ -879,9 +879,11 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     return `当前未取得可信状态或报告，Codex 任务 ${value.job_id} 可能仍在运行。` +
       `用 codex_jobs 核对正确 job_id；先用 codex_status 查询，不要直接重派。`;
   }
-  if (value.status === 'running') return value.phase === 'lock_wait'
-    ? `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。用 codex_status 等待这个 job_id，不要重复派活；需要退出队列时用 codex_cancel，只取消本任务。`
-    : `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
+  if (value.status === 'running') {
+    if (value.phase === 'lock_wait') return `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。用 codex_status 等待这个 job_id，不要重复派活；需要退出队列时用 codex_cancel，只取消本任务。`;
+    if (value.phase === 'codex_reconnecting') return `任务 ${value.job_id} 正在重连模型服务。用 codex_status 查询原任务，不要重复派活。`;
+    return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
+  }
   // 取消会保留恢复信息，但不会重建中断前的改动清单。
   if (value.status === 'cancelled') {
     if (value.phase === 'lock_wait') return '已取消排队，尚未启动 Codex；没有取消持锁任务。不要自行恢复或重派。';
@@ -1163,12 +1165,13 @@ export function apply(ctx, config = {}, run = runRunner) {
         }
         if (value.status === 'running') {
           bridgeErrors = 0;
-          const phase = { lock_wait: '排队等待目录写锁', router_check: '检查路由', codex_running: 'Codex 执行中', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
+          const phase = { lock_wait: '排队等待目录写锁', router_check: '检查路由', codex_running: 'Codex 执行中', codex_reconnecting: 'Codex 正在重连模型服务', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
           const stage = [phase, value.attempt > 0 && `第 ${value.attempt} 轮`,
             value.last_error_kind && `上次错误 ${value.last_error_kind}`,
             value.retry_at != null && `约 ${Math.max(0, Math.ceil(value.retry_at - Date.now() / 1000))} 秒后重试`]
             .filter(Boolean).join(' · ') || 'Codex 执行中';
-          state.progress = `${stage}，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`;
+          state.progress = value.phase === 'codex_reconnecting' ? stage
+            : `${stage}，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`;
           handle.updateProgress([state.cancelNotice, state.progress].filter(Boolean).join('\n'));
           const stageKey = JSON.stringify([value.phase, value.attempt, value.last_error_kind, value.retry_at]);
           if (stageKey !== state.lastStage) {
