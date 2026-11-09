@@ -775,6 +775,15 @@ test('reports requiring inspection keep original acceptance and tell the planner
   assert.doesNotMatch(nextStep(pending), /原验收标准：/);
 });
 
+test('mixed blockers tell the planner to gather both answers and environment evidence before continuation', () => {
+  const source = workflowSource('task_conflict');
+  source.structured.blockers.push({ id: 'service', kind: 'environment', message: '服务未响应',
+    question: '', resolution: '健康检查返回 HTTP 200' });
+  const value = withReport(source);
+  assert.equal(value.blocking.next_action, 'ask_user');
+  assert.match(nextStep(value), /取得回答且条件已满足后[\s\S]*codex_continue 同时提交 answers 和 resolution[\s\S]*具体证据[\s\S]*format: 是否保留旧 CSV 格式？/);
+});
+
 test('typed blockers drive questions, environment evidence and continuation without expanding permissions', () => {
   const rep = (...criteria) => ({ summary: 's', criteria: criteria.map(([criterion, status, evidence]) => ({ criterion, status, evidence })),
     files_changed: [], deviations: [], unresolved: [] });

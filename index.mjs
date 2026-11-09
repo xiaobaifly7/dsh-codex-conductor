@@ -933,8 +933,13 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   const list = !original && Array.isArray(acceptance) ? acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n') : '';
   if (value.status === 'completed' || blocking.blockers.length || ['verified', 'accepted_deviations', 'needs_changes', 'invalid'].includes(value.verification_status)) {
     if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
-    if (blocking.next_action === 'ask_user') return '先向用户提出以下具体问题，取得回答后用 codex_continue 提交 answers；不要重复派活或替用户决定：\n' +
-      blocking.questions.map((q) => `${q.id}: ${q.question}`).join('\n');
+    if (blocking.next_action === 'ask_user') {
+      const environment = blocking.blockers.some((b) => b.kind === 'environment');
+      const guidance = environment
+        ? '先向用户提出以下具体问题，同时核实报告里的环境解除条件。取得回答且条件已满足后，用 codex_continue 同时提交 answers 和 resolution，resolution 写明条件已满足的具体证据。条件未齐备时先不要续接；不要重复派活或替用户决定：\n'
+        : '先向用户提出以下具体问题，取得回答后用 codex_continue 提交 answers；不要重复派活或替用户决定：\n';
+      return guidance + blocking.questions.map((q) => `${q.id}: ${q.question}`).join('\n');
+    }
     if (blocking.next_action === 'wait_condition') return '当前受环境条件阻塞。先说明 blockers 中的解除条件；条件改变并取得证据后，用 codex_continue 的 resolution 说明事实再续跑，不要原样重试。';
     if (blocking.next_action === 'inspect_report') return '报告或任务状态仍需核对。先读完整报告和实际状态，按原验收标准逐条核对。对照原任务范围区分真实缺口与已说明的验证边界；边界说明本身不自动增加补做要求。确有遗留问题时，再查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。\n' +
       RECORD_REVIEW +
