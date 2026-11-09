@@ -1651,15 +1651,15 @@ export function apply(ctx, config = {}, run = runRunner) {
       criteria: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
           evidence: { type: 'string', minLength: 1 } }, required: ['index', 'status', 'evidence'] } },
-      notes: { type: 'string' },
-      accepted_deviations: { type: 'array', items: { type: 'object', additionalProperties: false,
+      notes: { type: 'string', description: '没有补充说明可省略。' },
+      accepted_deviations: { type: 'array', description: '需要接受原报告偏差或范围外改动时逐项填证据；没有时可省略。', items: { type: 'object', additionalProperties: false,
         properties: { kind: { type: 'string', enum: ['reported', 'scope'] }, index: { type: 'integer', minimum: 1 },
           evidence: { type: 'string', minLength: 1 } }, required: ['kind', 'index', 'evidence'] } },
       blockers: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
         id: { type: 'string' }, kind: { type: 'string', enum: ['user_input', 'task_conflict', 'environment', 'implementation'] },
         message: { type: 'string' }, question: { type: 'string' }, resolution: { type: 'string' },
       }, required: ['id', 'kind', 'message', 'question', 'resolution'] } },
-    }, required: ['job_id', 'status', 'criteria', 'notes', 'accepted_deviations'] },
+    }, required: ['job_id', 'status', 'criteria'] },
     output: OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_review: job_id 无效');
@@ -1667,8 +1667,8 @@ export function apply(ctx, config = {}, run = runRunner) {
       const source = await conductor.waitJob(args.job_id, 0);
       if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
-      const { job_id, ...review } = args;
-      const result = await conductor.review(job_id, review, owner, exec?.signal);
+      const { job_id, notes = '', accepted_deviations = [], ...review } = args;
+      const result = await conductor.review(job_id, { ...review, notes, accepted_deviations }, owner, exec?.signal);
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
         throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +

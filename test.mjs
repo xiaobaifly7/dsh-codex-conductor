@@ -1194,6 +1194,21 @@ test('codex_review sends every criterion in stdin and returns verification witho
   assert.ok(!h.calls.some((argv) => argv[0] === 'start'));
 });
 
+test('codex_review accepts a complete review without empty optional fields', async () => {
+  const source = workflowSource('implementation');
+  const review = { status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '只读测试确认已通过' }] };
+  const record = { ...review, notes: '', accepted_deviations: [] };
+  const h = harness({ config: { reviewResult: { ...source, verification_status: 'verified', verification: record } } });
+  h.finals.PARENT = source;
+  const tool = h.tools.codex_review;
+  assert.deepEqual(tool.parameters.required, ['job_id', 'status', 'criteria']);
+  const value = await tool.execute({ job_id: 'PARENT', ...review }, { agent: agentAt('/work/current') });
+  const request = h.requests.find(({ argv }) => argv[0] === 'review');
+  assert.deepEqual(JSON.parse(request.stdin), record);
+  assert.equal(value.verification_status, 'verified');
+  assert.ok(!h.calls.some((argv) => argv[0] === 'start'));
+});
+
 test('codex_review distinguishes rejected arguments from a reviewed failed execution', async () => {
   const source = workflowSource();
   const original = structuredClone(source);
