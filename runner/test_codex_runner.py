@@ -1672,6 +1672,22 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(self.control("summary", "--thread-id", "shared-thread")["groups"][0]["usage"])
         self.assertEqual(self.control("summary", "--job-id", "round-4")["groups"][0]["usage"], {"input_tokens": 50})
 
+    def test_summary_pages_threads_without_losing_totals_or_rounds(self):
+        for i in range(12):
+            job = self.stored_job(f"page-{i}", {"status": "completed", "thread_id": f"thread-{min(i, 10)}",
+                                               "structured": self.sample_report()}, context=self.sample_context())
+            os.utime(job / "args.json", (1000 + i, 1000 + i))
+
+        first = self.control("summary")
+        self.assertEqual((first["total"], first["total_jobs"], first["next_offset"]), (11, 12, 10))
+        self.assertEqual([g["thread_id"] for g in first["groups"]], [f"thread-{i}" for i in range(10, 0, -1)])
+        self.assertEqual(first["groups"][0]["job_ids"], ["page-10", "page-11"])
+
+        second = self.control("summary", "--limit", "1", "--offset", str(first["next_offset"]))
+        self.assertEqual((second["total"], second["total_jobs"], second["next_offset"]), (11, 12, None))
+        self.assertEqual([g["thread_id"] for g in second["groups"]], ["thread-0"])
+        self.assertEqual(self.control("summary", "--offset", "-1")["error_kind"], "bad_arguments")
+
     def test_summary_usage_requires_latest_cumulative_scope_for_multiple_rounds(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

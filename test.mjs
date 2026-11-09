@@ -1214,7 +1214,9 @@ test('codex_summary defaults to the current owner, passes thread filters and nev
   const exec = { agent: agentAt('/work/current') };
   assert.deepEqual(await h.tools.codex_summary.execute({}, exec), summary);
   assert.deepEqual(await h.tools.codex_summary.execute({ thread_id: 'THREAD' }, exec), summary);
-  assert.deepEqual(h.calls, [['summary', '--owner', 'S1'], ['summary', '--owner', 'S1', '--thread-id', 'THREAD']]);
+  assert.deepEqual(await h.tools.codex_summary.execute({ limit: 2, offset: 4 }, exec), summary);
+  assert.deepEqual(h.calls, [['summary', '--owner', 'S1'], ['summary', '--owner', 'S1', '--thread-id', 'THREAD'],
+    ['summary', '--owner', 'S1', '--limit', '2', '--offset', '4']]);
 });
 
 test('codex_summary renders null duration and usage as unknown while retaining genuine zero values', () => {
@@ -1222,8 +1224,10 @@ test('codex_summary renders null duration and usage as unknown while retaining g
   const group = { thread_id: 'THREAD', total_rounds: 1, latest_job_id: 'PARENT', verification_status: 'unreviewed',
     latest_job: workflowSource(), summary: '原始统计不完整', files_changed: [], open_items: [],
     finished_duration_s: null, usage: null, usage_scope: 'unknown' };
-  const render = (item) => h.tools.codex_summary.output.render({}, { total: 1, total_jobs: 1, groups: [item] })[0].text;
+  const render = (item) => h.tools.codex_summary.output.render({}, { total: 3, total_jobs: 5, groups: [item], next_offset: 1 })[0].text;
   const text = render(group);
+  assert.match(text, /3 组，5 轮；本页 1 组/);
+  assert.match(text, /offset=1 查看下一页/);
   assert.match(text, /执行 completed · 独立核验 unreviewed/);
   assert.match(text, /涉及文件（含历史改动）：无/);
   assert.match(render({ ...group, latest_job: { ...group.latest_job, status: 'running', execution_status: 'running' } }),

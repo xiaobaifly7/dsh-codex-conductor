@@ -747,6 +747,7 @@ export function createConductor(cfg, run = runRunner) {
     const argv = ['summary'];
     for (const key of ['cwd', 'owner']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
     if (filters.thread_id !== undefined) argv.push('--thread-id', filters.thread_id);
+    for (const key of ['limit', 'offset']) if (filters[key] !== undefined) argv.push(`--${key}`, String(filters[key]));
     for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
     return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -1606,13 +1607,17 @@ export function apply(ctx, config = {}, run = runRunner) {
     name: 'codex_summary',
     description: '只读汇总当前会话的多轮 Codex 任务；相同 thread_id 归为一组，无线程的独立列出。' +
       '显示最新验收、待办、交付文件、累计已结束耗时和用量。thread_total 是线程累计值，不把每轮累计值重复相加。' +
-      '可传 cwd 查一个项目，或 session_id 查指定会话；不会启动或继续任务。',
+      '可传 cwd 查一个项目，或 session_id 查指定会话；默认每页 10 组，用 limit 和 offset 翻页。不会启动或继续任务。',
     presentCall: () => ({ card: 'generic', kind: 'read', title: 'Codex 多轮任务汇总' }),
     parameters: { type: 'object', properties: {
       cwd: { type: 'string' }, session_id: { type: 'string' }, thread_id: { type: 'string' },
+      limit: { type: 'integer', minimum: 1, maximum: 100, description: '每页线程组数，默认 10。' },
+      offset: { type: 'integer', minimum: 0, description: '从第几组开始，默认 0；下一页用 next_offset。' },
     } },
     output: { schema: DATA_OUTPUT.schema, render: (_args, value) => [{ type: 'text', text: Array.isArray(value.groups)
-      ? [`Codex 汇总：${value.total} 组，${value.total_jobs} 轮；执行结束与独立验收分别显示。`, ...value.groups.map((g) =>
+      ? [`Codex 汇总：${value.total} 组，${value.total_jobs} 轮；本页 ${value.groups.length} 组。` +
+        (value.next_offset == null ? '' : `沿用筛选和每页条数，传 offset=${value.next_offset} 查看下一页。`) +
+        '执行结束与独立验收分别显示。', ...value.groups.map((g) =>
         [`${g.thread_id ?? g.group_id} · ${g.total_rounds} 轮 · 最新 ${g.latest_job_id} · 执行 ${g.latest_job?.execution_status ?? g.latest_job?.status ?? 'unknown'} · 独立核验 ${g.verification_status ?? 'unknown'}`,
           `目标：${taskLine(g.latest_job?.context, 160)}`, `最新结果：${g.summary ?? ''}`,
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,

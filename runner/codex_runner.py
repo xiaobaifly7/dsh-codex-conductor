@@ -1249,7 +1249,8 @@ def summarize_jobs(args):
         key = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
         groups.setdefault(key, []).append(job)
     result = []
-    for (kind, identifier), jobs in groups.items():
+    page = list(groups.items())[args.offset:args.offset + args.limit]
+    for (kind, identifier), jobs in page:
         rounds = list(reversed(jobs))
         latest = jobs[0]
         report = latest.get("structured")
@@ -1288,8 +1289,10 @@ def summarize_jobs(args):
                        "verification": verification, "open_items": open_items, "files_changed": files,
                        "finished_duration_s": round(sum(durations), 1) if all(type(d) in (int, float) for d in durations) else None,
                        "usage": summary_usage(rounds), "usage_scope": "thread_total" if kind == "thread" else "job"})
-    return {"status": "completed", "groups": result, "total": len(result),
-            "total_jobs": sum(g["total_rounds"] for g in result)}
+    next_offset = args.offset + len(result)
+    return {"status": "completed", "groups": result, "total": len(groups),
+            "total_jobs": sum(map(len, groups.values())), "offset": args.offset, "limit": args.limit,
+            "next_offset": next_offset if next_offset < len(groups) else None}
 
 
 def job_output(args):
@@ -1398,8 +1401,9 @@ def main():
         command.add_argument("--job-id", action="append", type=job_identifier)
         command.add_argument("--thread-id")
         command.add_argument("--parent-job", type=job_identifier)
+        command.add_argument("--offset", type=int, default=0)
     listing.add_argument("--limit", type=int, default=20)
-    listing.add_argument("--offset", type=int, default=0)
+    summary.add_argument("--limit", type=int, default=10)
     summary.add_argument("--round-limit", type=int, default=20)
     review = sub.add_parser("review")
     review.add_argument("job_id", type=job_identifier)
@@ -1417,6 +1421,10 @@ def main():
         except (OSError, ValueError, argparse.ArgumentTypeError) as e:
             parser.error("Invalid review: " + str(e))
         return
+    if args.command in ("list", "summary", "output"):
+        maximum = 8000 if args.command == "output" else 100
+        if args.offset < 0 or not 1 <= args.limit <= maximum:
+            parser.error(f"offset must be nonnegative and limit between 1 and {maximum}")
     if args.command == "summary":
         if not 1 <= args.round_limit <= 1000:
             parser.error("round-limit must be between 1 and 1000")
@@ -1426,9 +1434,6 @@ def main():
             emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
         return
     if args.command in ("list", "output"):
-        maximum = 100 if args.command == "list" else 8000
-        if args.offset < 0 or not 1 <= args.limit <= maximum:
-            parser.error(f"offset must be nonnegative and limit between 1 and {maximum}")
         try:
             emit(list_jobs(args) if args.command == "list" else job_output(args))
         except (OSError, ValueError) as e:
