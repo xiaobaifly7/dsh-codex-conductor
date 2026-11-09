@@ -38,6 +38,7 @@ const DEFAULTS = {
   codexBin: '',
   codexHome: '',
   runnerHome: '',
+  routerCheckUrl: '',
   model: '',
   effort: '',
   // 只读任务的推理强度，留空与 effort 相同
@@ -606,9 +607,12 @@ export function decide(exec, cfg) {
 
 // wsl.exe 的参数。配置了的路径用 env 显式传入，不依赖宿主进程继承来的环境
 export function runnerArgv(cfg, args) {
+  const router = cfg.routerCheckUrl && new URL(cfg.routerCheckUrl);
+  if (router && !['http:', 'https:'].includes(router.protocol)) throw new Error('routerCheckUrl 必须是 HTTP(S) URL');
   const env = [
     cfg.codexHome && `CODEX_HOME=${cfg.codexHome}`,
     cfg.runnerHome && `CODEX_RUNNER_HOME=${cfg.runnerHome}`,
+    router && `CODEX_RUNNER_ROUTER_URL=${router.origin}`,
     cfg.codexBin && `CODEX_RUNNER_CMD=${JSON.stringify([cfg.codexBin])}`,
   ].filter(Boolean);
   return [...(cfg.distro ? ['-d', cfg.distro] : []), '-e', 'env', ...env, cfg.python, cfg.runner, ...args];

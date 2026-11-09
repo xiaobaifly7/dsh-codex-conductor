@@ -179,7 +179,7 @@ def router_reachable():
         return True
     url = urlparse(target)
     try:
-        with socket.create_connection((url.hostname, url.port or 443), timeout=2):
+        with socket.create_connection((url.hostname, url.port or (80 if url.scheme == "http" else 443)), timeout=2):
             return True
     except OSError:
         return False
