@@ -895,12 +895,15 @@ export function withReport(value) {
 // 汇报条数和验收标准一致、编号也对得上时，逐条汇报显示验收标准原文（Codex 几乎总会改写条目），下一步不再重复列出。
 // 编号认 1. / 1) / 1、 / 1: / 第1条，NFKC 先把全角数字和标点换成半角
 function sameCriteria(report, acceptance) {
-  const criteria = report?.criteria ?? [];
-  return criteria.length > 0 && acceptance?.length === criteria.length && criteria.every((c, i) => {
+  const criteria = report?.criteria;
+  return Array.isArray(criteria) && criteria.length > 0 && acceptance?.length === criteria.length && criteria.every((c, i) => {
+    if (typeof c?.criterion !== 'string') return false;
     const n = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、])/.exec(String(c.criterion ?? '').normalize('NFKC'))?.[1];
     return n === undefined || Number(n) === i + 1;
   });
 }
+
+const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
@@ -925,13 +928,18 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       '如果这是可写任务，取消前可能已改了部分文件且没有改动清单，核验前先用 git status 或对比文件确认现状。';
   }
   const blocking = blockingState(value);
+  const report = value.report ?? {};
+  const original = sameCriteria(report, acceptance);
+  const list = !original && Array.isArray(acceptance) ? acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n') : '';
   if (value.status === 'completed' || blocking.blockers.length || ['verified', 'accepted_deviations', 'needs_changes', 'invalid'].includes(value.verification_status)) {
     if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
     if (blocking.next_action === 'ask_user') return '先向用户提出以下具体问题，取得回答后用 codex_continue 提交 answers；不要重复派活或替用户决定：\n' +
       blocking.questions.map((q) => `${q.id}: ${q.question}`).join('\n');
     if (blocking.next_action === 'wait_condition') return '当前受环境条件阻塞。先说明 blockers 中的解除条件；条件改变并取得证据后，用 codex_continue 的 resolution 说明事实再续跑，不要原样重试。';
-    if (blocking.next_action === 'inspect_report') return '报告或任务状态仍需核对。先读完整报告和实际状态，对照原任务范围区分真实缺口与已说明的验证边界；边界说明本身不自动增加补做要求。确有遗留问题时，再查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。' +
-      (value.out_of_scope?.length ? `\n范围外改动待核实：${value.out_of_scope.join('、')}。快照也可能包含其他进程写的文件，先核实归属，不能仅凭快照认定 Codex 越界。` : '');
+    if (blocking.next_action === 'inspect_report') return '报告或任务状态仍需核对。先读完整报告和实际状态，按原验收标准逐条核对。对照原任务范围区分真实缺口与已说明的验证边界；边界说明本身不自动增加补做要求。确有遗留问题时，再查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。\n' +
+      RECORD_REVIEW +
+      (value.out_of_scope?.length ? `\n范围外改动待核实：${value.out_of_scope.join('、')}。快照也可能包含其他进程写的文件，先核实归属，不能仅凭快照认定 Codex 越界。` : '') +
+      (list ? `\n原验收标准：\n${list}` : '');
     if (blocking.next_action === 'resume_fix') return '已有明确实现差距。用 codex_continue 续接原任务，它会保留原目录、验收、write、scope 和主机权限；不得借修正扩大授权。';
   }
   // 只读任务用 --ephemeral 运行；只有它续跑的写任务线程还能续。
@@ -950,19 +958,16 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     return (resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
       : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。') + partial;
   }
-  const report = value.report ?? {};
-  const original = sameCriteria(report, acceptance);
   const alerts = [
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',
     value.out_of_scope?.length ? `改动超出 scope：${value.out_of_scope.join('、')}。这份清单来自目录快照，可能含同时段其他进程写的文件（如定期日志）；` +
       '不在 Codex 自报 files_changed 里、明显来自其他进程的，只需一句说明，不算 Codex 越界，也不用请用户决定；其余的先核实是否应保留；' +
       '总是由其他进程写的文件，可以请用户写进插件配置 ignoreChanges，以后不再列出' : '',
   ].filter(Boolean);
-  const list = original ? '' : (acceptance ?? []).map((a, i) => `${i + 1}. ${a}`).join('\n');
   const where = original ? '上面逐条汇报里的验收标准' : list ? '下面的验收标准' : '验收标准';
   return (alerts.length ? `${alerts.join('\n')}\n偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。\n` : '') +
     `Codex 的答复不是完成证据。用只读检查逐条核验${where}，给出每条的证据；` +
-    '核验后用 codex_review 逐条记录证据：全部通过用 verified，有差距用 needs_changes，明确接受偏差用 accepted_deviations。' +
+    RECORD_REVIEW +
     `有差距时先记录 needs_changes，再用 codex_continue 在原权限内修正。${list ? `\n${list}` : ''}`;
 }
 

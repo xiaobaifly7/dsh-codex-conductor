@@ -758,6 +758,23 @@ test('report is surfaced and self-reported problems are flagged first', () => {
   assert.match(loose.report_note, /JSON/);
 });
 
+test('reports requiring inspection keep original acceptance and tell the planner to record review evidence', () => {
+  const acceptance = ['原 CSV 格式仍能解析', '现有数据和文件格式保持不变'];
+  const context = { acceptance };
+  const invalid = withReport({ status: 'failed', error_kind: 'schema_invalid', final_message: '只返回了纯文本', context });
+  const first = nextStep(invalid);
+  assert.match(first, /先读完整报告和实际状态[\s\S]*核验后用 codex_review/);
+  assert.match(first, /原验收标准：\n1\. 原 CSV 格式仍能解析\n2\. 现有数据和文件格式保持不变/);
+
+  const structured = { summary: '执行结束',
+    criteria: acceptance.map((_, i) => ({ criterion: `${i + 1}. 自报简述`, status: 'met', evidence: '证据' })),
+    files_changed: [], deviations: [], unresolved: ['未验证的边界'] };
+  const pending = withReport({ status: 'completed', structured, context });
+  assert.equal(pending.blocking.next_action, 'inspect_report');
+  assert.match(nextStep(pending), /边界说明本身不自动增加补做要求[\s\S]*核验后用 codex_review/);
+  assert.doesNotMatch(nextStep(pending), /原验收标准：/);
+});
+
 test('typed blockers drive questions, environment evidence and continuation without expanding permissions', () => {
   const rep = (...criteria) => ({ summary: 's', criteria: criteria.map(([criterion, status, evidence]) => ({ criterion, status, evidence })),
     files_changed: [], deviations: [], unresolved: [] });
