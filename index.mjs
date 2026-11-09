@@ -811,6 +811,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     'blockers 列出真实阻塞，没有就 []；每项包含唯一 id、kind、message、question、resolution 五个字符串。' +
     'kind 只用 user_input（缺用户信息）、task_conflict（任务冲突需用户取舍）、environment（环境条件未满足）、implementation（实现待修）。' +
     '前两类必须写清 question；其余没有问题时 question 留空，resolution 写已知解除条件，不确定原因时不要猜分类。\n' +
+    'JSON 字符串里的 Windows 路径优先写成 D:/docs/log.txt；必须保留反斜杠时按 JSON 转义。返回前确认整个对象可被 JSON 解析。\n' +
     '任务或验收标准里对最终答复版式的要求（如单独的结论行）写进 summary 即算满足，不算偏离，也不要因此标 blocked。\n';
 }
 
@@ -877,8 +878,10 @@ export function withReport(value) {
   if (outside) rest.out_of_scope = outside;
   Object.assign(rest, reviewState({ ...rest, ...(structured !== undefined ? { structured } : {}) }));
   if (rest.status === 'failed' && rest.error_kind === 'schema_invalid') {
-    const { error_kind: _kind, error: _error, retryable: _retryable, ...done } = rest;
-    const value = { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' };
+    const { error_kind: _kind, error, retryable: _retryable, ...done } = rest;
+    const prefix = 'Final message is not valid JSON: ';
+    const detail = typeof error === 'string' && error.startsWith(prefix) ? `\nJSON 解析错误：${error.slice(prefix.length)}` : '';
+    const value = { ...done, status: 'completed', report_note: 'Codex 没按 JSON 格式逐条汇报，核验时以 final_message 和实际文件为准。' + detail };
     return { ...value, blocking: blockingState(value) };
   }
   if (structured === undefined) return { ...rest, blocking: blockingState(rest) };

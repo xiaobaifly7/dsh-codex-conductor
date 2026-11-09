@@ -686,6 +686,7 @@ test('codex_run validation requires acceptance criteria', () => {
   const prompt = composePrompt('做事情做事情', ['甲条件成立'], ['src/a.py', 'tests/']);
   assert.match(prompt, /## 验收标准[\s\S]*1\. 甲条件成立[\s\S]*## 执行约束[\s\S]*只允许改动这些路径：src\/a\.py、tests\/[\s\S]*blocked[\s\S]*## 最后汇报[\s\S]*JSON/);
   assert.doesNotMatch(composePrompt('做事情做事情', ['甲条件成立']), /只允许改动/);
+  assert.match(prompt, /Windows 路径优先写成 D:\/docs\/log\.txt[\s\S]*反斜杠时按 JSON 转义/);
   assert.match(prompt, /单独的结论行）写进 summary 即算满足[\s\S]*不要因此标 blocked/);
 });
 
@@ -761,7 +762,10 @@ test('report is surfaced and self-reported problems are flagged first', () => {
 test('reports requiring inspection keep original acceptance and tell the planner to record review evidence', () => {
   const acceptance = ['原 CSV 格式仍能解析', '现有数据和文件格式保持不变'];
   const context = { acceptance };
-  const invalid = withReport({ status: 'failed', error_kind: 'schema_invalid', final_message: '只返回了纯文本', context });
+  const invalid = withReport({ status: 'failed', error_kind: 'schema_invalid', final_message: '原始答复', context,
+    error: 'Final message is not valid JSON: Invalid \\escape (line 1, column 17)' });
+  assert.match(invalid.report_note, /JSON 解析错误：Invalid \\escape \(line 1, column 17\)/);
+  assert.equal(invalid.final_message, '原始答复');
   const first = nextStep(invalid);
   assert.match(first, /先读完整报告和实际状态[\s\S]*核验后用 codex_review/);
   assert.match(first, /原验收标准：\n1\. 原 CSV 格式仍能解析\n2\. 现有数据和文件格式保持不变/);

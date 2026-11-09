@@ -706,8 +706,9 @@ def execute(args, prompt, run_dir):
         if args.schema:
             try:
                 result["structured"] = json.loads(final)
-            except ValueError:
-                result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON",
+            except ValueError as error:
+                detail = f": {error.msg} (line {error.lineno}, column {error.colno})" if isinstance(error, json.JSONDecodeError) else ""
+                result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON" + detail,
                               retryable=False)
         return result
     finally:

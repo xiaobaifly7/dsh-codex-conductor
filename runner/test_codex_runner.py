@@ -33,8 +33,8 @@ FAKE_CODEX = textwrap.dedent(r"""
     def say(**ev):
         print(json.dumps(ev), flush=True)
 
-    def finish():
-        say(type="item.completed", item={"type": "agent_message", "text": "done"})
+    def finish(text="done"):
+        say(type="item.completed", item={"type": "agent_message", "text": text})
         say(type="turn.completed", usage={"input_tokens": 1})
 
     if mode == "fault_logging":
@@ -45,6 +45,8 @@ FAKE_CODEX = textwrap.dedent(r"""
     if mode == "warnings_then_ok":
         say(type="item.completed", item={"type": "error", "message": "Codex is ignoring 2 unrecognized settings"})
         finish()
+    elif mode == "invalid_windows_path_report":
+        finish(r'{"summary": "D:\docs\log.txt"}')
     elif mode == "nonzero_after_completed":
         finish()
         sys.exit(1)
@@ -180,6 +182,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(r["thread_id"])
         self.assertNotIn("usage_scope", r)
         self.assertEqual(self.invoke("--sandbox", "workspace-write")["thread_id"], "thread-1")
+
+    def test_invalid_windows_path_report_preserves_the_original_and_reports_json_position(self):
+        schema = RUNNER.parents[1] / "report.v2.schema.json"
+        result = self.invoke("--schema", str(schema), mode="invalid_windows_path_report")
+        self.assertEqual(result["error_kind"], "schema_invalid")
+        self.assertEqual(result["final_message"], r'{"summary": "D:\docs\log.txt"}')
+        self.assertRegex(result["error"], r"Invalid \\escape \(line 1, column \d+\)")
+        self.assertNotIn("structured", result)
 
     def test_read_only_resume_keeps_the_writer_thread_and_marks_usage_as_thread_total(self):
         r = self.invoke("--resume", "writer-9")
