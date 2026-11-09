@@ -581,14 +581,19 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
     scope = [os.path.realpath(s) for s in scope] if scope else scope
     after = snapshot(root, scope=scope) if before is not None else None
     rel = lambda p: os.path.relpath(os.path.realpath(os.path.join(root, p)), root).replace(os.sep, "/")
-    events = list(dict.fromkeys((rel(p), k) for p, k in event_changes if p))
+    events = {}
+    for p, k in event_changes:
+        if p:
+            key = rel(p)
+            if k != "update" or events.get(key) != "add":
+                events[key] = k
     if after is not None:
         changes = [(p, "added") for p in after.keys() - before.keys()]
         changes += [(p, "deleted") for p in before.keys() - after.keys()]
         changes += [(p, "modified") for p in before.keys() & after.keys() if before[p] != after[p]]
         source = "snapshot"
         inside = [rel(s) for s in scope] if scope else ["."]
-        outside = [(p, k) for p, k in events if not any(
+        outside = [(p, k) for p, k in events.items() if not any(
             (s == "." and p != ".." and not p.startswith("../")) or s == p or p.startswith(s + "/") for s in inside)]
         changes += outside
         if scope:
@@ -596,7 +601,7 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
         elif outside:
             source = "snapshot+codex_events"
     else:
-        changes = events
+        changes = list(events.items())
         source = "codex_events"
     patterns, warnings = ignore_patterns(ignore)
     changes = [(p, k) for p, k in changes if not any(rx.search(p) for rx in patterns)]

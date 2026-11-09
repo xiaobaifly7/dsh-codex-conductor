@@ -143,11 +143,13 @@ const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex
 export function normPath(p) {
   if (typeof p !== 'string' || !p.trim()) return '';
   let s = p.trim().replace(/\\/g, '/');
+  const windows = /^[A-Za-z]:/.test(s) || s.startsWith('//');
+  // Resolve .. in WSL before converting a mount to its Windows drive.
+  s = path.posix.normalize(s);
   const m = /^\/mnt\/([a-z])(\/.*)?$/i.exec(s);
   if (m) s = `${m[1]}:${m[2] ?? '/'}`;
-  const windows = /^[A-Za-z]:/.test(s) || s.startsWith('//');
-  s = path.posix.normalize(s).replace(/\/+$/, '') || '/';
-  return windows ? s.toLowerCase() : s;
+  s = s.replace(/\/+$/, '') || '/';
+  return windows || m ? s.toLowerCase() : s;
 }
 
 const under = (p, r) => p === r || p.startsWith(r === '/' ? r : `${r}/`);

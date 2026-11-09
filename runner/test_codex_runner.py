@@ -1208,12 +1208,12 @@ class RunnerTests(unittest.TestCase):
         before = codex_runner.snapshot(str(root))
         (root / "keep" / "a.txt").write_text("changed")
         (extra / "out.txt").write_text("outside cwd")
-        events = [(str(extra / "out.txt"), "update"), ("../extra-output/out.txt", "update"),
+        events = [(str(extra / "out.txt"), "add"), ("../extra-output/out.txt", "update"),
                   ("keep/a.txt", "update"), ("other.txt", "update")]
         report = codex_runner.files_changed(str(root), before, events)
         self.assertEqual(report["files_changed_source"], "snapshot+codex_events")
         self.assertEqual(report["files_changed_total"], 2)
-        self.assertEqual(report["files_changed"], [{"path": "../extra-output/out.txt", "change": "update"},
+        self.assertEqual(report["files_changed"], [{"path": "../extra-output/out.txt", "change": "add"},
                                                  {"path": "keep/a.txt", "change": "modified"}])
         self.assertEqual(codex_runner.out_of_scope_paths({"cwd": str(root), "scope_paths": [str(root)], **report}),
                          ["../extra-output/out.txt"])

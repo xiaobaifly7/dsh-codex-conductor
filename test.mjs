@@ -691,6 +691,8 @@ test('codex_run validation requires acceptance criteria', () => {
 });
 
 test('scope check flags changes outside the allowed paths', () => {
+  const crossed = { files_changed: [{ path: '../../../c/tmp/step.ps1' }, { path: '../../../c/tmp/other.ps1' }] };
+  assert.deepEqual(outOfScope(crossed, '/mnt/e/lab/project', ['C:/tmp/step.ps1']), ['../../../c/tmp/other.ps1']);
   const value = { files_changed: [{ path: 'src/a.py' }, { path: 'tests/t.py' }, { path: 'README.md' }] };
   assert.deepEqual(outOfScope(value, 'F:\\proj', ['src/a.py', 'F:\\proj\\tests']), ['README.md']);
   assert.deepEqual(outOfScope(value, '/mnt/f/proj', ['src', 'tests/']), ['README.md']);
