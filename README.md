@@ -29,7 +29,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `codex_watch({"mode":"attention"})` 仅在失败、阻塞或报告异常等变化时通知；`mode="all"` 也包含开始和正常结束。它在无变化时只读 Harness 内存任务表，不启动 Codex、不反复唤醒模型。首次符合条件的变化后观察结束，需要继续时再调用。它保留任务原有结束通知，也不默认启用长期监控；取消观察只停止观察。
 
-`codex_runtime({"action":"status"})` 显示磁盘源码版本、实际加载记录、待生效差异和活任务数。`action="reload"` 默认 `when="idle"`，有任务时登记原生后台等待，查询期间又有任务启动时会重新确认空闲；`when="now"` 明确要求立即热重载，旧任务继续运行。先配置 `runtimeProfileFile` 为这个桌面实例实际使用的 `cordis.patch.yml` 的完整 Windows 路径。只更新本插件的 entry id 与模块 URL，不重启宿主、不结束 Codex；未取得新模块加载确认时不会显示“已生效”。
+`codex_runtime({"action":"status"})` 显示磁盘源码版本、实际加载记录、待生效差异和活任务数。`loaded` 包含实际加载的默认权限、服务档位和网关设置；`serviceTier: null` 表示沿用 Codex 配置。网关只显示提供方、主机端口和探测方式。`action="reload"` 默认 `when="idle"`，有任务时登记原生后台等待，查询期间又有任务启动时会重新确认空闲；`when="now"` 明确要求立即热重载，旧任务继续运行。先配置 `runtimeProfileFile` 为这个桌面实例实际使用的 `cordis.patch.yml` 的完整 Windows 路径。只更新本插件的 entry id 与模块 URL，不重启宿主、不结束 Codex；未取得新模块加载确认时不会显示“已生效”。
 配置已改到另一模块路径时，状态可显示唯一使用本插件生成 ID 的目标，并提示在 Harness 内刷新；旧实例不能改写该条目。
 
 - 任务在 WSL 后台运行，DSH 这边断开等待不影响任务；重试、超时、断线检测和目录写锁由随包的 [`runner/codex_runner.py`](runner/codex_runner.py) 处理。路由不可用时的重试保留尚未发送的任务提示；启动与取消同步，PID 或事件日志写入失败也会结束并回收子进程。即使 Codex 提前关闭标准输出但进程仍存活，超时、空闲和断线预算仍然生效。
@@ -254,7 +254,7 @@ Finished rows retain output. Aborting a waiting call cancels Codex; session arch
 
 `codex_watch` observes native task changes without model polling or idle WSL calls. `attention` reports failures, blockers and report problems; `all` also includes starts/normal completion. It ends after the first matching change; stopping it only stops observation and preserves normal completion notifications.
 
-`codex_runtime` compares source and loaded versions. Set `runtimeProfileFile` to the actual desktop profile. Reload defaults to `when="idle"`, waiting through native jobs and reconfirming idle if a task starts during listing. `when="now"` explicitly reloads immediately while old tasks continue. Only this plugin's entry ID/module URL change; confirmation requires the new loaded marker, without restarting the host.
+`codex_runtime` compares source and loaded versions. Its `loaded` record includes the effective default access settings, configured service tier (`null` inherits Codex settings), gateway origin and probe transport. Set `runtimeProfileFile` to the actual desktop profile. Reload defaults to `when="idle"`, waiting through native jobs and reconfirming idle if a task starts during listing. `when="now"` explicitly reloads immediately while old tasks continue. Only this plugin's entry ID/module URL change; confirmation requires the new loaded marker, without restarting the host.
 When the profile points at a different module path, status can show the single target with a generated conductor ID. The old instance cannot edit that target and asks for a Harness refresh.
 
 ### Permissions

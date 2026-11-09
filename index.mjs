@@ -606,8 +606,7 @@ export function decide(exec, cfg) {
   return undefined;
 }
 
-// wsl.exe 的参数。配置了的路径用 env 显式传入，不依赖宿主进程继承来的环境
-export function runnerArgv(cfg, args) {
+function routeConfiguration(cfg) {
   const router = cfg.routerCheckUrl && new URL(cfg.routerCheckUrl);
   if (router && !['http:', 'https:'].includes(router.protocol)) throw new Error('routerCheckUrl 必须是 HTTP(S) URL');
   const route = cfg.codexRoute;
@@ -621,6 +620,23 @@ export function runnerArgv(cfg, args) {
       throw new Error('codexRoute.baseUrl 必须是无凭据的 HTTP(S) URL');
     }
   }
+  return { router, route, routeUrl };
+}
+
+function loadedGateway(cfg) {
+  try {
+    const { router, route, routeUrl } = routeConfiguration(cfg);
+    return { codexRoute: routeUrl ? { provider: route.provider, origin: routeUrl.origin } : null,
+      routerCheck: router ? { transport: 'tcp', origin: router.origin }
+        : routeUrl ? { transport: 'http', origin: routeUrl.origin } : null };
+  } catch {
+    return { routeConfigInvalid: true };
+  }
+}
+
+// wsl.exe 的参数。配置了的路径用 env 显式传入，不依赖宿主进程继承来的环境
+export function runnerArgv(cfg, args) {
+  const { router, route, routeUrl } = routeConfiguration(cfg);
   const env = [
     cfg.codexHome && `CODEX_HOME=${cfg.codexHome}`,
     cfg.runnerHome && `CODEX_RUNNER_HOME=${cfg.runnerHome}`,
@@ -1786,7 +1802,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     writeFileSync(path.join(dir, 'loaded.json'),
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
         tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime'],
-        defaultHostAccess: cfg.defaultHostAccess === true,
+        allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
+        serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
   } catch {}
 }

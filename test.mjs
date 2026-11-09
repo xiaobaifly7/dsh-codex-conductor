@@ -1246,6 +1246,24 @@ test('codex_summary renders null duration and usage as unknown while retaining g
   assert.deepEqual(h.calls, []);
 });
 
+test('runtime status shows loaded service tier and sanitized gateway settings', async () => {
+  const current = harness({ config: { serviceTier: 'fast', allowHostAccess: true, defaultHostAccess: true,
+    codexRoute: { provider: 'magpie', baseUrl: 'http://127.0.0.1:3426/v1?private=route-test' },
+    routerCheckUrl: 'http://127.0.0.1:3440/health?private=probe-test' } });
+  const { loaded } = await current.tools.codex_runtime.execute({ action: 'status' });
+  assert.equal(loaded.serviceTier, 'fast');
+  assert.equal(loaded.allowHostAccess, true);
+  assert.equal(loaded.defaultHostAccess, true);
+  assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
+  assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
+  assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
+
+  const inherited = harness({ config: { codexRoute: { provider: 'magpie', baseUrl: 'http://127.0.0.1:3426/v1' } } });
+  const fallback = (await inherited.tools.codex_runtime.execute()).loaded;
+  assert.equal(fallback.serviceTier, null);
+  assert.deepEqual(fallback.routerCheck, { transport: 'http', origin: 'http://127.0.0.1:3426' });
+});
+
 test('codex_watch stays quiet without changes and stopping it leaves the business task running', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const jobs = fakeJobs();

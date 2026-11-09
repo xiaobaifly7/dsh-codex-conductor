@@ -302,7 +302,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
   }
   return ctx.tools.register({
     name: 'codex_runtime',
-    description: '查看磁盘源码、实际加载版本及在途 Codex 任务数；reload 默认等空闲后重载，when=now 立即请求。' +
+    description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限及在途 Codex 任务数；reload 默认等空闲后重载，when=now 立即请求。' +
       '不会取消或启动 Codex 任务。只有加载标记确认新模块后才报告生效；后台取消只停止观察。',
     presentCall: (args) => ({ card: 'generic', kind: args?.action === 'reload' ? 'write' : 'read', title: 'Codex runtime' }),
     parameters: { type: 'object', properties: {
