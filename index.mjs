@@ -547,7 +547,11 @@ function refusedPart(command, extra) {
     return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、$[...] 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
   }
   const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
-  return bad ? `不放行的是「${core(bad, expansions.get(bad).kinds).words.join(' ').slice(0, 200)}」` : '命令为空';
+  if (!bad) return '命令为空';
+  const words = core(bad, expansions.get(bad).kinds).words;
+  const hint = ['find', 'sed'].includes(words[0]) && words.slice(1).some((a) => a.includes('$'))
+    ? '；这类只读核验不接受含 $ 的参数，请直接写出固定路径和查询参数' : '';
+  return `不放行的是「${words.join(' ').slice(0, 200)}」${hint}`;
 }
 
 const present = (v) => v !== undefined && v !== null && v !== false && v !== '' &&
