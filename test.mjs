@@ -53,6 +53,9 @@ test('wsl.exe argv uses the default distro and Codex config unless configured', 
   assert.deepEqual(runnerArgv(base, ['status', 'J']), ['-e', 'env', 'python3', '/mnt/c/p/runner/codex_runner.py', 'status', 'J']);
   assert.deepEqual(runnerArgv({ ...base, routerCheckUrl: 'http://127.0.0.1:3425/v1' }, ['start']),
     ['-e', 'env', 'CODEX_RUNNER_ROUTER_URL=http://127.0.0.1:3425', 'python3', '/mnt/c/p/runner/codex_runner.py', 'start']);
+  assert.deepEqual(runnerArgv({ ...base, codexRoute: { provider: 'gateway', baseUrl: 'http://127.0.0.1:3426/v1' } }, ['start']),
+    ['-e', 'env', 'CODEX_RUNNER_ROUTE_PROVIDER=gateway', 'CODEX_RUNNER_ROUTE_URL=http://127.0.0.1:3426/v1',
+      'python3', '/mnt/c/p/runner/codex_runner.py', 'start']);
   assert.deepEqual(runnerArgv({ ...base, distro: 'Ubuntu', codexHome: '/home/u/.codex', codexBin: '/home/u/bin/codex' }, ['cancel', 'J']),
     ['-d', 'Ubuntu', '-e', 'env', 'CODEX_HOME=/home/u/.codex', 'CODEX_RUNNER_CMD=["/home/u/bin/codex"]',
       'python3', '/mnt/c/p/runner/codex_runner.py', 'cancel', 'J']);

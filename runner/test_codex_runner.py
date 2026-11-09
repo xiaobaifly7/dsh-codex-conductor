@@ -515,6 +515,35 @@ class RunnerTests(unittest.TestCase):
         self.assertFalse(r["retryable"])
         self.assertIsNone(r["thread_id"])
 
+    def test_configured_router_reaches_http_and_preserves_other_proxy_settings(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        route = 'http://127.0.0.1:3426/v1'
+        args = SimpleNamespace(use_user_config=True, model=None, effort=None, service_tier='fast',
+                               sandbox='danger-full-access', schema=None)
+        proxy = {'NO_PROXY': 'internal.example', 'HTTPS_PROXY': 'http://proxy.example:8080'}
+        if os.name != 'nt':
+            proxy['no_proxy'] = 'other.example'
+        with mock.patch.dict(os.environ, {
+            'CODEX_RUNNER_ROUTER_URL': '', 'CODEX_RUNNER_ROUTE_PROVIDER': 'gateway', 'CODEX_RUNNER_ROUTE_URL': route,
+            **proxy,
+        }), mock.patch.object(codex_runner.http.client, 'HTTPConnection') as connect:
+            self.assertTrue(codex_runner.router_reachable())
+            connect.return_value.request.assert_called_once_with('HEAD', '/')
+            connect.return_value.getresponse.side_effect = codex_runner.http.client.RemoteDisconnected()
+            self.assertFalse(codex_runner.router_reachable())
+            for thread_id in (None, 'THREAD'):
+                argv, env = codex_runner.build_command(args, Path(self.tmp.name), thread_id)
+                self.assertIn('model_provider="gateway"', argv)
+                self.assertIn('model_providers.gateway.base_url=' + json.dumps(route), argv)
+                self.assertIn('service_tier="fast"', argv)
+                self.assertIn('sandbox_mode="danger-full-access"', argv)
+                self.assertEqual(env['NO_PROXY'], 'internal.example,127.0.0.1')
+                if os.name != 'nt':
+                    self.assertEqual(env['no_proxy'], 'other.example,127.0.0.1')
+                self.assertEqual(env['HTTPS_PROXY'], 'http://proxy.example:8080')
+
     def test_router_down_never_spawns_codex(self):
         r = self.invoke("--retries", "0", env={"CODEX_RUNNER_ROUTER_URL": "http://127.0.0.1:9/x"})
         self.assertEqual(r["error_kind"], "router_down")

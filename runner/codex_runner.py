@@ -8,9 +8,10 @@
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
 """
 import argparse
-from contextlib import suppress
+from contextlib import closing, suppress
 import errno
 import hashlib
+import http.client
 import json
 import os
 import queue
@@ -174,14 +175,21 @@ def same_boot(job_dir):
 
 def router_reachable():
     # Opt-in: set CODEX_RUNNER_ROUTER_URL when Codex talks to a local proxy, so a dead proxy fails fast.
-    target = os.environ.get("CODEX_RUNNER_ROUTER_URL", "")
-    if target == "":
+    target = os.environ.get("CODEX_RUNNER_ROUTER_URL")
+    route = os.environ.get("CODEX_RUNNER_ROUTE_URL")
+    if not (target or route):
         return True
-    url = urlparse(target)
+    url = urlparse(target or route)
     try:
-        with socket.create_connection((url.hostname, url.port or (80 if url.scheme == "http" else 443)), timeout=2):
+        if target:
+            with socket.create_connection((url.hostname, url.port or (80 if url.scheme == "http" else 443)), timeout=2):
+                return True
+        connect = http.client.HTTPSConnection if url.scheme == "https" else http.client.HTTPConnection
+        with closing(connect(url.hostname, url.port, timeout=2)) as conn:
+            conn.request("HEAD", "/")
+            conn.getresponse()
             return True
-    except OSError:
+    except (OSError, http.client.HTTPException):
         return False
 
 
@@ -247,6 +255,17 @@ def build_command(args, run_dir, thread_id):
     if not args.use_user_config:
         cmd += STRIP_USER_EXTRAS + disable_user_mcp_servers()
     cmd += ["-c", 'approval_policy="never"']
+    route = env.get("CODEX_RUNNER_ROUTE_URL")
+    if route:
+        provider = env["CODEX_RUNNER_ROUTE_PROVIDER"]
+        cmd += ["-c", "model_provider=" + json.dumps(provider),
+                "-c", f"model_providers.{provider}.base_url=" + json.dumps(route)]
+        host = urlparse(route).hostname
+        if host in ("127.0.0.1", "localhost", "::1"):
+            inherited = env.get("NO_PROXY") or env.get("no_proxy", "")
+            for key in (("NO_PROXY",) if IS_WIN else ("NO_PROXY", "no_proxy")):
+                existing = env.get(key, inherited)
+                env[key] = ",".join(filter(None, (existing, host)))
     if args.model:
         cmd += ["-m", args.model]
     if args.effort:

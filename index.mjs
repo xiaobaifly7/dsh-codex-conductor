@@ -39,6 +39,7 @@ const DEFAULTS = {
   codexHome: '',
   runnerHome: '',
   routerCheckUrl: '',
+  codexRoute: null,
   model: '',
   effort: '',
   // 只读任务的推理强度，留空与 effort 相同
@@ -609,10 +610,23 @@ export function decide(exec, cfg) {
 export function runnerArgv(cfg, args) {
   const router = cfg.routerCheckUrl && new URL(cfg.routerCheckUrl);
   if (router && !['http:', 'https:'].includes(router.protocol)) throw new Error('routerCheckUrl 必须是 HTTP(S) URL');
+  const route = cfg.codexRoute;
+  let routeUrl;
+  if (route != null) {
+    if (typeof route.provider !== 'string' || !/^[A-Za-z0-9_-]+$/.test(route.provider) || typeof route.baseUrl !== 'string') {
+      throw new Error('codexRoute 需要已有自定义 provider 和 baseUrl');
+    }
+    routeUrl = new URL(route.baseUrl);
+    if (!['http:', 'https:'].includes(routeUrl.protocol) || routeUrl.username || routeUrl.password) {
+      throw new Error('codexRoute.baseUrl 必须是无凭据的 HTTP(S) URL');
+    }
+  }
   const env = [
     cfg.codexHome && `CODEX_HOME=${cfg.codexHome}`,
     cfg.runnerHome && `CODEX_RUNNER_HOME=${cfg.runnerHome}`,
     router && `CODEX_RUNNER_ROUTER_URL=${router.origin}`,
+    routeUrl && `CODEX_RUNNER_ROUTE_PROVIDER=${route.provider}`,
+    routeUrl && `CODEX_RUNNER_ROUTE_URL=${routeUrl.href}`,
     cfg.codexBin && `CODEX_RUNNER_CMD=${JSON.stringify([cfg.codexBin])}`,
   ].filter(Boolean);
   return [...(cfg.distro ? ['-d', cfg.distro] : []), '-e', 'env', ...env, cfg.python, cfg.runner, ...args];
