@@ -906,7 +906,7 @@ test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissi
 });
 
 // 用假的 runner 和假的 jobs 服务装上插件；后台循环的 `status --wait 20` 由测试逐个应答
-function harness({ config = {}, jobs, get = true } = {}) {
+function harness({ config = {}, jobs, agents, get = true } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -933,7 +933,7 @@ function harness({ config = {}, jobs, get = true } = {}) {
     return Promise.resolve(cancelResult ?? { job_id: argv[1], status: 'cancelled' });
   };
   const ctx = { tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: (ev, fn) => { handlers[ev] = fn; },
-    ...(get ? { get: (key) => (key === 'jobs' ? jobs : undefined) } : {}) };
+    ...(get ? { get: (key) => ({ jobs, agents })[key] } : {}) };
   apply(ctx, { workspaces: ['F:\\work\\项目'], ...pluginConfig }, run);
   const answer = async (job, value) => {
     for (let i = 0; !waiters[job]?.length; i++) {
@@ -1820,6 +1820,39 @@ test('after a plugin reload the live background job is reused, not registered ag
   assert.equal(jobs.started.length, 1);
   await before.answer('J1', { status: 'completed' });
   await jobs.started[0].done;
+});
+
+test('reattaches pending owned jobs on reload or agent creation without redispatching', async () => {
+  for (const alreadyLive of [true, false]) {
+    const jobs = fakeJobs();
+    const event = (type, seq, jobId, runnerId, owner = 'S1') => ({ type, seq, data: {
+      jobId, owner, kind: 'codex', label: `Codex ${runnerId} · 原任务`,
+    } });
+    const agent = agentAt('/work/original', [
+      event('job/registered', 0, 'native-old', 'OLD'),
+      event('job/registered', 1, 'native-done', 'DONE'),
+      event('job/settled', 2, 'native-done', 'DONE'),
+      event('job/registered', 3, 'native-mismatch', 'MISMATCH'),
+      event('job/registered', 4, 'native-other', 'OTHER', 'S2'),
+    ]);
+    const agents = { get: (id) => id === 'S1' ? agent : undefined, list: () => alreadyLive ? [agent] : [] };
+    const h = harness({ jobs, agents });
+    const report = { ...workflowSource(), job_id: 'OLD' };
+    h.finals.OLD = alreadyLive ? report : { ...report, status: 'running', structured: undefined };
+    h.finals.MISMATCH = { ...report, job_id: 'MISMATCH', context: { ...report.context, owner: 'S2' } };
+    if (!alreadyLive) h.handlers['agent/created']({ agent });
+    await h.answer('OLD', report);
+    await jobs.started[0].done;
+    await tick();
+    h.handlers['agent/created']({ agent });
+    await tick();
+    assert.equal(jobs.started.length, 1);
+    assert.equal(jobs.started[0].spec.owner, 'S1');
+    assert.equal(jobs.started[0].status, 'completed');
+    assert.match(jobs.started[0].result, /等待确认 CSV 格式/);
+    assert.deepEqual(jobs.unawaited, ['bg1']);
+    assert.ok(h.calls.every((argv) => argv[0] === 'status' && ['OLD', 'MISMATCH'].includes(argv[1])));
+  }
 });
 
 test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {

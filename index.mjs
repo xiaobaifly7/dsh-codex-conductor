@@ -1118,13 +1118,14 @@ export function apply(ctx, config = {}, run = runRunner) {
   // 这个 runner 任务仍在进行的 DSH 后台任务。按 DSH 任务表查而不记在插件内存里：
   // 插件热重载后旧的后台任务和它的等待循环仍在，内存记录却清空了，会重复登记、重复送回结果
   // 省略 jobId 时查询当前 agent 的任一 Codex 任务。
-  function liveBackground(jobId, exec) {
+  function liveBackground(jobId, exec, includeSettled = false) {
     const owner = exec?.agent?.id;
     const jobs = owner === undefined ? undefined : ctx.get?.('jobs');
     // 标签是「Codex <job_id>」或后面再跟「 · 任务摘要」
     const base = `Codex ${jobId}`;
-    const job = jobs?.list(owner).find((j) => j.kind === 'codex' && (!jobId || j.label === base || j.label?.startsWith(`${base} · `)) &&
-      (j.status === 'running' || j.status === 'stopping'));
+    const job = jobs?.list(owner).find((j) => j.owner === owner && j.kind === 'codex' &&
+      (!jobId || j.label === base || j.label?.startsWith(`${base} · `)) &&
+      (includeSettled || j.status === 'running' || j.status === 'stopping'));
     return job && { jobs, id: job.id, owner };
   }
 
@@ -1261,6 +1262,8 @@ export function apply(ctx, config = {}, run = runRunner) {
   }
 
   // 仍在执行时交给后台任务，结束后 DSH 只发一条带摘要的任务通知，完整结果要用 job_output 读；没有后台任务就照旧轮询
+  const finishStatus = (value) => ({ ...value, next: nextStep(value) });
+
   function notifyOnDone(value, exec, finish) {
     if (value.status !== 'running' || !value.job_id) return value;
     const id = background(value.job_id, exec, finish)?.id;
@@ -1381,9 +1384,8 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
-      const finish = (value) => ({ ...value, next: nextStep(value) });
       const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
-      return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
+      return value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
     },
   });
 
@@ -1438,22 +1440,40 @@ export function apply(ctx, config = {}, run = runRunner) {
     let events = historyOwner === exec?.agent?.id ? exec?.agent?.session?.log ?? [] : [];
     const query = owner !== undefined ? ctx.get?.('sessionQuery') : undefined;
     const observation = query ? await query.observeSession(owner, { projectionMode: 'none', signal: exec?.signal }) : undefined;
-    let history;
+    let history, settled;
     try {
       events = observation?.events ?? events;
-      history = events.filter((e) => e.seq >= (observation?.inheritedEventCount ?? 0) &&
-        e.type === 'job/registered' && e.data.kind === 'codex' && e.data.owner === historyOwner)
+      const ownJobs = events.filter((e) => e.seq >= (observation?.inheritedEventCount ?? 0) &&
+        (e.type === 'job/registered' || e.type === 'job/settled') && e.data.kind === 'codex' && e.data.owner === historyOwner);
+      history = ownJobs.filter((e) => e.type === 'job/registered')
         .map((e) => ({ id: e.data.jobId, owner: e.data.owner, kind: e.data.kind, label: e.data.label }));
+      settled = new Set(ownJobs.filter((e) => e.type === 'job/settled').map((e) => e.data.jobId));
     } finally { observation?.[Symbol.dispose](); }
-    const native = ctx.get?.('jobs')?.list(historyOwner) ?? [];
+    const native = (ctx.get?.('jobs')?.list(historyOwner) ?? []).filter((j) => j.owner === historyOwner);
     const linked = new Map([...history, ...native].filter((j) => j.kind === 'codex').flatMap((j) => {
       const match = /^Codex ([^\s·]+)/.exec(j.label ?? '');
       return match ? [[match[1], j]] : [];
     }));
     const filters = Object.fromEntries(['status', 'needs_attention', 'limit', 'offset', 'thread_id', 'parent_job']
       .filter((key) => args[key] !== undefined).map((key) => [key, args[key]]));
-    return { owner, linked, filters: { ...filters, ...(cwd !== undefined ? { cwd } : {}),
+    return { owner, linked, settled, filters: { ...filters, ...(cwd !== undefined ? { cwd } : {}),
       ...(owner !== undefined ? { owner, job_ids: [...linked.keys()] } : {}) } };
+  }
+
+  async function recoverBackground(agent) {
+    const owner = agent?.id;
+    const agents = ctx.get?.('agents');
+    if (!owner || agents?.get(owner) !== agent || !ctx.get?.('jobs')) return;
+    const exec = { agent };
+    const { linked, settled } = await historySelection({ session_id: 'current' }, exec);
+    for (const [id, entry] of linked) {
+      if (entry.status !== undefined || settled.has(entry.id)) continue;
+      const value = withReport(await conductor.waitJob(id, 0));
+      if (value.job_id !== id || value.context?.owner !== owner || unknownState(value) ||
+          !['running', 'completed', 'failed', 'cancelled'].includes(value.status)) continue;
+      if (agents.get(owner) !== agent) return;
+      if (!liveBackground(id, exec, true)) background(id, exec, finishStatus, entry.label);
+    }
   }
 
   ctx.tools.register({
@@ -1696,6 +1716,13 @@ export function apply(ctx, config = {}, run = runRunner) {
     profileFile: cfg.runtimeProfileFile,
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
+
+  // 宿主重开会清空内存任务表；只接回本会话已经登记、但未收到结算的 runner 作业。
+  const recoverAgent = (agent) => { void recoverBackground(agent).catch((error) => {
+    ctx.logger?.warn?.(`[codex-conductor] 无法接回后台任务：${error?.message ?? error}`);
+  }); };
+  ctx.on('agent/created', ({ agent }) => recoverAgent(agent));
+  for (const agent of ctx.get?.('agents')?.list?.() ?? []) recoverAgent(agent);
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
