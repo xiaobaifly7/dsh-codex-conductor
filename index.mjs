@@ -472,6 +472,10 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       args.slice(1).every((a) => /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(a));
     case 'git': return gitAllowed(args);
     case 'gzip': return ['-t', '--test'].includes(args[0]);
+    // GNU tar can inherit execution options from TAR_OPTIONS; only list with it removed.
+    case 'env': return kind === 'literal' && args.length === 5 && args[0] === '-u' &&
+      args[1] === 'TAR_OPTIONS' && args[2] === 'tar' && args[3] === '-tzvf' &&
+      !braceExpansion && !expansion.glob && /^(?!-)[^:$~]+$/.test(args[4]);
     case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && !braceExpansion && !expansion.glob &&
       args.slice(1).every((a) => !/^[+-]/.test(a) && !a.includes('$'));
     case 'iconv': return !args.some((a) => /^-[cs]*o/.test(a) ||
@@ -549,8 +553,12 @@ function refusedPart(command, extra) {
   const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
   if (!bad) return '命令为空';
   const words = core(bad, expansions.get(bad).kinds).words;
-  const hint = ['find', 'sed'].includes(words[0]) && words.slice(1).some((a) => a.includes('$'))
-    ? '；这类只读核验不接受含 $ 的参数，请直接写出固定路径和查询参数' : '';
+  let hint = '';
+  if (words[0] === 'tar' && words[1] === '-tzvf' && words.length === 3) {
+    hint = '；列出本地压缩包可用 env -u TAR_OPTIONS tar -tzvf ./archive.tar.gz，换成实际文件路径';
+  } else if (['find', 'sed'].includes(words[0]) && words.slice(1).some((a) => a.includes('$'))) {
+    hint = '；这类只读核验不接受含 $ 的参数，请直接写出固定路径和查询参数';
+  }
   return `不放行的是「${words.join(' ').slice(0, 200)}」${hint}`;
 }
 

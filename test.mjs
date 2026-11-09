@@ -118,6 +118,26 @@ test('command -v looks up names without permitting command execution', () => {
   ]) assert.equal(readOnlyCommand(command), false, command);
 });
 
+test('tar archive listing clears inherited options and accepts only one local literal file', () => {
+  const why = (command) => decide(call('ops_bash', { command }), cfg);
+  for (const command of [
+    'env -u TAR_OPTIONS tar -tzvf archive.tar.gz',
+    "env -u TAR_OPTIONS tar -tzvf '/tmp/local archive.tar.gz' 2>/dev/null",
+  ]) assert.equal(why(command), undefined, command);
+  assert.match(why('tar -tzvf archive.tar.gz'), /env -u TAR_OPTIONS tar -tzvf/);
+  for (const command of [
+    'env tar -tzvf archive.tar.gz', 'env -u OTHER tar -tzvf archive.tar.gz',
+    'env -u TAR_OPTIONS sh -c echo', 'env -u TAR_OPTIONS tar -xzvf archive.tar.gz',
+    'env -u TAR_OPTIONS tar -tzvf host:archive.tar.gz', 'env -u TAR_OPTIONS tar -tzvf -',
+    'env -u TAR_OPTIONS tar -tzvf "$archive"', 'env -u TAR_OPTIONS tar -tzvf $(printf archive.tar.gz)',
+    'env -u TAR_OPTIONS tar -tzvf *.tar.gz', 'env -u TAR_OPTIONS tar -tzvf {a,b}.tar.gz',
+    'HOME=example.invalid:dir; env -u TAR_OPTIONS tar -tzvf ~/archive.tar.gz',
+    'env -u TAR_OPTIONS tar -tzvf archive.tar.gz --checkpoint-action=exec=echo',
+    'timeout 1 env -u TAR_OPTIONS tar -tzvf archive.tar.gz',
+    'env -u TAR_OPTIONS tar -tzvf archive.tar.gz > out.txt',
+  ]) assert.ok(why(command), command);
+});
+
 test('gzip integrity checks pass without allowing compression or decompression', () => {
   const actual = 'R=/mnt/d/harness; gzip -t $R/logs/harness.log.20261108-041557.gz';
   for (const command of [
