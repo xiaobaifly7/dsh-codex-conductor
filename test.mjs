@@ -1052,6 +1052,30 @@ test('codex_run cannot resume a thread whose latest owned task needs a user answ
   assert.deepEqual(h.calls, [['list', '--limit', '1', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
 });
 
+test('a new write task cannot widen an overlapping pending scope before a real user reply', async () => {
+  const prior = { ...workflowSource('task_conflict'), scope_paths: ['/work/original/candidate.vhdx'] };
+  const row = { job_id: prior.job_id, blocking: withReport(prior).blocking, finished_at: 10 };
+  const registered = { type: 'job/registered', data: { kind: 'codex', owner: 'S1', jobId: 'bg1', label: 'Codex PARENT · test' } };
+  const settled = { type: 'job/settled', data: { jobId: 'bg1' } };
+  const human = { type: 'user/message', at: 11_000, data: { source: { kind: 'user' } } };
+  const notice = { type: 'user/message', at: 11_000, data: { source: { kind: 'tool-jobs' } } };
+  const expansion = ['candidate.vhdx', 'step.ps1'];
+  for (const { scope, events, denied } of [
+    { scope: expansion, events: [registered, settled, notice], denied: true },
+    { scope: undefined, events: [registered, settled], denied: true },
+    { scope: ['other.vhdx'], events: [registered, settled], denied: false },
+    { scope: ['candidate.vhdx'], events: [registered, settled], denied: false },
+    { scope: expansion, events: [registered, settled, human], denied: false },
+  ]) {
+    const h = harness({ config: { listResult: { jobs: [row] }, startResult: { job_id: 'J', status: 'completed' } } });
+    h.finals.PARENT = prior;
+    const pending = h.tools.codex_run.execute({ ...RUN, cwd: prior.cwd, scope, write: true }, { agent: agentAt(prior.cwd, events) });
+    if (denied) await assert.rejects(pending, /PARENT.*范围冲突.*用户回答/);
+    else assert.equal((await pending).job_id, 'J');
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, denied ? 0 : 1);
+  }
+});
+
 test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
   const source = workflowSource();
   const h = harness();

@@ -815,13 +815,33 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '任务或验收标准里对最终答复版式的要求（如单独的结论行）写进 summary 即算满足，不算偏离，也不要因此标 blocked。\n';
 }
 
+const taskScopePath = (cwd, p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd.replace(/[\\/]+$/, '')}/${p}`);
+
 // 不在 scope 内的改动；没给 scope 或 runner 没给出改动清单时返回 undefined
 export function outOfScope(value, cwd, scope) {
   if (!scope?.length || !Array.isArray(value.files_changed)) return undefined;
-  const abs = (p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd.replace(/[\\/]+$/, '')}/${p}`);
-  const roots = scope.map(abs);
-  return value.files_changed.map((f) => f.path)
-    .filter((p) => { const a = abs(p); return !roots.some((r) => under(a, r)); });
+  const roots = scope.map(p => taskScopePath(cwd, p));
+  return value.files_changed.map(f => f.path).filter(p => !roots.some(r => under(taskScopePath(cwd, p), r)));
+}
+
+function widensOverlappingScope(cwd, original, requested) {
+  if (!original?.length) return false;
+  if (!requested?.length) return true;
+  const before = original.map(p => taskScopePath(cwd, p));
+  const after = requested.map(p => taskScopePath(cwd, p));
+  return after.some(p => before.some(r => under(p, r) || under(r, p))) &&
+    after.some(p => !before.some(r => under(p, r)));
+}
+
+function hasUserReply(log, job, owner) {
+  const user = log.findLastIndex(e => e.type === 'user/message' && e.data?.source?.kind === 'user');
+  if (user < 0) return false;
+  const label = `Codex ${job.job_id}`;
+  const native = log.findLast(e => e.type === 'job/registered' && e.data?.kind === 'codex' && e.data.owner === owner &&
+    (e.data.label === label || e.data.label?.startsWith(`${label} · `)));
+  const settled = native?.data?.jobId && log.findLastIndex(e => e.type === 'job/settled' && e.data?.jobId === native.data.jobId);
+  return Number.isInteger(settled) && settled >= 0 ? user > settled :
+    Number.isFinite(log[user].at) && Number.isFinite(job.finished_at) && log[user].at > job.finished_at * 1000;
 }
 
 export function validateRun(args) {
@@ -1364,6 +1384,26 @@ export function apply(ctx, config = {}, run = runRunner) {
           throw new Error(`codex_run: 原任务 ${latest.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再用 codex_continue 提交回答。`);
         }
       }
+      if (!continuation && args.write && owner) {
+        const log = exec.agent.session?.log ?? [];
+        for (let offset = 0; offset !== null;) {
+          const history = await conductor.list({ owner, cwd, needs_attention: true, limit: 100, offset }, exec?.signal);
+          exec?.signal?.throwIfAborted();
+          if (!Array.isArray(history.jobs)) throw new Error('codex_run: 无法核对已有写入范围，未启动 Codex。');
+          for (const job of history.jobs) {
+            if (job.blocking?.next_action !== 'ask_user' || !job.blocking.blockers?.some(b => b.kind === 'task_conflict') ||
+                hasUserReply(log, job, owner)) continue;
+            const previous = withReport(await conductor.waitJob(job.job_id, 0, exec?.signal));
+            exec?.signal?.throwIfAborted();
+            if (unknownState(previous) || previous.job_id !== job.job_id) throw new Error(`codex_run: 无法核对原任务 ${job.job_id} 的写入范围，未启动 Codex。`);
+            if (previous.blocking?.next_action === 'ask_user' &&
+                widensOverlappingScope(previous.cwd ?? cwd, previous.scope_paths ?? previous.scope, args.scope)) {
+              throw new Error(`codex_run: 原任务 ${job.job_id} 的范围冲突仍需用户回答，未启动 Codex。请先向用户确认新增写入路径。`);
+            }
+          }
+          offset = history.next_offset ?? null;
+        }
+      }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         ...(continuation ? { continuation } : {}),
@@ -1414,7 +1454,7 @@ export function apply(ctx, config = {}, run = runRunner) {
           '可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令）、连接 Hyper-V 虚拟机；write 仍决定能否改动（文件、虚拟机、网络和系统状态）：' +
           '要启动/停止/新建虚拟机，或运行会建、改虚拟机的脚本，也要传 write=true，否则 Codex 只做只读调查。不再有沙箱，只靠提示约束。' +
           (cfg.defaultHostAccess === true ? '当前默认 true，新任务和 resume 都可省略；false 为本次任务恢复沙箱。' : '只在任务需要时传。') } } : {}),
-        scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。须覆盖任务中所有写入目标，包括工作区外的复制目的地。' +
+        scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。须覆盖所有获准的写入目标，包括新建的临时脚本、备份和工作区外的复制目的地。若任务必需的写入超出用户授权，先澄清再派单。' +
           '不展开通配符；动态命名的备份须在派活前确定具体文件名并列入 scope。' +
           '它不增加沙箱写权限；给了就写进约束，完成后在 out_of_scope 里列出范围外的改动。' },
         writable_roots: { type: 'array', items: { type: 'string' }, description: '本次任务在 cwd 以外需要写入的已有目录（Windows 路径或 /mnt/...）；需要 write=true。' +
