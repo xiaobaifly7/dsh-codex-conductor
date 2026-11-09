@@ -266,6 +266,26 @@ test('quoted and escaped digits before redirections remain command words and fil
   }
 });
 
+test('subshell parentheses delimit read-only commands without allowing arithmetic or writes', () => {
+  const why = (command) => decide(call('ops_bash', { command }), cfg);
+  const continued = '\\' + '\n';
+  for (const command of [
+    '(cd "$dir" && ls -la )', 'if (cd /repo; ls ); then echo ok; fi',
+    'echo "$( (cd /repo; ls ) )"', '( (cat /dev/null ) )',
+    '(cat input.txt >/dev/null )', "(printf '%s' ')' )",
+    '( [[ value =~ ^(value)$ ]] )', '( echo $' + '{value#)} )',
+    'echo $' + continued + '(ls)',
+  ]) assert.equal(why(command), undefined, command);
+  for (const command of [
+    '(touch marker)', '(echo x)>out.txt', '(cat <(echo ok))',
+    '((cat))', '( ((cat)) )', '(' + continued + '(cat))',
+    'echo $(' + continued + '(cat))', 'echo $' + continued + '[cat]',
+    'echo $' + continued + '(touch marker)', 'cat <' + continued + '(touch marker)',
+    "'(' cd /repo ')'", '\\(cd /repo; ls)',
+    'ls () { touch marker; }; ls', '(ls () { touch marker; }; ls )',
+  ]) assert.ok(why(command), command);
+});
+
 test('file descriptor duplication requires a complete numeric target', () => {
   for (const command of [
     'echo text 2>&1', 'echo text >&12 | head -1',

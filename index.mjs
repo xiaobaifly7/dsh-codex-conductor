@@ -171,6 +171,12 @@ function closingParen(s, start) {
   return -1;
 }
 
+// Bash removes a backslash-newline before recognizing operators.
+function skipLineContinuations(command, i) {
+  while (command[i] === '\\' && command[i + 1] === '\n') i += 2;
+  return i;
+}
+
 // 按未加引号的 && || | ; & 和换行切段，段内按空白切词并去掉引号。$(...) 交给 inner 判定，通过后当作一个普通词。
 // 返回 null 表示出现了不放行的结构：反引号、未通过的命令替换、进程替换、heredoc、写到 /dev/null 以外的重定向。
 export function splitCommand(command, inner = () => false, braceSegments = new Set(), expansions = new Map()) {
@@ -227,12 +233,14 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       continue;
     }
     if (ch === '`') return null;
-    if (ch === '$' && next === '[') return null;
-    if (ch === '$' && next === '(') {
+    const expansion = ch === '$' ? skipLineContinuations(command, i + 1) : -1;
+    if (command[expansion] === '[') return null;
+    if (command[expansion] === '(') {
       // $((...)) 是算术：会把变量值当表达式递归求值，值里的 a[$(...)] 就能执行命令
-      if (command[i + 2] === '(') return null;
-      const end = closingParen(command, i + 2);
-      if (end < 0 || !inner(command.slice(i + 2, end))) return null;
+      const start = expansion + 1;
+      if (command[skipLineContinuations(command, start)] === '(') return null;
+      const end = closingParen(command, start);
+      if (end < 0 || !inner(command.slice(start, end))) return null;
       // 保留 $，让后面的检查（sed 脚本、pwsh 路径）看得出这里展开过
       word += '$X';
       parameterWord += '$X';
@@ -265,14 +273,25 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       continue;
     }
     if (ch === ' ' || ch === '\t') { endWord(); continue; }
+    if (ch === '(' && !redirect) {
+      const leader = (w, j) => kinds[j] === 'literal' && LEAD_KEYWORDS.has(w);
+      if (!started && words.every(leader)) {
+        if (command[skipLineContinuations(command, i + 1)] === '(') return null;
+        word = ch; started = true; endWord(); continue;
+      }
+      // A command name followed by () can define a function rather than call it.
+      if ((started ? word : words.at(-1)) && (started ? words : words.slice(0, -1)).every(leader) &&
+          /^(?:[ \t\n]|\\\n)*\)/.test(command.slice(i + 1))) return null;
+    }
     if (ch === '>' || ch === '<' || (ch === '&' && next === '>')) {
       if (!redirect && kind === 'literal' && /^\d+$/.test(word)) {
         word = ''; started = false; syntax = ''; parameterWord = '';
       } else endWord();
       if (redirect) return null;
       let j = ch === '&' ? i + 2 : i + 1;
-      if (ch === '<' && (command[j] === '<' || command[j] === '(')) return null;
-      if (ch === '>' && command[j] === '(') return null;
+      const target = command[skipLineContinuations(command, j)];
+      if (ch === '<' && (target === '<' || target === '(')) return null;
+      if (ch === '>' && target === '(') return null;
       if (ch === '>' && command[j] === '>') j++;
       if (ch === '>' && command[j] === '&') {
         // 数字只是前缀时，Bash 可能把整个词当成写入目标。
