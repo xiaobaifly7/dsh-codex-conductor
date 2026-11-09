@@ -1354,8 +1354,18 @@ export function apply(ctx, config = {}, run = runRunner) {
     dispatching++;
     dispatchGeneration++;
     try {
+      const owner = exec?.agent?.id;
+      if (!continuation && args.resume && owner) {
+        const history = await conductor.list({ owner, thread_id: args.resume, limit: 1 }, exec?.signal);
+        exec?.signal?.throwIfAborted();
+        if (!Array.isArray(history.jobs)) throw new Error('codex_run: 无法核对待续接线程的最近任务，未启动 Codex。');
+        const latest = history.jobs[0];
+        if (latest?.blocking?.next_action === 'ask_user') {
+          throw new Error(`codex_run: 原任务 ${latest.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再用 codex_continue 提交回答。`);
+        }
+      }
       started = await conductor.start(args, cwd, undefined, {
-        owner: exec?.agent?.id ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
+        owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         ...(continuation ? { continuation } : {}),
       });
     } finally { dispatching--; }
@@ -1380,7 +1390,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
-      '不通过就带 resume=thread_id 派回修正。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      '原任务需要用户回答时先询问，再用 codex_continue；其他返工可带 resume=thread_id。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       (cfg.allowHostAccess === true
         ? (cfg.defaultHostAccess === true

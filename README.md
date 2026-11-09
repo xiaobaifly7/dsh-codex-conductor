@@ -25,7 +25,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 - 任务目录：传了 `cwd` 就用它；否则会话工作区落在某个带 `cwd` 的 `workspaces` 条目里时，用该条目的 `cwd`（有多条时取路径最长的那条）；再否则用会话工作区。只在 `task` 里写目录不会切换任务目录。
 
-收到需要回答的问题后，规划端先问用户，再调用例如 `codex_continue({"job_id":"J1","answers":[{"id":"choice","answer":"采用已确认的方案"}]})`。环境恢复时用 `resolution` 写实际证据。续接不会修改原验收或增加写权限；历史归属未知、状态未知或已取消的任务不会自动恢复。已存在后续轮次时返回它，后续处理使用最新 `job_id`，避免同一父任务反复派活。续接累计保留原目标、历轮用户决定与本轮补充；没有可续接线程时，另开线程也会带入这些决定，不堆叠历轮报告。
+收到需要回答的问题后，规划端先问用户，再调用例如 `codex_continue({"job_id":"J1","answers":[{"id":"choice","answer":"采用已确认的方案"}]})`。环境恢复时用 `resolution` 写实际证据。续接不会修改原验收或增加写权限。同一会话的线程还有待用户回答的问题时，`codex_run` 的 `resume` 会拒绝续跑；请先询问用户并用 `codex_continue` 续接。历史归属未知、状态未知或已取消的任务不会自动恢复。已存在后续轮次时返回它，后续处理使用最新 `job_id`，避免同一父任务反复派活。续接累计保留原目标、历轮用户决定与本轮补充；没有可续接线程时，另开线程也会带入这些决定，不堆叠历轮报告。
 
 `codex_watch({"mode":"attention"})` 仅在失败、阻塞或报告异常等变化时通知；`mode="all"` 也包含开始和正常结束。它在无变化时只读 Harness 内存任务表，不启动 Codex、不反复唤醒模型。首次符合条件的变化后观察结束，需要继续时再调用。它保留任务原有结束通知，也不默认启用长期监控；取消观察只停止观察。
 
@@ -236,7 +236,7 @@ A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL co
 
 `codex_run` requires acceptance criteria and an explicit `write` (`true` for changes, `false` for read-only investigation). Criteria have no item-count limit; dispatch, continuation, reports and independent review preserve their full list and order. Explicit `cwd` wins; otherwise use the most specific matching `{path, cwd}` workspace entry, then the session workspace. Mentioning a directory only in the task does not change it.
 
-`codex_continue` accepts typed blocker answers or environment-recovery evidence, preserving the original thread, directory, acceptance, write, scope and host access. Existing continuations are reused; further work uses the latest child `job_id`. Without a resumable thread, accumulated user decisions accompany the original context into a new thread, without stacking old reports. Unknown ownership/state and cancellation prevent automatic continuation.
+`codex_continue` accepts typed blocker answers or environment-recovery evidence, preserving the original thread, directory, acceptance, write, scope and host access. Existing continuations are reused; further work uses the latest child `job_id`. Without a resumable thread, accumulated user decisions accompany the original context into a new thread, without stacking old reports. Unknown ownership/state and cancellation prevent automatic continuation. If the latest job in the current session's thread still needs a user answer, `codex_run` with `resume` will refuse; ask the user and use `codex_continue`.
 
 The bundled runner handles background execution, retries, timeouts, idle/reconnect detection and thread resumption; disconnecting a wait does not stop it. Unsent prompts survive route retries, and PID/event-log write failures terminate and reap children. Closing stdout while still alive does not bypass the configured timeout, idle or reconnect budget.
 

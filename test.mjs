@@ -1044,6 +1044,14 @@ test('independent verification closes a failed round without rewriting its execu
   }
 });
 
+test('codex_run cannot resume a thread whose latest owned task needs a user answer', async () => {
+  const source = withReport(workflowSource('task_conflict'));
+  const h = harness({ config: { listResult: { jobs: [{ job_id: source.job_id, blocking: source.blocking }] } } });
+  const exec = { agent: agentAt('/work/current') };
+  await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id }, exec), /PARENT.*用户回答.*codex_continue/);
+  assert.deepEqual(h.calls, [['list', '--limit', '1', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
+});
+
 test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
   const source = workflowSource();
   const h = harness();
