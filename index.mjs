@@ -45,7 +45,7 @@ const DEFAULTS = {
   // 只读任务的推理强度，留空与 effort 相同
   readOnlyEffort: '',
   serviceTier: '',
-  waitSeconds: 1500,
+  waitSeconds: 0,
   // 允许 codex_run 传 host_access=true，让 Codex 在沙箱外运行（能启动 Windows 程序）；默认关闭
   allowHostAccess: false,
   // 省略 host_access 时默认使用主机模式，仍须开启 allowHostAccess
@@ -1370,11 +1370,13 @@ export function apply(ctx, config = {}, run = runRunner) {
     return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
   }
 
+  const waitSecondsDescription = `等待秒数，默认 ${cfg.waitSeconds}。普通派单传 0，派出后不等完成；` +
+    '只有用户明确要求本轮等待结果才传正数，表示最多等多少秒。后台任务完成后用 job_output 取结果；未登记后台任务时用 codex_status 查询。';
   ctx.tools.register({
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话），并等待结果。必须给出验收标准和 write：' +
+    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。普通派单传 wait_seconds=0，派出后不等完成。必须给出验收标准和 write：' +
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
@@ -1410,8 +1412,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
           `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
-        wait_seconds: { type: 'integer', description: `最多等待秒数，默认 ${cfg.waitSeconds}；到时任务转入后台继续，` +
-          '登记为后台任务时，Codex 结束后会收到任务通知，再用 job_output 读取完整结果；否则用 codex_status 接着等。' },
+        wait_seconds: { type: 'integer', description: waitSecondsDescription },
       },
       required: ['task', 'acceptance', 'write'],
     },
@@ -1608,7 +1609,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       answers: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
       resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
-      wait_seconds: { type: 'integer', minimum: 0 },
+      wait_seconds: { type: 'integer', minimum: 0, description: waitSecondsDescription },
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {

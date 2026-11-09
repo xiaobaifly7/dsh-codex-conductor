@@ -10,7 +10,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 | 工具 | 作用 |
 | --- | --- |
-| `codex_run` | 把任务交给 WSL 里的 Codex 并等待结果。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
+| `codex_run` | 把任务交给 WSL 里的 Codex，默认不等待完成。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
 | `codex_status` | 查询或继续等待任务；仍在执行时返回距 Codex 上次活动的秒数和它最近的动作。已登记为 DSH 后台任务的不必调用 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号 |
@@ -41,7 +41,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - Harness 重开后，恢复原会话时会接回该会话已登记、未结算的 Codex 作业；热更新时也会检查当前已打开的会话。只接回归属能确认的原作业，不重新派发，结束结果仍走原生后台通知。
 - WSL 重启后，runner 按「开机 ID + 本发行版 init 的启动时刻」认出重启前的任务（`wsl --shutdown`、Windows 重启换开机 ID，`wsl --terminate`、发行版自行停止换 init 启动时刻），报 `worker_died`（Codex 已开始会话的可写任务带回 `thread_id`，可以续跑；可写任务另提示退出前可能已改了一半且没有改动清单），状态查询和取消还会核对进程创建时刻，避免把同次启动内复用 PID 的其他进程当成本任务；重试等待期间也不沿用已退出 Codex 的进程记录。升级前未记录创建时刻的旧任务仍按启动批次和存活状态判断。`codex_cancel` 对已经结束的任务直接返回它的结果与对应下一步，不会叫 agent 重派。
 
-- 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，`codex_run` 一启动 Codex 就把它登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run` 经任务表等到 `wait_seconds`：这之前结束就直接返回结果，不另发通知；到点仍在执行时任务留在后台继续，结果里带 `background_job_id`，Codex 结束后 DSH 发一条只带一行摘要的任务通知，agent 用 `job_output` 读取与工具结果相同的完整文字（含逐条汇报和下一步）后继续，不用轮询。
+- 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，`codex_run` 一启动 Codex 就把它登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run` 默认 `wait_seconds: 0`，派出后不等完成。用户明确要求本轮等待时可传正数：等待期间结束就直接返回结果，不另发通知；仍在执行时任务留在后台继续，结果里带 `background_job_id`，Codex 结束后 DSH 发一条只带一行摘要的任务通知，agent 用 `job_output` 读取与工具结果相同的完整文字（含逐条汇报和下一步）后继续，不用轮询。
 
 - 同一个 runner 任务只登记一个后台任务（按 DSH 任务表判断，插件重载后也不重复）；对已登记的任务调用 `codex_status` 或 `codex_cancel` 会经 DSH 任务表等待，结果不会再作为通知重复送一次。等待中途停止工具调用时，插件结束这个后台任务（同时在 WSL 里取消 Codex），等它结算完再返回；取消未确认时保留任务编号并提示用 `codex_status` 查询，任务仍可能在运行。归档会话时，DSH 可能结束其中仍在运行的后台任务，Codex 任务随之取消。后台等待本身出错时送回 `monitor_failed`，提示 Codex 任务可能仍在运行、先用 `codex_status` 查询。没有 jobs 服务、登记失败或没有 agent 时，任务表里没有这一行，`codex_run` 直接等 runner 到 `wait_seconds`，之后照旧用 `codex_status` 轮询。
 
@@ -181,7 +181,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `effort` | Codex 配置 | 默认推理强度，`codex_run` 的 `effort` 可单次覆盖 |
 | `readOnlyEffort` | 同 `effort` | 只读任务（`write=false`）的默认推理强度，留空时用 `effort` |
 | `serviceTier` | Codex 配置 | 例如 `fast`（Codex 的 Fast 模式） |
-| `waitSeconds` | `1500` | `codex_run` 默认等待秒数，到时任务转后台 |
+| `waitSeconds` | `0` | `codex_run` / `codex_continue` 默认等待秒数；`0` 表示派出后不等完成 |
 | `allowHostAccess` | `false` | 为 `true` 时 `codex_run` 才提供 `host_access` 参数，允许 Codex 不带沙箱（`danger-full-access`）运行、启动 Windows 程序（见上文） |
 | `defaultHostAccess` | `false` | 与 `allowHostAccess=true` 一起使用，省略 `host_access` 的新任务和 `resume` 默认以 `danger-full-access` 运行；显式传 `host_access=false` 可为单次任务恢复沙箱 |
 | `plannerPromptFile` | `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` | 规划要求文件（Markdown，HTML 注释不算内容），注入 agent 的系统提示词（见上文） |
@@ -248,7 +248,7 @@ After Harness reopens, resuming an existing session reattaches its recorded, uns
 
 WSL restarts are recognized by boot ID and distro init start time, including shutdown, termination and auto-stop. Earlier tasks become `worker_died`; writers retain a started thread but may leave partial, unlisted edits. Status/cancellation also check process creation time to avoid same-boot PID reuse; finished Codex identities are not retained during retry waits. Older records without creation times retain boot/liveness checks. Cancellation ends the task's process tree; an already-ended task returns its result and matching next step instead of requesting redispatch.
 
-With DSH background jobs, each `codex_run` immediately registers one row, reused across plugin reloads. Progress refreshes about every 20 seconds with last-activity age and latest action. Finishing within `wait_seconds` returns directly; otherwise `background_job_id` identifies the continuing job. Completion sends a one-line notification; read its full report/next step with `job_output`, without polling or duplicate delivery from status/cancel waits.
+With DSH background jobs, each `codex_run` immediately registers one row, reused across plugin reloads. Progress refreshes about every 20 seconds with last-activity age and latest action. By default `wait_seconds` is `0`, so dispatch returns without waiting for completion. Set a positive value only when the user asks to wait in the current turn; a result that finishes within that time is returned directly. Otherwise `background_job_id` identifies the continuing job. Completion sends a one-line notification; read its full report/next step with `job_output`, without polling or duplicate delivery from status/cancel waits.
 
 Finished rows retain output. Aborting a waiting call cancels Codex; session archival can also cancel it. Unconfirmed cancellation keeps its ID and requires a status check; `monitor_failed` means Codex may still run. Without native jobs/registration, `codex_run` waits directly, then callers poll `codex_status`.
 

@@ -1663,12 +1663,18 @@ test('defaultHostAccess covers read, write and resume while explicit false resto
   assert.equal(off.calls.length, 0);
 });
 
-test('a running job is registered once as a DSH background job and reports back on completion', async () => {
+test('dispatch without a wait registers one DSH background job and reports back on completion', async () => {
   const jobs = fakeJobs();
+  const wait = jobs.wait.bind(jobs);
+  jobs.wait = (id, ms, ...rest) => {
+    assert.equal(ms, 1);
+    return wait(id, ms, ...rest);
+  };
   const { tools, handlers, calls, answer } = harness({ jobs });
   const claim = [{ type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } }];
   const exec = { agent: agentAt('F:\\work\\项目', claim) };
-  const first = await tools.codex_run.execute(RUN, exec);
+  const { task, acceptance, write } = RUN;
+  const first = await tools.codex_run.execute({ task, acceptance, write }, exec);
   assert.equal(first.status, 'running');
   assert.equal(first.background_job_id, 'bg1');
   // DSH 的结束通知只有一行摘要，完整结果要用 job_output 读
