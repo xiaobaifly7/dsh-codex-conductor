@@ -1671,7 +1671,7 @@ test('defaultHostAccess covers read, write and resume while explicit false resto
   assert.equal(off.calls.length, 0);
 });
 
-test('dispatch without a wait registers one DSH background job and reports back on completion', async () => {
+test('dispatch with a positive wait still returns a DSH background job without waiting', async () => {
   const jobs = fakeJobs();
   const wait = jobs.wait.bind(jobs);
   jobs.wait = (id, ms, ...rest) => {
@@ -1681,8 +1681,7 @@ test('dispatch without a wait registers one DSH background job and reports back 
   const { tools, handlers, calls, answer } = harness({ jobs });
   const claim = [{ type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } }];
   const exec = { agent: agentAt('F:\\work\\项目', claim) };
-  const { task, acceptance, write } = RUN;
-  const first = await tools.codex_run.execute({ task, acceptance, write }, exec);
+  const first = await tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, exec);
   assert.equal(first.status, 'running');
   assert.equal(first.background_job_id, 'bg1');
   // DSH 的结束通知只有一行摘要，完整结果要用 job_output 读
@@ -1692,7 +1691,7 @@ test('dispatch without a wait registers one DSH background job and reports back 
   assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20']]);
   assert.equal(jobs.started[0].spec.owner, 'S1');
   assert.equal(jobs.started[0].spec.kind, 'codex');
-  const again = await tools.codex_status.execute({ job_id: 'J1', wait_seconds: 0 }, exec);
+  const again = await tools.codex_status.execute({ job_id: 'J1' }, exec);
   assert.equal(again.background_job_id, 'bg1');
   assert.equal(jobs.started.length, 1);
   // 仍在执行：声称 Codex 在做不提醒
@@ -1775,11 +1774,12 @@ test('without a jobs service, a failing start() or an agent, codex_run keeps pol
   assert.equal(jobs.started.length, 0);
 });
 
-test('codex_run registers the DSH job at start and returns its stored result when it settles within the wait', async () => {
+test('codex_status with an explicit wait returns the stored DSH result', async () => {
   const jobs = fakeJobs();
   const { tools, calls, answer } = harness({ jobs });
   const exec = { agent: agentAt('F:\\work\\项目') };
-  const pending = tools.codex_run.execute({ ...RUN, scope: ['src'], wait_seconds: 600 }, exec);
+  const dispatched = await tools.codex_run.execute({ ...RUN, scope: ['src'] }, exec);
+  const pending = tools.codex_status.execute({ job_id: dispatched.job_id, wait_seconds: 600 }, exec);
   await tick();
   // 还在等的时候任务表里已经有这一行，进度随后台循环刷新
   assert.equal(jobs.started.length, 1);
@@ -1792,33 +1792,13 @@ test('codex_run registers the DSH job at start and returns its stored result whe
   assert.match(jobs.started[0].handle.progress[0], /2 秒：ran: ls/);
   assert.equal(value.status, 'completed');
   assert.equal(value.background_job_id, undefined);
-  const text = tools.codex_run.output.render({}, value)[0].text;
+  const text = tools.codex_status.output.render({}, value)[0].text;
   assert.equal(text, jobs.started[0].result);
   assert.match(text, /^completed · 1 met · 1 files · 12 s · 待关注 {2}job_id: J1 {2}thread_id: T\n[\s\S]*超出 scope：README\.md/);
   // 结算时这次等待在等：算作已被等到，DSH 不另发通知；结果只交出这一次
   assert.deepEqual(jobs.unawaited, []);
   assert.equal(jobs.read('bg1', 'S1').result, undefined);
   assert.ok(calls.slice(1).every((a) => a.join(' ') === 'status J1 --wait 20'));
-});
-
-test('stopping codex_run mid-wait kills the DSH job and waits for it to settle before rethrowing', async () => {
-  const jobs = fakeJobs();
-  const { tools, calls, answer } = harness({ jobs });
-  const stop = new AbortController();
-  const pending = tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, { agent: agentAt('F:\\work\\项目'), signal: stop.signal });
-  let rejected = false;
-  pending.catch(() => { rejected = true; });
-  await tick();
-  stop.abort();
-  await tick();
-  assert.equal(jobs.started[0].status, 'stopping');
-  assert.deepEqual(calls.at(-1), ['cancel', 'J1']);
-  assert.equal(rejected, false);
-  await answer('J1', { status: 'cancelled' });
-  // 中止抛明确的错误，而不是 jobs.wait 原始拒绝（会渲染成 Error: [object Object]）
-  await assert.rejects(pending, /已被中止/);
-  assert.equal(jobs.started[0].status, 'killed');
-  assert.deepEqual(jobs.unawaited, []);
 });
 
 test('codex_status and codex_cancel on a background job wait through DSH, so no second notice is sent', async () => {
@@ -1859,10 +1839,13 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   await tools.codex_run.execute(RUN, exec);
   const stop = new AbortController();
   const aborted = tools.codex_status.execute({ job_id: 'J3', wait_seconds: 600 }, { ...exec, signal: stop.signal });
+  let rejected = false;
+  aborted.catch(() => { rejected = true; });
   stop.abort();
   await tick();
   assert.equal(jobs.started[2].status, 'stopping');
   assert.deepEqual(calls.at(-1), ['cancel', 'J3']);
+  assert.equal(rejected, false);
   await answer('J3', { status: 'cancelled' });
   await assert.rejects(aborted, /已被中止/);
   assert.deepEqual(jobs.unawaited, []);
@@ -2546,7 +2529,9 @@ test('an aborted background wait distinguishes unconfirmed cancellation from a s
     ? Promise.resolve(jobs.view(jobs.started[0])) : wait(id, ms, ...rest);
   const { tools, answer } = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' } } });
   const stop = new AbortController();
-  const pending = tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, { agent: agentAt('F:\\work\\项目'), signal: stop.signal });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const { job_id } = await tools.codex_run.execute(RUN, exec);
+  const pending = tools.codex_status.execute({ job_id, wait_seconds: 600 }, { ...exec, signal: stop.signal });
   const rejected = assert.rejects(pending, /J1[^\n]*已被中止[\s\S]*取消未确认[\s\S]*codex_status 查询 J1/);
   await tick();
   stop.abort();

@@ -1374,19 +1374,23 @@ export function apply(ctx, config = {}, run = runRunner) {
       exec.signal.throwIfAborted();
     }
     const label = `Codex ${started.job_id} · ${taskLine(args, 40)}`;
-    const value = started.status === 'running' && started.job_id
-      ? await collect(started.job_id, background(started.job_id, exec, finish, label), args.wait_seconds ?? cfg.waitSeconds, exec?.signal)
-      : withReport(started);
+    let value;
+    if (started.status === 'running' && started.job_id) {
+      const bg = background(started.job_id, exec, finish, label);
+      value = await collect(started.job_id, bg, bg ? 0 : (args.wait_seconds ?? cfg.waitSeconds), exec?.signal);
+    } else {
+      value = withReport(started);
+    }
     return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
   }
 
-  const waitSecondsDescription = `等待秒数，默认 ${cfg.waitSeconds}。普通派单传 0，派出后不等完成；` +
-    '只有用户明确要求本轮等待结果才传正数，表示最多等多少秒。后台任务完成后用 job_output 取结果；未登记后台任务时用 codex_status 查询。';
+  const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
+    '登记成功时直接返回任务号；需要同步等待时用该 job_id 调 codex_status。';
   ctx.tools.register({
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。普通派单传 wait_seconds=0，派出后不等完成。必须给出验收标准和 write：' +
+    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回任务号，结束时用 job_output 取报告。必须给出验收标准和 write：' +
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
@@ -1433,15 +1437,14 @@ export function apply(ctx, config = {}, run = runRunner) {
   ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
-    description: '查询或继续等待 codex_run 返回的任务。已登记为后台任务（结果带 background_job_id）的，结束时会收到 DSH 任务通知，' +
-      '用 job_output 读完整结果，不必调用本工具；没登记的才用它等，仍在执行时返回 last_activity（它最近在做什么）和距上次活动的秒数，' +
-      '同时返回当前阶段、尝试轮次和上次重试原因；原任务与验收上下文可用 codex_output artifact=context 读取。' +
-      '建议每次等 300–600 秒，不要频繁轮询；报告截断或已经读过时用 codex_output 分段重读。',
+    description: '查询 Codex 任务，默认只查一次。已登记后台任务时，通常等 DSH 通知并用 job_output 读结果；' +
+      '只有用户明确要求本轮同步等待时才传正数。仍在执行时返回最近活动、距上次活动的秒数、阶段和尝试轮次。' +
+      '用 codex_output 分段读取原任务、验收标准和已回传的报告。',
     parameters: {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: 'codex_run 返回的 job_id。' },
-        wait_seconds: { type: 'integer', description: '最多等待秒数，默认 600；0 表示只查一次。' },
+        wait_seconds: { type: 'integer', description: '默认 0，只查一次；用户明确要求等待时传最多等待的秒数。' },
       },
       required: ['job_id'],
     },
@@ -1451,7 +1454,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
-      const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 600, exec?.signal);
+      const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 0, exec?.signal);
       return value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
     },
   });
