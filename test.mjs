@@ -102,6 +102,22 @@ test('bare no-op and continue keep the read-only boundary', () => {
   ]) assert.equal(readOnlyCommand(command), false, command);
 });
 
+test('command -v looks up names without permitting command execution', () => {
+  for (const command of [
+    'command -v grep head tail wc cut sort',
+    'if command -v rg >/dev/null; then rg needle src; fi',
+  ]) {
+    assert.equal(readOnlyCommand(command), true, command);
+    assert.equal(decide(call('ops_bash', { command }), cfg), undefined, command);
+  }
+  for (const command of [
+    'command touch marker', 'command -p touch marker', 'command -v', 'command -v -p rg',
+    'command "$mode" rg', 'command -v "$name"', 'command -v rg*',
+    '/tmp/command -v rg', 'timeout 1 command -v rg',
+    'command -v "$(touch marker)"', 'command -v rg > marker', 'command -v rg; touch marker',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
 test('gzip integrity checks pass without allowing compression or decompression', () => {
   const actual = 'R=/mnt/d/harness; gzip -t $R/logs/harness.log.20261108-041557.gz';
   for (const command of [
@@ -227,6 +243,22 @@ test('quoted and escaped digits before redirections remain command words and fil
   }
   for (const command of ['cat 2>/dev/null', "cat '2'>/dev/null", String.raw`cat \2>/dev/null`]) {
     assert.equal(readOnlyCommand(command), true, command);
+  }
+});
+
+test('file descriptor duplication requires a complete numeric target', () => {
+  for (const command of [
+    'echo text 2>&1', 'echo text >&12 | head -1',
+    'command -v grep >&1; head -1 input.txt',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+  assert.deepEqual(splitCommand('echo text >&12 | head -1'), [['echo', 'text'], ['head', '-1']]);
+  for (const command of [
+    'echo text >&1marker', 'command -v grep >&1marker',
+    'echo text >&1"marker"', 'echo text >&1#marker',
+    'echo text >&1$(printf marker)', 'echo text >&1\r',
+  ]) {
+    assert.equal(readOnlyCommand(command), false, command);
+    assert.match(decide(call('ops_bash', { command }), cfg), /重定向/);
   }
 });
 

@@ -274,7 +274,13 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       if (ch === '<' && (command[j] === '<' || command[j] === '(')) return null;
       if (ch === '>' && command[j] === '(') return null;
       if (ch === '>' && command[j] === '>') j++;
-      if (ch === '>' && command[j] === '&' && /\d/.test(command[j + 1] ?? '')) { i = j + 1; continue; }
+      if (ch === '>' && command[j] === '&') {
+        // 数字只是前缀时，Bash 可能把整个词当成写入目标。
+        const fd = /^\d+(?=[ \t\n;&|<>()]|$)/.exec(command.slice(j + 1));
+        if (!fd) return null;
+        i = j + fd[0].length;
+        continue;
+      }
       // 重定向目标也走正常分词和命令替换检查，不作为命令参数保留。
       redirect = ch;
       i = j - 1;
@@ -462,6 +468,8 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   switch (cmd) {
     // 只放行直接、无参数的内建控制；timeout 后的同名外部程序仍拒绝。
     case ':': case 'continue': return kind === 'literal' && args.length === 0;
+    case 'command': return kind === 'literal' && args[0] === '-v' && args.length > 1 &&
+      args.slice(1).every((a) => /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(a));
     case 'git': return gitAllowed(args);
     case 'gzip': return ['-t', '--test'].includes(args[0]);
     case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && !braceExpansion && !expansion.glob &&
