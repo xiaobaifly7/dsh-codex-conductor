@@ -47,6 +47,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         finish()
     elif mode == "invalid_windows_path_report":
         finish(r'{"summary": "D:\docs\log.txt"}')
+    elif mode == "literal_newline_report":
+        finish('{"summary":"ok","criteria":[{"criterion":"checked","status":"met","evidence":"first\nsecond"}],'
+               '"files_changed":[],"deviations":[],"unresolved":[]}')
     elif mode == "nonzero_after_completed":
         finish()
         sys.exit(1)
@@ -182,6 +185,14 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(r["thread_id"])
         self.assertNotIn("usage_scope", r)
         self.assertEqual(self.invoke("--sandbox", "workspace-write")["thread_id"], "thread-1")
+
+    def test_literal_newline_in_evidence_preserves_the_structured_and_raw_report(self):
+        schema = RUNNER.parents[1] / "report.v2.schema.json"
+        result = self.invoke("--schema", str(schema), mode="literal_newline_report")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["structured"]["criteria"],
+                         [{"criterion": "checked", "status": "met", "evidence": "first\nsecond"}])
+        self.assertIn('"evidence":"first\nsecond"', result["final_message"])
 
     def test_invalid_windows_path_report_preserves_the_original_and_reports_json_position(self):
         schema = RUNNER.parents[1] / "report.v2.schema.json"

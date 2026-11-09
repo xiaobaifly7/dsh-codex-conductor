@@ -705,7 +705,8 @@ def execute(args, prompt, run_dir):
             result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
         if args.schema:
             try:
-                result["structured"] = json.loads(final)
+                # Codex can emit literal newlines inside evidence strings. Preserve them and the raw report.
+                result["structured"] = json.loads(final, strict=False)
             except ValueError as error:
                 detail = f": {error.msg} (line {error.lineno}, column {error.colno})" if isinstance(error, json.JSONDecodeError) else ""
                 result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON" + detail,
