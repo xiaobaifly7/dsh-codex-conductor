@@ -217,6 +217,39 @@ test('reload returns fixture HEAD, preserves URL options, and every request has 
   assert.equal(status(f).profile_module, second.expected_module);
 });
 
+test('status shows one relocated managed target without allowing the old instance to reload it', (t) => {
+  const f = fixture(t);
+  marker(f);
+  const next = new URL('../next/index.mjs?v=next', f.moduleUrl).href;
+  const managedId = 'codex-conductor-runtime-12345678-1234-4234-8234-123456789abc';
+  const text = profile(next).replace(oldId, managedId);
+  writeFileSync(f.profileFile, text);
+  const relocated = status(f);
+  assert.equal(relocated.profile_module, next);
+  assert.equal(relocated.source.module, f.moduleUrl);
+  assert.equal(relocated.state, 'pending');
+  assert.equal(relocated.can_reload, false);
+  assert.match(relocated.profile_error, /刷新插件/);
+  assert.throws(() => requestRuntimeReload(f), /Expected one runtime entry; found 0/);
+  assert.equal(readFileSync(f.profileFile, 'utf8'), text);
+
+  const duplicate = 'codex-conductor-runtime-abcdefab-1234-4234-8234-123456789abc';
+  const other = f.moduleUrl.replace('/package/', '/other/');
+  for (const second of [
+    '  - id: ' + duplicate + '\n    name: ' + other + '\n',
+    '  - name: ' + other + '\n    id: ' + duplicate + '\n',
+    '  -\n    id: ' + duplicate + '\n    name: ' + other + '\n',
+    '  - {id: ' + duplicate + ', name: ' + other + '}\n',
+  ]) {
+    writeFileSync(f.profileFile, text.replace('settings:', second + 'settings:'));
+    assert.equal(status(f).profile_module, null);
+  }
+  writeFileSync(f.profileFile, text.replace('id: other-plugin', 'id: other-plugin # prior ID ' + duplicate));
+  assert.equal(status(f).profile_module, next);
+  writeFileSync(f.profileFile, profile(next));
+  assert.equal(status(f).profile_module, null);
+});
+
 test('missing, duplicate and unknown own entries are rejected without any file changes', (t) => {
   const f = fixture(t);
   const invalid = [
@@ -228,6 +261,7 @@ test('missing, duplicate and unknown own entries are rejected without any file c
       `  - {id: ${oldId}, name: '${windowsModule}'}`),
     profile(windowsModule).replace('    name: file:', '    id: duplicate\n    name: file:'),
     profile(windowsModule) + 'plugins:\n',
+    profile(windowsModule).replace('settings:', '  -\n    id: hidden-duplicate\n    name: ' + windowsModule + '\nsettings:'),
     profile(windowsModule).replace('settings:', `  - {id: hidden-duplicate, name: '${windowsModule}'}\nsettings:`),
     profile(windowsModule).replace('settings:', `  - name: '${windowsModule}'\n    id: wrong-order\nsettings:`),
   ];

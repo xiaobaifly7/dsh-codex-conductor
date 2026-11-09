@@ -86,13 +86,17 @@ function scalar(line, key, prefix) {
     render: (next) => quote === '"' ? JSON.stringify(next) : quote === "'" ? `'${next.replace(/'/g, "''")}'` : next };
 }
 
+const GENERATED_RUNTIME_ID = /codex-conductor-runtime-[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}/;
+const withoutComment = (value) => value.replace(/"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[ \t]+#.*$/g,
+  (token) => token.trimStart().startsWith('#') ? '' : token);
+
 // shortcut: block plugin lists and Cordis patch insert lists only; reject unsupported forms of our own entry.
-function ownEntry(text, moduleUrl) {
+function ownEntry(text, moduleUrl, byManagedId = false) {
   const lines = [...text.matchAll(/[^\r\n]+/g)]
     .map((match) => ({ text: match[0], start: match.index }));
   const sections = lines.map((line, i) => /^plugins:[ \t]*(?:#.*)?$/.test(line.text) ? i : -1).filter((i) => i >= 0);
   const first = lines.find((line) => !/^\s*(?:#.*)?$/.test(line.text));
-  if (sections.length > 1 || (sections.length === 0 && !/^- /.test(first?.text ?? ''))) {
+  if (sections.length > 1 || (sections.length === 0 && !/^-(?:[ \t]|$)/.test(first?.text ?? ''))) {
     throw new Error('Expected a block plugins list or Cordis patch list');
   }
   const wanted = modulePath(moduleUrl);
@@ -106,7 +110,7 @@ function ownEntry(text, moduleUrl) {
     let entry = null;
     for (const line of list) {
       if (/^\s*(?:#.*)?$/.test(line.text)) continue;
-      const item = /^( *)- /.exec(line.text);
+      const item = /^( *)-(?:[ \t]|$)/.exec(line.text);
       if (indent !== null && line.text.search(/\S/) < indent) break;
       if (item && (indent === null || item[1].length === indent)) {
         indent = item[1].length;
@@ -123,6 +127,12 @@ function ownEntry(text, moduleUrl) {
         visit(candidate.lines.slice(1));
         continue;
       }
+      // Notice generated IDs in unsupported entry shapes, but ignore comments and nested config.
+      if (byManagedId && !candidate.lines.some((line, i) => {
+        const pad = i === 0 ? firstPrefix : prefix;
+        return line.text.startsWith(pad) && (i === 0 || /^(?:id|"id"|'id'):/.test(line.text.slice(pad.length))) &&
+          GENERATED_RUNTIME_ID.test(withoutComment(line.text));
+      })) continue;
       const nameLines = candidate.lines.map((line, i) => ({ line, i, prefix: i === 0 ? firstPrefix : prefix }))
         .filter((item) => item.line.text.startsWith(item.prefix + 'name:'));
       let name = null;
@@ -138,32 +148,40 @@ function ownEntry(text, moduleUrl) {
           continue;
         }
         let same = false;
-        try { same = !/\s|\\/.test(field.value) && modulePath(field.value) === wanted; } catch {}
+        try {
+          const key = modulePath(field.value);
+          same = !/\s|\\/.test(field.value) && (key === wanted ||
+            (byManagedId && path.posix.basename(key) === path.posix.basename(wanted)));
+        } catch {}
         if (same) name = field;
         else if (containsOwnUrl(block.join('\n'))) throw new Error('Unsupported runtime name scalar');
       }
       if (!name) {
-        if (containsOwnUrl(candidate.lines[0].text)) throw new Error('Unsupported runtime entry format');
+        if (byManagedId || containsOwnUrl(candidate.lines[0].text)) throw new Error('Unsupported runtime entry format');
         continue;
       }
       const firstId = scalar(candidate.lines[0], 'id', firstPrefix);
       const ids = [firstId, ...candidate.lines.slice(1).map((line) => scalar(line, 'id', prefix))].filter(Boolean);
-      if (!firstId || nameLines.length !== 1 || ids.length !== 1 || !/^[a-zA-Z0-9_-]+$/.test(firstId.value)) {
+      const id = byManagedId ? ids.find((field) => field.value.match(GENERATED_RUNTIME_ID)?.[0] === field.value) : firstId;
+      if (!id || nameLines.length !== 1 || ids.length !== 1 || !/^[a-zA-Z0-9_-]+$/.test(id.value)) {
         throw new Error('Ambiguous or unsupported runtime entry');
       }
-      matches.push({ id: firstId, name });
+      matches.push({ id, name });
     }
   }
   visit(sections.length ? lines.slice(sections[0] + 1) : lines);
-  if (matches.length !== 1) throw new Error('Expected one runtime entry; found ' + matches.length);
-  return matches[0];
+  if (matches.length > 1) throw new Error('Expected one runtime entry; found ' + matches.length);
+  return matches[0] ?? null;
 }
 
-function profileRecord(profileFile, moduleUrl) {
+function profileRecord(profileFile, moduleUrl, readRelocated = false) {
   if (!profileFile) throw new Error('profileFile is not configured');
   const bytes = readFileSync(profileFile);
   const decoded = decodeProfile(bytes);
-  return { bytes, ...decoded, entry: ownEntry(decoded.text, moduleUrl) };
+  const exact = ownEntry(decoded.text, moduleUrl);
+  const entry = exact ?? (readRelocated ? ownEntry(decoded.text, moduleUrl, true) : null);
+  if (!entry) throw new Error('Expected one runtime entry; found 0');
+  return { bytes, ...decoded, entry, exact: exact !== null };
 }
 
 // The caller supplies the deduplicated in-flight runner count and owns idle/now scheduling.
@@ -172,7 +190,13 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
   const { record: loaded, error: loaded_error } = loadedRecord(loadedFile);
   let profile_module = null;
   let profile_error = null;
-  try { profile_module = profileRecord(profileFile, moduleUrl).entry.name.value; }
+  let can_reload = false;
+  try {
+    const profile = profileRecord(profileFile, moduleUrl, true);
+    profile_module = profile.entry.name.value;
+    can_reload = profile.exact;
+    if (!can_reload) profile_error = '配置指向另一位置，旧实例不能改写；请在 DeepSeek Harness 中刷新插件。';
+  }
   catch (error) { profile_error = error.message; }
   let state = 'unknown';
   if (loaded) {
@@ -186,7 +210,7 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
         loaded.dirty === false && source.dirty === false) state = 'synchronized';
   }
   return { source, instance: loadedIdentity, loaded, loaded_error, profile_module, profile_error,
-    active_tasks: activeTasks, state, can_reload: profile_module !== null };
+    active_tasks: activeTasks, state, can_reload };
 }
 
 export function requestRuntimeReload({ moduleUrl, profileFile }) {
