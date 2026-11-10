@@ -1308,7 +1308,11 @@ def summary_usage(rounds):
 
 def summarize_jobs(args):
     groups = {}
+    error_kinds = {}
     for job in matching_jobs(args):
+        if job.get("error_kind"):
+            kind = job["error_kind"]
+            error_kinds[kind] = error_kinds.get(kind, 0) + 1
         key = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
         groups.setdefault(key, []).append(job)
     result = []
@@ -1355,7 +1359,7 @@ def summarize_jobs(args):
                        "usage": summary_usage(rounds), "usage_scope": "thread_total" if kind == "thread" else "job"})
     next_offset = args.offset + len(result)
     return {"status": "completed", "groups": result, "total": len(groups),
-            "total_jobs": sum(map(len, groups.values())), "offset": args.offset, "limit": args.limit,
+            "total_jobs": sum(map(len, groups.values())), "error_kinds": error_kinds, "offset": args.offset, "limit": args.limit,
             "next_offset": next_offset if next_offset < len(groups) else None}
 
 

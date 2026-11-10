@@ -2160,6 +2160,20 @@ class RunnerTests(unittest.TestCase):
                     (jd / filename).write_text("")
                     self.assertEqual(self.control("output", jd.name, "--artifact", artifact)["error_kind"], "artifact_empty")
 
+    def test_summary_counts_error_kinds_across_the_full_filtered_range(self):
+        for i, kind in enumerate(("router_down", "idle_timeout", "router_down", "schema_invalid", None)):
+            self.stored_job(f"error-{i}", {"status": "failed" if kind else "completed", "error_kind": kind,
+                                           "thread_id": "same" if i < 2 else f"thread-{i}"}, context=self.sample_context())
+        self.stored_job("other-owner-error", {"status": "failed", "error_kind": "permanent"},
+                        context=self.sample_context("owner-b"))
+        expected = {"router_down": 2, "idle_timeout": 1, "schema_invalid": 1}
+        for offset in (0, 1, 100):
+            page = self.control("summary", "--owner", "owner-a", "--limit", "1", "--offset", str(offset))
+            self.assertEqual(page["error_kinds"], expected)
+            self.assertEqual(page["total_jobs"], 5)
+        completed = self.control("summary", "--owner", "owner-a", "--status", "completed")
+        self.assertEqual(completed["error_kinds"], {"schema_invalid": 1})
+        self.assertEqual(self.control("summary", "--owner", "missing")["error_kinds"], {})
 
     def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
         context = self.sample_context()
