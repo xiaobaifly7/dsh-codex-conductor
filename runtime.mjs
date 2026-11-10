@@ -46,6 +46,12 @@ export function loadedRecord(loadedFile) {
       throw new Error('Invalid runtime loaded record (module, loadedAt and pid are required)');
     }
     modulePath(record.module);
+    if (record.pid !== process.pid) try {
+      process.kill(record.pid, 0); // Check existence without sending a signal.
+    } catch (error) {
+      if (error.code === 'ESRCH') throw new Error('DeepSeek Harness 进程已退出，无法确认当前加载状态。');
+      if (error.code !== 'EPERM') throw error;
+    }
     return { record, error: null };
   } catch (error) {
     return { record: null, error: error.message };

@@ -152,7 +152,7 @@ function profile(module, { quote = '', newline = '\n', indent = '  ' } = {}) {
 }
 
 function marker(f, identity = runtimeIdentity(f.moduleUrl)) {
-  const record = { ...identity, loadedAt: '2026-01-01T01:02:03.000Z', pid: 12345,
+  const record = { ...identity, loadedAt: '2026-01-01T01:02:03.000Z', pid: process.pid,
     workspaces: ['*'], allowHostAccess: true, defaultHostAccess: true,
     plannerPromptFile: 'fixture-only.md', plannerPromptInjected: true };
   writeFileSync(f.loadedFile, JSON.stringify(record));
@@ -209,6 +209,25 @@ test('status uses actual marker with full host flags and distinguishes disk from
   assert.equal(changed.source.version, '1.2.4');
   assert.equal(changed.loaded.version, '1.2.3');
   assert.equal(changed.instance.version, '1.2.3');
+});
+
+test('an exited process cannot confirm runtime synchronization or a reload', async (t) => {
+  const f = fixture(t);
+  repository(f);
+  writeFileSync(f.profileFile, profile(f.moduleUrl));
+  const record = marker(f);
+  const child = spawnSync(process.execPath, ['-e', ''], { windowsHide: true });
+  assert.equal(child.status, 0);
+  writeFileSync(f.loadedFile, JSON.stringify({ ...record, pid: child.pid }));
+
+  const result = status(f);
+  assert.equal(result.state, 'unknown');
+  assert.equal(result.loaded, null);
+  assert.match(result.loaded_error, /进程已退出/);
+  const confirmation = await waitForRuntimeLoad({ loadedFile: f.loadedFile, expectedModule: f.moduleUrl, timeoutMs: 0 });
+  assert.equal(confirmation.confirmed, false);
+  assert.equal(confirmation.loaded, null);
+  assert.match(confirmation.error, /进程已退出/);
 });
 
 test('dirty, unknown and differing identities never claim clean synchronization', (t) => {
@@ -384,7 +403,7 @@ test('wait confirms only the exact new module and returns the actual published r
   const expectedModule = f.moduleUrl.replace('?v=old', '?v=new');
   marker(f);
   const actual = { module: expectedModule, version: '1.2.4', revision: null, dirty: true,
-    loadedAt: new Date().toISOString(), pid: 4321, defaultHostAccess: true, workspaces: ['*'] };
+    loadedAt: new Date().toISOString(), pid: process.pid, defaultHostAccess: true, workspaces: ['*'] };
   const publication = (async () => {
     await delay(20);
     writeFileSync(f.loadedFile, '{partial');

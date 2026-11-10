@@ -1761,7 +1761,7 @@ test('apply preserves another live process loaded record and replaces own, stale
       assert.notEqual(status.loaded.loadedAt, '2000-01-01T00:00:00Z');
     }
   }
-  assert.deepEqual(probes, [livePid, protectedPid, deadPid]);
+  assert.deepEqual(new Set(probes), new Set([livePid, protectedPid, deadPid]));
 });
 
 test('codex_watch stays quiet without changes and stopping it leaves the business task running', async (t) => {

@@ -1499,12 +1499,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     mkdirSync(dir, { recursive: true });
     const loadedFile = path.join(dir, 'loaded.json');
     const { record } = loadedRecord(loadedFile);
-    let occupied = false;
-    if (record && record.pid !== process.pid) try {
-      process.kill(record.pid, 0);
-      occupied = true;
-    } catch (error) { occupied = error.code === 'EPERM'; }
-    if (!occupied) writeFileSync(loadedFile,
+    if (!record || record.pid === process.pid) writeFileSync(loadedFile,
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
         tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
           ...(cfg.gemini ? ['gemini_write'] : [])],

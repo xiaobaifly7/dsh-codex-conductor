@@ -28,6 +28,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 面板沿用 DSH 的网页服务，不另开端口；`/dsh-codex-conductor/*` 的每个接口都调用 DSH 自己的登录及 Host/Origin 校验，缺少鉴权服务时拒绝访问。`webServer`、`settings` 或客户端槽位不存在时不影响原有工具。文件 URL 加载也支持前端：升级时保留完整包（包括 `package.json`、`client.js`、`panel.mjs`），仍用 `file:///…/index.mjs?v=…`，更换 entry ID 和 `v` 后由 DSH 热加载，无须重启宿主。`runtimeProfileFile` 须指向这个实例实际使用的 `cordis.patch.yml`；新版本先由用户部署。
 
+`0.9.64` 加载状态和重载确认会核对 Harness 进程仍在运行，已退出实例的旧标记不会被当成当前加载结果。
+
 `0.9.63` 未筛选的任务历史先按时间分页，再读取当前页的任务和报告。
 
 `0.9.62` 重启后别的插件推进目标被宿主拒绝（回合以 blocked 结束）时，续接请求仍可恢复该目标；这种情况下不会改发用户消息。
@@ -381,6 +383,8 @@ Reports offer a readable view and the original text for both v2 and legacy forma
 `0.9.60` shows original acceptance criteria in the readable report (expandable after 300 characters, falling back to report labels when unavailable) and returns HTTP 409 for state conflicts such as cancelling already-written settings, while internal failures remain 500.
 
 Every `/dsh-codex-conductor/*` endpoint explicitly uses DSH's own login and Host/Origin checks on its existing web server; no extra port is opened, and missing authentication fails closed. Missing optional web/settings/slot services leave the existing tools available. File-URL loading supports the client declaration: deploy the complete package, including `package.json`, `client.js`, and `panel.mjs`, keep `file:///…/index.mjs?v=…`, and change the entry ID and `v` token for a hot load without restarting DSH. Set `runtimeProfileFile` to that instance's real `cordis.patch.yml`; deployment is a separate user action.
+
+`0.9.64` checks that the Harness process is still present before reporting synchronization or confirming a reload.
 
 `0.9.63` pages unfiltered history by timestamp before reading the selected jobs and reports.
 
