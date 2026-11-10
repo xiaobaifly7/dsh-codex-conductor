@@ -18,10 +18,11 @@ const sample = () => ({
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
 // A small hook host exercises real handlers/effects without installing React or using a browser.
-function clientHost(handler = () => ({})) {
+function clientHost(handler = () => ({}), { window = {}, modules = {}, ...globals } = {}) {
   const slots = [], effects = [], requests = [], timers = new Map();
   let index = 0, dirty = false, root, tree, definition, timerId = 0;
   const react = {
+    Component: class { constructor(props) { this.props = props; } },
     createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat(Infinity) }),
     useState(initial) {
       const i = index++;
@@ -38,8 +39,8 @@ function clientHost(handler = () => ({})) {
     },
   };
   vm.runInNewContext(source, {
-    window: { __ModuleLoader__: { load: (value) => { definition = value; } } }, AbortController,
-    setTimeout: (fn) => { timers.set(++timerId, fn); return timerId; }, clearTimeout: (id) => timers.delete(id),
+    ...globals, window: { ...window, __ModuleLoader__: { load: (value) => { definition = value; } } }, AbortController,
+    setTimeout: (fn, ms) => { timers.set(++timerId, { fn, ms }); return timerId; }, clearTimeout: (id) => timers.delete(id),
     fetch: async (url, options) => {
       const path = url.replace('/dsh-codex-conductor', '');
       const body = options.body ? JSON.parse(options.body) : undefined;
@@ -48,14 +49,14 @@ function clientHost(handler = () => ({})) {
       return { ok: !result?.error, status: result?.error ? 500 : 200, json: async () => result };
     },
   });
-  const exports = definition.factory((name) => name === 'react' ? react : { Button: 'button', Input: 'input', Checkbox: 'checkbox' });
+  const exports = definition.factory((name) => name === 'react' ? react : modules[name] || { Button: 'button', Input: 'input', Checkbox: 'checkbox' });
   function render() { index = 0; dirty = false; tree = root(); while (effects.length) effects.shift()(); }
   return {
-    exports, requests,
+    exports, requests, timers,
     mount(component, props = {}) { root = () => component(props); render(); },
     async flush() { for (let n = 0; n < 12; n++) { await new Promise(setImmediate); if (dirty) render(); } },
     get tree() { return tree; },
-    poll() { for (const [id, fn] of [...timers]) { timers.delete(id); fn(); } },
+    poll() { for (const [id, { fn }] of [...timers]) { timers.delete(id); fn(); } },
     dispose() { for (const slot of slots) slot?.cleanup?.(); },
   };
 }
@@ -79,6 +80,150 @@ const field = (host, label) => {
   return nodes(container).find((node) => ['input', 'select', 'checkbox'].includes(node.type));
 };
 const change = async (host, label, value) => { field(host, label).props.onChange({ target: { value } }); await host.flush(); };
+
+// Expose the test-rendered element tree through the selectors used by the collector.
+function renderedNode(tree) {
+  const all = nodes(tree).filter((node) => typeof node === 'object');
+  const matches = (node, selector) => selector.startsWith('.') ? node.props.className?.split(' ').includes(selector.slice(1))
+    : selector.startsWith('[') ? Object.hasOwn(node.props, selector.slice(1, -1)) : node.type === selector;
+  return {
+    textContent: nodes(tree).filter((node) => typeof node !== 'object').join(''),
+    get firstElementChild() { return renderedNode(tree.children.find((node) => node && typeof node === 'object')); },
+    querySelectorAll(selector) {
+      const found = selector === 'ol > li' ? all.filter((node) => node.type === 'ol').flatMap((node) => node.children)
+        .filter((node) => node?.type === 'li') : all.filter((node) => matches(node, selector));
+      return found.map(renderedNode);
+    },
+    querySelector(selector) { return this.querySelectorAll(selector)[0] ?? null; },
+  };
+}
+
+test('selftest waits for panel reads, opens the first real Report and blocks mutation handlers', async (t) => {
+  const service = panelService();
+  const host = clientHost(service.handle); t.after(() => host.dispose());
+  const reads = [];
+  let finished = 0;
+  const selftest = { finish: () => { finished++; }, read: async (path) => { reads.push(path); return service.handle(path); } };
+  const job = { job_id: 'first-job', title: 'first', status: 'completed', started_at: 0 };
+  service.handle = (path) => path.startsWith('/jobs') ? { total: 1, jobs: [job] } : panelService().handle(path);
+  host.mount(host.exports.Panel, { selftest }); await host.flush();
+  assert.deepEqual(reads.sort(), ['/attention', '/jobs?filter=all&offset=0', '/prompt', '/settings', '/status']);
+  const report = host.tree.children.flatMap((node) => node?.children || []).find((node) => node?.type === host.exports.Report);
+  assert.equal(report.props.jobId, 'first-job');
+  assert.equal(report.props.selftest, selftest);
+  assert.equal(finished, 0, 'must wait for the report');
+  const status = host.tree.children.find((node) => node?.type === host.exports.Status);
+  const reload = nodes(host.exports.Status(status.props)).find((node) => node.type === 'button' && text(node) === '重新加载插件（等任务结束）');
+  await reload.props.onClick();
+  assert.equal(host.requests.length, 0, 'even an invoked mutation handler cannot write in selftest mode');
+  assert.equal(host.timers.size, 0, 'offscreen panel does not start normal seven-second polling');
+
+  const reportHost = clientHost(); t.after(() => reportHost.dispose());
+  const output = reportReader(JSON.stringify(sample()), []);
+  reportHost.mount(reportHost.exports.Report, { jobId: 'first-job', selftest: { finish: () => { finished++; }, read: output } });
+  await reportHost.flush();
+  assert.equal(finished, 1);
+  assert.match(text(reportHost.tree), /概述.*逐条验收/s);
+  assert.equal(reportHost.requests.length, 0);
+});
+
+test('selftest with no tasks finishes after reads, including a failed interface', async (t) => {
+  for (const failed of [false, true]) {
+    const service = panelService(), host = clientHost(); t.after(() => host.dispose());
+    let finished = 0;
+    host.mount(host.exports.Panel, { selftest: {
+      finish: () => { finished++; },
+      read: async (path) => { if (failed && path === '/status') throw new Error('状态读取失败，请重试。'); return service.handle(path); },
+    } });
+    await host.flush();
+    assert.ok(finished > 0);
+    assert.equal(host.requests.length, 0);
+    if (failed) assert.match(text(host.tree), /状态读取失败/);
+  }
+});
+
+test('selftest collector reads rendered headings, displayed status and 80 Unicode report characters', () => {
+  const host = clientHost(undefined, { navigator: { userAgent: 'test Electron/40' }, location: { origin: 'http://test' } });
+  const report = sample(); report.criteria[0].criterion = '🙂'.repeat(100);
+  const tree = { type: 'div', props: {}, children: [
+    host.exports.Status({ status: { runtime: { loaded: { version: '0.9.61' } }, settings: settings() } }),
+    ...['常用设置', '最近任务', '规划提示词'].map((title) => ({ type: 'h3', props: {}, children: [title] })),
+    { type: 'li', props: { className: 'dcc-job' }, children: ['task'] },
+    { type: 'div', props: { 'data-dcc-report': 'J' }, children: [host.exports.ReadableReport({ report })] },
+  ] };
+  const result = host.exports.collectSelftest(renderedNode(tree), [{ path: '/status', status: 200 }], ['failure'], false);
+  assert.deepEqual(plain(result.sections), { 运行状态: true, 常用设置: true, 最近任务: true, 规划提示词: true });
+  assert.deepEqual(plain(result.status), { version: '0.9.61', model: 'old-model', effort: '高', serviceTier: '跟随 Codex 配置' });
+  assert.equal(result.taskCount, 1);
+  assert.deepEqual(plain(result.report), { opened: true, summary: true, criteria: true, firstCriterion: '通过：' + '🙂'.repeat(77) });
+  assert.deepEqual(plain(result.errors), ['failure']);
+  assert.equal(result.userAgent, 'test Electron/40');
+  assert.equal(result.origin, 'http://test');
+});
+
+function offscreenHost(handler, render) {
+  const events = new Map();
+  const node = Object.assign(renderedNode(null), { style: {}, setAttribute(name, value) { this[name] = value; },
+    remove() { this.removed = true; } });
+  const root = { render: (element) => render(element), unmount() { this.unmounted = true; } };
+  const host = clientHost(handler, {
+    navigator: { userAgent: 'test Electron/40' }, location: { origin: 'http://test' },
+    document: { createElement: () => node, body: { appendChild: () => { node.appended = true; } } },
+    window: { addEventListener: (name, fn) => events.set(name, fn), removeEventListener: (name) => events.delete(name) },
+    modules: { 'react-dom/client': { createRoot: () => root } },
+  });
+  return { host, node, root, events };
+}
+
+test('selftest without a request only polls once a minute after settings registration', async () => {
+  let registered = false;
+  const { host, node } = offscreenHost(() => { assert.equal(registered, true); return { request: null }; }, () => assert.fail('unexpected render'));
+  let cleanup;
+  const slots = { register() { registered = true; return () => { registered = false; }; },
+    inject(_name, fn) { cleanup = fn(); return cleanup; } };
+  host.exports.apply({ inject: (_names, fn) => fn({ get: () => slots }) });
+  await host.flush();
+  assert.equal(node.appended, undefined);
+  assert.deepEqual(host.requests, [{ path: '/selftest/request', body: undefined }]);
+  assert.deepEqual([...host.timers.values()].map(({ ms }) => ms), [60000]);
+  host.poll(); await host.flush();
+  assert.equal(host.requests.length, 2);
+  cleanup();
+  assert.equal(host.timers.size, 0);
+  assert.equal(registered, false);
+});
+
+test('selftest unmounts offscreen before posting and records timeout, render errors and disposal', async () => {
+  for (const mode of ['complete', 'timeout', 'error', 'dispose']) {
+    const { host, node, root, events } = offscreenHost((_path, body) => {
+      if (body === undefined) return mode === 'timeout' ? new Promise(() => {}) : {};
+      assert.equal(node.removed, true); assert.equal(root.unmounted, true);
+      assert.equal(body.result.settingsRegistered, true); return { saved: true };
+    }, (element) => {
+      if (mode === 'complete') {
+        const selftest = element.children[0].props.selftest;
+        selftest.read('/status').then(selftest.finish);
+      }
+      if (mode === 'timeout') element.children[0].props.selftest.read('/status');
+      if (mode === 'error') throw new Error('primitive render failed');
+    });
+    const controller = new AbortController();
+    const pending = host.exports.runSelftest({ id: 'test', claim: 'claim' }, controller.signal);
+    assert.equal(node.appended, true); assert.equal(node.inert, true); assert.equal(node['aria-hidden'], 'true');
+    assert.match(node.style.cssText, /left:-100000px.*visibility:hidden/);
+    if (mode === 'timeout') host.poll();
+    if (mode === 'dispose') controller.abort();
+    const result = await pending;
+    assert.equal(result.timedOut, mode === 'timeout');
+    if (mode === 'error') assert.deepEqual(plain(result.errors), ['primitive render failed']);
+    assert.equal(node.removed, true); assert.equal(root.unmounted, true);
+    assert.equal(events.size, 0); assert.equal(host.timers.size, 0);
+    assert.deepEqual(host.requests.map(({ path }) => path), mode === 'dispose' ? []
+      : ['complete', 'timeout'].includes(mode) ? ['/status', '/selftest/result'] : ['/selftest/result']);
+    if (mode === 'complete') assert.deepEqual(plain(result.http), [{ path: '/status', status: 200 }]);
+    if (mode === 'timeout') assert.deepEqual(plain(result.http), [{ path: '/status', status: null }]);
+  }
+});
 
 test('client parser matches workflow validation for v2, legacy, and malformed structures', () => {
   const { parseReport } = clientHost().exports;

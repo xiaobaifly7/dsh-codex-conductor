@@ -1,9 +1,42 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import path from 'node:path';
 const { validatePanelSettings, writeBackedUpFile } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
+const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export const PANEL_PATH = '/dsh-codex-conductor';
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const bad = (message, status = 400) => Object.assign(new Error(message), { status });
+const SELFTEST_LIMIT = 64 * 1024;
+
+function selftestResult(body) {
+  object(body, ['id', 'claim', 'result']);
+  if (Buffer.byteLength(JSON.stringify(body)) > SELFTEST_LIMIT) throw bad('自检结果超过 64 KiB，请缩短后重试。', 413);
+  const result = body.result;
+  object(result, ['settingsRegistered', 'sections', 'status', 'taskCount', 'report', 'http', 'errors', 'userAgent', 'origin', 'timedOut']);
+  object(result.sections, ['运行状态', '常用设置', '最近任务', '规划提示词']);
+  object(result.status, ['version', 'model', 'effort', 'serviceTier']);
+  object(result.report, ['opened', 'summary', 'criteria', 'firstCriterion']);
+  const string = (v, max) => typeof v === 'string' && Array.from(v).length <= max;
+  const boolean = (v) => typeof v === 'boolean';
+  if (!string(body.id, 128) || !string(body.claim, 36) ||
+      !boolean(result.settingsRegistered) || !boolean(result.timedOut) ||
+      !['运行状态', '常用设置', '最近任务', '规划提示词'].every((key) => boolean(result.sections[key])) ||
+      !['version', 'model', 'effort', 'serviceTier'].every((key) => result.status[key] === null || string(result.status[key], 256)) ||
+      !Number.isSafeInteger(result.taskCount) || result.taskCount < 0 || result.taskCount > 20 ||
+      !['opened', 'summary', 'criteria'].every((key) => boolean(result.report[key])) || !string(result.report.firstCriterion, 80) ||
+      !string(result.userAgent, 2048) || !string(result.origin, 2048) ||
+      !Array.isArray(result.errors) || result.errors.length > 40 || !result.errors.every((v) => string(v, 1000)) ||
+      !Array.isArray(result.http) || result.http.length > 100) throw bad('自检结果字段不正确，请重新触发自检。');
+  for (const entry of result.http) {
+    object(entry, ['path', 'status']);
+    if (!string(entry.path, 1024) || !/^\/(?:status|settings|jobs|prompt|attention|output|selftest\/request)(?:\?|$)/.test(entry.path) ||
+        !(entry.status === null || (Number.isInteger(entry.status) && entry.status >= 100 && entry.status <= 599))) {
+      throw bad('自检接口记录不正确，请重新触发自检。');
+    }
+  }
+  return result;
+}
 
 function readableError(error) {
   const message = String(error?.message ?? error);
@@ -49,19 +82,54 @@ export function panelSettings(cfg) {
 }
 
 // No paths or runner commands come from HTTP input.
-export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
+export function createPanelApi({ cfg, conductor, runtime, plannerFile,
+  selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
   let saving = false;
+  const selftests = new Map();
   return async function api(method, pathname, query = {}, body) {
     const route = pathname.slice(PANEL_PATH.length);
     const known = { '/status': ['GET'], '/attention': ['GET'], '/settings': ['GET', 'POST'],
       '/settings/apply': ['POST'], '/settings/cancel': ['POST'], '/jobs': ['GET'], '/output': ['GET'],
-      '/cancel': ['POST'], '/prompt': ['GET', 'POST'], '/reload': ['POST'] };
+      '/cancel': ['POST'], '/prompt': ['GET', 'POST'], '/reload': ['POST'],
+      '/selftest/request': ['GET'], '/selftest/result': ['POST'] };
     if (!pathname.startsWith(PANEL_PATH + '/') || !known[route]) throw bad('找不到这个功能，请刷新面板后重试。', 404);
     if (!known[route].includes(method)) throw bad('打开方式不正确，请使用面板上的按钮重试。', 405);
     const allowedQuery = route === '/jobs' ? ['filter', 'offset'] : route === '/output' ? ['job_id', 'offset', 'limit'] : [];
     object(query, allowedQuery);
-    if (method === 'POST' && route !== '/settings') object(body, route === '/prompt' ? ['text'] : route === '/cancel' ? ['job_id', 'confirm'] :
+    if (method === 'POST' && route !== '/settings' && route !== '/selftest/result') object(body, route === '/prompt' ? ['text'] : route === '/cancel' ? ['job_id', 'confirm'] :
       route === '/settings/apply' ? ['changes', 'confirm'] : []);
+    if (route === '/selftest/request') {
+      if (!selftestDirectory) return { request: null };
+      const claim = randomUUID();
+      const claimed = path.join(selftestDirectory, `panel-selftest-request.${claim}.processing.json`);
+      try { renameSync(path.join(selftestDirectory, 'panel-selftest-request.json'), claimed); }
+      catch (error) { if (error.code === 'ENOENT') return { request: null }; throw error; }
+      if (statSync(claimed).size > 4096) throw bad('自检请求超过 4 KiB，请缩短后重试。', 413);
+      let request;
+      try { request = JSON.parse(readFileSync(claimed, 'utf8').replace(/^\uFEFF/, '')); }
+      catch { throw bad('自检请求不是有效 JSON，请重新触发。'); }
+      object(request, ['id']);
+      if (request.id !== undefined && (typeof request.id !== 'string' || Array.from(request.id).length > 128)) {
+        throw bad('自检请求编号必须是最多 128 字符的文字。');
+      }
+      const id = request.id ?? claim;
+      selftests.set(claim, { id, claimed });
+      return { request: { id, claim } };
+    }
+    if (route === '/selftest/result') {
+      const result = selftestResult(body);
+      const request = selftests.get(body.claim);
+      if (!request || request.id !== body.id) throw bad('自检请求已失效，请重新触发。', 409);
+      const temporary = path.join(selftestDirectory, `panel-selftest-result.${body.claim}.tmp`);
+      try {
+        writeFileSync(temporary, JSON.stringify({ id: request.id, version, pid: process.pid,
+          receivedAt: new Date().toISOString(), ...result }, null, 2) + '\n', { flag: 'wx' });
+        renameSync(temporary, path.join(selftestDirectory, 'panel-selftest-result.json'));
+      } finally { rmSync(temporary, { force: true }); }
+      selftests.delete(body.claim);
+      unlinkSync(request.claimed);
+      return { saved: true };
+    }
     if (route === '/status') {
       return { runtime: await runtime.execute({ action: 'status' }), settings: panelSettings(cfg) };
     }
@@ -174,7 +242,8 @@ function registerReadyPanel({ ctx, ...options }) {
         let size = 0;
         for await (const chunk of req) {
           size += chunk.length;
-          if (size > 1024 * 1024) throw bad('提交的内容超过 1 MiB，请缩短内容后再保存。', 413);
+          const limit = url.pathname === PANEL_PATH + '/selftest/result' ? SELFTEST_LIMIT : 1024 * 1024;
+          if (size > limit) throw bad(`提交的内容超过 ${limit === SELFTEST_LIMIT ? '64 KiB' : '1 MiB'}，请缩短内容后再保存。`, 413);
           chunks.push(chunk);
         }
         try { body = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw bad('提交内容的格式不正确，请刷新页面后重新操作。'); }

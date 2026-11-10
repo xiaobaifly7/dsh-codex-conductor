@@ -13,6 +13,7 @@ const routes = [
   ['GET', '/jobs'], ['GET', '/output?job_id=job-1'],
   ['POST', '/cancel', { job_id: 'job-1', confirm: true }],
   ['GET', '/prompt'], ['POST', '/prompt', { text: 'updated' }], ['POST', '/reload', {}],
+  ['GET', '/selftest/request'], ['POST', '/selftest/result', {}],
 ];
 
 // Model Cordis injection ownership: only changed dependencies restart a child callback.
@@ -71,7 +72,7 @@ function fixture(t, options = {}) {
   let handler;
   const services = { webServer: web, settings, connection, ...options.services };
   const ctx = serviceContext(t, services);
-  const apiOptions = { cfg, conductor, runtime, plannerFile, ...options.api };
+  const apiOptions = { cfg, conductor, runtime, plannerFile, selftestDirectory: root, ...options.api };
   const registration = registerPanel({ ctx, ...apiOptions });
   async function request(method, route, body, { raw, chunks, contentType = 'application/json' } = {}) {
     if (!handler) return { status: 404 };
@@ -98,6 +99,81 @@ function rejected(response, status, message) {
   assert.equal(typeof response.body.error, 'string');
   if (message) assert.match(response.body.error, message);
 }
+
+const selftestSample = () => ({
+  settingsRegistered: true, sections: { 运行状态: true, 常用设置: true, 最近任务: true, 规划提示词: true },
+  status: { version: '0.9.61', model: 'gpt-6', effort: '高', serviceTier: 'fast' }, taskCount: 1,
+  report: { opened: true, summary: true, criteria: true, firstCriterion: '第 1 条：面板正常渲染 —— 通过' },
+  http: [{ path: '/status', status: 200 }, { path: '/output?job_id=job-1&offset=0&limit=8000', status: 200 }],
+  errors: [], userAgent: 'Mozilla/5.0 Electron/40.0.0', origin: 'http://localhost:1234', timedOut: false,
+});
+
+test('selftest without a request neither creates files nor calls the panel services', async (t) => {
+  const f = fixture(t);
+  const before = readdirSync(f.root);
+  for (let i = 0; i < 2; i++) assert.deepEqual(await f.request('GET', '/selftest/request'), { status: 200, body: { request: null } });
+  assert.deepEqual(readdirSync(f.root), before);
+  assert.deepEqual(f.calls(), [0, 0, 0, 0]);
+  const missing = fixture(t, { api: { selftestDirectory: path.join(f.root, 'absent') } });
+  assert.deepEqual((await missing.request('GET', '/selftest/request')).body, { request: null });
+  const headless = fixture(t, { api: { selftestDirectory: '' } });
+  assert.deepEqual((await headless.request('GET', '/selftest/request')).body, { request: null });
+  rejected(await headless.request('POST', '/selftest/result', { id: '', claim: '', result: selftestSample() }), 409);
+  assert.deepEqual(readdirSync(f.root), before);
+});
+
+test('selftest atomically claims each request once and atomically replaces the last result', async (t) => {
+  const f = fixture(t);
+  for (const input of [{}, { id: 'desktop-🙂' }]) {
+    writeFileSync(path.join(f.root, 'panel-selftest-request.json'), JSON.stringify(input));
+    const responses = await Promise.all(Array.from({ length: 3 }, () => f.request('GET', '/selftest/request')));
+    const claims = responses.map((item) => item.body.request).filter(Boolean);
+    assert.equal(claims.length, 1);
+    const request = claims[0];
+    assert.equal(request.id, input.id ?? request.claim);
+    assert.equal(readdirSync(f.root).filter((name) => name.endsWith('.processing.json')).length, 1);
+    const body = { ...request, result: selftestSample() };
+    const response = await f.request('POST', '/selftest/result', body);
+    assert.deepEqual(response, { status: 200, body: { saved: true } });
+    const saved = JSON.parse(readFileSync(path.join(f.root, 'panel-selftest-result.json'), 'utf8'));
+    assert.deepEqual(saved, { id: request.id, version: JSON.parse(readFileSync(new URL('./package.json', import.meta.url))).version,
+      pid: process.pid, receivedAt: saved.receivedAt, ...body.result });
+    assert.ok(Number.isFinite(Date.parse(saved.receivedAt)));
+    assert.deepEqual(readdirSync(f.root).sort(), ['panel-selftest-result.json', 'planner.md']);
+    rejected(await f.request('POST', '/selftest/result', body), 409);
+  }
+  assert.deepEqual(f.calls(), [0, 0, 0, 0]);
+  assert.equal(f.runtime.cancelPending.mock.callCount(), 0);
+  assert.equal(readFileSync(f.plannerFile, 'utf8'), '原有规划要求🙂\n');
+});
+
+test('selftest rejects malformed requests and invalid, unclaimed or oversized results', async (t) => {
+  const f = fixture(t);
+  for (const request of ['{', 'null', '[]', '{"id":12}', '{"id":"' + 'x'.repeat(129) + '"}', '{"path":"elsewhere"}', ' '.repeat(4097)]) {
+    writeFileSync(path.join(f.root, 'panel-selftest-request.json'), request);
+    rejected(await f.request('GET', '/selftest/request'), request.length > 4096 ? 413 : 400);
+  }
+  writeFileSync(path.join(f.root, 'panel-selftest-request.json'), '{"id":"valid"}');
+  const request = (await f.request('GET', '/selftest/request')).body.request;
+  const result = selftestSample();
+  const invalid = [null, [], {}, { ...result, injected: true }, { ...result, settingsRegistered: 1 },
+    { ...result, sections: { ...result.sections, 最近任务: 'yes' } }, { ...result, status: { ...result.status, model: 42 } },
+    { ...result, taskCount: -1 }, { ...result, taskCount: 21 }, { ...result, timedOut: 'false' },
+    { ...result, report: { ...result.report, firstCriterion: '🙂'.repeat(81) } },
+    { ...result, errors: [123] }, { ...result, userAgent: null }, { ...result, origin: false },
+    { ...result, http: [{ path: '/reload', status: 200 }] }, { ...result, http: [{ path: '/status', status: '200' }] },
+    { ...result, http: [{ path: '/status', status: 600 }] }];
+  for (const value of invalid) rejected(await f.request('POST', '/selftest/result', { ...request, result: value }), 400);
+  rejected(await f.request('POST', '/selftest/result', { ...request, pid: 1, result }), 400);
+  rejected(await f.request('POST', '/selftest/result', { ...request, id: 'wrong', result }), 409);
+  rejected(await f.request('POST', '/selftest/result', { ...request, claim: 'unknown', result }), 409);
+  const oversized = JSON.stringify({ ...request, result: { ...result, errors: ['x'.repeat(65536)] } });
+  rejected(await f.request('POST', '/selftest/result', undefined, { raw: oversized }), 413);
+  await assert.rejects(f.api('POST', PANEL_PATH + '/selftest/result', {}, JSON.parse(oversized)), { status: 413 });
+  assert.equal(readdirSync(f.root).some((name) => name === 'panel-selftest-result.json' || name.endsWith('.tmp')), false);
+  assert.deepEqual(f.calls(), [0, 0, 0, 0]);
+  assert.equal((await f.request('POST', '/selftest/result', { ...request, result })).status, 200);
+});
 
 test('panel settings expose only editable fields and redact nested Gemini configuration', () => {
   const cfg = { model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
@@ -332,18 +408,22 @@ test('panel jobs pages preserve the filter and runner next offset', async (t) =>
 });
 
 test('panel HTTP rejects unauthenticated requests and absent authentication on every route before side effects', async (t) => {
-  for (const mode of ['logged-out', 'missing-service', 'missing-method']) {
+  for (const mode of ['logged-out', 'cross-origin', 'missing-service', 'missing-method']) {
     const f = fixture(t);
     if (mode === 'logged-out') f.connection.requestRejection.mock.mockImplementation(() => 401);
+    else if (mode === 'cross-origin') f.connection.requestRejection.mock.mockImplementation(() => 403);
     else f.services.connection = mode === 'missing-service' ? undefined : {};
+    const requestFile = path.join(f.root, 'panel-selftest-request.json');
+    writeFileSync(requestFile, '{}');
     const before = readFileSync(f.plannerFile);
     for (const [method, route, body] of routes) {
-      rejected(await f.request(method, route, body), mode === 'logged-out' ? 401 : 503);
+      rejected(await f.request(method, route, body), mode === 'logged-out' ? 401 : mode === 'cross-origin' ? 403 : 503);
     }
     assert.deepEqual(f.calls(), [0, 0, 0, 0]);
     assert.equal(f.runtime.cancelPending.mock.callCount(), 0);
     assert.deepEqual(readFileSync(f.plannerFile), before);
-    assert.deepEqual(readdirSync(f.root), ['planner.md']);
+    assert.equal(readFileSync(requestFile, 'utf8'), '{}');
+    assert.deepEqual(readdirSync(f.root).sort(), ['panel-selftest-request.json', 'planner.md']);
   }
   const f = fixture(t);
   f.connection.requestRejection.mock.mockImplementation(() => 403);
@@ -622,7 +702,7 @@ test('panel client applies fast status before history and always reads the separ
       assert.ok(applied.includes(2));
       assert.ok(!applied.includes(history.total));
     } finally {
-      for (const cleanup of cleanups) cleanup();
+      for (const cleanup of cleanups) cleanup?.();
       finish(history);
     }
   }
