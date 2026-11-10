@@ -93,6 +93,17 @@ test('resume: paused, blocked and disarmed active goals resume with their ID/rev
   assert.deepEqual(f.messages, []);
 });
 
+test('resume: a turn rejected as blocked after a restart resumes a disarmed goal but never sends a prompt', async (t) => {
+  const f = fixture(t);
+  const blocked = { type: 'turn/end', data: { reason: { kind: 'blocked' } } };
+  f.goalViews.set(f.add('goal', [start(), interrupted(), start(), blocked]), goal({ phase: 'active' }));
+  f.add('plain', [start(), interrupted(), start(), blocked]);
+  const result = await f.run({ sessions: ['goal', 'plain'] });
+  assert.deepEqual(result.sessions, [row('goal', 'goal_resumed', 'goal'), row('plain', 'not_interrupted')]);
+  assert.equal(f.resumes.length, 1);
+  assert.deepEqual(f.messages, []);
+});
+
 test('resume: missing, armed, completed and exhausted goals submit default/custom messages', async (t) => {
   for (const [label, view, message] of [
     ['missing', undefined, undefined], ['armed', goal({ phase: 'active', activation: 'armed' }), '接着做😀'],

@@ -37,9 +37,10 @@ async function resumeSession(ctx, sessionId, message) {
     if (agents.get(sessionId) !== agent) return skipped('session_changed');
     if (agent.status === 'running') return skipped('running');
     const lastTurn = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
-    if (lastTurn?.type !== 'turn/end' || lastTurn.data?.reason?.kind !== 'interrupted') {
-      return skipped('not_interrupted');
-    }
+    const ended = lastTurn?.type === 'turn/end' ? lastTurn.data?.reason?.kind : undefined;
+    // After a restart another plugin may try to advance the disarmed goal; the host rejects that turn as "blocked"
+    // before any step runs, so the session is still waiting to be resumed.
+    if (ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
     const goals = ctx.get('goals');
     const goal = goals?.get(agent);
     if (goal && ['active', 'paused', 'blocked'].includes(goal.phase) &&
@@ -49,6 +50,8 @@ async function resumeSession(ctx, sessionId, message) {
       goals.resume(agent, { id: goal.id, revision: goal.revision });
       return { sessionId, status: 'resumed', reason: 'goal_resumed', method };
     }
+    // A rejected turn alone says nothing was cut short, so it never justifies sending a prompt.
+    if (ended === 'blocked') return skipped('not_interrupted');
     method = 'message';
     agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
     return { sessionId, status: 'resumed', reason: 'message_submitted', method };
