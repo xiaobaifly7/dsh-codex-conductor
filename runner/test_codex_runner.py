@@ -90,6 +90,20 @@ FAKE_CODEX = textwrap.dedent(r"""
             say(type="error", message="connection reset before recording input")
             sys.exit(1)
         finish()
+    elif mode in ("silent_command", "parallel_commands", "completed_command_idle", "active_command_timeout"):
+        say(type="item.started", item={"id": "a", "type": "command_execution", "status": "in_progress"})
+        if mode == "parallel_commands":
+            say(type="item.started", item={"id": "b", "type": "command_execution", "status": "in_progress"})
+            say(type="item.completed", item={"id": "b", "type": "command_execution", "status": "completed"})
+        say(type="item.completed", item={"id": "r", "type": "reasoning", "text": "Waiting for command"})
+        if mode == "active_command_timeout":
+            time.sleep(300)
+        if mode != "completed_command_idle":
+            time.sleep(1.2)
+        say(type="item.completed", item={"id": "a", "type": "command_execution", "status": "completed"})
+        if mode == "completed_command_idle":
+            time.sleep(300)
+        finish()
     elif mode == "permanent":
         say(type="turn.failed", error={"message": "401 Unauthorized"})
         sys.exit(1)
@@ -353,6 +367,15 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(self.calls()[-1]["prompt"], prompt)
                 self.assertIn("resume", self.calls()[-1]["argv"])
 
+    def test_active_commands_suspend_idle_timeout_until_the_matching_completion(self):
+        for mode in ("silent_command", "parallel_commands"):
+            with self.subTest(mode=mode):
+                value = self.invoke("--idle-timeout", ".3", "--timeout", "5", "--retries", "0", mode=mode)
+                self.assertEqual(value["status"], "completed")
+        for mode, expected in (("completed_command_idle", "idle_timeout"), ("active_command_timeout", "timeout")):
+            with self.subTest(mode=mode):
+                value = self.invoke("--idle-timeout", ".3", "--timeout", "1", "--retries", "0", mode=mode)
+                self.assertEqual(value["error_kind"], expected)
 
     def test_pid_and_event_write_errors_reap_the_process_and_preserve_the_error(self):
         sys.path.insert(0, str(RUNNER.parent))
