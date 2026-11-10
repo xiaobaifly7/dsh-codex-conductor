@@ -865,7 +865,7 @@ def last_activity(events):
 
 def task_context(value):
     fields = {"owner", "task", "acceptance", "write"}
-    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher"}:
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of"}:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -876,6 +876,13 @@ def task_context(value):
         raise ValueError("context.acceptance must be a nonempty array of nonempty strings")
     if not isinstance(value["write"], bool):
         raise ValueError("context.write must be a boolean")
+    if "verification_of" in value:
+        if not isinstance(value["verification_of"], str):
+            raise ValueError("context.verification_of must be a job identifier")
+        try:
+            job_identifier(value["verification_of"])
+        except argparse.ArgumentTypeError as e:
+            raise ValueError("context.verification_of: " + str(e)) from e
     if "dispatcher" in value:
         dispatcher = value["dispatcher"]
         if (not isinstance(dispatcher, dict) or set(dispatcher) != {"version", "revision", "pid"} or
@@ -954,6 +961,7 @@ def job_metadata(job_dir, task=None, finished_at=None, thread_id=None, *, resolv
     meta = {"context": task.get("context"), "sandbox": task.get("sandbox"), "scope": task.get("scope")}
     meta["task_options"] = {"writable_roots": task.get("writable_roots"),
                             "use_user_config": task.get("use_user_config", False), "effort": task.get("effort")}
+    meta["task_options"].update({k: task[k] for k in ("model", "service_tier") if task.get(k) is not None})
     if task.get("cwd"):
         meta["cwd"] = resolve(local_path(task["cwd"]))
         if task.get("scope"):
@@ -1232,6 +1240,9 @@ def enriched_status(job_id, job_dir, value, record=None):
     metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
                                                                          thread_id=value.get("thread_id"))
     result = {**metadata, **value, "job_id": job_id}
+    for key in ("model", "service_tier"):
+        if key in metadata["task_options"]:
+            result["task_options"] = {**result["task_options"], key: metadata["task_options"][key]}
     result.update(review_summary(result))
     result.update(verification_summary(job_dir, result))
     result["blocking"] = blocking_summary(result)
@@ -1414,12 +1425,88 @@ def list_jobs(args):
     page = [{**{k: j.get(k) for k in fields},
              "context": {"owner": j["context"].get("owner"),
                          "task": j["context"]["task"].strip().splitlines()[0][:160],
-                         **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {})}
+                         **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
+                         **({"verification_of": j["context"]["verification_of"]} if "verification_of" in j["context"] else {})}
              if j.get("context") else None,
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
             "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
+
+
+def products(args):
+    paths, truncated = {}, False
+    resolve = cache(os.path.realpath)
+
+    def add(cwd, path):
+        nonlocal truncated
+        if not isinstance(path, str) or not path.strip() or "\0" in path:
+            raise ValueError("Product paths must be nonempty strings")
+        if truncated:
+            return
+        absolute = scope_path(cwd, path, resolve=resolve)
+        key = tree_key(absolute, resolve=resolve)
+        # Directory grants would expose unrelated raw material beneath cwd or a write scope.
+        if os.path.isdir(absolute) or key in (tree_key(cwd, resolve=resolve), tree_key(str(HOME), resolve=resolve)):
+            return
+        if key not in paths:
+            if len(paths) < args.limit:
+                paths[key] = absolute
+            else:
+                truncated = True
+
+    for job_dir in job_directories():
+        if job_dir.is_symlink() or not job_dir.resolve().is_relative_to((HOME / "jobs").resolve()):
+            continue
+        args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+        if not result_file.exists() or args_file.is_symlink():
+            continue
+        try:
+            task = json.loads(args_file.read_text("utf-8"))
+        except (OSError, ValueError):
+            continue  # No trustworthy owner is available.
+        context = task.get("context") if isinstance(task, dict) else None
+        if not isinstance(context, dict) or context.get("owner") != args.owner:
+            continue
+        try:
+            task_context(context)
+            if result_file.is_symlink():
+                raise ValueError("result.json must be a regular job file")
+            result = json.loads(result_file.read_text("utf-8"))
+            if not isinstance(result, dict):
+                raise ValueError("result.json must be an object")
+            if "context" in result and result["context"] != context:
+                raise ValueError("result context does not match args.json")
+            if result.get("status") in ("running", "unknown"):
+                continue
+            if result.get("status") not in ("completed", "failed", "cancelled"):
+                raise ValueError("result.json has an invalid status")
+            cwd = task.get("cwd")
+            if not isinstance(cwd, str) or not os.path.isabs(local_path(cwd)):
+                raise ValueError("Task cwd must be an absolute path")
+            cwd = resolve(local_path(cwd))
+            changes = result.get("files_changed", [])
+            if not isinstance(changes, list):
+                raise ValueError("files_changed must be an array")
+            for change in changes:
+                if not isinstance(change, dict):
+                    raise ValueError("files_changed entries must contain a path")
+                add(cwd, change.get("path"))
+            for record in (task, result):
+                writes = record.get("write_paths", [])
+                if not isinstance(writes, list):
+                    raise ValueError("write_paths must be an array")
+                for path in writes:
+                    add(cwd, path)
+            for name in ("args.json", "prompt.txt", "result.json", "last_message.txt", "reviews.json", "stderr.log", "events.jsonl"):
+                artifact = job_dir / name
+                if artifact.is_file() and not artifact.is_symlink():
+                    add(str(job_dir), name)
+        except (OSError, ValueError, TypeError) as e:
+            raise ValueError(f"Invalid product record for {job_dir.name}: {e}") from e
+        if truncated:
+            break
+    return {"status": "completed", "owner": args.owner, "paths": list(paths.values()), "truncated": truncated}
 
 
 def summary_usage(rounds):
@@ -1652,6 +1739,9 @@ def main():
     listing.add_argument("--started-between", nargs=2, type=float, metavar=("START", "END"))
     summary.add_argument("--limit", type=int, default=10)
     summary.add_argument("--round-limit", type=int, default=20)
+    product_query = sub.add_parser("products")
+    product_query.add_argument("--owner", required=True)
+    product_query.add_argument("--limit", type=int, default=10000)
     review = sub.add_parser("review")
     review.add_argument("job_id", type=job_identifier)
     review.add_argument("--reviewer", required=True)
@@ -1661,6 +1751,14 @@ def main():
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
+    if args.command == "products":
+        if not args.owner.strip() or not 1 <= args.limit <= 10000:
+            parser.error("owner must be nonempty and limit between 1 and 10000")
+        try:
+            emit(products(args))
+        except (OSError, ValueError) as e:
+            emit({"status": "failed", "owner": args.owner, "error_kind": "invalid_record", "error": str(e), "retryable": False})
+        return
     if args.command == "list" and args.started_between is not None:
         start, end = args.started_between
         if not (isfinite(start) and isfinite(end) and start <= end):

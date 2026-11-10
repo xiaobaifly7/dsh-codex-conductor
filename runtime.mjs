@@ -225,7 +225,7 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
 
 const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
-  maxStorageMb: '任务记录上限', gemini: 'Gemini 设置' };
+  maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置' };
 
 export function validatePanelSettings(value, geminiConfigured = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
@@ -240,6 +240,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'readOnlyEffort') valid = v === '' || efforts.includes(v);
     else if (key === 'serviceTier') valid = ['', 'fast', 'ultrafast'].includes(v);
     else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
+    else if (key === 'plannerReads') valid = ['open', 'products'].includes(v);
     else if (['lockTimeoutSeconds', 'maxStorageMb'].includes(key)) valid = typeof v === 'number' && Number.isFinite(v) && v > 0;
     else if (key === 'gemini') {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&

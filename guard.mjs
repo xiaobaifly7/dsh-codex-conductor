@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export function wslPath(p) {
@@ -103,6 +104,9 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
   let kinds = [];
   let parameters = [];
   let patterns = [];
+  let dynamicWords = [];
+  let inputs = [];
+  let dynamic = false;
   let word = '';
   let kind = 'literal';
   let started = false;
@@ -119,6 +123,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
     if (started) {
       if (redirect) {
         if ((redirect !== '<' && word !== '/dev/null') || !braceExpansionsSafe(parameterWord)) valid = false;
+        if (redirect === '<') inputs.push({ path: word, dynamic: dynamic || /[*?{}~]|\[[^\]]+\]/.test(syntax) });
         redirect = null;
       } else {
         words.push(word);
@@ -132,20 +137,21 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
         expanded ||= /\{(?:[^{}]*,[^{}]*|(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?)\}/.test(syntax);
         const pattern = /[*?]|\[[^\]]+\]/.test(syntax);
         patterns.push(pattern);
+        dynamicWords.push(dynamic || /^~/.test(syntax) || /\{(?:[^{}]*,[^{}]*|[^{}]*\.\.[^{}]*)\}/.test(syntax));
         glob ||= pattern;
         // test 的额外词可能变成操作符；固定字母/路径前缀的 glob 无法生成 -v、! 等词。
         fieldSplit ||= /\$(?![?#])/.test(syntax) ||
           (pattern && !/^[A-Za-z0-9_./]/.test(word) && !intOperand(word));
       }
     }
-    word = ''; kind = 'literal'; started = false; syntax = ''; parameterWord = '';
+    word = ''; kind = 'literal'; started = false; syntax = ''; parameterWord = ''; dynamic = false;
   };
   const endSegment = (separator = '') => {
     endWord();
     if (redirect) valid = false;
     if (words.length) {
       if (expanded) braceSegments.add(words);
-      expansions.set(words, { glob, fieldSplit, unsafeParameter, kinds, parameters, patterns });
+      expansions.set(words, { glob, fieldSplit, unsafeParameter, kinds, parameters, patterns, dynamicWords, inputs });
       segments.push(words);
       // Only an unconditional, initial assignment preamble supplies known scalar values.
       if (preamble && words.every((w, i) => kinds[i] === 'assignment' && assignmentAllowed(w)) && [';', '\n'].includes(separator)) {
@@ -160,7 +166,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
         if (kinds.includes('assignment')) variables.clear();
       }
     }
-    words = []; kinds = []; parameters = []; patterns = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
+    words = []; kinds = []; parameters = []; patterns = []; dynamicWords = []; inputs = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
   };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
@@ -172,6 +178,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
     }
     if (ch === '`') return null;
     if (ch === '$') {
+      if (/^[({A-Za-z0-9_@*#?!-]/.test(next ?? '')) dynamic = true;
       const variable = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(command.slice(i));
       if (variable && variables.has(variable[1] ?? variable[2]) && (kind === 'assignment' ? !words.length : words.length > 0)) {
         const value = variables.get(variable[1] ?? variable[2]);
@@ -271,11 +278,14 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
   return valid && !redirect ? segments : null;
 }
 
-function gitAllowed(args) {
+function gitArguments(args) {
   let i = 0;
   while (args[i] === '--no-pager' || args[i] === '-P' || args[i] === '-C') i += args[i] === '-C' ? 2 : 1;
-  const sub = args[i];
-  const rest = args.slice(i + 1);
+  return args.slice(i);
+}
+
+function gitAllowed(args) {
+  const [sub, ...rest] = gitArguments(args);
   if (sub === '--version') return rest.length === 0;
   // --no-index 接受外部程序开关的缩写；--text 本身是合法的文本比较选项。
   if (rest.some((a) => /^--(output|ext(?:-|$)|textc)/.test(a.split('=')[0]))) return false;
@@ -654,6 +664,234 @@ function refusedPart(command, extra) {
 const present = (v) => v !== undefined && v !== null && v !== false && v !== '' &&
   !(typeof v === 'object' && Object.keys(v).length === 0);
 
+export const PRODUCT_HINT = '这是原料，规划端不直接读。需要里面的事实就用 codex_run 派给 Codex 去查；要核对 Codex 的产物就用 codex_verify。';
+
+// Use the same mount/case normalization as scopes; resolve local links before comparing.
+export function readPath(file, cwd = '') {
+  if (typeof file !== 'string' || !file.trim()) return '';
+  if (/^~|^[A-Za-z]:[^\\/]|^[A-Za-z][A-Za-z0-9+.-]+:/.test(file) && !/^[A-Za-z]:[\\/]/.test(file)) return '';
+  const absolute = /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(file) ? file : cwd ? `${cwd}/${file}` : '';
+  if (!absolute) return '';
+  const native = process.platform === 'win32'
+    ? absolute.replace(/^\/mnt\/([a-z])(?=\/|$)/i, (_, drive) => `${drive}:`) : absolute;
+  try { return normPath(realpathSync(native)); } catch { return normPath(absolute); }
+}
+
+const METADATA_COMMANDS = new Set(['pwd', 'ls', 'stat', 'du', 'df', 'basename', 'dirname', 'realpath', 'readlink',
+  'which', 'echo', 'printf', 'true', 'test', '[', '[[', 'read', 'exit', ':', 'continue', 'for',
+  'ps', 'pgrep', 'uname', 'whoami', 'id', 'tasklist', 'netstat', 'reg', 'icacls', 'tree', 'command']);
+const CONTENT_COMMANDS = new Set(['cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'rg', 'sed', 'awk',
+  'nl', 'cut', 'strings', 'hexdump', 'od', 'dd', 'diff', 'cmp', 'sha256sum', 'sha1sum', 'md5sum',
+  'sort', 'uniq', 'paste', 'column', 'jq', 'file', 'readelf', 'objdump', 'nm', 'gzip', 'iconv', 'base64', 'ssh-keygen']);
+const NO_VALUE_OPTIONS = new Set(['--help', '--version', '--number', '--number-nonblank', '--show-all', '--show-ends', '--show-tabs',
+  '--squeeze-blank', '--line-number', '--ignore-case', '--invert-match', '--extended-regexp', '--fixed-strings', '--recursive',
+  '--with-filename', '--no-filename', '--only-matching', '--count', '--files-with-matches', '--files-without-match', '--text',
+  '--quiet', '--silent', '--no-messages', '--null', '--null-data', '--lines', '--bytes', '--chars', '--words', '--max-line-length',
+  '--human-readable', '--unique', '--reverse', '--numeric-sort', '--general-numeric-sort', '--ignore-leading-blanks', '--check',
+  '--brief', '--mime', '--mime-type', '--mime-encoding', '--dereference', '--uncompress', '--test', '--decode', '--ignore-garbage',
+  '--raw-output', '--compact-output', '--slurp', '--null-input', '--raw-input', '--sort-keys', '--monochrome-output', '--exit-status']);
+
+// Return operand indexes, retaining options that themselves read a file (grep -f, jq --slurpfile, ...).
+function fileArguments(args, takes = [], fileOptions = []) {
+  const files = [], operands = [];
+  let flags = true;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (flags && arg === '--') { flags = false; continue; }
+    if (flags && arg.startsWith('-') && arg !== '-') {
+      const option = arg.split('=')[0];
+      const attached = arg.includes('=') || (!arg.startsWith('--') && arg.length > 2);
+      const key = arg.startsWith('--') ? option : arg.slice(0, 2);
+      if (!arg.startsWith('--') && !takes.includes(key) && !fileOptions.includes(key) &&
+          [...takes, ...fileOptions].some(flag => /^-[^-]$/.test(flag) && arg.slice(2).includes(flag[1]))) return null;
+      if (fileOptions.includes(key)) {
+        if (attached) files.push({ index: i, path: arg.startsWith('--') ? arg.slice(arg.indexOf('=') + 1) : arg.slice(2) });
+        else if (args[++i] !== undefined) files.push({ index: i, path: args[i] });
+        else return null;
+      } else if (takes.includes(key) && !attached) {
+        if (args[++i] === undefined) return null;
+      } else if (arg.startsWith('--') && !takes.includes(key) && (attached || !NO_VALUE_OPTIONS.has(key))) return null;
+      continue;
+    }
+    operands.push({ index: i, path: arg });
+  }
+  return { files, operands };
+}
+
+export function shellReadTargets(command, cwd) {
+  const expansions = new Map(), braces = new Set(), targets = [];
+  let unknown = false;
+  const segments = splitCommand(command, (sub) => {
+    const reads = shellReadTargets(sub, cwd);
+    if (reads === null) unknown = true;
+    else targets.push(...reads);
+    return true;
+  }, braces, expansions);
+  if (!segments || unknown) return null;
+  for (const raw of segments) {
+    const expansion = expansions.get(raw);
+    const { words, start } = core(raw, expansion.kinds);
+    for (const input of expansion.inputs) {
+      if (input.dynamic || !readPath(input.path, cwd)) return null;
+      targets.push(readPath(input.path, cwd));
+    }
+    if (!words.length) continue;
+    const [cmd, ...args] = words;
+    if (cmd === 'cd') { cwd = ''; continue; } // shortcut: relative reads after cd are refused; use workdir until cwd control-flow parsing is needed.
+    if (METADATA_COMMANDS.has(cmd)) {
+      if (['du', 'tree'].includes(cmd) && (args.some(a => /^--(?:files0-from|fromfile)/.test(a)) || expansion.dynamicWords.some(Boolean))) return null;
+      continue;
+    }
+    if (cmd === 'find') {
+      if (args.some(a => ['-exec', '-execdir', '-ok', '-okdir', '-files0-from'].includes(a))) return null;
+      continue;
+    }
+    if (cmd === 'git') {
+      const [sub, ...rest] = gitArguments(args);
+      if (sub === 'status' && rest.some(a => /^--v|^-[^-]*v/.test(a))) return null;
+      if (sub === 'ls-files' && rest.some(a => a.startsWith('--eo'))) return null;
+      if (['status', 'ls-files', 'ls-tree', 'rev-parse', 'describe', 'branch', 'remote', 'tag', 'check-ignore', '--version'].includes(sub)) continue;
+      return null;
+    }
+    if (cmd === 'date') {
+      if (args.some(a => /^--f|^-[^-]*f/.test(a))) return null;
+      continue;
+    }
+    if (cmd === 'tr') continue; // Operates on stdin; any input redirection or upstream reader is checked separately.
+    if (!CONTENT_COMMANDS.has(cmd)) return null;
+    if (expansion.dynamicWords.slice(start).some(Boolean) || braces.has(raw)) return null;
+    // Recursive diff follows directory links, so its reads can escape the supplied roots.
+    if (cmd === 'diff' && args.some(a => /^-[^-]*r/.test(a) || a === '--recursive')) return null;
+    if (['sha256sum', 'sha1sum', 'md5sum'].includes(cmd) && args.some(a => a === '--check' || /^-[^-]*c/.test(a))) return null;
+    if (cmd === 'dd') {
+      for (let i = 0; i < args.length; i++) if (args[i].startsWith('if=')) {
+        if (expansion.dynamicWords[start + i + 1] || expansion.patterns[start + i + 1]) return null;
+        const p = readPath(args[i].slice(3), cwd);
+        if (!p) return null;
+        targets.push(p);
+      }
+      continue;
+    }
+    const search = ['grep', 'egrep', 'fgrep', 'rg'].includes(cmd);
+    if (cmd === 'rg' && args.includes('--files')) {
+      if (args.some(a => /^(-[^-]*f|--file(?:=|$)|--ignore-file)/.test(a))) return null;
+      continue;
+    }
+    if (search && args.some(a => a === '--follow' || (cmd === 'rg' ? /^-[^-]*L/.test(a) : /^-[^-]*R/.test(a)))) return null;
+    const takes = search ? ['-e', '--regexp', '-m', '--max-count', '-A', '-B', '-C', '--after-context', '--before-context', '--context', '-g', '--glob', '--iglob', '-t', '-T', '--type', '--type-not', '--include', '--exclude', '-d', '--directories', '--encoding']
+      : ({ awk: ['-F', '-v'], head: ['-n', '-c', '--lines', '--bytes'], tail: ['-n', '-c', '--lines', '--bytes', '--pid', '--sleep-interval'],
+        nl: ['-b', '-d', '-f', '-h', '-i', '-l', '-n', '-s', '-v', '-w'], cut: ['-b', '-c', '-d', '-f', '--bytes', '--characters', '--delimiter', '--fields'],
+        strings: ['-n', '-t', '-e', '-T', '--bytes', '--radix', '--encoding'], hexdump: ['-n', '-s', '-e', '--length', '--skip', '--format'],
+        od: ['-A', '-j', '-N', '-t', '-w', '--address-radix', '--skip-bytes', '--read-bytes', '--format', '--width'],
+        sort: ['-k', '-t', '-S', '--key', '--field-separator', '--buffer-size'], uniq: ['-f', '-s', '-w', '--skip-fields', '--skip-chars', '--check-chars'],
+        paste: ['-d', '--delimiters'], column: ['-s', '-c', '-N', '-O', '--separator'], iconv: ['-f', '-t', '--from-code', '--to-code'],
+        file: ['-e', '-F', '-P', '--exclude', '--separator', '--parameter'], diff: ['-I', '-x', '--ignore-matching-lines', '--exclude'] }[cmd] ?? []);
+    const fileOptions = search ? ['-f', '--file', '--exclude-from', '--ignore-file']
+      : cmd === 'file' ? ['-f', '-m', '--files-from', '--magic-file']
+      : cmd === 'hexdump' ? ['-f', '--format-file']
+      : cmd === 'diff' ? ['--from-file', '--to-file', '-X', '--exclude-from'] : [];
+    // File lists, scripts and jq file bindings can introduce further unbounded reads.
+    if ((['wc', 'sort'].includes(cmd) && args.some(a => a.startsWith('--files0-from'))) ||
+        (cmd === 'file' && args.some(a => /^(-f|--files-from)/.test(a))) ||
+        (cmd === 'jq' && args.some(a => /^--(?:slurpfile|rawfile|from-file|argfile|run-tests|library-path)(?:=|$)|^-[^-]*[fL]/.test(a)))) return null;
+    const parsed = fileArguments(args, takes, fileOptions);
+    if (!parsed) return null;
+    // awk can replace its input paths through ARGV/ARGC.
+    if (cmd === 'awk' && /\b(?:ARGV|ARGC)\b/.test(parsed.operands[0]?.path ?? '')) return null;
+    if (cmd === 'jq' && /\b(?:import|include)\b/.test(parsed.operands[0]?.path ?? '')) return null;
+    const hasPattern = search && args.some(a => /^(-[ef]|--regexp(?:=|$)|--file(?:=|$))/.test(a));
+    if ((search && !hasPattern) || ['sed', 'awk', 'jq'].includes(cmd)) parsed.operands.shift();
+    if (cmd === 'ssh-keygen') {
+      parsed.files.push(...parsed.operands.splice(0));
+      const index = args.findIndex(a => a === '-f' || a === '-lf');
+      if (index >= 0) parsed.files.push({ index: index + 1, path: args[index + 1] });
+    }
+    for (const operand of [...parsed.files, ...parsed.operands]) {
+      if (operand.path === '-') continue;
+      const index = start + operand.index + 1;
+      if (expansion.dynamicWords[index] || expansion.patterns[index]) return null;
+      const p = readPath(operand.path, cwd);
+      if (!p) return null;
+      targets.push(p);
+    }
+    if (!parsed.operands.length && !expansion.inputs.length && (cmd === 'rg' || (search && args.some(a => /^-[^-]*[rR]|^--recursive$/.test(a))))) {
+      if (!cwd) return null;
+      targets.push(readPath(cwd));
+    }
+  }
+  return targets;
+}
+
+export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd) {
+  const name = String(exec?.name ?? '').split('__').at(-1);
+  const args = exec.arguments ?? {};
+  const ops = name.startsWith('ops_');
+  if (ops) cwd = exec?.agent?.session?.header?.cwd;
+  const directory = ops ? (name === 'ops_bash' ? args.workdir : undefined) : args.workdir ?? args.cwd;
+  if (directory !== undefined) cwd = readPath(directory, cwd);
+  if (SHELL_TOOLS[name]) return shellReadTargets(args.command, cwd);
+  if (name === 'find_referencing_symbols') return null; // Referencing bodies can come from files outside the supplied path.
+  const operation = name.replace(/^wsl-/, '');
+  const search = /^(?:ops_)?(?:grep|search|search_files|search_for_pattern|find_symbol|get_symbols_overview)$/.test(operation);
+  const reader = /^(?:ops_)?(?:read|read_file|read_files|read_many_files|read_multiple_files|read_image|view_image|read_text_file|read_media_file|inspect_local_file|read_pdf|read_docx|read_table|diff)$/.test(operation);
+  if (!search && !reader) return [];
+  const input = args.paths ?? args.files ?? args.file_path ?? args.filePath ?? args.relative_path ?? args.path ?? (search ? cwd : undefined);
+  const paths = Array.isArray(input) ? input : [input];
+  if (!paths.length) return null;
+  const targets = paths.map(p => readPath(typeof p === 'object' && p ? p.path ?? p.file_path ?? p.filePath : p, cwd));
+  return targets.every(Boolean) ? targets : null;
+}
+
+export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '' } = {}) {
+  const sessions = new Map();
+  const limit = 10_000;
+  const stateFor = (owner) => {
+    let state = sessions.get(owner);
+    if (!state) {
+      if (sessions.size >= 100) sessions.delete(sessions.keys().next().value);
+      state = { paths: new Set(), refreshed: -Infinity, pending: null, failed: false };
+      sessions.set(owner, state);
+    }
+    return state;
+  };
+  const add = (owner, paths) => {
+    if (!owner) return;
+    const state = stateFor(owner);
+    for (const file of paths) {
+      const key = readPath(file);
+      if (!key) continue;
+      try { if (statSync(process.platform === 'win32' ? key : file).isDirectory()) continue; } catch {}
+      if (state.paths.size >= limit && !state.paths.has(key)) state.paths.delete(state.paths.values().next().value);
+      state.paths.add(key);
+    }
+  };
+  const allowed = (file, state, directories) => {
+    if (state?.paths.has(file) || (plannerFile && file === readPath(plannerFile))) return true;
+    return [...cfg.plannerReadAllow ?? [], ...directories].some(root => {
+      const key = readPath(root);
+      if (file === key) return true;
+      const native = process.platform === 'win32' ? key : root;
+      try { return statSync(native).isDirectory() && under(file, key); } catch { return false; }
+    });
+  };
+  return { add, check(exec, cwd, directories = []) {
+    const targets = plannerReadTargets(exec, cwd);
+    if (targets?.length === 0) return undefined;
+    const owner = exec?.agent?.id;
+    const state = owner ? stateFor(owner) : undefined;
+    if (targets && targets.every(file => allowed(file, state, directories))) return undefined;
+    if (targets && state && !state.pending && now() - state.refreshed >= 25_000) {
+      state.refreshed = now();
+      state.pending = Promise.resolve().then(() => refresh(owner)).then(value => {
+        if (value?.status !== 'completed' || value.owner !== owner || !Array.isArray(value.paths) || value.paths.some(p => typeof p !== 'string')) throw new Error('无法确认产物');
+        add(owner, value.paths);
+        state.failed = false;
+      }).catch(() => { state.failed = true; }).finally(() => { state.pending = null; });
+    }
+    return `[codex-conductor] ${state?.pending || state?.failed ? '暂时无法确认是不是产物。' : ''}${PRODUCT_HINT}`;
+  } };
+}
+
 // 返回拒绝理由（字符串）或 undefined（放行）。
 export function decide(exec, cfg) {
   if (!inWorkspace(exec?.agent?.session?.header?.cwd, cfg.roots)) return undefined;
@@ -669,9 +907,9 @@ export function decide(exec, cfg) {
   if (!blocked) return undefined;
   const args = exec.arguments ?? {};
   const used = blocked.filter((k) => present(args[k]));
-  if (used.length) return deny(`${tool} 带了 ${used.join(' / ')} 参数，已拒绝`);
+  if (used.length) return cfg.plannerReads === 'products' ? `[codex-conductor] ${PRODUCT_HINT}` : deny(`${tool} 带了 ${used.join(' / ')} 参数，已拒绝`);
   if (!readOnlyCommand(args.command, cfg.allowCommands)) {
-    return deny(`这条命令不在只读核验范围内，${refusedPart(args.command, cfg.allowCommands)}`);
+    return cfg.plannerReads === 'products' ? `[codex-conductor] ${PRODUCT_HINT}` : deny(`这条命令不在只读核验范围内，${refusedPart(args.command, cfg.allowCommands)}`);
   }
   return undefined;
 }

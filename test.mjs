@@ -12,6 +12,8 @@ import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePr
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 import './panel.test.mjs';
 import './resume.test.mjs';
+import './planner.test.mjs';
+import './verify.test.mjs';
 
 const packageVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
@@ -798,7 +800,7 @@ test('an invalid allowCommands pattern leaves the tools and guard installed', ()
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: () => {},
     logger: { warn: (s) => warnings.push(s) } },
   { workspaces: ['F:\\work\\项目'], allowCommands: ['[', '^\\./verify\\.sh --check$'] });
-  assert.equal(tools.length, 10);
+  assert.equal(tools.length, 11);
   assert.equal(guards.length, 1);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /allowCommands/);
@@ -1041,13 +1043,13 @@ test('conductor start only starts; waitJob waits with a bounded status call and 
   assert.deepEqual(calls.at(-1).argv, ['cancel', 'J2']);
 });
 
-test('apply registers ten tools in order, a guard and the false-dispatch check', () => {
+test('apply registers eleven tools in order, a guard and the false-dispatch check', () => {
   const tools = [];
   const guards = [];
   const handlers = {};
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; } },
     { workspaces: ['F:\\work\\项目'] });
-  assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output',
+  assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_verify', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output',
     'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime']);
   assert.deepEqual(tools[0].parameters.required, ['task', 'acceptance', 'write']);
   assert.match(tools[0].description, /固定为 JSON[\s\S]*启动不了 Windows 程序/);
@@ -3649,7 +3651,7 @@ test('gemini_write stays unregistered without valid configuration', () => {
   for (const gemini of [undefined, null, {}, { command: 42 }, { command: '' }, { command: 'agy.exe' }, { command: 'C:agy.exe' }, 'agy.exe']) {
     const h = harness({ config: { gemini } });
     assert.equal(h.tools.gemini_write, undefined);
-    assert.equal(Object.keys(h.tools).length, 10);
+    assert.equal(Object.keys(h.tools).length, 11);
     assert.doesNotMatch(h.guards[0](call('edit')), /gemini_write/);
     assert.equal(h.warnings.length, gemini == null ? 0 : 1);
     if (h.warnings.length) assert.match(h.warnings[0], /gemini/);
@@ -3687,6 +3689,18 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   assert.ok(spawned.prompt.endsWith(constraint));
   const loaded = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
   assert.ok(loaded.tools.includes('gemini_write'));
+});
+
+test('products mode remembers this session\'s gemini output without granting its sources', async (t) => {
+  const h = geminiFixture(t, { config: { plannerReads: 'products' } });
+  const result = await h.execute();
+  assert.equal(result.status, 'completed');
+  assert.equal(h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), undefined);
+  assert.match(h.guards[0]({ ...call('read', { file_path: path.join(h.cwd, 'notes.md') }, h.cwd), agent: agentAt(h.cwd) }), /原料/);
+  const other = agentAt(h.cwd);
+  other.id = 'S2';
+  assert.match(h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: other }), /原料/);
+  assert.match(result.next, /机械核对.*codex_verify/);
 });
 
 test('gemini_write rejects running and queued Codex writers and unavailable history', async (t) => {
