@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.39` 基于上游 `0.9.38`，保留 runner 修复、配置校验、日志读取与错误类型统计。
+`0.9.40` 基于上游 `0.9.39`，保留 runner 修复、配置校验、日志读取与错误类型统计。
 
 ## 功能
 
@@ -254,7 +254,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.39` builds on upstream `0.9.38`, retaining the runner fixes, configuration validation, log access and error-kind statistics.
+`0.9.40` builds on upstream `0.9.39`, retaining the runner fixes, configuration validation, log access and error-kind statistics.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
