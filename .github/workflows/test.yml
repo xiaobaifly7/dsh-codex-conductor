@@ -20,5 +20,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: node --test test.mjs workflow.test.mjs runtime.test.mjs
+      - run: node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs
       - run: python runner/test_codex_runner.py

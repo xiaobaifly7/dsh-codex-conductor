@@ -27,7 +27,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test.mjs workflow.test.mjs runtime.test.mjs && python3 runner/test_codex_runner.py"
+    "test": "node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs && python3 runner/test_codex_runner.py"
   },
   "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "codex", "wsl"],
   "license": "MIT",
