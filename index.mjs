@@ -1190,9 +1190,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
     output: DATA_OUTPUT,
     async execute(args = {}, exec) {
-      for (const key of ['cwd', 'session_id']) if (args[key] !== undefined && (typeof args[key] !== 'string' || !args[key].trim())) {
-        throw new Error(`codex_jobs: ${key} 必须是非空字符串`);
-      }
       if (args.status !== undefined && !['running', 'completed', 'cancelled', 'failed', 'unknown'].includes(args.status)) throw new Error('codex_jobs: status 无效');
       if (args.needs_attention !== undefined && typeof args.needs_attention !== 'boolean') throw new Error('codex_jobs: needs_attention 必须是布尔值');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new Error('codex_jobs: limit 必须是 1–100 的整数');
