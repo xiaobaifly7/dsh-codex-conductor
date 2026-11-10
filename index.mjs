@@ -939,6 +939,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
+        dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
         ...(continuation ? { continuation } : {}),
       });
     } finally { dispatching--; }
@@ -1129,7 +1130,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     name: 'codex_jobs',
     description: '只读列出 Codex 任务历史，找回 runner job_id、Codex thread_id 和本会话的 Harness 后台任务编号。' +
       '默认查当前工作区，可用 session_id="current" 查当前会话，或传指定会话 ID；旧任务归属未知时按 cwd 查。' +
-      '可按执行状态或 needs_attention 筛选。completed 只表示执行结束，自报全部满足仍需独立核验。不会启动或恢复任务。',
+      '可按执行状态或 needs_attention 筛选；新任务带派单版本和进程号，有在线后台记录时同时显示 Harness 后台状态。' +
+      'completed 只表示执行结束，自报全部满足仍需独立核验。不会启动或恢复任务。',
     presentCall: () => ({ card: 'generic', kind: 'read', title: 'Codex 任务历史' }),
     parameters: {
       type: 'object',
@@ -1158,7 +1160,8 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (!Array.isArray(value.jobs)) return value;
       return { ...value, jobs: value.jobs.map((job) => {
         const bg = linked.get(job.job_id);
-        return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner } : {}) };
+        return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner,
+          ...(bg.status ? { background_status: bg.status } : {}) } : {}) };
       }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}) };
     },
   });

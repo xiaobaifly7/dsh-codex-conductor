@@ -1193,7 +1193,9 @@ test('codex_continue dispatches 22 original criteria with original context, perm
     assert.deepEqual(argv.filter((_, i) => argv[i - 1] === '--writable-root'), source.task_options.writable_roots);
     if (sandbox === 'read-only') assert.ok(!argv.includes('--sandbox'));
     else assert.equal(flag('--sandbox'), sandbox);
-    assert.deepEqual(envelope.context, { owner: 'S1', task: source.context.task, acceptance: source.context.acceptance,
+    const { dispatcher, ...taskContext } = envelope.context;
+    assert.equal(dispatcher.pid, process.pid);
+    assert.deepEqual(taskContext, { owner: 'S1', task: source.context.task, acceptance: source.context.acceptance,
       write: source.context.write, continuation: { parent_job_id: 'PARENT', answers, resolution } });
     assert.match(envelope.prompt, /保留旧 CSV 格式/);
     assert.ok(envelope.prompt.includes(source.context.acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
@@ -2768,7 +2770,10 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   assert.equal(starts.length, 1);
   assert.ok(starts[0].argv.includes('--context-json'));
   const envelope = JSON.parse(starts[0].stdin);
-  assert.deepEqual(envelope.context, { owner: 'S1', task: args.task, acceptance, write: false });
+  const { dispatcher, ...taskContext } = envelope.context;
+  assert.equal(dispatcher.pid, process.pid);
+  assert.match(dispatcher.version, /^\d+\.\d+\.\d+/);
+  assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);
   assert.deepEqual(value.report, structured);
@@ -2800,6 +2805,7 @@ test('history filters preserve session links and output reads are bounded, repea
   const exec = { agent: agentAt('F:\\work\\项目') };
   const list = await h.tools.codex_jobs.execute({ session_id: 'current', needs_attention: true, limit: 10, offset: 2 }, exec);
   assert.equal(list.jobs[0].background_job_id, 'BG');
+  assert.equal(list.jobs[0].background_status, 'completed');
   assert.equal(list.jobs[0].owner, 'S1');
   assert.deepEqual(h.calls[0], ['list', '--limit', '10', '--offset', '2', '--owner', 'S1', '--needs-attention', '--job-id', 'J']);
   const request = { job_id: 'J', artifact: 'report', offset: 0, limit: 8000 };
@@ -2823,6 +2829,7 @@ test('session journal links recover old jobs after the native task table has bee
   } }]);
   const value = await h.tools.codex_jobs.execute({ session_id: 'current' }, { agent });
   assert.equal(value.jobs[0].background_job_id, 'native-old');
+  assert.equal(value.jobs[0].background_status, undefined);
   assert.ok(h.calls[0].includes('OLD'));
   assert.equal(h.calls[0].includes('--cwd'), false);
 });

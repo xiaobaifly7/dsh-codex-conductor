@@ -2024,6 +2024,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_context_envelope_round_trips_large_unicode_without_argv(self):
         context = self.sample_context()
+        context["dispatcher"] = {"version": "0.9.41", "revision": None, "pid": 1234}
         context["task"] += "上下文😀" * 20000
         context["acceptance"] = ["验证完整结果" * 2000]
         envelope = json.dumps({"prompt": "only this prompt reaches Codex", "context": context}, ensure_ascii=False)
@@ -2038,6 +2039,8 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["context"], context)
                 if command == "start":
                     self.assertEqual(json.loads((jd / "args.json").read_text("utf-8"))["context"], context)
+                    page = self.control("list", "--owner", context["owner"])
+                    self.assertEqual(page["jobs"][0]["context"]["dispatcher"], context["dispatcher"])
                 else:
                     self.assertFalse((jd / "args.json").exists())
                 self.assertIn("review_status", result)
@@ -2052,7 +2055,8 @@ class RunnerTests(unittest.TestCase):
         values = ["not json", "[]", json.dumps({"prompt": "do it"}),
                   json.dumps({"prompt": 12, "context": context})]
         for key, bad in (("owner", []), ("task", None), ("acceptance", "one"),
-                         ("acceptance", [1]), ("write", "true")):
+                         ("acceptance", [1]), ("write", "true"),
+                         ("dispatcher", {"version": "0.9.41", "revision": None, "pid": True})):
             values.append(json.dumps({"prompt": "do it", "context": {**context, key: bad}}))
         for value in values:
             with self.subTest(value=value[:25]):

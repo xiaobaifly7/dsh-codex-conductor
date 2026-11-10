@@ -863,7 +863,7 @@ def last_activity(events):
 
 def task_context(value):
     fields = {"owner", "task", "acceptance", "write"}
-    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation"}:
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher"}:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -874,6 +874,13 @@ def task_context(value):
         raise ValueError("context.acceptance must be a nonempty array of nonempty strings")
     if not isinstance(value["write"], bool):
         raise ValueError("context.write must be a boolean")
+    if "dispatcher" in value:
+        dispatcher = value["dispatcher"]
+        if (not isinstance(dispatcher, dict) or set(dispatcher) != {"version", "revision", "pid"} or
+                type(dispatcher["pid"]) is not int or dispatcher["pid"] <= 0 or
+                any(dispatcher[k] is not None and (not isinstance(dispatcher[k], str) or not dispatcher[k].strip())
+                    for k in ("version", "revision"))):
+            raise ValueError("context.dispatcher requires a positive pid and version/revision strings or null")
     if "continuation" in value:
         continuation = value["continuation"]
         if not isinstance(continuation, dict) or set(continuation) != {"parent_job_id", "answers", "resolution"}:
@@ -1349,7 +1356,9 @@ def list_jobs(args):
               "last_error_kind", "retry_at")
     page = [{**{k: j.get(k) for k in fields},
              "context": {"owner": j["context"].get("owner"),
-                         "task": j["context"]["task"].strip().splitlines()[0][:160]} if j.get("context") else None,
+                         "task": j["context"]["task"].strip().splitlines()[0][:160],
+                         **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {})}
+             if j.get("context") else None,
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     return {"status": "completed", "jobs": page, "total": len(jobs), "offset": args.offset, "limit": args.limit,
