@@ -66,6 +66,7 @@ window.__ModuleLoader__.load({
     }
 
     function pendingError(value) {
+      if (/等待空闲已超过 10 分钟/.test(value)) return '等待空闲已超过 10 分钟，未请求重载；请重新保存设置、重新请求等空闲，或确认立即生效。';
       if (/EACCES|EPERM|权限|只读|denied/i.test(value)) return '无法写入设置，请联系维护者检查文件权限后重试。';
       if (/EBUSY|占用|locked/i.test(value)) return '保存设置的文件正被占用，请稍后重试。';
       if (/YAML|字段|格式|parse|scalar|encoding/i.test(value)) return '已保存的设置格式不支持修改，请联系维护者检查设置文件后重试。';
@@ -189,6 +190,17 @@ window.__ModuleLoader__.load({
       return text ? h('p', { className: error ? 'dcc-error' : 'dcc-muted', role: error ? 'alert' : 'status' }, text) : null;
     }
 
+    function idleWaitText(runtime, action) {
+      if (runtime.idle_wait?.status === 'timed_out') return '等待空闲已超过 10 分钟，已停止自动重载。请重新保存设置、重新请求等空闲，或确认立即生效；待生效设置可撤销。';
+      const reasons = [];
+      if (runtime.active_tasks == null) reasons.push('确认 Codex 任务均已结束');
+      else if (runtime.active_tasks > 0) reasons.push(`${runtime.active_tasks} 个 Codex 任务结束`);
+      if (runtime.active_sessions == null || runtime.sessions_error) reasons.push('确认所有 DeepSeek 会话的当前一轮已结束');
+      else if (runtime.active_sessions > 0) reasons.push(`${runtime.active_sessions} 个会话的当前一轮结束`);
+      const countdown = runtime.idle_wait?.remaining_seconds;
+      return `等${reasons.length ? ` ${reasons.join('，并等 ')}` : '待确认 Codex 任务和 DeepSeek 会话均空闲'}后${action}。最长等 10 分钟${countdown == null ? '' : `，剩余 ${countdown} 秒`}；超时停止自动重载，保留待生效设置。`;
+    }
+
     function Status({ status, attention, errors = {}, messages = {}, busy = '', onRefresh, onReload, onCancel }) {
       const runtime = status?.runtime;
       const pending = runtime?.pending_settings;
@@ -220,21 +232,26 @@ window.__ModuleLoader__.load({
             statusRow('规划端读取范围', activeSettings ? activeSettings.plannerReads === 'products' ? '只读 Codex 的产物' : '不限制读取' : '未读到', '这是当前正在生效的读取范围。'),
             statusRow('额外允许读取的路径', activeSettings ? `${activeSettings.plannerReadAllowCount ?? 0} 条` : '未读到', '这里只显示数量，需要修改时请编辑插件配置。'),
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
-            statusRow('正在执行的任务', runtime?.active_tasks ?? '未读到', '保存设置时，可等这些任务结束后自动生效。'),
+            statusRow('正在执行的任务', runtime?.active_tasks ?? '未读到', 'Codex 活任务数量；等空闲会同时等待 DeepSeek 会话的当前回合结束。'),
+            statusRow('正在运行的 DeepSeek 会话回合', runtime?.active_sessions ?? '未读到', '统计所有会话中正在进行的回合，包括等待模型回复的会话。'),
             statusRow('最近 24 小时内需要关注的任务', attention ?? (errors.attention ? '未读到' : '正在读取…'), '只统计最近 24 小时内开始、需要你查看的任务。'),
             h(Message, { text: errors.attention, error: true }),
             statusRow('重新加载', runtime?.can_reload ? '现在可以操作' : '暂时不能操作', '只有服务确认可以加载时，下面的按钮才可用。'),
             statusRow('设置读取', runtime?.profile_error ? '无法读取已保存的设置，请联系维护者检查设置文件后刷新。' : '未发现错误', '读取已保存设置遇到的问题会显示在这里。'),
             statusRow('运行版本读取', runtime?.loaded_error ? '无法读取当前运行版本，请刷新；仍然失败请联系维护者。' : '未发现错误', '读取当前运行版本遇到的问题会显示在这里。'),
-            runtime?.active_error ? h(Message, { error: true, text: '无法确认正在执行的任务数量，请刷新后重试；仍然失败请联系维护者。' }) : null) : null,
+            runtime?.active_error ? h(Message, { error: true, text: '无法确认正在执行的任务数量，请刷新后重试；仍然失败请联系维护者。' }) : null,
+            runtime?.sessions_error ? h(Message, { error: true, text: '无法确认正在运行的 DeepSeek 会话回合，不能执行等空闲重载。请刷新后重试；仍然失败请联系维护者。' }) : null) : null,
+          runtime?.idle_wait ? h(Message, { error: runtime.idle_wait.status === 'timed_out',
+            text: idleWaitText(runtime, pending ? '自动生效' : '自动重新加载') }) : null,
           pending ? h('div', { className: 'dcc-status' },
-            h(Message, { text: pending.awaiting_load ? '设置已写入，等待加载生效。' : pending.error ? '设置已保存，但未能生效。' : runtime.active_tasks == null
-              ? '设置已保存，确认当前任务结束后自动生效。' : `已保存，等 ${runtime.active_tasks} 个 Codex 任务结束后自动生效` }),
+            h(Message, { text: pending.awaiting_load ? '设置已写入，等待加载生效。' : pending.error ? '设置已保存，但未能生效。'
+              : runtime.idle_wait ? '设置已保存，等待空闲后自动生效。' : `已保存，${idleWaitText(runtime, '自动生效')}` }),
             h('small', null, pending.awaiting_load ? '设置已经写入，不能再撤销。请刷新运行状态确认是否生效。' : '待生效修改尚未用于当前任务。可以继续修改设置后保存，也可以撤销。'),
             pending.error ? h(Message, { error: true, text: `待生效设置未能生效：${pendingError(pending.error)} ${pending.awaiting_load ? '请刷新状态，仍未生效请联系维护者。' : '可修改设置后重新保存，或撤销这次修改。'}` }) : null,
             !pending.awaiting_load ? h(Button, { size: 'sm', disabled: !!busy, onClick: onCancel }, '撤销这次修改') : null) : null,
           h(Button, { variant: 'outline', disabled: !!busy || !!errors.status || !runtime?.can_reload,
             onClick: onReload }, busy === 'reload' ? '正在重新加载…' : '重新加载插件（等任务结束）'),
+          h('small', null, '等 Codex 活任务和所有 DeepSeek 会话的当前一轮结束后重载，最长等 10 分钟；超时不强制重载，请重新请求。'),
           h(Message, { text: messages.reload }), h(Message, { text: errors.reload, error: true }));
     }
 
@@ -401,7 +418,7 @@ window.__ModuleLoader__.load({
           pending_settings: result?.pending_settings ?? null } }));
         setEdits({});
         setConfirmApply(false);
-        const text = waiting ? `已保存，等 ${result.active_tasks} 个 Codex 任务结束后自动生效`
+        const text = waiting ? ''
           : result?.status === 'reloaded' || result?.status === 'already_current' ? '设置已保存并生效。'
             : '设置已保存，但还没有确认生效。请刷新运行状态查看。';
         setMessages((old) => ({ ...old, settingsSave: text }));
@@ -423,7 +440,7 @@ window.__ModuleLoader__.load({
       dirty ||= !!validation;
       function cancelPending(clearDraft = false) {
         return mutate('settingsSave', '/settings/cancel', {}, () => {
-          setStatus((old) => ({ ...old, runtime: { ...old?.runtime, pending_settings: null } }));
+          setStatus((old) => ({ ...old, runtime: { ...old?.runtime, pending_settings: null, idle_wait: null } }));
           setConfirmApply(false);
           if (clearDraft) setEdits({});
           setMessages((old) => ({ ...old, settingsSave: '已撤销待生效修改，当前运行设置不变。' }));
@@ -461,10 +478,11 @@ window.__ModuleLoader__.load({
         h('style', null, CSS),
         h(Status, { status, attention, errors, messages, busy, onRefresh: () => setRevision((v) => v + 1),
           onCancel: () => cancelPending(), onReload: () => mutate('reload', '/reload', {}, (value) => {
+            setStatus((old) => ({ ...old, runtime: { ...old?.runtime, ...value } }));
             const text = { reloaded: '已重新加载，正在刷新运行状态。', already_current: '当前已经是已保存的版本。',
               unconfirmed: '已请求加载，但还没有确认生效，请刷新运行状态查看。',
-              waiting_for_idle: '已安排，任务结束后自动重新加载。', failed: '重新加载失败，请刷新运行状态后重试。'
-            }[value.status] || '服务没有确认加载结果，请刷新运行状态查看。';
+              waiting_for_idle: '', failed: '重新加载失败，请刷新运行状态后重试。'
+            }[value.status] ?? '服务没有确认加载结果，请刷新运行状态查看。';
             if (value.status === 'failed') setErrors((old) => ({ ...old, reload: text }));
             else setMessages((old) => ({ ...old, reload: text }));
           }) }),
@@ -498,9 +516,9 @@ window.__ModuleLoader__.load({
                 onClick: () => setConfirmApply(true) }, '立即生效'),
               h(Button, { disabled: !!busy || !dirty, onClick: () => { setEdits({}); setConfirmApply(false); setErrors((old) => ({ ...old, settingsSave: '' })); } }, '放弃未保存的更改'),
               dirty ? h('small', null, '有未保存的设置。') : null),
-            h('small', null, '没有任务正在执行时，保存后立即生效。再次保存会替换上一次待生效修改。'),
+            h('small', null, 'Codex 活任务和所有 DeepSeek 会话的当前一轮均结束时，保存后立即生效；否则最长等 10 分钟。超时停止自动重载，保留待生效设置，请重新保存或撤销。再次保存会替换上一次待生效修改。'),
             confirmApply ? h('div', { className: 'dcc-confirm' },
-              h('p', null, '确定让这些设置立即生效吗？正在跑的 Codex 任务不会被打断，重载后会自动接回。'),
+              h('p', null, '确定让这些设置立即生效吗？Codex 后台任务会继续运行，重载后会自动接回；正在进行的 DeepSeek 回合可能被中止，包括正在等待模型回复的回合。要保留当前回合，请选择等空闲生效。'),
               h('div', { className: 'dcc-row' },
                 h(Button, { variant: 'outline', disabled: !!busy || !!validation, onClick: () => saveSettings(true) }, '确认立即生效'),
                 h(Button, { disabled: !!busy, onClick: () => setConfirmApply(false) }, '先不生效'))) : null,

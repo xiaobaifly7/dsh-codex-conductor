@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.69` 的等空闲重载同时等待 Codex 活任务和所有 DeepSeek 会话的当前回合结束，显示数量与倒计时，最长等 10 分钟后停止自动重载并保留待生效设置；立即生效可能中止 DeepSeek 当前回合，Codex 后台任务继续并会接回。
+
 `0.9.68` 为 `gemini_write` 增加硬上限与 80% 目标、同一超时预算内的一次自动压缩、失败时目标文件恢复，以及插件生成且不计入字数的可选七字段 YAML frontmatter。
 
 ### 0.9.66：规划端只读产物与独立核验
@@ -38,9 +40,9 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 在 DSH 设置页打开“Codex 指挥”，可以查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、查看报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。运行状态和设置先显示，任务历史和关注数量分别加载。
 
-空闲时保存设置会立即应用；Codex 忙时默认先保存为待生效设置，等待空闲后自动应用。待生效设置写在本机 `pending-settings.json`（与 `loaded.json` 同目录，通常是 `%LOCALAPPDATA%\dsh-codex-conductor`），重启后会恢复；它绑定当前环境配置的 `runtimeProfileFile`，避免误用到另一个实例。再次保存会覆盖之前的待生效设置，也可以撤销尚未应用的设置。等待期间每 5 秒检查一次是否空闲；应用失败时，会留下待生效设置和原因，方便查看和处理。实际应用时先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；只有确认新版本实际加载后才显示生效。规划提示词保存前也会备份。
+空闲指没有 Codex 活任务，且宿主所有会话均没有 `status === 'running'` 的回合，包括等待模型回复的回合；无法读取会话状态时拒绝等空闲重载。空闲时保存设置会立即应用；否则默认先保存为待生效设置，等待空闲后自动应用。待生效设置写在本机 `pending-settings.json`（与 `loaded.json` 同目录，通常是 `%LOCALAPPDATA%\dsh-codex-conductor`），重启后会恢复；它绑定当前环境配置的 `runtimeProfileFile`，避免误用到另一个实例。再次保存会覆盖之前的待生效设置，也可以撤销尚未应用的设置。等待期间每 5 秒检查一次是否空闲；面板每 7 秒刷新活任务数、运行中会话数与剩余秒数。最长等待 10 分钟，超时停止自动重载，不强制应用，保留待生效设置和原因；请重新保存、撤销，或明确确认立即生效。实际应用时先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；只有确认新版本实际加载后才显示生效。规划提示词保存前也会备份。
 
-需要马上应用时，选择“立即生效”并确认即可热重载。热重载本身不会取消正在运行的 Codex，新设置用于后续派发，正在跑的任务继续按启动时的设置执行。加载后会复用仍在任务表中的原任务；当前已打开的会话中，已登记但未结算且归属可确认的任务会自动接回，不重复派发。未打开的会话在恢复时检查；缺少登记记录、归属不明或状态无法核对的任务不会自动接回。主动取消 Codex 任务、归档会话或中止正在同步等待结果的工具调用，仍可能取消对应任务，这与停止观察或热重载不同。
+需要马上应用时，选择“立即生效”并确认即可热重载。Codex 后台任务继续按启动时的设置执行并会接回，新设置用于后续派发；但宿主重载插件可能中止正在进行的 DeepSeek 回合，即使回合正在等待模型回复、没有调用本插件工具也一样。要保留当前回合，请使用等空闲生效。加载后会复用仍在任务表中的原任务；当前已打开的会话中，已登记但未结算且归属可确认的任务会自动接回，不重复派发。未打开的会话在恢复时检查；缺少登记记录、归属不明或状态无法核对的任务不会自动接回。主动取消 Codex 任务、归档会话或中止正在同步等待结果的工具调用，仍可能取消对应任务。
 
 任务报告提供易读视图和原文，支持 v2 和旧版格式。易读视图会先读完整份报告再解析，最多读取 256 Ki 字符（262,144 个字符）；超出上限或格式无法解析时，仍可分页查看原文，不把截断内容当成完整报告。面板的“最近 24 小时需要关注”按任务开始时间统计；“待关注”任务列表仍包含更早的历史任务，两者数量可能不同。
 
@@ -120,7 +122,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `codex_watch({"mode":"attention"})` 仅在失败、阻塞或报告异常等变化时通知；`mode="all"` 也包含开始和正常结束。它在无变化时只读 Harness 内存任务表，不启动 Codex、不反复唤醒模型。首次符合条件的变化后观察结束，需要继续时再调用。它保留任务原有结束通知，也不默认启用长期监控；取消观察只停止观察。
 
-`codex_runtime({"action":"status"})` 显示磁盘源码版本、实际加载记录、待生效差异和活任务数。`loaded` 包含实际加载的默认权限、服务档位和网关设置；`serviceTier: null` 表示沿用 Codex 配置。网关只显示提供方、主机端口和探测方式。`action="reload"` 默认 `when="idle"`，有任务时登记原生后台等待，查询期间又有任务启动时会重新确认空闲；`when="now"` 明确要求立即热重载，旧任务继续运行。先配置 `runtimeProfileFile` 为这个桌面实例实际使用的 `cordis.patch.yml` 的完整 Windows 路径。只更新本插件的 entry id 与模块 URL，不重启宿主、不结束 Codex；最多等 30 秒确认加载。超时返回“尚未确认”，用 `action="status"` 继续查。重复重载会观察已提交的同一请求；只有实际加载标记才证明生效。若 Harness 明确报告加载错误，先修复错误再从 Harness 刷新插件。
+`codex_runtime({"action":"status"})` 显示磁盘源码版本、实际加载记录、待生效差异、Codex 活任务数、运行中会话数和 `idle_wait` 等待状态。`loaded` 包含实际加载的默认权限、服务档位和网关设置；`serviceTier: null` 表示沿用 Codex 配置。网关只显示提供方、主机端口和探测方式。`action="reload"` 默认 `when="idle"`，同时等 Codex 活任务和所有 DeepSeek 会话的当前一轮结束，重载前重新确认空闲，无法确认会话状态时拒绝重载；最长等 10 分钟，超时停止自动重载，用 `action="status"` 查看 `idle_wait.status="timed_out"`，可重新请求等空闲。`when="now"` 明确要求立即热重载，Codex 后台任务继续并会接回，但正在进行的 DeepSeek 回合可能被中止。先配置 `runtimeProfileFile` 为这个桌面实例实际使用的 `cordis.patch.yml` 的完整 Windows 路径。只更新本插件的 entry id 与模块 URL，不重启宿主；请求重载后最多等 30 秒确认加载。确认超时返回“尚未确认”，用 `action="status"` 继续查。重复重载会观察已提交的同一请求；只有实际加载标记才证明生效。若 Harness 明确报告加载错误，先修复错误再从 Harness 刷新插件。
 配置已改到另一模块路径时，状态可显示唯一使用本插件生成 ID 的目标，并提示在 Harness 内刷新；旧实例不能改写该条目。
 
 - 任务在 WSL 后台运行，DSH 这边断开等待不影响任务；重试、超时、断线检测和目录写锁由随包的 [`runner/codex_runner.py`](runner/codex_runner.py) 处理。路由不可用时的重试保留尚未发送的任务提示；启动与取消同步，PID 或事件日志写入失败也会结束并回收子进程。即使 Codex 提前关闭标准输出但进程仍存活，超时、空闲和断线预算仍然生效。
@@ -254,7 +256,7 @@ github:xiaobaifly7/dsh-codex-conductor
 dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 ```
 
-以 `file:///.../index.mjs` 直接加载 profile 管理范围外的源码时，升级应同时更新条目 `id` 的版本后缀（如 `codex-conductor-<commit>`）和模块 URL 的 `?v=<commit>`。DSH 0.2.1-rc.2 的 Loader 对已激活的同 ID 条目只改 `name` 不保证重新导入；版本化 ID 会创建新实例，避免文件已经更新、运行代码仍旧的情况。以 `loaded.json` 的模块 URL、加载时间和进程号确认实际生效。已有后台任务继续完成，新实例仍按原生任务表复用，不重复派发。
+以 `file:///.../index.mjs` 直接加载 profile 管理范围外的源码时，升级应同时更新条目 `id` 的版本后缀（如 `codex-conductor-<commit>`）和模块 URL 的 `?v=<commit>`。DSH 0.2.1-rc.2 的 Loader 对已激活的同 ID 条目只改 `name` 不保证重新导入；版本化 ID 会创建新实例，避免文件已经更新、运行代码仍旧的情况。以 `loaded.json` 的模块 URL、加载时间和进程号确认实际生效。已有 Codex 后台任务继续完成，新实例仍按原生任务表复用，不重复派发；直接改 profile 会立即触发宿主重载，可能中止 DeepSeek 当前回合，应先等所有回合结束。
 
 ## 配置
 
@@ -370,6 +372,8 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`0.9.69` waits for both active Codex tasks and current turns in all DeepSeek sessions before an idle reload, shows counts and a countdown, and stops automatic reload after 10 minutes while retaining pending settings; immediate reload may abort DeepSeek turns while Codex background tasks continue and reconnect.
+
 `0.9.68` adds a hard limit and 80% target for `gemini_write`, one automatic compression attempt within the shared timeout budget, output restoration on failure, and optional plugin-generated seven-field YAML frontmatter excluded from character counts.
 
 ### 0.9.66: Products-only planner reads and independent verification
@@ -418,9 +422,9 @@ A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL co
 
 Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, read reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Runtime status and settings appear first; task history and attention counts load separately.
 
-Saving settings while idle applies them immediately. While Codex is busy, the default is to save pending settings and apply them automatically once idle. Pending settings are stored locally in `pending-settings.json`, beside `loaded.json` (normally in `%LOCALAPPDATA%\dsh-codex-conductor`), and restored after a restart. They are tied to the current environment's configured `runtimeProfileFile` so they cannot be applied to another instance by mistake. Saving again replaces the pending settings; you can also cancel settings that have not yet been applied. The idle check runs every 5 seconds. If applying fails, the pending settings and failure reason remain available. Applying settings backs up and atomically updates this plugin's profile fields, preserving comments and unrelated configuration; only the actual load marker confirms success. Prompt saves also create a backup.
+Idle means no active Codex tasks and no session with `status === 'running'`, including turns waiting for a model response; unavailable session status refuses an idle reload. Saving settings while idle applies them immediately; otherwise pending settings are saved and applied once idle. Pending settings are stored locally in `pending-settings.json`, beside `loaded.json` (normally in `%LOCALAPPDATA%\dsh-codex-conductor`), and restored after a restart. They are tied to the current environment's configured `runtimeProfileFile` so they cannot be applied to another instance by mistake. Saving again replaces the pending settings; you can also cancel settings that have not yet been applied. The idle check runs every 5 seconds, and the panel refreshes task counts, running session counts and remaining seconds every 7 seconds. After 10 minutes, automatic reload stops without forcing application, retaining pending settings and the reason; save again, cancel pending settings, or explicitly confirm immediate application. Applying settings backs up and atomically updates this plugin's profile fields, preserving comments and unrelated configuration; only the actual load marker confirms success. Prompt saves also create a backup.
 
-To apply settings now, choose **立即生效** and confirm the hot reload. The reload itself does not cancel running Codex tasks. New settings apply to later dispatches; running tasks retain their launch settings. After loading, the plugin reuses tasks still in the native task table and reconnects registered, unsettled tasks in open sessions when their ownership can be confirmed, without dispatching them again. Closed sessions are checked when restored. Tasks without registration records, with unknown ownership, or with unverifiable status are not automatically reconnected. Explicitly cancelling a Codex task, archiving its session, or aborting a tool call that is synchronously waiting for its result can still cancel the task; stopping an observer or hot reloading is different.
+To apply settings now, choose **立即生效** and confirm the hot reload. Codex background tasks continue with their launch settings and reconnect; new settings apply to later dispatches. However, the host's plugin reload may abort an ongoing DeepSeek turn, including a turn waiting for a model response without calling this plugin's tools. Choose idle application to preserve current turns. After loading, the plugin reuses tasks still in the native task table and reconnects registered, unsettled tasks in open sessions when their ownership can be confirmed, without dispatching them again. Closed sessions are checked when restored. Tasks without registration records, with unknown ownership, or with unverifiable status are not automatically reconnected. Explicitly cancelling a Codex task, archiving its session, or aborting a tool call that is synchronously waiting for its result can still cancel the task.
 
 Reports offer a readable view and the original text for both v2 and legacy formats. The readable view reads the entire report before parsing, up to 256 Ki characters (262,144 characters). Larger reports or reports that cannot be parsed remain available as paginated original text; truncated text is not treated as a complete report. The panel's last-24-hours attention count uses task start time. The attention list still includes older tasks, so its total can differ from that count.
 
@@ -519,7 +523,7 @@ Finished rows retain output. Aborting a waiting call cancels Codex; session arch
 
 `codex_watch` observes native task changes without model polling or idle WSL calls. `attention` reports failures, blockers and report problems; `all` also includes starts/normal completion. It ends after the first matching change; stopping it only stops observation and preserves normal completion notifications.
 
-`codex_runtime` compares source and loaded versions. Its `loaded` record includes the effective default access settings, configured service tier (`null` inherits Codex settings), gateway origin and probe transport. Set `runtimeProfileFile` to the actual desktop profile. Reload defaults to `when="idle"`, waiting through native jobs and reconfirming idle if a task starts during listing. `when="now"` explicitly reloads immediately while old tasks continue. Only this plugin's entry ID/module URL change; confirmation requires the new loaded marker, without restarting the host. If the 30-second confirmation window expires, check `action="status"`. A repeated reload observes the existing request instead of rewriting it. If Harness reports a loader error, fix it before refreshing the plugin.
+`codex_runtime` compares source and loaded versions and reports active Codex tasks, running sessions and `idle_wait`. Its `loaded` record includes the effective default access settings, configured service tier (`null` inherits Codex settings), gateway origin and probe transport. Set `runtimeProfileFile` to the actual desktop profile. Reload defaults to `when="idle"`, waiting for both Codex tasks and current turns in all DeepSeek sessions, reconfirming idle before reload and refusing when session status is unavailable. After 10 minutes it stops without forcing a reload; `action="status"` reports `idle_wait.status="timed_out"`, and you can request idle reload again. `when="now"` explicitly reloads immediately: Codex background tasks continue and reconnect, but ongoing DeepSeek turns may be aborted. Only this plugin's entry ID/module URL change; confirmation requires the new loaded marker, without restarting the host. If the 30-second confirmation window expires, check `action="status"`. A repeated reload observes the existing request instead of rewriting it. If Harness reports a loader error, fix it before refreshing the plugin.
 When the profile points at a different module path, status can show the single target with a generated conductor ID. The old instance cannot edit that target and asks for a Harness refresh.
 
 ### Permissions

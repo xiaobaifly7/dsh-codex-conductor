@@ -333,19 +333,22 @@ test('bad JSON falls back without an error; oversized raw pages load once each',
 const settings = () => ({ model: 'old-model', effort: 'high', serviceTier: '', plannerAnswers: false,
   plannerReads: 'open', plannerReadAllowCount: 2, gemini: { model: 'gemini-old', effort: 'medium' } });
 function panelService() {
-  const service = { cfg: settings(), status: { settings: settings(), runtime: { state: 'synchronized', active_tasks: 2, pending_settings: null } }, saveError: null };
+  const service = { cfg: settings(), status: { settings: settings(), runtime: { state: 'synchronized', active_tasks: 2,
+    active_sessions: 0, sessions_error: null, idle_wait: null, can_reload: true, pending_settings: null } }, saveError: null };
   service.handle = (path, body) => {
     if (body !== undefined) {
       if (service.saveError) return service.saveError;
-      if (path === '/settings/cancel') { service.status.runtime.pending_settings = null; return { cancelled: true }; }
+      if (path === '/settings/cancel') { service.status.runtime.pending_settings = null; service.status.runtime.idle_wait = null; return { cancelled: true }; }
       if (path === '/settings/apply') {
         service.cfg = { ...service.cfg, ...body.changes };
-        service.status = { settings: service.cfg, runtime: { state: 'synchronized', active_tasks: 2, pending_settings: null } };
+        service.status = { settings: service.cfg, runtime: { ...service.status.runtime, state: 'synchronized', idle_wait: null, pending_settings: null } };
         return { saved: true, runtime: { status: 'reloaded', pending_settings: null } };
       }
+      service.status.runtime.idle_wait = { status: 'waiting', deadline_at: '2026-11-11T00:10:00Z', remaining_seconds: 600 };
+      if (path === '/reload') return { ...service.status.runtime, status: 'waiting_for_idle' };
       const pending = { changes: body, saved_at: '2026-11-11T00:00:00Z' };
       service.status.runtime.pending_settings = pending;
-      return { saved: true, runtime: { status: 'waiting_for_idle', active_tasks: 2, pending_settings: pending } };
+      return { saved: true, runtime: { ...service.status.runtime, status: 'waiting_for_idle' } };
     }
     if (path === '/status') return structuredClone(service.status);
     if (path === '/settings') return structuredClone(service.cfg);
@@ -400,7 +403,7 @@ test('pending editing merges previous changes, replaces them on save, and preser
   await change(host, '执行时的思考程度', 'max');
   await click(host, '等当前任务结束后自动生效');
   assert.deepEqual(host.requests.find((r) => r.body).body, { model: 'pending-model', gemini: { model: 'gemini-new' }, effort: 'max' });
-  assert.ok(text(host.tree).includes('已保存，等 2 个 Codex 任务结束后自动生效'));
+  assert.ok(text(host.tree).includes('等 2 个 Codex 任务结束后自动生效'));
   assert.ok(text(host.tree).includes('当前模型： old-model'));
   await change(host, 'Codex 模型', 'unsaved-model');
   await click(host, '撤销这次修改');
@@ -413,7 +416,9 @@ test('immediate settings require a second click and send the confirmed patch', a
   host.mount(host.exports.Panel); await host.flush(); await change(host, 'Codex 模型', 'new-model');
   await click(host, '立即生效');
   assert.equal(host.requests.filter((r) => r.body).length, 0);
-  assert.ok(text(host.tree).includes('正在跑的 Codex 任务不会被打断，重载后会自动接回'));
+  assert.ok(text(host.tree).includes('Codex 后台任务会继续运行，重载后会自动接回'));
+  assert.ok(text(host.tree).includes('正在进行的 DeepSeek 回合可能被中止，包括正在等待模型回复的回合'));
+  assert.ok(text(host.tree).includes('要保留当前回合，请选择等空闲生效'));
   await click(host, '先不生效');
   assert.equal(host.requests.filter((r) => r.body).length, 0);
   await click(host, '立即生效');
@@ -474,4 +479,78 @@ test('standalone status exposes pending errors, hides internal errors and disall
   tree = Status({ status: service.status, attention: 3 });
   assert.ok(text(tree).includes('设置已写入，等待加载生效'));
   assert.ok(!nodes(tree).some((node) => node.type === 'button' && text(node) === '撤销这次修改'));
+});
+
+test('status shows both busy counts, countdown and unknown session status without exposing internal errors', () => {
+  const { Status } = clientHost().exports, service = panelService();
+  Object.assign(service.status.runtime, { active_sessions: 2,
+    idle_wait: { status: 'waiting', deadline_at: '2026-11-11T00:10:00Z', remaining_seconds: 539 } });
+  let displayed = text(Status({ status: service.status }));
+  for (const value of ['正在执行的任务： 2', '正在运行的 DeepSeek 会话回合： 2',
+    '等 2 个 Codex 任务结束，并等 2 个会话的当前一轮结束后自动重新加载', '最长等 10 分钟，剩余 539 秒']) {
+    assert.ok(displayed.includes(value), value);
+  }
+  Object.assign(service.status.runtime, { active_tasks: 0, active_sessions: null, sessions_error: 'agents secret-internal-error' });
+  displayed = text(Status({ status: service.status }));
+  assert.ok(displayed.includes('正在运行的 DeepSeek 会话回合： 未读到'));
+  assert.ok(displayed.includes('确认所有 DeepSeek 会话的当前一轮已结束'));
+  assert.ok(displayed.includes('不能执行等空闲重载'));
+  assert.ok(!displayed.includes('secret-internal-error'));
+});
+
+test('saved waiting state follows session turns and timeout polls, retaining pending settings for retry or cancellation', async (t) => {
+  const service = panelService();
+  Object.assign(service.status.runtime, { active_tasks: 0, active_sessions: 2 });
+  const host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  await change(host, 'Codex 模型', 'new-model');
+  await click(host, '等当前任务结束后自动生效');
+  assert.ok(text(host.tree).includes('等 2 个会话的当前一轮结束后自动生效'));
+  assert.ok(text(host.tree).includes('剩余 600 秒'));
+  assert.ok(text(host.tree).includes('当前模型： old-model'));
+  service.status.runtime.active_sessions = 1;
+  service.status.runtime.idle_wait.remaining_seconds = 17;
+  host.poll(); await host.flush();
+  assert.ok(text(host.tree).includes('等 1 个会话的当前一轮结束后自动生效'));
+  assert.ok(text(host.tree).includes('剩余 17 秒'));
+  assert.ok(!text(host.tree).includes('等 2 个会话'));
+  service.status.runtime.idle_wait = { ...service.status.runtime.idle_wait, status: 'timed_out', remaining_seconds: 0 };
+  service.status.runtime.pending_settings.error = '等待空闲已超过 10 分钟，未请求重载；请重新保存设置、重新请求等空闲，或确认立即生效。';
+  host.poll(); await host.flush();
+  for (const value of ['已停止自动重载', '待生效修改尚未用于当前任务', '未请求重载；请重新保存设置', '撤销这次修改']) {
+    assert.ok(text(host.tree).includes(value), value);
+  }
+  assert.ok(!text(host.tree).includes('后自动生效。最长等'));
+  assert.equal(field(host, 'Codex 模型').props.value, 'new-model');
+  assert.equal(host.requests.filter((request) => request.body).length, 1, 'status polling never requests reload');
+  await click(host, '等当前任务结束后自动生效');
+  assert.ok(text(host.tree).includes('剩余 600 秒'));
+  assert.ok(!text(host.tree).includes('已停止自动重载'));
+  await click(host, '撤销这次修改');
+  assert.equal(service.status.runtime.pending_settings, null);
+  assert.ok(!text(host.tree).includes('剩余 600 秒'));
+});
+
+test('reload without pending settings refreshes waiting and timed out states, then clears them after application', async (t) => {
+  const service = panelService();
+  Object.assign(service.status.runtime, { active_tasks: 0, active_sessions: 2 });
+  const host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  await click(host, '重新加载插件（等任务结束）');
+  assert.ok(text(host.tree).includes('等 2 个会话的当前一轮结束后自动重新加载'));
+  assert.ok(text(host.tree).includes('剩余 600 秒'));
+  assert.equal(service.status.runtime.pending_settings, null);
+  service.status.runtime.idle_wait = { ...service.status.runtime.idle_wait, status: 'timed_out', remaining_seconds: 0 };
+  host.poll(); await host.flush();
+  assert.ok(text(host.tree).includes('已停止自动重载'));
+  assert.ok(text(host.tree).includes('重新请求等空闲'));
+  assert.ok(!text(host.tree).includes('后自动重新加载。最长等'));
+  assert.equal(host.requests.filter((request) => request.body).length, 1);
+  await click(host, '重新加载插件（等任务结束）');
+  assert.ok(!text(host.tree).includes('已停止自动重载'));
+  Object.assign(service.status.runtime, { active_sessions: 0, idle_wait: null });
+  host.poll(); await host.flush();
+  assert.ok(text(host.tree).includes('正在运行的 DeepSeek 会话回合： 0'));
+  assert.ok(!text(host.tree).includes('剩余 600 秒'));
+  assert.ok(!text(host.tree).includes('等 2 个会话'));
 });

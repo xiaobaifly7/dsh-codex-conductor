@@ -515,13 +515,13 @@ function nativeJobs() {
   };
 }
 
-function runtimeTool(f, { jobs, conductor = { list: async () => ({ jobs: [], total: 0 }) },
+function runtimeTool(f, { jobs, agents = { list: () => [] }, conductor = { list: async () => ({ jobs: [], total: 0 }) },
   activeDispatches = () => 0, dispatchGeneration = () => 0, profileFile = f.profileFile, loadedIdentity = null } = {}) {
   let tool;
   const cleanups = [];
   const ctx = { tools: { register(spec) { tool = spec; return spec; } },
     effect(setup) { cleanups.push(setup()); },
-    get(name) { assert.equal(name, 'jobs'); return jobs; } };
+    get(name) { assert.ok(['jobs', 'agents'].includes(name)); return name === 'agents' ? agents : jobs; } };
   const registered = registerRuntimeTool({ ctx, conductor, moduleUrl: f.moduleUrl, loadedIdentity,
     profileFile, loadedFile: f.loadedFile, activeDispatches, dispatchGeneration });
   assert.equal(registered, tool);
@@ -546,6 +546,162 @@ function forbidCodexMutations(list) {
 }
 
 const runtimeExec = { agent: { id: 'runtime-owner' } };
+
+test('idle reload waits for all running session turns even with no Codex tasks, including turns starting during listing', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const sessions = [{ id: 'model-request', status: 'idle' }, { id: 'subagent', status: 'running' }, { id: 'finished', status: 'idle' }];
+  const jobs = nativeJobs();
+  let lists = 0;
+  const tool = runtimeTool(f, { jobs, agents: { list: () => sessions },
+    conductor: forbidCodexMutations(async () => {
+      if (++lists === 1) sessions[0].status = 'running';
+      return { jobs: [], total: 0 };
+    }) });
+  const waiting = await tool.execute({ action: 'reload' }, runtimeExec);
+  assert.equal(waiting.status, 'waiting_for_idle');
+  assert.equal(waiting.active_tasks, 0);
+  assert.equal(waiting.active_sessions, 2);
+  assert.equal(waiting.idle_wait.status, 'waiting');
+  assert.ok(waiting.idle_wait.remaining_seconds > 0 && waiting.idle_wait.remaining_seconds <= 600);
+  const observer = jobs.started[0];
+  t.after(() => observer.cancel());
+  assert.match(observer.progress.at(-1), /等 2 个会话的当前一轮结束/);
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  sessions[0].status = 'idle';
+  await delay(5200);
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  const status = await tool.execute({ action: 'status' });
+  assert.equal(status.active_sessions, 1);
+  assert.ok(status.idle_wait.remaining_seconds < waiting.idle_wait.remaining_seconds);
+  assert.match(observer.progress.at(-1), /等 1 个会话的当前一轮结束/);
+  sessions[1].status = 'idle';
+  const expected = await requestedModule(f);
+  marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
+  const result = JSON.parse((await observer.done).result);
+  assert.equal(result.status, 'reloaded');
+  assert.equal(result.active_sessions, 0);
+  assert.equal(result.idle_wait, null);
+  assert.equal(jobs.started.length, 1);
+});
+
+test('panel saves wait for DeepSeek turns even when Codex is idle, then apply the pending settings', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const session = { status: 'running' };
+  const tool = runtimeTool(f, { agents: { list: () => [session] } });
+  const waiting = await tool.execute({ action: 'reload' }, { panel: true }, { model: 'after-turn' });
+  assert.equal(waiting.status, 'waiting_for_idle');
+  assert.equal(waiting.active_tasks, 0);
+  assert.equal(waiting.active_sessions, 1);
+  assert.equal(waiting.idle_wait.status, 'waiting');
+  assert.deepEqual(waiting.pending_settings.changes, { model: 'after-turn' });
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  session.status = 'idle';
+  const expected = await requestedModule(f);
+  assert.match(readFileSync(f.profileFile, 'utf8'), /model: after-turn/);
+  marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
+  const status = await tool.execute({ action: 'status' });
+  assert.equal(status.pending_settings, null);
+  assert.equal(status.active_sessions, 0);
+});
+
+test('idle reload times out after ten minutes without reloading, even if the last turn has just ended', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const jobs = nativeJobs();
+  const session = { status: 'running' };
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const tool = runtimeTool(f, { jobs, agents: { list: () => [session] } });
+  await tool.execute({ action: 'reload' }, runtimeExec);
+  const observer = jobs.started[0];
+  t.after(() => observer.cancel());
+  now += 10 * 60 * 1000;
+  session.status = 'idle';
+  const outcome = await observer.done;
+  assert.equal(outcome.status, 'failed');
+  const result = JSON.parse(outcome.result);
+  assert.equal(result.error_kind, 'idle_timeout');
+  assert.match(result.error, /已超过 10 分钟，未请求重载/);
+  const status = await tool.execute({ action: 'status' });
+  assert.equal(status.idle_wait.status, 'timed_out');
+  assert.equal(status.idle_wait.remaining_seconds, 0);
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  assert.equal(readdirSync(f.root).some((name) => name.endsWith('.bak')), false);
+});
+
+test('timed out pending settings remain saved with a visible error and do not resume waiting after restart', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const session = { status: 'running' };
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  const tool = runtimeTool(f, { agents: { list: () => [session] } });
+  await tool.execute({ action: 'reload' }, { panel: true }, { model: 'still-pending' });
+  now += 10 * 60 * 1000 + 1000;
+  await delay(5200);
+  const status = await tool.execute({ action: 'status' });
+  assert.equal(status.idle_wait.status, 'timed_out');
+  assert.deepEqual(status.pending_settings.changes, { model: 'still-pending' });
+  assert.match(status.pending_settings.error, /已超过 10 分钟，未请求重载/);
+  tool.dispose();
+  session.status = 'idle';
+  const restarted = runtimeTool(f, { agents: { list: () => [session] } });
+  const restored = await restarted.execute({ action: 'status' });
+  assert.match(restored.pending_settings.error, /已超过 10 分钟/);
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  restarted.cancelPending();
+  assert.equal((await restarted.execute({ action: 'status' })).idle_wait, null);
+});
+
+test('the pending settings idle deadline survives a restart even if sessions are now idle', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const first = runtimeTool(f, { agents: { list: () => [{ status: 'running' }] } });
+  await first.execute({ action: 'reload' }, { panel: true }, { model: 'expired' });
+  first.dispose();
+  const pendingFile = path.join(f.root, 'pending-settings.json');
+  const pending = JSON.parse(readFileSync(pendingFile, 'utf8'));
+  pending.saved_at = new Date(Date.now() - 11 * 60 * 1000).toISOString();
+  writeFileSync(pendingFile, JSON.stringify(pending));
+  const restarted = runtimeTool(f);
+  await delay(10);
+  const state = await restarted.execute({ action: 'status' });
+  assert.match(state.pending_settings.error, /已超过 10 分钟/);
+  assert.equal(state.idle_wait.status, 'timed_out');
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  restarted.cancelPending();
+});
+
+test('missing or failing session status blocks idle writes but status and explicit now remain usable', async (t) => {
+  for (const agents of [null, { list() { throw new Error('session service offline'); } }]) {
+    const f = fixture(t);
+    const original = profile(f.moduleUrl);
+    writeFileSync(f.profileFile, original);
+    const tool = runtimeTool(f, { agents });
+    const status = await tool.execute({ action: 'status' });
+    assert.equal(status.status, 'status');
+    assert.equal(status.active_sessions, null);
+    assert.match(status.sessions_error, /无法确认 DeepSeek 会话回合状态/);
+    for (const changes of [undefined, { model: 'unapplied' }]) {
+      const failed = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true }, changes);
+      assert.equal(failed.status, 'failed');
+      assert.equal(failed.error_kind, 'session_status_unavailable');
+      assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+      assert.equal(fs.existsSync(path.join(f.root, 'pending-settings.json')), false);
+    }
+    const operation = tool.execute({ action: 'reload', when: 'now' }, { panel: true });
+    const expected = await requestedModule(f);
+    marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
+    assert.equal((await operation).status, 'reloaded');
+  }
+});
 
 test('planner read scope persists while busy and applies through idle and immediate reloads', async (t) => {
   for (const when of ['idle', 'now']) {
@@ -674,7 +830,8 @@ test('queued settings are revalidated at idle and keep a visible error if the pr
 test('immediate panel settings preserve running jobs and wait for the exact loaded marker', async (t) => {
   const f = fixture(t);
   writeFileSync(f.profileFile, profile(f.moduleUrl));
-  const tool = runtimeTool(f, { conductor: forbidCodexMutations(async () => ({ jobs: [{ job_id: 'J' }], total: 1 })) });
+  const tool = runtimeTool(f, { agents: { list: () => [{ status: 'running' }] },
+    conductor: forbidCodexMutations(async () => ({ jobs: [{ job_id: 'J' }], total: 1 })) });
   let settled = false;
   const operation = tool.execute({ action: 'reload', when: 'now' }, { panel: true }, { model: 'immediate' })
     .then((result) => { settled = true; return result; });
@@ -686,6 +843,7 @@ test('immediate panel settings preserve running jobs and wait for the exact load
   const result = await operation;
   assert.equal(result.status, 'reloaded');
   assert.equal(result.active_tasks, 1);
+  assert.equal(result.active_sessions, 1);
   assert.equal(result.pending_settings, null);
 });
 

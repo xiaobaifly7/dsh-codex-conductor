@@ -391,10 +391,14 @@ export async function waitForRuntimeLoad({ loadedFile, expectedModule, timeoutMs
 }
 
 
+const IDLE_WAIT_MS = 10 * 60 * 1000;
+const IDLE_TIMEOUT = '等待空闲已超过 10 分钟，未请求重载；请重新保存设置、重新请求等空闲，或确认立即生效。';
+
 export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity, profileFile, loadedFile, activeDispatches, dispatchGeneration }) {
   const pendingFile = loadedFile ? path.join(path.dirname(loadedFile), 'pending-settings.json') : '';
   let pendingController;
   let disposed = false;
+  let idleWait = null;
   function readPending() {
     if (!pendingFile) return null;
     try {
@@ -433,10 +437,19 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       ...(value.expected_module ? { awaiting_load: true } : {}) };
   }
   const label = 'Codex runtime · 等待空闲后重载';
-  const snapshot = (activeTasks, active_error = null) => ({
-    ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks }), active_error,
-    pending_settings: pendingView(),
-  });
+  function snapshot(activeTasks, active_error = null) {
+    let active_sessions = null;
+    let sessions_error = null;
+    try {
+      const agents = ctx.get?.('agents');
+      active_sessions = agents.list().filter((agent) => agent.status === 'running').length;
+    } catch (error) { sessions_error = `无法确认 DeepSeek 会话回合状态：${error.message}，请刷新后重试。`; }
+    return { ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks }), active_error,
+      active_sessions, sessions_error, pending_settings: pendingView(),
+      idle_wait: idleWait && { status: idleWait.status, deadline_at: new Date(idleWait.deadline).toISOString(),
+        remaining_seconds: Math.max(0, Math.ceil((idleWait.deadline - Date.now()) / 1000)) } };
+  }
+  const busy = (current, generation) => current.active_tasks !== 0 || current.active_sessions !== 0 || generation !== dispatchGeneration();
   async function activeCount(signal) {
     const generation = dispatchGeneration();
     const starting = activeDispatches();
@@ -465,7 +478,8 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
   const pendingReload = (current) => current.can_reload && current.profile_module !== moduleUrl;
   async function reload(current, signal, changes, pending) {
     signal?.throwIfAborted();
-    if (current.state === 'synchronized' && !changes) return { ...current, status: 'already_current' };
+    idleWait = null;
+    if (current.state === 'synchronized' && !changes) return { ...current, idle_wait: null, status: 'already_current' };
     const request = pending?.expected_module ? { expected_module: pending.expected_module, saved: true, reused: true } :
       !changes && pendingReload(current) ? { expected_module: current.profile_module, reused: true } :
       requestRuntimeReload({ moduleUrl, profileFile, changes });
@@ -475,16 +489,30 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       status: confirmation.confirmed ? 'reloaded' : 'unconfirmed',
       ...(confirmation.confirmed ? {} : { next: '重载请求已提交，尚未确认加载。用 codex_runtime action=status 查询，不要重复重载。' }) };
   }
-  async function waitUntilIdle(current, generation, signal, progress, settings = false) {
+  async function waitUntilIdle(current, generation, signal, progress, apply, settings = false, deadline = Date.now() + IDLE_WAIT_MS) {
     let observed = current;
-    while ((observed.active_tasks > 0 || generation !== dispatchGeneration()) && (settings || observed.state !== 'synchronized')) {
-      progress?.('等待 Codex 空闲，在途任务数：' + observed.active_tasks);
-      await delay(5000, undefined, { signal });
-      const active = await activeCount(signal);
-      observed = snapshot(active.count);
-      generation = active.generation;
+    const waiting = idleWait = { status: 'waiting', deadline };
+    try {
+      for (;;) {
+        signal?.throwIfAborted();
+        observed = snapshot(observed.active_tasks, observed.active_error);
+        if (!settings && observed.state === 'synchronized') return apply(observed);
+        if (Date.now() >= deadline) {
+          waiting.status = 'timed_out';
+          throw Object.assign(new Error(IDLE_TIMEOUT), { code: 'idle_timeout', status: 408 });
+        }
+        if (observed.sessions_error) throw new Error(observed.sessions_error);
+        // Submit synchronously after the final session check: another turn must not start in an await gap.
+        if (!busy(observed, generation)) return apply(observed);
+        progress?.(`等待 ${observed.active_tasks} 个 Codex 任务结束；等 ${observed.active_sessions} 个会话的当前一轮结束（最多再等 ${Math.ceil((deadline - Date.now()) / 1000)} 秒）`);
+        await delay(Math.min(5000, deadline - Date.now()), undefined, { signal });
+        const active = await activeCount(signal);
+        observed = snapshot(active.count);
+        generation = active.generation;
+      }
+    } finally {
+      if (idleWait === waiting && waiting.status !== 'timed_out') idleWait = null;
     }
-    return observed;
   }
   async function applyPending(current, signal) {
     const pending = readPending();
@@ -524,8 +552,12 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         }
         const pending = readPending();
         if (!pending) return;
-        if (!pending.expected_module) current = await waitUntilIdle(current, generation, controller.signal, undefined, true);
-        await applyPending(current, controller.signal);
+        if (!pending.expected_module) {
+          const deadline = Date.parse(pending.saved_at) + IDLE_WAIT_MS;
+          if (!Number.isFinite(deadline)) throw new Error('待生效设置的保存时间无效，请重新保存。');
+          await waitUntilIdle(current, generation, controller.signal, undefined,
+            (observed) => applyPending(observed, controller.signal), true, deadline);
+        } else await applyPending(current, controller.signal);
       } catch (error) {
         if (!controller.signal.aborted) {
           const pending = readPending();
@@ -545,8 +577,10 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
   });
   const tool = {
     name: 'codex_runtime',
-    description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限及在途 Codex 任务数；reload 默认等空闲后重载，when=now 立即请求。' +
-      '不会取消或启动 Codex 任务。已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。',
+    description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限、在途 Codex 任务数及进行中的 DeepSeek 会话回合数。' +
+      'reload 默认 when=idle，同时等 Codex 任务结束且所有会话 status 不为 running，最多等 10 分钟；超时不重载，需重新请求。' +
+      'when=now 立即重载，可能中止正在进行的 DeepSeek 回合；Codex 后台任务继续运行，重载后按登记记录接回。' +
+      '已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。',
     presentCall: (args) => ({ card: 'generic', kind: args?.action === 'reload' ? 'write' : 'read', title: 'Codex runtime' }),
     parameters: { type: 'object', properties: {
       action: { type: 'string', enum: ['status', 'reload'], default: 'status' },
@@ -560,6 +594,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       clearPending();
       pendingController?.abort();
       pendingController = undefined;
+      idleWait = null;
       return { cancelled: true };
     },
     async execute(args = {}, exec, changes) {
@@ -573,12 +608,19 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
           error: 'runtimeProfileFile 未配置，无法请求重载。' };
       }
       try {
+        const deadline = Date.now() + IDLE_WAIT_MS;
         let count = null;
         let generation;
         let active_error = null;
         try {
           // 派发计数可能经历 0→1→0，提交空闲重载前须确认列表对应的代次未变。
-          do { ({ count, generation } = await activeCount(exec?.signal)); }
+          do {
+            ({ count, generation } = await activeCount(exec?.signal));
+            if (action === 'reload' && when === 'idle' && Date.now() >= deadline) {
+              idleWait = { status: 'timed_out', deadline };
+              return { ...snapshot(count), status: 'failed', error_kind: 'idle_timeout', error_status: 408, error: IDLE_TIMEOUT };
+            }
+          }
           while (when === 'idle' && generation !== dispatchGeneration());
         } catch (error) {
           exec?.signal?.throwIfAborted();
@@ -587,19 +629,24 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         }
         current = snapshot(count, active_error);
         if (action === 'status') return { ...current, status: 'status' };
+        if (when === 'idle' && current.sessions_error && !pendingReload(current) && (changes || current.state !== 'synchronized')) {
+          return { ...current, status: 'failed', error_kind: 'session_status_unavailable', error_status: 503, error: current.sessions_error };
+        }
+        const idle = !busy(current, generation);
         if (changes) {
           const profile = profileRecord(profileFile, moduleUrl);
           settingsEdits(profile, changes);
           if (active_error && when === 'idle') return { ...current, status: 'failed', error_status: 502, error: active_error };
           if (!pendingFile) {
-            if (when === 'now' || count === 0) return await reload(current, exec?.signal, changes);
+            if (when === 'now' || idle) return await reload(current, exec?.signal, changes);
             throw Object.assign(new Error('没有可用的本地保存目录，无法保存待生效的设置。请配置本地数据目录后重试。'), { status: 409 });
           }
           writePending({ id: randomUUID(), profile_file: profileFile, module_path: modulePath(moduleUrl),
             changes, saved_at: new Date().toISOString() });
-          if (when === 'now' || count === 0) {
-            pendingController?.abort();
-            pendingController = undefined;
+          pendingController?.abort();
+          pendingController = undefined;
+          idleWait = null;
+          if (when === 'now' || idle) {
             return await applyPending(current, exec?.signal);
           }
           startPending(current, generation);
@@ -610,14 +657,14 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
           return { ...current, status: 'failed', error_kind: 'active_count_unavailable', error_status: 502, error: active_error };
         }
         if (!current.can_reload) throw Object.assign(new Error(current.profile_error), { status: current.profile_error_status });
-        if (awaiting || current.state === 'synchronized' || when === 'now' || current.active_tasks === 0) {
+        if (awaiting || current.state === 'synchronized' || when === 'now' || idle) {
           return await reload(current, exec?.signal, changes);
         }
         const owner = exec?.agent?.id;
         const jobs = ctx.get?.('jobs');
         if ((owner === undefined && exec?.panel !== true) || !jobs?.start || !jobs?.list) {
           return { ...current, status: 'failed', error_kind: 'native_jobs_unavailable', error_status: 409,
-            error: 'Codex 仍在运行且无法登记原生后台观察；未请求重载。' };
+            error: 'Codex 任务或 DeepSeek 回合仍在进行，且无法登记原生后台观察；未请求重载。' };
         }
         const existing = jobs.list(owner).find((job) => job.owner === owner && job.kind === 'codex-runtime' && job.label === label &&
           (job.status === 'running' || job.status === 'stopping'));
@@ -628,12 +675,13 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
             const signal = controller.signal;
             const done = (async () => {
               try {
-                const observed = await waitUntilIdle(current, generation, signal, (text) => handle.updateProgress(text));
-                const result = await reload(observed, signal);
+                const result = await waitUntilIdle(current, generation, signal, (text) => handle.updateProgress(text),
+                  (observed) => reload(observed, signal), false, deadline);
                 return { status: 'completed', detail: result.status === 'unconfirmed' ? '重载请求已提交，尚未确认加载' : result.status,
                   result: JSON.stringify(result) };
               } catch (error) {
                 const result = { status: signal.aborted ? 'cancelled' : 'failed', error: String(error?.message ?? error),
+                  ...(error.code === 'idle_timeout' ? { error_kind: 'idle_timeout' } : {}),
                   ...(signal.aborted ? { note: '仅停止观察；不会取消 Codex，也不会撤销已发出的重载请求。' } : {}) };
                 return { status: signal.aborted ? 'killed' : 'failed', detail: result.status, result: JSON.stringify(result) };
               }
@@ -641,7 +689,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
             return { done, cancel: () => controller.abort() };
           },
         });
-        return { ...current, status: 'waiting_for_idle', background_job_id: id, reused: false };
+        return { ...snapshot(count, active_error), status: 'waiting_for_idle', background_job_id: id, reused: false };
       } catch (error) {
         return { ...(current ?? snapshot(null)), status: 'failed', error_kind: exec?.signal?.aborted ? 'aborted' : 'runtime_error',
           error_status: error?.status ?? 500, error: String(error?.message ?? error) };
