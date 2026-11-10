@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.70` 为面板状态、任务、关注数和报告读取设置 15 秒整体上限，为任务列表、状态和报告查询及 `codex_jobs`、`codex_status`、`codex_runtime` 的任务统计设置 10 秒查询预算（显式等待另加等待时长），随包 runner 的完整 JSON 到达即返回，查询失败明确报错且不取消 Codex 任务。
+
 `0.9.69` 的等空闲重载同时等待 Codex 活任务和所有 DeepSeek 会话的当前回合结束，显示数量与倒计时，最长等 10 分钟后停止自动重载并保留待生效设置；立即生效可能中止 DeepSeek 当前回合，Codex 后台任务继续并会接回。
 
 `0.9.68` 为 `gemini_write` 增加硬上限与 80% 目标、同一超时预算内的一次自动压缩、失败时目标文件恢复，以及插件生成且不计入字数的可选七字段 YAML frontmatter。
@@ -371,6 +373,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.70` bounds panel status, jobs, attention and report reads to 15 seconds, gives list/status/report queries and the query phase of `codex_jobs`, `codex_status` and `codex_runtime` a 10-second budget (plus any explicit wait), and returns bundled-runner JSON without waiting for pipe closure or cancelling Codex tasks on query failure.
 
 `0.9.69` waits for both active Codex tasks and current turns in all DeepSeek sessions before an idle reload, shows counts and a countdown, and stops automatic reload after 10 minutes while retaining pending settings; immediate reload may abort DeepSeek turns while Codex background tasks continue and reconnect.
 

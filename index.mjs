@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
-const { runtimeIdentity, loadedRecord, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
+const { runtimeIdentity, loadedRecord, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
@@ -156,7 +156,7 @@ export function runnerArgv(cfg, args) {
 }
 
 // 跑一个命令，返回它输出的最后一行 JSON。timeoutMs 到了还没结束（WSL 卡死或起不来）就结束它并按 bridge_error 返回，
-export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onProgress } = {}) {
+export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onProgress, singleResult = false } = {}) {
   if (signal?.aborted) return Promise.resolve({ status: 'failed', error_kind: 'bridge_error',
     error: `${command} 调用前已被中止`, retryable: true });
   return new Promise((resolve, reject) => {
@@ -169,9 +169,13 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
     }
     const out = [];
     const err = [];
-    if (!onProgress) child.stdout.on('data', (d) => out.push(d));
+    if (!onProgress && !singleResult) child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));
-    const onAbort = () => child.kill();
+    const onAbort = () => {
+      cleanup();
+      child.kill();
+      resolve({ status: 'failed', error_kind: 'bridge_error', error: `${command} 查询已中止`, retryable: true });
+    };
     signal?.addEventListener('abort', onAbort, { once: true });
     // 用 1 秒一跳的 interval，而不是一个长 setTimeout：Windows 上 libuv 计时走 QueryPerformanceCounter，含睡眠时间，
     // 一个长 setTimeout 会在电脑睡眠唤醒后立刻判超时、误杀在飞的 status；interval 睡眠期间只补一跳（约 1 秒），不会误杀，
@@ -188,7 +192,7 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
       resolve({ status: 'failed', error_kind: 'bridge_error', retryable: true,
         error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束它（WSL 可能卡住或正在启动）` });
     }, 1000);
-    if (onProgress) {
+    if (onProgress || singleResult) {
       const lines = createInterface({ input: child.stdout });
       const fail = (error) => { cleanup(); child.kill(); reject(error); };
       lines.on('error', fail);
@@ -197,8 +201,8 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
         let value;
         try { value = JSON.parse(line); } catch { return; }
         if (typeof value?.status !== 'string') return;
-        if (value.status !== 'running') {
-          // 终态已经完整到达，不等只读查询进程关闭。
+        if (!onProgress || value.status !== 'running') {
+          // Runner emits one JSON result; inherited pipes must not delay its delivery.
           cleanup();
           resolve(value);
           child.kill();
@@ -230,9 +234,10 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
 // 调用 WSL 里的 runner。不设 WSL_UTF8 时 wsl.exe 自己的报错是 UTF-16LE，按 UTF-8 读出来是乱码
 // exec 可注入，默认 runProcess；测试据此验证超时/stdin/signal/env 真的传到了 spawn，而不是只在假 run 上验证
 export const runRunner = (cfg, args, opts = {}, exec = runProcess) =>
-  exec('wsl.exe', runnerArgv(cfg, args), { ...opts, env: { ...process.env, WSL_UTF8: '1' } });
+  exec('wsl.exe', runnerArgv(cfg, args), { ...opts, singleResult: cfg.runner === DEFAULTS.runner,
+    env: { ...process.env, WSL_UTF8: '1' } });
 
-// start / cancel 正常几秒就返回，冷启动 WSL 也用不了这么久；status 在它自己的等待之外再留这么多余量
+// Mutations retain the cold-start allowance; only background streams use the longer silence watchdog.
 const BRIDGE_TIMEOUT_MS = 120_000;
 const BRIDGE_SLACK_MS = 60_000;
 
@@ -241,6 +246,15 @@ const unknownState = (value) => ['bridge_error', 'unknown_job', 'invalid_record'
 const cancelUnconfirmed = (value) => unknownState(value) || !['cancelled', 'completed', 'failed'].includes(value.status);
 
 export function createConductor(cfg, run = runRunner) {
+  async function query(argv, signal, timeoutMs = QUERY_TIMEOUT_MS) {
+    try {
+      return await queryWithTimeout((signal) => run(cfg, argv, { signal, timeoutMs }), signal, timeoutMs);
+    } catch (error) {
+      if (error?.code !== 'query_timeout' && !signal?.aborted) throw error;
+      return { status: 'failed', error_kind: 'bridge_error', error: error.message, retryable: true };
+    }
+  }
+
   // 手动查询仍有界；随包 runner 的后台观察可以在同一进程内继续等待。
   async function waitJob(jobId, seconds, signal, onProgress) {
     // 夹在 1 天内：既防超大值让底层 status 等上几十天，也让 timeoutMs 远小于 2^31
@@ -249,7 +263,8 @@ export function createConductor(cfg, run = runRunner) {
     const argv = ['status', jobId, '--wait', String(wait)];
     if (follow) argv.push('--follow');
     const value = signal?.aborted ? undefined
-      : await run(cfg, argv, { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS, ...(follow && { onProgress }) });
+      : follow ? await run(cfg, argv, { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS, onProgress })
+        : await query(argv, signal, wait * 1000 + QUERY_TIMEOUT_MS);
     if (signal?.aborted) {
       await cancel(jobId, signal);
       signal.throwIfAborted();
@@ -305,12 +320,11 @@ export function createConductor(cfg, run = runRunner) {
     if (filters.scope_conflicts) argv.push('--scope-conflicts');
     if (filters.started_between) argv.push('--started-between', ...filters.started_between.map(String));
     for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
-    return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+    return query(argv, signal);
   }
 
   async function output(jobId, { artifact = 'report', offset = 0, limit = 4000 } = {}, signal) {
-    return run(cfg, ['output', jobId, '--artifact', artifact, '--offset', String(offset), '--limit', String(limit)],
-      { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+    return query(['output', jobId, '--artifact', artifact, '--offset', String(offset), '--limit', String(limit)], signal);
   }
 
   async function review(jobId, review, reviewer, signal) {
@@ -965,10 +979,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // 等 runner 任务的结果。有后台任务时经 DSH 任务表等：结算时这次等待算作已被等到，DSH 就不会再把同一结果作为通知补发
   async function collect(jobId, bg, seconds, signal) {
+    seconds = Math.min(seconds, 86_400);
     if (bg) {
       let view;
       try {
-        view = await bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, signal);
+        view = await queryWithTimeout((signal) => bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, signal),
+          signal, seconds * 1000 + QUERY_TIMEOUT_MS);
       } catch (error) {
         // 中途停止：结束后台任务（它的 cancel 会取消 runner 任务），等它结算完再抛出，免得之后又冒出一条结束通知。
         // 抛一条明确的错误：jobs.wait 的中止拒绝直接抛出会被 DSH 渲染成 Error: [object Object]
@@ -1219,7 +1235,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
-      const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 0, exec?.signal);
+      const seconds = Math.min(args.wait_seconds ?? 0, 86_400);
+      const value = await queryWithTimeout(() => collect(args.job_id, liveBackground(args.job_id, exec), seconds, exec?.signal),
+        undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
       return value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
     },
@@ -1349,14 +1367,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.needs_attention !== undefined && typeof args.needs_attention !== 'boolean') throw new Error('codex_jobs: needs_attention 必须是布尔值');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) throw new Error('codex_jobs: limit 必须是 1–100 的整数');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_jobs: offset 必须是非负整数');
-      const { filters, linked, owner } = await historySelection(args, exec);
-      const value = await conductor.list(filters, exec?.signal);
-      if (!Array.isArray(value.jobs)) return value;
-      return { ...value, jobs: value.jobs.map((job) => {
-        const bg = linked.get(job.job_id);
-        return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner,
-          ...(bg.status ? { background_status: bg.status } : {}) } : {}) };
-      }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}) };
+      return queryWithTimeout(async (signal) => {
+        const { filters, linked, owner } = await historySelection(args, { ...exec, signal });
+        signal.throwIfAborted();
+        const value = await conductor.list(filters, signal);
+        if (!Array.isArray(value.jobs)) return value;
+        return { ...value, jobs: value.jobs.map((job) => {
+          const bg = linked.get(job.job_id);
+          return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner,
+            ...(bg.status ? { background_status: bg.status } : {}) } : {}) };
+        }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}) };
+      }, exec?.signal);
     },
   });
 

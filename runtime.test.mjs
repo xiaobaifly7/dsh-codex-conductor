@@ -679,8 +679,9 @@ test('the pending settings idle deadline survives a restart even if sessions are
   restarted.cancelPending();
 });
 
-test('missing or failing session status blocks idle writes but status and explicit now remain usable', async (t) => {
-  for (const agents of [null, { list() { throw new Error('session service offline'); } }]) {
+test('missing, failing or asynchronous session status blocks idle writes but status and explicit now remain usable', async (t) => {
+  for (const agents of [null, { list() { throw new Error('session service offline'); } },
+    { list: () => new Promise(() => {}) }, { list: async () => { throw new Error('async session service offline'); } }]) {
     const f = fixture(t);
     const original = profile(f.moduleUrl);
     writeFileSync(f.profileFile, original);
@@ -701,6 +702,38 @@ test('missing or failing session status blocks idle writes but status and explic
     marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
     assert.equal((await operation).status, 'reloaded');
   }
+});
+
+test('runtime counts have a 10-second total budget, abort stalled pages, and never reload on failure', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const signals = [];
+  const tool = runtimeTool(f, { conductor: forbidCodexMutations(async ({ offset }, signal) => {
+    signals.push(signal);
+    if (offset > 0) return new Promise(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 6000));
+    return { jobs: [{ job_id: 'J1' }], total: 2 };
+  }) });
+  const pending = tool.execute({ action: 'reload' }, runtimeExec);
+  t.mock.timers.tick(6000);
+  await new Promise(setImmediate);
+  await new Promise(setImmediate);
+  assert.equal(signals.length, 2);
+  t.mock.timers.tick(4000);
+  const failed = await pending;
+  assert.equal(failed.status, 'failed');
+  assert.equal(failed.active_tasks, null);
+  assert.match(failed.error, /查询超过 10 秒/);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  const status = tool.execute({ action: 'status' });
+  t.mock.timers.tick(10_000);
+  const result = await status;
+  assert.equal(result.status, 'status');
+  assert.equal(result.active_tasks, null);
+  assert.match(result.active_error, /查询超过 10 秒/);
 });
 
 test('planner read scope persists while busy and applies through idle and immediate reloads', async (t) => {
@@ -876,7 +909,8 @@ test('runtime tool defaults to status and counts all runner pages by unique ID p
   const controller = new AbortController();
   const conductor = forbidCodexMutations(async (filters, signal) => {
     calls.push(filters);
-    assert.equal(signal, controller.signal);
+    assert.ok(signal instanceof AbortSignal);
+    assert.equal(signal.aborted, controller.signal.aborted);
     return { status: 'completed', total: 102, offset: filters.offset, jobs: filters.offset === 0
       ? Array.from({ length: 100 }, (_, i) => ({ job_id: 'J' + i })) : [{ job_id: 'J99' }, { job_id: 'J100' }] };
   });
