@@ -2539,6 +2539,83 @@ class RunnerTests(unittest.TestCase):
             self.assertTrue(fresh_job.exists())
             codex_runner.prune_old("missing")  # absent subdir is a no-op, not an error
 
+    def test_storage_limit_prunes_oldest_finished_jobs_and_runs_before_new_task(self):
+        for command in ("run", "start"):
+            with self.subTest(command=command):
+                home = Path(self.tmp.name) / command
+                entries = []
+                for subdir, name, age in (("jobs", "oldest", 300), ("runs", "older", 200), ("jobs", "newest", 100)):
+                    d = home / subdir / name
+                    d.mkdir(parents=True)
+                    (d / "result.json").write_text(json.dumps({"status": "completed"}))
+                    (d / "events.jsonl").write_bytes(b"x" * 8192)
+                    saved = time.time() - age
+                    os.utime(d / "result.json", (saved, saved))
+                    # Directory timestamps do not define retention order.
+                    os.utime(d, (saved + 2 * age, saved + 2 * age))
+                    entries.append(d)
+                size = lambda d: sum(p.stat().st_size for p in d.rglob("*") if p.is_file())
+                limit = size(entries[-1]) + 1
+                result = self.invoke("--max-storage-mb", str(limit / 1024 ** 2), command=command,
+                                     env={"CODEX_RUNNER_HOME": str(home)})
+                if command == "start":
+                    with mock.patch.dict(self.env, {"CODEX_RUNNER_HOME": str(home)}):
+                        result = self.control("status", result["job_id"], "--wait", "10")
+                self.assertEqual(result["status"], "completed", result)
+                self.assertFalse(entries[0].exists())
+                self.assertFalse(entries[1].exists())
+                self.assertTrue(entries[2].exists())
+                self.assertTrue(Path(result["log_dir"]).is_dir())
+
+    def test_storage_limit_keeps_active_unfinished_invalid_and_identity_checked_records(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        kept = []
+        for name, result, pid_file in (("running", {"status": "running"}, None), ("queued", None, "worker.pid"),
+                                      ("worker-alive", {"status": "completed"}, "worker.pid"),
+                                      ("codex-alive", {"status": "failed"}, "codex.pid"),
+                                      ("unfinished", None, None), ("invalid", {}, None)):
+            d = self.stored_job(name, result)
+            (d / "worker.pid").unlink(missing_ok=True)
+            (d / "events.jsonl").write_bytes(b"x" * 8192)
+            if pid_file:
+                codex_runner.record_pid(d / pid_file, os.getpid())
+            kept.append(d)
+        reused = self.stored_job("reused", {"status": "cancelled"})
+        codex_runner.record_pid(reused / "worker.pid", os.getpid())
+        (reused / "worker.start").write_text("a different process start")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            codex_runner.prune_storage(0.001)
+        self.assertFalse(reused.exists())
+        self.assertTrue(all(d.exists() for d in kept))
+        self.assertEqual(self.calls(), [])
+
+    def test_storage_limit_continues_after_a_failed_deletion(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        oldest = self.stored_job("oldest", {"status": "failed"})
+        newer = self.stored_job("newer", {"status": "completed"})
+        os.utime(oldest / "result.json", (1, 1))
+        remove = codex_runner.shutil.rmtree
+        def fail_oldest(d, **kwargs):
+            if d == oldest:
+                raise PermissionError("busy")
+            return remove(d, **kwargs)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.shutil, "rmtree", side_effect=fail_oldest):
+            codex_runner.prune_storage(0.000001)
+        self.assertTrue(oldest.exists())
+        self.assertFalse(newer.exists())
+
+    def test_storage_limit_is_optional_and_rejects_nonpositive_or_nonfinite_values(self):
+        d = self.stored_job("keep-without-cap", {"status": "completed"})
+        self.assertEqual(self.invoke()["status"], "completed")
+        self.assertTrue(d.exists())
+        for value in ("0", "-1", "nan", "inf", "-inf"):
+            self.assertEqual(self.control("start", "--cwd", str(self.cwd), "--max-storage-mb=" + value)["error_kind"], "bad_arguments")
+
     def test_prune_keeps_old_unfinished_dirs_and_recent_results(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -2546,18 +2623,21 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
             stale = time.time() - codex_runner.PRUNE_TTL - 86400
             for subdir in ("jobs", "runs"):
-                for name in ("running", "queued", "recently-finished"):
+                for name in ("running", "queued", "recently-finished", "finished-with-live-process"):
                     d = codex_runner.HOME / subdir / name
                     d.mkdir(parents=True)
-                    if name == "recently-finished":
+                    if name in ("recently-finished", "finished-with-live-process"):
                         (d / "result.json").write_text("{}")
                     else:
                         (d / "worker.pid").write_text(str(os.getpid()))
                         (d / "events.jsonl").write_text("active")
+                    if name == "finished-with-live-process":
+                        codex_runner.record_pid(d / "codex.pid", os.getpid())
+                        os.utime(d / "result.json", (stale, stale))
                     os.utime(d, (stale, stale))
                 codex_runner.prune_old(subdir)
                 self.assertEqual(sorted(d.name for d in (codex_runner.HOME / subdir).iterdir()),
-                                 ["queued", "recently-finished", "running"])
+                                 ["finished-with-live-process", "queued", "recently-finished", "running"])
 
     def test_worker_registers_its_own_process_identity_before_execution(self):
         sys.path.insert(0, str(RUNNER.parent))

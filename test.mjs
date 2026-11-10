@@ -3116,11 +3116,12 @@ test('settings warns and defaults each invalid entry without losing valid config
   assert.deepEqual(warnings, []);
 });
 
-test('optional timeout and retry settings validate numbers and pass only configured runner flags', async () => {
-  const keys = { timeoutSeconds: '--timeout', idleTimeoutSeconds: '--idle-timeout', retries: '--retries', lockTimeoutSeconds: '--lock-timeout' };
-  for (const config of [{}, { timeoutSeconds: null, idleTimeoutSeconds: undefined, retries: null, lockTimeoutSeconds: null },
-    { timeoutSeconds: '', idleTimeoutSeconds: '', retries: '', lockTimeoutSeconds: '' },
-    { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0, lockTimeoutSeconds: 30.5 }]) {
+test('optional timeout, retry and storage settings validate numbers and pass only configured runner flags', async () => {
+  const keys = { timeoutSeconds: '--timeout', idleTimeoutSeconds: '--idle-timeout', retries: '--retries',
+    lockTimeoutSeconds: '--lock-timeout', maxStorageMb: '--max-storage-mb' };
+  for (const config of [{}, { timeoutSeconds: null, idleTimeoutSeconds: undefined, retries: null, lockTimeoutSeconds: null, maxStorageMb: null },
+    { timeoutSeconds: '', idleTimeoutSeconds: '', retries: '', lockTimeoutSeconds: '', maxStorageMb: '' },
+    { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0, lockTimeoutSeconds: 30.5, maxStorageMb: 64.5 }]) {
     const h = harness({ config });
     await h.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
     const argv = h.calls[0];

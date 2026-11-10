@@ -97,6 +97,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### 存储
 
+- `maxStorageMb`（runner 的 `run` / `start --max-storage-mb N`）可设置 `jobs` 与 `runs` 的合计大小上限，单位 MiB（1 MiB = 1024² 字节），留空不限制。设置后先执行原有 30 天清理，再按 `result.json` 保存时间从旧到新删除已结束任务，清理发生在本次任务目录创建前。运行中、排队中，以及身份核对后 worker 或 Codex 仍在的目录不删；无法删除或保留任务已超上限时只尽力清理，不报错。该上限在启动时执行，不限制单个日志文件或正在运行任务的增长。
+
 - 历史查询默认使用当前工作区；`session_id="current"` 查询当前会话，也可指定会话 ID。新任务将 owner、原任务、原验收标准和写入意图保存在已有任务参数中，长任务不会受 Windows 命令行参数长度影响。旧任务优先关联 Harness 会话 journal 和原生任务表；无法确认归属的保留未知，可按工作区找回。完整上下文用 `codex_output` 的 `artifact="context"` 读取。
 
 - 完整结果读取使用 `job_id`，不是 `background_job_id`：`artifact="report"` 读取原始报告，`result` 读取执行结果，`context` 读取原任务与验收，`review` 读取独立核验历史，`stderr` / `events` 分别读取 `stderr.log` / `events.jsonl`。默认每段 4000 个 Unicode 字符，最多 8000；按返回的 `next_offset` 继续读取，直至 `eof=true`。日志在任务运行中也可读取；缺失或空文件会明确说明。这也适用于 `job_output` 已消费或被 64 KiB 上限截断的结果。旧任务没有保存上下文时会明确说明。
@@ -187,6 +189,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `codexBin` | 自动查找 | WSL 内 codex 的路径；默认先查 PATH（跳过 `/mnt/` 下的 Windows 版），再查 `~/.npm-global/bin`、`~/.local/bin`、`/usr/local/bin` |
 | `codexHome` | Codex 默认 | 传给 Codex 的 `CODEX_HOME` |
 | `runnerHome` | `~/.local/state/codex-runner` | 任务记录和日志目录 |
+| `maxStorageMb` | 留空（不限制） | `jobs` 与 `runs` 合计大小上限（MiB），须为正有限数字，可含小数；启动时尽力清理最旧的已结束任务，保留活任务和本次任务 |
 | `routerCheckUrl` | 空 | Codex 使用固定本机模型网关时，可填其 HTTP(S) 地址。runner 在 WSL 内先探测该主机和端口；不可达时报 `router_down`，不会先启动 Codex。仅探测，不修改模型配置。 |
 | `codexRoute` | 空 | `{ provider, baseUrl }`，只给插件启动的 Codex 指定已有的自定义提供方与 HTTP(S) 地址，不改 Codex 配置文件。未设置 `routerCheckUrl` 时，启动前向该地址的主机请求 `HEAD /`，确认网关有响应。环回地址只在该 Codex 进程中绕过代理。 |
 | `model` | Codex 配置 | 默认模型 |
@@ -207,7 +210,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `denyTools` | `[]` | 额外拒绝的工具名 |
 | `python` | `python3` | WSL 内运行 runner 的解释器 |
 
-插件加载时检查配置项类型；类型不对时记录带键名的警告，只将该项恢复默认值，其余设置继续生效。超时/重试项的 `null`、空字符串或省略均表示留空，不向 runner 传参；它们只通过插件配置设置，不增加单次工具调用参数。
+插件加载时检查配置项类型；类型不对时记录带键名的警告，只将该项恢复默认值，其余设置继续生效。超时/重试与存储上限项的 `null`、空字符串或省略均表示留空，不向 runner 传参；它们只通过插件配置设置，不增加单次工具调用参数。
 
 建议在项目的 `AGENTS.md` 里写明分工，例如：先写好每个任务的验收标准；用 `codex_run` 派活并尽量给出 `scope`；不把 Codex 的答复当作完成证据，用只读检查逐条核验；未通过先用 `codex_review` 记录证据，再用 `codex_continue` 沿用原权限修正。
 
@@ -269,6 +272,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `lockTimeoutSeconds` | Empty (unlimited) | Positive finite seconds waiting for directory write locks; expiry returns retryable `lock_timeout` before Codex starts. Null, empty or omitted passes no flag. |
+| `maxStorageMb` | Empty (unlimited) | Positive finite combined `jobs`/`runs` limit in MiB, including fractions; startup best-effort cleanup removes the oldest finished records, preserving active and current tasks. Null, empty or omitted passes no flag. |
 
 Execution, reconnect, exit-grace, status-wait and snapshot budgets use monotonic time; event/retry timestamps and displayed durations retain wall time. Unfinished `command_execution` items are tracked by ID: idle timeout pauses until all matching commands complete, while total timeout and reconnect limits remain active. Read-only resume threads survive route-check failures. Writers retain the full retry prompt until the current attempt reports command, file-change or assistant-message work; thread/turn startup and configuration warnings alone do not prove the user's continuation answer was saved. Failure classification reads only stderr added during the current attempt, while the full log retains all attempts.
 
@@ -312,6 +316,8 @@ Rows/results start with a summary such as `completed · 12 met / 1 blocked · 3 
 `codex_summary` groups actual threads, separating unthreaded jobs; default selection is the current session, with `cwd`/`thread_id` filters. It returns 10 groups per page by default; keep the same filters and `limit`, and pass `next_offset` as `offset` to continue. Group and round totals cover all matches. Top-level `error_kinds` and one rendered line count each error kind across all matching jobs, including separate rounds in the same thread, independent of the displayed page; no new filter is added. It shows files, open items and finished-round durations while keeping execution and verification separate, without claiming permanent project-wide correctness. Resumed usage is `usage_scope: "thread_total"`: take the latest cumulative value, never sum it repeatedly. Mixed/unknown accounting is marked; read-only retries after an actual Codex failure start fresh and omit that cumulative mark, while route-check failures preserve the resumed thread.
 
 ### Storage
+
+Optional `maxStorageMb` (runner `run` / `start --max-storage-mb N`) caps combined `jobs` and `runs` storage in MiB (1024² bytes). Omission is unlimited. After the existing 30-day cleanup, finished directories are removed oldest first by `result.json` save time, before creating the current task directory. Running/queued jobs and records whose worker or Codex process identity still matches are retained. Cleanup is best effort: deletion failures or retained tasks exceeding the limit do not fail the new task. This runs at startup and does not cap individual logs or growth of active tasks.
 
 `codex_jobs` queries workspace/session history by execution or attention state, linking runner/thread/native IDs and session journals. New jobs preserve original task/acceptance, owner and write context without a separate database or Windows command-line length limit. Unknown legacy ownership remains unknown and can be found by workspace. Stored normalized paths preserve historical scope conclusions after later symlink changes.
 
