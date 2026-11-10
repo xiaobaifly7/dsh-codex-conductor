@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.41` 的任务历史显示派单版本和进程号，以及可查的 Harness 后台状态。
+`0.9.42` 新增可选的 `gemini_write`，由 Gemini 写教程与文档正文，插件核对路径、字数和改动范围。
 
 ## 功能
 
@@ -22,6 +22,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | `codex_summary` | 按 Codex 线程汇总多轮结果、涉及文件、未闭环事项、已结束耗时和用量，并统计筛选范围内的错误类型；执行状态与独立核验分别展示，不重复相加线程累计用量 |
 | `codex_watch` | 安静观察当前会话的原生 Codex 后台任务，首次重要变化时通知；停止观察不会取消 Codex |
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效 |
+| `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 
 ### 任务生命周期
 
@@ -117,7 +118,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### 工作区护栏
 
-工具始终注册；`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
+十个 Codex 工具始终注册；`gemini_write` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
 
 - 拒绝直接写文件或执行任意代码的工具：`write`、`edit`、`pwsh`、`run_code`、`subagent_codex`，以及 `wsl-write`、`wsl-edit`、`wsl-term`、`wsl-bootstrap`、`actions_run`、`actions_configure`；MCP 工具按动作名拒绝（`write`、`edit`、`replace`、`insert`、`delete`、`execute` 等）。
 - Seep 的 `seep_r2_cmd` 是任意 radare2 命令入口，在受保护工作区交给 Codex 执行；`seep_r2_info`、`seep_status` 等结构化查询仍可用于只读核验。
@@ -214,6 +215,29 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 建议在项目的 `AGENTS.md` 里写明分工，例如：先写好每个任务的验收标准；用 `codex_run` 派活并尽量给出 `scope`；不把 Codex 的答复当作完成证据，用只读检查逐条核验；未通过先用 `codex_review` 记录证据，再用 `codex_continue` 沿用原权限修正。
 
+### Gemini 教程与文档写作（默认关闭）
+
+源码改动、源码调查和素材笔记用 `codex_run`；教程、文档正文用 `gemini_write`，一章一章做。需要本机已安装并登录的官方 Antigravity CLI（`agy.exe`）；写作要求与素材内容会发送给 Google。不配置 `gemini` 就不注册工具。`command` 必须是绝对 Windows 路径，缺失或无效时警告并关闭；DSH 桌面版可能重定向 `LOCALAPPDATA`，不能用它猜测 agy 的安装位置。
+
+```yaml
+- id: codex-conductor
+  config:
+    gemini:
+      command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
+      proxy: 'http://127.0.0.1:7890'
+      model: gemini-4-argon
+      effort: medium
+      timeoutSeconds: 600
+```
+
+`model / effort / timeoutSeconds` 的默认值如上，`effort` 支持 `low / medium / high`；`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
+
+调用示例：`gemini_write({"prompt":"根据素材写第一章入门说明，事实不得超出素材。","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`。`prompt` 至少 10 个字符；`sources` 为 1–20 个已有文件，总大小最多 1 MiB。素材与输出可用绝对路径或相对任务目录的路径，`cwd` 选择规则同 `codex_run`，Windows 下也接受 `/mnt/<盘符>/...`。输出必须在任务目录内、不能与素材相同；已有目标须传 `overwrite=true`。单次可覆盖 `model / effort`。
+
+同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 字符计数（含标点和空白），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报。超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`；`next` 提示核对内容、超限重写或处理范围外改动，`usage` 透传 CLI 用量。
+
+`files_changed` 来自目标所在目录及子目录的文件名、大小、mtime 快照，最多检查 1,000 个目录项，不跟随符号链接；达到上限会设置 `snapshot.truncated=true` 并注明未覆盖部分。`write_paths` 保存 stdout 的 `write_file` 路径旁证；除目标外的快照改动与写入事件列入 `out_of_scope`，需核实是否来自同时段其他进程。`accept-edits` 不是单文件沙箱；目录之外、快照未覆盖且没有写入事件的操作无法由这份清单证明，工具也不会自动回滚改动。
+
 ## 单独使用 runner
 
 ```text
@@ -254,9 +278,32 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.41` shows the dispatch version and process in job history, along with the live Harness background status when available.
+`0.9.42` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
 
-A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+
+### Gemini tutorial and documentation writing (off by default)
+
+Use `codex_run` for source changes, investigation and material notes; use `gemini_write` for tutorial/document prose, one chapter at a time. It requires the official Antigravity CLI (`agy.exe`), already installed and signed in locally. Prompts and inline source content are sent to Google. Without `gemini`, the tool is not registered. A missing/invalid `command` warns and disables it; supply an absolute Windows path because desktop DSH can redirect `LOCALAPPDATA`.
+
+```yaml
+- id: codex-conductor
+  config:
+    gemini:
+      command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
+      proxy: 'http://127.0.0.1:7890'
+      model: gemini-4-argon
+      effort: medium
+      timeoutSeconds: 600
+```
+
+The last three values are the defaults; effort accepts `low / medium / high`. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
+
+`gemini_write` requires a `prompt` of at least 10 characters, 1–20 existing `sources` totaling at most 1 MiB, and one `output`. Source/output paths are absolute or relative to the task directory; `cwd` follows `codex_run` selection and accepts Windows or mounted `/mnt/<drive>/...` paths on Windows. Output must stay inside the task directory, differ from all sources, and requires `overwrite=true` when present. Per-call `model`, `effort` and positive `max_chars` are optional. For example: `gemini_write({"prompt":"Write chapter one using only the supplied facts.","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`.
+
+Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode characters including whitespace/punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`). CLI errors, missing output/result, timeout, cancellation, excess length or out-of-scope writes return `failed`; `next` requests content verification, rewriting or scope review, and `usage` passes through CLI usage.
+
+`files_changed` compares names/sizes/mtimes under the output's parent directory recursively, without following symlinks, capped at 1,000 entries; `snapshot.truncated` discloses incomplete coverage. `write_paths` retains stdout `write_file` paths as supporting evidence; extra snapshot changes/events appear in `out_of_scope` and may include concurrent writers. The tool remains available inside guarded workspaces. `accept-edits` is not a single-file sandbox: unreported operations outside snapshot coverage cannot be established by this list, and changes are not automatically rolled back.
 
 ### Task lifecycle
 
