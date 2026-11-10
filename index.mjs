@@ -273,6 +273,7 @@ export function createConductor(cfg, run = runRunner) {
     for (const key of ['cwd', 'owner', 'status']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
     for (const [key, flag] of [['thread_id', '--thread-id'], ['parent_job', '--parent-job']]) if (filters[key] !== undefined) argv.push(flag, filters[key]);
     if (filters.needs_attention) argv.push('--needs-attention');
+    if (filters.scope_conflicts) argv.push('--scope-conflicts');
     for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
     return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -957,7 +958,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
       if (!cfg.plannerAnswers && !continuation && args.write && owner) {
         for (let offset = 0; offset !== null;) {
-          const history = await conductor.list({ owner, needs_attention: true, limit: 100, offset }, exec?.signal);
+          const history = await conductor.list({ owner, scope_conflicts: true, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对已有写入范围', history);
           for (const job of history.jobs) {

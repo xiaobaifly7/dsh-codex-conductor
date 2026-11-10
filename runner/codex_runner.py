@@ -1282,6 +1282,9 @@ def job_details(job):
 
 
 def matching_jobs(args):
+    scope_conflicts = getattr(args, "scope_conflicts", False)
+    needs_attention = args.needs_attention or scope_conflicts
+
     def matches_metadata(value, job_id):
         context = value.get("context")
         if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
@@ -1333,15 +1336,19 @@ def matching_jobs(args):
         if getattr(args, "parent_job", None) and parent != args.parent_job:
             continue
         value.update(job_id=job_dir.name, _record=record)
-        if args.status or args.needs_attention:
+        if args.status or needs_attention:
             value = job_details(value)
         if args.status and value["execution_status"] != args.status:
             continue
         verification = value.get("verification_status", "unreviewed")
         attention = verification in ("needs_changes", "invalid") or (
             verification == "unreviewed" and value.get("review_status") == "needs_attention")
-        if args.needs_attention and not attention:
+        if needs_attention and not attention:
             continue
+        if scope_conflicts:
+            blocking = value["blocking"]
+            if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
+                continue
         jobs.append({**value, "parent_job_id": parent,
                      "started_at": args_file.stat().st_mtime if args_file.exists() else None,
                      "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
@@ -1594,6 +1601,7 @@ def main():
         command.add_argument("--parent-job", type=job_identifier)
         command.add_argument("--offset", type=int, default=0)
     listing.add_argument("--limit", type=int, default=20)
+    listing.add_argument("--scope-conflicts", action="store_true")
     summary.add_argument("--limit", type=int, default=10)
     summary.add_argument("--round-limit", type=int, default=20)
     review = sub.add_parser("review")

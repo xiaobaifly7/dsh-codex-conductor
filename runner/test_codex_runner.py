@@ -2264,6 +2264,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"keep", "explicit"})
         self.assertEqual(read.call_count, 2)
 
+    def test_scope_conflict_list_filters_before_pagination(self):
+        conflict = self.blocker(kind="task_conflict")
+        for job_id, blockers, owner in (
+                ("report-conflict", [conflict], "owner-a"),
+                ("review-conflict", [], "owner-a"),
+                ("user-question", [self.blocker()], "owner-a"),
+                ("closed-conflict", [conflict], "owner-a"),
+                ("other-owner", [conflict], "owner-b")):
+            self.stored_job(job_id, {"status": "completed", "structured": self.sample_report(blockers=blockers)},
+                            context=self.sample_context(owner))
+        review = self.sample_review(status="needs_changes", blockers=[conflict])
+        self.assertEqual(self.submit_review("review-conflict", review)["verification_status"], "needs_changes")
+        self.assertEqual(self.submit_review("closed-conflict", self.sample_review())["verification_status"], "verified")
+
+        args = ("list", "--owner", "owner-a", "--scope-conflicts", "--limit", "1")
+        first = self.control(*args)
+        self.assertEqual(first["total"], 2)
+        second = self.control(*args, "--offset", str(first["next_offset"]))
+        self.assertEqual(second["total"], 2)
+        self.assertIsNone(second["next_offset"])
+        self.assertEqual({first["jobs"][0]["job_id"], second["jobs"][0]["job_id"]},
+                         {"report-conflict", "review-conflict"})
+
     def test_running_list_skips_finished_artifacts(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
