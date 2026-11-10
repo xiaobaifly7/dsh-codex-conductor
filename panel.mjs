@@ -67,26 +67,12 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;
-      const since = now - 24 * 60 * 60;
-      const ids = new Set();
-      let offset = 0;
-      for (;;) {
-        const page = runnerResult(await conductor.list({ needs_attention: true, limit: 100, offset }));
-        if (!Array.isArray(page?.jobs) || !Number.isSafeInteger(page.total) || page.total < 0 ||
-            page.jobs.length > 100 || (page.offset !== undefined && page.offset !== offset) ||
-            (!page.jobs.length && offset < page.total)) {
-          throw bad('任务列表暂时不完整，请刷新状态后再试。', 502);
-        }
-        // The runner sorts by start time, newest first; older pages cannot add recent tasks.
-        let older = false;
-        for (const job of page.jobs) {
-          if (!Number.isFinite(job.started_at)) continue;
-          if (job.started_at < since) older = true;
-          else if (job.started_at <= now) ids.add(job.job_id);
-        }
-        offset += page.jobs.length;
-        if (older || offset >= page.total) return { total: ids.size };
+      const page = runnerResult(await conductor.list({ needs_attention: true, limit: 1, started_between: [now - 86400, now] }));
+      if (!Number.isSafeInteger(page?.total) || page.total < 0 || !Array.isArray(page.jobs) ||
+          page.jobs.length !== Math.min(page.total, 1)) {
+        throw bad('任务列表暂时不完整，请刷新状态后再试。', 502);
       }
+      return { total: page.total };
     }
     if (route === '/settings' && method === 'GET') return panelSettings(cfg);
     if (['/settings', '/settings/apply', '/settings/cancel', '/reload'].includes(route)) {

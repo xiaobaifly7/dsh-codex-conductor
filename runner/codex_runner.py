@@ -14,6 +14,7 @@ from functools import cache
 import hashlib
 import http.client
 import json
+from math import isfinite
 import os
 import queue
 import random
@@ -1285,6 +1286,7 @@ def job_details(job):
 
 def matching_jobs(args):
     scope_conflicts = getattr(args, "scope_conflicts", False)
+    started_between = getattr(args, "started_between", None)
     needs_attention = args.needs_attention or scope_conflicts
     resolve = os.path.realpath
     # The panel lists the same paths across many rows; reuse them only for this display query.
@@ -1311,6 +1313,13 @@ def matching_jobs(args):
         if getattr(args, "command", None) == "summary" and not args.owner and args.job_id and job_dir.name not in args.job_id:
             continue
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+        if started_between is not None:
+            try:
+                started_at = args_file.stat().st_mtime
+            except FileNotFoundError:
+                continue
+            if not started_between[0] <= started_at <= started_between[1]:
+                continue
         try:
             finished = result_file.exists()
             # Only terminal jobs publish result.json.
@@ -1356,8 +1365,10 @@ def matching_jobs(args):
             blocking = value["blocking"]
             if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
                 continue
+        if started_between is None:
+            started_at = args_file.stat().st_mtime if args_file.exists() else None
         jobs.append({**value, "parent_job_id": parent,
-                     "started_at": args_file.stat().st_mtime if args_file.exists() else None,
+                     "started_at": started_at,
                      "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
                      "updated_at": max(p.stat().st_mtime for p in (job_dir, args_file, result_file, job_dir / "events.jsonl",
                                                                  job_dir / "reviews.json") if p.exists())})
@@ -1609,6 +1620,7 @@ def main():
         command.add_argument("--offset", type=int, default=0)
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--scope-conflicts", action="store_true")
+    listing.add_argument("--started-between", nargs=2, type=float, metavar=("START", "END"))
     summary.add_argument("--limit", type=int, default=10)
     summary.add_argument("--round-limit", type=int, default=20)
     review = sub.add_parser("review")
@@ -1620,6 +1632,10 @@ def main():
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
+    if args.command == "list" and args.started_between is not None:
+        start, end = args.started_between
+        if not (isfinite(start) and isfinite(end) and start <= end):
+            parser.error("--started-between requires finite epoch seconds in order")
     if args.command == "forget-too-big":
         try:
             emit({"status": "completed", "removed": forget_too_big(args.cwd)})

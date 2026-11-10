@@ -275,6 +275,7 @@ export function createConductor(cfg, run = runRunner) {
     for (const [key, flag] of [['thread_id', '--thread-id'], ['parent_job', '--parent-job']]) if (filters[key] !== undefined) argv.push(flag, filters[key]);
     if (filters.needs_attention) argv.push('--needs-attention');
     if (filters.scope_conflicts) argv.push('--scope-conflicts');
+    if (filters.started_between) argv.push('--started-between', ...filters.started_between.map(String));
     for (const id of filters.job_ids ?? []) argv.push('--job-id', id);
     return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }

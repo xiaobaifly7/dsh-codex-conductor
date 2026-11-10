@@ -2264,6 +2264,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"keep", "explicit"})
         self.assertEqual(read.call_count, 2)
 
+    def test_recent_attention_filters_start_time_before_pagination(self):
+        for job_id, started in (("old", 999), ("first", 1000), ("middle", 1500), ("last", 2000),
+                                ("future", 2001), ("unknown", None)):
+            directory = self.stored_job(job_id, {"status": "failed", "error_kind": "router_down"})
+            args_file = directory / "args.json"
+            if started is None:
+                args_file.unlink()
+            else:
+                os.utime(args_file, (started, started))
+        closed = self.stored_job("verified", {"status": "completed", "structured": self.sample_report()},
+                                 context=self.sample_context())
+        os.utime(closed / "args.json", (1500, 1500))
+        self.assertEqual(self.submit_review("verified", self.sample_review())["verification_status"], "verified")
+
+        window = ("list", "--needs-attention", "--started-between", "1000", "2000")
+        first = self.control(*window, "--limit", "1")
+        self.assertEqual(first["total"], 3)
+        self.assertEqual([j["job_id"] for j in first["jobs"]], ["last"])
+        self.assertEqual([j["job_id"] for j in self.control(*window)["jobs"]], ["last", "middle", "first"])
+        self.assertEqual(self.control("list", "--needs-attention")["total"], 6)
+        for bounds in (("nan", "2000"), ("2001", "2000")):
+            self.assertEqual(self.control("list", "--started-between", *bounds)["error_kind"], "bad_arguments")
+
     def test_scope_conflict_list_filters_before_pagination(self):
         conflict = self.blocker(kind="task_conflict")
         for job_id, blockers, owner in (

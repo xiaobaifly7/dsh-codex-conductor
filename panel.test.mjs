@@ -191,8 +191,10 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments, [{ action: 'status' }]);
   assert.equal(f.conductor.list.mock.callCount(), 0);
-  assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 0 } });
-  assert.deepEqual(f.conductor.list.mock.calls[0].arguments, [{ needs_attention: true, limit: 100, offset: 0 }]);
+  t.mock.method(Date, 'now', () => 1800000000000);
+  assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 1 } });
+  assert.deepEqual(f.conductor.list.mock.calls[0].arguments,
+    [{ needs_attention: true, limit: 1, started_between: [1799913600, 1800000000] }]);
   assert.deepEqual(await f.request('GET', '/settings'), { status: 200, body: panelSettings(f.cfg) });
   const settings = { model: 'codex/gpt-6:latest', plannerAnswers: true, gemini: { effort: 'high' } };
   assert.deepEqual(await f.request('POST', '/settings', settings),
@@ -228,20 +230,14 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, undefined]);
 });
 
-test('panel attention counts starts in the past 24 hours across pages and stops before old history', async (t) => {
+test('panel attention counts the last 24 hours with one runner query', async (t) => {
   const f = fixture(t);
   const now = 1800000000;
   t.mock.method(Date, 'now', () => now * 1000);
-  const recent = Array.from({ length: 101 }, (_, i) => ({ job_id: 'recent-' + i, started_at: now - i }));
-  const rows = [{ job_id: 'future', started_at: now + 1 }, { job_id: 'unknown', started_at: null }, ...recent,
-    { job_id: 'boundary', started_at: now - 86400 },
-    ...Array.from({ length: 524 }, (_, i) => ({ job_id: 'old-' + i, started_at: now - 86401 - i }))];
-  f.conductor.list.mock.mockImplementation(async ({ offset, limit, needs_attention }) => {
-    assert.equal(needs_attention, true);
-    return { total: rows.length, offset, jobs: rows.slice(offset, offset + limit) };
-  });
+  f.conductor.list.mock.mockImplementation(async () => ({ total: 102, jobs: [{ job_id: 'recent' }] }));
   assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 102 } });
-  assert.deepEqual(f.conductor.list.mock.calls.map(({ arguments: [args] }) => args.offset), [0, 100]);
+  assert.deepEqual(f.conductor.list.mock.calls.map(({ arguments: args }) => args),
+    [[{ needs_attention: true, limit: 1, started_between: [now - 86400, now] }]]);
   for (const page of [{ total: 1, jobs: [] }, { total: 1, jobs: null }, { total: -1, jobs: [] }]) {
     f.conductor.list.mock.mockImplementation(async () => page);
     rejected(await f.request('GET', '/attention'), 502, /列表.*请/);
