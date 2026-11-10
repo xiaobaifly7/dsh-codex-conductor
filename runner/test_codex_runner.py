@@ -1031,6 +1031,22 @@ class RunnerTests(unittest.TestCase):
             f.write("\n" + item("item.started", "file_change", changes=[{"path": "/mnt/d/x/a.ps1"}]))
         self.assertEqual(codex_runner.last_activity(events), "editing: a.ps1")
 
+    def test_runner_phase_cache_avoids_event_scans_and_legacy_logs_still_work(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        events = self.cwd / "events.jsonl"
+        codex_runner.runner_event(self.cwd, 2, "retry_wait", "transient", 1234)
+        with events.open("ab") as f:
+            f.write(b'{"type":"item.updated"}\n' * 10000)
+        expected = {"phase": "retry_wait", "attempt": 2, "last_error_kind": "transient", "retry_at": 1234}
+        with mock.patch("builtins.open", side_effect=AssertionError("scanned the full events log")):
+            self.assertEqual(codex_runner.runner_activity(events), expected)
+        (self.cwd / "phase.json").unlink()
+        self.assertEqual(codex_runner.runner_activity(events), expected)
+        (self.cwd / "phase.json").write_text("interrupted cache write")
+        self.assertEqual(codex_runner.runner_activity(events), expected)
+
     def test_model_effort_and_fast_mode_reach_codex(self):
         sys.path.insert(0, str(RUNNER.parent))
         import argparse

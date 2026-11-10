@@ -1132,10 +1132,20 @@ def runner_event(run_dir, attempt, phase, reason=None, retry_at=None):
              "time": time.time(), "retry_at": retry_at}
     with open(run_dir / "events.jsonl", "ab") as f:
         f.write((json.dumps(event) + "\n").encode("utf-8"))
+    tmp = run_dir / "phase.json.tmp"
+    tmp.write_text(json.dumps(event), "utf-8")
+    os.replace(tmp, run_dir / "phase.json")
 
 
 def runner_activity(events):
     activity = {"phase": None, "attempt": None, "last_error_kind": None, "retry_at": None}
+    try:
+        event = json.loads(events.with_name("phase.json").read_text("utf-8"))
+        if isinstance(event, dict) and event.get("type") == "runner.phase":
+            return {"phase": event.get("phase"), "attempt": event.get("attempt"),
+                    "last_error_kind": event.get("reason"), "retry_at": event.get("retry_at")}
+    except (OSError, ValueError):
+        pass
     try:
         with open(events, "rb") as f:
             position = f.seek(0, os.SEEK_END)
