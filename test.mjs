@@ -1267,6 +1267,26 @@ test('codex_review rejects other or unknown owners before recording any review',
   assert.ok(h.calls.every((argv) => argv[0] === 'status'));
 });
 
+test('codex_review cannot record accepted deviations before the user replies', async () => {
+  const source = workflowSource('implementation');
+  source.structured.deviations = ['CSV 输出文件名有偏差'];
+  const accepted_deviations = [{ kind: 'reported', index: 1, evidence: '已核对偏差的影响' }];
+  const args = { job_id: 'PARENT', status: 'accepted_deviations',
+    criteria: [{ index: 1, status: 'met', evidence: 'CSV 测试通过' }], accepted_deviations };
+  const [registered, settled, human] = answeredParent;
+  const notice = { ...human, data: { source: { kind: 'tool-jobs' } } };
+  const h = harness({ config: { reviewResult: { ...source, verification_status: 'accepted_deviations' } } });
+  h.finals.PARENT = source;
+  for (const status of ['accepted_deviations', 'verified', 'needs_changes']) {
+    const exec = { agent: agentAt('/work/current', [human, registered, settled, notice]) };
+    await assert.rejects(h.tools.codex_review.execute({ ...args, status }, exec), /用户确认.*未写入核验/);
+  }
+  assert.equal(h.calls.filter(argv => argv[0] === 'review').length, 0);
+  const value = await h.tools.codex_review.execute(args, { agent: agentAt('/work/current', [...answeredParent, notice]) });
+  assert.equal(value.verification_status, 'accepted_deviations');
+  assert.deepEqual(JSON.parse(h.requests.find(({ argv }) => argv[0] === 'review').stdin).accepted_deviations, accepted_deviations);
+});
+
 test('codex_review sends every criterion in stdin and returns verification without rewriting the report', async () => {
   const source = workflowSource('implementation');
   source.context.acceptance.push('旧 CSV 文件保持不变');

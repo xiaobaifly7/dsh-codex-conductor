@@ -1715,7 +1715,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   ctx.tools.register({
     name: 'codex_review',
     description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
-      'accepted_deviations=逐条通过且明确接受原报告偏差/范围外改动。不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
+      'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
@@ -1723,7 +1723,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
           evidence: { type: 'string', minLength: 1 } }, required: ['index', 'status', 'evidence'] } },
       notes: { type: 'string', description: '没有补充说明可省略。' },
-      accepted_deviations: { type: 'array', description: '需要接受原报告偏差或范围外改动时逐项填证据；没有时可省略。', items: { type: 'object', additionalProperties: false,
+      accepted_deviations: { type: 'array', description: '原会话用户在作业结束后明确接受偏差或范围外改动时，逐项记录确认依据；没有时可省略。', items: { type: 'object', additionalProperties: false,
         properties: { kind: { type: 'string', enum: ['reported', 'scope'] }, index: { type: 'integer', minimum: 1 },
           evidence: { type: 'string', minLength: 1 } }, required: ['kind', 'index', 'evidence'] } },
       blockers: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
@@ -1739,6 +1739,10 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
       const { job_id, notes = '', accepted_deviations = [], ...review } = args;
+      if (Array.isArray(accepted_deviations) && accepted_deviations.length > 0 &&
+          !hasUserReply(exec.agent.session?.log ?? [], source, owner)) {
+        throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
+      }
       const result = await conductor.review(job_id, { ...review, notes, accepted_deviations }, owner, exec?.signal);
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
