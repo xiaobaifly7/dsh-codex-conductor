@@ -41,6 +41,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
     say(type="thread.started", thread_id="thread-1")
+    if mode == "retry_before_turn" and calls == 0:
+        say(type="error", message="connection reset before prompt submission")
+        sys.exit(1)
     say(type="turn.started")
     if mode == "warnings_then_ok":
         say(type="item.completed", item={"type": "error", "message": "Codex is ignoring 2 unrecognized settings"})
@@ -71,6 +74,7 @@ FAKE_CODEX = textwrap.dedent(r"""
         time.sleep(300)
     elif mode in ("transient_then_ok", "transient_with_inherited_group_child", "success_with_inherited_group_child"):
         if calls == 0:
+            say(type="item.completed", item={"id": "command-0", "type": "command_execution", "status": "completed"})
             if mode != "transient_then_ok":
                 child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"],
                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -79,6 +83,12 @@ FAKE_CODEX = textwrap.dedent(r"""
                 say(type="error", message="stream disconnected before completion")
                 say(type="turn.failed", error={"message": "stream disconnected before completion"})
                 sys.exit(1)
+        finish()
+    elif mode in ("retry_before_turn", "retry_after_warning"):
+        if calls == 0:
+            say(type="item.completed", item={"type": "error", "message": "unrecognized configuration"})
+            say(type="error", message="connection reset before recording input")
+            sys.exit(1)
         finish()
     elif mode == "permanent":
         say(type="turn.failed", error={"message": "401 Unauthorized"})
@@ -330,6 +340,19 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["usage_scope"], "thread_total")
                 self.assertEqual(self.calls()[-1]["prompt"], "NEW TASK: fix the CSV parser")
                 self.assertIn("writer-9", self.calls()[-1]["argv"])
+
+    def test_writer_resume_preserves_prompt_before_work_events(self):
+        prompt = "User answer: keep column B and finish the original acceptance criteria"
+        for mode in ("retry_before_turn", "retry_after_warning"):
+            with self.subTest(mode=mode):
+                self.state = Path(self.tmp.name) / mode
+                value = self.invoke("--sandbox", "workspace-write", "--resume", "writer-9", mode=mode,
+                                    prompt=prompt, env={"FAKE_STATE": str(self.state)})
+                self.assertEqual(value["status"], "completed")
+                self.assertEqual(value["attempts"], 2)
+                self.assertEqual(self.calls()[-1]["prompt"], prompt)
+                self.assertIn("resume", self.calls()[-1]["argv"])
+
 
     def test_pid_and_event_write_errors_reap_the_process_and_preserve_the_error(self):
         sys.path.insert(0, str(RUNNER.parent))
