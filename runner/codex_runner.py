@@ -140,8 +140,11 @@ def process_start(pid):
 
 
 def record_pid(path, pid):
-    path.with_suffix(".start").write_text(process_start(pid) or "")
-    path.write_text(str(pid))
+    publisher = os.getpid()
+    for target, value in ((path.with_suffix(".start"), process_start(pid) or ""), (path, str(pid))):
+        tmp = target.with_name(f"{target.name}.{publisher}.tmp")
+        tmp.write_text(value)
+        os.replace(tmp, target)
 
 
 def recorded_pid(path):
