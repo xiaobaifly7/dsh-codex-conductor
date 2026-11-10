@@ -102,6 +102,31 @@ test('readable report preserves evidence, questions, deviations and unresolved i
   assert.equal(nodes(tree).filter((node) => node.type === 'details').length, 1);
 });
 
+test('readable report maps original criteria by number and expands long Unicode requirements', () => {
+  const { ReadableReport } = clientHost().exports;
+  const acceptance = Array.from({ length: 10 }, (_, i) => `验收要求 ${i + 1}`);
+  acceptance[9] = '🙂'.repeat(350);
+  const report = { ...sample(), criteria: [
+    { criterion: '1', status: 'met', evidence: '刷新后设置仍然可见' },
+    { criterion: '２）', status: 'not_met', evidence: '仍需补充验证' },
+    { criterion: '第10条', status: 'blocked', evidence: '没有测试设备' },
+    { criterion: '11', status: 'blocked', evidence: '旧记录没有原文' },
+  ] };
+  const tree = ReadableReport({ report, acceptance });
+  const headings = nodes(tree).filter((node) => node.type === 'strong').map(text);
+  assert.deepEqual(headings, ['第 1 条：验收要求 1 —— 通过', '第 2 条：验收要求 2 —— 未通过',
+    `第 10 条：${'🙂'.repeat(300)}… —— 受阻`, '受阻：11']);
+  const details = nodes(tree).filter((node) => node.type === 'details');
+  assert.equal(details.length, 1);
+  assert.ok(text(details[0]).includes('展开验收标准原文'));
+  assert.ok(text(details[0]).includes(acceptance[9]));
+  for (const item of report.criteria) assert.ok(text(tree).includes(`证据：${item.evidence}`));
+  const legacy = ReadableReport({ report: sample(), acceptance: acceptance.slice(0, 3) });
+  assert.ok(text(legacy).includes('第 1 条：验收要求 1 —— 通过'));
+  const mismatched = ReadableReport({ report: sample(), acceptance: acceptance.slice(0, 2) });
+  assert.ok(text(mismatched).includes('通过：保存设置'));
+});
+
 function reportReader(content, requests, total = true) {
   const chars = Array.from(content);
   return async (path) => {
@@ -133,10 +158,14 @@ test('report reader assembles all pages using runner character offsets and limit
 });
 
 test('report view defaults to readable; raw page navigation reuses cached full report', async (t) => {
-  const requests = [], read = reportReader(JSON.stringify({ ...sample(), summary: '概述'.repeat(4100) }), requests);
-  const host = clientHost(read); t.after(() => host.dispose());
+  const requests = [], report = { ...sample(), summary: '概述'.repeat(4100) };
+  report.criteria[0].criterion = '1';
+  const read = reportReader(JSON.stringify(report), requests);
+  const host = clientHost(async (...args) => ({ ...await read(...args), acceptance: ['保存设置后刷新仍可见', '查看报告', '验证接回'] }));
+  t.after(() => host.dispose());
   host.mount(host.exports.Report, { jobId: 'J' }); await host.flush();
   assert.ok(text(host.tree).includes('逐条验收'));
+  assert.ok(text(host.tree).includes('第 1 条：保存设置后刷新仍可见 —— 通过'));
   await click(host, '查看原文');
   assert.ok(text(host.tree).includes('第 1 页'));
   await click(host, '下一页'); await click(host, '上一页'); await click(host, '查看易读报告');

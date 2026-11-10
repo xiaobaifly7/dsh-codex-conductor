@@ -109,17 +109,26 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function ReadableReport({ report }) {
+    function ReadableReport({ report, acceptance = [] }) {
       const list = (title, items) => items.length ? h('div', null, h('h4', null, title),
         h('ul', null, ...items.map((text, i) => h('li', { key: i }, text)))) : null;
       return h('div', { className: 'dcc-readable' },
         h('h4', null, '概述'), h('p', null, report.summary || 'Codex 没有填写概述。'),
         h('h4', null, '逐条验收（Codex 自述）'),
         h('small', null, '以下是 Codex 的汇报，还需要核对实际结果。'),
-        h('ol', null, ...report.criteria.map((item, i) => h('li', { key: i },
-          h('strong', null, `${{ met: '通过', not_met: '未通过', blocked: '受阻' }[item.status]}：${item.criterion}`),
-          item.evidence.length > 300 ? h('details', null, h('summary', null, '展开 Codex 给的证据'), h('p', null, item.evidence))
-            : h('p', null, `证据：${item.evidence || '未提供'}`)))),
+        h('ol', null, ...report.criteria.map((item, i) => {
+          const number = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、]|$)/.exec(item.criterion.normalize('NFKC'))?.[1];
+          const index = number === undefined ? i + 1 : Number(number);
+          const original = (number !== undefined || acceptance.length === report.criteria.length) && acceptance[index - 1];
+          const chars = typeof original === 'string' ? Array.from(original) : [];
+          const status = { met: '通过', not_met: '未通过', blocked: '受阻' }[item.status];
+          return h('li', { key: i },
+            h('strong', null, chars.length ? `第 ${index} 条：${chars.slice(0, 300).join('')}${chars.length > 300 ? '…' : ''} —— ${status}`
+              : `${status}：${item.criterion}`),
+            chars.length > 300 ? h('details', null, h('summary', null, '展开验收标准原文'), h('p', null, original)) : null,
+            item.evidence.length > 300 ? h('details', null, h('summary', null, '展开 Codex 给的证据'), h('p', null, item.evidence))
+              : h('p', null, `证据：${item.evidence || '未提供'}`));
+        })),
         report.blockers?.length ? h('div', null, h('h4', null, 'Codex 留下的问题（以下为 Codex 原话）'),
           ...report.blockers.map((item) => h('div', { key: item.id, className: 'dcc-status' },
             h('p', null, `问题：${item.message}`), h('p', null, `它想问：${item.question || '未填写'}`),
@@ -267,7 +276,7 @@ window.__ModuleLoader__.load({
         document && !document.report && !document.tooLarge ? h('small', null, '这份报告不支持易读视图，以下显示原文。') : null,
         h(Message, { text: error, error: true }),
         loading ? h('p', { role: 'status' }, '正在读取报告…') : null,
-        readable ? h(ReadableReport, { report: document.report }) : page ? h('pre', { className: 'dcc-report', tabIndex: 0, 'aria-label': '本页报告全文' }, page.text || '这一页还没有输出。') : null,
+        readable ? h(ReadableReport, { report: document.report, acceptance: document.pages[0].acceptance }) : page ? h('pre', { className: 'dcc-report', tabIndex: 0, 'aria-label': '本页报告全文' }, page.text || '这一页还没有输出。') : null,
         h('div', { className: 'dcc-row' },
           !readable ? h(Button, { size: 'sm', disabled: loading || pageIndex === 0, onClick: () => setPageIndex((v) => v - 1) }, '上一页') : null,
           !readable ? h(Button, { size: 'sm', disabled: loading || !page || page.eof || !(page.next_offset > page.offset), onClick: nextPage }, '下一页') : null,

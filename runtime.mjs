@@ -180,7 +180,7 @@ function profileRecord(profileFile, moduleUrl, readRelocated = false) {
   const decoded = decodeProfile(bytes);
   const exact = ownEntry(decoded.text, moduleUrl);
   const entry = exact ?? (readRelocated ? ownEntry(decoded.text, moduleUrl, true) : null);
-  if (!entry) throw new Error('Expected one runtime entry; found 0');
+  if (!entry) throw Object.assign(new Error('Expected one runtime entry; found 0'), { status: 409 });
   return { bytes, ...decoded, entry, exact: exact !== null };
 }
 
@@ -190,14 +190,18 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
   const { record: loaded, error: loaded_error } = loadedRecord(loadedFile);
   let profile_module = null;
   let profile_error = null;
+  let profile_error_status = null;
   let can_reload = false;
   try {
     const profile = profileRecord(profileFile, moduleUrl, true);
     profile_module = profile.entry.name.value;
     can_reload = profile.exact;
-    if (!can_reload) profile_error = '配置指向另一位置，旧实例不能改写；请在 DeepSeek Harness 中刷新插件。';
+    if (!can_reload) {
+      profile_error = '配置指向另一位置，旧实例不能改写；请在 DeepSeek Harness 中刷新插件。';
+      profile_error_status = 409;
+    }
   }
-  catch (error) { profile_error = error.message; }
+  catch (error) { profile_error = error.message; profile_error_status = error.status ?? 500; }
   let state = 'unknown';
   if (loaded) {
     const different = modulePath(loaded.module) !== modulePath(source.module) ||
@@ -210,7 +214,7 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
         loaded.dirty === false && source.dirty === false) state = 'synchronized';
   }
   return { source, instance: loadedIdentity, loaded, loaded_error, profile_module, profile_error,
-    active_tasks: activeTasks, state, can_reload };
+    ...(profile_error ? { profile_error_status } : {}), active_tasks: activeTasks, state, can_reload };
 }
 
 const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
@@ -331,7 +335,7 @@ export function writeBackedUpFile(file, bytes, expected = readFileSync(file), ba
     const fd = openSync(temporary, 'wx', mode);
     created = true;
     try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
-    if (!readFileSync(file).equals(expected)) throw new Error('文件在保存前已被其他程序修改，请刷新后再试');
+    if (!readFileSync(file).equals(expected)) throw Object.assign(new Error('文件在保存前已被其他程序修改，请刷新后再试'), { status: 409 });
     if (backupFile) writeFileSync(backupFile, expected, { flag: 'wx', mode });
     renameSync(temporary, file);
     created = false;
@@ -481,7 +485,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     try {
       signal?.throwIfAborted();
       if (pending.profile_file !== profileFile || pending.module_path !== modulePath(moduleUrl)) {
-        throw new Error('待生效的设置属于另一份安装或配置，请撤销后重新保存。');
+        throw Object.assign(new Error('待生效的设置属于另一份安装或配置，请撤销后重新保存。'), { status: 409 });
       }
       // Revalidate against the current profile, including Gemini and supported YAML shapes.
       const profile = profileRecord(profileFile, moduleUrl);
@@ -497,7 +501,8 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         writePending({ ...readPending(), error: `设置未能生效：${error.message} 请修改后重新保存，或撤销这次修改。` });
       }
       if (signal?.aborted) throw error;
-      return { ...snapshot(current.active_tasks), status: 'failed', saved: true, error: pendingView()?.error ?? error.message };
+      return { ...snapshot(current.active_tasks), status: 'failed', saved: true, error_status: error.status ?? 500,
+        error: pendingView()?.error ?? error.message };
     }
   }
   function startPending(current, generation) {
@@ -544,7 +549,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
     cancelPending() {
       const pending = readPending();
-      if (pending?.expected_module && pendingView()) throw new Error('设置已写入，不能撤销。请等待加载后再保存新的设置。');
+      if (pending?.expected_module && pendingView()) throw Object.assign(new Error('设置已写入，不能撤销。请等待加载后再保存新的设置。'), { status: 409 });
       clearPending();
       pendingController?.abort();
       pendingController = undefined;
@@ -557,7 +562,8 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       if (!['idle', 'now'].includes(when)) throw new Error('codex_runtime: invalid when');
       let current = null;
       if (action === 'reload' && !profileFile) {
-        return { ...snapshot(null), status: 'failed', error_kind: 'profile_not_configured', error: 'runtimeProfileFile 未配置，无法请求重载。' };
+        return { ...snapshot(null), status: 'failed', error_kind: 'profile_not_configured', error_status: 409,
+          error: 'runtimeProfileFile 未配置，无法请求重载。' };
       }
       try {
         let count = null;
@@ -577,10 +583,10 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         if (changes) {
           const profile = profileRecord(profileFile, moduleUrl);
           settingsEdits(profile, changes);
-          if (active_error && when === 'idle') return { ...current, status: 'failed', error: active_error };
+          if (active_error && when === 'idle') return { ...current, status: 'failed', error_status: 502, error: active_error };
           if (!pendingFile) {
             if (when === 'now' || count === 0) return await reload(current, exec?.signal, changes);
-            throw new Error('没有可用的本地保存目录，无法保存待生效的设置。请配置本地数据目录后重试。');
+            throw Object.assign(new Error('没有可用的本地保存目录，无法保存待生效的设置。请配置本地数据目录后重试。'), { status: 409 });
           }
           writePending({ id: randomUUID(), profile_file: profileFile, module_path: modulePath(moduleUrl),
             changes, saved_at: new Date().toISOString() });
@@ -594,16 +600,16 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         }
         const awaiting = pendingReload(current);
         if (active_error && when === 'idle' && !awaiting) {
-          return { ...current, status: 'failed', error_kind: 'active_count_unavailable', error: active_error };
+          return { ...current, status: 'failed', error_kind: 'active_count_unavailable', error_status: 502, error: active_error };
         }
-        if (!current.can_reload) throw new Error(current.profile_error);
+        if (!current.can_reload) throw Object.assign(new Error(current.profile_error), { status: current.profile_error_status });
         if (awaiting || current.state === 'synchronized' || when === 'now' || current.active_tasks === 0) {
           return await reload(current, exec?.signal, changes);
         }
         const owner = exec?.agent?.id;
         const jobs = ctx.get?.('jobs');
         if ((owner === undefined && exec?.panel !== true) || !jobs?.start || !jobs?.list) {
-          return { ...current, status: 'failed', error_kind: 'native_jobs_unavailable',
+          return { ...current, status: 'failed', error_kind: 'native_jobs_unavailable', error_status: 409,
             error: 'Codex 仍在运行且无法登记原生后台观察；未请求重载。' };
         }
         const existing = jobs.list(owner).find((job) => job.owner === owner && job.kind === 'codex-runtime' && job.label === label &&
@@ -631,7 +637,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         return { ...current, status: 'waiting_for_idle', background_job_id: id, reused: false };
       } catch (error) {
         return { ...(current ?? snapshot(null)), status: 'failed', error_kind: exec?.signal?.aborted ? 'aborted' : 'runtime_error',
-          error: String(error?.message ?? error) };
+          error_status: error?.status ?? 500, error: String(error?.message ?? error) };
       }
     },
   };

@@ -87,7 +87,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
       try {
         if (route === '/settings/cancel') return runtime.cancelPending();
         const result = await runtime.execute({ action: 'reload', when: route === '/settings/apply' ? 'now' : 'idle' }, { panel: true }, changes);
-        if (result.status === 'failed') throw Object.assign(bad(result.error ?? '重载失败', 409), { saved: result.saved === true });
+        if (result.status === 'failed') throw Object.assign(bad(result.error ?? '重载失败', result.error_status ?? 500), { saved: result.saved === true });
         return changes ? { saved: result.saved === true, runtime: result } : result;
       } finally { saving = false; }
     }
@@ -103,8 +103,24 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
           (job.verification_status === 'unreviewed' && job.review_status === 'needs_attention') })) };
     }
     if (route === '/output') {
-      return runnerResult(await conductor.output(jobId(query.job_id), { artifact: 'report',
-        offset: offset(query.offset, 0), limit: offset(query.limit, 8000, 20000) }));
+      const id = jobId(query.job_id), start = offset(query.offset, 0);
+      const page = runnerResult(await conductor.output(id, { artifact: 'report',
+        offset: start, limit: offset(query.limit, 8000, 20000) }));
+      if (start !== 0) return page;
+      try {
+        const parts = [];
+        let offset = 0;
+        for (;;) {
+          const context = runnerResult(await conductor.output(id, { artifact: 'context', offset, limit: 8000 }));
+          parts.push(context.text);
+          if (context.eof) {
+            const acceptance = JSON.parse(parts.join('')).acceptance;
+            return Array.isArray(acceptance) ? { ...page, acceptance } : page;
+          }
+          if (!(context.next_offset > offset)) return page;
+          offset = context.next_offset;
+        }
+      } catch { return page; } // Optional context must not prevent reading the report.
     }
     if (route === '/cancel') {
       const id = jobId(body.job_id);
