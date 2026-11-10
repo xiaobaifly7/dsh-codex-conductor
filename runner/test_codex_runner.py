@@ -316,7 +316,7 @@ class RunnerTests(unittest.TestCase):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
 
-        for sandbox in ("workspace-write", "danger-full-access"):
+        for sandbox in ("workspace-write", "danger-full-access", "read-only"):
             with self.subTest(sandbox=sandbox), mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "warnings_then_ok"}), \
                     mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"), \
                     mock.patch.object(codex_runner, "router_reachable", side_effect=[False, True]):
@@ -329,6 +329,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["attempts"], 2)
                 self.assertEqual(result["usage_scope"], "thread_total")
                 self.assertEqual(self.calls()[-1]["prompt"], "NEW TASK: fix the CSV parser")
+                self.assertIn("writer-9", self.calls()[-1]["argv"])
 
     def test_pid_and_event_write_errors_reap_the_process_and_preserve_the_error(self):
         sys.path.insert(0, str(RUNNER.parent))
