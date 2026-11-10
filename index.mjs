@@ -53,6 +53,7 @@ const DEFAULTS = {
   idleTimeoutSeconds: null,
   retries: null,
   lockTimeoutSeconds: null,
+  maxStorageMb: null,
   workspaces: [],
   denyTools: [],
   allowCommands: [],
@@ -235,7 +236,7 @@ export function createConductor(cfg, run = runRunner) {
     if (cfg.model) argv.push('--model', cfg.model);
     if (cfg.serviceTier) argv.push('--service-tier', cfg.serviceTier);
     for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries'],
-      ['lockTimeoutSeconds', '--lock-timeout']]) {
+      ['lockTimeoutSeconds', '--lock-timeout'], ['maxStorageMb', '--max-storage-mb']]) {
       if (cfg[key] != null) argv.push(flag, String(cfg[key]));
     }
     // host_access 不管 write 都在沙箱外运行，write=false 的只读只靠提示约束
@@ -651,7 +652,7 @@ export function taskCwd(args, session, workspaces) {
 function settings(config, logger) {
   config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
     const value = config[key];
-    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds'].includes(key);
+    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb'].includes(key);
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))

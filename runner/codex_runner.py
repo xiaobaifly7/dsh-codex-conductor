@@ -777,6 +777,7 @@ def add_task_arguments(p):
     p.add_argument("--use-user-config", action="store_true", help="Inherit ~/.codex/config.toml, MCP servers and hooks")
     p.add_argument("--timeout", type=float, default=3600)
     p.add_argument("--lock-timeout", type=positive_float, help="Maximum seconds waiting for write locks; omitted waits indefinitely")
+    p.add_argument("--max-storage-mb", type=positive_float, help="Best-effort jobs/runs storage limit in MiB; omitted is unlimited")
     # The Windows sandbox setup alone was silent for about 60s, so keep this well above that.
     p.add_argument("--idle-timeout", type=float, default=600)
     p.add_argument("--reconnect-timeout", type=float, default=180)
@@ -1488,15 +1489,51 @@ def prune_old(subdir):
             result = d / "result.json"
             if not d.is_dir():
                 continue
+            if any(recorded_pid(d / name) is not None for name in ("worker.pid", "codex.pid")):
+                continue
             if result.is_file():
                 expired = result.stat().st_mtime < cutoff
             else:
-                if any(recorded_pid(d / name) is not None for name in ("worker.pid", "codex.pid")):
-                    continue
                 expired = max(p.stat().st_mtime for p in [d, *d.rglob("*")]) < cutoff
             if expired:
                 shutil.rmtree(d, ignore_errors=True)
         except (OSError, ValueError):
+            pass
+
+
+def storage_size(root):
+    return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
+
+
+def prune_storage(max_storage_mb):
+    total, finished = 0, []
+    for root in (HOME / "jobs", HOME / "runs"):
+        try:
+            total += storage_size(root)
+            directories = list(root.iterdir())
+        except OSError:
+            continue
+        for d in directories:
+            try:
+                result = d / "result.json"
+                if not d.is_dir() or d.is_symlink() or not result.is_file():
+                    continue
+                value = json.loads(result.read_text("utf-8"))
+                if not isinstance(value, dict) or value.get("status") not in ("completed", "failed", "cancelled"):
+                    continue
+                if any(recorded_pid(d / name) is not None for name in ("worker.pid", "codex.pid")):
+                    continue
+                finished.append((result.stat().st_mtime, d))
+            except (OSError, ValueError):
+                continue
+    for _, d in sorted(finished, key=lambda item: item[0]):
+        if total <= max_storage_mb * 1024 ** 2:
+            break
+        try:
+            size = storage_size(d)
+            shutil.rmtree(d, ignore_errors=True)
+            total -= size - storage_size(d)
+        except OSError:
             pass
 
 
@@ -1562,6 +1599,11 @@ def main():
     if args.command in ("run", "start"):
         args.cwd = local_path(args.cwd)
         prompt = read_task_input(args, parser)
+        if args.command == "start" or args.max_storage_mb is not None:
+            prune_old("jobs")
+            prune_old("runs")
+        if args.max_storage_mb is not None:
+            prune_storage(args.max_storage_mb)
 
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -1574,8 +1616,6 @@ def main():
         sys.exit(0 if result["status"] == "completed" else 1)
 
     if args.command == "start":
-        prune_old("jobs")
-        prune_old("runs")
         job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         job_dir = HOME / "jobs" / job_id
         job_dir.mkdir(parents=True)
