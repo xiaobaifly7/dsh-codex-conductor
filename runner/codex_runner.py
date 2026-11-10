@@ -1632,6 +1632,7 @@ def main():
     status = sub.add_parser("status")
     status.add_argument("job_id", type=job_identifier)
     status.add_argument("--wait", type=float, default=0)
+    status.add_argument("--follow", action="store_true")
     sub.add_parser("cancel").add_argument("job_id", type=job_identifier)
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
@@ -1748,12 +1749,16 @@ def main():
         return
 
     if args.command == "status":
-        deadline = time.monotonic() + args.wait
+        interval = max(1, args.wait) if args.follow else args.wait
+        deadline = time.monotonic() + interval
         while True:
             current = job_status(args.job_id)
-            if current["status"] != "running" or time.monotonic() >= deadline:
+            now = time.monotonic()
+            if current["status"] != "running" or now >= deadline:
                 emit(current)
-                return
+                if not args.follow or current["status"] != "running":
+                    return
+                deadline = now + interval
             time.sleep(1)
 
     if args.command == "cancel":

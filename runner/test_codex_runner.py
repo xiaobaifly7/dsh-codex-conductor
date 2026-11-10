@@ -984,6 +984,20 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(done["status"], "completed")
         self.assertEqual(done["final_message"], "done")
 
+    def test_follow_status_emits_progress_before_the_final_result(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        running = {"job_id": "J", "status": "running"}
+        done = {"job_id": "J", "status": "completed"}
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(sys, "argv", [str(RUNNER), "status", "J", "--wait", "1", "--follow"]), \
+                mock.patch.object(codex_runner, "job_status", side_effect=[running, done]), \
+                mock.patch.object(codex_runner.time, "monotonic", side_effect=[0, 1, 2, 3]), \
+                mock.patch.object(codex_runner.time, "sleep"), mock.patch.object(codex_runner, "emit") as emit:
+            codex_runner.main()
+        self.assertEqual(emit.call_args_list, [mock.call(running), mock.call(done)])
+
     def test_cancel_kills_the_worker_and_the_tree(self):
         context = self.sample_context()
         envelope = json.dumps({"prompt": "do it", "context": context})

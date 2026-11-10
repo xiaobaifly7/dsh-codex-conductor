@@ -16,6 +16,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
@@ -154,10 +155,10 @@ export function runnerArgv(cfg, args) {
 
 // 跑一个命令，返回它输出的最后一行 JSON。timeoutMs 到了还没结束（WSL 卡死或起不来）就结束它并按 bridge_error 返回，
 // 不等 close：进程树没收干净时 close 可能一直不来
-export function runProcess(command, argv, { stdin, signal, timeoutMs, env } = {}) {
+export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onProgress } = {}) {
   if (signal?.aborted) return Promise.resolve({ status: 'failed', error_kind: 'bridge_error',
     error: `${command} 调用前已被中止`, retryable: true });
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let child;
     try {
       child = spawn(command, argv, { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], env });
@@ -167,7 +168,7 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env } = {}
     }
     const out = [];
     const err = [];
-    child.stdout.on('data', (d) => out.push(d));
+    if (!onProgress) child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));
     const onAbort = () => child.kill();
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -186,18 +187,36 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env } = {}
       resolve({ status: 'failed', error_kind: 'bridge_error', retryable: true,
         error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束它（WSL 可能卡住或正在启动）` });
     }, 1000);
+    let lastLine = '';
+    if (onProgress) {
+      const lines = createInterface({ input: child.stdout });
+      const fail = (error) => { cleanup(); child.kill(); reject(error); };
+      lines.on('error', fail);
+      lines.on('line', (line) => {
+        if (!line.trim()) return;
+        lastLine = line;
+        let value;
+        try { value = JSON.parse(line); } catch { return; }
+        if (value?.status !== 'running') return;
+        ticks = 0;
+        try { onProgress(value); } catch (error) { fail(error); }
+      });
+    }
     child.on('error', (error) => {
       cleanup();
       resolve({ status: 'failed', error_kind: 'bridge_error', error: error.message, retryable: true });
     });
     child.on('close', (code) => {
       cleanup();
-      const lines = Buffer.concat(out).toString('utf8').trim().split('\n');
+      const stdout = onProgress ? lastLine : Buffer.concat(out).toString('utf8').trim();
       try {
-        resolve(JSON.parse(lines.at(-1)));
+        const value = JSON.parse(stdout.split('\n').at(-1));
+        if (onProgress && (typeof value?.status !== 'string' || value.status === 'running')) throw new Error();
+        resolve(value);
       } catch {
         const stderr = Buffer.concat(err).toString('utf8').trim().slice(-2000);
-        resolve({ status: 'failed', error_kind: 'bridge_error', error: `runner exited ${code}: ${stderr || lines.join('\n').slice(-2000)}`, retryable: true });
+        const detail = stderr || (onProgress ? 'status stream closed without a final result' : stdout.slice(-2000));
+        resolve({ status: 'failed', error_kind: 'bridge_error', error: `runner exited ${code}: ${detail}`, retryable: true });
       }
     });
     child.stdin.on('error', () => {});
@@ -219,12 +238,15 @@ const unknownState = (value) => ['bridge_error', 'unknown_job', 'invalid_record'
 const cancelUnconfirmed = (value) => unknownState(value) || !['cancelled', 'completed', 'failed'].includes(value.status);
 
 export function createConductor(cfg, run = runRunner) {
-  // 每次等待是一个有界的 `status --wait` 进程，到点即退出；仍在执行时 runner 会带回空闲秒数和最近动作
-  async function waitJob(jobId, seconds, signal) {
+  // 手动查询仍有界；随包 runner 的后台观察可以在同一进程内继续等待。
+  async function waitJob(jobId, seconds, signal, onProgress) {
     // 夹在 1 天内：既防超大值让底层 status 等上几十天，也让 timeoutMs 远小于 2^31
     const wait = Math.min(Math.max(0, seconds), 86_400);
+    const follow = onProgress && cfg.runner === DEFAULTS.runner;
+    const argv = ['status', jobId, '--wait', String(wait)];
+    if (follow) argv.push('--follow');
     const value = signal?.aborted ? undefined
-      : await run(cfg, ['status', jobId, '--wait', String(wait)], { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS });
+      : await run(cfg, argv, { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS, ...(follow && { onProgress }) });
     if (signal?.aborted) {
       await cancel(jobId, signal);
       signal.throwIfAborted();
@@ -716,7 +738,7 @@ function settings(config, logger) {
   };
 }
 
-// 后台循环每次 `status --wait` 的秒数，只决定任务表进度行多久刷新一次
+// 后台状态更新间隔；最终结果写好后立即返回。
 const BG_WAIT = 20;
 // runner 取消后会立即写下结果，后台循环一秒内就能看到，这里只是上限
 const CANCEL_SETTLE_MS = 30_000;
@@ -783,29 +805,33 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         : `codex_output ${JSON.stringify({ job_id: jobId, artifact: value.report_status === 'valid' ? 'report' : 'result' })}`;
       return { status: JOB_STATUS[value.status] ?? 'failed', detail: `${summaryLine(value)} · ${lookup}`, result: text };
     };
+    let bridgeErrors = 0;
+    const progress = (value) => {
+      bridgeErrors = 0;
+      if (value.log_dir) state.logDir = value.log_dir;
+      const phase = { lock_wait: '排队等待目录写锁', router_check: '检查路由', codex_running: 'Codex 执行中', codex_reconnecting: 'Codex 正在重连模型服务', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
+      const stage = [phase, value.attempt > 0 && `第 ${value.attempt} 轮`,
+        value.last_error_kind && `上次错误 ${value.last_error_kind}`,
+        value.retry_at != null && `约 ${Math.max(0, Math.ceil(value.retry_at - Date.now() / 1000))} 秒后重试`]
+        .filter(Boolean).join(' · ') || 'Codex 执行中';
+      state.progress = value.phase === 'codex_reconnecting' ? stage
+        : `${stage}，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`;
+      handle.updateProgress([state.cancelNotice, state.progress].filter(Boolean).join('\n'));
+      const stageKey = JSON.stringify([value.phase, value.attempt, value.last_error_kind, value.retry_at]);
+      if (stageKey !== state.lastStage) {
+        handle.append(`${stage}\n`, { channel: 'log' });
+        state.lastStage = stageKey;
+      }
+    };
     try {
-      let bridgeErrors = 0;
       for (;;) {
-        const value = withReport(await conductor.waitJob(jobId, BG_WAIT));
+        const value = withReport(await conductor.waitJob(jobId, BG_WAIT, undefined, progress));
         if (value.log_dir) state.logDir = value.log_dir;
         if (unknownState(value) && value.error_kind !== 'bridge_error') {
           throw new Error([value.error_kind ?? value.status, value.error].filter(Boolean).join(': '));
         }
         if (value.status === 'running') {
-          bridgeErrors = 0;
-          const phase = { lock_wait: '排队等待目录写锁', router_check: '检查路由', codex_running: 'Codex 执行中', codex_reconnecting: 'Codex 正在重连模型服务', retry_wait: '等待重试', finalizing: '整理最终结果' }[value.phase] ?? value.phase;
-          const stage = [phase, value.attempt > 0 && `第 ${value.attempt} 轮`,
-            value.last_error_kind && `上次错误 ${value.last_error_kind}`,
-            value.retry_at != null && `约 ${Math.max(0, Math.ceil(value.retry_at - Date.now() / 1000))} 秒后重试`]
-            .filter(Boolean).join(' · ') || 'Codex 执行中';
-          state.progress = value.phase === 'codex_reconnecting' ? stage
-            : `${stage}，距上次活动 ${value.seconds_since_last_event ?? '?'} 秒：${value.last_activity ?? '启动中'}`;
-          handle.updateProgress([state.cancelNotice, state.progress].filter(Boolean).join('\n'));
-          const stageKey = JSON.stringify([value.phase, value.attempt, value.last_error_kind, value.retry_at]);
-          if (stageKey !== state.lastStage) {
-            handle.append(`${stage}\n`, { channel: 'log' });
-            state.lastStage = stageKey;
-          }
+          progress(value);
           continue;
         }
         // status 是只读的：一次 wsl.exe 出错（含电脑睡眠唤醒、发行版重启瞬间）不代表任务结束，连续多次才放弃

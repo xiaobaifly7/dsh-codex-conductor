@@ -1147,7 +1147,8 @@ function harness({ config = {}, jobs, agents, get = true, launchGemini } = {}) {
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'review') return Promise.resolve(reviewResult);
     if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
-    if (argv[0] === 'status' && argv[3] === '20') return new Promise((r) => (waiters[argv[1]] ??= []).push(r));
+    if (argv[0] === 'status' && argv[3] === '20') return new Promise((resolve) =>
+      (waiters[argv[1]] ??= []).push({ resolve, onProgress: options.onProgress }));
     // 下一轮事件循环才答：后台循环的等待参数若不是 20，也不会只靠微任务空转、饿死 answer()
     if (argv[0] === 'status') return new Promise((r) => setImmediate(r, finals[argv[1]] ?? { job_id: argv[1], status: 'running', seconds_since_last_event: 1 }));
     return Promise.resolve(cancelResult ?? { job_id: argv[1], status: 'cancelled' });
@@ -1164,7 +1165,9 @@ function harness({ config = {}, jobs, agents, get = true, launchGemini } = {}) {
       }
       await tick();
     }
-    waiters[job].shift()(value);
+    const waiter = waiters[job][0];
+    if (value.status === 'running' && waiter.onProgress) waiter.onProgress(value);
+    else waiters[job].shift().resolve(value);
   };
   return { tools, handlers, calls, requests, answer, finals, guards, warnings };
 }
@@ -2135,7 +2138,7 @@ test('dispatch with a positive wait still returns a DSH background job without w
   assert.match(first.note, /任务通知[\s\S]*job_output 读取 bg1 的完整结果/);
   assert.match(first.next, /等 DSH 的任务通知，再用 job_output 读取完整结果/);
   // 到点仍在执行：经任务表等，不直接等 runner；runner 只收到后台循环的查询
-  assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20']]);
+  assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20', '--follow']]);
   assert.equal(jobs.started[0].spec.owner, 'S1');
   assert.equal(jobs.started[0].spec.kind, 'codex');
   const again = await tools.codex_status.execute({ job_id: 'J1' }, exec);
@@ -2150,7 +2153,7 @@ test('dispatch with a positive wait still returns a DSH background job without w
     structured: { summary: 's', criteria: [{ criterion: 'pytest 通过', status: 'not_met', evidence: 'e' }, { criterion: 'A', status: 'met', evidence: 'e' },
       { criterion: 'B', status: 'met', evidence: 'e' }, { criterion: 'C', status: 'blocked', evidence: 'e' }], files_changed: [], deviations: [], unresolved: [] } });
   const done = await jobs.started[0].done;
-  assert.ok(calls.some((a) => a.join(' ') === 'status J1 --wait 20'));
+  assert.ok(calls.some((a) => a.join(' ') === 'status J1 --wait 20 --follow'));
   assert.match(jobs.started[0].handle.progress[0], /7 秒：ran: pytest/);
   assert.equal(done.status, 'completed');
   // 任务表的 detail 和结果第一行都以一行摘要开头；文件数取 runner 的 files_changed_total
@@ -2245,7 +2248,7 @@ test('codex_status with an explicit wait returns the stored DSH result', async (
   // 结算时这次等待在等：算作已被等到，DSH 不另发通知；结果只交出这一次
   assert.deepEqual(jobs.unawaited, []);
   assert.equal(jobs.read('bg1', 'S1').result, undefined);
-  assert.ok(calls.slice(1).every((a) => a.join(' ') === 'status J1 --wait 20'));
+  assert.ok(calls.slice(1).every((a) => a.join(' ') === 'status J1 --wait 20 --follow'));
 });
 
 test('codex_status and codex_cancel on a background job wait through DSH, so no second notice is sent', async () => {
@@ -2835,6 +2838,19 @@ test('every runner call has an upper bound: status gets its wait plus slack, sta
   ac.abort();
   await assert.rejects(pending);
   assert.deepEqual(seen, [['start', 120000], ['status', 90000], ['cancel', 120000], ['status', 660000], ['cancel', 120000]]);
+});
+
+test('runProcess streams progress and requires a terminal status', async () => {
+  const progress = [];
+  const opts = { onProgress: (row) => progress.push(row.phase), timeoutMs: 4000 };
+  const script = 'console.log(JSON.stringify({status:"running",phase:"lock_wait"}));' +
+    'console.log(JSON.stringify({status:"running",phase:"codex_running"}));';
+  const result = await runProcess(process.execPath, ['-e', script +
+    'console.log(JSON.stringify({status:"completed"}));'], opts);
+  assert.deepEqual(progress, ['lock_wait', 'codex_running']);
+  assert.deepEqual(result, { status: 'completed' });
+  const incomplete = await runProcess(process.execPath, ['-e', script], opts);
+  assert.equal(incomplete.error_kind, 'bridge_error');
 });
 
 test('a bridge error on a known job says to query it before sending the task again', () => {
