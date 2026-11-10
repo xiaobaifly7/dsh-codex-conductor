@@ -2136,6 +2136,31 @@ class RunnerTests(unittest.TestCase):
             else:
                 self.assertEqual(value["groups"][0]["job_ids"], ["history-2"])
 
+    def test_output_logs_use_repeatable_unicode_pages_for_running_and_finished_jobs(self):
+        for status in (None, {"status": "failed", "error_kind": "incomplete"}):
+            jd = self.stored_job("live-logs" if status is None else "failed-logs", status)
+            content = "首行 😀\r\nnext 字\n"
+            for artifact, filename in (("stderr", "stderr.log"), ("events", "events.jsonl")):
+                with self.subTest(status=status, artifact=artifact):
+                    self.assertEqual(self.control("output", jd.name, "--artifact", artifact)["error_kind"], "artifact_missing")
+                    (jd / filename).write_bytes(content.encode("utf-8"))
+                    pages, offset = [], 0
+                    while True:
+                        args = ("output", jd.name, "--artifact", artifact, "--limit", "3", "--offset", str(offset))
+                        page = self.control(*args)
+                        self.assertEqual(self.control(*args), page)
+                        self.assertEqual(page["status"], "completed")
+                        self.assertEqual(page["total_chars"], len(content))
+                        pages.append(page["text"])
+                        if page["eof"]:
+                            self.assertIsNone(page["next_offset"])
+                            break
+                        offset = page["next_offset"]
+                    self.assertEqual("".join(pages), content)
+                    (jd / filename).write_text("")
+                    self.assertEqual(self.control("output", jd.name, "--artifact", artifact)["error_kind"], "artifact_empty")
+
+
     def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
         context = self.sample_context()
         jd = self.stored_job("output", {"status": "completed"}, context=context)
