@@ -538,8 +538,8 @@ def too_big_trees():
         if isinstance(data, dict) else {}
 
 
-def tree_key(cwd):
-    return normalized_path(os.path.realpath(local_path(cwd)))
+def tree_key(cwd, *, resolve=None):
+    return normalized_path((resolve or os.path.realpath)(local_path(cwd)))
 
 
 def remember_too_big(cwd):
@@ -1289,9 +1289,8 @@ def matching_jobs(args):
     started_between = getattr(args, "started_between", None)
     needs_attention = args.needs_attention or scope_conflicts
     resolve = os.path.realpath
-    # The panel lists the same paths across many rows; reuse them only for this display query.
-    if getattr(args, "command", None) == "list" and not (args.owner or args.cwd or args.status or args.job_id or
-            getattr(args, "thread_id", None) or getattr(args, "parent_job", None) or scope_conflicts):
+    # Reuse canonical paths only within this list query. Scope-conflict checks keep fresh resolution.
+    if getattr(args, "command", None) == "list" and not scope_conflicts:
         resolve = cache(resolve)
 
     def matches_metadata(value, job_id):
@@ -1299,18 +1298,19 @@ def matching_jobs(args):
         if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
                                job_id in (args.job_id or [])):
             return False
-        return not args.cwd or bool(value.get("cwd") and tree_key(args.cwd) == tree_key(value["cwd"]))
+        return not args.cwd or bool(value.get("cwd") and
+                                    tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
 
     jobs = []
     root = HOME / "jobs"
     for job_dir in root.iterdir() if root.exists() else []:
+        if not args.owner and args.job_id and job_dir.name not in args.job_id:
+            continue
         if not job_dir.is_dir():
             continue
         try:
             job_identifier(job_dir.name)
         except argparse.ArgumentTypeError:
-            continue
-        if getattr(args, "command", None) == "summary" and not args.owner and args.job_id and job_dir.name not in args.job_id:
             continue
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
         if started_between is not None:

@@ -2220,6 +2220,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"owned", "legacy", "bad-report"})
         old = next(j for j in result["jobs"] if j["job_id"] == "legacy")
         self.assertIsNone(old["context"])
+        exact = self.control("list", "--job-id", "legacy", "--limit", "1")
+        self.assertEqual(exact["total"], 1)
+        self.assertEqual([j["job_id"] for j in exact["jobs"]], ["legacy"])
         owned = next(j for j in result["jobs"] if j["job_id"] == "owned")
         self.assertEqual(owned["context"], {"owner": "owner-a", "task": "Task title"})
         self.assertEqual(owned["scope"], ["src"])
@@ -2330,7 +2333,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["total"], 1)
         self.assertEqual([job["job_id"] for job in result["jobs"]], ["live"])
 
-    def test_global_history_reuses_paths_only_within_one_query(self):
+    def test_history_reuses_paths_only_within_one_query(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
 
@@ -2350,8 +2353,9 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(codex_runner.list_jobs(args), history)
             self.assertEqual(cwd_reads(), 2)
             args.owner = "owner-a"
+            args.cwd = str(self.cwd)
             self.assertEqual(codex_runner.list_jobs(args), history)
-            self.assertEqual(cwd_reads(), 5)
+            self.assertEqual(cwd_reads(), 3)
 
     def test_history_pages_reuse_records_and_only_enrich_selected_jobs(self):
         sys.path.insert(0, str(RUNNER.parent))
