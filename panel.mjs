@@ -1,7 +1,7 @@
 import { readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-const { validatePanelSettings, writeBackedUpFile } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
+const { validatePanelSettings, writeBackedUpFile, queryWithTimeout } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export const PANEL_PATH = '/dsh-codex-conductor';
@@ -88,7 +88,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
   selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
   let saving = false;
   const selftests = new Map();
-  return async function api(method, pathname, query = {}, body) {
+  async function api(method, pathname, query = {}, body, signal) {
+    signal?.throwIfAborted();
     const route = pathname.slice(PANEL_PATH.length);
     const known = { '/status': ['GET'], '/attention': ['GET'], '/settings': ['GET', 'POST'],
       '/settings/apply': ['POST'], '/settings/cancel': ['POST'], '/jobs': ['GET'], '/output': ['GET'],
@@ -133,11 +134,11 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
       return { saved: true };
     }
     if (route === '/status') {
-      return { runtime: await runtime.execute({ action: 'status' }), settings: panelSettings(cfg) };
+      return { runtime: await runtime.execute({ action: 'status' }, { signal }), settings: panelSettings(cfg) };
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;
-      const page = runnerResult(await conductor.list({ needs_attention: true, limit: 1, started_between: [now - 86400, now] }));
+      const page = runnerResult(await conductor.list({ needs_attention: true, limit: 1, started_between: [now - 86400, now] }, signal));
       if (!Number.isSafeInteger(page?.total) || page.total < 0 || !Array.isArray(page.jobs) ||
           page.jobs.length !== Math.min(page.total, 1)) {
         throw bad('任务列表暂时不完整，请刷新状态后再试。', 502);
@@ -165,7 +166,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
       const filter = query.filter ?? 'all';
       if (!['all', 'running', 'attention'].includes(filter)) throw bad('任务筛选不正确，请重新选择要查看的任务。');
       const page = runnerResult(await conductor.list({ limit: 20, offset: offset(query.offset, 0), ...(filter === 'running' ? { status: 'running' } : {}),
-        ...(filter === 'attention' ? { needs_attention: true } : {}) }));
+        ...(filter === 'attention' ? { needs_attention: true } : {}) }, signal));
       return { total: page.total, next_offset: page.next_offset, jobs: page.jobs.map((job) => ({ job_id: job.job_id, started_at: job.started_at,
         status: job.status, execution_status: job.execution_status,
         title: Array.from(job.context?.task ?? '').slice(0, 60).join(''),
@@ -175,13 +176,14 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
     if (route === '/output') {
       const id = jobId(query.job_id), start = offset(query.offset, 0);
       const page = runnerResult(await conductor.output(id, { artifact: 'report',
-        offset: start, limit: offset(query.limit, 8000, 20000) }));
+        offset: start, limit: offset(query.limit, 8000, 20000) }, signal));
       if (start !== 0) return page;
       try {
         const parts = [];
         let offset = 0;
         for (;;) {
-          const context = runnerResult(await conductor.output(id, { artifact: 'context', offset, limit: 8000 }));
+          signal?.throwIfAborted();
+          const context = runnerResult(await conductor.output(id, { artifact: 'context', offset, limit: 8000 }, signal));
           parts.push(context.text);
           if (context.eof) {
             const acceptance = JSON.parse(parts.join('')).acceptance;
@@ -190,7 +192,10 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
           if (!(context.next_offset > offset)) return page;
           offset = context.next_offset;
         }
-      } catch { return page; } // Optional context must not prevent reading the report.
+      } catch {
+        signal?.throwIfAborted();
+        return page;
+      } // Optional context must not prevent reading the report.
     }
     if (route === '/cancel') {
       const id = jobId(body.job_id);
@@ -206,7 +211,11 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
     if (typeof body.text !== 'string') throw bad('规划提示词必须是文字，请重新填写后保存。');
     writeBackedUpFile(plannerFile, Buffer.from(body.text, 'utf8'));
     return { saved: true };
-  };
+  }
+  return (method, pathname, query, body) => method === 'GET' &&
+    ['/status', '/jobs', '/attention', '/output'].includes(pathname.slice(PANEL_PATH.length))
+    ? queryWithTimeout((signal) => api(method, pathname, query, body, signal), undefined, 15_000)
+    : api(method, pathname, query, body);
 }
 
 export function registerPanel({ ctx, ...options }) {

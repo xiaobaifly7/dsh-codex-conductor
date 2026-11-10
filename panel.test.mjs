@@ -100,6 +100,54 @@ function rejected(response, status, message) {
   if (message) assert.match(response.body.error, message);
 }
 
+test('panel reads return HTTP 504 within 15 seconds even when query services never settle', async (t) => {
+  const f = fixture(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const signals = [];
+  f.runtime.execute.mock.mockImplementation((_args, { signal }) => {
+    signals.push(signal);
+    return new Promise(() => {});
+  });
+  for (const method of ['list', 'output']) f.conductor[method].mock.mockImplementation((...args) => {
+    signals.push(args.at(-1));
+    return new Promise(() => {});
+  });
+  let settled = false;
+  const responses = Promise.all(['/status', '/jobs?filter=all&offset=0', '/attention', '/output?job_id=J']
+    .map((route) => f.request('GET', route))).then((result) => { settled = true; return result; });
+  t.mock.timers.tick(14_999);
+  await new Promise(setImmediate);
+  assert.equal(settled, false);
+  assert.equal((await f.request('GET', '/settings')).status, 200);
+  assert.equal((await f.request('GET', '/prompt')).status, 200);
+  t.mock.timers.tick(1);
+  for (const response of await responses) rejected(response, 504, /查询超过 15 秒.*重试/);
+  assert.equal(signals.length, 4);
+  assert.ok(signals.every((signal) => signal.aborted));
+  assert.equal(f.conductor.cancel.mock.callCount(), 0);
+});
+
+test('panel report pagination shares one deadline and cannot swallow its timeout as optional context', async (t) => {
+  const f = fixture(t);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let contextSignal;
+  f.conductor.output.mock.mockImplementation(async (_id, { artifact, offset }, signal) => {
+    if (artifact === 'report') return { text: 'report', eof: true };
+    contextSignal = signal;
+    if (offset > 0) return new Promise(() => {});
+    await new Promise((resolve) => setTimeout(resolve, 9000));
+    return { text: '{', next_offset: 8000, eof: false };
+  });
+  const response = f.request('GET', '/output?job_id=J');
+  await new Promise(setImmediate);
+  t.mock.timers.tick(9000);
+  await new Promise(setImmediate);
+  assert.equal(f.conductor.output.mock.callCount(), 3);
+  t.mock.timers.tick(6000);
+  rejected(await response, 504, /查询超过 15 秒/);
+  assert.equal(contextSignal.aborted, true);
+});
+
 const selftestSample = () => ({
   settingsRegistered: true, sections: { 运行状态: true, 常用设置: true, 最近任务: true, 规划提示词: true },
   status: { version: '0.9.61', model: 'gpt-6', effort: '高', serviceTier: 'fast' }, taskCount: 1,
@@ -291,11 +339,12 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   const f = fixture(t);
   const status = await f.request('GET', '/status');
   assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
-  assert.deepEqual(f.runtime.execute.mock.calls[0].arguments, [{ action: 'status' }]);
+  assert.deepEqual(f.runtime.execute.mock.calls[0].arguments[0], { action: 'status' });
+  assert.ok(f.runtime.execute.mock.calls[0].arguments[1].signal instanceof AbortSignal);
   assert.equal(f.conductor.list.mock.callCount(), 0);
   t.mock.method(Date, 'now', () => 1800000000000);
   assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 1 } });
-  assert.deepEqual(f.conductor.list.mock.calls[0].arguments,
+  assert.deepEqual(f.conductor.list.mock.calls[0].arguments.slice(0, 1),
     [{ needs_attention: true, limit: 1, started_between: [1799913600, 1800000000] }]);
   assert.deepEqual(await f.request('GET', '/settings'), { status: 200, body: panelSettings(f.cfg) });
   const settings = { model: 'codex/gpt-6:latest', plannerAnswers: true, gemini: { effort: 'high' } };
@@ -310,14 +359,14 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
     const response = await f.request('GET', '/jobs' + query);
     assert.deepEqual(response, { status: 200, body: { total: 1, next_offset: null, jobs: [{ job_id: 'job-1', started_at: 123,
       status: 'running', execution_status: 'running', title: '🙂'.repeat(60), needs_attention: true }] } });
-    assert.deepEqual(f.conductor.list.mock.calls.at(-1).arguments, [{ limit: 20, offset: 0, ...expected }]);
+    assert.deepEqual(f.conductor.list.mock.calls.at(-1).arguments.slice(0, 1), [{ limit: 20, offset: 0, ...expected }]);
   }
   assert.deepEqual(await f.request('GET', '/output?job_id=job-1'),
     { status: 200, body: { text: '报告🙂', next_offset: 4, eof: true } });
-  assert.deepEqual(f.conductor.output.mock.calls[0].arguments, ['job-1', { artifact: 'report', offset: 0, limit: 8000 }]);
-  assert.deepEqual(f.conductor.output.mock.calls[1].arguments, ['job-1', { artifact: 'context', offset: 0, limit: 8000 }]);
+  assert.deepEqual(f.conductor.output.mock.calls[0].arguments.slice(0, 2), ['job-1', { artifact: 'report', offset: 0, limit: 8000 }]);
+  assert.deepEqual(f.conductor.output.mock.calls[1].arguments.slice(0, 2), ['job-1', { artifact: 'context', offset: 0, limit: 8000 }]);
   assert.equal((await f.request('GET', '/output?job_id=J_2&offset=12&limit=20000')).status, 200);
-  assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments, ['J_2', { artifact: 'report', offset: 12, limit: 20000 }]);
+  assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments.slice(0, 2), ['J_2', { artifact: 'report', offset: 12, limit: 20000 }]);
   assert.deepEqual(await f.request('POST', '/cancel', { job_id: 'job-1', confirm: true }),
     { status: 200, body: { job_id: 'job-1', status: 'cancelled' } });
   assert.deepEqual(f.conductor.cancel.mock.calls[0].arguments, ['job-1']);
@@ -379,7 +428,7 @@ test('panel attention counts the last 24 hours with one runner query', async (t)
   t.mock.method(Date, 'now', () => now * 1000);
   f.conductor.list.mock.mockImplementation(async () => ({ total: 102, jobs: [{ job_id: 'recent' }] }));
   assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 102 } });
-  assert.deepEqual(f.conductor.list.mock.calls.map(({ arguments: args }) => args),
+  assert.deepEqual(f.conductor.list.mock.calls.map(({ arguments: args }) => args.slice(0, 1)),
     [[{ needs_attention: true, limit: 1, started_between: [now - 86400, now] }]]);
   for (const page of [{ total: 1, jobs: [] }, { total: 1, jobs: null }, { total: -1, jobs: [] }]) {
     f.conductor.list.mock.mockImplementation(async () => page);
@@ -428,7 +477,7 @@ test('panel jobs pages preserve the filter and runner next offset', async (t) =>
   assert.equal(response.status, 200);
   assert.equal(response.body.total, 61);
   assert.equal(response.body.next_offset, 40);
-  assert.deepEqual(f.conductor.list.mock.calls[0].arguments, [{ limit: 20, offset: 20, needs_attention: true }]);
+  assert.deepEqual(f.conductor.list.mock.calls[0].arguments.slice(0, 1), [{ limit: 20, offset: 20, needs_attention: true }]);
   rejected(await f.request('GET', '/jobs?offset=-1'), 400, /页码/);
   assert.equal(f.conductor.list.mock.callCount(), 1);
 });
@@ -464,7 +513,7 @@ test('panel HTTP GET cannot write settings/prompt, cancel tasks or reload runtim
     assert.equal((await f.request('GET', route, { model: 'overwrite', text: 'overwrite', confirm: true })).status, 200);
   }
   for (const route of ['/cancel', '/reload', '/settings/apply', '/settings/cancel']) rejected(await f.request('GET', route), 405);
-  assert.deepEqual(f.runtime.execute.mock.calls.map(({ arguments: args }) => args), [[{ action: 'status' }]]);
+  assert.deepEqual(f.runtime.execute.mock.calls.map(({ arguments: args }) => args.slice(0, 1)), [[{ action: 'status' }]]);
   assert.equal(f.conductor.cancel.mock.callCount(), 0);
   assert.deepEqual(readFileSync(f.plannerFile), original);
   assert.deepEqual(readdirSync(f.root), ['planner.md']);

@@ -4,7 +4,28 @@ import { closeSync, fsyncSync, openSync, readFileSync, renameSync, lstatSync, mk
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { setTimeout as delay } from 'node:timers/promises';
+import { setTimeout as delay, setImmediate as yieldTurn } from 'node:timers/promises';
+
+export const QUERY_TIMEOUT_MS = 10_000;
+
+export async function queryWithTimeout(query, signal, timeoutMs = QUERY_TIMEOUT_MS) {
+  signal?.throwIfAborted();
+  const controller = new AbortController();
+  const onAbort = () => controller.abort(signal.reason);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(Object.assign(
+    new Error(`查询超过 ${timeoutMs / 1000} 秒未返回，请检查任务服务后重试。`),
+    { code: 'query_timeout', status: 504 })), timeoutMs);
+  try {
+    return await Promise.race([
+      new Promise((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true })),
+      query(controller.signal),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onAbort);
+  }
+}
 
 function modulePath(moduleUrl) {
   const url = new URL(moduleUrl);
@@ -442,7 +463,13 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     let sessions_error = null;
     try {
       const agents = ctx.get?.('agents');
-      active_sessions = agents.list().filter((agent) => agent.status === 'running').length;
+      const sessions = agents.list();
+      if (!Array.isArray(sessions)) {
+        // Idle reload needs a synchronous final check, with no await gap before writing.
+        Promise.resolve(sessions).catch(() => {});
+        throw new Error('会话服务未提供同步状态列表');
+      }
+      active_sessions = sessions.filter((agent) => agent.status === 'running').length;
     } catch (error) { sessions_error = `无法确认 DeepSeek 会话回合状态：${error.message}，请刷新后重试。`; }
     return { ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks }), active_error,
       active_sessions, sessions_error, pending_settings: pendingView(),
@@ -450,7 +477,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         remaining_seconds: Math.max(0, Math.ceil((idleWait.deadline - Date.now()) / 1000)) } };
   }
   const busy = (current, generation) => current.active_tasks !== 0 || current.active_sessions !== 0 || generation !== dispatchGeneration();
-  async function activeCount(signal) {
+  const activeCount = (signal) => queryWithTimeout(async (signal) => {
     const generation = dispatchGeneration();
     const starting = activeDispatches();
     const ids = new Set();
@@ -471,10 +498,11 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       total = page.total;
       for (const job of page.jobs) ids.add(job.job_id);
       offset += page.jobs.length;
+      if (offset < total) await yieldTurn(undefined, { signal });
     } while (offset < total);
     // 查询期间取得 job_id 的派发仍计入在途任务，避免误判空闲。
     return { count: Math.max(starting, ids.size + activeDispatches()), generation };
-  }
+  }, signal);
   const pendingReload = (current) => current.can_reload && current.profile_module !== moduleUrl;
   async function reload(current, signal, changes, pending) {
     signal?.throwIfAborted();
@@ -614,16 +642,24 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         let active_error = null;
         try {
           // 派发计数可能经历 0→1→0，提交空闲重载前须确认列表对应的代次未变。
-          do {
-            ({ count, generation } = await activeCount(exec?.signal));
-            if (action === 'reload' && when === 'idle' && Date.now() >= deadline) {
-              idleWait = { status: 'timed_out', deadline };
-              return { ...snapshot(count), status: 'failed', error_kind: 'idle_timeout', error_status: 408, error: IDLE_TIMEOUT };
+          await queryWithTimeout(async (signal) => {
+            do {
+              ({ count, generation } = await activeCount(signal));
+              if (action === 'reload' && when === 'idle' && Date.now() >= deadline) {
+                idleWait = { status: 'timed_out', deadline };
+                throw Object.assign(new Error(IDLE_TIMEOUT), { code: 'idle_timeout', status: 408 });
+              }
+              if (action === 'reload' && when === 'idle' && generation !== dispatchGeneration()) {
+                await yieldTurn(undefined, { signal });
+              }
             }
-          }
-          while (when === 'idle' && generation !== dispatchGeneration());
+            while (action === 'reload' && when === 'idle' && generation !== dispatchGeneration());
+          }, exec?.signal);
         } catch (error) {
           exec?.signal?.throwIfAborted();
+          if (error.code === 'idle_timeout') {
+            return { ...snapshot(count), status: 'failed', error_kind: 'idle_timeout', error_status: 408, error: IDLE_TIMEOUT };
+          }
           count = null;
           active_error = String(error?.message ?? error);
         }

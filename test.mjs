@@ -10,6 +10,8 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
+import { createPanelApi, PANEL_PATH } from './panel.mjs';
+import { wslPath } from './guard.mjs';
 import './panel.test.mjs';
 import './resume.test.mjs';
 import './planner.test.mjs';
@@ -1126,7 +1128,7 @@ test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissi
 });
 
 // 用假的 runner 和假的 jobs 服务装上插件；后台循环的 `status --wait 20` 由测试逐个应答
-function harness({ config = {}, jobs, agents, get = true, launchGemini } = {}) {
+function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGemini } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -1157,7 +1159,7 @@ function harness({ config = {}, jobs, agents, get = true, launchGemini } = {}) {
   };
   const ctx = { tools: { register: (t) => { tools[t.name] = t; }, guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; },
     logger: { warn: (text) => warnings.push(text) },
-    ...(get ? { get: (key) => ({ jobs, agents })[key] } : {}) };
+    ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
   apply(ctx, { workspaces: ['F:\\work\\项目'], ...pluginConfig }, run, launchGemini);
   const answer = async (job, value) => {
     for (let i = 0; !waiters[job]?.length; i++) {
@@ -1171,7 +1173,7 @@ function harness({ config = {}, jobs, agents, get = true, launchGemini } = {}) {
     if (value.status === 'running' && waiter.onProgress) waiter.onProgress(value);
     else waiters[job].shift().resolve(value);
   };
-  return { tools, handlers, calls, requests, answer, finals, guards, warnings };
+  return { tools, handlers, calls, requests, answer, finals, guards, warnings, run };
 }
 const tick = () => new Promise((r) => setImmediate(r));
 const nudges = [];
@@ -2822,11 +2824,11 @@ test('runProcess returns the last JSON line, passes stdin, and turns a hung or m
   assert.equal((await runProcess('dsh-conductor-no-such-command', [])).error_kind, 'bridge_error');
 });
 
-test('every runner call has an upper bound: status gets its wait plus slack, start and cancel 120 s', async () => {
+test('every runner call has an upper bound: status gets its wait plus 10 s, start and cancel 120 s', async () => {
   const seen = [];
   const run = (_cfg, argv, opts) => {
     seen.push([argv[0], opts?.timeoutMs]);
-    if (argv[0] === 'status' && opts?.signal) {
+    if (argv[0] === 'status' && argv[3] === '600') {
       return new Promise((r) => opts.signal.addEventListener('abort', () => r({ status: 'failed', error_kind: 'bridge_error' })));
     }
     return Promise.resolve({ job_id: 'J', status: 'running' });
@@ -2839,7 +2841,7 @@ test('every runner call has an upper bound: status gets its wait plus slack, sta
   const pending = c.waitJob('J', 600, ac.signal);
   ac.abort();
   await assert.rejects(pending);
-  assert.deepEqual(seen, [['start', 120000], ['status', 90000], ['cancel', 120000], ['status', 660000], ['cancel', 120000]]);
+  assert.deepEqual(seen, [['start', 120000], ['status', 40000], ['cancel', 120000], ['status', 610000], ['cancel', 120000]]);
 });
 
 test('runProcess streams progress and accepts the final line before process exit', async () => {
@@ -2853,6 +2855,98 @@ test('runProcess streams progress and accepts the final line before process exit
   assert.deepEqual(result, { status: 'completed' });
   const incomplete = await runProcess(process.execPath, ['-e', script], opts);
   assert.equal(incomplete.error_kind, 'bridge_error');
+});
+
+test('runner single-result calls return complete JSON while their output pipes remain open', async () => {
+  const runner = wslPath(fileURLToPath(new URL('./runner/codex_runner.py', import.meta.url)));
+  for (const status of ['running', 'completed']) {
+    const started = Date.now();
+    const result = await runRunner({ runner }, ['list'], { timeoutMs: 5000 }, (_command, _argv, options) =>
+      runProcess(process.execPath, ['-e', `console.log(JSON.stringify({status:${JSON.stringify(status)}}));setInterval(() => {}, 60000);`], options));
+    assert.deepEqual(result, { status });
+    assert.ok(Date.now() - started < 3000);
+  }
+  const result = await runRunner({ runner: '/custom.py' }, ['list'], { timeoutMs: 5000 }, (_command, _argv, options) =>
+    runProcess(process.execPath, ['-e', 'console.log(JSON.stringify({noise:true}));console.log(JSON.stringify({status:"completed"}));'], options));
+  assert.deepEqual(result, { status: 'completed' });
+});
+
+test('runner read queries time out in 10 seconds even if the executor ignores timeouts and aborts', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const calls = [];
+  const conductor = createConductor({}, (_cfg, argv, options) => {
+    calls.push({ argv, options });
+    return new Promise(() => {});
+  });
+  const pending = Promise.all([conductor.list(), conductor.output('J'), conductor.waitJob('J', 0)]);
+  t.mock.timers.tick(10_000);
+  for (const result of await pending) {
+    assert.equal(result.error_kind, 'bridge_error');
+    assert.match(result.error, /查询超过 10 秒/);
+  }
+  assert.deepEqual(calls.map(({ argv }) => argv[0]), ['list', 'output', 'status']);
+  assert.ok(calls.every(({ options }) => options.timeoutMs === 10_000 && options.signal.aborted));
+});
+
+test('panel and DeepSeek queries remain independent of an open background follow stream', { timeout: 5000 }, async () => {
+  const jobs = fakeJobs();
+  const h = harness({ jobs, agents: { list: () => [] } });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const { job_id } = await h.tools.codex_run.execute(RUN, exec);
+  assert.ok(h.requests.some(({ argv, onProgress }) => argv.includes('--follow') && typeof onProgress === 'function'));
+  const api = createPanelApi({ cfg: {}, conductor: createConductor({}, h.run), runtime: h.tools.codex_runtime });
+  const [status, page, attention, history, task, runtime] = await Promise.all([
+    api('GET', PANEL_PATH + '/status'), api('GET', PANEL_PATH + '/jobs'), api('GET', PANEL_PATH + '/attention'),
+    h.tools.codex_jobs.execute({}, exec), h.tools.codex_status.execute({ job_id }, exec), h.tools.codex_runtime.execute(),
+  ]);
+  assert.equal(status.runtime.status, 'status');
+  assert.deepEqual(page.jobs, []);
+  assert.equal(attention.total, 0);
+  assert.deepEqual(history.jobs, []);
+  assert.equal(task.status, 'running');
+  assert.equal(runtime.status, 'status');
+  assert.equal(jobs.started[0].status, 'running');
+  assert.equal(h.calls.some(([command]) => command === 'cancel'), false);
+  await h.answer(job_id, { status: 'completed' });
+  assert.equal((await jobs.started[0].done).status, 'completed');
+});
+
+test('codex_jobs bounds a stalled host history query and disposes a late observation', async (t) => {
+  let finish;
+  let signal;
+  const dispose = t.mock.fn();
+  const h = harness({ sessionQuery: { observeSession(_owner, options) {
+    signal = options.signal;
+    return new Promise((resolve) => { finish = resolve; });
+  } } });
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const rejected = assert.rejects(h.tools.codex_jobs.execute({ session_id: 'current' }, { agent: agentAt('/work') }),
+    { code: 'query_timeout', status: 504 });
+  t.mock.timers.tick(10_000);
+  await rejected;
+  assert.equal(signal.aborted, true);
+  finish({ events: [], [Symbol.dispose]: dispose });
+  await tick();
+  assert.equal(dispose.mock.callCount(), 1);
+  assert.deepEqual(h.calls, []);
+});
+
+test('codex_status bounds a stalled host wait without killing its background Codex task', async (t) => {
+  const jobs = fakeJobs();
+  const h = harness({ jobs });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const { job_id } = await h.tools.codex_run.execute(RUN, exec);
+  let signal;
+  jobs.wait = (_id, _ms, _owner, value) => { signal = value; return new Promise(() => {}); };
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const rejected = assert.rejects(h.tools.codex_status.execute({ job_id }, exec), { code: 'query_timeout' });
+  t.mock.timers.tick(10_000);
+  await rejected;
+  assert.equal(signal.aborted, true);
+  assert.equal(jobs.started[0].status, 'running');
+  assert.equal(h.calls.some(([command]) => command === 'cancel'), false);
+  await h.answer(job_id, { status: 'completed' });
+  await jobs.started[0].done;
 });
 
 test('a bridge error on a known job says to query it before sending the task again', () => {
@@ -2926,7 +3020,7 @@ test('codex_status validates wait_seconds and waitJob clamps it so the timeout c
   let seenMs;
   const c = createConductor({}, (_cfg, argv, opts) => { seenMs = opts?.timeoutMs; return Promise.resolve({ status: 'running' }); });
   await c.waitJob('J', 3_000_000);
-  assert.equal(seenMs, 86_400 * 1000 + 60_000);
+  assert.equal(seenMs, 86_400 * 1000 + 10_000);
   assert.ok(seenMs < 2 ** 31 - 1);
 });
 
