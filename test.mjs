@@ -1737,7 +1737,7 @@ test('dispatch with a positive wait still returns a DSH background job without w
   assert.match(jobs.started[0].handle.progress[0], /7 秒：ran: pytest/);
   assert.equal(done.status, 'completed');
   // 任务表的 detail 和结果第一行都以一行摘要开头；文件数取 runner 的 files_changed_total
-  assert.equal(done.detail, 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注 · runner J1 · codex_output');
+  assert.equal(done.detail, 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注 · codex_output {"job_id":"J1","artifact":"report"}');
   assert.equal(done.result.split('\n')[0], 'completed · 2 met / 1 not_met / 1 blocked · 3 files · 148 s · 待关注  job_id: J1  thread_id: T');
   assert.match(done.result, /逐条汇报[\s\S]*✗ 1\. pytest 通过 —— e[\s\S]*下一步[\s\S]*报告或任务状态仍需核对/);
   assert.doesNotMatch(done.result, /resume=/);
@@ -1756,13 +1756,13 @@ test('background job maps cancel, failure and lost monitoring', async () => {
   await answer('J1', { status: 'cancelled' });
   const killed = await jobs.started[0].done;
   assert.equal(killed.status, 'killed');
-  assert.equal(killed.detail, 'cancelled · runner J1 · codex_output');
+  assert.equal(killed.detail, 'cancelled · codex_output {"job_id":"J1","artifact":"result"}');
 
   await tools.codex_run.execute(RUN, exec);
   await answer('J2', { status: 'failed', error_kind: 'timeout', error: 'x', duration_s: 30.2, files_changed: [], files_changed_total: 0 });
   const failed = await jobs.started[1].done;
   assert.equal(failed.status, 'failed');
-  assert.equal(failed.detail, 'failed · timeout · 30 s · runner J2 · codex_output');
+  assert.equal(failed.detail, 'failed · timeout · 30 s · codex_output {"job_id":"J2","artifact":"result"}');
   assert.match(failed.result, /^failed · timeout · 30 s {2}job_id: J2\n/);
 
   await tools.codex_run.execute(RUN, exec);
@@ -2065,6 +2065,7 @@ test('losing monitoring does not erase an unconfirmed native cancellation', asyn
   for (let i = 0; i < 3; i++) await answer('J1', { status: 'failed', error_kind: 'bridge_error', error: 'status bridge unavailable' });
   const done = await jobs.started[0].done;
   assert.equal(done.status, 'failed');
+  assert.equal(done.detail, 'monitor_failed · codex_status {"job_id":"J1"}');
   assert.match(done.result, /^monitor_failed[\s\S]*取消未确认[\s\S]*J1[\s\S]*cancel bridge unavailable[\s\S]*codex_status/);
 });
 

@@ -1223,8 +1223,10 @@ export function apply(ctx, config = {}, run = runRunner) {
       const warning = value.status === 'monitor_failed' && state.cancelNotice ? `\n${state.cancelNotice}` : '';
       const text = render(value)[0].text + warning + outputEntry(jobId, state.logDir);
       handle.append(`${text}\n`, { channel: 'log' });
-      return { status: JOB_STATUS[value.status] ?? 'failed',
-        detail: `${summaryLine(value)} · runner ${jobId} · codex_output`, result: text };
+      const lookup = value.status === 'monitor_failed'
+        ? `codex_status ${JSON.stringify({ job_id: jobId })}`
+        : `codex_output ${JSON.stringify({ job_id: jobId, artifact: value.report_status === 'valid' ? 'report' : 'result' })}`;
+      return { status: JOB_STATUS[value.status] ?? 'failed', detail: `${summaryLine(value)} · ${lookup}`, result: text };
     };
     try {
       let bridgeErrors = 0;
