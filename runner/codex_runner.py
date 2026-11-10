@@ -1412,7 +1412,7 @@ PRUNE_TTL = 30 * 86400
 
 
 def prune_old(subdir):
-    """仅尽力清理结果已超过 PRUNE_TTL 的任务目录。"""
+    """仅尽力清理过期结果，以及已无进程且长期没有活动的未完成任务。"""
     root = HOME / subdir
     if not root.is_dir():
         return
@@ -1420,9 +1420,17 @@ def prune_old(subdir):
     for d in root.iterdir():
         try:
             result = d / "result.json"
-            if d.is_dir() and result.is_file() and result.stat().st_mtime < cutoff:
+            if not d.is_dir():
+                continue
+            if result.is_file():
+                expired = result.stat().st_mtime < cutoff
+            else:
+                if any(recorded_pid(d / name) is not None for name in ("worker.pid", "codex.pid")):
+                    continue
+                expired = max(p.stat().st_mtime for p in [d, *d.rglob("*")]) < cutoff
+            if expired:
                 shutil.rmtree(d, ignore_errors=True)
-        except OSError:
+        except (OSError, ValueError):
             pass
 
 
@@ -1491,6 +1499,8 @@ def main():
 
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        run_dir.mkdir(parents=True)
+        record_pid(run_dir / "worker.pid", os.getpid())
         result = execute(args, prompt, run_dir)
         result.update(review_summary(result))
         write_result(run_dir, result)

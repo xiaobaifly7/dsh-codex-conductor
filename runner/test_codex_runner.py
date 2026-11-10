@@ -2369,6 +2369,26 @@ class RunnerTests(unittest.TestCase):
             codex_runner.main()
         self.assertEqual(json.loads((jd / "result.json").read_text())["status"], "completed")
 
+    def test_prune_removes_only_stale_unfinished_dirs_with_no_live_process(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            stale = time.time() - codex_runner.PRUNE_TTL - 86400
+            for subdir in ("jobs", "runs"):
+                for name in ("abandoned", "running", "queued", "orphan", "recent-log"):
+                    d = codex_runner.HOME / subdir / name
+                    d.mkdir(parents=True)
+                    (d / "events.jsonl").write_text("activity")
+                    if name in ("running", "queued", "orphan"):
+                        codex_runner.record_pid(d / ("codex.pid" if name == "orphan" else "worker.pid"), os.getpid())
+                    for path in [d, *d.iterdir()]:
+                        os.utime(path, (stale, stale))
+                    if name == "recent-log":
+                        (d / "stderr.log").write_text("recent")
+                codex_runner.prune_old(subdir)
+                self.assertEqual(sorted(d.name for d in (codex_runner.HOME / subdir).iterdir()),
+                                 ["orphan", "queued", "recent-log", "running"])
 
 
 if __name__ == "__main__":
