@@ -549,6 +549,23 @@ def remember_too_big(cwd):
         pass
 
 
+def forget_too_big(cwd):
+    try:
+        data = json.loads((HOME / TOO_BIG_FILE).read_text("utf-8"))
+    except FileNotFoundError:
+        return False
+    if not isinstance(data, dict):
+        raise ValueError("Snapshot size cache must be a JSON object")
+    key = tree_key(cwd)
+    if key not in data:
+        return False
+    del data[key]
+    tmp = HOME / f"{TOO_BIG_FILE}.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(data), "utf-8")
+    os.replace(tmp, HOME / TOO_BIG_FILE)
+    return True
+
+
 def scope_path(cwd, scope):
     path = local_path(scope)
     if not IS_WIN:
@@ -1547,6 +1564,7 @@ def main():
     status.add_argument("--wait", type=float, default=0)
     sub.add_parser("cancel").add_argument("job_id", type=job_identifier)
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
+    sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
     for command in (listing, summary):
@@ -1570,6 +1588,12 @@ def main():
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
+    if args.command == "forget-too-big":
+        try:
+            emit({"status": "completed", "removed": forget_too_big(args.cwd)})
+        except (OSError, ValueError) as e:
+            emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
+        return
     if args.command == "review":
         try:
             decision = json.loads(read_prompt(strict=True))

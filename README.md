@@ -225,9 +225,12 @@ python3 runner/codex_runner.py list [--cwd DIR] [--owner SESSION_ID] [--status S
 python3 runner/codex_runner.py output JOB_ID [--artifact report|result|context|review|stderr|events] [--offset 0] [--limit 4000]
 python3 runner/codex_runner.py review JOB_ID --reviewer SESSION_ID < review.json
 python3 runner/codex_runner.py summary [--cwd DIR] [--owner SESSION_ID] [--thread-id THREAD_ID] [--round-limit 20]
+python3 runner/codex_runner.py forget-too-big --cwd DIR
 ```
 
 `run` / `start` 可选 `--context-json`，此时 stdin 为 `{"prompt":"完整交接提示","context":{"owner":"会话 ID","task":"原任务","acceptance":["原验收"],"write":true}}`；不传时沿用纯文本提示。`list` 默认最近 20 条、每页最多 100 条；`--status` 按执行状态筛选。`output` 偏移和长度按 Unicode 字符计算，不切断中文或 emoji，可重复读取。CLI 同样保留主机访问权限选项，新增查询不会启动 Codex。
+
+目录瘦身后可用 `forget-too-big --cwd DIR` 提前移除“目录太大”的记录，返回 `{"status":"completed","removed":true}`；没有记录时 `removed=false`。它复用快照缓存的目录键规范化，不启动 Codex，也不拍快照；下一次可写任务重新尝试整树快照。此命令仅由 CLI 提供。有效记录命中时仍只拍 scope 或使用事件，7 天过期前不主动重试整树。
 
 每条命令只在 stdout 输出一个 JSON 对象，原始事件写入日志目录。`--scope` 可重复，写相对 `--cwd` 的路径或绝对路径，只在目录太大、无法整树快照时用来缩小快照范围；插件把 `codex_run` 的 `scope` 逐条传入。结果中的 `cwd` 和传入 scope 时的 `scope_paths` 是规范化的真实绝对路径，快照、事件和范围检查共用这个基准，避免目录别名造成重复改动或误报越界。`--writable-root` 也可重复，只在 `workspace-write` 下增加本次调用的可写目录（目录须已存在），不改变只读模式。`--ignore` 也可重复：路径（相对 `--cwd`）匹配这些 Python `re` 正则的改动在截取前 300 条之前就从 `files_changed` 里去掉；插件把 `ignoreChanges` 逐条传入。
 
@@ -330,6 +333,10 @@ Snapshots detect additions, modifications (including permissions) and deletions 
 Snapshots may catch other processes' writes, such as logs. Clearly unrelated files absent from Codex's own list need only an explanation. `ignoreChanges` uses Python `re` on relative `/`-separated paths; `(?P<log>^logs/)` works, JavaScript's `(?<log>^logs/)` does not. Invalid patterns are skipped with explicit `ignore_warnings` in results/output. Matches are removed before the 300-entry cap from lists, counts and scope checks. The hand-off explains that independently changing files are not grounds for `blocked`; explicit task requirements still apply.
 
 Trees exceeding the 20-second snapshot budget are remembered for seven days: snapshot supplied scope paths plus events elsewhere (`scope_snapshot+codex_events`), or events alone without scope (`codex_events`). Only actual budget exhaustion enters that cache; permission/IO failures fall back to events without marking the tree too large. `start` prunes finished `jobs`/`runs` with results saved over 30 days ago. Unfinished directories are pruned only when neither worker nor Codex remains and their latest internal/directory modification is over 30 days old; running/queued records remain regardless of directory age.
+
+### Standalone runner
+
+After reducing a tree, run `python3 runner/codex_runner.py forget-too-big --cwd DIR`. It removes only that normalized cache key and prints `{"status":"completed","removed":true}`, or `removed=false` if absent. It starts neither Codex nor a snapshot; the next writable task tries a full snapshot again. This is CLI-only. Cached entries continue to skip full snapshots until their seven-day expiry or explicit removal.
 
 Planner instructions live in `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` (`plannerPromptFile` overrides it; `loaded.json` shows the actual path). A comment-only template is created; text outside HTML comments enters the planner's system prompt every step, survives compaction, applies after saving without reload, and is not sent verbatim to Codex. Completed runs remind the planner to check it when set.
 
