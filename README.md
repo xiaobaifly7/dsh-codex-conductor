@@ -50,6 +50,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 
+`0.9.55` 控制面板读取任务历史和关注数量时，只在本次查询内复用同一路径的解析结果，减少重复文件系统访问。
+
 `0.9.53` 控制面板先显示运行状态和设置；任务历史和关注数量独立加载，不阻塞其他内容。
 
 `0.9.51` 默认的写入范围预检会先筛选待答范围冲突再分页，避免因无关历史重复查询。开启 `plannerAnswers` 时仍沿用原有行为。
@@ -317,6 +319,8 @@ python3 runner/test_codex_runner.py
 `0.9.43` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
 
 `0.9.48` permits more demonstrably read-only text and file checks and ordinary assignments, explains dangerous command forms, and preserves another live process's loaded record.
+
+`0.9.55` reuses path resolution within a single global history query for the panel, reducing repeated filesystem work.
 
 `0.9.53` shows runtime status and settings while task history and the attention count are still loading.
 

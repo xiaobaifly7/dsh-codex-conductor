@@ -10,6 +10,7 @@ Every command prints exactly one JSON object on stdout. Raw events go to a log f
 import argparse
 from contextlib import closing, suppress
 import errno
+from functools import cache
 import hashlib
 import http.client
 import json
@@ -569,7 +570,7 @@ def forget_too_big(cwd):
     return True
 
 
-def scope_path(cwd, scope):
+def scope_path(cwd, scope, *, resolve=None):
     path = local_path(scope)
     if not IS_WIN:
         path = path.replace("\\", "/")  # a relative Windows path such as src\lib, read as index.mjs normPath reads it
@@ -582,7 +583,7 @@ def scope_path(cwd, scope):
                 path = base + rest
         except OSError:
             pass
-    return os.path.realpath(path)
+    return (resolve or os.path.realpath)(path)
 
 
 def snapshot_before(cwd, scope_args):
@@ -946,15 +947,16 @@ def task_record(job_dir):
     return task
 
 
-def job_metadata(job_dir, task=None, finished_at=None, thread_id=None):
+def job_metadata(job_dir, task=None, finished_at=None, thread_id=None, *, resolve=None):
+    resolve = resolve or os.path.realpath
     task = task_record(job_dir) if task is None else task
     meta = {"context": task.get("context"), "sandbox": task.get("sandbox"), "scope": task.get("scope")}
     meta["task_options"] = {"writable_roots": task.get("writable_roots"),
                             "use_user_config": task.get("use_user_config", False), "effort": task.get("effort")}
     if task.get("cwd"):
-        meta["cwd"] = os.path.realpath(local_path(task["cwd"]))
+        meta["cwd"] = resolve(local_path(task["cwd"]))
         if task.get("scope"):
-            meta.update(scope=task["scope"], scope_paths=[scope_path(meta["cwd"], s) for s in task["scope"]])
+            meta.update(scope=task["scope"], scope_paths=[scope_path(meta["cwd"], s, resolve=resolve) for s in task["scope"]])
     thread = thread_id or task.get("resume")
     if not thread_id and task.get("sandbox") and task["sandbox"] != "read-only":
         thread = started_thread(job_dir / "events.jsonl") or thread
@@ -1284,6 +1286,11 @@ def job_details(job):
 def matching_jobs(args):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     needs_attention = args.needs_attention or scope_conflicts
+    resolve = os.path.realpath
+    # The panel lists the same paths across many rows; reuse them only for this display query.
+    if getattr(args, "command", None) == "list" and not (args.owner or args.cwd or args.status or args.job_id or
+            getattr(args, "thread_id", None) or getattr(args, "parent_job", None) or scope_conflicts):
+        resolve = cache(resolve)
 
     def matches_metadata(value, job_id):
         context = value.get("context")
@@ -1321,7 +1328,7 @@ def matching_jobs(args):
             try:
                 record["metadata"] = job_metadata(job_dir, task=record["task"],
                                                  finished_at=result_file.stat().st_mtime if result_file.exists() else None,
-                                                 thread_id=value.get("thread_id"))
+                                                 thread_id=value.get("thread_id"), resolve=resolve)
                 value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
             except (OSError, ValueError, TypeError):
                 record = None
