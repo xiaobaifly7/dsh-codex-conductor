@@ -8,6 +8,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.43` 新增可选的 `gemini_write`，由 Gemini 写教程与文档正文，插件核对路径、字数和改动范围。
 
+`0.9.44` 新增默认关闭的 `plannerAnswers`，允许规划端按用户原始目标和已有事实回答阻塞问题、登记接受偏差，并在汇报中说明代做的决定；拿不准、涉及删除数据或用户未提及的目录时仍先询问用户。
+
 ## 功能
 
 **派活工具**
@@ -30,7 +32,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 - 任务目录：传了 `cwd` 就用它；否则会话工作区落在某个带 `cwd` 的 `workspaces` 条目里时，用该条目的 `cwd`（有多条时取路径最长的那条）；再否则用会话工作区。只在 `task` 里写目录不会切换任务目录。
 
-收到需要回答的问题后，规划端先问用户，等原会话收到实际回复再调用例如 `codex_continue({"job_id":"J1","answers":[{"id":"choice","answer":"采用已确认的方案"}]})`。没有收到该问题产生后的用户回复时，即使传齐 `answers`，也只返回待答问题。环境恢复时用 `resolution` 写实际证据。续接不会修改原验收或增加写权限。同一线程中较早的任务仍未收到用户答复时，`codex_run` 的 `resume` 和 `codex_continue` 都不会启动新作业，较新的任务状态不会覆盖待答问题。最近一轮仍待答时，请先询问用户并用 `codex_continue` 提交回答。同一会话里有待答范围冲突时，新写任务按各自工作目录解析写入路径；如果与原范围重叠并扩大范围，即使换了工作目录也必须先等用户答复。历史归属未知、状态未知或已取消的任务不会自动恢复。已存在后续轮次时返回它，后续处理使用最新 `job_id`，避免同一父任务反复派活。续接累计保留原目标、历轮用户决定与本轮补充；没有可续接线程时，另开线程也会带入这些决定，不堆叠历轮报告。
+默认 `plannerAnswers=false` 时，收到需要回答的问题后，规划端先问用户，等原会话收到实际回复再调用例如 `codex_continue({"job_id":"J1","answers":[{"id":"choice","answer":"采用已确认的方案"}]})`。没有收到该问题产生后的用户回复时，即使传齐 `answers`，也只返回待答问题。环境恢复时用 `resolution` 写实际证据。续接不会修改原验收或增加写权限。同一线程中较早的任务仍未收到用户答复时，`codex_run` 的 `resume` 和 `codex_continue` 都不会启动新作业，较新的任务状态不会覆盖待答问题。最近一轮仍待答时，请先询问用户并用 `codex_continue` 提交回答。同一会话里有待答范围冲突时，新写任务按各自工作目录解析写入路径；如果与原范围重叠并扩大范围，即使换了工作目录也必须先等用户答复。历史归属未知、状态未知或已取消的任务不会自动恢复。已存在后续轮次时返回它，后续处理使用最新 `job_id`，避免同一父任务反复派活。续接累计保留原目标、历轮用户决定与本轮补充；没有可续接线程时，另开线程也会带入这些决定，不堆叠历轮报告。
 
 `codex_watch({"mode":"attention"})` 仅在失败、阻塞或报告异常等变化时通知；`mode="all"` 也包含开始和正常结束。它在无变化时只读 Harness 内存任务表，不启动 Codex、不反复唤醒模型。首次符合条件的变化后观察结束，需要继续时再调用。它保留任务原有结束通知，也不默认启用长期监控；取消观察只停止观察。
 
@@ -76,7 +78,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 阻塞报告使用 [`report.v2.schema.json`](report.v2.schema.json)：在原五字段上新增 `blockers`。每项有 `id / kind / message / question / resolution`，区分缺用户信息、任务冲突、环境条件和实现待修。`resolution` 是解除条件或已有信息，非空不代表已经解决。不按报错关键词猜类别；旧报告没有分类时先查明原因。旧 [`report.schema.json`](report.schema.json) 保留五字段，供热重载前仍在运行的旧版本使用；新版可读取两种报告。
 
-独立核验使用 `codex_review`：`criteria` 用原验收标准从 1 开始的 `index`，逐项提供 `status` 和实际 `evidence`；结论为 `verified / needs_changes / accepted_deviations`。通过结论要求各项实际通过；有报告偏差或范围外改动时，接受前必须等作业结束后的原会话用户确认，再在 `accepted_deviations` 中按 `reported / scope` 与 1 起始编号逐项记录依据。历史存入任务目录的 `reviews.json`，原 `result.json` 和 Codex 报告不改写；可用 `codex_output` 的 `artifact="review"` 分页重读。
+独立核验使用 `codex_review`：`criteria` 用原验收标准从 1 开始的 `index`，逐项提供 `status` 和实际 `evidence`；结论为 `verified / needs_changes / accepted_deviations`。通过结论要求各项实际通过；默认 `plannerAnswers=false` 时，有报告偏差或范围外改动，接受前必须等作业结束后的原会话用户确认，再在 `accepted_deviations` 中按 `reported / scope` 与 1 起始编号逐项记录依据。历史存入任务目录的 `reviews.json`，原 `result.json` 和 Codex 报告不改写；可用 `codex_output` 的 `artifact="review"` 分页重读。
 
 `codex_summary()` 默认汇总当前会话；传 `cwd` 可汇总一个项目，`thread_id` 可只看一个线程。默认每页 10 组，沿用筛选和 `limit`，用 `next_offset` 作为下次的 `offset` 翻页；总组数和总轮数始终按全部匹配记录计算。没有线程号的任务独立成组。最新轮次的执行状态与独立核验结论分开显示，不能据此宣称整个项目永久无问题。线程累计 token 只取最新可用累计值；混合或未知统计口径会明确标出，耗时只加总已结束轮次。
 
@@ -206,6 +208,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `retries` | 留空（runner 为 `2`） | 最多自动重试次数，须为非负整数；`0` 表示不自动重试 |
 | `allowHostAccess` | `false` | 为 `true` 时 `codex_run` 才提供 `host_access` 参数，允许 Codex 不带沙箱（`danger-full-access`）运行、启动 Windows 程序（见上文） |
 | `defaultHostAccess` | `false` | 与 `allowHostAccess=true` 一起使用，省略 `host_access` 的新任务和 `resume` 默认以 `danger-full-access` 运行；显式传 `host_access=false` 可为单次任务恢复沙箱 |
+| `plannerAnswers` | `false` | 为 `true` 时允许规划端按用户原始目标和已有事实回答阻塞问题、登记 `accepted_deviations`，并跳过待答范围冲突的写入预检；最新任务仍为 `ask_user` 时须用 `codex_continue`，答案仍须覆盖全部问题 id。在给用户的汇报里说明代做的决定；拿不准、涉及删除数据或改动用户没提过的目录时仍先问用户 |
 | `plannerPromptFile` | `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` | 规划要求文件（Markdown，HTML 注释不算内容），注入 agent 的系统提示词（见上文） |
 | `runtimeProfileFile` | 空 | 当前 Harness 实例实际使用的 `cordis.patch.yml` 完整 Windows 路径；用于版本匹配与明确请求的热重载，留空时不能自动重载 |
 | `allowCommands` | `[]` | 额外放行的命令，JavaScript 正则逐段匹配（按 `\|`、`&&`、`;` 切开后的每一段），建议写成锚定正则；非法正则会警告并跳过，护栏和其余条目照常生效 |
@@ -284,6 +287,8 @@ python3 runner/test_codex_runner.py
 
 `0.9.43` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
 
+`0.9.44` adds opt-in `plannerAnswers` so the planner can answer blockers and record accepted deviations from the user's original goal and known facts, reporting its decisions and still asking the user when uncertain or when answers entail data deletion or changes to directories the user did not mention.
+
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
 ### Gemini tutorial and documentation writing (off by default)
@@ -313,7 +318,7 @@ Running/queued Codex writers or a failed task query block execution; pending loc
 
 `codex_run` requires acceptance criteria and an explicit `write` (`true` for changes, `false` for read-only investigation). Criteria have no item-count limit; dispatch, continuation, reports and independent review preserve their full list and order. Explicit `cwd` wins; otherwise use the most specific matching `{path, cwd}` workspace entry, then the session workspace. Mentioning a directory only in the task does not change it.
 
-`codex_continue` accepts typed blocker answers or environment-recovery evidence, preserving the original thread, directory, acceptance, write, scope and host access. When there are pending questions, the original session must receive a user reply after the questions were raised; tool-provided answers alone do not start a job. Existing continuations are reused; further work uses the latest child `job_id`. Without a resumable thread, accumulated user decisions accompany the original context into a new thread, without stacking old reports. Unknown ownership/state and cancellation prevent automatic continuation. Both resume paths check for earlier questions on the same thread that still have no user reply, even after a newer job. If the latest job still needs an answer, use `codex_continue` after asking the user. A fresh write task in the same session cannot widen an overlapping scope with a pending conflict until the user replies, even from a different working directory. Paths are resolved against each task's own directory.
+`codex_continue` accepts typed blocker answers or environment-recovery evidence, preserving the original thread, directory, acceptance, write, scope and host access. With the default `plannerAnswers=false`, pending questions require a user reply in the original session after the questions were raised; tool-provided answers alone do not start a job. Existing continuations are reused; further work uses the latest child `job_id`. Without a resumable thread, accumulated user decisions accompany the original context into a new thread, without stacking old reports. Unknown ownership/state and cancellation prevent automatic continuation. By default, both resume paths check for earlier questions on the same thread that still have no user reply, even after a newer job. If the latest job still needs an answer, use `codex_continue` after asking the user. By default, a fresh write task in the same session cannot widen an overlapping scope with a pending conflict until the user replies, even from a different working directory. Paths are resolved against each task's own directory.
 
 The bundled runner handles background execution, retries, timeouts, idle/reconnect detection and thread resumption; disconnecting a wait does not stop it. Unsent prompts survive route retries, and PID/event-log write failures terminate and reap children. Closing stdout while still alive does not bypass the configured timeout, idle or reconnect budget.
 
@@ -325,6 +330,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
+| `plannerAnswers` | `false` | Allows planner answers and `accepted_deviations` based on the user's original goal and known facts, and skips pending-conflict write-scope preflight. The latest `ask_user` task still requires `codex_continue`, with answers covering every question ID. Report decisions made for the user; ask first when uncertain or when answers entail data deletion or changes to directories the user did not mention. |
 | `lockTimeoutSeconds` | Empty (unlimited) | Positive finite seconds waiting for directory write locks; expiry returns retryable `lock_timeout` before Codex starts. Null, empty or omitted passes no flag. |
 | `maxStorageMb` | Empty (unlimited) | Positive finite combined `jobs`/`runs` limit in MiB, including fractions; startup best-effort cleanup removes the oldest finished records, preserving active and current tasks. Null, empty or omitted passes no flag. |
 

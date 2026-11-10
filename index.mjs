@@ -63,6 +63,7 @@ const DEFAULTS = {
   allowHostAccess: false,
   // 省略 host_access 时默认使用主机模式，仍须开启 allowHostAccess
   defaultHostAccess: false,
+  plannerAnswers: false,
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
   reportSchema: here('./report.v2.schema.json'),
   // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
@@ -439,11 +440,14 @@ function sameCriteria(report, acceptance) {
 }
 
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
+const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并在给用户的汇报里写明替用户做了哪些决定；拿不准，或回答意味着删除数据、改动用户没提过的目录时，仍然先问用户。';
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
-export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only' } = {}) {
+export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false } = {}) {
   acceptance ??= value.acceptance ?? value.context?.acceptance;
+  const recordReview = plannerAnswers
+    ? RECORD_REVIEW.replace('用户明确接受已列出的偏差时', '已列出的偏差符合用户原始目标和已有事实时') + PLANNER_ANSWERS : RECORD_REVIEW;
   if (!value.job_id && unknownState(value)) {
     return '这次未取得任务编号，无法确认 Codex 是否已经启动。先用 codex_jobs 按相同任务目录和原任务核对近期记录，找回 job_id 后再查状态，不要直接重派。';
   }
@@ -470,14 +474,18 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
     if (blocking.next_action === 'ask_user') {
       const environment = blocking.blockers.some((b) => b.kind === 'environment');
-      const guidance = environment
+      const guidance = plannerAnswers
+        ? PLANNER_ANSWERS + (environment
+          ? '同时核实报告里的环境解除条件；答案齐全且条件已满足后，用 codex_continue 同时提交 answers 和 resolution，resolution 写明条件已满足的具体证据。条件未齐备时先不要续接；不要重复派活：\n'
+          : '用 codex_continue 提交 answers；不要重复派活：\n')
+        : environment
         ? '先向用户提出以下具体问题，同时核实报告里的环境解除条件。取得回答且条件已满足后，用 codex_continue 同时提交 answers 和 resolution，resolution 写明条件已满足的具体证据。条件未齐备时先不要续接；不要重复派活或替用户决定：\n'
         : '先向用户提出以下具体问题，取得回答后用 codex_continue 提交 answers；不要重复派活或替用户决定：\n';
       return guidance + blocking.questions.map((q) => `${q.id}: ${q.question}`).join('\n');
     }
     if (blocking.next_action === 'wait_condition') return '当前受环境条件阻塞。先说明 blockers 中的解除条件；条件改变并取得证据后，用 codex_continue 的 resolution 说明事实再续跑，不要原样重试。';
     if (blocking.next_action === 'inspect_report') return '报告或任务状态仍需核对。先读完整报告和实际状态，按原验收标准逐条核对。对照原任务范围区分真实缺口与已说明的验证边界；边界说明本身不自动增加补做要求。确有遗留问题时，再查清需要用户回答、环境变化还是实现修正；不能把未知原因当实现问题重复派活。\n' +
-      RECORD_REVIEW +
+      recordReview +
       (value.out_of_scope?.length ? `\n范围外改动待核实：${value.out_of_scope.join('、')}。快照也可能包含其他进程写的文件，先核实归属，不能仅凭快照认定 Codex 越界。` : '') +
       (list ? `\n原验收标准：\n${list}` : '');
     if (blocking.next_action === 'resume_fix') return '已有明确实现差距。用 codex_continue 续接原任务，它会保留原目录、验收、write、scope 和主机权限；不得借修正扩大授权。';
@@ -510,9 +518,9 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       '总是由其他进程写的文件，可以请用户写进插件配置 ignoreChanges，以后不再列出' : '',
   ].filter(Boolean);
   const where = original ? '上面逐条汇报里的验收标准' : list ? '下面的验收标准' : '验收标准';
-  return (alerts.length ? `${alerts.join('\n')}\n偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。\n` : '') +
+  return (alerts.length ? `${alerts.join('\n')}\n${plannerAnswers ? PLANNER_ANSWERS : '偏离或冲突需要用户取舍的，先向用户说明，不要替用户选。'}\n` : '') +
     `Codex 的答复不是完成证据。用只读检查逐条核验${where}，给出每条的证据；` +
-    RECORD_REVIEW +
+    recordReview +
     `有差距时先记录 needs_changes，再用 codex_continue 在原权限内修正。${list ? `\n${list}` : ''}`;
 }
 
@@ -712,6 +720,7 @@ const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 
 export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const cfg = settings(config, ctx.logger);
+  const canAnswer = (log, job, owner) => cfg.plannerAnswers === true || hasUserReply(log, job, owner);
   const conductor = createConductor(cfg, run);
   let dispatching = 0;
   let dispatchGeneration = 0;
@@ -804,7 +813,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
     } catch (error) {
       const lost = withReport({ job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error) });
-      lost.next = nextStep(lost);
+      lost.next = nextStep(lost, undefined, undefined, cfg);
       return publish(lost);
     } finally {
       state.settled = true;
@@ -886,7 +895,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   // 仍在执行时交给后台任务，结束后 DSH 只发一条带摘要的任务通知，完整结果要用 job_output 读；没有后台任务就照旧轮询
-  const finishStatus = (value) => ({ ...value, next: nextStep(value) });
+  const finishStatus = (value) => ({ ...value, next: nextStep(value, undefined, undefined, cfg) });
 
   function notifyOnDone(value, exec, finish) {
     if (value.status !== 'running' || !value.job_id) return value;
@@ -916,7 +925,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
         ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
       return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
-        { readOnly: args.write !== true }) + reminder };
+        { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers }) + reminder };
     };
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
     exec?.signal?.throwIfAborted();
@@ -937,19 +946,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对待续接线程的任务', history);
           const pending = history.jobs.find((job, index) => job.blocking?.next_action === 'ask_user' &&
-            ((!continuation && offset === 0 && index === 0) || !hasUserReply(log, job, owner)));
-          if (pending) throw new Error(`${tool}: 原任务 ${pending.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再按最新任务状态用 codex_continue 处理。`);
+            ((!continuation && offset === 0 && index === 0) || !canAnswer(log, job, owner)));
+          if (pending) throw new Error(cfg.plannerAnswers
+            ? `${tool}: 原任务 ${pending.job_id} 有待答问题，未启动 Codex。请用 codex_continue 提交 answers。${PLANNER_ANSWERS}`
+            : `${tool}: 原任务 ${pending.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再按最新任务状态用 codex_continue 处理。`);
           offset = history.next_offset ?? null;
         }
       }
-      if (!continuation && args.write && owner) {
+      if (!cfg.plannerAnswers && !continuation && args.write && owner) {
         for (let offset = 0; offset !== null;) {
           const history = await conductor.list({ owner, needs_attention: true, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对已有写入范围', history);
           for (const job of history.jobs) {
             if (job.blocking?.next_action !== 'ask_user' || !job.blocking.blockers?.some(b => b.kind === 'task_conflict') ||
-                hasUserReply(log, job, owner)) continue;
+                canAnswer(log, job, owner)) continue;
             const scope = job.scope_paths ?? job.scope;
             if (unknownState(job) || typeof job.cwd !== 'string' || !job.cwd.trim() ||
                 (scope !== null && (!Array.isArray(scope) || scope.some(p => typeof p !== 'string' || !p.trim())))) {
@@ -993,7 +1004,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
-      '原任务需要用户回答时先询问，再用 codex_continue；其他返工可带 resume=thread_id。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      (cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
+      '其他返工可带 resume=thread_id。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
       (cfg.allowHostAccess === true
@@ -1088,9 +1100,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           `用 codex_jobs 核对正确 job_id，再用 codex_status 查询 ${args.job_id}；需要取消时可再调用 codex_cancel，不要重派。`;
       } else if (done.status === 'completed') {
         // 取消没赶上：任务已经完成，改动已经留下，按完成处理
-        next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done)}`;
+        next = `取消没有生效：任务在取消前已经完成，改动已经留下。先把这点告诉用户。\n${nextStep(done, undefined, undefined, cfg)}`;
       } else if (done.status === 'cancelled') {
-        next = done.phase === 'lock_wait' ? nextStep(done)
+        next = done.phase === 'lock_wait' ? nextStep(done, undefined, undefined, cfg)
           : '已按本次调用取消。可写任务可能已改了一部分且没有改动清单，核验或重派前先用 git status 或对比文件确认现状。';
       } else {
         next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
@@ -1221,8 +1233,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const continuations = new Map();
   ctx.tools.register({
     name: 'codex_continue',
-    description: '在用户回答阻塞问题或环境条件已改变后续接原任务；先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
-      'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
+    description: (cfg.plannerAnswers ? '在规划端回答阻塞问题或环境条件已改变后续接原任务；' : '在用户回答阻塞问题或环境条件已改变后续接原任务；') +
+      '先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
+      (cfg.plannerAnswers ? 'answers 用阻塞问题的 id，可由规划端回答；' + PLANNER_ANSWERS : 'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；') +
+      '缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
       '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
@@ -1250,14 +1264,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           const child = withReport(await conductor.waitJob(children.jobs[0].job_id, 0));
           const bg = liveBackground(child.job_id, exec);
           return { ...child, reused: true, ...(bg ? { background_job_id: bg.id } : {}),
-            next: `原任务已有后续轮次 ${child.job_id}，没有重复派活。补充信息或修正请基于该轮次。\n${nextStep(child)}` };
+            next: `原任务已有后续轮次 ${child.job_id}，没有重复派活。补充信息或修正请基于该轮次。\n${nextStep(child, undefined, undefined, cfg)}` };
         }
         const plan = prepareContinuation(source, args, owner);
         const needsReply = plan.ready && plan.blocking.questions.length > 0 &&
-          !hasUserReply(exec.agent.session?.log ?? [], source, owner);
+          !canAnswer(exec.agent.session?.log ?? [], source, owner);
         if (!plan.ready || needsReply) return { ...source, continuation_ready: false, blocking: plan.blocking,
           remaining_questions: needsReply ? plan.blocking.questions : plan.remaining_questions,
-          next: needsReply ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
+          next: cfg.plannerAnswers && plan.blocking.questions.length ? plan.next + PLANNER_ANSWERS : needsReply
+            ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
         return dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
           exec, plan.continuation, plan.task);
       })();
@@ -1269,7 +1284,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     name: 'codex_review',
     description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
-      'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
+      (cfg.plannerAnswers ? 'accepted_deviations=逐条通过且规划端按用户原始目标和已有事实接受原报告偏差或范围外改动。' + PLANNER_ANSWERS
+        : 'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。') +
+      '不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
@@ -1277,7 +1294,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
           evidence: { type: 'string', minLength: 1 } }, required: ['index', 'status', 'evidence'] } },
       notes: { type: 'string', description: '没有补充说明可省略。' },
-      accepted_deviations: { type: 'array', description: '原会话用户在作业结束后明确接受偏差或范围外改动时，逐项记录确认依据；没有时可省略。', items: { type: 'object', additionalProperties: false,
+      accepted_deviations: { type: 'array', description: cfg.plannerAnswers
+        ? '规划端按用户原始目标和已有事实接受偏差或范围外改动时，逐项记录决定依据；没有时可省略。' + PLANNER_ANSWERS
+        : '原会话用户在作业结束后明确接受偏差或范围外改动时，逐项记录确认依据；没有时可省略。', items: { type: 'object', additionalProperties: false,
         properties: { kind: { type: 'string', enum: ['reported', 'scope'] }, index: { type: 'integer', minimum: 1 },
           evidence: { type: 'string', minLength: 1 } }, required: ['kind', 'index', 'evidence'] } },
       blockers: { type: 'array', items: { type: 'object', additionalProperties: false, properties: {
@@ -1294,7 +1313,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       exec?.signal?.throwIfAborted();
       const { job_id, notes = '', accepted_deviations = [], ...review } = args;
       if (Array.isArray(accepted_deviations) && accepted_deviations.length > 0 &&
-          !hasUserReply(exec.agent.session?.log ?? [], source, owner)) {
+          !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
       const result = await conductor.review(job_id, { ...review, notes, accepted_deviations }, owner, exec?.signal);
@@ -1304,7 +1323,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
       }
       const value = withReport(result);
-      return { ...value, next: nextStep(value) };
+      return { ...value, next: nextStep(value, undefined, undefined, cfg) };
     },
   });
 
@@ -1382,7 +1401,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
                     ['needs_changes', 'invalid'].includes(value.verification_status))));
                 if (mode === 'all' || attention) alerts.push({ job_id: item.job_id, background_job_id: backgroundId,
                   status: value.status, summary: value.report?.summary ?? value.error ?? summaryLine(value),
-                  blocking: value.blocking, verification_status: value.verification_status, next: nextStep(value) });
+                  blocking: value.blocking, verification_status: value.verification_status, next: nextStep(value, undefined, undefined, cfg) });
               }
               if (stopped) break;
               if (alerts.length) return { status: 'completed', detail: `${alerts.length} 个重要状态变化`,
@@ -1479,6 +1498,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
           ...(cfg.gemini ? ['gemini_write'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
+        plannerAnswers: cfg.plannerAnswers === true,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
   } catch {}

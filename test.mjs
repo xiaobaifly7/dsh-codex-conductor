@@ -1064,6 +1064,16 @@ test('codex_run cannot resume a thread whose latest owned task needs a user answ
   assert.deepEqual(h.calls, [['list', '--limit', '100', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
 });
 
+test('plannerAnswers still requires codex_continue when resuming the latest ask_user task', async () => {
+  const source = withReport(workflowSource('task_conflict'));
+  const h = harness({ config: { plannerAnswers: true, listResult: { jobs: [source] } } });
+  for (const log of [[], answeredParent]) {
+    await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id },
+      { agent: agentAt('/work/current', log) }), /PARENT.*未启动 Codex.*codex_continue.*answers/);
+  }
+  assert.ok(h.calls.every(argv => argv[0] === 'list' && argv.includes('--thread-id')));
+});
+
 test('a new write task cannot widen an overlapping pending scope before a real user reply', async () => {
   const prior = { ...workflowSource('task_conflict'), scope_paths: ['/work/original/candidate.vhdx'] };
   const row = { job_id: prior.job_id, cwd: prior.cwd, scope_paths: prior.scope_paths, scope: prior.scope,
@@ -1092,6 +1102,16 @@ test('a new write task cannot widen an overlapping pending scope before a real u
     assert.ok(!h.calls.find(argv => argv[0] === 'list').includes('--cwd'));
     assert.equal(h.calls.some(argv => argv[0] === 'status' && argv[1] === 'PARENT'), false);
   }
+});
+
+test('plannerAnswers skips scope history preflight for a new write task', async () => {
+  const source = withReport(workflowSource('task_conflict'));
+  const h = harness({ config: { plannerAnswers: true, listResult: { jobs: [source] },
+    startResult: { job_id: 'NEXT', status: 'completed' } } });
+  const value = await h.tools.codex_run.execute({ ...RUN, cwd: source.cwd, scope: ['src', 'step.ps1'], write: true },
+    { agent: agentAt('/work/current') });
+  assert.equal(value.job_id, 'NEXT');
+  assert.deepEqual(h.calls.map(argv => argv[0]), ['start']);
 });
 
 test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
@@ -1136,6 +1156,27 @@ test('both resume paths reject an older unanswered task on the same thread', asy
   }
 });
 
+test('plannerAnswers lets both resume paths pass older unanswered tasks on the same thread', async () => {
+  const parent = withReport(workflowSource('task_conflict'));
+  const latest = withReport({ ...workflowSource('implementation'), job_id: 'CHILD' });
+  for (const tool of ['codex_run', 'codex_continue']) {
+    const listResult = (argv) => !argv.includes('--thread-id') ? { jobs: [] }
+      : argv[argv.indexOf('--offset') + 1] === '0' ? { jobs: [latest], next_offset: 1 } : { jobs: [parent] };
+    const h = harness({ config: { plannerAnswers: true, listResult,
+      startResult: { job_id: 'NEXT', status: 'completed' } } });
+    h.finals.CHILD = latest;
+    const args = tool === 'codex_run'
+      ? { ...RUN, write: true, scope: ['src'], resume: parent.thread_id } : { job_id: 'CHILD', wait_seconds: 0 };
+    const log = [...answeredParent.slice(0, 2),
+      { type: 'user/message', time: 12_000, data: { source: { kind: 'tool-jobs' } } }];
+    assert.equal((await h.tools[tool].execute(args, { agent: agentAt('/work/current', log) })).job_id, 'NEXT');
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
+    assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, 2);
+    const start = h.calls.find(argv => argv[0] === 'start');
+    assert.equal(start[start.indexOf('--resume') + 1], parent.thread_id);
+  }
+});
+
 test('codex_continue requires a real reply after the report or review raised questions', async () => {
   const [registered, settled, human] = answeredParent;
   const notice = { ...human, time: 12_500, data: { source: { kind: 'tool-jobs' } } };
@@ -1161,6 +1202,36 @@ test('codex_continue requires a real reply after the report or review raised que
     assert.equal((await h.tools.codex_continue.execute(args, replied)).job_id, 'CHILD');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
   }
+});
+
+test('plannerAnswers applies complete planner answers without a user reply and keeps answer validation', async () => {
+  const source = workflowSource('task_conflict');
+  source.structured.blockers.push({ ...source.structured.blockers[0], id: 'columns', question: '是否保留旧列？' });
+  const h = harness({ config: { plannerAnswers: true, listResult: (argv) =>
+    ({ jobs: argv.includes('--thread-id') ? [withReport(source)] : [] }),
+    startResult: { job_id: 'CHILD', status: 'completed' } } });
+  h.finals.PARENT = source;
+  const exec = { agent: agentAt('/work/current') };
+  const answers = [{ id: 'columns', answer: '保留旧列' }, { id: 'format', answer: '保留旧格式' }];
+  const missing = await h.tools.codex_continue.execute({ job_id: 'PARENT' }, exec);
+  const partial = await h.tools.codex_continue.execute({ job_id: 'PARENT', answers: answers.slice(0, 1) }, exec);
+  assert.equal(missing.continuation_ready, false);
+  assert.equal(partial.continuation_ready, false);
+  assert.deepEqual(missing.remaining_questions.map(q => q.id), ['format', 'columns']);
+  assert.deepEqual(partial.remaining_questions.map(q => q.id), ['format']);
+  assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
+  const status = await h.tools.codex_status.execute({ job_id: 'PARENT', wait_seconds: 0 }, exec);
+  for (const text of [missing.next, partial.next, status.next, h.tools.codex_run.description,
+    h.tools.codex_continue.description, h.tools.codex_review.description,
+    h.tools.codex_review.parameters.properties.accepted_deviations.description]) {
+    assert.match(text, /按用户原始目标和已有事实自行回答[\s\S]*汇报里写明替用户做了哪些决定[\s\S]*拿不准[\s\S]*删除数据、改动用户没提过的目录[\s\S]*先问用户/);
+    assert.doesNotMatch(text, /须来自原会话中的实际用户回复|先向用户提出以下具体问题|原会话用户已明确接受/);
+  }
+  const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', answers, wait_seconds: 0 }, exec);
+  assert.equal(value.job_id, 'CHILD');
+  const starts = h.requests.filter(({ argv }) => argv[0] === 'start');
+  assert.equal(starts.length, 1);
+  assert.deepEqual(JSON.parse(starts[0].stdin).context.continuation.answers, answers);
 });
 
 test('codex_continue dispatches 22 original criteria with original context, permissions and options', async () => {
@@ -1301,6 +1372,24 @@ test('codex_review cannot record accepted deviations before the user replies', a
   assert.deepEqual(JSON.parse(h.requests.find(({ argv }) => argv[0] === 'review').stdin).accepted_deviations, accepted_deviations);
 });
 
+test('plannerAnswers lets the planner record accepted deviations without a user reply', async () => {
+  const source = workflowSource('implementation');
+  source.structured.deviations = ['CSV 输出文件名有偏差'];
+  const accepted_deviations = [{ kind: 'reported', index: 1, evidence: '按原目标核对，保留现有文件名' }];
+  const record = { status: 'accepted_deviations', criteria: [{ index: 1, status: 'met', evidence: 'CSV 测试通过' }],
+    notes: '向用户汇报保留现有文件名的决定', accepted_deviations };
+  const h = harness({ config: { plannerAnswers: true,
+    reviewResult: { ...source, verification_status: 'accepted_deviations', verification: record } } });
+  h.finals.PARENT = source;
+  const value = await h.tools.codex_review.execute({ job_id: 'PARENT', ...record }, { agent: agentAt('/work/current') });
+  assert.equal(value.verification_status, 'accepted_deviations');
+  const reviews = h.requests.filter(({ argv }) => argv[0] === 'review');
+  assert.equal(reviews.length, 1);
+  assert.deepEqual(JSON.parse(reviews[0].stdin), record);
+  assert.deepEqual(value.report, source.structured);
+  assert.equal(h.calls.some(argv => argv[0] === 'start'), false);
+});
+
 test('codex_review sends every criterion in stdin and returns verification without rewriting the report', async () => {
   const source = workflowSource('implementation');
   source.context.acceptance.push('旧 CSV 文件保持不变');
@@ -1422,13 +1511,15 @@ test('codex_summary renders null duration and usage as unknown while retaining g
 });
 
 test('runtime status shows loaded service tier and sanitized gateway settings', async () => {
-  const current = harness({ config: { serviceTier: 'fast', allowHostAccess: true, defaultHostAccess: true,
+  const current = harness({ config: { serviceTier: 'fast', allowHostAccess: true, defaultHostAccess: true, plannerAnswers: true,
     codexRoute: { provider: 'magpie', baseUrl: 'http://127.0.0.1:3426/v1?private=route-test' },
     routerCheckUrl: 'http://127.0.0.1:3440/health?private=probe-test' } });
   const { loaded } = await current.tools.codex_runtime.execute({ action: 'status' });
   assert.equal(loaded.serviceTier, 'fast');
   assert.equal(loaded.allowHostAccess, true);
   assert.equal(loaded.defaultHostAccess, true);
+  assert.equal(loaded.plannerAnswers, true);
+  assert.equal(loaded.version, '0.9.44');
   assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
   assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
   assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
@@ -1436,6 +1527,7 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   const inherited = harness({ config: { codexRoute: { provider: 'magpie', baseUrl: 'http://127.0.0.1:3426/v1' } } });
   const fallback = (await inherited.tools.codex_runtime.execute()).loaded;
   assert.equal(fallback.serviceTier, null);
+  assert.equal(fallback.plannerAnswers, false);
   assert.deepEqual(fallback.routerCheck, { transport: 'http', origin: 'http://127.0.0.1:3426' });
 });
 
@@ -2778,7 +2870,7 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   const envelope = JSON.parse(starts[0].stdin);
   const { dispatcher, ...taskContext } = envelope.context;
   assert.equal(dispatcher.pid, process.pid);
-  assert.match(dispatcher.version, /^\d+\.\d+\.\d+/);
+  assert.equal(dispatcher.version, '0.9.44');
   assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);
@@ -3116,9 +3208,9 @@ test('runProcess removes abort listeners on success, error and timeout', async (
 test('settings warns and defaults each invalid entry without losing valid configuration', async () => {
   const invalidTypes = { distro: 1, python: false, runner: [], codexBin: {}, codexHome: false, runnerHome: 1,
     routerCheckUrl: [], codexRoute: [], model: true, effort: {}, readOnlyEffort: 3, serviceTier: [],
-    waitSeconds: '100', allowHostAccess: 'false', defaultHostAccess: 1, reportSchema: null,
+    waitSeconds: '100', allowHostAccess: 'false', defaultHostAccess: 1, plannerAnswers: 'true', reportSchema: null,
     plannerPromptFile: [], runtimeProfileFile: {}, workspaces: {}, denyTools: 'edit', allowCommands: {}, ignoreChanges: 'logs' };
-  for (const invalid of [invalidTypes, { waitSeconds: '', allowHostAccess: '', defaultHostAccess: '',
+  for (const invalid of [invalidTypes, { waitSeconds: '', allowHostAccess: '', defaultHostAccess: '', plannerAnswers: '',
     workspaces: '', denyTools: '', allowCommands: '', ignoreChanges: '', codexRoute: '' }]) {
     const warnings = [];
     const tools = {};
@@ -3136,6 +3228,7 @@ test('settings warns and defaults each invalid entry without losing valid config
     assert.equal(loaded.codexRoute, null);
     assert.equal(loaded.allowHostAccess, false);
     assert.equal(loaded.defaultHostAccess, false);
+    assert.equal(loaded.plannerAnswers, false);
     assert.ok(loaded.runner.endsWith('/runner/codex_runner.py'));
     assert.equal(tools.codex_run.parameters.properties.timeoutSeconds, undefined);
   }
