@@ -244,6 +244,21 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["error_kind"], "timeout")
         self.assertEqual(r["attempts"], 1)
 
+    def test_attempt_timeouts_ignore_wall_clock_jumps(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--timeout", "3", "--idle-timeout", "3"])
+        run_dir = Path(self.tmp.name) / "attempt"
+        run_dir.mkdir()
+        with mock.patch.dict(os.environ, {"FAKE_MODE": "slow_ok", "FAKE_SLEEP": ".1"}), \
+                mock.patch.object(codex_runner.time, "time", side_effect=range(0, 360000, 3600)):
+            state = codex_runner.run_attempt(args, "do it", run_dir, None)
+        self.assertTrue(state["completed"])
+        self.assertIsNone(state["end_reason"])
+
     def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
         start = time.monotonic()
         r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0", mode="close_stdout_then_hang")
@@ -1109,10 +1124,18 @@ class RunnerTests(unittest.TestCase):
                         clock[0] += 2
                     return real_stat(path, *args, **kwargs)
 
-                with mock.patch.object(codex_runner.time, "time", side_effect=lambda: clock[0]), \
+                with mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: clock[0]), \
                         mock.patch.object(codex_runner.os, "stat", side_effect=slow_stat):
                     self.assertIsNone(codex_runner.snapshot(str(self.cwd), budget=1, scope=scope))
                 self.assertEqual(len(scanned), 1)
+
+    def test_snapshot_budget_ignores_wall_clock_jumps(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        (self.cwd / "a.txt").write_text("a")
+        with mock.patch.object(codex_runner.time, "time", side_effect=range(0, 360000, 3600)):
+            self.assertIn("a.txt", codex_runner.snapshot(str(self.cwd)))
 
     def test_snapshot_stat_errors_fall_back_to_events_instead_of_reporting_deletion(self):
         sys.path.insert(0, str(RUNNER.parent))
