@@ -22,6 +22,7 @@ const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
+const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -1420,10 +1421,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
   });
 
-  registerRuntimeTool({ ctx, conductor, moduleUrl: import.meta.url, loadedIdentity,
+  const runtime = registerRuntimeTool({ ctx, conductor, moduleUrl: import.meta.url, loadedIdentity,
     profileFile: cfg.runtimeProfileFile,
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
+  registerPanel({ ctx, cfg, conductor, runtime, plannerFile });
 
   if (cfg.gemini) ctx.tools.register({
     name: 'gemini_write',

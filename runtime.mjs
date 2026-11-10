@@ -166,7 +166,7 @@ function ownEntry(text, moduleUrl, byManagedId = false) {
       if (!id || nameLines.length !== 1 || ids.length !== 1 || !/^[a-zA-Z0-9_-]+$/.test(id.value)) {
         throw new Error('Ambiguous or unsupported runtime entry');
       }
-      matches.push({ id, name });
+      matches.push({ id, name, lines: candidate.lines, indent: candidate.indent });
     }
   }
   visit(sections.length ? lines.slice(sections[0] + 1) : lines);
@@ -213,7 +213,138 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
     active_tasks: activeTasks, state, can_reload };
 }
 
-export function requestRuntimeReload({ moduleUrl, profileFile }) {
+export function validatePanelSettings(value, geminiConfigured = false) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
+    throw new Error('请提交要修改的设置');
+  }
+  const efforts = ['low', 'medium', 'high', 'xhigh', 'max'];
+  const model = (v) => typeof v === 'string' && /^[A-Za-z0-9._/:-]{1,80}$/.test(v);
+  for (const [key, v] of Object.entries(value)) {
+    let valid = false;
+    if (key === 'model') valid = model(v);
+    else if (key === 'effort') valid = efforts.includes(v);
+    else if (key === 'readOnlyEffort') valid = v === '' || efforts.includes(v);
+    else if (key === 'serviceTier') valid = ['', 'fast', 'ultrafast'].includes(v);
+    else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
+    else if (['lockTimeoutSeconds', 'maxStorageMb'].includes(key)) valid = typeof v === 'number' && Number.isFinite(v) && v > 0;
+    else if (key === 'gemini') {
+      valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
+        Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
+    }
+    if (!valid) throw new Error(`设置 ${key} 的值无效`);
+  }
+  return value;
+}
+
+function yamlSetting(value, field) {
+  if (typeof value !== 'string') return String(value);
+  if (value === '') return "''";
+  const rendered = field?.render(value) ?? value;
+  if (rendered !== value) return rendered;
+  return /^[A-Za-z_/][A-Za-z0-9._/-]*$/.test(value) && !/^(null|true|false|yes|no|on|off)$/i.test(value)
+    ? value : JSON.stringify(value);
+}
+
+function settingsEdits(profile, changes) {
+  const { lines, indent } = profile.entry;
+  const pad = ' '.repeat(indent + 2);
+  const configs = lines.filter((line) => line.text.startsWith(pad + 'config:'));
+  if (configs.length > 1) throw new Error('conductor 配置重复，未保存');
+  const newline = /\r\n|\r|\n/.exec(profile.text)?.[0] ?? '\n';
+  const edits = [];
+  const endOfLine = (line) => line.start + line.text.length;
+  const replace = (line, key, prefix, value) => {
+    const field = scalar(line, key, prefix);
+    if (!field || /^[!&*|>\[{]/.test(field.value)) throw new Error(`不支持 ${key} 的 YAML 写法，未保存`);
+    const rendered = yamlSetting(value, field);
+    edits.push([{ ...field, render: () => rendered }, value]);
+  };
+  const insert = (at, text) => edits.push([{ start: at, length: 0, render: () => text }, null]);
+  if (!configs.length) {
+    validatePanelSettings(changes, false);
+    const last = lines.at(-1);
+    insert(endOfLine(last), newline + pad + 'config:' + Object.entries(changes)
+      .map(([key, value]) => newline + pad + '  ' + key + ': ' + yamlSetting(value)).join(''));
+    return edits;
+  }
+  const config = configs[0];
+  if (!new RegExp('^' + pad + 'config:[ \\t]*(?:#.*)?$').test(config.text)) throw new Error('conductor config 必须使用分行 YAML，未保存');
+  const start = lines.indexOf(config) + 1;
+  const children = [];
+  for (const line of lines.slice(start)) {
+    if (line.text.search(/\S/) <= indent + 2) break;
+    children.push(line);
+  }
+  const fieldPad = /^ */.exec(children[0]?.text ?? '')[0] || pad + '  ';
+  const gemini = children.filter((line) => line.text.startsWith(fieldPad + 'gemini:'));
+  validatePanelSettings(changes, gemini.length === 1 && new RegExp('^' + fieldPad + 'gemini:[ \\t]*(?:#.*)?$').test(gemini[0].text));
+  let additions = '';
+  for (const [key, value] of Object.entries(changes)) {
+    if (key === 'gemini') {
+      const parent = gemini[0];
+      const nested = [];
+      for (const line of children.slice(children.indexOf(parent) + 1)) {
+        if (line.text.search(/\S/) <= fieldPad.length) break;
+        nested.push(line);
+      }
+      const nestedPad = /^ */.exec(nested[0]?.text ?? '')[0] || fieldPad + '  ';
+      let added = '';
+      for (const [k, item] of Object.entries(value)) {
+        const hits = nested.filter((line) => line.text.startsWith(nestedPad + k + ':'));
+        if (hits.length > 1) throw new Error(`gemini.${k} 配置重复，未保存`);
+        if (hits.length) replace(hits[0], k, nestedPad, item);
+        else added += newline + nestedPad + k + ': ' + yamlSetting(item);
+      }
+      if (added) insert(endOfLine(parent), added);
+      continue;
+    }
+    const hits = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
+    if (hits.length > 1) throw new Error(`${key} 配置重复，未保存`);
+    if (hits.length) replace(hits[0], key, fieldPad, value);
+    else additions += newline + fieldPad + key + ': ' + yamlSetting(value);
+  }
+  if (additions) insert(endOfLine(config), additions);
+  return edits;
+}
+
+function editedProfile(profile, edits) {
+  let text = profile.text;
+  for (const [field, value] of edits.sort((a, b) => b[0].start - a[0].start)) {
+    text = text.slice(0, field.start) + field.render(value) + text.slice(field.start + field.length);
+  }
+  return text;
+}
+
+export function writeBackedUpFile(file, bytes, expected = readFileSync(file), backup = true) {
+  const attributes = lstatSync(file);
+  if (!attributes.isFile()) throw new Error('Runtime profile must be a regular file');
+  const mode = attributes.mode;
+  const token = randomUUID();
+  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${token}.tmp`);
+  const backupFile = backup ? `${file}.${new Date().toISOString().replace(/[:.]/g, '-')}.${token}.bak` : null;
+  let created = false;
+  try {
+    const fd = openSync(temporary, 'wx', mode);
+    created = true;
+    try { writeFileSync(fd, bytes); fsyncSync(fd); } finally { closeSync(fd); }
+    if (!readFileSync(file).equals(expected)) throw new Error('文件在保存前已被其他程序修改，请刷新后再试');
+    if (backupFile) writeFileSync(backupFile, expected, { flag: 'wx', mode });
+    renameSync(temporary, file);
+    created = false;
+  } finally {
+    if (created) unlinkSync(temporary);
+  }
+  return backupFile;
+}
+
+export function saveRuntimeSettings({ moduleUrl, profileFile, changes }) {
+  const profile = profileRecord(profileFile, moduleUrl);
+  const text = editedProfile(profile, settingsEdits(profile, changes));
+  const backup = writeBackedUpFile(profileFile, profile.encode(text), profile.bytes);
+  return { saved: true, backup };
+}
+
+export function requestRuntimeReload({ moduleUrl, profileFile, changes }) {
   modulePath(moduleUrl);
   const profile = profileRecord(profileFile, moduleUrl);
   const token = randomUUID();
@@ -222,27 +353,10 @@ export function requestRuntimeReload({ moduleUrl, profileFile }) {
   const expected_module = url.href;
   const requested_revision = runtimeIdentity(moduleUrl).revision;
   const requested_at = new Date().toISOString();
-  const edits = [[profile.entry.id, `codex-conductor-runtime-${token}`], [profile.entry.name, expected_module]];
-  let text = profile.text;
-  for (const [field, value] of edits.sort((a, b) => b[0].start - a[0].start)) {
-    text = text.slice(0, field.start) + field.render(value) + text.slice(field.start + field.length);
-  }
-  const attributes = lstatSync(profileFile);
-  if (!attributes.isFile()) throw new Error('Runtime profile must be a regular file');
-  const mode = attributes.mode;
-  const temporary = path.join(path.dirname(profileFile), `.${path.basename(profileFile)}.${token}.tmp`);
-  let created = false;
-  try {
-    const fd = openSync(temporary, 'wx', mode);
-    created = true;
-    try { writeFileSync(fd, profile.encode(text)); fsyncSync(fd); } finally { closeSync(fd); }
-    if (!readFileSync(profileFile).equals(profile.bytes)) throw new Error('Profile changed while preparing runtime reload');
-    renameSync(temporary, profileFile);
-    created = false;
-  } finally {
-    if (created) unlinkSync(temporary);
-  }
-  return { expected_module, requested_revision, requested_at };
+  const edits = [[profile.entry.id, `codex-conductor-runtime-${token}`], [profile.entry.name, expected_module],
+    ...(changes ? settingsEdits(profile, changes) : [])];
+  const backup = writeBackedUpFile(profileFile, profile.encode(editedProfile(profile, edits)), profile.bytes, Boolean(changes));
+  return { expected_module, requested_revision, requested_at, ...(backup ? { backup, saved: true } : {}) };
 }
 
 export async function waitForRuntimeLoad({ loadedFile, expectedModule, timeoutMs = 30_000, signal }) {
@@ -293,17 +407,17 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     return { count: Math.max(starting, ids.size + activeDispatches()), generation };
   }
   const pendingReload = (current) => current.can_reload && current.profile_module !== moduleUrl;
-  async function reload(current, signal) {
+  async function reload(current, signal, changes) {
     signal?.throwIfAborted();
-    if (current.state === 'synchronized') return { ...current, status: 'already_current' };
-    const request = pendingReload(current) ? { expected_module: current.profile_module, reused: true } :
-      requestRuntimeReload({ moduleUrl, profileFile });
+    if (current.state === 'synchronized' && !changes) return { ...current, status: 'already_current' };
+    const request = !changes && pendingReload(current) ? { expected_module: current.profile_module, reused: true } :
+      requestRuntimeReload({ moduleUrl, profileFile, changes });
     const confirmation = await waitForRuntimeLoad({ loadedFile, expectedModule: request.expected_module, signal });
     return { ...snapshot(current.active_tasks, current.active_error), ...request, ...confirmation,
       status: confirmation.confirmed ? 'reloaded' : 'unconfirmed',
       ...(confirmation.confirmed ? {} : { next: '重载请求已提交，尚未确认加载。用 codex_runtime action=status 查询，不要重复重载。' }) };
   }
-  return ctx.tools.register({
+  const tool = {
     name: 'codex_runtime',
     description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限及在途 Codex 任务数；reload 默认等空闲后重载，when=now 立即请求。' +
       '不会取消或启动 Codex 任务。已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。',
@@ -314,7 +428,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     } },
     output: { schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
-    async execute(args = {}, exec) {
+    async execute(args = {}, exec, changes) {
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('codex_runtime: arguments must be an object');
       const { action = 'status', when = 'idle' } = args;
       if (!['status', 'reload'].includes(action)) throw new Error('codex_runtime: invalid action');
@@ -338,17 +452,20 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         }
         current = snapshot(count, active_error);
         if (action === 'status') return { ...current, status: 'status' };
+        if (changes && (active_error || count !== 0)) {
+          return { ...current, status: 'failed', error: active_error || '还有 Codex 任务正在运行，请等任务结束后再保存；配置尚未修改。' };
+        }
         const awaiting = pendingReload(current);
         if (active_error && when === 'idle' && !awaiting) {
           return { ...current, status: 'failed', error_kind: 'active_count_unavailable', error: active_error };
         }
         if (!current.can_reload) throw new Error(current.profile_error);
         if (awaiting || current.state === 'synchronized' || when === 'now' || current.active_tasks === 0) {
-          return await reload(current, exec?.signal);
+          return await reload(current, exec?.signal, changes);
         }
         const owner = exec?.agent?.id;
         const jobs = ctx.get?.('jobs');
-        if (owner === undefined || !jobs?.start || !jobs?.list) {
+        if ((owner === undefined && exec?.panel !== true) || !jobs?.start || !jobs?.list) {
           return { ...current, status: 'failed', error_kind: 'native_jobs_unavailable',
             error: 'Codex 仍在运行且无法登记原生后台观察；未请求重载。' };
         }
@@ -387,5 +504,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
           error: String(error?.message ?? error) };
       }
     },
-  });
+  };
+  ctx.tools.register(tool);
+  return tool;
 }

@@ -12,6 +12,12 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.49` 恢复默认关闭的 `plannerAnswers` 开启时的完整放宽：规划端可按用户原始目标和已有事实代答阻塞问题，跳过待答范围冲突的写入范围预检，并自行登记包含 `kind: 'scope'` 的 `accepted_deviations`，无需用户回复。
 
+### 0.9.50：设置里的“Codex 指挥”
+
+在 DSH 设置页打开“Codex 指挥”，可以自动查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、分页阅读全文报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。保存设置会先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；确认实际加载后才显示生效。Codex 忙时先等任务结束再保存；重载按钮可以登记空闲等待。规划提示词保存前也会备份。
+
+面板沿用 DSH 的网页服务，不另开端口；`/dsh-codex-conductor/*` 的每个接口都调用 DSH 自己的登录及 Host/Origin 校验，缺少鉴权服务时拒绝访问。`webServer`、`settings` 或客户端槽位不存在时不影响原有工具。文件 URL 加载也支持前端：升级时保留完整包（包括 `package.json`、`client.js`、`panel.mjs`），仍用 `file:///…/index.mjs?v=…`，更换 entry ID 和 `v` 后由 DSH 热加载，无须重启宿主。`runtimeProfileFile` 须指向这个实例实际使用的 `cordis.patch.yml`；新版本先由用户部署。
+
 ## 功能
 
 **派活工具**
@@ -297,6 +303,12 @@ python3 runner/test_codex_runner.py
 `0.9.49` restores full opt-in `plannerAnswers`: the planner can answer blockers based on the user's original goal and known facts, skip pending-conflict write-scope preflight, and record `accepted_deviations`, including `kind: 'scope'`, without a user reply.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+
+### 0.9.50: Codex control panel
+
+Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, page through full reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Settings saves back up and atomically update this plugin's profile fields while preserving comments and unrelated configuration; success requires the actual load marker. Wait for active Codex tasks before saving settings; the reload button can queue an idle observer. Prompt saves also create a backup.
+
+Every `/dsh-codex-conductor/*` endpoint explicitly uses DSH's own login and Host/Origin checks on its existing web server; no extra port is opened, and missing authentication fails closed. Missing optional web/settings/slot services leave the existing tools available. File-URL loading supports the client declaration: deploy the complete package, including `package.json`, `client.js`, and `panel.mjs`, keep `file:///…/index.mjs?v=…`, and change the entry ID and `v` token for a hot load without restarting DSH. Set `runtimeProfileFile` to that instance's real `cordis.patch.yml`; deployment is a separate user action.
 
 ### Gemini tutorial and documentation writing (off by default)
 

@@ -1,11 +1,12 @@
 {
   "name": "dsh-codex-conductor",
-  "version": "0.9.49",
+  "version": "0.9.50",
   "description": "DeepSeek Harness plugin: hand coding tasks to Codex CLI in WSL with acceptance criteria and per-criterion reports, and keep the agent itself to planning and read-only verification.",
   "type": "module",
   "main": "./index.mjs",
   "exports": {
     ".": "./index.mjs",
+    "./client": "./client.js",
     "./package.json": "./package.json",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
@@ -14,6 +15,8 @@
     "guard.mjs",
     "workflow.mjs",
     "runtime.mjs",
+    "panel.mjs",
+    "client.js",
     "gemini.mjs",
     "report.schema.json",
     "report.v2.schema.json",
@@ -38,6 +41,14 @@
     "dsh": ">=0.2.1-rc.2 <0.3.0"
   },
   "dsh": {
-    "bundle": { "patch": "./cordis.patch.yml" }
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-primitives"
+      ]
+    }
   }
 }
