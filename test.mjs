@@ -1094,9 +1094,42 @@ test('codex_continue without answers returns the source and pending questions wi
   assert.equal(h.calls.filter((argv) => argv[0] === 'start').length, 0);
 });
 
+const answeredParent = [
+  { type: 'job/registered', data: { kind: 'codex', owner: 'S1', jobId: 'bg1', label: 'Codex PARENT' } },
+  { type: 'job/settled', data: { jobId: 'bg1' } },
+  { type: 'user/message', time: 11_000, data: { source: { kind: 'user' } } },
+];
+
+test('codex_continue requires a real reply after the report or review raised questions', async () => {
+  const [registered, settled, human] = answeredParent;
+  const notice = { ...human, time: 12_500, data: { source: { kind: 'tool-jobs' } } };
+  for (const fromReview of [false, true]) {
+    const source = workflowSource('task_conflict');
+    const first = source.structured.blockers[0];
+    source.structured.blockers.push({ ...first, id: 'columns', question: '是否保留旧列？' });
+    if (fromReview) {
+      source.verification_status = 'needs_changes';
+      source.verification = { status: 'needs_changes', time: 12, blockers: source.structured.blockers };
+      source.structured.blockers = [];
+    }
+    const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
+    h.finals.PARENT = source;
+    const args = { job_id: 'PARENT', answers: [{ id: 'format', answer: '保留旧格式' }, { id: 'columns', answer: '保留旧列' }],
+      resolution: '已有补充信息', wait_seconds: 0 };
+    const log = fromReview ? [registered, settled, human, notice] : [human, registered, settled, notice];
+    const denied = await h.tools.codex_continue.execute(args, { agent: agentAt('/work/current', log) });
+    assert.equal(denied.continuation_ready, false);
+    assert.deepEqual(denied.remaining_questions.map(q => q.id), ['format', 'columns']);
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
+    const replied = { agent: agentAt('/work/current', [...log, { ...human, time: 13_000 }]) };
+    assert.equal((await h.tools.codex_continue.execute(args, replied)).job_id, 'CHILD');
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
+  }
+});
+
 test('codex_continue dispatches 22 original criteria with original context, permissions and options', async () => {
   for (const sandbox of ['workspace-write', 'danger-full-access', 'read-only']) {
-    const source = workflowSource();
+    const source = { ...workflowSource(), finished_at: 10 };
     source.context.acceptance = Array.from({ length: 22 }, (_, i) => `验收 ${i + 1}：保留 "CSV" 原文与数据 😀`);
     source.structured.criteria = source.context.acceptance.map((criterion) =>
       ({ ...source.structured.criteria[0], criterion }));
@@ -1114,7 +1147,7 @@ test('codex_continue dispatches 22 original criteria with original context, perm
     const answers = [{ id: ' format ', answer: ' 保留旧 CSV 格式 ' }];
     const resolution = '\n    格式约束保持不变\n';
     const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', answers, resolution, wait_seconds: 0 },
-      { agent: agentAt('/work/current') });
+      { agent: agentAt('/work/current', [answeredParent[2]]) });
     assert.equal(value.job_id, 'CHILD');
     const starts = h.requests.filter(({ argv }) => argv[0] === 'start');
     assert.equal(starts.length, 1);
@@ -1140,7 +1173,7 @@ test('codex_continue dispatches 22 original criteria with original context, perm
 });
 
 test('codex_continue shares concurrent dispatch and reuses an existing child after reload', async () => {
-  const exec = { agent: agentAt('/work/current') };
+  const exec = { agent: agentAt('/work/current', answeredParent) };
   const args = { job_id: 'PARENT', answers: [{ id: 'format', answer: '保留旧格式' }], wait_seconds: 0 };
   const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
   h.finals.PARENT = workflowSource();
@@ -1152,7 +1185,7 @@ test('codex_continue shares concurrent dispatch and reuses an existing child aft
   after.finals.PARENT = h.finals.PARENT;
   after.finals.CHILD = { job_id: 'CHILD', status: 'running', context: { ...h.finals.PARENT.context,
     continuation: { parent_job_id: 'PARENT', answers: [], resolution: '' } } };
-  const reused = await after.tools.codex_continue.execute(args, exec);
+  const reused = await after.tools.codex_continue.execute(args, { agent: agentAt('/work/current') });
   assert.equal(reused.reused, true);
   assert.equal(reused.job_id, 'CHILD');
   assert.equal(after.calls.filter((argv) => argv[0] === 'start').length, 0);
@@ -1164,7 +1197,7 @@ test('codex_continue shares concurrent dispatch and reuses an existing child aft
 test('codex_continue persists user decisions through two new threads and a plugin reload', async () => {
   const source = workflowSource();
   delete source.thread_id;
-  const exec = { agent: agentAt('/work/current') };
+  const exec = { agent: agentAt('/work/current', answeredParent) };
   const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
   h.finals.PARENT = source;
   await h.tools.codex_continue.execute({ job_id: 'PARENT',

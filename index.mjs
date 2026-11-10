@@ -838,12 +838,16 @@ function widensOverlappingScope(previousCwd, original, cwd, requested) {
 function hasUserReply(log, job, owner) {
   const user = log.findLastIndex(e => e.type === 'user/message' && e.data?.source?.kind === 'user');
   if (user < 0) return false;
+  const replyAt = log[user].at ?? log[user].time;
+  const review = job.verification;
+  if (review?.blockers?.length && Number.isFinite(review.time) &&
+      (!Number.isFinite(replyAt) || replyAt <= review.time * 1000)) return false;
   const label = `Codex ${job.job_id}`;
   const native = log.findLast(e => e.type === 'job/registered' && e.data?.kind === 'codex' && e.data.owner === owner &&
     (e.data.label === label || e.data.label?.startsWith(`${label} · `)));
   const settled = native?.data?.jobId && log.findLastIndex(e => e.type === 'job/settled' && e.data?.jobId === native.data.jobId);
   return Number.isInteger(settled) && settled >= 0 ? user > settled :
-    Number.isFinite(log[user].at) && Number.isFinite(job.finished_at) && log[user].at > job.finished_at * 1000;
+    Number.isFinite(replyAt) && Number.isFinite(job.finished_at) && replyAt > job.finished_at * 1000;
 }
 
 export function validateRun(args) {
@@ -1660,7 +1664,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   ctx.tools.register({
     name: 'codex_continue',
     description: '在用户回答阻塞问题或环境条件已改变后续接原任务；先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
-      'answers 用阻塞问题的 id，resolution 说明环境变化或旧报告解除阻塞的事实。缺回答时只返回问题；原任务运行中、状态未知或已取消时不重派。' +
+      'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
       '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
@@ -1691,8 +1695,11 @@ export function apply(ctx, config = {}, run = runRunner) {
             next: `原任务已有后续轮次 ${child.job_id}，没有重复派活。补充信息或修正请基于该轮次。\n${nextStep(child)}` };
         }
         const plan = prepareContinuation(source, args, owner);
-        if (!plan.ready) return { ...source, continuation_ready: false, blocking: plan.blocking,
-          remaining_questions: plan.remaining_questions, next: plan.next };
+        const needsReply = plan.ready && plan.blocking.questions.length > 0 &&
+          !hasUserReply(exec.agent.session?.log ?? [], source, owner);
+        if (!plan.ready || needsReply) return { ...source, continuation_ready: false, blocking: plan.blocking,
+          remaining_questions: needsReply ? plan.blocking.questions : plan.remaining_questions,
+          next: needsReply ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
         return dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
           exec, plan.continuation, plan.task);
       })();
