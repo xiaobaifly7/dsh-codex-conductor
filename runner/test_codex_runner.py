@@ -1176,6 +1176,41 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered tree")):
             self.assertEqual(codex_runner.snapshot_before(str(root), None), (None, None))
 
+    def test_snapshot_io_failure_does_not_remember_a_tree_as_too_big(self):
+        codex_runner, root = self.big_tree()
+        real_stat = os.stat
+
+        def fail_stat(path, *args, **kwargs):
+            if kwargs.get("follow_symlinks") is False:
+                raise OSError(errno.EIO, "temporary I/O failure")
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner.os, "stat", side_effect=fail_stat):
+            self.assertEqual(codex_runner.snapshot_before(str(root), None), (None, None))
+        self.assertNotIn(codex_runner.tree_key(str(root)), codex_runner.too_big_trees())
+        before, scope = codex_runner.snapshot_before(str(root), None)
+        self.assertIsNone(scope)
+        self.assertIn("other.txt", before)
+
+    @unittest.skipIf(os.name == "nt", "Windows-mounted path casing is tested inside WSL")
+    def test_mounted_windows_paths_share_snapshot_and_history_keys(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
+            codex_runner.remember_too_big("/mnt/C/Work/Project")
+            self.assertIn(codex_runner.tree_key("c:\\work\\PROJECT"), codex_runner.too_big_trees())
+            self.assertEqual(codex_runner.write_lock_key("/mnt/c/work/project"),
+                             codex_runner.write_lock_key("C:\\Work\\Project"))
+            self.assertNotEqual(codex_runner.tree_key("/home/Project"), codex_runner.tree_key("/home/project"))
+            self.stored_job("mixed-case", {"status": "completed", "cwd": "/mnt/C/Work/Project"})
+            for command in ("list", "summary"):
+                value = self.control(command, "--cwd", "c:\\work\\PROJECT")
+                self.assertEqual(value.get("total_jobs", value["total"]), 1)
+            value = {"cwd": "/mnt/c/WORK/project", "scope_paths": ["/mnt/C/work/PROJECT/Src"],
+                     "files_changed": [{"path": "src/File.py"}, {"path": "src-other/File.py"}]}
+            self.assertEqual(codex_runner.out_of_scope_paths(value), ["src-other/File.py"])
+
     def test_stale_too_big_entry_is_ignored(self):
         codex_runner, root = self.big_tree()
         codex_runner.HOME.mkdir(parents=True)
