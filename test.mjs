@@ -11,6 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 import './panel.test.mjs';
+import './resume.test.mjs';
 
 const packageVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
@@ -19,7 +20,7 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
 process.env.LOCALAPPDATA = localAppData;
 after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-test('entry reload queries re-evaluate workflow, runtime, guard and gemini helpers', async () => {
+test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemini helpers', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'conductor-reload-'));
   const traceKey = `conductor-reload-${path.basename(dir)}`;
   globalThis[traceKey] = [];
@@ -33,6 +34,8 @@ test('entry reload queries re-evaluate workflow, runtime, guard and gemini helpe
       writeFileSync(path.join(dir, 'runtime.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('runtime-${version}');\n` +
         'export const runtimeIdentity = () => ({}), loadedRecord = () => ({ record: null }), registerRuntimeTool = () => {};\n');
+      writeFileSync(path.join(dir, 'resume.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('resume-${version}');\nexport const registerResumeRequests = () => {};\n`);
       writeFileSync(path.join(dir, 'gemini.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('gemini-${version}');\nexport const geminiWrite = () => ({});\n`);
       writeFileSync(path.join(dir, 'panel.mjs'),
@@ -44,11 +47,46 @@ test('entry reload queries re-evaluate workflow, runtime, guard and gemini helpe
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'panel-new', 'panel-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('apply waits for session services and processes a pending local resume request', async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-resume-load-'));
+  const directory = path.join(root, 'dsh-codex-conductor');
+  mkdirSync(directory);
+  writeFileSync(path.join(directory, 'resume-request.json'), JSON.stringify({ sessions: ['session-load'] }));
+  let dispose;
+  t.after(() => { dispose?.(); rmSync(root, { recursive: true, force: true }); });
+  const submitted = Promise.withResolvers();
+  const agent = { id: 'session-load', status: 'idle', followup: submitted.resolve };
+  let activate;
+  const previous = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = root;
+  try {
+    apply({ tools: { register() {} }, on() {}, inject(names, callback) {
+      // The panel also waits for its own services through inject; only the session one matters here.
+      if (names.includes('sessionController')) {
+        assert.deepEqual(names, ['agents', 'sessionController', 'sessionQuery']);
+        activate = callback;
+      }
+    } });
+  } finally { process.env.LOCALAPPDATA = previous; }
+  assert.equal(readFileSync(path.join(directory, 'resume-request.json'), 'utf8').includes('session-load'), true);
+  const services = {
+    agents: { get: () => agent },
+    sessionController: { resolveAgent: async () => ({ agent }) },
+    sessionQuery: { readSession: async () => ({ events: [{ type: 'turn/end', data: { reason: { kind: 'interrupted' } } }] }) },
+  };
+  activate({ get: (name) => services[name], effect: (factory) => { dispose = factory(); } });
+  const message = await submitted.promise;
+  assert.equal(message.role, 'user');
+  assert.equal(message.content[0].text, '继续');
+  await tick();
+  assert.equal(JSON.parse(readFileSync(path.join(directory, 'resume-result.json'), 'utf8')).sessions[0].status, 'resumed');
 });
 
 test('assignments and loop lists cannot smuggle flags into allowed commands', () => {
