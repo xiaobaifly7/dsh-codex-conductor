@@ -51,7 +51,15 @@ async function resumeSession(ctx, sessionId, message) {
       return { sessionId, status: 'resumed', reason: 'goal_resumed', method };
     }
     // A rejected turn alone says nothing was cut short, so it never justifies sending a prompt.
-    if (ended === 'blocked') return skipped('not_interrupted');
+    if (ended === 'blocked') {
+      const hasPending = agent.inbox?.hasPending;
+      if (hasPending === undefined) throw new Error('agent.inbox.hasPending is unavailable');
+      if (!hasPending) return skipped('not_interrupted');
+      method = 'inbox';
+      // shortcut: wakeDriver is loop-specific; use a public wake-only API when the host provides one.
+      agent.wakeDriver();
+      return { sessionId, status: 'resumed', reason: 'pending_inbox_woken', method };
+    }
     method = 'message';
     agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
     return { sessionId, status: 'resumed', reason: 'message_submitted', method };
