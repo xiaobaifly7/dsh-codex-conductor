@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.72` 将尚未生成的报告作为正常等待状态返回，报告随任务结束后的自动刷新打开，自检优先检查已结束任务并记录运行中报告尚未生成，`codex_output` 提示等完成通知后再读。
+
 `0.9.70` 为面板状态、任务、关注数和报告读取设置 15 秒整体上限，为任务列表、状态和报告查询及 `codex_jobs`、`codex_status`、`codex_runtime` 的任务统计设置 10 秒查询预算（显式等待另加等待时长），随包 runner 的完整 JSON 到达即返回，查询失败明确报错且不取消 Codex 任务。
 
 `0.9.69` 的等空闲重载同时等待 Codex 活任务和所有 DeepSeek 会话的当前回合结束，显示数量与倒计时，最长等 10 分钟后停止自动重载并保留待生效设置；立即生效可能中止 DeepSeek 当前回合，Codex 后台任务继续并会接回。
@@ -64,7 +66,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 在 `%LOCALAPPDATA%\dsh-codex-conductor\panel-selftest-request.json` 写入 `{}` 或 `{"id":"desktop-check-1"}` 即可触发；`id` 可选，最多 128 个 Unicode 字符，省略时自动生成。建议先写同目录临时文件，再改名发布。前端在设置入口登记后检查一次，之后每 60 秒检查一次；没有请求时不渲染面板、不读取业务接口、不写自检文件。
 
-第一个通过 DSH 登录及来源校验的前端会原子认领文件，在不可见、不可聚焦的离屏节点里用页面的 React 和 DSH 基础组件渲染真实面板，读取状态、设置、最近任务、提示词和关注数；有任务时自动打开第一条报告的易读视图。整次渲染最多等 30 秒，完成或超时后卸载并移除节点。自检只读，不保存设置、不重载、不取消任务、不写提示词；唯一 POST 是提交自检结果。
+第一个通过 DSH 登录及来源校验的前端会原子认领文件，在不可见、不可聚焦的离屏节点里用页面的 React 和 DSH 基础组件渲染真实面板，读取状态、设置、最近任务、提示词和关注数；优先打开本页最近一条已结束任务的报告，没有已结束任务时打开第一条，运行中报告尚未生成时在 `report.note` 记录“报告尚未生成（任务运行中）”。整次渲染最多等 30 秒，完成或超时后卸载并移除节点。自检只读，不保存设置、不重载、不取消任务、不写提示词；唯一 POST 是提交自检结果。
 
 结果原子替换同目录的 `panel-selftest-result.json`，包含后端的 `id`、`version`、`pid`、`receivedAt`，以及前端的 `settingsRegistered`、四个标题的 `sections`、状态区实际显示值 `status`（`version/model/effort/serviceTier`）、本页 `taskCount`、`report`（`opened/summary/criteria/firstCriterion`，首条验收前 80 个 Unicode 字符）、`http`（读取接口的路径和状态码，无 HTTP 响应时为 `null`）、`errors`、`timedOut`、`userAgent` 和 `origin`。检查 `userAgent` 中的 `Electron/` 才能确认认领者是桌面窗口；Web 页面也可能先认领。无任务时报告布尔值为 `false`，不代表报告渲染失败。
 
@@ -373,6 +375,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.72` treats reports awaiting generation as a normal pending state, opens them on the next automatic refresh after task completion, prefers finished tasks in panel self-tests while recording pending reports, and tells `codex_output` readers to wait for the completion notification.
 
 `0.9.70` bounds panel status, jobs, attention and report reads to 15 seconds, gives list/status/report queries and the query phase of `codex_jobs`, `codex_status` and `codex_runtime` a 10-second budget (plus any explicit wait), and returns bundled-runner JSON without waiting for pipe closure or cancelling Codex tasks on query failure.
 

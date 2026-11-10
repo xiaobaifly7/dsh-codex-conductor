@@ -382,6 +382,65 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, undefined]);
 });
 
+test('panel returns pending report pages as HTTP 200 without reading optional context', async (t) => {
+  const f = fixture(t);
+  for (const pending of [
+    { job_id: 'J', artifact: 'report', execution_status: 'running', status: 'pending', error_kind: 'artifact_pending', retryable: true },
+    { job_id: 'J', artifact: 'report', execution_status: 'running', status: 'pending' },
+  ]) {
+    f.conductor.output.mock.mockImplementation(async () => pending);
+    for (const offset of [0, 8000]) {
+      const before = f.conductor.output.mock.callCount();
+      assert.deepEqual(await f.request('GET', `/output?job_id=J&offset=${offset}`), {
+        status: 200, body: { ...pending, status: 'pending', error_kind: 'artifact_pending',
+          message: '这个任务还在运行，报告会在任务结束后生成。' },
+      });
+      assert.equal(f.conductor.output.mock.callCount(), before + 1);
+    }
+  }
+  for (const failure of [
+    { status: 'failed', error_kind: 'artifact_read_failed' },
+    { status: 'failed', error_kind: 'artifact_missing' },
+    { status: 'pending', error_kind: 'artifact_read_failed' },
+    { status: 'pending', error: 'runner read failed' },
+  ]) {
+    f.conductor.output.mock.mockImplementation(async () => failure);
+    rejected(await f.request('GET', '/output?job_id=J'), 502);
+  }
+});
+
+test('panel stops optional context pagination on pending without losing a ready report', async (t) => {
+  const f = fixture(t);
+  const report = { text: '报告', eof: true };
+  for (const pendingAt of [0, 8000]) {
+    const reads = [];
+    f.conductor.output.mock.mockImplementation(async (_id, { artifact, offset }) => {
+      if (artifact === 'report') return report;
+      reads.push(offset);
+      return offset === pendingAt ? { status: 'pending', error_kind: 'artifact_pending', retryable: true }
+        : { text: '{', eof: false, next_offset: pendingAt };
+    });
+    assert.deepEqual(await f.request('GET', '/output?job_id=J'), { status: 200, body: report });
+    assert.deepEqual(reads, pendingAt === 0 ? [0] : [0, 8000]);
+  }
+});
+
+test('selftest saves a pending report note without reporting an error', async (t) => {
+  const f = fixture(t);
+  writeFileSync(path.join(f.root, 'panel-selftest-request.json'), '{}');
+  const request = (await f.request('GET', '/selftest/request')).body.request;
+  const result = selftestSample();
+  result.report = { opened: true, summary: false, criteria: false, firstCriterion: '', note: '报告尚未生成（任务运行中）' };
+  for (const note of [true, null, '🙂'.repeat(129)]) {
+    rejected(await f.request('POST', '/selftest/result', { ...request,
+      result: { ...result, report: { ...result.report, note } } }), 400);
+  }
+  assert.equal((await f.request('POST', '/selftest/result', { ...request, result })).status, 200);
+  const saved = JSON.parse(readFileSync(path.join(f.root, 'panel-selftest-result.json'), 'utf8'));
+  assert.deepEqual(saved.report, result.report);
+  assert.deepEqual(saved.errors, []);
+});
+
 test('panel report reads full Unicode context internally and exposes only acceptance on its first page', async (t) => {
   const f = fixture(t);
   const acceptance = ['保存设置后刷新仍可见', '🙂'.repeat(350)];

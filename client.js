@@ -104,6 +104,7 @@ window.__ModuleLoader__.load({
       let offset = 0, length = 0;
       while (true) {
         const page = await read(reportPath(jobId, offset), signal);
+        if (page.status === 'pending' || page.error_kind === 'artifact_pending') return { pages: [], report: null, pending: true };
         pages.push({ ...page, offset });
         // Python offsets count Unicode code points, not bytes or JavaScript UTF-16 units.
         length += Array.from(page.text || '').length;
@@ -255,7 +256,7 @@ window.__ModuleLoader__.load({
           h(Message, { text: messages.reload }), h(Message, { text: errors.reload, error: true }));
     }
 
-    function Report({ jobId, onClose, selftest }) {
+    function Report({ jobId, refreshKey, onClose, selftest }) {
       const [document, setDocument] = useState(null);
       const [pageIndex, setPageIndex] = useState(0);
       const [raw, setRaw] = useState(false);
@@ -277,6 +278,9 @@ window.__ModuleLoader__.load({
           .finally(() => { if (!controller.signal.aborted) setLoading(false); });
         return () => controller.abort();
       }, [jobId, revision]);
+      useEffect(() => {
+        if (document?.pending && !selftest) setRevision((value) => value + 1);
+      }, [refreshKey]);
       useEffect(() => { if (!loading) selftest?.finish(); }, [loading, selftest]);
       async function nextPage() {
         if (document.pages[pageIndex + 1]) { setPageIndex(pageIndex + 1); return; }
@@ -293,20 +297,22 @@ window.__ModuleLoader__.load({
         finally { if (!controller.signal.aborted) setLoading(false); }
       }
       const readable = document?.report && !raw;
+      const pending = document?.pending;
       return h('div', { className: 'dcc-actions', 'data-dcc-report': jobId },
         h('div', { className: 'dcc-row' },
-          h('strong', null, readable ? '任务报告' : `任务报告 · 第 ${pageIndex + 1} 页`),
+          h('strong', null, readable || pending ? '任务报告' : `任务报告 · 第 ${pageIndex + 1} 页`),
           document?.report ? h(Button, { size: 'sm', onClick: () => setRaw((value) => !value) }, raw ? '查看易读报告' : '查看原文') : null,
           h(Button, { size: 'sm', onClick: onClose }, '收起报告')),
-        h('small', null, `任务编号：${jobId}。${readable ? '已读完报告。' : '原文每页最多 8000 字符，可翻页查看。'}`),
+        h('small', null, `任务编号：${jobId}。${pending ? '' : readable ? '已读完报告。' : '原文每页最多 8000 字符，可翻页查看。'}`),
         document?.tooLarge ? h('small', null, '报告超过 262144 字符，仅提供原文分页。') : null,
-        document && !document.report && !document.tooLarge ? h('small', null, '这份报告不支持易读视图，以下显示原文。') : null,
+        document && !pending && !document.report && !document.tooLarge ? h('small', null, '这份报告不支持易读视图，以下显示原文。') : null,
         h(Message, { text: error, error: true }),
         loading ? h('p', { role: 'status' }, '正在读取报告…') : null,
+        pending ? h('p', { role: 'status', 'data-dcc-report-pending': true }, '这个任务还在运行，报告会在任务结束后生成。') : null,
         readable ? h(ReadableReport, { report: document.report, acceptance: document.pages[0].acceptance }) : page ? h('pre', { className: 'dcc-report', tabIndex: 0, 'aria-label': '本页报告全文' }, page.text || '这一页还没有输出。') : null,
         h('div', { className: 'dcc-row' },
-          !readable ? h(Button, { size: 'sm', disabled: loading || pageIndex === 0, onClick: () => setPageIndex((v) => v - 1) }, '上一页') : null,
-          !readable ? h(Button, { size: 'sm', disabled: loading || !page || page.eof || !(page.next_offset > page.offset), onClick: nextPage }, '下一页') : null,
+          !readable && !pending ? h(Button, { size: 'sm', disabled: loading || pageIndex === 0, onClick: () => setPageIndex((v) => v - 1) }, '上一页') : null,
+          !readable && !pending ? h(Button, { size: 'sm', disabled: loading || !page || page.eof || !(page.next_offset > page.offset), onClick: nextPage }, '下一页') : null,
           h(Button, { size: 'sm', disabled: loading, onClick: () => setRevision((v) => v + 1) }, '刷新报告'),
           !readable && page?.eof ? h('small', null, '已到当前输出末尾；任务运行中可刷新报告。') : null));
     }
@@ -374,7 +380,7 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         if (!selftest || !['status', 'settings', 'jobs', 'prompt', 'attention'].every((key) => Object.hasOwn(errors, key))) return;
-        if (jobs?.jobs.length) setReportJob(jobs.jobs[0].job_id);
+        if (jobs?.jobs.length) setReportJob((jobs.jobs.find((job) => ['completed', 'failed', 'cancelled'].includes(job.execution_status || job.status)) || jobs.jobs[0]).job_id);
         else selftest.finish();
       }, [selftest, errors, jobs]);
 
@@ -562,7 +568,8 @@ window.__ModuleLoader__.load({
             h(Button, { size: 'sm', disabled: !!busy || !(jobs?.next_offset > jobOffset),
               onClick: () => selectJobPage([...jobOffsets, jobs.next_offset]) }, '下一页')),
           h(Message, { text: messages.cancel }), h(Message, { text: errors.cancel, error: true }),
-          reportJob ? h(Report, { key: reportJob, jobId: reportJob, onClose: () => setReportJob(null), selftest }) : null),
+          reportJob ? h(Report, { key: reportJob, jobId: reportJob, refreshKey: jobs,
+            onClose: () => setReportJob(null), selftest }) : null),
 
         h('section', { 'aria-label': '规划提示词' }, h('h3', null, '规划提示词'),
           h('p', { className: 'dcc-muted' }, '填写给 DeepSeek 的要求，例如怎样安排任务、判断做完没有。自动刷新不会覆盖正在编辑的草稿。'),
@@ -598,6 +605,7 @@ window.__ModuleLoader__.load({
         taskCount: node.querySelectorAll('.dcc-job').length,
         report: { opened: !!node.querySelector('[data-dcc-report]'), summary: titles.includes('概述'),
           criteria: titles.some((title) => title.startsWith('逐条验收')),
+          ...(node.querySelector('[data-dcc-report-pending]') ? { note: '报告尚未生成（任务运行中）' } : {}),
           firstCriterion: Array.from(report?.querySelector('ol > li')?.textContent || '').slice(0, 80).join('') },
         http,
         errors: [...new Set([...errors, ...Array.from(node.querySelectorAll('.dcc-error'), (item) => item.textContent)])]

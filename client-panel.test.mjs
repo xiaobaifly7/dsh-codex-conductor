@@ -127,6 +127,24 @@ test('selftest waits for panel reads, opens the first real Report and blocks mut
   assert.equal(reportHost.requests.length, 0);
 });
 
+test('selftest prefers the newest finished task and falls back to the first running task', async (t) => {
+  for (const state of ['completed', 'failed', 'cancelled', null]) {
+    const jobs = [
+      { job_id: 'running', status: 'running', started_at: 4 },
+      { job_id: 'unknown', status: 'unknown', started_at: 3 },
+      ...(state ? [{ job_id: 'finished', status: 'running', execution_status: state, started_at: 2 },
+        { job_id: 'older', status: 'completed', started_at: 1 }] : []),
+    ];
+    const service = panelService();
+    const selftest = { finish: () => assert.fail('must wait for Report'),
+      read: async (path) => path.startsWith('/jobs') ? { total: jobs.length, jobs } : service.handle(path) };
+    const host = clientHost(); t.after(() => host.dispose());
+    host.mount(host.exports.Panel, { selftest }); await host.flush();
+    const report = host.tree.children.flatMap((node) => node?.children || []).find((node) => node?.type === host.exports.Report);
+    assert.equal(report.props.jobId, state ? 'finished' : 'running');
+  }
+});
+
 test('selftest with no tasks finishes after reads, including a failed interface', async (t) => {
   for (const failed of [false, true]) {
     const service = panelService(), host = clientHost(); t.after(() => host.dispose());
@@ -300,6 +318,68 @@ test('report reader assembles all pages using runner character offsets and limit
   }
   const oversized = await loadReport('J', undefined, reportReader('x'.repeat(REPORT_LIMIT + 1), [], false));
   assert.equal(oversized.tooLarge, true, 'cap also works without total_chars');
+});
+
+test('pending reports show a normal status and selftest note instead of an error or raw fallback', async (t) => {
+  for (const pending of [{ status: 'pending' }, { error_kind: 'artifact_pending' }]) {
+    let finished = 0, reads = 0;
+    const host = clientHost(undefined, { navigator: { userAgent: 'test Electron/40' }, location: { origin: 'http://test' } });
+    t.after(() => host.dispose());
+    host.mount(host.exports.Report, { jobId: 'J',
+      selftest: { finish: () => { finished++; }, read: async () => { reads++; return pending; } } });
+    await host.flush();
+    assert.equal(text(host.tree).includes('这个任务还在运行，报告会在任务结束后生成。'), true);
+    assert.doesNotMatch(text(host.tree), /不支持易读视图|没有输出|第 1 页|上一页|下一页/);
+    assert.equal(nodes(host.tree).some((node) => node.type === 'pre' || node.props?.role === 'alert'), false);
+    assert.equal(finished, 1);
+    assert.equal(reads, 1, 'pending output must not be treated as a malformed page');
+    assert.equal(host.timers.size, 0);
+    const result = host.exports.collectSelftest(renderedNode(host.tree), [], [], false);
+    assert.deepEqual(plain(result.report), { opened: true, summary: false, criteria: false,
+      firstCriterion: '', note: '报告尚未生成（任务运行中）' });
+    assert.deepEqual(plain(result.errors), []);
+  }
+});
+
+test('the next automatic jobs refresh reopens a pending report when its task finishes', async (t) => {
+  const service = panelService();
+  const job = { job_id: 'J', title: 'task', status: 'running', execution_status: 'running', started_at: 0 };
+  const panel = clientHost((path) => path.startsWith('/jobs') ? { total: 1, jobs: [{ ...job }] } : service.handle(path));
+  t.after(() => panel.dispose());
+  panel.mount(panel.exports.Panel); await panel.flush();
+  await click(panel, '查看报告');
+  const selected = () => panel.tree.children.flatMap((node) => node?.children || []).find((node) => node?.type === panel.exports.Report);
+  const offsets = [];
+  const read = reportReader(JSON.stringify(sample()), offsets);
+  const report = clientHost(async (...args) => job.execution_status === 'running'
+    ? { status: 'pending', error_kind: 'artifact_pending' } : read(...args));
+  t.after(() => report.dispose());
+  report.mount(report.exports.Report, selected().props); await report.flush();
+  assert.ok(text(report.tree).includes('这个任务还在运行，报告会在任务结束后生成。'));
+  const firstRefresh = selected().props.refreshKey;
+  panel.poll(); await panel.flush();
+  assert.notEqual(selected().props.refreshKey, firstRefresh);
+  report.mount(report.exports.Report, selected().props); await report.flush();
+  assert.equal(report.requests.length, 2, 'a pending report follows the existing poll while running');
+  job.status = job.execution_status = 'completed';
+  panel.poll(); await panel.flush();
+  assert.equal(selected().props.key, 'J');
+  report.mount(report.exports.Report, selected().props); await report.flush();
+  assert.match(text(report.tree), /概述.*逐条验收/s);
+  assert.doesNotMatch(text(report.tree), /这个任务还在运行/);
+  assert.equal(report.requests.length, 3);
+  assert.deepEqual(offsets, [0]);
+  panel.poll(); await panel.flush();
+  report.mount(report.exports.Report, selected().props); await report.flush();
+  assert.equal(report.requests.length, 3, 'a complete report is not read again on each poll');
+});
+
+test('report view preserves real read errors', async (t) => {
+  const host = clientHost(() => ({ error: '读取报告失败，请重试。' })); t.after(() => host.dispose());
+  host.mount(host.exports.Report, { jobId: 'J' }); await host.flush();
+  assert.equal(nodes(host.tree).some((node) => node.props?.role === 'alert'), true);
+  assert.match(text(host.tree), /读取报告失败/);
+  assert.doesNotMatch(text(host.tree), /这个任务还在运行/);
 });
 
 test('report view defaults to readable; raw page navigation reuses cached full report', async (t) => {

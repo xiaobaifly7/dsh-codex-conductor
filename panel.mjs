@@ -16,7 +16,7 @@ function selftestResult(body) {
   object(result, ['settingsRegistered', 'sections', 'status', 'taskCount', 'report', 'http', 'errors', 'userAgent', 'origin', 'timedOut']);
   object(result.sections, ['运行状态', '常用设置', '最近任务', '规划提示词']);
   object(result.status, ['version', 'model', 'effort', 'serviceTier']);
-  object(result.report, ['opened', 'summary', 'criteria', 'firstCriterion']);
+  object(result.report, ['opened', 'summary', 'criteria', 'firstCriterion', 'note']);
   const string = (v, max) => typeof v === 'string' && Array.from(v).length <= max;
   const boolean = (v) => typeof v === 'boolean';
   if (!string(body.id, 128) || !string(body.claim, 36) ||
@@ -25,6 +25,7 @@ function selftestResult(body) {
       !['version', 'model', 'effort', 'serviceTier'].every((key) => result.status[key] === null || string(result.status[key], 256)) ||
       !Number.isSafeInteger(result.taskCount) || result.taskCount < 0 || result.taskCount > 20 ||
       !['opened', 'summary', 'criteria'].every((key) => boolean(result.report[key])) || !string(result.report.firstCriterion, 80) ||
+      (result.report.note !== undefined && !string(result.report.note, 128)) ||
       !string(result.userAgent, 2048) || !string(result.origin, 2048) ||
       !Array.isArray(result.errors) || result.errors.length > 40 || !result.errors.every((v) => string(v, 1000)) ||
       !Array.isArray(result.http) || result.http.length > 100) throw bad('自检结果字段不正确，请重新触发自检。');
@@ -69,7 +70,10 @@ function offset(value, fallback, maximum) {
   return n;
 }
 
-function runnerResult(value) {
+function runnerResult(value, output = false) {
+  if (output && (value?.error_kind === 'artifact_pending' || (value?.status === 'pending' && !value.error_kind && !value.error))) {
+    return { ...value, status: 'pending', error_kind: 'artifact_pending', message: '这个任务还在运行，报告会在任务结束后生成。' };
+  }
   if (value?.error || value?.error_kind || value?.status === 'failed') {
     throw bad(value?.error ?? value?.error_kind ?? '任务查询失败', 502);
   }
@@ -176,14 +180,15 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
     if (route === '/output') {
       const id = jobId(query.job_id), start = offset(query.offset, 0);
       const page = runnerResult(await conductor.output(id, { artifact: 'report',
-        offset: start, limit: offset(query.limit, 8000, 20000) }, signal));
-      if (start !== 0) return page;
+        offset: start, limit: offset(query.limit, 8000, 20000) }, signal), true);
+      if (start !== 0 || page.status === 'pending') return page;
       try {
         const parts = [];
         let offset = 0;
         for (;;) {
           signal?.throwIfAborted();
-          const context = runnerResult(await conductor.output(id, { artifact: 'context', offset, limit: 8000 }, signal));
+          const context = runnerResult(await conductor.output(id, { artifact: 'context', offset, limit: 8000 }, signal), true);
+          if (context.status === 'pending') return page;
           parts.push(context.text);
           if (context.eof) {
             const acceptance = JSON.parse(parts.join('')).acceptance;
