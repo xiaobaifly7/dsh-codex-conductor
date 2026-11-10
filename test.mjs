@@ -2139,8 +2139,9 @@ test('dispatch with a positive wait still returns a DSH background job without w
   assert.equal(first.status, 'running');
   assert.equal(first.background_job_id, 'bg1');
   // DSH 的结束通知只有一行摘要，完整结果要用 job_output 读
-  assert.match(first.note, /任务通知[\s\S]*job_output 读取 bg1 的完整结果/);
-  assert.match(first.next, /等 DSH 的任务通知，再用 job_output 读取完整结果/);
+  assert.match(first.note, /任务通知[\s\S]*job_output 读取 bg1 的完整结果一次/);
+  assert.match(first.note, /完成通知前不要用 job_output 轮询；需要查进度时用 codex_status 查询 runner job_id=J1/);
+  assert.match(first.next, /等 DSH 的完成通知，再用 job_output 读取一次完整结果。需要重读或分页时用 codex_output/);
   // 到点仍在执行：经任务表等，不直接等 runner；runner 只收到后台循环的查询
   assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20', '--follow']]);
   assert.equal(jobs.started[0].spec.owner, 'S1');

@@ -1022,9 +1022,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const id = background(value.job_id, exec, finish)?.id;
     if (id === undefined) return value;
     return { ...value, background_job_id: id,
-      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），届时用 job_output 读取 ${id} 的完整结果（含逐条汇报和下一步）；` +
-        `超长结果用 codex_output 按 runner job_id=${value.job_id} 可重复分页读取，在此之前不必轮询。`,
-      next: '等 DSH 的任务通知，再用 job_output 读取完整结果；需要全文时用 codex_output 分页。' +
+      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），收到后用 job_output 读取 ${id} 的完整结果一次（含逐条汇报和下一步）。` +
+        `完成通知前不要用 job_output 轮询；需要查进度时用 codex_status 查询 runner job_id=${value.job_id}。`,
+      next: '等 DSH 的完成通知，再用 job_output 读取一次完整结果。需要重读或分页时用 codex_output。' +
         '在此之前不要自己动手补做，也不要重复派同一个任务。' };
   }
 
