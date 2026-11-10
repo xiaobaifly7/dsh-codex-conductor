@@ -1171,9 +1171,11 @@ def runner_activity(events):
     return activity
 
 
-def enriched_status(job_id, job_dir, value):
+def enriched_status(job_id, job_dir, value, record=None):
     finished = (job_dir / "result.json").stat().st_mtime if (job_dir / "result.json").exists() else None
-    result = {**job_metadata(job_dir, finished_at=finished, thread_id=value.get("thread_id")), **value, "job_id": job_id}
+    metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
+                                                                         thread_id=value.get("thread_id"))
+    result = {**metadata, **value, "job_id": job_id}
     result.update(review_summary(result))
     result.update(verification_summary(job_dir, result))
     result["blocking"] = blocking_summary(result)
@@ -1191,7 +1193,7 @@ def enriched_status(job_id, job_dir, value):
     return {**result, **activity}
 
 
-def job_status(job_id):
+def job_status(job_id, record=None):
     try:
         job_dir = job_directory(job_id)
         if not job_dir.exists():
@@ -1200,23 +1202,30 @@ def job_status(job_id):
                     "verification_status": "unreviewed", "verification": None}
         result = job_dir / "result.json"
         if result.exists():
-            return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
+            value = record["result"] if record is not None else None
+            return enriched_status(job_id, job_dir, value if value is not None else json.loads(result.read_text("utf-8")), record)
         pid_file = job_dir / "worker.pid"
         if recorded_pid(pid_file) is not None:
             events = job_dir / "events.jsonl"
             idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": idle,
-                                                    "last_activity": last_activity(events) if events.exists() else None})
+                                                    "last_activity": last_activity(events) if events.exists() else None}, record)
         if result.exists():
-            return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")))
+            return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")), record)
         if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
-            return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None})
-        return enriched_status(job_id, job_dir, worker_died(job_id, job_dir))
+            return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None}, record)
+        return enriched_status(job_id, job_dir, worker_died(job_id, job_dir), record)
     except (OSError, ValueError, TypeError) as e:
         value = {"job_id": job_id, "status": "failed", "error_kind": "invalid_record",
                  "error": str(e), "retryable": False}
         return {**value, **review_summary(value), "blocking": blocking_summary(value),
                 "verification_status": "invalid", "verification": None}
+
+
+def job_details(job):
+    if "_details" not in job:
+        job["_details"] = job_status(job["job_id"], job["_record"])
+    return {**job, **job["_details"]}
 
 
 def matching_jobs(args):
@@ -1231,21 +1240,14 @@ def matching_jobs(args):
             continue
         if getattr(args, "command", None) == "summary" and not args.owner and args.job_id and job_dir.name not in args.job_id:
             continue
-        if args.owner or args.cwd:
-            try:
-                record = task_record(job_dir)
-                result = job_dir / "result.json"
-                if result.exists():
-                    record = {**record, **json.loads(result.read_text("utf-8"))}
-            except (OSError, ValueError, TypeError):
-                record = {}
-            context = record.get("context")
-            if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
-                                   job_dir.name in (args.job_id or [])):
-                continue
-            if args.cwd and (not record.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(local_path(record["cwd"]))):
-                continue
-        value = job_status(job_dir.name)
+        args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+        try:
+            task = task_record(job_dir)
+            result = json.loads(result_file.read_text("utf-8")) if result_file.exists() else None
+            value = {**task, **(result if result is not None else {})}
+            record = {"task": task, "result": result}
+        except (OSError, ValueError, TypeError):
+            value, record = {}, None
         context = value.get("context")
         parent = (context or {}).get("continuation", {}).get("parent_job_id")
         if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
@@ -1253,19 +1255,25 @@ def matching_jobs(args):
             continue
         if args.cwd and (not value.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(value["cwd"])):
             continue
+        if record is not None:
+            record["metadata"] = job_metadata(job_dir, task=record["task"],
+                                             finished_at=result_file.stat().st_mtime if result_file.exists() else None,
+                                             thread_id=value.get("thread_id"))
+            value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
         if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
             continue
         if getattr(args, "parent_job", None) and parent != args.parent_job:
             continue
-        review = review_summary(value)
-        if args.status and review["execution_status"] != args.status:
+        value.update(job_id=job_dir.name, _record=record)
+        if args.status or args.needs_attention:
+            value = job_details(value)
+        if args.status and value["execution_status"] != args.status:
             continue
         verification = value.get("verification_status", "unreviewed")
         attention = verification in ("needs_changes", "invalid") or (
-            verification == "unreviewed" and review["review_status"] == "needs_attention")
+            verification == "unreviewed" and value.get("review_status") == "needs_attention")
         if args.needs_attention and not attention:
             continue
-        args_file, result_file = job_dir / "args.json", job_dir / "result.json"
         jobs.append({**value, "parent_job_id": parent,
                      "started_at": args_file.stat().st_mtime if args_file.exists() else None,
                      "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
@@ -1277,8 +1285,8 @@ def matching_jobs(args):
 
 def list_jobs(args):
     jobs = matching_jobs(args)
-    page = jobs[args.offset:args.offset + args.limit]
-    fields = ("job_id", "cwd", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
+    page = [job_details(j) for j in jobs[args.offset:args.offset + args.limit]]
+    fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
               "last_error_kind", "retry_at")
@@ -1306,6 +1314,7 @@ def summarize_jobs(args):
     result = []
     page = list(groups.items())[args.offset:args.offset + args.limit]
     for (kind, identifier), jobs in page:
+        jobs = [job_details(j) for j in jobs]
         rounds = list(reversed(jobs))
         latest = jobs[0]
         report = latest.get("structured")

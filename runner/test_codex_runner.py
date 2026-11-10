@@ -2052,7 +2052,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_list_filters_owner_cwd_execution_attention_and_paginates(self):
         context = self.sample_context()
-        self.stored_job("owned", {"status": "completed", "structured": self.sample_report()}, context=context)
+        self.stored_job("owned", {"status": "completed", "structured": self.sample_report()}, context=context, scope=["src"])
         self.stored_job("legacy", {"status": "cancelled", "retryable": False})
         self.stored_job("other", {"status": "completed", "structured": self.sample_report()}, context=self.sample_context("owner-b"))
         self.stored_job("bad-report", {"status": "failed", "error_kind": "schema_invalid"}, context=context)
@@ -2063,6 +2063,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(old["context"])
         owned = next(j for j in result["jobs"] if j["job_id"] == "owned")
         self.assertEqual(owned["context"], {"owner": "owner-a", "task": "Task title"})
+        self.assertEqual(owned["scope"], ["src"])
+        self.assertEqual(owned["scope_paths"], [os.path.realpath(self.cwd / "src")])
         self.assertEqual(owned["criteria_counts"], {"met": 1, "not_met": 0, "blocked": 0})
         self.assertEqual(owned["report_status"], "valid")
         self.assertEqual(owned["review_status"], "needs_verification")
@@ -2102,6 +2104,37 @@ class RunnerTests(unittest.TestCase):
             result = codex_runner.list_jobs(args)
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"keep", "explicit"})
         self.assertEqual(read.call_count, 2)
+
+    def test_history_pages_reuse_records_and_only_enrich_selected_jobs(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for i in range(4):
+            jd = self.stored_job(f"history-{i}", {"status": "completed", "thread_id": f"thread-{i}",
+                                                  "structured": self.sample_report()}, context=self.sample_context())
+            os.utime(jd / "args.json", (1000 + i, 1000 + i))
+        read_text = Path.read_text
+        for command in ("list", "summary"):
+            reads = []
+
+            def read(path, *args, **kwargs):
+                if path.name in ("args.json", "result.json"):
+                    reads.append(path)
+                return read_text(path, *args, **kwargs)
+
+            args = SimpleNamespace(command=command, owner="owner-a", cwd=str(self.cwd), job_id=None,
+                                   status=None, needs_attention=False, offset=1, limit=1, round_limit=20)
+            with self.subTest(command=command), mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(Path, "read_text", read), \
+                    mock.patch.object(codex_runner, "enriched_status", wraps=codex_runner.enriched_status) as enrich:
+                value = codex_runner.list_jobs(args) if command == "list" else codex_runner.summarize_jobs(args)
+            self.assertEqual(value["total"], 4)
+            self.assertEqual(len(reads), len(set(reads)))
+            self.assertEqual(enrich.call_count, 1)
+            if command == "list":
+                self.assertEqual(value["jobs"][0]["job_id"], "history-2")
+            else:
+                self.assertEqual(value["groups"][0]["job_ids"], ["history-2"])
 
     def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
         context = self.sample_context()
