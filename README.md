@@ -18,6 +18,18 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 面板沿用 DSH 的网页服务，不另开端口；`/dsh-codex-conductor/*` 的每个接口都调用 DSH 自己的登录及 Host/Origin 校验，缺少鉴权服务时拒绝访问。`webServer`、`settings` 或客户端槽位不存在时不影响原有工具。文件 URL 加载也支持前端：升级时保留完整包（包括 `package.json`、`client.js`、`panel.mjs`），仍用 `file:///…/index.mjs?v=…`，更换 entry ID 和 `v` 后由 DSH 热加载，无须重启宿主。`runtimeProfileFile` 须指向这个实例实际使用的 `cordis.patch.yml`；新版本先由用户部署。
 
+### 0.9.51：从本机请求续接被中断的会话
+
+向 `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.json` 写入以下 JSON（与 `loaded.json` 同目录）。建议先写临时文件，再在同目录改名发布，避免插件读到未写完的 JSON：
+
+```json
+{"sessions":["session-example"],"message":"继续"}
+```
+
+`message` 可省略，默认“继续”，最多 2000 个 Unicode 字符。`sessions` 最多 20 项，ID 仅接受 `[A-Za-z0-9_-]{1,100}`，重复 ID 只处理一次。插件加载、热重载和目录文件通知时检查请求；没有请求文件就不会续接。请求先原子改名认领，再逐个处理：不存在、正在运行或最后一个回合不是 `interrupted` 的会话跳过；其余优先恢复可恢复的目标，否则提交用户消息。未在窗口打开的会话也可加载后续接。
+
+同目录的 `resume-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、整批状态 `processed` / `rejected`，以及 `sessions` 数组中的 `sessionId`、`status`（`resumed` / `skipped`）、`reason`、`method`（`goal` / `message` / `null`）；出错时另有 `error`。输入不合法时整批拒绝，不提交任何消息。目录监听不可用时会记警告，仍在加载时检查。结果只保留最近一批；提交下一批前先核对本批时间并读取结果。已认领的请求不在重启后自动重放，避免重复提交。
+
 ## 功能
 
 **派活工具**
@@ -309,6 +321,18 @@ A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL co
 Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, page through full reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Settings saves back up and atomically update this plugin's profile fields while preserving comments and unrelated configuration; success requires the actual load marker. Wait for active Codex tasks before saving settings; the reload button can queue an idle observer. Prompt saves also create a backup.
 
 Every `/dsh-codex-conductor/*` endpoint explicitly uses DSH's own login and Host/Origin checks on its existing web server; no extra port is opened, and missing authentication fails closed. Missing optional web/settings/slot services leave the existing tools available. File-URL loading supports the client declaration: deploy the complete package, including `package.json`, `client.js`, and `panel.mjs`, keep `file:///…/index.mjs?v=…`, and change the entry ID and `v` token for a hot load without restarting DSH. Set `runtimeProfileFile` to that instance's real `cordis.patch.yml`; deployment is a separate user action.
+
+### 0.9.51: Resume interrupted sessions from a local file
+
+Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.json`, alongside `loaded.json`. Write a temporary file first, then rename it in the same directory so the plugin cannot read a partial request:
+
+```json
+{"sessions":["session-example"],"message":"Continue"}
+```
+
+`message` is optional, defaults to `继续`, and accepts at most 2000 Unicode characters. Supply at most 20 session IDs matching `[A-Za-z0-9_-]{1,100}`; duplicate IDs are handled once. The plugin checks on load, hot reload and directory notifications. Without a request file, nothing resumes. It atomically claims the file before processing: missing sessions, running sessions, and sessions whose last turn did not end as `interrupted` are skipped. Eligible sessions resume a resumable goal first, otherwise receive the user message. Sessions do not need to be open in a window.
+
+`resume-result.json` contains claim time `requestedAt`, completion time `completedAt`, batch `status` (`processed` / `rejected`), and a `sessions` array with `sessionId`, `status` (`resumed` / `skipped`), `reason`, and `method` (`goal` / `message` / `null`); failures also include `error`. Invalid input rejects the whole batch without submitting messages. If directory watching is unavailable, a warning is logged and the load-time check remains. Only the latest result is retained; check its timestamp and read it before submitting another batch. Claimed requests are not replayed after a restart, preventing duplicate submissions.
 
 ### Gemini tutorial and documentation writing (off by default)
 
