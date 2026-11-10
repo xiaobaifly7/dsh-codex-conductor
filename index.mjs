@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
-const { runtimeIdentity, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
+const { runtimeIdentity, loadedRecord, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -1493,7 +1493,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   if (process.env.LOCALAPPDATA) try {
     const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
     mkdirSync(dir, { recursive: true });
-    writeFileSync(path.join(dir, 'loaded.json'),
+    const loadedFile = path.join(dir, 'loaded.json');
+    const { record } = loadedRecord(loadedFile);
+    let occupied = false;
+    if (record && record.pid !== process.pid) try {
+      process.kill(record.pid, 0);
+      occupied = true;
+    } catch (error) { occupied = error.code === 'EPERM'; }
+    if (!occupied) writeFileSync(loadedFile,
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
         tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
           ...(cfg.gemini ? ['gemini_write'] : [])],

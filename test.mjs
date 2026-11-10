@@ -29,7 +29,7 @@ test('entry reload queries re-evaluate workflow, runtime, guard and gemini helpe
         'export const validReport = () => true, blockingState = () => ({}), prepareContinuation = () => ({});\n');
       writeFileSync(path.join(dir, 'runtime.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('runtime-${version}');\n` +
-        'export const runtimeIdentity = () => ({}), registerRuntimeTool = () => {};\n');
+        'export const runtimeIdentity = () => ({}), loadedRecord = () => ({ record: null }), registerRuntimeTool = () => {};\n');
       writeFileSync(path.join(dir, 'gemini.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('gemini-${version}');\nexport const geminiWrite = () => ({});\n`);
       writeFileSync(path.join(dir, 'guard.mjs'),
@@ -175,7 +175,7 @@ test('writing or arbitrary commands are refused', () => {
     'pwsh -NoProfile -Command x -File tests/a.ps1', 'timeout 30 rm -rf x', 'timeout 30', 'timeout abc ls',
     'bash a.sh', 'bash -c "ls"', 'bash -n -c x', 'sh -n', 'cat <<EOF\nx\nEOF', 'tee a.txt',
     'cp a b', 'mv a b', 'touch a', 'npm install', 'sort -o out in', 'uniq in out', 'rg --pre sh x',
-    'cd x && rm y', 'git status; rm -rf /', 'bash -c "ls"', 'xargs rm', 'FOO=1 ls', "echo 'unterminated",
+    'cd x && rm y', 'git status; rm -rf /', 'bash -c "ls"', 'xargs rm', "echo 'unterminated",
     "awk '{print > \"f\"}' a", 'diff <(ls) b', 'ls | tee out', '', 'iconv -f a -t b in -o out',
     "D=/mnt/d/x\ncd \"$D\" || exit 1\npython3 - <<'PYEOF'\nopen('a','w')\nPYEOF",
     'PWSH=/mnt/c/tools/pwsh.exe\ntimeout 900 "$PWSH" -NoProfile -File x.ps1 > /tmp/al.txt',
@@ -187,7 +187,7 @@ test('writing or arbitrary commands are refused', () => {
     'sed -n 1p -i f', 'sed -n 1p f -i', 'sed -n 1p --in-place=.bak f', 'sed -n 1p -f s.sed f',
     "sed -n 1p -e 'w out' f", "sed -n '1p' -e '1e touch X' f", "sed -n '/a\\/,/e echo X;: /p' f",
     // sed 脚本或文件参数里的变量、命令替换、花括号展开后可以变成 e/w 命令或开关
-    'p=1wW; sed -n $p f', 'sed -n "$p" f', 'sed -n "1,$p" f', "v=x; sed -n \"/$v/p\" f", 'sed -n "/$(printf x)/p" f',
+    'p=1wW; sed -n $p f', 'sed -n "$p" f', 'sed -n "1,$p" f', 'sed -n "/$(printf x)/p" f',
     'sed -n 1p {-i,f}', 'sed -n 1p $(printf -- -i) f', "printf -v p '1e touch X'",
     // 算术求值会递归展开变量值里的 a[$(...)]
     'echo $(( cat ))', "cat='a[$(touch X)]'; echo $(( cat ))", "cat='a[$(touch X)]'; [[ cat -eq 0 ]]",
@@ -197,8 +197,139 @@ test('writing or arbitrary commands are refused', () => {
   assert.equal(readOnlyCommand("sed -n '/start/,/end/p' a.txt b.txt"), true);
 });
 
+test('sed permits static print and substitution output without file or process actions', () => {
+  for (const command of [
+    "sed -n '128,160p' input.txt", "sed 's/a/b/' input.txt", "sed -E 's/[0-9]+/N/g' input.txt",
+    "sed 's|/old/|/new/|g; s/old$/new/' input.txt", "sed 's/a/b/; 2,4p' input.txt",
+    String.raw`sed 's/\//:/g' input.txt`,
+    "sed -n '1p' ./src/*.txt",
+    String.raw`sed -E 's/("password"[[:space:]]*:[[:space:]]*")[^"]*"/\1<redacted>"/' config.json`,
+    'v=x; sed -n "/$v/p" input.txt',
+  ]) for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  for (const command of [
+    'sed -i s/a/b/ input.txt', 'sed -ni 1p input.txt', 'sed --in-place=.bak s/a/b/ input.txt',
+    "sed 's/a/b/w out' input.txt", "sed 's/a/b/e' input.txt", "sed 's/a/b/; w out' input.txt",
+    "sed '1e touch marker' input.txt", "sed '1r other' input.txt", "sed -f program.sed input.txt",
+    "sed 's/a/b/' input.txt -e 'w out'", "sed 's/a/b/\ne touch marker' input.txt",
+    "sed 's/[/]/b/e' input.txt", 'sed "$script" input.txt', 'sed -n 1p "$file"', 'sed s/a/b/*',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('awk permits static stdout programs without process, redirection or extension syntax', () => {
+  for (const command of [
+    "awk 'NR>=10 && NR<=20 {print NR, $0}' input.txt", "awk '{s+=$1} END {print s}' input.txt",
+    String.raw`awk -F: -v label=total '{printf "%s %d\n", label, NF}' input.txt`,
+    "awk 'NR<3 {print length($0)}' input.txt",
+    "awk 'NR>=3 || NR<=1 {print $0}' ./src/*.txt",
+  ]) for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  for (const command of [
+    `awk 'BEGIN{system("x")}'`, "awk 'BEGIN{system " + '\\' + '\n' + '("x")}\'',
+    `awk '{print > "out"}' input.txt`, `awk '{printf "%s", $0 >> "out"}' input.txt`,
+    `awk '{print | "sh"}' input.txt`, `awk 'BEGIN{getline x < "input"}'`,
+    `awk '@load "extension"' input.txt`, `awk '@include "program"' input.txt`,
+    'awk -f program.awk input.txt', "awk '{print}' -f program.awk", 'awk "$program" input.txt', 'awk BEGIN{*}',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('find exec actions only accept complete read-only commands', () => {
+  for (const command of [
+    "find ./src -type f -name '*.mjs'", String.raw`find . -exec ls -l {} \;`,
+    'find . -type f -exec du -sm {} +', String.raw`find . -execdir sha256sum {} \;`,
+    String.raw`find . -exec stat -c '%s %n' {} \;`,
+    String.raw`find . -exec awk '{print $0}' input.txt \;`,
+  ]) for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  for (const command of [
+    'find . -delete', 'find . -fprint out', 'find . -fprint0 out', 'find . -fprintf out %p', 'find . -fls out',
+    String.raw`find . -ok ls {} \;`, String.raw`find . -okdir ls {} \;`,
+    String.raw`find . -exec rm {} \;`, String.raw`find . -execdir sh -c 'echo x' \;`,
+    String.raw`find . -exec sed -i s/a/b/ {} \;`, String.raw`find . -exec dd if={} of=out \;`,
+    String.raw`find . -exec python3 -m pytest {} \;`, String.raw`find . -exec sed '{}' input.txt \;`,
+    String.raw`find . -exec awk BEGIN{*} \;`,
+    String.raw`find . -exec sed 's/a/b/' + -e 'e touch marker' {} \;`,
+    'find . -exec ls -l {}', 'find . -exec ls -l {} ;',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('dd only reads input and sends bytes to stdout', () => {
+  for (const command of ['dd if=input.bin', 'dd if=input.bin bs=1 skip=128 count=32',
+    'dd if=input.bin bs=1M count=2 | od -An -tx1']) {
+    for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  }
+  for (const command of ['dd if=input.bin of=out', 'dd of=/dev/null', 'dd if=input.bin conv=notrunc',
+    'dd if=$file', 'dd "$operands"', 'dd if=input.bin > out']) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('paste, tr, base64 decode and key fingerprints keep output on stdout', () => {
+  for (const command of ["paste -sd+ -", 'paste a.txt b.txt', "tr -d '\\r' < input.txt", "tr -cd '[:print:]'",
+    'base64 -d input.txt', 'base64 --decode --ignore-garbage < input.txt', 'ssh-keygen -l -f key.pub', 'ssh-keygen -lf key.pub',
+    'xargs sha256sum', 'xargs -r cat']) {
+    for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  }
+  for (const command of ['paste a.txt b.txt > out', "tr -d '\\r' > out", 'base64 -d > out',
+    'base64 -d -o out input.txt', 'ssh-keygen -t ed25519 -f key', 'ssh-keygen -l -f key.pub -R host',
+    'ssh-keygen -l -f "$file"', 'tr "$(touch marker)" x', 'xargs rm', 'xargs sed', 'xargs -r cat > out',
+    'xargs -I{} sh -c "{}"', 'xargs "$command"']) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('ordinary assignment prefixes and literal path preambles stay read-only', () => {
+  for (const command of [
+    'FOO=1 ls', 'R=/repo sed -n 1p input.txt', 'C=disk.vhdx ls -l input.txt', 'LC_ALL=C tr -d x',
+    'R=/repo; sed -n 1p "$R/input.txt"', 'C=disk.vhdx; dd if="$C" count=1',
+    'R=/repo; ls -l "$R" 2>&1 | head -20; find "$R" -maxdepth 3 -name "*.avhdx" 2>/dev/null | head -10',
+    'R=/repo; echo "$(find "$R" -type f | wc -l)"', 'R=/repo; C=$R/data; sed -n 1p "$C"',
+    'R=$(pwd) ls',
+  ]) for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  for (const command of [
+    'R=$(touch marker) ls', 'R=/repo rm file', 'export R=/repo; ls',
+    'PATH=/tmp ls', 'LD_PRELOAD=library.so ls', 'GIT_EXTERNAL_DIFF=sh git diff',
+    'HOME=/tmp git diff', 'GCONV_PATH=/tmp iconv -f UTF-8 -t UTF-16 input.txt',
+    'R=/repo; R=$(cat input); sed -n 1p "$R"', 'R=/repo; read R < input; sed -n 1p "$R"',
+    'R=/repo; R=$(cat input) C=$R; sed -n 1p "$C"',
+    'R=/repo; R=$(cat input) :; sed -n 1p "$R"',
+    'R=(-delete); find . "$R"', 'R=(-i); sed -n 1p "$R" input.txt',
+    'R=/repo; FOO=1 read R < input; sed -n 1p "$R"',
+    'R=/repo; for R in *; do sed -n 1p "$R"; done', 'if false; then R=/repo; fi; sed -n 1p "$R"',
+    'R=/repo & sed -n 1p "$R"', 'R=/repo | sed -n 1p "$R"',
+    'R=/repo; echo "${R:=other}"; sed -n 1p "$R"', 'R=/repo sed -n 1p "$R/file"',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('new guard denials explain dangerous sed, awk, find and dd forms', () => {
+  for (const [command, hint] of [
+    ['sed -i s/a/b/ input.txt', /-i\/--in-place/], ["sed 's/a/b/w out' input.txt", /w\/e/],
+    [`awk 'BEGIN{system("x")}'`, /system/], [`awk '{print > "out"}'`, /重定向 >/],
+    ['find . -delete', /-delete.*写文件/], [String.raw`find . -exec rm {} \;`, /-exec 后的 rm/],
+    ['dd if=input of=out', /of=.*写入/],
+  ]) assert.match(decide(call('wsl', { command }), cfg), hint, command);
+});
+
+test('process, environment, registry, ACL and additional git queries stay read-only', () => {
+  for (const command of [
+    'tasklist', 'tasklist /FI "IMAGENAME eq app.exe" /FO CSV', 'netstat -ano', 'netstat -ano -p tcp', 'env',
+    String.raw`reg query 'HKCU\Environment'`, String.raw`icacls 'C:\ProgramData\Example'`,
+    'git --version', 'git rev-list --count HEAD', 'git diff-tree --root --no-commit-id --name-status -r HEAD',
+    'git check-ignore -v evidence.log',
+  ]) for (const tool of ['wsl', 'ops_bash']) assert.equal(decide(call(tool, { command }), cfg), undefined, command);
+  for (const command of [
+    'tasklist > out', 'netstat -ano > out', 'env bash -c ls', 'env -i node -e x',
+    String.raw`reg add 'HKCU\Environment' /v Example /d value`, String.raw`reg export 'HKCU\Environment' out.reg`,
+    String.raw`icacls 'C:\Data' /grant User:F`, String.raw`icacls 'C:\Data' /save out`, 'icacls "$args"',
+    'git rev-list --output=out HEAD', 'git diff-tree --ext-diff HEAD', 'git check-ignore --output=out input',
+  ]) assert.equal(readOnlyCommand(command), false, command);
+});
+
+test('remote access, arbitrary interpreters, exports, delays and interpreter heredocs remain refused', () => {
+  for (const command of [
+    'ssh host true', 'ssh.exe host true', 'pwsh -Command Get-Date', 'powershell -Command Get-Date',
+    'python -c "print(1)"', 'python3 script.py', 'node -e "console.log(1)"', 'curl -I https://example.org',
+    'export R=/repo', 'sleep 1', "python3 - <<'PY'\nprint(1)\nPY", 'node <<EOF\nconsole.log(1)\nEOF',
+  ]) for (const tool of ['wsl', 'ops_bash']) assert.ok(decide(call(tool, { command }), cfg), command);
+});
+
 test('guard denials name the part that was refused', () => {
   const why = (command) => decide(call('wsl', { command }), cfg);
+  assert.match(why('X=-delete; find . $X'), /不放行的是「X=-delete」/);
+  assert.match(why('PATH=/tmp ls'), /不放行的是「PATH=\/tmp ls」/);
   assert.match(why(`git status && ${'ls a; '.repeat(60)}timeout 30 rm -rf x`), /不放行的是「rm -rf x」/);
   assert.match(why(`${'cat a; '.repeat(60)}echo $((1+2))`), /含不放行的结构：[^。]*\$\(\(\.\.\.\)\) 算术/);
   assert.match(why('cat a > b'), /重定向/);
@@ -1519,7 +1650,7 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.equal(loaded.allowHostAccess, true);
   assert.equal(loaded.defaultHostAccess, true);
   assert.equal(loaded.plannerAnswers, true);
-  assert.equal(loaded.version, '0.9.44');
+  assert.equal(loaded.version, '0.9.45');
   assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
   assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
   assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
@@ -1529,6 +1660,48 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.equal(fallback.serviceTier, null);
   assert.equal(fallback.plannerAnswers, false);
   assert.deepEqual(fallback.routerCheck, { transport: 'http', origin: 'http://127.0.0.1:3426' });
+});
+
+test('apply preserves another live process loaded record and replaces own, stale or corrupt records', async (t) => {
+  const file = path.join(localAppData, 'dsh-codex-conductor', 'loaded.json');
+  harness();
+  const own = JSON.parse(readFileSync(file, 'utf8'));
+  t.after(() => writeFileSync(file, JSON.stringify(own)));
+  const livePid = process.pid + 1;
+  const deadPid = process.pid + 2;
+  const protectedPid = process.pid + 3;
+  const probes = [];
+  t.mock.method(process, 'kill', (pid, signal) => {
+    assert.equal(signal, 0);
+    probes.push(pid);
+    if (pid === deadPid) throw Object.assign(new Error('not running'), { code: 'ESRCH' });
+    if (pid === protectedPid) throw Object.assign(new Error('access denied'), { code: 'EPERM' });
+    assert.equal(pid, livePid);
+    return true;
+  });
+  for (const row of [
+    { record: { ...own, pid: livePid, version: 'desktop-version' }, keep: true },
+    { record: { ...own, pid: protectedPid }, keep: true },
+    { record: { ...own, pid: deadPid } }, { record: { ...own, loadedAt: '2000-01-01T00:00:00Z' } },
+    { text: '{broken' }, { record: { pid: livePid } },
+    { record: { ...own, pid: livePid, module: 'not a file URL' } },
+    { record: { ...own, pid: livePid, loadedAt: 'invalid date' } },
+    { record: { ...own, pid: -1 } },
+  ]) {
+    const original = row.text ?? JSON.stringify(row.record);
+    writeFileSync(file, original);
+    const h = harness();
+    const status = await h.tools.codex_runtime.execute({ action: 'status' });
+    assert.equal(status.instance.module, own.module);
+    assert.equal(status.instance.version, '0.9.45');
+    if (row.keep) assert.equal(readFileSync(file, 'utf8'), original);
+    else {
+      assert.equal(status.loaded.pid, process.pid);
+      assert.equal(status.loaded.version, '0.9.45');
+      assert.notEqual(status.loaded.loadedAt, '2000-01-01T00:00:00Z');
+    }
+  }
+  assert.deepEqual(probes, [livePid, protectedPid, deadPid]);
 });
 
 test('codex_watch stays quiet without changes and stopping it leaves the business task running', async (t) => {
@@ -2870,7 +3043,7 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   const envelope = JSON.parse(starts[0].stdin);
   const { dispatcher, ...taskContext } = envelope.context;
   assert.equal(dispatcher.pid, process.pid);
-  assert.equal(dispatcher.version, '0.9.44');
+  assert.equal(dispatcher.version, '0.9.45');
   assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);

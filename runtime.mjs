@@ -37,7 +37,7 @@ export function runtimeIdentity(moduleUrl) {
     dirty: status === null ? null : status !== '' };
 }
 
-function loadedRecord(loadedFile) {
+export function loadedRecord(loadedFile) {
   try {
     if (!loadedFile) throw new Error('loadedFile is not configured');
     const record = JSON.parse(readFileSync(loadedFile, 'utf8').replace(/^\uFEFF/, ''));
