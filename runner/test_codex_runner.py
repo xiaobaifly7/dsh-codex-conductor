@@ -2503,6 +2503,31 @@ class RunnerTests(unittest.TestCase):
             codex_runner.main()
         self.assertEqual(json.loads((jd / "result.json").read_text())["status"], "completed")
 
+    def test_dead_worker_marks_only_identity_checked_residual_codex_processes(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("orphaned", None, sandbox="workspace-write")
+        (jd / "worker.pid").write_text("123")
+        (jd / "worker.start").write_text("worker-original")
+        (jd / "codex.pid").write_text("456")
+        (jd / "codex.start").write_text("codex-original")
+        (jd / "boot_id").write_text("same-boot")
+        for boot, codex_start, residual in (("same-boot", "codex-original", True),
+                                            ("same-boot", "reused", False), ("new-boot", "codex-original", False)):
+            with self.subTest(boot=boot, codex_start=codex_start), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(codex_runner, "boot_id", return_value=boot), \
+                    mock.patch.object(codex_runner, "process_start", side_effect=lambda pid: codex_start if pid == 456 else None), \
+                    mock.patch.object(codex_runner, "kill_tree") as kill:
+                value = codex_runner.job_status(jd.name)
+                self.assertEqual(value["error_kind"], "worker_died")
+                self.assertEqual(value["retryable"], not residual)
+                self.assertEqual(value.get("residual_codex_pid"), 456 if residual else None)
+                if residual:
+                    self.assertIn("Do not retry", value["error"])
+                kill.assert_not_called()
+
     def test_prune_removes_only_stale_unfinished_dirs_with_no_live_process(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

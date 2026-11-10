@@ -1224,7 +1224,7 @@ def job_status(job_id, record=None):
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")), record)
         if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None}, record)
-        return enriched_status(job_id, job_dir, worker_died(job_id, job_dir), record)
+        return enriched_status(job_id, job_dir, worker_died(job_id, job_dir, record["task"] if record else None), record)
     except (OSError, ValueError, TypeError) as e:
         value = {"job_id": job_id, "status": "failed", "error_kind": "invalid_record",
                  "error": str(e), "retryable": False}
@@ -1411,19 +1411,25 @@ def job_output(args):
             "next_offset": end if end < len(content) else None, "eof": end >= len(content)}
 
 
-def worker_died(job_id, job_dir):
+def worker_died(job_id, job_dir, task=None):
     """The worker exited without a result (WSL restart, crash). A writer can still be resumed from its thread;
     a read-only run is --ephemeral, so only a writer thread it resumed can be."""
-    try:
-        task = json.loads((job_dir / "args.json").read_text("utf-8"))
-    except (OSError, ValueError):
-        task = {}
+    if task is None:
+        try:
+            task = json.loads((job_dir / "args.json").read_text("utf-8"))
+        except (OSError, ValueError):
+            task = {}
     thread = task.get("resume")
     if task.get("sandbox") != "read-only":
         thread = started_thread(job_dir / "events.jsonl") or thread
-    return {"job_id": job_id, "status": "failed", "error_kind": "worker_died", "retryable": True,
-            "error": "The runner worker exited without writing a result (WSL restart or crash).",
-            "sandbox": task.get("sandbox"), "thread_id": thread, "log_dir": str(job_dir)}
+    result = {"job_id": job_id, "status": "failed", "error_kind": "worker_died", "retryable": True,
+              "error": "The runner worker exited without writing a result (WSL restart or crash).",
+              "sandbox": task.get("sandbox"), "thread_id": thread, "log_dir": str(job_dir)}
+    pid = recorded_pid(job_dir / "codex.pid")
+    if pid is not None:
+        result.update(residual_codex_pid=pid, retryable=False)
+        result["error"] += f" Codex PID {pid} is still present. Do not retry until the residual process is stopped."
+    return result
 
 
 def started_thread(events):
