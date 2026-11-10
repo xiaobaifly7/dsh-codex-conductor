@@ -348,6 +348,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
             reconnecting_since = None
             completed_at = None
             stdout_done = False
+            active_commands = set()
             while True:
                 now = time.monotonic()
                 if stdin_errors:
@@ -373,7 +374,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state["end_reason"] = "timeout"
                     kill_tree(proc.pid)
                     break
-                if not completed_at and now - last_event > args.idle_timeout:
+                if not completed_at and not active_commands and now - last_event > args.idle_timeout:
                     state["end_reason"] = "idle_timeout"
                     kill_tree(proc.pid)
                     break
@@ -396,6 +397,11 @@ def run_attempt(args, prompt, run_dir, thread_id):
                 if kind in ("item.started", "item.completed") and item.get("type") in (
                         "command_execution", "file_change", "agent_message"):
                     state["prompt_delivered"] = True
+                if item.get("type") == "command_execution":
+                    if kind == "item.started" and item.get("status") == "in_progress":
+                        active_commands.add(item.get("id"))
+                    elif kind == "item.completed":
+                        active_commands.discard(item.get("id"))
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
                 if kind == "error":
                     reconnecting_since = reconnecting_since or time.monotonic()
