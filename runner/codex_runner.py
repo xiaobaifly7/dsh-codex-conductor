@@ -1284,7 +1284,35 @@ def job_details(job):
     return {**job, **job["_details"]}
 
 
-def matching_jobs(args):
+def job_directories(job_ids=None):
+    root = HOME / "jobs"
+    for job_dir in root.iterdir() if root.exists() else []:
+        if job_ids and job_dir.name not in job_ids:
+            continue
+        if not job_dir.is_dir():
+            continue
+        try:
+            job_identifier(job_dir.name)
+        except argparse.ArgumentTypeError:
+            continue
+        yield job_dir
+
+
+def job_listing_times(job_dir, started_at=None):
+    args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+    if started_at is None:
+        started_at = args_file.stat().st_mtime if args_file.exists() else None
+    return {"job_id": job_dir.name, "started_at": started_at,
+            "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
+            "updated_at": max(p.stat().st_mtime for p in (job_dir, args_file, result_file, job_dir / "events.jsonl",
+                                                        job_dir / "reviews.json") if p.exists())}
+
+
+def job_listing_order(job):
+    return (job["started_at"] or job["updated_at"], job["job_id"])
+
+
+def matching_jobs(args, *, page_dates=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
     needs_attention = args.needs_attention or scope_conflicts
@@ -1302,17 +1330,10 @@ def matching_jobs(args):
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
 
     jobs = []
-    root = HOME / "jobs"
-    for job_dir in root.iterdir() if root.exists() else []:
-        if not args.owner and args.job_id and job_dir.name not in args.job_id:
-            continue
-        if not job_dir.is_dir():
-            continue
-        try:
-            job_identifier(job_dir.name)
-        except argparse.ArgumentTypeError:
-            continue
+    directories = job_directories(args.job_id if not args.owner else None) if page_dates is None else page_dates
+    for job_dir in directories:
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+        started_at = None
         if started_between is not None:
             try:
                 started_at = args_file.stat().st_mtime
@@ -1365,20 +1386,27 @@ def matching_jobs(args):
             blocking = value["blocking"]
             if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
                 continue
-        if started_between is None:
-            started_at = args_file.stat().st_mtime if args_file.exists() else None
-        jobs.append({**value, "parent_job_id": parent,
-                     "started_at": started_at,
-                     "finished_at": result_file.stat().st_mtime if result_file.exists() else None,
-                     "updated_at": max(p.stat().st_mtime for p in (job_dir, args_file, result_file, job_dir / "events.jsonl",
-                                                                 job_dir / "reviews.json") if p.exists())})
-    jobs.sort(key=lambda j: (j["started_at"] or j["updated_at"], j["job_id"]), reverse=True)
+        dates = job_listing_times(job_dir, started_at) if page_dates is None else page_dates[job_dir]
+        jobs.append({**value, "parent_job_id": parent, **dates})
+    jobs.sort(key=job_listing_order, reverse=True)
     return jobs
 
 
 def list_jobs(args):
-    jobs = matching_jobs(args)
-    page = [job_details(j) for j in jobs[args.offset:args.offset + args.limit]]
+    requested = slice(args.offset, args.offset + args.limit)
+    filters = ("cwd", "owner", "status", "job_id", "thread_id", "parent_job", "needs_attention",
+               "scope_conflicts", "started_between")
+    if any(getattr(args, key, None) for key in filters):
+        jobs = matching_jobs(args)
+        total = len(jobs)
+        page = jobs[requested]
+    else:
+        # Ordering and totals for an unfiltered page need timestamps only.
+        dates = {p: job_listing_times(p) for p in job_directories()}
+        ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
+        total = len(ordered)
+        page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
+    page = [job_details(j) for j in page]
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
@@ -1390,8 +1418,8 @@ def list_jobs(args):
              if j.get("context") else None,
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
-    return {"status": "completed", "jobs": page, "total": len(jobs), "offset": args.offset, "limit": args.limit,
-            "next_offset": next_offset if next_offset < len(jobs) else None, "eof": next_offset >= len(jobs)}
+    return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
+            "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
 
 
 def summary_usage(rounds):

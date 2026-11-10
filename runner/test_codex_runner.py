@@ -2366,7 +2366,8 @@ class RunnerTests(unittest.TestCase):
                                                   "structured": self.sample_report()}, context=self.sample_context())
             os.utime(jd / "args.json", (1000 + i, 1000 + i))
         read_text = Path.read_text
-        for command in ("list", "summary"):
+        for query in ("unfiltered", "list", "summary"):
+            command = "list" if query == "unfiltered" else query
             reads = []
 
             def read(path, *args, **kwargs):
@@ -2374,15 +2375,20 @@ class RunnerTests(unittest.TestCase):
                     reads.append(path)
                 return read_text(path, *args, **kwargs)
 
-            args = SimpleNamespace(command=command, owner="owner-a", cwd=str(self.cwd), job_id=None,
+            unfiltered = query == "unfiltered"
+            args = SimpleNamespace(command=command, owner=None if unfiltered else "owner-a",
+                                   cwd=None if unfiltered else str(self.cwd), job_id=None,
                                    status=None, needs_attention=False, offset=1, limit=1, round_limit=20)
-            with self.subTest(command=command), mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+            with self.subTest(query=query), mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
                     mock.patch.object(Path, "read_text", read), \
                     mock.patch.object(codex_runner, "enriched_status", wraps=codex_runner.enriched_status) as enrich:
                 value = codex_runner.list_jobs(args) if command == "list" else codex_runner.summarize_jobs(args)
             self.assertEqual(value["total"], 4)
             self.assertEqual(len(reads), len(set(reads)))
             self.assertEqual(enrich.call_count, 1)
+            if unfiltered:
+                self.assertEqual({path.parent.name for path in reads}, {"history-2"})
+                self.assertEqual(value["next_offset"], 2)
             if command == "list":
                 self.assertEqual(value["jobs"][0]["job_id"], "history-2")
             else:
