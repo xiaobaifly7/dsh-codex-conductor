@@ -927,13 +927,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try {
       const owner = exec?.agent?.id;
       const log = exec?.agent?.session?.log ?? [];
+      const tool = continuation ? 'codex_continue' : 'codex_run';
+      const preflightUnavailable = (reason, value) => new Error(`${tool}: ${reason}，未启动 Codex。` +
+        (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
       if (args.resume && owner) {
-        const tool = continuation ? 'codex_continue' : 'codex_run';
         // 新一轮的结果不能替代同线程更早问题的用户回复。
         for (let offset = 0; offset !== null;) {
           const history = await conductor.list({ owner, thread_id: args.resume, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
-          if (!Array.isArray(history.jobs)) throw new Error(`${tool}: 无法核对待续接线程的任务，未启动 Codex。`);
+          if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对待续接线程的任务', history);
           const pending = history.jobs.find((job, index) => job.blocking?.next_action === 'ask_user' &&
             ((!continuation && offset === 0 && index === 0) || !hasUserReply(log, job, owner)));
           if (pending) throw new Error(`${tool}: 原任务 ${pending.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再按最新任务状态用 codex_continue 处理。`);
@@ -944,14 +946,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         for (let offset = 0; offset !== null;) {
           const history = await conductor.list({ owner, needs_attention: true, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
-          if (!Array.isArray(history.jobs)) throw new Error('codex_run: 无法核对已有写入范围，未启动 Codex。');
+          if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对已有写入范围', history);
           for (const job of history.jobs) {
             if (job.blocking?.next_action !== 'ask_user' || !job.blocking.blockers?.some(b => b.kind === 'task_conflict') ||
                 hasUserReply(log, job, owner)) continue;
             const scope = job.scope_paths ?? job.scope;
             if (unknownState(job) || typeof job.cwd !== 'string' || !job.cwd.trim() ||
                 (scope !== null && (!Array.isArray(scope) || scope.some(p => typeof p !== 'string' || !p.trim())))) {
-              throw new Error(`codex_run: 无法核对原任务 ${job.job_id} 的写入范围，未启动 Codex。`);
+              throw preflightUnavailable(`无法核对原任务 ${job.job_id} 的写入范围`, job);
             }
             if (widensOverlappingScope(job.cwd, scope, cwd, args.scope)) {
               throw new Error(`codex_run: 原任务 ${job.job_id} 的范围冲突仍需用户回答，未启动 Codex。请先向用户确认新增写入路径。`);

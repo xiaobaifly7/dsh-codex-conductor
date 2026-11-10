@@ -4,7 +4,9 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.42` 新增可选的 `gemini_write`，由 Gemini 写教程与文档正文，插件核对路径、字数和改动范围。
+`0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
+
+`0.9.43` 新增可选的 `gemini_write`，由 Gemini 写教程与文档正文，插件核对路径、字数和改动范围。
 
 ## 功能
 
@@ -278,7 +280,9 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.42` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
+`0.9.42` identifies a WSL connection failure when it prevents dispatch preflight, preserving the existing scope and continuation checks.
+
+`0.9.43` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 

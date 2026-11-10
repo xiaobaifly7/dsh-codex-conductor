@@ -2024,7 +2024,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_context_envelope_round_trips_large_unicode_without_argv(self):
         context = self.sample_context()
-        context["dispatcher"] = {"version": "0.9.41", "revision": None, "pid": 1234}
+        context["dispatcher"] = {"version": "0.9.43", "revision": None, "pid": 1234}
         context["task"] += "上下文😀" * 20000
         context["acceptance"] = ["验证完整结果" * 2000]
         envelope = json.dumps({"prompt": "only this prompt reaches Codex", "context": context}, ensure_ascii=False)
@@ -2056,7 +2056,7 @@ class RunnerTests(unittest.TestCase):
                   json.dumps({"prompt": 12, "context": context})]
         for key, bad in (("owner", []), ("task", None), ("acceptance", "one"),
                          ("acceptance", [1]), ("write", "true"),
-                         ("dispatcher", {"version": "0.9.41", "revision": None, "pid": True})):
+                         ("dispatcher", {"version": "0.9.43", "revision": None, "pid": True})):
             values.append(json.dumps({"prompt": "do it", "context": {**context, key: bad}}))
         for value in values:
             with self.subTest(value=value[:25]):
