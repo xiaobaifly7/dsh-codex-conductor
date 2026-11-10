@@ -384,8 +384,8 @@ class RunnerTests(unittest.TestCase):
         parser = codex_runner.Parser()
         codex_runner.add_task_arguments(parser)
         args = parser.parse_args(["--cwd", str(self.cwd)])
-        real_open, real_write = open, Path.write_text
-        for operation in ("pid", "write", "flush"):
+        real_open, real_write, real_replace = open, Path.write_text, os.replace
+        for operation in ("pid", "replace", "write", "flush"):
             with self.subTest(operation=operation):
                 run_dir = Path(self.tmp.name) / operation
                 run_dir.mkdir()
@@ -399,13 +399,18 @@ class RunnerTests(unittest.TestCase):
                     return proc
 
                 def write_pid(path, *a, **kw):
-                    if operation == "pid" and path == run_dir / "codex.pid":
+                    if operation == "pid" and path.parent == run_dir and path.name.startswith("codex.pid"):
                         raise failure
                     return real_write(path, *a, **kw)
 
+                def replace_pid(source, target):
+                    if operation == "replace" and target == run_dir / "codex.pid":
+                        raise failure
+                    return real_replace(source, target)
+
                 def open_log(path, *a, **kw):
                     f = real_open(path, *a, **kw)
-                    if path == run_dir / "events.jsonl" and operation != "pid":
+                    if path == run_dir / "events.jsonl" and operation in ("write", "flush"):
                         wrapped = mock.MagicMock(wraps=f)
                         wrapped.__enter__.return_value = wrapped
                         wrapped.__exit__.side_effect = lambda *exc: f.close()
@@ -417,6 +422,7 @@ class RunnerTests(unittest.TestCase):
                     with mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "fault_logging"}), \
                             mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
                             mock.patch.object(Path, "write_text", write_pid), \
+                            mock.patch.object(codex_runner.os, "replace", replace_pid), \
                             mock.patch.object(codex_runner, "open", open_log, create=True):
                         with self.assertRaises(OSError) as stopped:
                             codex_runner.run_attempt(args, "do it", run_dir, None)
@@ -452,7 +458,7 @@ class RunnerTests(unittest.TestCase):
             job_dir, work, gate, reached = map(Path, sys.argv[2:])
             real_write = Path.write_text
             def delayed_write(path, text, *a, **kw):
-                if path == job_dir / 'codex.pid':
+                if path.parent == job_dir and path.name.startswith('codex.pid'):
                     real_write(reached, text)
                     deadline = time.monotonic() + 10
                     while not gate.exists() and time.monotonic() < deadline:
@@ -2669,6 +2675,41 @@ class RunnerTests(unittest.TestCase):
                 codex_runner.prune_old(subdir)
                 self.assertEqual(sorted(d.name for d in (codex_runner.HOME / subdir).iterdir()),
                                  ["finished-with-live-process", "queued", "recently-finished", "running"])
+
+    def test_pid_publication_keeps_identity_complete_during_interleaved_writes(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("atomic-pid", None)
+        pid = os.getpid()
+        codex_runner.record_pid(jd / "worker.pid", pid)
+        real_write = Path.write_text
+        for name in ("worker.pid", "codex.pid"):
+            with self.subTest(name=name):
+                target = jd / name
+                codex_runner.record_pid(target, pid)
+                nested, observed, staged = [False], [], set()
+                def interleaved_write(path, text, *a, **kw):
+                    if path.parent != jd:
+                        return real_write(path, text, *a, **kw)
+                    staged.add(path.name)
+                    with path.open("w") as f:
+                        f.write(text[:1])
+                        f.flush()
+                        observed.append(codex_runner.recorded_pid(target))
+                        self.assertEqual(observed[-1], pid, "a partial identity must never be visible")
+                        if not nested[0]:
+                            nested[0] = True
+                            codex_runner.record_pid(target, pid)
+                        f.write(text[1:])
+                    return len(text)
+                with mock.patch.object(codex_runner.os, "getpid", side_effect=[101, 202]), \
+                        mock.patch.object(Path, "write_text", interleaved_write):
+                    codex_runner.record_pid(target, pid)
+                self.assertEqual(observed, [pid] * 4)
+                self.assertEqual(len(staged), 4)
+                self.assertEqual(codex_runner.recorded_pid(target), pid)
+                self.assertEqual(list(jd.glob("*.tmp")), [])
 
     def test_worker_registers_its_own_process_identity_before_execution(self):
         sys.path.insert(0, str(RUNNER.parent))
