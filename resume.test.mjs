@@ -9,6 +9,7 @@ import { processResumeRequest, registerResumeRequests } from './resume.mjs';
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const claimPattern = new RegExp(`^resume-request\\.${uuid}\\.processing\\.json$`);
 const interrupted = () => ({ type: 'turn/end', data: { reason: { kind: 'interrupted' } } });
+const blocked = () => ({ type: 'turn/end', data: { reason: { kind: 'blocked' } } });
 const start = () => ({ type: 'turn/start', data: {} });
 const end = () => ({ type: 'turn/end', data: { reason: { kind: 'completed' } } });
 const goal = (extra = {}) => ({ id: 'goal-1', revision: 7, phase: 'paused', activation: 'disarmed',
@@ -21,7 +22,7 @@ function fixture(t) {
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const file = (name) => path.join(directory, name);
   const agents = new Map(), events = new Map(), goalViews = new Map();
-  const calls = [], messages = [], resumes = [], warnings = [], cleanups = [];
+  const calls = [], messages = [], resumes = [], wakes = [], warnings = [], cleanups = [];
   const claims = () => fs.readdirSync(directory).filter(name => claimPattern.test(name));
   const assertClaimed = () => {
     assert.equal(fs.existsSync(file('resume-request.json')), false);
@@ -50,7 +51,9 @@ function fixture(t) {
     effect(setup) { cleanups.push(setup()); } };
   t.after(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
   const add = (id, history = [start(), interrupted()]) => {
-    const agent = { status: 'idle', followup(message) { assertClaimed(); messages.push({ id, message }); } };
+    const agent = { status: 'idle', inbox: { hasPending: false },
+      wakeDriver() { assertClaimed(); wakes.push(id); this.status = 'running'; },
+      followup(message) { assertClaimed(); messages.push({ id, message }); } };
     agents.set(id, agent);
     events.set(id, history);
     return agent;
@@ -69,7 +72,7 @@ function fixture(t) {
     return result;
   };
   const run = async (request) => { write(request); return verify(await processResumeRequest({ ctx, directory })); };
-  return { ctx, directory, file, agents, events, goalViews, services, calls, messages, resumes, warnings,
+  return { ctx, directory, file, agents, events, goalViews, services, calls, messages, resumes, wakes, warnings,
     cleanups, claims, add, write, saved, verify, run };
 }
 
@@ -84,24 +87,99 @@ test('resume: absent request is a no-op, including orphaned claims', async (t) =
 
 test('resume: paused, blocked and disarmed active goals resume with their ID/revision', async (t) => {
   const f = fixture(t);
-  for (const phase of ['paused', 'blocked', 'active']) f.goalViews.set(f.add(phase), goal({ phase }));
+  for (const phase of ['paused', 'blocked', 'active']) {
+    const agent = f.add(phase);
+    agent.inbox.hasPending = true;
+    f.goalViews.set(agent, goal({ phase }));
+  }
   const result = await f.run({ sessions: ['paused', 'blocked', 'active'], message: '继续目标' });
   assert.equal(result.status, 'processed');
   assert.deepEqual(result.sessions, ['paused', 'blocked', 'active'].map(id => row(id, 'goal_resumed', 'goal')));
   assert.deepEqual(f.resumes, ['paused', 'blocked', 'active'].map(id => ({ agent: f.agents.get(id),
     value: { id: 'goal-1', revision: 7 } })));
   assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.wakes, []);
 });
 
 test('resume: a turn rejected as blocked after a restart resumes a disarmed goal but never sends a prompt', async (t) => {
   const f = fixture(t);
-  const blocked = { type: 'turn/end', data: { reason: { kind: 'blocked' } } };
-  f.goalViews.set(f.add('goal', [start(), interrupted(), start(), blocked]), goal({ phase: 'active' }));
-  f.add('plain', [start(), interrupted(), start(), blocked]);
+  const agent = f.add('goal', [start(), interrupted(), start(), blocked()]);
+  agent.inbox.hasPending = true;
+  f.goalViews.set(agent, goal({ phase: 'active' }));
+  f.add('plain', [start(), interrupted(), start(), blocked()]);
   const result = await f.run({ sessions: ['goal', 'plain'] });
   assert.deepEqual(result.sessions, [row('goal', 'goal_resumed', 'goal'), row('plain', 'not_interrupted')]);
   assert.equal(f.resumes.length, 1);
   assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.wakes, []);
+});
+
+test('resume: blocked pending inbox wakes once without adding messages or changing the inbox', async (t) => {
+  const f = fixture(t), agent = f.add('A', [start(), blocked()]);
+  const inbox = agent.inbox = Object.freeze({ hasPending: true });
+  const result = await f.run({ sessions: ['A', 'A'], message: 'Do not send this prompt' });
+  assert.deepEqual(result.sessions, [row('A', 'pending_inbox_woken', 'inbox')]);
+  assert.deepEqual(f.wakes, ['A']);
+  assert.equal(agent.inbox, inbox);
+  assert.equal(agent.inbox.hasPending, true);
+  assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.resumes, []);
+  assert.equal(await processResumeRequest(f), undefined);
+  assert.deepEqual(f.wakes, ['A']);
+});
+
+test('resume: blocked without pending input keeps the original skip reason', async (t) => {
+  const f = fixture(t), agent = f.add('A', [start(), blocked()]);
+  delete agent.wakeDriver;
+  assert.deepEqual((await f.run({ sessions: ['A'] })).sessions, [row('A', 'not_interrupted')]);
+  assert.deepEqual(f.wakes, []);
+  assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.resumes, []);
+});
+
+test('resume: running blocked sessions with pending input never wake, including during a history read', async (t) => {
+  for (const duringRead of [false, true]) await t.test(duringRead ? 'during read' : 'already running', async (t) => {
+    const f = fixture(t), agent = f.add('A', [start(), blocked()]);
+    agent.inbox.hasPending = true;
+    if (duringRead) {
+      const read = f.services.sessionQuery.readSession;
+      f.services.sessionQuery.readSession = async (id) => {
+        const result = await read(id);
+        agent.status = 'running';
+        return result;
+      };
+    } else agent.status = 'running';
+    assert.deepEqual((await f.run({ sessions: ['A'] })).sessions, [row('A', 'running')]);
+    assert.deepEqual(f.wakes, []);
+    assert.deepEqual(f.messages, []);
+    assert.deepEqual(f.resumes, []);
+  });
+});
+
+test('resume: unavailable agents or inbox interfaces and failed wakes skip without stopping the batch', async (t) => {
+  const errors = { agent: /status/, inbox: /hasPending/, pending: /hasPending/,
+    wake: /wakeDriver/, failure: /wake failed/ };
+  for (const stage of Object.keys(errors)) await t.test(stage, async (t) => {
+    const f = fixture(t), agent = f.add('A', [start(), blocked()]);
+    agent.inbox.hasPending = true;
+    f.add('B', [start(), blocked()]).inbox.hasPending = true;
+    if (stage === 'agent') {
+      const resolve = f.services.sessionController.resolveAgent;
+      f.services.sessionController.resolveAgent = async (id) => id === 'A' ? {} : resolve(id);
+    }
+    if (stage === 'inbox') delete agent.inbox;
+    if (stage === 'pending') delete agent.inbox.hasPending;
+    if (stage === 'wake') delete agent.wakeDriver;
+    if (stage === 'failure') agent.wakeDriver = () => { throw new Error('wake failed'); };
+    const result = await f.run({ sessions: ['A', 'B'] });
+    assert.match(result.sessions[0].error, errors[stage]);
+    assert.deepEqual(result.sessions, [{ sessionId: 'A', status: 'skipped', reason: 'error',
+      method: ['wake', 'failure'].includes(stage) ? 'inbox' : null, error: result.sessions[0].error },
+    row('B', 'pending_inbox_woken', 'inbox')]);
+    assert.deepEqual(f.wakes, ['B']);
+    assert.deepEqual(f.messages, []);
+    assert.deepEqual(f.resumes, []);
+  });
 });
 
 test('resume: missing, armed, completed and exhausted goals submit default/custom messages', async (t) => {
@@ -111,6 +189,7 @@ test('resume: missing, armed, completed and exhausted goals submit default/custo
     ['over-budget', goal({ roundsStarted: 4 }), '继续'],
   ]) await t.test(label, async (t) => {
     const f = fixture(t), agent = f.add('A');
+    agent.inbox.hasPending = true;
     if (view) f.goalViews.set(agent, view);
     else delete f.services.goals;
     const result = await f.run({ sessions: ['A'], ...(message === undefined ? {} : { message }) });
@@ -121,6 +200,7 @@ test('resume: missing, armed, completed and exhausted goals submit default/custo
     assert.deepEqual(sent, { id: sent.id, role: 'user', content: [{ type: 'text', text: message ?? '继续' }],
       source: { kind: 'user' } });
     assert.deepEqual(f.resumes, []);
+    assert.deepEqual(f.wakes, []);
   });
 });
 
@@ -131,12 +211,14 @@ test('resume: missing, running and non-interrupted sessions skip without sending
   f.add('new-complete', [start(), interrupted(), start(), end(), { type: 'message', data: {} }]);
   f.add('open', [start(), interrupted(), start()]);
   f.add('empty', []);
+  for (const agent of f.agents.values()) agent.inbox.hasPending = true;
   const result = await f.run({ sessions: ['missing', 'running', 'complete', 'new-complete', 'open', 'empty'] });
   assert.deepEqual(result.sessions, [row('missing', 'not_found'), row('running', 'running'),
     ...['complete', 'new-complete', 'open', 'empty'].map(id => row(id, 'not_interrupted'))]);
   assert.equal(f.calls.some(([kind, id]) => kind === 'read' && ['missing', 'running'].includes(id)), false);
   assert.deepEqual(f.messages, []);
   assert.deepEqual(f.resumes, []);
+  assert.deepEqual(f.wakes, []);
 });
 
 test('resume: cold loader closes an interrupted turn before history is queried', async (t) => {
@@ -322,6 +404,27 @@ function watchFixture(t, f, failure = false) {
   return { watcher, check, notify: (...args) => notify(...args),
     dispose: () => f.cleanups.splice(0).forEach(cleanup => cleanup()) };
 }
+
+test('resume watcher: another gate rejection with pending input does not retry the wake', async (t) => {
+  const f = fixture(t), agent = f.add('A', [start(), blocked()]);
+  agent.inbox.hasPending = true;
+  const wake = agent.wakeDriver;
+  agent.wakeDriver = function () {
+    wake.call(this);
+    f.events.get('A').push(start(), blocked());
+    this.status = 'idle';
+  };
+  f.write({ sessions: ['A'] });
+  const w = watchFixture(t, f);
+  await w.check();
+  assert.deepEqual(f.saved().sessions, [row('A', 'pending_inbox_woken', 'inbox')]);
+  await w.notify('change', 'resume-result.json');
+  await w.notify('rename', null);
+  await w.check();
+  assert.deepEqual(f.wakes, ['A']);
+  assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.resumes, []);
+});
 
 test('resume watcher: startup checks once and filename/null notifications process requests serially', async (t) => {
   const f = fixture(t);

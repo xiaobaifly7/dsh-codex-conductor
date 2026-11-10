@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.74` 让续接请求可以唤醒最后一轮被门禁阻止、且 inbox 仍有待处理输入的空闲会话，由宿主领取原有输入，不新增用户消息或重发推进提示。
+
 `0.9.73` 明确续接参数：新任务省略 `resume`；原任务补答阻塞问题时用 `codex_continue(job_id)`；手动续接只填写工具真实返回的 Codex `thread_id`，不要生成编号或混用 DSH 会话号、任务编号。
 
 `0.9.72` 将尚未生成的报告作为正常等待状态返回，报告随任务结束后的自动刷新打开，自检优先检查已结束任务并记录运行中报告尚未生成，`codex_output` 提示等完成通知后再读。
@@ -84,9 +86,9 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 {"sessions":["session-example"],"message":"继续"}
 ```
 
-`message` 可省略，默认“继续”，最多 2000 个 Unicode 字符。`sessions` 最多 20 项，ID 仅接受 `[A-Za-z0-9_-]{1,100}`，重复 ID 只处理一次。插件加载、热重载和目录文件通知时检查请求；没有请求文件就不会续接。请求先原子改名认领，再逐个处理：不存在、正在运行或最后一个回合不是 `interrupted` 的会话跳过；其余优先恢复可恢复的目标，否则提交用户消息。未在窗口打开的会话也可加载后续接。
+`message` 可省略，默认“继续”，最多 2000 个 Unicode 字符。`sessions` 最多 20 项，ID 仅接受 `[A-Za-z0-9_-]{1,100}`，重复 ID 只处理一次。插件加载、热重载和目录文件通知时检查请求；没有请求文件就不会续接。请求先原子改名认领，再逐个处理：不存在、正在运行或最后一个回合不是 `interrupted` / `blocked` 的会话跳过；其余优先恢复可恢复的目标。没有可恢复目标时，`interrupted` 沿用提交用户消息的方式；`blocked` 仅在 inbox 有待处理输入时调用宿主现有的 `wakeDriver()` 唤醒，不新增消息、不重发被拒的推进提示，也不自行改写 inbox；没有待处理输入仍以 `not_interrupted` 跳过。宿主缺少 agent、inbox 查询或唤醒接口时记录错误并继续处理其他会话。未在窗口打开的会话也可加载后续接。
 
-同目录的 `resume-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、整批状态 `processed` / `rejected`，以及 `sessions` 数组中的 `sessionId`、`status`（`resumed` / `skipped`）、`reason`、`method`（`goal` / `message` / `null`）；出错时另有 `error`。输入不合法时整批拒绝，不提交任何消息。目录监听不可用时会记警告，仍在加载时检查。结果只保留最近一批；提交下一批前先核对本批时间并读取结果。已认领的请求不在重启后自动重放，避免重复提交。
+同目录的 `resume-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、整批状态 `processed` / `rejected`，以及 `sessions` 数组中的 `sessionId`、`status`（`resumed` / `skipped`）、`reason`、`method`（`goal` / `message` / `inbox` / `null`）；出错时另有 `error`。`pending_inbox_woken` 表示“已请求会话处理还在排队的输入”，只表示唤醒已发起；若门禁再次拒绝，不自动重试，也不补回宿主已领取的输入。输入不合法时整批拒绝，不提交任何消息。目录监听不可用时会记警告，仍在加载时检查。结果只保留最近一批；提交下一批前先核对本批时间并读取结果。已认领的请求不在重启后自动重放，避免重复提交。
 
 ## 功能
 
@@ -378,6 +380,8 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`0.9.74` lets resume requests wake idle sessions whose last turn was blocked and whose inbox still has pending input. The host claims the existing input without adding a user message or resending a rejected advancement prompt.
+
 `0.9.73` clarifies continuation IDs: omit `resume` for new tasks, use `codex_continue(job_id)` for blocker answers on existing jobs, and only pass a Codex `thread_id` actually returned by a tool when resuming manually. Do not invent IDs or substitute Harness session IDs or job IDs.
 
 `0.9.72` treats reports awaiting generation as a normal pending state, opens them on the next automatic refresh after task completion, prefers finished tasks in panel self-tests while recording pending reports, and tells `codex_output` readers to wait for the completion notification.
@@ -472,9 +476,9 @@ Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.j
 {"sessions":["session-example"],"message":"Continue"}
 ```
 
-`message` is optional, defaults to `继续`, and accepts at most 2000 Unicode characters. Supply at most 20 session IDs matching `[A-Za-z0-9_-]{1,100}`; duplicate IDs are handled once. The plugin checks on load, hot reload and directory notifications. Without a request file, nothing resumes. It atomically claims the file before processing: missing sessions, running sessions, and sessions whose last turn did not end as `interrupted` are skipped. Eligible sessions resume a resumable goal first, otherwise receive the user message. Sessions do not need to be open in a window.
+`message` is optional, defaults to `继续`, and accepts at most 2000 Unicode characters. Supply at most 20 session IDs matching `[A-Za-z0-9_-]{1,100}`; duplicate IDs are handled once. The plugin checks on load, hot reload and directory notifications. Without a request file, nothing resumes. It atomically claims the file before processing: missing sessions, running sessions, and sessions whose last turn did not end as `interrupted` or `blocked` are skipped. Eligible sessions resume a resumable goal first. Otherwise, `interrupted` retains the user-message path; `blocked` calls the host's existing `wakeDriver()` only when the inbox has pending input, without adding messages, resending rejected advancement prompts, or editing the inbox. An empty inbox still skips with `not_interrupted`. Missing agents, inbox queries or wake methods record an error without stopping the batch. Sessions do not need to be open in a window.
 
-`resume-result.json` contains claim time `requestedAt`, completion time `completedAt`, batch `status` (`processed` / `rejected`), and a `sessions` array with `sessionId`, `status` (`resumed` / `skipped`), `reason`, and `method` (`goal` / `message` / `null`); failures also include `error`. Invalid input rejects the whole batch without submitting messages. If directory watching is unavailable, a warning is logged and the load-time check remains. Only the latest result is retained; check its timestamp and read it before submitting another batch. Claimed requests are not replayed after a restart, preventing duplicate submissions.
+`resume-result.json` contains claim time `requestedAt`, completion time `completedAt`, batch `status` (`processed` / `rejected`), and a `sessions` array with `sessionId`, `status` (`resumed` / `skipped`), `reason`, and `method` (`goal` / `message` / `inbox` / `null`); failures also include `error`. `pending_inbox_woken` means a wake was requested to process queued input; it does not guarantee admission. Another gate rejection triggers no automatic retry or restoration of input already claimed by the host. Invalid input rejects the whole batch without submitting messages. If directory watching is unavailable, a warning is logged and the load-time check remains. Only the latest result is retained; check its timestamp and read it before submitting another batch. Claimed requests are not replayed after a restart, preventing duplicate submissions.
 
 ### Gemini tutorial and documentation writing (off by default)
 
