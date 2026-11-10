@@ -1404,7 +1404,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
       await ensureOwnJob(args.job_id, exec, 'codex_output');
-      return conductor.output(args.job_id, args, exec?.signal);
+      const value = await conductor.output(args.job_id, args, exec?.signal);
+      return value.error_kind === 'artifact_pending' || (value.status === 'pending' && !value.error_kind && !value.error)
+        ? { ...value, note: '任务还在运行，报告尚未生成；等完成通知后再读' }
+        : value;
     },
   });
 

@@ -3255,7 +3255,9 @@ test('history filters preserve session links and output reads are bounded, repea
   const first = await h.tools.codex_output.execute(request, exec);
   const second = await h.tools.codex_output.execute(request, exec);
   assert.deepEqual(first, second);
+  assert.deepEqual(first, page);
   const rendered = h.tools.codex_output.output.render(request, first)[0].text;
+  assert.deepEqual(JSON.parse(rendered), page);
   assert.ok(Buffer.byteLength(rendered, 'utf8') < 65536);
   assert.deepEqual(h.calls.slice(1), Array(2).fill(['output', 'J', '--artifact', 'report', '--offset', '0', '--limit', '8000']));
   await assert.rejects(h.tools.codex_output.execute({ job_id: '../J' }, exec), /job_id/);
@@ -3263,6 +3265,44 @@ test('history filters preserve session links and output reads are bounded, repea
   await assert.rejects(h.tools.codex_jobs.execute({ status: 'accepted' }, exec), /status/);
   await assert.rejects(h.tools.codex_jobs.execute({ offset: -1 }, exec), /offset/);
   assert.equal(h.calls.some((a) => a[0] === 'cancel'), false);
+});
+
+test('codex_output explains pending artifacts in execute and rendered output without changing runner fields', async () => {
+  const note = '任务还在运行，报告尚未生成；等完成通知后再读';
+  for (const status of [
+    { status: 'pending', error_kind: 'artifact_pending', retryable: true },
+    { status: 'pending' },
+    { status: 'pending', error_kind: null, error: '' },
+  ]) {
+    const pending = { job_id: 'J', artifact: 'report', execution_status: 'running', ...status };
+    const h = harness({ config: { outputResult: pending } });
+    const tool = h.tools.codex_output;
+    const request = { job_id: 'J' };
+    const value = await tool.execute(request, {});
+    assert.deepEqual(value, { ...pending, note });
+    assert.deepEqual(await tool.execute(request, {}), value);
+    const rendered = tool.output.render(request, value)[0].text;
+    assert.ok(rendered.includes(note));
+    assert.deepEqual(JSON.parse(rendered), { ...pending, note });
+    assert.equal(pending.note, undefined);
+  }
+});
+
+test('codex_output keeps actual read failures instead of describing them as pending reports', async () => {
+  for (const failure of [
+    { status: 'failed', error_kind: 'artifact_read_failed', error: 'permission denied', retryable: true },
+    { status: 'pending', error_kind: 'artifact_read_failed', error: 'permission denied' },
+    { status: 'pending', error: 'runner output unavailable' },
+    { status: 'failed', error_kind: 'bridge_error', error: 'query failed', retryable: true },
+  ]) {
+    const original = { job_id: 'J', artifact: 'report', execution_status: 'running', ...failure };
+    const h = harness({ config: { outputResult: original } });
+    const value = await h.tools.codex_output.execute({ job_id: 'J' }, {});
+    assert.deepEqual(value, original);
+    const rendered = h.tools.codex_output.output.render({}, value)[0].text;
+    assert.deepEqual(JSON.parse(rendered), original);
+    assert.equal(rendered.includes('报告尚未生成'), false);
+  }
 });
 
 test('session journal links recover old jobs after the native task table has been cleared', async () => {
