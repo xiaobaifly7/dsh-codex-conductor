@@ -298,7 +298,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
              "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
              "file_changes": []}
-    start = time.time()
+    start = time.monotonic()
     proc = reader = writer = None
     startup = acquire_file_lock(run_dir / "process.lock", blocking=True)
     try:
@@ -343,12 +343,12 @@ def run_attempt(args, prompt, run_dir, thread_id):
             reader.start()
             writer = threading.Thread(target=send_prompt, daemon=True)
             writer.start()
-            last_event = time.time()
+            last_event = time.monotonic()
             reconnecting_since = None
             completed_at = None
             stdout_done = False
             while True:
-                now = time.time()
+                now = time.monotonic()
                 if stdin_errors:
                     state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
                     kill_tree(proc.pid)
@@ -393,16 +393,16 @@ def run_attempt(args, prompt, run_dir, thread_id):
                 item = ev.get("item") or {}
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
                 if kind == "error":
-                    reconnecting_since = reconnecting_since or time.time()
+                    reconnecting_since = reconnecting_since or time.monotonic()
                 else:
                     reconnecting_since = None
-                    last_event = time.time()
+                    last_event = time.monotonic()
                 if kind == "thread.started":
                     state["thread_id"] = ev.get("thread_id") or state["thread_id"]
                 elif kind == "turn.completed":
                     state["completed"] = True
                     state["usage"] = ev.get("usage")
-                    completed_at = time.time()
+                    completed_at = time.monotonic()
                 elif kind == "turn.failed":
                     state["failed"] = True
                     state["error"] = (ev.get("error") or {}).get("message") or json.dumps(ev, ensure_ascii=False)
@@ -479,7 +479,7 @@ TOO_BIG_TTL = 7 * 86400
 def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
     None when the walk exceeds the budget."""
-    deadline = time.time() + budget
+    deadline = time.monotonic() + budget
     files = {}
 
     def add(path):
@@ -494,20 +494,20 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
             raise error
 
     for top in scope or [root]:
-        if time.time() > deadline:
+        if time.monotonic() > deadline:
             return None
         if not os.path.isdir(top):
             add(top)  # a scoped file, or one that does not exist yet
             continue
         for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
-            if time.time() > deadline:
+            if time.monotonic() > deadline:
                 return None
             dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
             for name in filenames:
-                if time.time() > deadline:
+                if time.monotonic() > deadline:
                     return None
                 add(os.path.join(dirpath, name))
-    return files if time.time() <= deadline else None
+    return files if time.monotonic() <= deadline else None
 
 
 def too_big_trees():
@@ -1528,10 +1528,10 @@ def main():
         return
 
     if args.command == "status":
-        deadline = time.time() + args.wait
+        deadline = time.monotonic() + args.wait
         while True:
             current = job_status(args.job_id)
-            if current["status"] != "running" or time.time() >= deadline:
+            if current["status"] != "running" or time.monotonic() >= deadline:
                 emit(current)
                 return
             time.sleep(1)
