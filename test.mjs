@@ -3137,10 +3137,10 @@ test('settings warns and defaults each invalid entry without losing valid config
 });
 
 test('optional timeout and retry settings validate numbers and pass only configured runner flags', async () => {
-  const keys = { timeoutSeconds: '--timeout', idleTimeoutSeconds: '--idle-timeout', retries: '--retries' };
-  for (const config of [{}, { timeoutSeconds: null, idleTimeoutSeconds: undefined, retries: null },
-    { timeoutSeconds: '', idleTimeoutSeconds: '', retries: '' },
-    { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0 }]) {
+  const keys = { timeoutSeconds: '--timeout', idleTimeoutSeconds: '--idle-timeout', retries: '--retries', lockTimeoutSeconds: '--lock-timeout' };
+  for (const config of [{}, { timeoutSeconds: null, idleTimeoutSeconds: undefined, retries: null, lockTimeoutSeconds: null },
+    { timeoutSeconds: '', idleTimeoutSeconds: '', retries: '', lockTimeoutSeconds: '' },
+    { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0, lockTimeoutSeconds: 30.5 }]) {
     const h = harness({ config });
     await h.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
     const argv = h.calls[0];
@@ -3166,6 +3166,12 @@ test('optional timeout and retry settings validate numbers and pass only configu
       assert.ok(argv.includes('retained'));
     }
   }
+});
+
+test('lock timeouts direct the planner to inspect current writers before waiting or cancelling', () => {
+  const next = nextStep({ job_id: 'J', cwd: '/work', status: 'failed', error_kind: 'lock_timeout', retryable: true });
+  assert.match(next, /写锁.*超时[\s\S]*codex_jobs[\s\S]*同目录[\s\S]*等待.*取消/);
+  assert.doesNotMatch(next, /稍后用同样的参数再派一次/);
 });
 
 

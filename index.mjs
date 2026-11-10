@@ -52,6 +52,7 @@ const DEFAULTS = {
   timeoutSeconds: null,
   idleTimeoutSeconds: null,
   retries: null,
+  lockTimeoutSeconds: null,
   workspaces: [],
   denyTools: [],
   allowCommands: [],
@@ -233,7 +234,8 @@ export function createConductor(cfg, run = runRunner) {
     if (effort) argv.push('--effort', effort);
     if (cfg.model) argv.push('--model', cfg.model);
     if (cfg.serviceTier) argv.push('--service-tier', cfg.serviceTier);
-    for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries']]) {
+    for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries'],
+      ['lockTimeoutSeconds', '--lock-timeout']]) {
       if (cfg[key] != null) argv.push(flag, String(cfg[key]));
     }
     // host_access 不管 write 都在沙箱外运行，write=false 的只读只靠提示约束
@@ -481,6 +483,9 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
     if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
+    if (value.error_kind === 'lock_timeout') {
+      return '等待写锁超时，尚未启动 Codex。先用 codex_jobs 查询同目录正在运行的任务，再决定等待还是用 codex_cancel 取消持锁任务；不要直接重派。';
+    }
     if (value.error_kind === 'reconnect_timeout' || value.error_kind === 'router_down') {
       const attempts = value.attempts ?? value.attempt;
       const cause = value.error_kind === 'reconnect_timeout' ? 'Codex 重连超时' : 'Codex 本地路由不可达';
@@ -646,7 +651,7 @@ export function taskCwd(args, session, workspaces) {
 function settings(config, logger) {
   config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
     const value = config[key];
-    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries'].includes(key);
+    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds'].includes(key);
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))

@@ -657,6 +657,8 @@ def execute(args, prompt, run_dir):
                 if args.sandbox == "workspace-write":
                     roots += [os.path.join(args.cwd, local_path(p)) for p in getattr(args, "writable_roots", None) or []]
                 roots = {write_lock_key(p): p for p in roots}
+                lock_timeout = getattr(args, "lock_timeout", None)
+                deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
                 while True:
                     for key in sorted(roots):
@@ -672,6 +674,10 @@ def execute(args, prompt, run_dir):
                     if not waiting:
                         runner_event(run_dir, 0, "lock_wait")
                         waiting = True
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return {**base, "status": "failed", "error_kind": "lock_timeout",
+                                "error": "Timed out waiting for directory write locks; Codex was not started.",
+                                "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
                     # shortcut: waiters are not FIFO; add ordered admission if task ordering is required.
                     time.sleep(0.25)
             except OSError as error:
@@ -745,6 +751,13 @@ def execute(args, prompt, run_dir):
             lock.close()
 
 
+def positive_float(value):
+    number = float(value)
+    if not 0 < number < float("inf"):
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return number
+
+
 def add_task_arguments(p):
     p.add_argument("--context-json", action="store_true", help="Read a prompt/context JSON envelope from stdin")
     p.add_argument("--cwd", required=True)
@@ -763,6 +776,7 @@ def add_task_arguments(p):
                    help="Regex for cwd-relative paths other processes write; such changes are left out; repeatable")
     p.add_argument("--use-user-config", action="store_true", help="Inherit ~/.codex/config.toml, MCP servers and hooks")
     p.add_argument("--timeout", type=float, default=3600)
+    p.add_argument("--lock-timeout", type=positive_float, help="Maximum seconds waiting for write locks; omitted waits indefinitely")
     # The Windows sandbox setup alone was silent for about 60s, so keep this well above that.
     p.add_argument("--idle-timeout", type=float, default=600)
     p.add_argument("--reconnect-timeout", type=float, default=180)

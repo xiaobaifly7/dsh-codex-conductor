@@ -686,6 +686,59 @@ class RunnerTests(unittest.TestCase):
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
 
+    def test_lock_timeout_fails_queued_writer_without_touching_owner(self):
+        jobs = []
+        try:
+            first = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="one")
+            jobs.append(first["job_id"])
+            self.wait_for(lambda: (self.state / "ready-0").exists())
+            second = self.invoke("--sandbox", "danger-full-access", "--lock-timeout", "0.3", command="start", prompt="two")
+            jobs.append(second["job_id"])
+            self.assertEqual(second["status"], "running")
+            result = self.control("status", second["job_id"], "--wait", "10")
+            self.assertEqual((result.get("status"), result.get("error_kind"), result.get("attempts")), ("failed", "lock_timeout", 0), result)
+            self.assertTrue(result["retryable"])
+            self.assertEqual(result["phase"], "lock_wait")
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual(self.control("status", first["job_id"])["status"], "running")
+            (self.state / "release-0").touch()
+            self.assertEqual(self.control("status", first["job_id"], "--wait", "10")["status"], "completed")
+        finally:
+            for job_id in reversed(jobs):
+                self.control("cancel", job_id)
+
+    def test_lock_timeout_uses_monotonic_time_without_snapshot_or_codex(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "workspace-write", "--lock-timeout", "1"])
+        elapsed = [0]
+        def advance(delay):
+            elapsed[0] += delay
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                codex_runner.acquire_write_lock(str(self.cwd)), \
+                mock.patch.object(codex_runner, "time", wraps=time) as clock, \
+                mock.patch.object(codex_runner, "snapshot_before") as snapshot, \
+                mock.patch.object(codex_runner, "router_reachable") as router, \
+                mock.patch.object(codex_runner, "run_attempt") as attempt:
+            clock.monotonic.side_effect = lambda: elapsed[0]
+            clock.time.side_effect = lambda: 1_700_000_000 - elapsed[0] * 1_000_000
+            clock.sleep.side_effect = advance
+            result = codex_runner.execute(args, "do it", Path(self.tmp.name) / "run")
+            self.assertEqual(result["error_kind"], "lock_timeout")
+            self.assertEqual(elapsed[0], 1)
+            self.assertIsNone(codex_runner.acquire_write_lock(str(self.cwd)))
+            snapshot.assert_not_called()
+            router.assert_not_called()
+            attempt.assert_not_called()
+
+    def test_lock_timeout_rejects_nonpositive_or_nonfinite_values(self):
+        for value in ("0", "-1", "nan", "inf", "-inf"):
+            self.assertEqual(self.control("run", "--cwd", str(self.cwd), "--lock-timeout=" + value)["error_kind"], "bad_arguments")
+        self.assertEqual(self.calls(), [])
+
     def test_cancel_waiting_writer_does_not_cancel_owner_or_start_a_model(self):
         jobs = []
         try:
