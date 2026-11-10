@@ -282,6 +282,8 @@ window.__ModuleLoader__.load({
       const [edits, setEdits] = useState({});
       const [jobs, setJobs] = useState(null);
       const [filter, setFilter] = useState('all');
+      const [jobOffsets, setJobOffsets] = useState([0]);
+      const jobOffset = jobOffsets[jobOffsets.length - 1];
       const [prompt, setPrompt] = useState(null);
       const [promptDraft, setPromptDraft] = useState(null);
       const [errors, setErrors] = useState({});
@@ -322,7 +324,7 @@ window.__ModuleLoader__.load({
             const reads = [
               read('status', '/status', setStatus),
               read('settings', '/settings', setSettings),
-              read('jobs', `/jobs?filter=${filter}`, setJobs),
+              read('jobs', `/jobs?filter=${filter}&offset=${jobOffset}`, setJobs),
               read('prompt', '/prompt', (value) => setPrompt(value.text)),
               read('attention', '/attention', (value) => setAttention(value.total)),
             ];
@@ -332,7 +334,15 @@ window.__ModuleLoader__.load({
         }
         refresh();
         return () => { controller.abort(); clearTimeout(timer); };
-      }, [filter, revision]);
+      }, [filter, revision, jobOffset]);
+
+      function selectJobPage(offsets) {
+        generation.current += 1;
+        setJobOffsets(offsets);
+        setJobs(null);
+        setConfirmJob(null);
+        setErrors((old) => ({ ...old, jobs: '' }));
+      }
 
       async function mutate(key, path, body, success) {
         if (mutation.current || !life.current) return;
@@ -418,7 +428,7 @@ window.__ModuleLoader__.load({
         return h('label', { className: 'dcc-field', key }, h('span', null, label), control, h('small', null, hint));
       }
       const executionText = { running: '运行中', completed: '已结束', failed: '执行失败', cancelled: '已取消', unknown: '状态待确认' };
-      const recent = [...(jobs?.jobs || [])].sort((a, b) => b.started_at - a.started_at).slice(0, 20);
+      const pageJobs = jobs?.jobs ?? [];
       const promptValue = promptDraft === null ? prompt ?? '' : promptDraft;
       const promptDirty = prompt !== null && promptValue !== prompt;
 
@@ -467,16 +477,16 @@ window.__ModuleLoader__.load({
             h(Message, { text: messages.settingsSave }), h(Message, { text: errors.settingsSave, error: true }))
             : h('p', null, errors.settings ? '设置暂时无法读取，请刷新后重试。' : '正在读取设置…')),
 
-        h('section', { 'aria-label': '最近任务' }, h('h3', null, '最近任务'),
+        h('section', { 'aria-label': '任务记录' }, h('h3', null, '任务记录'),
           h('div', { className: 'dcc-row', role: 'group', 'aria-label': '筛选任务' },
             ...[['running', '正在跑'], ['attention', '待关注'], ['all', '全部']].map(([value, label]) =>
               h(Button, { key: value, size: 'sm', variant: filter === value ? 'primary' : 'ghost', 'aria-pressed': filter === value,
-                onClick: () => { if (value !== filter) { setFilter(value); setJobs(null); setConfirmJob(null); } } }, label)),
+                onClick: () => { if (value !== filter) { setFilter(value); selectJobPage([0]); } } }, label)),
             h('small', null, '“待关注”包含历史任务')),
-          h('small', null, jobs ? `当前筛选共 ${jobs.total} 项，显示最近 ${recent.length} 项，最多 20 项。` : '正在读取任务…'),
+          h('small', null, jobs ? `第 ${jobOffsets.length} 页，共 ${jobs.total} 项，本页 ${pageJobs.length} 项。` : errors.jobs ? '暂时读不到任务。' : '正在读取任务…'),
           h(Message, { text: errors.jobs, error: true }),
-          jobs && !recent.length ? h('p', null, '当前筛选下没有任务。') : null,
-          h('ul', { className: 'dcc-jobs' }, ...recent.map((job) => {
+          jobs && !pageJobs.length ? h('p', null, '本页没有任务。') : null,
+          h('ul', { className: 'dcc-jobs' }, ...pageJobs.map((job) => {
             const running = (job.execution_status || job.status) === 'running';
             return h('li', { key: job.job_id, className: 'dcc-job' },
               h('strong', null, job.title || '未填写任务标题'),
@@ -498,6 +508,11 @@ window.__ModuleLoader__.load({
                     }) }, busy === 'cancel' ? '正在取消…' : '确认停止这个任务'),
                   h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmJob(null) }, '继续执行'))) : null);
           })),
+          h('div', { className: 'dcc-row', role: 'group', 'aria-label': '任务分页' },
+            h(Button, { size: 'sm', disabled: !!busy || jobOffsets.length === 1,
+              onClick: () => selectJobPage(jobOffsets.slice(0, -1)) }, '上一页'),
+            h(Button, { size: 'sm', disabled: !!busy || !(jobs?.next_offset > jobOffset),
+              onClick: () => selectJobPage([...jobOffsets, jobs.next_offset]) }, '下一页')),
           h(Message, { text: messages.cancel }), h(Message, { text: errors.cancel, error: true }),
           reportJob ? h(Report, { key: reportJob, jobId: reportJob, onClose: () => setReportJob(null) }) : null),
 

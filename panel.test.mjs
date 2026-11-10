@@ -60,7 +60,7 @@ function fixture(t, options = {}) {
   const runtime = { execute: t.mock.fn(async (args) => args.action === 'status' ? state : { status: 'reloaded', saved: true }),
     cancelPending: t.mock.fn(() => ({ cancelled: true })) };
   const conductor = {
-    list: t.mock.fn(async () => ({ total: jobs.length, jobs })),
+    list: t.mock.fn(async () => ({ total: jobs.length, jobs, next_offset: null })),
     output: t.mock.fn(async () => ({ text: '报告🙂', next_offset: 4, eof: true })),
     cancel: t.mock.fn(async (job_id) => ({ job_id, status: 'cancelled' })),
   };
@@ -204,9 +204,9 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   for (const [query, expected] of [['', {}], ['?filter=all', {}], ['?filter=running', { status: 'running' }],
     ['?filter=attention', { needs_attention: true }]]) {
     const response = await f.request('GET', '/jobs' + query);
-    assert.deepEqual(response, { status: 200, body: { total: 1, jobs: [{ job_id: 'job-1', started_at: 123,
+    assert.deepEqual(response, { status: 200, body: { total: 1, next_offset: null, jobs: [{ job_id: 'job-1', started_at: 123,
       status: 'running', execution_status: 'running', title: '🙂'.repeat(60), needs_attention: true }] } });
-    assert.deepEqual(f.conductor.list.mock.calls.at(-1).arguments, [{ limit: 20, ...expected }]);
+    assert.deepEqual(f.conductor.list.mock.calls.at(-1).arguments, [{ limit: 20, offset: 0, ...expected }]);
   }
   assert.deepEqual(await f.request('GET', '/output?job_id=job-1'),
     { status: 200, body: { text: '报告🙂', next_offset: 4, eof: true } });
@@ -268,6 +268,18 @@ test('panel settings immediately apply only with literal confirmation and cancel
   finish({ status: 'waiting_for_idle', saved: true, active_tasks: 1, pending_settings: { changes: { effort: 'max' } } });
   assert.equal((await save).body.runtime.pending_settings.changes.effort, 'max');
   assert.deepEqual(await f.request('POST', '/settings/cancel', {}), { status: 200, body: { cancelled: true } });
+});
+
+test('panel jobs pages preserve the filter and runner next offset', async (t) => {
+  const f = fixture(t);
+  f.conductor.list.mock.mockImplementation(async () => ({ total: 61, next_offset: 40, jobs: f.jobs }));
+  const response = await f.request('GET', '/jobs?filter=attention&offset=20');
+  assert.equal(response.status, 200);
+  assert.equal(response.body.total, 61);
+  assert.equal(response.body.next_offset, 40);
+  assert.deepEqual(f.conductor.list.mock.calls[0].arguments, [{ limit: 20, offset: 20, needs_attention: true }]);
+  rejected(await f.request('GET', '/jobs?offset=-1'), 400, /页码/);
+  assert.equal(f.conductor.list.mock.callCount(), 1);
 });
 
 test('panel HTTP rejects unauthenticated requests and absent authentication on every route before side effects', async (t) => {
@@ -544,6 +556,7 @@ test('panel client applies fast status before history and always reads the separ
     try {
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(applied.includes(state), 'running status should render while history is pending');
+      assert.ok(routes.includes(`/jobs?filter=${filter}&offset=0`));
       assert.ok(!applied.includes(history));
       assert.equal(routes.includes('/attention'), true);
       finish(history);

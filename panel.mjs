@@ -58,7 +58,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
       '/cancel': ['POST'], '/prompt': ['GET', 'POST'], '/reload': ['POST'] };
     if (!pathname.startsWith(PANEL_PATH + '/') || !known[route]) throw bad('找不到这个功能，请刷新面板后重试。', 404);
     if (!known[route].includes(method)) throw bad('打开方式不正确，请使用面板上的按钮重试。', 405);
-    const allowedQuery = route === '/jobs' ? ['filter'] : route === '/output' ? ['job_id', 'offset', 'limit'] : [];
+    const allowedQuery = route === '/jobs' ? ['filter', 'offset'] : route === '/output' ? ['job_id', 'offset', 'limit'] : [];
     object(query, allowedQuery);
     if (method === 'POST' && route !== '/settings') object(body, route === '/prompt' ? ['text'] : route === '/cancel' ? ['job_id', 'confirm'] :
       route === '/settings/apply' ? ['changes', 'confirm'] : []);
@@ -108,9 +108,9 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
     if (route === '/jobs') {
       const filter = query.filter ?? 'all';
       if (!['all', 'running', 'attention'].includes(filter)) throw bad('任务筛选不正确，请重新选择要查看的任务。');
-      const page = runnerResult(await conductor.list({ limit: 20, ...(filter === 'running' ? { status: 'running' } : {}),
+      const page = runnerResult(await conductor.list({ limit: 20, offset: offset(query.offset, 0), ...(filter === 'running' ? { status: 'running' } : {}),
         ...(filter === 'attention' ? { needs_attention: true } : {}) }));
-      return { total: page.total, jobs: page.jobs.map((job) => ({ job_id: job.job_id, started_at: job.started_at,
+      return { total: page.total, next_offset: page.next_offset, jobs: page.jobs.map((job) => ({ job_id: job.job_id, started_at: job.started_at,
         status: job.status, execution_status: job.execution_status,
         title: Array.from(job.context?.task ?? '').slice(0, 60).join(''),
         needs_attention: ['needs_changes', 'invalid'].includes(job.verification_status) ||
