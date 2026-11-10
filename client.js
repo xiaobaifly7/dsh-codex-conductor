@@ -120,6 +120,7 @@ window.__ModuleLoader__.load({
 
     function Panel() {
       const [status, setStatus] = useState(null);
+      const [attention, setAttention] = useState(null);
       const [settings, setSettings] = useState(null);
       const [edits, setEdits] = useState({});
       const [jobs, setJobs] = useState(null);
@@ -148,26 +149,29 @@ window.__ModuleLoader__.load({
         async function refresh() {
           if (!mutation.current) {
             const version = generation.current;
-            const results = await Promise.allSettled([
-              api('/status', controller.signal),
-              api('/settings', controller.signal),
-              api(`/jobs?filter=${filter}`, controller.signal),
-              api('/prompt', controller.signal),
-            ]);
-            if (controller.signal.aborted) return;
             // A poll started before a save must not replace the newly saved values.
-            if (version === generation.current && !mutation.current) {
-              results.forEach((result, i) => {
-                const key = ['status', 'settings', 'jobs', 'prompt'][i];
-                setErrors((old) => ({ ...old, [key]: result.status === 'rejected'
-                  ? (key === 'status' && result.reason.status === 502 ? `任务状态读取失败，请稍后刷新。${result.reason.message}` : result.reason.message) : '' }));
-                if (result.status !== 'fulfilled') return;
-                if (i === 0) setStatus(result.value);
-                if (i === 1) setSettings(result.value);
-                if (i === 2) setJobs(result.value);
-                if (i === 3) setPrompt(result.value.text);
-              });
+            const fresh = () => !controller.signal.aborted && version === generation.current && !mutation.current;
+            async function read(key, route, update) {
+              try {
+                const value = await api(route, controller.signal);
+                if (!fresh()) return;
+                update(value);
+                setErrors((old) => ({ ...old, [key]: '' }));
+              } catch (error) {
+                if (fresh()) setErrors((old) => ({ ...old, [key]: error.message }));
+              }
             }
+            const reads = [
+              read('status', '/status', setStatus),
+              read('settings', '/settings', setSettings),
+              read('jobs', `/jobs?filter=${filter}`, (page) => {
+                setJobs(page);
+                if (filter === 'attention') setAttention(page.total);
+              }),
+              read('prompt', '/prompt', (value) => setPrompt(value.text)),
+            ];
+            if (filter !== 'attention') reads.push(read('attention', '/attention', (value) => setAttention(value.total)));
+            await Promise.all(reads);
           }
           if (!controller.signal.aborted) timer = setTimeout(refresh, 7000);
         }
@@ -267,7 +271,8 @@ window.__ModuleLoader__.load({
             statusRow('自动回答 Codex 的问题', activeSettings ? activeSettings.plannerAnswers ? '已开启' : '已关闭' : '未读到', '打开后 DeepSeek 会替你回答 Codex 的问题并继续干活，不再等你'),
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
             statusRow('正在执行的任务', runtime?.active_tasks ?? '未读到', '任务执行期间不应强行重新加载。'),
-            statusRow('需要关注的任务', status.attention_tasks ?? '未读到', '这些任务有问题或结果需要你查看。'),
+            statusRow('需要关注的任务', attention ?? ((filter === 'attention' ? errors.jobs : errors.attention) ? '未读到' : '正在读取…'), '这些任务有问题或结果需要你查看。'),
+            filter !== 'attention' ? h(Message, { text: errors.attention, error: true }) : null,
             statusRow('重新加载', runtime?.can_reload ? '现在可以操作' : '暂时不能操作', '只有服务确认可以加载时，下面的按钮才可用。'),
             statusRow('配置读取', runtime?.profile_error || '未发现错误', '读取已保存配置遇到的问题会显示在这里。'),
             statusRow('运行版本读取', runtime?.loaded_error || '未发现错误', '读取当前运行版本遇到的问题会显示在这里。')) : null,

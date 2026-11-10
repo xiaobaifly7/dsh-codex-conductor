@@ -7,7 +7,7 @@ import vm from 'node:vm';
 import { createPanelApi, panelSettings, registerPanel, PANEL_PATH } from './panel.mjs';
 
 const routes = [
-  ['GET', '/status'], ['GET', '/settings'], ['POST', '/settings', { model: 'new-model' }],
+  ['GET', '/status'], ['GET', '/attention'], ['GET', '/settings'], ['POST', '/settings', { model: 'new-model' }],
   ['GET', '/jobs'], ['GET', '/output?job_id=job-1'],
   ['POST', '/cancel', { job_id: 'job-1', confirm: true }],
   ['GET', '/prompt'], ['POST', '/prompt', { text: 'updated' }], ['POST', '/reload', {}],
@@ -185,8 +185,10 @@ test('panel reads the current connection on every request as authentication appe
 test('panel HTTP implements every valid route using only stub runtime/conductor', async (t) => {
   const f = fixture(t);
   const status = await f.request('GET', '/status');
-  assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg), attention_tasks: 1 } });
+  assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments, [{ action: 'status' }]);
+  assert.equal(f.conductor.list.mock.callCount(), 0);
+  assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 1 } });
   assert.deepEqual(f.conductor.list.mock.calls[0].arguments, [{ needs_attention: true, limit: 1 }]);
   assert.deepEqual(await f.request('GET', '/settings'), { status: 200, body: panelSettings(f.cfg) });
   const settings = { model: 'codex/gpt-6:latest', plannerAnswers: true, gemini: { effort: 'high' } };
@@ -376,7 +378,8 @@ test('panel HTTP reports runner failures, unconfirmed cancellation and unavailab
   for (const failure of [{ error: 'runner unavailable' }, { error_kind: 'missing' }, { status: 'failed' }]) {
     f.conductor.list.mock.mockImplementation(async () => failure);
     f.conductor.output.mock.mockImplementation(async () => failure);
-    for (const route of ['/status', '/jobs', '/output?job_id=J']) rejected(await f.request('GET', route), 502);
+    for (const route of ['/attention', '/jobs', '/output?job_id=J']) rejected(await f.request('GET', route), 502);
+    assert.equal((await f.request('GET', '/status')).status, 200);
   }
   for (const result of [undefined, {}, { status: 'running' }, { status: 'cancelled', error_kind: 'unconfirmed' }]) {
     f.conductor.cancel.mock.mockImplementation(async () => result);
@@ -459,4 +462,47 @@ test('panel client follows late slots and settings declarations through removal 
   assert.equal(unregister.mock.callCount(), 3);
   ctx.set('slots', slots);
   assert.equal(slots.register.mock.callCount(), 3);
+});
+
+test('panel client applies fast status before history and reuses the attention page count', async () => {
+  const source = readFileSync(new URL('./client.js', import.meta.url), 'utf8');
+  for (const filter of ['all', 'attention']) {
+    const effects = [], applied = [], routes = [];
+    const state = { runtime: { state: 'synchronized', active_tasks: 0 }, settings: {} };
+    const history = { total: 7, jobs: [] };
+    let finish;
+    const deferred = new Promise((resolve) => { finish = resolve; });
+    let module;
+    vm.runInNewContext(source, {
+      window: { __ModuleLoader__: { load: (value) => { module = value; } } },
+      AbortController, setTimeout, clearTimeout,
+      async fetch(url) {
+        const route = url.slice(PANEL_PATH.length);
+        routes.push(route);
+        const value = route.startsWith('/jobs') || route === '/attention' ? await deferred :
+          route === '/status' ? state : route === '/prompt' ? { text: 'prompt' } : {};
+        return { ok: true, json: async () => value };
+      },
+    });
+    const react = {
+      createElement: () => null, useRef: (current) => ({ current }),
+      useEffect: (effect) => effects.push(effect),
+      useState: (value) => [value === 'all' ? filter : value, (next) => applied.push(next)],
+    };
+    module.factory((name) => name === 'react' ? react : {}).Panel();
+    const cleanups = effects.map((effect) => effect());
+    try {
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(applied.includes(state), 'running status should render while history is pending');
+      assert.ok(!applied.includes(history));
+      assert.equal(routes.includes('/attention'), filter !== 'attention');
+      finish(history);
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.ok(applied.includes(history));
+      assert.ok(applied.includes(history.total));
+    } finally {
+      for (const cleanup of cleanups) cleanup();
+      finish(history);
+    }
+  }
 });

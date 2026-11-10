@@ -41,7 +41,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
   let saving = false;
   return async function api(method, pathname, query = {}, body) {
     const route = pathname.slice(PANEL_PATH.length);
-    const known = { '/status': ['GET'], '/settings': ['GET', 'POST'], '/jobs': ['GET'], '/output': ['GET'],
+    const known = { '/status': ['GET'], '/attention': ['GET'], '/settings': ['GET', 'POST'], '/jobs': ['GET'], '/output': ['GET'],
       '/cancel': ['POST'], '/prompt': ['GET', 'POST'], '/reload': ['POST'] };
     if (!pathname.startsWith(PANEL_PATH + '/') || !known[route]) throw bad('没有这个接口', 404);
     if (!known[route].includes(method)) throw bad('请求方法不支持', 405);
@@ -49,9 +49,11 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
     object(query, allowedQuery);
     if (method === 'POST' && route !== '/settings') object(body, route === '/prompt' ? ['text'] : route === '/cancel' ? ['job_id', 'confirm'] : []);
     if (route === '/status') {
-      const [state, attention] = await Promise.all([runtime.execute({ action: 'status' }), conductor.list({ needs_attention: true, limit: 1 })]);
-      runnerResult(attention);
-      return { runtime: state, settings: panelSettings(cfg), attention_tasks: attention.total };
+      return { runtime: await runtime.execute({ action: 'status' }), settings: panelSettings(cfg) };
+    }
+    if (route === '/attention') {
+      const attention = runnerResult(await conductor.list({ needs_attention: true, limit: 1 }));
+      return { total: attention.total };
     }
     if (route === '/settings' && method === 'GET') return panelSettings(cfg);
     if (route === '/settings' || route === '/reload') {
