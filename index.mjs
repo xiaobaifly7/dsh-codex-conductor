@@ -1430,11 +1430,12 @@ export function apply(ctx, config = {}, run = runRunner) {
           for (const job of history.jobs) {
             if (job.blocking?.next_action !== 'ask_user' || !job.blocking.blockers?.some(b => b.kind === 'task_conflict') ||
                 hasUserReply(log, job, owner)) continue;
-            const previous = withReport(await conductor.waitJob(job.job_id, 0, exec?.signal));
-            exec?.signal?.throwIfAborted();
-            if (unknownState(previous) || previous.job_id !== job.job_id) throw new Error(`codex_run: 无法核对原任务 ${job.job_id} 的写入范围，未启动 Codex。`);
-            if (previous.blocking?.next_action === 'ask_user' &&
-                widensOverlappingScope(previous.cwd ?? cwd, previous.scope_paths ?? previous.scope, cwd, args.scope)) {
+            const scope = job.scope_paths ?? job.scope;
+            if (unknownState(job) || typeof job.cwd !== 'string' || !job.cwd.trim() ||
+                !Array.isArray(scope) || scope.some(p => typeof p !== 'string' || !p.trim())) {
+              throw new Error(`codex_run: 无法核对原任务 ${job.job_id} 的写入范围，未启动 Codex。`);
+            }
+            if (widensOverlappingScope(job.cwd, scope, cwd, args.scope)) {
               throw new Error(`codex_run: 原任务 ${job.job_id} 的范围冲突仍需用户回答，未启动 Codex。请先向用户确认新增写入路径。`);
             }
           }
@@ -1613,13 +1614,19 @@ export function apply(ctx, config = {}, run = runRunner) {
     if (!owner || agents?.get(owner) !== agent || !ctx.get?.('jobs')) return;
     const exec = { agent };
     const { linked, settled } = await historySelection({ session_id: 'current' }, exec);
-    for (const [id, entry] of linked) {
-      if (entry.status !== undefined || settled.has(entry.id)) continue;
-      const value = withReport(await conductor.waitJob(id, 0));
-      if (value.job_id !== id || value.context?.owner !== owner || unknownState(value) ||
-          !['running', 'completed', 'failed', 'cancelled'].includes(value.status)) continue;
-      if (agents.get(owner) !== agent) return;
-      if (!liveBackground(id, exec, true)) background(id, exec, finishStatus, entry.label);
+    const pending = new Map([...linked].filter(([, entry]) => entry.status === undefined && !settled.has(entry.id)));
+    if (!pending.size) return;
+    for (let offset = 0; offset !== null;) {
+      const history = await conductor.list({ owner, job_ids: [...pending.keys()], limit: 100, offset });
+      if (!Array.isArray(history.jobs)) throw new Error('无法核对原任务状态');
+      for (const value of history.jobs) {
+        const entry = pending.get(value.job_id);
+        if (!entry || value.context?.owner !== owner || unknownState(value) ||
+            !['running', 'completed', 'failed', 'cancelled'].includes(value.status)) continue;
+        if (agents.get(owner) !== agent) return;
+        if (!liveBackground(value.job_id, exec, true)) background(value.job_id, exec, finishStatus, entry.label);
+      }
+      offset = history.next_offset ?? null;
     }
   }
 

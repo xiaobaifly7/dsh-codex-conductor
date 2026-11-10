@@ -1057,7 +1057,8 @@ test('codex_run cannot resume a thread whose latest owned task needs a user answ
 
 test('a new write task cannot widen an overlapping pending scope before a real user reply', async () => {
   const prior = { ...workflowSource('task_conflict'), scope_paths: ['/work/original/candidate.vhdx'] };
-  const row = { job_id: prior.job_id, blocking: withReport(prior).blocking, finished_at: 10 };
+  const row = { job_id: prior.job_id, cwd: prior.cwd, scope_paths: prior.scope_paths, scope: prior.scope,
+    status: prior.status, blocking: withReport(prior).blocking, finished_at: 10 };
   const registered = { type: 'job/registered', data: { kind: 'codex', owner: 'S1', jobId: 'bg1', label: 'Codex PARENT · test' } };
   const settled = { type: 'job/settled', data: { jobId: 'bg1' } };
   const human = { type: 'user/message', at: 11_000, data: { source: { kind: 'user' } } };
@@ -1080,6 +1081,7 @@ test('a new write task cannot widen an overlapping pending scope before a real u
     else assert.equal((await pending).job_id, 'J');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, denied ? 0 : 1);
     assert.ok(!h.calls.find(argv => argv[0] === 'list').includes('--cwd'));
+    assert.equal(h.calls.some(argv => argv[0] === 'status' && argv[1] === 'PARENT'), false);
   }
 });
 
@@ -1990,8 +1992,12 @@ test('reattaches pending owned jobs on reload or agent creation without redispat
       event('job/registered', 4, 'native-other', 'OTHER', 'S2'),
     ]);
     const agents = { get: (id) => id === 'S1' ? agent : undefined, list: () => alreadyLive ? [agent] : [] };
-    const h = harness({ jobs, agents });
     const report = { ...workflowSource(), job_id: 'OLD' };
+    const old = { ...report, status: alreadyLive ? 'completed' : 'running' };
+    const mismatch = { ...report, job_id: 'MISMATCH', context: { ...report.context, owner: 'S2' } };
+    const h = harness({ jobs, agents, config: { listResult: argv => argv[argv.indexOf('--offset') + 1] === '0'
+      ? { jobs: [mismatch, { ...old, status: 'unknown' }, { ...old, job_id: 'UNLINKED' }], next_offset: 1 }
+      : { jobs: [old], next_offset: null } } });
     h.finals.OLD = alreadyLive ? report : { ...report, status: 'running', structured: undefined };
     h.finals.MISMATCH = { ...report, job_id: 'MISMATCH', context: { ...report.context, owner: 'S2' } };
     if (!alreadyLive) h.handlers['agent/created']({ agent });
@@ -2005,7 +2011,8 @@ test('reattaches pending owned jobs on reload or agent creation without redispat
     assert.equal(jobs.started[0].status, 'completed');
     assert.match(jobs.started[0].result, /等待确认 CSV 格式/);
     assert.deepEqual(jobs.unawaited, ['bg1']);
-    assert.ok(h.calls.every((argv) => argv[0] === 'status' && ['OLD', 'MISMATCH'].includes(argv[1])));
+    assert.ok(h.calls.some(argv => argv[0] === 'list' && argv[argv.indexOf('--offset') + 1] === '1'));
+    assert.ok(h.calls.every(argv => argv[0] === 'list' || (argv[0] === 'status' && argv[1] === 'OLD' && argv[3] === '20')));
   }
 });
 
@@ -3127,4 +3134,22 @@ test('optional timeout and retry settings validate numbers and pass only configu
       assert.ok(argv.includes('retained'));
     }
   }
+});
+
+
+test('pending scope checks fail closed on unverifiable list records without status queries', async () => {
+  const prior = withReport(workflowSource('task_conflict'));
+  for (const change of [{ cwd: null }, { scope_paths: null, scope: null }, { scope_paths: 'src' },
+    { scope_paths: [null] }, { status: 'unknown' }, { error_kind: 'invalid_record' }]) {
+    const h = harness({ config: { listResult: { jobs: [{ ...prior, ...change }] } } });
+    await assert.rejects(h.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('/work/original') }), /无法核对.*写入范围/);
+    assert.ok(h.calls.every(argv => argv[0] === 'list'));
+  }
+  const priorRow = { ...prior, scope_paths: null };
+  const h = harness({ config: { listResult: argv => argv[argv.indexOf('--offset') + 1] === '0'
+    ? { jobs: [], next_offset: 1 } : { jobs: [priorRow], next_offset: null } } });
+  await assert.rejects(h.tools.codex_run.execute({ ...RUN, cwd: '/work/original', scope: ['src', 'other'], write: true },
+    { agent: agentAt('/work/original') }), /范围冲突.*用户回答/);
+  assert.equal(h.calls.length, 2);
+  assert.ok(h.calls.every(argv => argv[0] === 'list'));
 });
