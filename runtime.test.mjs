@@ -11,7 +11,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import fs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import { runtimeIdentity, runtimeStatus, requestRuntimeReload, waitForRuntimeLoad, registerRuntimeTool,
-  saveRuntimeSettings, validatePanelSettings } from './runtime.mjs';
+  saveRuntimeSettings, validatePanelSettings, writeBackedUpFile } from './runtime.mjs';
 
 const runtimeUrl = new URL('./runtime.mjs', import.meta.url).href;
 const oldId = 'codex-conductor-runtime-5e86941';
@@ -115,6 +115,15 @@ test('failed atomic profile replacement leaves the original intact and removes t
     const backup = readdirSync(f.root).find((file) => file.endsWith('.bak'));
     assert.equal(readFileSync(path.join(f.root, backup), 'utf8'), original);
   } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
+
+test('concurrent file edits are a conflict and preserve the latest content without a backup', (t) => {
+  const f = fixture(t);
+  writeFileSync(f.profileFile, 'edited by another process');
+  assert.throws(() => writeBackedUpFile(f.profileFile, Buffer.from('replacement'), Buffer.from('stale content')),
+    { status: 409 });
+  assert.equal(readFileSync(f.profileFile, 'utf8'), 'edited by another process');
+  assert.deepEqual(readdirSync(f.root).sort(), ['package', 'profile.yml']);
 });
 
 function repository(f) {
@@ -301,7 +310,7 @@ test('reload returns fixture HEAD, preserves URL options, and every request has 
   assert.equal(status(f).profile_module, second.expected_module);
 });
 
-test('status shows one relocated managed target without allowing the old instance to reload it', (t) => {
+test('status shows one relocated managed target without allowing the old instance to reload it', async (t) => {
   const f = fixture(t);
   marker(f);
   const next = new URL('../next/index.mjs?v=next', f.moduleUrl).href;
@@ -314,7 +323,12 @@ test('status shows one relocated managed target without allowing the old instanc
   assert.equal(relocated.state, 'pending');
   assert.equal(relocated.can_reload, false);
   assert.match(relocated.profile_error, /刷新插件/);
-  assert.throws(() => requestRuntimeReload(f), /Expected one runtime entry; found 0/);
+  assert.equal(relocated.profile_error_status, 409);
+  assert.throws(() => requestRuntimeReload(f), { status: 409 });
+  const tool = runtimeTool(f);
+  for (const changes of [undefined, { model: 'new-model' }]) {
+    assert.equal((await tool.execute({ action: 'reload' }, { panel: true }, changes)).error_status, 409);
+  }
   assert.equal(readFileSync(f.profileFile, 'utf8'), text);
 
   const duplicate = 'codex-conductor-runtime-abcdefab-1234-4234-8234-123456789abc';
@@ -606,7 +620,7 @@ test('immediate panel settings preserve running jobs and wait for the exact load
   const expected = await requestedModule(f);
   assert.equal(settled, false);
   assert.match(readFileSync(f.profileFile, 'utf8'), /model: immediate/);
-  assert.throws(() => tool.cancelPending(), /不能撤销/);
+  assert.throws(() => tool.cancelPending(), { status: 409, message: '设置已写入，不能撤销。请等待加载后再保存新的设置。' });
   marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
   const result = await operation;
   assert.equal(result.status, 'reloaded');
@@ -628,6 +642,7 @@ test('a profile write failure retains pending settings and its reason for the pa
     const result = await runtimeTool(f).execute({ action: 'reload' }, { panel: true }, { model: 'new-model' });
     assert.equal(result.status, 'failed');
     assert.equal(result.saved, true);
+    assert.equal(result.error_status, 500);
     assert.match(result.pending_settings.error, /fixture profile is locked/);
     assert.deepEqual(JSON.parse(readFileSync(path.join(f.root, 'pending-settings.json'))).changes, { model: 'new-model' });
     assert.equal(readFileSync(f.profileFile, 'utf8'), original);
@@ -751,6 +766,7 @@ test('reload without configured profile is explicitly refused and invalid argume
   const result = await tool.execute({ action: 'reload' }, runtimeExec);
   assert.equal(result.status, 'failed');
   assert.equal(result.error_kind, 'profile_not_configured');
+  assert.equal(result.error_status, 409);
   assert.equal(result.active_tasks, null);
   for (const args of [null, [], { action: 'restart' }, { when: 'later' }]) await assert.rejects(tool.execute(args, runtimeExec));
 });
@@ -763,6 +779,7 @@ test('busy idle reload without native jobs, owner, or successful registration ne
     [{ list: () => [], start() { throw new Error('native service offline'); } }, runtimeExec]]) {
     const result = await runtimeTool(f, { conductor, jobs }).execute({ action: 'reload' }, exec);
     assert.equal(result.status, 'failed');
+    assert.equal(result.error_status, jobs?.start && !jobs.started ? 500 : 409);
     assert.equal(result.active_tasks, 1);
     assert.equal(readFileSync(f.profileFile, 'utf8'), profile(f.moduleUrl));
   }
@@ -978,6 +995,7 @@ test('bridge failure keeps status readable, blocks idle writes, and still allows
     const idle = await tool.execute({ action: 'reload', when: 'idle' }, runtimeExec);
     assert.equal(idle.status, 'failed');
     assert.equal(idle.error_kind, 'active_count_unavailable');
+    assert.equal(idle.error_status, 502);
     assert.equal(idle.active_tasks, null);
     assert.match(idle.active_error, /WSL offline/);
     assert.deepEqual(readFileSync(f.profileFile), bytes);

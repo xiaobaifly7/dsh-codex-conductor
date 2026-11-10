@@ -212,7 +212,8 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   }
   assert.deepEqual(await f.request('GET', '/output?job_id=job-1'),
     { status: 200, body: { text: '报告🙂', next_offset: 4, eof: true } });
-  assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments, ['job-1', { artifact: 'report', offset: 0, limit: 8000 }]);
+  assert.deepEqual(f.conductor.output.mock.calls[0].arguments, ['job-1', { artifact: 'report', offset: 0, limit: 8000 }]);
+  assert.deepEqual(f.conductor.output.mock.calls[1].arguments, ['job-1', { artifact: 'context', offset: 0, limit: 8000 }]);
   assert.equal((await f.request('GET', '/output?job_id=J_2&offset=12&limit=20000')).status, 200);
   assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments, ['J_2', { artifact: 'report', offset: 12, limit: 20000 }]);
   assert.deepEqual(await f.request('POST', '/cancel', { job_id: 'job-1', confirm: true }),
@@ -230,6 +231,46 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, undefined]);
 });
 
+test('panel report reads full Unicode context internally and exposes only acceptance on its first page', async (t) => {
+  const f = fixture(t);
+  const acceptance = ['保存设置后刷新仍可见', '🙂'.repeat(350)];
+  const context = Array.from(JSON.stringify({ task: '私有任务🙂'.repeat(2000), acceptance, owner: 'private-owner' }));
+  const report = { text: '报告🙂', next_offset: 4, eof: true };
+  f.conductor.output.mock.mockImplementation(async (id, { artifact, offset, limit }) => {
+    assert.equal(id, 'job-1');
+    if (artifact === 'report') return report;
+    assert.equal(artifact, 'context');
+    const end = Math.min(context.length, offset + limit);
+    return { text: context.slice(offset, end).join(''), next_offset: end < context.length ? end : null,
+      eof: end >= context.length, source_path: 'private-path' };
+  });
+  assert.deepEqual(await f.request('GET', '/output?job_id=job-1'), { status: 200, body: { ...report, acceptance } });
+  assert.deepEqual(f.conductor.output.mock.calls.map(({ arguments: [, options] }) => options), [
+    { artifact: 'report', offset: 0, limit: 8000 },
+    { artifact: 'context', offset: 0, limit: 8000 },
+    { artifact: 'context', offset: 8000, limit: 8000 },
+  ]);
+  assert.deepEqual(await f.request('GET', '/output?job_id=job-1&offset=4'), { status: 200, body: report });
+  assert.equal(f.conductor.output.mock.callCount(), 4);
+  rejected(await f.request('GET', '/output?job_id=job-1&artifact=context'), 400);
+  assert.equal(f.conductor.output.mock.callCount(), 4);
+});
+
+test('panel keeps reports readable when legacy context is missing, invalid or unavailable', async (t) => {
+  const f = fixture(t);
+  const report = { text: '报告', eof: true };
+  for (const context of [{ status: 'failed', error_kind: 'legacy_context_missing' }, { text: '{', eof: true },
+    { text: '{}', eof: true }, { text: '{"acceptance":"invalid"}', eof: true },
+    { text: '{', eof: false, next_offset: 0 }, new Error('context bridge unavailable')]) {
+    f.conductor.output.mock.mockImplementation(async (_id, { artifact }) => {
+      if (artifact === 'report') return report;
+      if (context instanceof Error) throw context;
+      return context;
+    });
+    assert.deepEqual(await f.request('GET', '/output?job_id=job-1'), { status: 200, body: report });
+  }
+});
+
 test('panel attention counts the last 24 hours with one runner query', async (t) => {
   const f = fixture(t);
   const now = 1800000000;
@@ -242,6 +283,18 @@ test('panel attention counts the last 24 hours with one runner query', async (t)
     f.conductor.list.mock.mockImplementation(async () => page);
     rejected(await f.request('GET', '/attention'), 502, /列表.*请/);
   }
+});
+
+test('panel cancellation returns 409 for already-written settings and 500 for internal failures', async (t) => {
+  const f = fixture(t);
+  f.runtime.cancelPending.mock.mockImplementation(() => {
+    throw Object.assign(new Error('设置已写入，不能撤销。请等待加载后再保存新的设置。'), { status: 409 });
+  });
+  rejected(await f.request('POST', '/settings/cancel', {}), 409, /设置已写入，不能撤销/);
+  f.runtime.cancelPending.mock.mockImplementation(() => { throw new Error('unexpected cancellation failure'); });
+  rejected(await f.request('POST', '/settings/cancel', {}), 500);
+  f.runtime.cancelPending.mock.mockImplementation(() => ({ cancelled: true }));
+  assert.equal((await f.request('POST', '/settings/cancel', {})).status, 200);
 });
 
 test('panel settings immediately apply only with literal confirmation and cancellation obeys the save lock', async (t) => {
@@ -466,8 +519,16 @@ test('panel HTTP serializes settings/reload, retains saved failure state and rel
   assert.equal((await first).body.saved, true);
   f.runtime.execute.mock.mockImplementation(async () => ({ status: 'failed', saved: true, error: 'reload failed' }));
   const failed = await f.request('POST', '/settings', { effort: 'high' });
-  rejected(failed, 409, /操作没有完成.*请/);
+  rejected(failed, 500, /操作没有完成.*请/);
   assert.equal(failed.body.saved, true);
+  for (const status of [409, 502]) {
+    f.runtime.execute.mock.mockImplementation(async () => ({ status: 'failed', error_status: status, saved: true, error: '服务暂时不可用，请重试。' }));
+    for (const [route, body] of [['/settings', { effort: 'high' }], ['/settings/apply', { changes: { effort: 'high' }, confirm: true }], ['/reload', {}]]) {
+      const response = await f.request('POST', route, body);
+      rejected(response, status);
+      assert.equal(response.body.saved, true);
+    }
+  }
   f.runtime.execute.mock.mockImplementation(async () => { throw new Error('runtime unavailable'); });
   rejected(await f.request('POST', '/reload', {}), 500, /操作没有完成.*请/);
   f.runtime.execute.mock.mockImplementation(async () => ({ status: 'already_current' }));

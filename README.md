@@ -24,6 +24,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 任务报告提供易读视图和原文，支持 v2 和旧版格式。易读视图会先读完整份报告再解析，最多读取 256 Ki 字符（262,144 个字符）；超出上限或格式无法解析时，仍可分页查看原文，不把截断内容当成完整报告。面板的“最近 24 小时需要关注”按任务开始时间统计；“待关注”任务列表仍包含更早的历史任务，两者数量可能不同。
 
+`0.9.59` 的逐条验收会显示原验收标准（超过 300 字符可展开，取不到时沿用报告原文），已写入设置不可撤销等状态冲突返回 HTTP 409，内部故障仍返回 500。
+
 面板沿用 DSH 的网页服务，不另开端口；`/dsh-codex-conductor/*` 的每个接口都调用 DSH 自己的登录及 Host/Origin 校验，缺少鉴权服务时拒绝访问。`webServer`、`settings` 或客户端槽位不存在时不影响原有工具。文件 URL 加载也支持前端：升级时保留完整包（包括 `package.json`、`client.js`、`panel.mjs`），仍用 `file:///…/index.mjs?v=…`，更换 entry ID 和 `v` 后由 DSH 热加载，无须重启宿主。`runtimeProfileFile` 须指向这个实例实际使用的 `cordis.patch.yml`；新版本先由用户部署。
 
 ### 0.9.52：从本机请求续接被中断的会话
@@ -355,6 +357,8 @@ Saving settings while idle applies them immediately. While Codex is busy, the de
 To apply settings now, choose **立即生效** and confirm the hot reload. The reload itself does not cancel running Codex tasks. New settings apply to later dispatches; running tasks retain their launch settings. After loading, the plugin reuses tasks still in the native task table and reconnects registered, unsettled tasks in open sessions when their ownership can be confirmed, without dispatching them again. Closed sessions are checked when restored. Tasks without registration records, with unknown ownership, or with unverifiable status are not automatically reconnected. Explicitly cancelling a Codex task, archiving its session, or aborting a tool call that is synchronously waiting for its result can still cancel the task; stopping an observer or hot reloading is different.
 
 Reports offer a readable view and the original text for both v2 and legacy formats. The readable view reads the entire report before parsing, up to 256 Ki characters (262,144 characters). Larger reports or reports that cannot be parsed remain available as paginated original text; truncated text is not treated as a complete report. The panel's last-24-hours attention count uses task start time. The attention list still includes older tasks, so its total can differ from that count.
+
+`0.9.59` shows original acceptance criteria in the readable report (expandable after 300 characters, falling back to report labels when unavailable) and returns HTTP 409 for state conflicts such as cancelling already-written settings, while internal failures remain 500.
 
 Every `/dsh-codex-conductor/*` endpoint explicitly uses DSH's own login and Host/Origin checks on its existing web server; no extra port is opened, and missing authentication fails closed. Missing optional web/settings/slot services leave the existing tools available. File-URL loading supports the client declaration: deploy the complete package, including `package.json`, `client.js`, and `panel.mjs`, keep `file:///…/index.mjs?v=…`, and change the entry ID and `v` token for a hot load without restarting DSH. Set `runtimeProfileFile` to that instance's real `cordis.patch.yml`; deployment is a separate user action.
 
