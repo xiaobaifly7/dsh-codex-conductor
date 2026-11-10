@@ -259,6 +259,18 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(state["completed"])
         self.assertIsNone(state["end_reason"])
 
+    def test_failure_classification_only_reads_current_attempt_stderr(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        self.fake.write_text(FAKE_CODEX.replace('sys.exit(0)',
+            'sys.stderr.write("first attempt: connection reset\\n" if calls == 0 else "second attempt stopped\\n"); sys.exit(0)'))
+        value = self.invoke(mode="exit0_without_completion")
+        self.assertEqual(value["error_kind"], "incomplete")
+        self.assertEqual(value["attempts"], 2)
+        self.assertEqual(value["error"], "second attempt stopped")
+        self.assertIn("first attempt", (Path(value["log_dir"]) / "stderr.log").read_text())
+
     def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
         start = time.monotonic()
         r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0", mode="close_stdout_then_hang")
