@@ -681,6 +681,10 @@ def execute(args, prompt, run_dir):
                 deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
                 while True:
+                    if waiting and deadline is not None and time.monotonic() >= deadline:
+                        return {**base, "status": "failed", "error_kind": "lock_timeout",
+                                "error": "Timed out waiting for directory write locks; Codex was not started.",
+                                "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
                     for key in sorted(roots):
                         lock = acquire_write_lock(roots[key])
                         if lock is None:
@@ -694,12 +698,9 @@ def execute(args, prompt, run_dir):
                     if not waiting:
                         runner_event(run_dir, 0, "lock_wait")
                         waiting = True
-                    if deadline is not None and time.monotonic() >= deadline:
-                        return {**base, "status": "failed", "error_kind": "lock_timeout",
-                                "error": "Timed out waiting for directory write locks; Codex was not started.",
-                                "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
                     # shortcut: waiters are not FIFO; add ordered admission if task ordering is required.
-                    time.sleep(0.25)
+                    delay = 0.25 if deadline is None else min(0.25, max(0, deadline - time.monotonic()))
+                    time.sleep(delay)
             except OSError as error:
                 return {**base, "status": "failed", "error_kind": "runner_error", "error": str(error),
                         "retryable": False, "attempts": 0, "duration_s": round(time.time() - started, 1)}
