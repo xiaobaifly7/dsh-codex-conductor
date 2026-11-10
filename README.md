@@ -36,6 +36,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 
+`0.9.51` 默认的写入范围预检会先筛选待答范围冲突再分页，避免因无关历史重复查询。开启 `plannerAnswers` 时仍沿用原有行为。
+
 `0.9.46` 查询运行中任务时跳过已有最终结果的任务，避免逐条读取历史报告。
 
 ### 任务生命周期
@@ -261,7 +263,7 @@ python3 runner/codex_runner.py run    --cwd DIR [--sandbox workspace-write|dange
 python3 runner/codex_runner.py start  --cwd DIR [--sandbox workspace-write|danger-full-access] [--scope PATH ...] [--writable-root DIR ...] [--ignore REGEX ...] < prompt.txt
 python3 runner/codex_runner.py status JOB_ID [--wait SECONDS]
 python3 runner/codex_runner.py cancel JOB_ID
-python3 runner/codex_runner.py list [--cwd DIR] [--owner SESSION_ID] [--status STATUS] [--needs-attention] [--limit 20] [--offset 0]
+python3 runner/codex_runner.py list [--cwd DIR] [--owner SESSION_ID] [--status STATUS] [--needs-attention] [--scope-conflicts] [--limit 20] [--offset 0]
 python3 runner/codex_runner.py output JOB_ID [--artifact report|result|context|review|stderr|events] [--offset 0] [--limit 4000]
 python3 runner/codex_runner.py review JOB_ID --reviewer SESSION_ID < review.json
 python3 runner/codex_runner.py summary [--cwd DIR] [--owner SESSION_ID] [--thread-id THREAD_ID] [--round-limit 20]
@@ -299,6 +301,8 @@ python3 runner/test_codex_runner.py
 `0.9.43` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
 
 `0.9.48` permits more demonstrably read-only text and file checks and ordinary assignments, explains dangerous command forms, and preserves another live process's loaded record.
+
+`0.9.51` filters pending scope conflicts before paging the default write-scope preflight. The opt-in `plannerAnswers` behavior is unchanged.
 
 `0.9.49` restores full opt-in `plannerAnswers`: the planner can answer blockers based on the user's original goal and known facts, skip pending-conflict write-scope preflight, and record `accepted_deviations`, including `kind: 'scope'`, without a user reply.
 

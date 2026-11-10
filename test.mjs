@@ -1235,7 +1235,9 @@ test('a new write task cannot widen an overlapping pending scope before a real u
     if (denied) await assert.rejects(pending, /PARENT.*范围冲突.*用户回答/);
     else assert.equal((await pending).job_id, 'J');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, denied ? 0 : 1);
-    assert.ok(!h.calls.find(argv => argv[0] === 'list').includes('--cwd'));
+    const list = h.calls.find(argv => argv[0] === 'list');
+    assert.ok(list.includes('--scope-conflicts'));
+    assert.ok(!list.includes('--cwd'));
     assert.equal(h.calls.some(argv => argv[0] === 'status' && argv[1] === 'PARENT'), false);
   }
 });
