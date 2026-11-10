@@ -1237,17 +1237,14 @@ test('a new write task cannot widen an overlapping pending scope before a real u
   }
 });
 
-test('plannerAnswers checks a pending write scope before dispatching', async () => {
+test('plannerAnswers skips scope history preflight for a new write task', async () => {
   const source = withReport(workflowSource('task_conflict'));
   const h = harness({ config: { plannerAnswers: true, listResult: { jobs: [source] },
     startResult: { job_id: 'NEXT', status: 'completed' } } });
-  const args = { ...RUN, cwd: source.cwd, write: true };
-  const exec = { agent: agentAt('/work/current') };
-  await assert.rejects(h.tools.codex_run.execute({ ...args, scope: ['src', 'extra.csv'] }, exec),
-    /PARENT.*范围冲突.*用户回答/);
-  assert.deepEqual(h.calls.map(argv => argv[0]), ['list']);
-  const within = await h.tools.codex_run.execute({ ...args, scope: ['src'] }, exec);
-  assert.equal(within.job_id, 'NEXT');
+  const value = await h.tools.codex_run.execute({ ...RUN, cwd: source.cwd, scope: ['src', 'extra.csv'], write: true },
+    { agent: agentAt('/work/current') });
+  assert.equal(value.job_id, 'NEXT');
+  assert.deepEqual(h.calls.map(argv => argv[0]), ['start']);
 });
 
 test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
@@ -1361,7 +1358,7 @@ test('plannerAnswers applies complete planner answers without a user reply and k
     h.tools.codex_continue.description, h.tools.codex_review.description,
     h.tools.codex_review.parameters.properties.accepted_deviations.description]) {
     assert.match(text, /按用户原始目标和已有事实自行回答[\s\S]*汇报里写明替用户做了哪些决定[\s\S]*拿不准[\s\S]*删除数据、改动用户没提过的目录[\s\S]*先问用户/);
-    assert.doesNotMatch(text, /须来自原会话中的实际用户回复|先向用户提出以下具体问题|原会话用户已明确接受/);
+    assert.doesNotMatch(text, /须来自原会话中的实际用户回复|先向用户提出以下具体问题|原会话用户已明确接受|范围外改动.*用户确认/);
   }
   const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', answers, wait_seconds: 0 }, exec);
   assert.equal(value.job_id, 'CHILD');
@@ -1526,7 +1523,7 @@ test('plannerAnswers lets the planner record accepted deviations without a user 
   assert.equal(h.calls.some(argv => argv[0] === 'start'), false);
 });
 
-test('plannerAnswers cannot accept out-of-scope changes without a real user reply', async () => {
+test('plannerAnswers lets the planner accept out-of-scope changes without a user reply', async () => {
   const source = { ...workflowSource('implementation'), out_of_scope: ['extra.csv'] };
   const h = harness({ config: { plannerAnswers: true,
     reviewResult: { ...source, verification_status: 'accepted_deviations' } } });
@@ -1534,11 +1531,11 @@ test('plannerAnswers cannot accept out-of-scope changes without a real user repl
   const args = { job_id: 'PARENT', status: 'accepted_deviations',
     criteria: [{ index: 1, status: 'met', evidence: 'CSV 测试通过' }],
     accepted_deviations: [{ kind: 'scope', index: 1, evidence: '保留额外文件' }] };
-  await assert.rejects(h.tools.codex_review.execute(args, { agent: agentAt('/work/current') }),
-    /用户确认.*未写入核验/);
-  assert.equal(h.calls.filter(argv => argv[0] === 'review').length, 0);
-  const approved = await h.tools.codex_review.execute(args, { agent: agentAt('/work/current', answeredParent) });
-  assert.equal(approved.verification_status, 'accepted_deviations');
+  const value = await h.tools.codex_review.execute(args, { agent: agentAt('/work/current') });
+  assert.equal(value.verification_status, 'accepted_deviations');
+  const reviews = h.requests.filter(({ argv }) => argv[0] === 'review');
+  assert.equal(reviews.length, 1);
+  assert.deepEqual(JSON.parse(reviews[0].stdin).accepted_deviations, args.accepted_deviations);
 });
 
 test('codex_review sends every criterion in stdin and returns verification without rewriting the report', async () => {
@@ -1670,7 +1667,7 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.equal(loaded.allowHostAccess, true);
   assert.equal(loaded.defaultHostAccess, true);
   assert.equal(loaded.plannerAnswers, true);
-  assert.equal(loaded.version, '0.9.48');
+  assert.equal(loaded.version, '0.9.49');
   assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
   assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
   assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
@@ -1713,11 +1710,11 @@ test('apply preserves another live process loaded record and replaces own, stale
     const h = harness();
     const status = await h.tools.codex_runtime.execute({ action: 'status' });
     assert.equal(status.instance.module, own.module);
-    assert.equal(status.instance.version, '0.9.48');
+    assert.equal(status.instance.version, '0.9.49');
     if (row.keep) assert.equal(readFileSync(file, 'utf8'), original);
     else {
       assert.equal(status.loaded.pid, process.pid);
-      assert.equal(status.loaded.version, '0.9.48');
+      assert.equal(status.loaded.version, '0.9.49');
       assert.notEqual(status.loaded.loadedAt, '2000-01-01T00:00:00Z');
     }
   }
@@ -3063,7 +3060,7 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   const envelope = JSON.parse(starts[0].stdin);
   const { dispatcher, ...taskContext } = envelope.context;
   assert.equal(dispatcher.pid, process.pid);
-  assert.equal(dispatcher.version, '0.9.48');
+  assert.equal(dispatcher.version, '0.9.49');
   assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);
