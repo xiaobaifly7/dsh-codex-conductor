@@ -3666,6 +3666,9 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   assert.equal(value.chars, 10);
   assert.equal(value.cjk_chars, 5);
   assert.equal(value.over_limit, false);
+  assert.equal(value.attempts, 1);
+  assert.deepEqual(value.attempt_chars, [10]);
+  assert.equal(readFileSync(value.output, 'utf8'), '正文汉字𠀀😀abc\n');
   assert.deepEqual(value.usage, { input_tokens: 10, output_tokens: 20 });
   assert.equal(value.model, 'gemini-4-argon');
   assert.equal(value.effort, 'medium');
@@ -3794,10 +3797,34 @@ test('gemini_write lists snapshot changes and out-of-scope write events separate
   assert.deepEqual(value.out_of_scope.map(f => path.relative(h.cwd, f).replace(/\\/g, '/')).sort(), ['event-only.md', 'extra/other.md', 'notes.md']);
   assert.deepEqual(value.write_paths, ['chapter.md', 'event-only.md']);
   assert.match(value.next, /处理范围外改动/);
+  assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
+});
+
+test('gemini_write automatically compresses the previous draft once within the hard limit', async (t) => {
+  const drafts = ['第一稿：事实来自素材[1]。\n', '事实[1]。\n'];
+  let attempt = 0;
+  const h = geminiFixture(t, { action: ({ child, options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), drafts[attempt++]);
+    geminiDone(child);
+  } });
+  const value = await h.execute({ max_chars: 10 });
+  assert.equal(value.status, 'completed', value.error);
+  assert.equal(value.attempts, 2);
+  assert.deepEqual(value.attempt_chars, drafts.map((draft) => [...draft].length));
+  assert.equal(value.chars, [...drafts[1]].length);
+  assert.equal(value.over_limit, false);
+  assert.equal(readFileSync(value.output, 'utf8'), drafts[1]);
+  assert.deepEqual(value.files_changed, [{ path: value.output, change: 'added' }]);
+  assert.match(h.spawns[0].prompt, /正文硬上限为 10 个 Unicode 码点，绝对不得超过 10；目标为 8 个/);
+  assert.match(h.spawns[0].prompt, /包含标题、Markdown 标记、标点、空格和换行；整个文件均计入/);
+  assert.ok(h.spawns[1].prompt.includes(`上一稿正文实际为 ${[...drafts[0]].length} 个 Unicode 码点，超过硬上限 10；目标为 8 个。`));
+  assert.match(h.spawns[1].prompt, /保留事实和出处引用.*压缩到 8 个 Unicode 码点以内/);
+  assert.ok(h.spawns[1].prompt.includes(JSON.stringify(drafts[0])));
+  assert.ok(h.spawns[1].prompt.includes(WRITING.prompt));
 });
 
 test('gemini_write detects max_chars from the file instead of the model response', async (t) => {
-  const h = geminiFixture(t, { action: ({ child, options }) => {
+  const h = geminiFixture(t, { config: { plannerReads: 'products' }, action: ({ child, options }) => {
     writeFileSync(path.join(options.cwd, 'chapter.md'), '汉字😀abc');
     geminiDone(child, 0, { status: 'SUCCESS', response: '只有一字', usage: { total_tokens: 99 } });
   } });
@@ -3806,12 +3833,119 @@ test('gemini_write detects max_chars from the file instead of the model response
   assert.equal(value.chars, 6);
   assert.equal(value.cjk_chars, 2);
   assert.equal(value.over_limit, true);
+  assert.equal(value.attempts, 2);
+  assert.deepEqual(value.attempt_chars, [6, 6]);
   assert.equal(value.model, 'test-model');
   assert.equal(value.effort, 'low');
   assert.deepEqual(value.usage, { total_tokens: 99 });
-  assert.match(value.next, /超限重写/);
+  assert.match(value.next, /自动压缩后仍超过 max_chars.*拆成更小的章节/);
   assert.match(h.spawns[0].prompt, /不得超过 5/);
+  assert.equal(h.spawns.length, 2);
+  assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
   assert.equal((await h.execute({ max_chars: 6, overwrite: true })).status, 'completed');
+});
+
+test('gemini_write restores the original output bytes when both attempts exceed max_chars', async (t) => {
+  const h = geminiFixture(t);
+  const output = path.join(h.cwd, 'chapter.md');
+  const original = Buffer.from([0xef, 0xbb, 0xbf, 0xff, 0x00, 0x0d, 0x0a]);
+  writeFileSync(output, original);
+  const value = await h.execute({ max_chars: 3, overwrite: true });
+  assert.equal(value.status, 'failed');
+  assert.equal(value.attempts, 2);
+  assert.deepEqual(value.attempt_chars, [10, 10]);
+  assert.deepEqual(readFileSync(output), original);
+});
+
+test('gemini_write generates escaped seven-field frontmatter without counting it', async (t) => {
+  const body = '正文😀\n';
+  const h = geminiFixture(t, { action: ({ child, options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), body);
+    geminiDone(child);
+  } });
+  const frontmatter = { created: '2026-11-10T08:09', updated: '2026-11-11T10:11', title: '教程: "引号" \\ 路径 #tag',
+    type: 'topic', status: 'review', tags: ['a:b', 'null', '[x]'], aliases: ['true', '别名'] };
+  const value = await h.execute({ frontmatter, max_chars: 4 });
+  assert.equal(value.status, 'completed', value.error);
+  assert.equal(value.chars, 4);
+  assert.equal(value.cjk_chars, 2);
+  assert.equal(value.attempts, 1);
+  assert.deepEqual(value.attempt_chars, [4]);
+  const content = readFileSync(value.output, 'utf8');
+  assert.equal(content, '---\ncreated: "2026-11-10T08:09"\nupdated: "2026-11-11T10:11"\n' +
+    'title: "教程: \\"引号\\" \\\\ 路径 #tag"\ntype: "topic"\nstatus: "review"\n' +
+    'tags: ["a:b","null","[x]"]\naliases: ["true","别名"]\n---\n' + body);
+  assert.match(h.spawns[0].prompt, /插件生成的 YAML frontmatter 不计入/);
+  assert.match(h.spawns[0].prompt, /只输出正文，不要输出 YAML frontmatter/);
+  const schema = h.tools.gemini_write.parameters.properties.frontmatter;
+  assert.equal(schema.additionalProperties, false);
+  assert.deepEqual(schema.required, ['title', 'tags']);
+  assert.deepEqual(Object.keys(schema.properties), ['created', 'updated', 'title', 'type', 'status', 'tags', 'aliases']);
+});
+
+test('gemini_write replaces model frontmatter including BOM, CRLF and empty blocks', async (t) => {
+  for (const prefix of ['---\ntitle: wrong\n---\n', '\uFEFF---\r\ntags: [wrong]\r\n...\r\n', '---\n---\n']) {
+    const h = geminiFixture(t, { action: ({ child, options }) => {
+      writeFileSync(path.join(options.cwd, 'chapter.md'), prefix + '正文\n');
+      geminiDone(child);
+    } });
+    const value = await h.execute({ frontmatter: { title: '插件标题', tags: ['课程'] }, max_chars: 3 });
+    assert.equal(value.status, 'completed', value.error);
+    assert.equal(value.chars, 3);
+    assert.equal(value.cjk_chars, 2);
+    const content = readFileSync(value.output, 'utf8');
+    assert.equal(content.match(/^---$/gm).length, 2);
+    assert.match(content, /title: "插件标题"/);
+    assert.doesNotMatch(content, /wrong|\uFEFF/);
+    assert.ok(content.endsWith('---\n正文\n'));
+  }
+});
+
+test('gemini_write fills local minute timestamps and metadata defaults', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date(2026, 10, 11, 7, 8, 59).getTime() });
+  const h = geminiFixture(t);
+  const value = await h.execute({ frontmatter: { title: '默认字段', tags: '课程' } });
+  assert.equal(value.status, 'completed', value.error);
+  assert.ok(readFileSync(value.output, 'utf8').startsWith('---\ncreated: "2026-11-11T07:08"\nupdated: "2026-11-11T07:08"\n' +
+    'title: "默认字段"\ntype: "resource"\nstatus: "draft"\ntags: "课程"\naliases: []\n---\n'));
+});
+
+test('gemini_write validates frontmatter before launch and accepts 200 Unicode code points', async (t) => {
+  const h = geminiFixture(t);
+  const valid = { title: '标题', tags: ['课程'] };
+  const invalid = [null, [], 'yaml', {}, { tags: ['课程'] }, { title: '标题' }, { ...valid, title: ' ' },
+    { ...valid, tags: [] }, { ...valid, tags: '' }, { ...valid, tags: [' '] }, { ...valid, extra: 'no' },
+    { ...valid, type: 'tutorial' }, { ...valid, status: 'published' }, { ...valid, aliases: [42] },
+    ...['created', 'updated', 'title', 'type', 'status'].map((key) => ({ ...valid, [key]: ['array'] })),
+    ...['created', 'updated', 'title', 'type', 'status', 'tags', 'aliases'].map((key) => ({ ...valid, [key]: '😀'.repeat(201) })),
+    ...['\n', '\r', '\t', '\0', '\u0085', '\u2028', '\u2029', '\ud800'].map((char) => ({ ...valid, title: `标题${char}内容` })),
+    { ...valid, tags: ['a\nb'] }, { ...valid, aliases: ['a\nb'] }];
+  for (const frontmatter of invalid) {
+    const value = await h.execute({ frontmatter });
+    assert.equal(value.status, 'failed');
+    assert.match(value.error, /frontmatter/);
+    assert.equal(value.attempts, 0);
+  }
+  assert.equal(h.spawns.length, 0);
+  const value = await h.execute({ frontmatter: { title: '😀'.repeat(200), tags: ['课程'], aliases: [] } });
+  assert.equal(value.status, 'completed', value.error);
+});
+
+test('gemini_write keeps and counts model frontmatter when the parameter is omitted', async (t) => {
+  const original = '---\ntitle: model\n---\n正文\n';
+  const h = geminiFixture(t, { action: ({ child, options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), original);
+    geminiDone(child);
+  } });
+  const value = await h.execute();
+  assert.equal(value.status, 'completed', value.error);
+  assert.equal(value.chars, [...original].length);
+  assert.equal(readFileSync(value.output, 'utf8'), original);
+  assert.doesNotMatch(h.spawns[0].prompt, /元数据由插件生成/);
+  const failed = await h.execute({ overwrite: true, max_chars: [...original].length - 1 });
+  assert.equal(failed.status, 'failed');
+  assert.deepEqual(failed.attempt_chars, [[...original].length, [...original].length]);
+  assert.equal(readFileSync(value.output, 'utf8'), original);
 });
 
 test('gemini_write returns failed for CLI, protocol and missing or empty file errors', async (t) => {
@@ -3827,15 +3961,20 @@ test('gemini_write returns failed for CLI, protocol and missing or empty file er
     assert.equal(value.status, 'failed', mode);
     assert.match(value.error, reason, mode);
     assert.ok(value.error.length <= 2000);
+    assert.equal(value.attempts, 1);
+    assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
   }
 });
 
 test('gemini_write times out and cancels the child without leaking abort listeners', async (t) => {
-  t.mock.timers.enable({ apis: ['setInterval'] });
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const h = geminiFixture(t, { config: { gemini: { timeoutSeconds: 1 } }, action: ({ child }) => child.stderr.write('error: still waiting') });
   const pending = h.execute();
   await tick();
   await tick();
+  now = 1000;
   t.mock.timers.tick(1000);
   const timedOut = await pending;
   assert.equal(timedOut.status, 'failed');
@@ -3851,6 +3990,57 @@ test('gemini_write times out and cancels the child without leaking abort listene
   const count = h.spawns.length;
   assert.equal((await h.execute({}, { signal: stop.signal })).status, 'failed');
   assert.equal(h.spawns.length, count);
+});
+
+test('gemini_write shares the timeout budget across both attempts and restores the output', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let attempt = 0;
+  const h = geminiFixture(t, { config: { gemini: { timeoutSeconds: 2 } }, action: ({ options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), ++attempt === 1 ? 'x'.repeat(21) : 'partial');
+  } });
+  const output = path.join(h.cwd, 'chapter.md');
+  writeFileSync(output, '调用前原文');
+  const pending = h.execute({ overwrite: true, max_chars: 10 });
+  await tick();
+  await tick();
+  assert.equal(h.spawns.length, 1);
+  now = 1250;
+  t.mock.timers.tick(1250);
+  geminiDone(h.spawns[0].child);
+  await tick();
+  await tick();
+  assert.equal(h.spawns.length, 2);
+  now = 1999;
+  t.mock.timers.tick(749);
+  assert.equal(h.spawns[1].child.killed, false);
+  now = 2000;
+  t.mock.timers.tick(1);
+  const value = await pending;
+  assert.equal(value.status, 'failed');
+  assert.match(value.error, /超过 2 秒未结束/);
+  assert.equal(value.attempts, 2);
+  assert.deepEqual(value.attempt_chars, [21, 7]);
+  assert.equal(h.spawns[1].child.killed, true);
+  assert.equal(readFileSync(output, 'utf8'), '调用前原文');
+});
+
+test('gemini_write does not launch a rewrite after the timeout budget is exhausted', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const h = geminiFixture(t, { config: { gemini: { timeoutSeconds: 1 } }, action: ({ child, options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), '超限正文');
+    now = 1000;
+    geminiDone(child);
+  } });
+  const value = await h.execute({ max_chars: 2 });
+  assert.equal(value.status, 'failed');
+  assert.match(value.error, /超过 1 秒未结束/);
+  assert.equal(value.attempts, 1);
+  assert.deepEqual(value.attempt_chars, [4]);
+  assert.equal(h.spawns.length, 1);
+  assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
 });
 
 test('gemini_write inherits environment and injects all proxy variables only into the child', async (t) => {
