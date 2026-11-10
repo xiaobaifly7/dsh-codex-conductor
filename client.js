@@ -36,13 +36,18 @@ window.__ModuleLoader__.load({
       .dcc-readable li { margin-bottom: 8px; }
     `;
 
-    async function api(path, signal, body) {
-      const response = await fetch(PREFIX + path, {
-        credentials: 'same-origin', signal,
-        ...(body === undefined ? {} : {
-          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-        }),
-      });
+    async function api(path, signal, body, http) {
+      const entry = http && { path, status: null };
+      if (entry) http.push(entry);
+      let response;
+      try {
+        response = await fetch(PREFIX + path, {
+          credentials: 'same-origin', signal,
+          ...(body === undefined ? {} : {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+          }),
+        });
+      } finally { if (entry) entry.status = response?.status ?? null; }
       let value;
       try { value = await response.json(); }
       catch (_) { throw new Error('服务没有返回有效数据，请稍后重试。'); }
@@ -229,7 +234,7 @@ window.__ModuleLoader__.load({
           h(Message, { text: messages.reload }), h(Message, { text: errors.reload, error: true }));
     }
 
-    function Report({ jobId, onClose }) {
+    function Report({ jobId, onClose, selftest }) {
       const [document, setDocument] = useState(null);
       const [pageIndex, setPageIndex] = useState(0);
       const [raw, setRaw] = useState(false);
@@ -245,12 +250,13 @@ window.__ModuleLoader__.load({
         setError('');
         setDocument(null);
         setPageIndex(0);
-        loadReport(jobId, controller.signal)
+        loadReport(jobId, controller.signal, selftest?.read || api)
           .then((value) => { if (!controller.signal.aborted) setDocument(value); })
           .catch((err) => { if (!controller.signal.aborted) setError(userError(err.message)); })
           .finally(() => { if (!controller.signal.aborted) setLoading(false); });
         return () => controller.abort();
       }, [jobId, revision]);
+      useEffect(() => { if (!loading) selftest?.finish(); }, [loading, selftest]);
       async function nextPage() {
         if (document.pages[pageIndex + 1]) { setPageIndex(pageIndex + 1); return; }
         const controller = life.current;
@@ -266,7 +272,7 @@ window.__ModuleLoader__.load({
         finally { if (!controller.signal.aborted) setLoading(false); }
       }
       const readable = document?.report && !raw;
-      return h('div', { className: 'dcc-actions' },
+      return h('div', { className: 'dcc-actions', 'data-dcc-report': jobId },
         h('div', { className: 'dcc-row' },
           h('strong', null, readable ? '任务报告' : `任务报告 · 第 ${pageIndex + 1} 页`),
           document?.report ? h(Button, { size: 'sm', onClick: () => setRaw((value) => !value) }, raw ? '查看易读报告' : '查看原文') : null,
@@ -284,7 +290,7 @@ window.__ModuleLoader__.load({
           !readable && page?.eof ? h('small', null, '已到当前输出末尾；任务运行中可刷新报告。') : null));
     }
 
-    function Panel() {
+    function Panel({ selftest } = {}) {
       const [status, setStatus] = useState(null);
       const [attention, setAttention] = useState(null);
       const [settings, setSettings] = useState(null);
@@ -322,7 +328,7 @@ window.__ModuleLoader__.load({
             const fresh = () => !controller.signal.aborted && version === generation.current && !mutation.current;
             async function read(key, route, update) {
               try {
-                const value = await api(route, controller.signal);
+                const value = await (selftest?.read || api)(route, controller.signal);
                 if (!fresh()) return;
                 update(value);
                 setErrors((old) => ({ ...old, [key]: '' }));
@@ -339,11 +345,17 @@ window.__ModuleLoader__.load({
             ];
             await Promise.all(reads);
           }
-          if (!controller.signal.aborted) timer = setTimeout(refresh, 7000);
+          if (!controller.signal.aborted && !selftest) timer = setTimeout(refresh, 7000);
         }
         refresh();
         return () => { controller.abort(); clearTimeout(timer); };
       }, [filter, revision, jobOffset]);
+
+      useEffect(() => {
+        if (!selftest || !['status', 'settings', 'jobs', 'prompt', 'attention'].every((key) => Object.hasOwn(errors, key))) return;
+        if (jobs?.jobs.length) setReportJob(jobs.jobs[0].job_id);
+        else selftest.finish();
+      }, [selftest, errors, jobs]);
 
       function selectJobPage(offsets) {
         generation.current += 1;
@@ -354,7 +366,7 @@ window.__ModuleLoader__.load({
       }
 
       async function mutate(key, path, body, success) {
-        if (mutation.current || !life.current) return;
+        if (selftest || mutation.current || !life.current) return;
         const controller = life.current;
         mutation.current = true;
         generation.current += 1;
@@ -486,7 +498,7 @@ window.__ModuleLoader__.load({
             h(Message, { text: messages.settingsSave }), h(Message, { text: errors.settingsSave, error: true }))
             : h('p', null, errors.settings ? '设置暂时无法读取，请刷新后重试。' : '正在读取设置…')),
 
-        h('section', { 'aria-label': '任务记录' }, h('h3', null, '任务记录'),
+        h('section', { 'aria-label': '最近任务' }, h('h3', null, '最近任务'),
           h('div', { className: 'dcc-row', role: 'group', 'aria-label': '筛选任务' },
             ...[['running', '正在跑'], ['attention', '待关注'], ['all', '全部']].map(([value, label]) =>
               h(Button, { key: value, size: 'sm', variant: filter === value ? 'primary' : 'ghost', 'aria-pressed': filter === value,
@@ -523,7 +535,7 @@ window.__ModuleLoader__.load({
             h(Button, { size: 'sm', disabled: !!busy || !(jobs?.next_offset > jobOffset),
               onClick: () => selectJobPage([...jobOffsets, jobs.next_offset]) }, '下一页')),
           h(Message, { text: messages.cancel }), h(Message, { text: errors.cancel, error: true }),
-          reportJob ? h(Report, { key: reportJob, jobId: reportJob, onClose: () => setReportJob(null) }) : null),
+          reportJob ? h(Report, { key: reportJob, jobId: reportJob, onClose: () => setReportJob(null), selftest }) : null),
 
         h('section', { 'aria-label': '规划提示词' }, h('h3', null, '规划提示词'),
           h('p', { className: 'dcc-muted' }, '填写给 DeepSeek 的要求，例如怎样安排任务、判断做完没有。自动刷新不会覆盖正在编辑的草稿。'),
@@ -543,15 +555,106 @@ window.__ModuleLoader__.load({
           h(Message, { text: messages.promptSave }), h(Message, { text: errors.promptSave, error: true })));
     }
 
+    function collectSelftest(node, http, errors, timedOut) {
+      const headings = Array.from(node.querySelectorAll('h3'), (item) => item.textContent);
+      const rows = Array.from(node.querySelectorAll('.dcc-status'));
+      const value = (label) => {
+        const row = rows.find((item) => item.querySelector('strong')?.textContent === `${label}：`);
+        return row ? row.firstElementChild.textContent.slice(label.length + 1).slice(0, 256) : null;
+      };
+      const report = node.querySelector('.dcc-readable');
+      const titles = Array.from(report?.querySelectorAll('h4') || [], (item) => item.textContent);
+      return {
+        settingsRegistered: true,
+        sections: Object.fromEntries(['运行状态', '常用设置', '最近任务', '规划提示词'].map((title) => [title, headings.includes(title)])),
+        status: { version: value('正在运行的版本'), model: value('当前模型'), effort: value('思考程度'), serviceTier: value('速度档') },
+        taskCount: node.querySelectorAll('.dcc-job').length,
+        report: { opened: !!node.querySelector('[data-dcc-report]'), summary: titles.includes('概述'),
+          criteria: titles.some((title) => title.startsWith('逐条验收')),
+          firstCriterion: Array.from(report?.querySelector('ol > li')?.textContent || '').slice(0, 80).join('') },
+        http,
+        errors: [...new Set([...errors, ...Array.from(node.querySelectorAll('.dcc-error'), (item) => item.textContent)])]
+          .slice(0, 40).map((text) => Array.from(text).slice(0, 1000).join('')),
+        userAgent: navigator.userAgent, origin: location.origin, timedOut,
+      };
+    }
+
+    async function runSelftest(request, signal, http = []) {
+      const node = document.createElement('div');
+      node.setAttribute('aria-hidden', 'true');
+      node.inert = true;
+      node.style.cssText = 'position:fixed;left:-100000px;top:0;width:960px;visibility:hidden;pointer-events:none';
+      const errors = [];
+      let root, timedOut = false, finish;
+      const finished = new Promise((resolve) => { finish = resolve; });
+      const capture = (error) => errors.push(String(error?.message ?? error));
+      const onError = (event) => capture(event.error ?? event.reason ?? event.message);
+      const timeout = setTimeout(() => { timedOut = true; capture('面板自检超过 30 秒。'); finish(); }, 30000);
+      signal.addEventListener('abort', finish, { once: true });
+      window.addEventListener('error', onError);
+      window.addEventListener('unhandledrejection', onError);
+      document.body.appendChild(node);
+      let result;
+      try {
+        const { createRoot } = require('react-dom/client');
+        class Boundary extends React.Component {
+          constructor(props) { super(props); this.state = { failed: false }; }
+          static getDerivedStateFromError() { return { failed: true }; }
+          componentDidCatch(error) { capture(error); finish(); }
+          render() { return this.state.failed ? null : this.props.children; }
+        }
+        const selftest = { finish, read: (path, readSignal) => api(path, readSignal, undefined, http) };
+        root = createRoot(node);
+        root.render(h(Boundary, null, h(Panel, { selftest })));
+        await finished;
+      } catch (error) { capture(error); }
+      finally {
+        clearTimeout(timeout);
+        signal.removeEventListener('abort', finish);
+        try { result = collectSelftest(node, http, errors, timedOut); }
+        finally {
+          try { root?.unmount(); } catch (error) {
+            if (result?.errors.length < 40) result.errors.push(Array.from(String(error?.message ?? error)).slice(0, 1000).join(''));
+          }
+          node.remove();
+          window.removeEventListener('error', onError);
+          window.removeEventListener('unhandledrejection', onError);
+        }
+      }
+      if (!signal.aborted) await api('/selftest/result', signal, { ...request, result });
+      return result;
+    }
+
+    function startSelftests() {
+      if (typeof document === 'undefined') return () => {};
+      const controller = new AbortController();
+      let timer;
+      async function check() {
+        const http = [];
+        try {
+          const { request } = await api('/selftest/request', controller.signal, undefined, http);
+          if (request && !controller.signal.aborted) await runSelftest(request, controller.signal, http);
+        } catch (_) { /* A failed probe must not affect the settings entry. */ }
+        if (!controller.signal.aborted) timer = setTimeout(check, 60000);
+      }
+      check();
+      return () => { controller.abort(); clearTimeout(timer); };
+    }
+
     function apply(ctx) {
       ctx.inject(['slots'], (ctx) => {
         const slots = ctx.get('slots');
-        return slots.inject('settings.section', () => slots.register({
-          name: 'settings.section', id: 'dsh-codex-conductor', order: 80, label: () => 'Codex 指挥',
-        }, Panel));
+        return slots.inject('settings.section', () => {
+          const unregister = slots.register({
+            name: 'settings.section', id: 'dsh-codex-conductor', order: 80, label: () => 'Codex 指挥',
+          }, Panel);
+          const stop = startSelftests();
+          return () => { stop(); unregister(); };
+        });
       });
     }
 
-    return { apply, Panel, Status, ReadableReport, Report, parseReport, loadReport, settingsPatch, pendingPatch, REPORT_LIMIT };
+    return { apply, Panel, Status, ReadableReport, Report, parseReport, loadReport, settingsPatch, pendingPatch, REPORT_LIMIT,
+      collectSelftest, runSelftest, startSelftests };
   },
 });

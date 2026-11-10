@@ -28,6 +28,18 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 面板沿用 DSH 的网页服务，不另开端口；`/dsh-codex-conductor/*` 的每个接口都调用 DSH 自己的登录及 Host/Origin 校验，缺少鉴权服务时拒绝访问。`webServer`、`settings` 或客户端槽位不存在时不影响原有工具。文件 URL 加载也支持前端：升级时保留完整包（包括 `package.json`、`client.js`、`panel.mjs`），仍用 `file:///…/index.mjs?v=…`，更换 entry ID 和 `v` 后由 DSH 热加载，无须重启宿主。`runtimeProfileFile` 须指向这个实例实际使用的 `cordis.patch.yml`；新版本先由用户部署。
 
+### 0.9.61：桌面面板只读自检
+
+在 `%LOCALAPPDATA%\dsh-codex-conductor\panel-selftest-request.json` 写入 `{}` 或 `{"id":"desktop-check-1"}` 即可触发；`id` 可选，最多 128 个 Unicode 字符，省略时自动生成。建议先写同目录临时文件，再改名发布。前端在设置入口登记后检查一次，之后每 60 秒检查一次；没有请求时不渲染面板、不读取业务接口、不写自检文件。
+
+第一个通过 DSH 登录及来源校验的前端会原子认领文件，在不可见、不可聚焦的离屏节点里用页面的 React 和 DSH 基础组件渲染真实面板，读取状态、设置、最近任务、提示词和关注数；有任务时自动打开第一条报告的易读视图。整次渲染最多等 30 秒，完成或超时后卸载并移除节点。自检只读，不保存设置、不重载、不取消任务、不写提示词；唯一 POST 是提交自检结果。
+
+结果原子替换同目录的 `panel-selftest-result.json`，包含后端的 `id`、`version`、`pid`、`receivedAt`，以及前端的 `settingsRegistered`、四个标题的 `sections`、状态区实际显示值 `status`（`version/model/effort/serviceTier`）、本页 `taskCount`、`report`（`opened/summary/criteria/firstCriterion`，首条验收前 80 个 Unicode 字符）、`http`（读取接口的路径和状态码，无 HTTP 响应时为 `null`）、`errors`、`timedOut`、`userAgent` 和 `origin`。检查 `userAgent` 中的 `Electron/` 才能确认认领者是桌面窗口；Web 页面也可能先认领。无任务时报告布尔值为 `false`，不代表报告渲染失败。
+
+`GET /dsh-codex-conductor/selftest/request` 返回 `{"request":null}` 或 `{"request":{"id":"…","claim":"…"}}`；`POST /dsh-codex-conductor/selftest/result` 接收 `{"id":"…","claim":"…","result":{…}}`，请求体上限 64 KiB，严格校验字段，认领凭据只能成功提交一次。请求文件上限 4 KiB，仅允许 `id`。结果只保留最近一次；非法请求或未完成的认领保留为 `panel-selftest-request.<claim>.processing.json`，不会自动重放。没有结果或结果中有错误时，不能据此宣称桌面验收通过。
+
+部署注意：`@deepseek-ai/dsh-client-hmr` 通过 `/plugins/events` 向已打开窗口推送模块图或重建通知；正常条目的前端 revision 变化才会清缓存并重新执行模块。revision 来自 `client.js` 的修改时间、创建/元数据变更时间和大小，不是 profile token。只换 profile token 不保证前端重载；revision 未变且条目未被移除重建时，需要刷新窗口或重启 DSH。部署新版 `client.js` 并收到变化后的 revision 时，可以在页面内热替换，无须整窗刷新。
+
 ### 0.9.52：从本机请求续接被中断的会话
 
 向 `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.json` 写入以下 JSON（与 `loaded.json` 同目录）。建议先写临时文件，再在同目录改名发布，避免插件读到未写完的 JSON：
@@ -365,6 +377,18 @@ Reports offer a readable view and the original text for both v2 and legacy forma
 `0.9.60` shows original acceptance criteria in the readable report (expandable after 300 characters, falling back to report labels when unavailable) and returns HTTP 409 for state conflicts such as cancelling already-written settings, while internal failures remain 500.
 
 Every `/dsh-codex-conductor/*` endpoint explicitly uses DSH's own login and Host/Origin checks on its existing web server; no extra port is opened, and missing authentication fails closed. Missing optional web/settings/slot services leave the existing tools available. File-URL loading supports the client declaration: deploy the complete package, including `package.json`, `client.js`, and `panel.mjs`, keep `file:///…/index.mjs?v=…`, and change the entry ID and `v` token for a hot load without restarting DSH. Set `runtimeProfileFile` to that instance's real `cordis.patch.yml`; deployment is a separate user action.
+
+### 0.9.61: Read-only desktop panel self-test
+
+Write `{}` or `{"id":"desktop-check-1"}` to `%LOCALAPPDATA%\dsh-codex-conductor\panel-selftest-request.json`. The optional ID accepts up to 128 Unicode characters and is generated if omitted. Prefer publishing a temporary file by renaming it in the same directory. After registering the settings entry, the client checks once and then every 60 seconds. Without a request it does not mount the panel, read business endpoints, or write self-test files.
+
+The first client passing DSH's login and origin checks atomically claims the request. It mounts the real panel with the page's React and DSH primitives in an invisible, unfocusable offscreen node, reads status, settings, recent tasks, the prompt and attention count, and opens the first task's readable report if present. Rendering times out after 30 seconds; completion or timeout unmounts and removes the node. It never saves settings, reloads the plugin, cancels tasks, or writes prompts. Its only POST submits the self-test result.
+
+The atomically replaced `panel-selftest-result.json` in the same directory contains server fields `id`, `version`, `pid`, `receivedAt`; client fields `settingsRegistered`, the four heading flags in `sections`, displayed `status` values (`version/model/effort/serviceTier`), current-page `taskCount`, `report` (`opened/summary/criteria/firstCriterion`, the first 80 Unicode characters), `http` paths/status codes (`null` when no HTTP response arrived), `errors`, `timedOut`, `userAgent`, and `origin`. Look for `Electron/` in `userAgent` to confirm the desktop window claimed it; a Web client can claim first. Report flags remain false when there are no tasks.
+
+`GET /dsh-codex-conductor/selftest/request` returns `{"request":null}` or `{"request":{"id":"…","claim":"…"}}`. `POST /dsh-codex-conductor/selftest/result` accepts `{"id":"…","claim":"…","result":{…}}`, strictly validates fields, limits the body to 64 KiB, and accepts a claim only once. The request file allows only `id` and is limited to 4 KiB. Only the latest result is retained. Invalid or unfinished requests remain as `panel-selftest-request.<claim>.processing.json` and are never replayed automatically. A missing result or a result containing errors is not proof of a successful desktop check.
+
+Deployment: `@deepseek-ai/dsh-client-hmr` pushes graph/rebuild events to open windows through `/plugins/events`. Healthy entries clear their cached code and execute again when their client revision changes. That revision comes from `client.js` mtime, ctime and size, not the profile token. Changing only that token does not guarantee a client reload; if the revision stays unchanged and the entry is not removed/recreated, refresh the window or restart DSH. Deploying an updated `client.js` and receiving its changed revision permits in-page replacement without a whole-window refresh.
 
 ### 0.9.52: Resume interrupted sessions from a local file
 
