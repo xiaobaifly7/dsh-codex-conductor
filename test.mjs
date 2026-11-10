@@ -15,7 +15,7 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
 process.env.LOCALAPPDATA = localAppData;
 after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-test('entry reload queries re-evaluate both workflow and runtime helpers', async () => {
+test('entry reload queries re-evaluate workflow, runtime and guard helpers', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'conductor-reload-'));
   const traceKey = `conductor-reload-${path.basename(dir)}`;
   globalThis[traceKey] = [];
@@ -29,11 +29,14 @@ test('entry reload queries re-evaluate both workflow and runtime helpers', async
       writeFileSync(path.join(dir, 'runtime.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('runtime-${version}');\n` +
         'export const runtimeIdentity = () => ({}), registerRuntimeTool = () => {};\n');
+      writeFileSync(path.join(dir, 'guard.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
+        readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));
       const entry = pathToFileURL(path.join(dir, 'index.mjs'));
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['guard-new', 'guard-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
