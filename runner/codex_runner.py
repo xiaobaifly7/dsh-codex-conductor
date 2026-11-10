@@ -297,7 +297,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
     cmd, env = build_command(args, run_dir, thread_id)
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
              "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
-             "file_changes": []}
+             "file_changes": [], "prompt_delivered": False}
     start = time.monotonic()
     proc = reader = writer = None
     startup = acquire_file_lock(run_dir / "process.lock", blocking=True)
@@ -392,6 +392,10 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     continue
                 kind = ev.get("type")
                 item = ev.get("item") or {}
+                # Startup events and configuration warnings can precede saving this turn's input.
+                if kind in ("item.started", "item.completed") and item.get("type") in (
+                        "command_execution", "file_change", "agent_message"):
+                    state["prompt_delivered"] = True
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
                 if kind == "error":
                     reconnecting_since = reconnecting_since or time.monotonic()
@@ -705,7 +709,7 @@ def execute(args, prompt, run_dir):
             delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
             time.sleep(delay)
-            if thread_id and args.sandbox != "read-only" and kind != "router_down":
+            if thread_id and args.sandbox != "read-only" and kind != "router_down" and state["prompt_delivered"]:
                 prompt = ("The previous attempt was interrupted. Inspect the current state of the workspace, "
                           "then finish the original task without repeating completed work.")
             elif args.sandbox == "read-only" and kind != "router_down":
