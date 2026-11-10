@@ -1787,7 +1787,7 @@ export function apply(ctx, config = {}, run = runRunner) {
   ctx.tools.register({
     name: 'codex_summary',
     description: '只读汇总当前会话的多轮 Codex 任务；相同 thread_id 归为一组，无线程的独立列出。' +
-      '显示最新验收、待办、交付文件、累计已结束耗时和用量。thread_total 是线程累计值，不把每轮累计值重复相加。' +
+      '显示最新验收、待办、交付文件、累计已结束耗时、用量及筛选范围内的错误分类统计。thread_total 是线程累计值，不把每轮累计值重复相加。' +
       '可传 cwd 查一个项目，或 session_id 查指定会话；默认每页 10 组，用 limit 和 offset 翻页。不会启动或继续任务。',
     presentCall: () => ({ card: 'generic', kind: 'read', title: 'Codex 多轮任务汇总' }),
     parameters: { type: 'object', properties: {
@@ -1798,7 +1798,9 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: { schema: DATA_OUTPUT.schema, render: (_args, value) => [{ type: 'text', text: Array.isArray(value.groups)
       ? [`Codex 汇总：${value.total} 组，${value.total_jobs} 轮；本页 ${value.groups.length} 组。` +
         (value.next_offset == null ? '' : `沿用筛选和每页条数，传 offset=${value.next_offset} 查看下一页。`) +
-        '执行结束与独立验收分别显示。', ...value.groups.map((g) =>
+        '执行结束与独立验收分别显示。',
+        `错误分类（全部匹配任务）：${value.error_kinds ? Object.entries(value.error_kinds).map(([kind, count]) => `${kind}=${count}`).join('、') || '无' : '未知'}`,
+        ...value.groups.map((g) =>
         [`${g.thread_id ?? g.group_id} · ${g.total_rounds} 轮 · 最新 ${g.latest_job_id} · 执行 ${g.latest_job?.execution_status ?? g.latest_job?.status ?? 'unknown'} · 独立核验 ${g.verification_status ?? 'unknown'}`,
           `目标：${taskLine(g.latest_job?.context, 160)}`, `最新结果：${g.summary ?? ''}`,
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
