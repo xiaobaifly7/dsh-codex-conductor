@@ -10,6 +10,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.45` 保留默认关闭的 `plannerAnswers`：规划端可按用户原始目标和已有事实回答范围内的问题，并在汇报中说明代做的决定。扩大有待确认冲突的写入范围或接受范围外改动，仍须原会话用户确认。
 
+`0.9.48` 放行更多可确认只读的文本、文件核验命令和普通变量赋值，说明危险用法的拒绝原因，并保留其他存活进程的加载记录。
+
 ## 功能
 
 **派活工具**
@@ -136,8 +138,9 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - PowerShell 的 `-Command` 形式（包括只读查询）默认拒绝。需要 Windows 执行与核验时，交给主机访问模式的 Codex，或使用项目 `tests` 目录下的已有验证脚本。
 - `gzip` 只放行首参数为字面量 `-t` 或 `--test` 的压缩文件完整性检查；直接压缩、解压文件的形式仍然拒绝。
 - 查看本地 gzip 压缩归档内容可用 `env -u TAR_OPTIONS tar -tzvf ./archive.tar.gz`。只接受一个固定本地路径；移除 `TAR_OPTIONS` 后才允许列目录，解包、远程归档和额外选项仍拒绝。
-- `sed` 只放行 `sed -n '<地址>p' 文件…`，支持用 `;` 分隔多段打印（如 `1,5p;20,25p`）：地址是行号、`N,M` 或 `/正则/`（可带第二个 `/正则/`），正则里不能有 `\` 和 `$`；后面的参数不能以 `-` 开头（`-i`、`--in-place`、`-e`、`-f` 都不行），也不能含 `$` 或 `{`。取末行用 `tail`。`printf -v` 和含 `$` 的首参数不放行，其余输出参数仍可用变量和只读命令替换。
-- 有参数过滤的命令（`git`、`find`、`sort`、`uniq`、`iconv`、`rg`、`tree`、`file`、`date`、`node`、`go`、`cargo`、`make`、`npm/pnpm/yarn`）不接受含 `$` 的参数、未引用的花括号展开或可能展开成选项的未引用 glob（如 `find . -[d]elete`）；带固定路径前缀的匹配（如 `find src/* -type f`、`git diff src/*.mjs`）和引用的字面模式仍可用；`cat $(ls)` 这类读取也不受此限制。输入重定向的目标也接受同样的替换检查；`-v/-R` 和 `read` 的赋值目标必须是安全的字面变量名，`read` 的提示文本仍可使用变量。`git grep -O/--open-files-in-pager`、Go 的 `-exec/-toolexec/-vettool`、`sort --compress-program/--random-source` 不放行。Git 另支持 `config --get/-l/--list`、`remote [-v/--verbose]`、`tag -l/--list` 和 `stash list` 这些只读形式。
+- `sed` 支持固定的 `p` 打印和 `s` 替换输出（可用 `;` 组合），拒绝 `-i/-f/-e`、`w/e/r` 命令及替换的 `w/e` 标志；打印地址沿用行号、`N,M` 或不含 `\`、`$` 的 `/正则/`，取末行用 `tail`。`awk` 支持固定的 stdout 程序，拒绝 `system`、进程管道、写重定向、`getline` 和扩展加载。`find -exec/-execdir` 只接受完整的已放行只读命令，拒绝删除、文件输出及交互执行动作。`dd` 仅接受 `if=/bs=/skip=/count=` 并输出到 stdout；`paste`、`tr`、`base64 -d`、`ssh-keygen -l -f` 可用于读取核验。
+- 普通数据变量可作为只读命令的赋值前缀；会改变命令查找、启动代码或执行选项的环境变量不放行。命令开头用 `;` 或换行分隔的字面路径赋值可用于后续核验及只读命令替换，未知变量和可能生成危险选项的展开仍拒绝；条件、循环或 `read` 会清除已知变量信息。`xargs` 仅支持可选的 `-r` 加固定的 `cat` 或 `sha256sum`。`printf -v` 和含 `$` 的首参数不放行，其余输出参数仍可用变量和只读命令替换。
+- 有参数过滤的命令（`git`、`find`、`sed`、`awk`、`dd`、`base64`、`ssh-keygen`、`icacls`、`sort`、`uniq`、`iconv`、`rg`、`tree`、`file`、`date`、`node`、`go`、`cargo`、`make`、`npm/pnpm/yarn`）不接受未确定的变量或命令替换、未引用的花括号展开或可能展开成选项的未引用 glob（如 `find . -[d]elete`）；`sed/awk` 的脚本本身也不能由 glob 生成。带固定路径前缀的文件匹配（如 `find src/* -type f`、`git diff src/*.mjs`）和引用的字面模式仍可用；`cat $(ls)` 这类读取也不受此限制。输入重定向的目标也接受同样的替换检查；`-v/-R` 和 `read` 的赋值目标必须是安全的字面变量名，`read` 的提示文本仍可使用变量。`git grep -O/--open-files-in-pager`、Go 的 `-exec/-toolexec/-vettool`、`sort --compress-program/--random-source` 不放行。Git 另支持 `config --get/-l/--list`、`remote [-v/--verbose]`、`tag -l/--list`、`stash list`、`--version`、`rev-list`、`diff-tree` 和 `check-ignore` 这些只读形式；`tasklist`、`netstat`、裸 `env`、`reg query` 和单路径 `icacls` 查询也可用。
 - `file` 的 `-C/--compile` 编译模式、`date` 的 `-s/--set` 和直接设时间形式不放行，也覆盖短选项组合及长选项缩写。Git 的 `--ext-diff/--textconv` 及有效缩写（如 `--ext-d`、`--textc`）被拒绝，合法只读选项 `--text` 仍可用。
 - `bash -n` / `sh -n` 只接受静态文件参数，禁止 `+n`、变量和未引用的展开；`test` / `[` 只接受静态操作符，文件名和字符串仍可用引用变量。`uniq` 不接受未引用的通配符；`tree` 的 `-o` 及含它的短选项组合均不放行。
 - 拒绝时说明原因：命令结构本身不放行时，列出不放行的结构（写到 `/dev/null` 以外的重定向、反引号、heredoc、`$((...))`、`$[...]`、进程替换、`$(...)` 里的非只读命令、未闭合引号）；否则指出第一段不放行的命令（去掉流程关键字和 `timeout N` 前缀后，截取前 200 字）。
@@ -270,7 +273,7 @@ python3 runner/codex_runner.py forget-too-big --cwd DIR
 - 护栏是工作流约束，不是安全沙箱：它按工具名和命令文本判断，`pytest`、`npm test`、`tests/*.ps1` 等会执行项目代码。
 - `host_access=true` 的任务没有沙箱，Codex 能动整台机器；不越界和只读都只靠提示约束，只在信任的本机环境里开启 `allowHostAccess`。
 - 防虚报检查基于文字匹配，可能漏判或误判，每个回合最多提醒一次。
-- 插件加载时会写 `%LOCALAPPDATA%\dsh-codex-conductor\loaded.json`（加载时间、进程号、实际加载的模块地址、护栏工作区），用于确认插件已生效。
+- 插件加载时会写 `%LOCALAPPDATA%\dsh-codex-conductor\loaded.json`（加载时间、进程号、实际加载的模块地址、护栏工作区），用于确认插件已生效；已有有效记录属于其他存活进程时保留，属于本进程、PID 已退出或记录损坏时更新，`codex_runtime` 的 `instance` 仍来自当前进程内存。
 
 ## 测试
 
@@ -290,6 +293,8 @@ python3 runner/test_codex_runner.py
 `0.9.43` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
 
 `0.9.45` keeps opt-in `plannerAnswers` for decisions within the user's original goal and known facts. Expanding a pending conflicting write scope or accepting out-of-scope changes still requires a reply in the original session.
+
+`0.9.48` permits more demonstrably read-only text and file checks and ordinary assignments, explains dangerous command forms, and preserves another live process's loaded record.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
@@ -403,11 +408,15 @@ Planner instructions live in `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.
 
 Configured `workspaces` deny the agent's file-writing/arbitrary-execution tools. `'*'` covers every workspace; native Linux `/` covers the root and native descendants and also works as scope. Windows drives and `/mnt/<drive>/...` retain Windows-path matching. Seep's arbitrary `seep_r2_cmd` goes to Codex; structured `seep_r2_info`/`seep_status` queries remain available.
 
-Shell verification permits pipelines, conditions, loops and read-only `$(...)`, but refuses non-null write redirection, backticks, heredocs, process substitution and arithmetic `$((...))`/`$[...]`. Single-quoted/escaped arithmetic text stays literal. Argument-filtered commands reject `$`, unquoted braces and unquoted globs capable of generating options (`find . -[d]elete`); fixed paths (`find src/* -type f`, `git diff src/*.mjs`) and quoted patterns remain supported.
+Shell verification permits pipelines, conditions, loops and read-only `$(...)`, but refuses non-null write redirection, backticks, heredocs, process substitution and arithmetic `$((...))`/`$[...]`. Single-quoted/escaped arithmetic text stays literal. Argument-filtered commands reject unresolved expansions, unquoted braces and unquoted globs capable of generating options (`find . -[d]elete`); fixed paths (`find src/* -type f`, `git diff src/*.mjs`) and quoted patterns remain supported. Ordinary data assignments may prefix read-only commands; environment settings that affect program lookup, startup code or execution options remain denied. Initial literal path assignments separated by semicolons/newlines can supply later checks and read-only substitutions; conditions, loops and `read` clear known values.
 
 `file -C/--compile`, `date -s/--set` and positional time setting are refused, including short-option combinations/long abbreviations. Git `--ext-diff/--textconv` abbreviations (`--ext-d`, `--textc`) are refused; `--text` stays valid. Caller-selected Git pagers, Go execution tools and sort compression/random sources remain denied. Read-only Git config, remote, tag and stash forms remain supported.
 
-`sed` only allows `sed -n '<addr>p[;<addr>p…]' file...`. Redirection targets receive substitution checks; variable-test/read destinations must be literal. `allowCommands` uses JavaScript regexes; invalid patterns warn and are skipped without disabling the guard. Denials identify the structure or first refused segment. PowerShell syntax checks use bundled [`tools/Test-PsSyntax.ps1`](tools/Test-PsSyntax.ps1): `pwsh -NoProfile -File <that script> a.ps1 ...`. Dispatch reminders use this session's live jobs across reloads; other sessions' jobs do not suppress them. The guard is a workflow constraint, not a sandbox; test commands execute project code.
+`sed` permits static `p` printing and `s` substitution to stdout, including semicolon-separated scripts, while refusing in-place editing, external scripts, `w/e/r` commands and substitution `w/e` flags. `awk` permits static stdout programs without `system`, process pipes, output redirection, `getline` or extension loading. Neither program may come from unquoted glob expansion. `find -exec/-execdir` accepts complete, already-permitted read-only commands; deletion, file output and interactive execution stay denied. `dd` accepts only `if=/bs=/skip=/count=` with stdout output. `paste`, `tr`, `base64 -d` and `ssh-keygen -l -f` are supported. Process and port queries (`tasklist`, `netstat`), bare `env`, `reg query`, single-path `icacls` queries and Git `--version/rev-list/diff-tree/check-ignore` also pass. Redirection targets receive substitution checks; variable-test/read destinations must be literal. `allowCommands` uses JavaScript regexes; invalid patterns warn and are skipped without disabling the guard. Denials identify the structure or first refused segment, with a specific reason for dangerous sed/awk/find/dd forms. PowerShell syntax checks use bundled [`tools/Test-PsSyntax.ps1`](tools/Test-PsSyntax.ps1): `pwsh -NoProfile -File <that script> a.ps1 ...`. Dispatch reminders use this session's live jobs across reloads; other sessions' jobs do not suppress them. The guard is a workflow constraint, not a sandbox; test commands execute project code.
+
+`xargs` accepts only optional `-r` followed by literal `cat` or `sha256sum`.
+
+`loaded.json` is preserved when its valid record belongs to another live PID, and refreshed for this process, a dead PID or a corrupt record; `codex_runtime.instance` always uses the current in-memory identity.
 
 Bare, argument-free `:` and `continue` are supported. Quoted/escaped forms, `timeout` wrappers and executable paths remain refused.
 Direct `command -v name …` lookup of literal command names is allowed; execution mode, expanded operands and wrapper/path invocations remain refused.

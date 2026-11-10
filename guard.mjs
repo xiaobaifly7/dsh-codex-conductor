@@ -20,14 +20,13 @@ const READERS = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'grep',
   'file', 'du', 'df', 'diff', 'cmp', 'sha256sum', 'sha1sum', 'md5sum', 'nl', 'cut', 'tr', 'column', 'jq',
   'basename', 'dirname', 'realpath', 'readlink', 'which', 'echo', 'printf', 'date', 'hexdump', 'od',
   'strings', 'readelf', 'objdump', 'nm', 'true', 'test', '[', '[[', 'read', 'exit', 'pytest', 'ps', 'pgrep',
-  'uname', 'whoami', 'id']);
+  'uname', 'whoami', 'id', 'paste', 'tasklist', 'netstat']);
 // 流程控制关键字本身不执行任何东西，剥掉后检查它带的命令
 const LEAD_KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '(', 'time']);
 const CLOSE_KEYWORDS = new Set(['fi', 'done', '}', ')']);
 const GIT_READ = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'ls-tree', 'blame',
-  'grep', 'describe', 'shortlog', 'cat-file', 'whatchanged']);
+  'grep', 'describe', 'shortlog', 'cat-file', 'whatchanged', 'rev-list', 'diff-tree', 'check-ignore']);
 const GIT_BRANCH_READ = new Set(['-a', '-r', '-v', '-vv', '--list', '--all', '--show-current', '--no-color']);
-const FIND_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls']);
 // 项目自带的验证脚本视同 pytest：只放行 -File 指向 tests 目录下的 .ps1，不放行 -Command
 // 只认字面的 pwsh 路径：$PWSH 之类的变量可以先被单独赋值成任意命令，展开后按空白切开执行
 const PWSH = /^([^$]*[\\/])?(pwsh|powershell)(\.exe)?$/i;
@@ -39,6 +38,11 @@ export const PS_SYNTAX = wslPath(PS_SYNTAX_WIN);
 // 地址里不放行 \/：转义的斜杠会让后面的 e/w 命令混进地址；也不放行 $：变量或命令替换展开后同样能混进 e/w（末行用 tail）
 const SED_ADDRESS = String.raw`(?:\d+(?:,\d+)?|/[^/\\$]*/(?:,/[^/\\$]*/)?)`;
 const SED_PRINT = new RegExp(String.raw`^\s*${SED_ADDRESS}p(?:\s*;\s*${SED_ADDRESS}p)*\s*;?\s*$`);
+const SED_START = new RegExp(String.raw`^\s*(?:${SED_ADDRESS})?([sp])`);
+// These names change command lookup, startup code or tool execution options rather than hold task data.
+const EXEC_ENV = /^(?:PATH|HOME|XDG_CONFIG_HOME|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|CDPATH|GLOBIGNORE|BASH_XTRACEFD|PS4|PROMPT_COMMAND|LD_.*|DYLD_.*|GCONV_PATH|GIT_.*|TAR_OPTIONS|NODE_.*|PYTHON.*|AWKPATH|AWKLIBPATH)$/;
+const assignmentAllowed = (w) => /^[A-Za-z_][A-Za-z0-9_]*=(?![-(])\S*$/.test(w) &&
+  !w.includes('$(') && !EXEC_ENV.test(w.slice(0, w.indexOf('=')));
 
 const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex_run 交给 Codex；你只做只读核验：read / glob / grep 等读工具，' +
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、gzip -t、pytest、npm test 等，' +
@@ -91,10 +95,14 @@ function skipLineContinuations(command, i) {
 
 // 按未加引号的 && || | ; & 和换行切段，段内按空白切词并去掉引号。$(...) 交给 inner 判定，通过后当作一个普通词。
 // 返回 null 表示出现了不放行的结构：反引号、未通过的命令替换、进程替换、heredoc、写到 /dev/null 以外的重定向。
-export function splitCommand(command, inner = () => false, braceSegments = new Set(), expansions = new Map()) {
+export function splitCommand(command, inner = () => false, braceSegments = new Set(), expansions = new Map(), variables = new Map()) {
+  variables = new Map(variables);
+  let preamble = true;
   const segments = [];
   let words = [];
   let kinds = [];
+  let parameters = [];
+  let patterns = [];
   let word = '';
   let kind = 'literal';
   let started = false;
@@ -115,9 +123,15 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       } else {
         words.push(word);
         kinds.push(kind);
+        parameters.push(parameterWord);
+        const commandPosition = words.slice(0, -1).every((w, j) => kinds[j] === 'assignment' ||
+          (kinds[j] === 'literal' && LEAD_KEYWORDS.has(w)));
+        if ((commandPosition && (LEAD_KEYWORDS.has(word) || CLOSE_KEYWORDS.has(word) || ['for', 'read'].includes(word))) ||
+            (kind === 'assignment' && !preamble)) variables.clear();
         unsafeParameter ||= !braceExpansionsSafe(parameterWord);
         expanded ||= /\{(?:[^{}]*,[^{}]*|(?:-?\d+\.\.-?\d+|[A-Za-z]\.\.[A-Za-z])(?:\.\.-?\d+)?)\}/.test(syntax);
         const pattern = /[*?]|\[[^\]]+\]/.test(syntax);
+        patterns.push(pattern);
         glob ||= pattern;
         // test 的额外词可能变成操作符；固定字母/路径前缀的 glob 无法生成 -v、! 等词。
         fieldSplit ||= /\$(?![?#])/.test(syntax) ||
@@ -126,15 +140,27 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
     }
     word = ''; kind = 'literal'; started = false; syntax = ''; parameterWord = '';
   };
-  const endSegment = () => {
+  const endSegment = (separator = '') => {
     endWord();
     if (redirect) valid = false;
     if (words.length) {
       if (expanded) braceSegments.add(words);
-      expansions.set(words, { glob, fieldSplit, unsafeParameter, kinds });
+      expansions.set(words, { glob, fieldSplit, unsafeParameter, kinds, parameters, patterns });
       segments.push(words);
+      // Only an unconditional, initial assignment preamble supplies known scalar values.
+      if (preamble && words.every((w, i) => kinds[i] === 'assignment' && assignmentAllowed(w)) && [';', '\n'].includes(separator)) {
+        for (const w of words) {
+          const eq = w.indexOf('=');
+          const value = w.slice(eq + 1);
+          variables.delete(w.slice(0, eq));
+          if (/^[^\s$`*?\[\]{}\\~;|&<>]*$/.test(value)) variables.set(w.slice(0, eq), value);
+        }
+      } else {
+        preamble = false;
+        if (kinds.includes('assignment')) variables.clear();
+      }
     }
-    words = []; kinds = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
+    words = []; kinds = []; parameters = []; patterns = []; expanded = false; glob = false; fieldSplit = false; unsafeParameter = false;
   };
   for (let i = 0; i < command.length; i++) {
     const ch = command[i];
@@ -145,6 +171,17 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       continue;
     }
     if (ch === '`') return null;
+    if (ch === '$') {
+      const variable = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))/.exec(command.slice(i));
+      if (variable && variables.has(variable[1] ?? variable[2]) && (kind === 'assignment' ? !words.length : words.length > 0)) {
+        const value = variables.get(variable[1] ?? variable[2]);
+        word += value; parameterWord += value;
+        if (kind === 'literal') kind = 'word';
+        started = true; i += variable[0].length - 1;
+        continue;
+      }
+      if (next === '{' && !variable) variables.clear();
+    }
     const expansion = ch === '$' ? skipLineContinuations(command, i + 1) : -1;
     if (command[expansion] === '[') return null;
     if (command[expansion] === '(') {
@@ -152,7 +189,7 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       const start = expansion + 1;
       if (command[skipLineContinuations(command, start)] === '(') return null;
       const end = closingParen(command, start);
-      if (end < 0 || !inner(command.slice(start, end))) return null;
+      if (end < 0 || !inner(command.slice(start, end), variables)) return null;
       // 保留 $，让后面的检查（sed 脚本、pwsh 路径）看得出这里展开过
       word += '$X';
       parameterWord += '$X';
@@ -218,11 +255,12 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       continue;
     }
     if (ch === '\n' || ch === ';' || ch === '|' || ch === '&') {
-      endSegment();
+      endSegment(next === ch ? ch + next : ch);
       if ((ch === '|' || ch === '&') && next === ch) i++;
       continue;
     }
-    if (ch === '=' && kind === 'literal' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word)) kind = 'assignment';
+    if (ch === '=' && kind === 'literal' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(word) &&
+        words.every((w, j) => kinds[j] === 'assignment' || (kinds[j] === 'literal' && LEAD_KEYWORDS.has(w)))) kind = 'assignment';
     word += ch;
     parameterWord += ch;
     syntax += ch;
@@ -238,6 +276,7 @@ function gitAllowed(args) {
   while (args[i] === '--no-pager' || args[i] === '-P' || args[i] === '-C') i += args[i] === '-C' ? 2 : 1;
   const sub = args[i];
   const rest = args.slice(i + 1);
+  if (sub === '--version') return rest.length === 0;
   // --no-index 接受外部程序开关的缩写；--text 本身是合法的文本比较选项。
   if (rest.some((a) => /^--(output|ext(?:-|$)|textc)/.test(a.split('=')[0]))) return false;
   // -ePATTERN/-fFILE 等会吞掉后面的字母，其中的 O 不是 pager 开关。
@@ -274,6 +313,8 @@ function core(words, kinds) {
   while (start < end && kinds[start] === 'literal' && LEAD_KEYWORDS.has(words[start])) start++;
   while (start < end && kinds[end - 1] === 'literal' && CLOSE_KEYWORDS.has(words[end - 1]) &&
       (end - start === 1 || words[end - 1] === ')')) end--;
+  const assignments = [];
+  while (start < end && kinds[start] === 'assignment') assignments.push(words[start++]);
   let wrapped = false;
   while (words[start] === 'timeout') {
     let i = start + 1;
@@ -282,7 +323,108 @@ function core(words, kinds) {
     start = i + 1;
     wrapped = true;
   }
-  return { words: words.slice(start, end), kind: wrapped ? 'command' : kinds[start] };
+  return { words: words.slice(start, end), kind: wrapped ? 'command' : kinds[start], start, assignments };
+}
+
+// Read one sed field; unfamiliar bracket syntax is refused rather than mistaken for a delimiter.
+function sedField(script, start, delimiter, pattern) {
+  for (let i = start; i < script.length; i++) {
+    if (/\r|\n/.test(script[i])) return -1;
+    if (script[i] === '\\') {
+      if (!script[i + 1] || /\r|\n/.test(script[++i])) return -1;
+    } else if (script[i] === delimiter) return i;
+    else if (pattern && script[i] === '[') {
+      const cls = /^\[\^?(?:\[:[a-z]+:\]|[^\][\\\r\n])+\]/.exec(script.slice(i));
+      if (!cls || cls[0].includes(delimiter)) return -1;
+      i += cls[0].length - 1;
+    }
+  }
+  return -1;
+}
+
+function sedScriptAllowed(script) {
+  if (SED_PRINT.test(script)) return true;
+  let rest = script;
+  while (rest.trim()) {
+    const start = SED_START.exec(rest);
+    if (!start) return false;
+    let end = start[0].length;
+    if (start[1] === 's') {
+      const delimiter = rest[end++];
+      if (!delimiter || /[A-Za-z0-9\\\s]/.test(delimiter)) return false;
+      const pattern = sedField(rest, end, delimiter, true);
+      if (pattern < 0) return false;
+      const replacement = sedField(rest, pattern + 1, delimiter, false);
+      if (replacement < 0) return false;
+      end = replacement + 1;
+      const flags = /^[gIp0-9]*/.exec(rest.slice(end))[0];
+      end += flags.length;
+    }
+    rest = rest.slice(end).trimStart();
+    if (!rest) return true;
+    if (rest[0] !== ';') return false;
+    rest = rest.slice(1);
+  }
+  return false;
+}
+
+function sedIssue(args, patterns = []) {
+  let i = 0;
+  while (/^-[nEr]+$/.test(args[i] ?? '') || ['--quiet', '--silent', '--regexp-extended'].includes(args[i])) i++;
+  if (args.some((a) => /^-[^-]*i/.test(a) || a.startsWith('--in-place'))) return '-i/--in-place 会改写文件';
+  if (!args[i] || args[i].startsWith('-')) return '仅支持内联打印或替换脚本，不放行 -e/-f 等脚本选项';
+  if (patterns[i]) return '脚本不能由未引用的 glob 展开生成';
+  if (!sedScriptAllowed(args[i])) return '脚本仅支持 p/s 输出，不放行 w/e/r 命令及 s 的 w/e 标志';
+  if (args.slice(i + 1).some((a) => a.startsWith('-') && a !== '-')) return '脚本后的选项可能改写文件或加载其他脚本';
+  return '';
+}
+
+function awkIssue(args, patterns = []) {
+  let i = 0;
+  while (args[i] === '-F' || args[i] === '-v' || /^-F./.test(args[i] ?? '')) {
+    const option = args[i++];
+    if (option === '-F' || option === '-v') {
+      if (args[i] === undefined || (option === '-v' && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(args[i]))) return '-F/-v 缺少字面参数';
+      i++;
+    }
+  }
+  const script = args[i]?.replace(/\\\r?\n/g, '');
+  if (!script || script.startsWith('-')) return '不放行 -f/-e/-i/-l 等文件、附加程序或扩展加载选项';
+  if (patterns[i]) return '程序不能由未引用的 glob 展开生成';
+  if (/\bsystem\s*\(/.test(script)) return 'system(...) 可以启动进程';
+  if (script.replaceAll('||', '').includes('|')) return '管道 | 可以启动进程';
+  if (/>(?!=)/.test(script)) return '重定向 > 可以写文件';
+  if (/\bgetline\b/.test(script)) return 'getline 可以读取外部文件或管道';
+  if (script.includes('@')) return '@include/@load/间接调用可以加载或执行代码';
+  if (args.slice(i + 1).some((a) => a.startsWith('-') && a !== '-')) return '程序后的选项可能加载其他程序或扩展';
+  return '';
+}
+
+function findIssue(args, extra, braceExpansion, expansion) {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (/^-(?:delete$|fprint|fls$|ok)/.test(a)) return `${a} 会写文件或执行交互命令`;
+    if (a !== '-exec' && a !== '-execdir') continue;
+    let end = i + 1;
+    while (end < args.length && args[end] !== ';' && !(args[end] === '+' && args[end - 1] === '{}')) end++;
+    if (end === args.length || end === i + 1) return `${a} 缺少完整的只读命令及 ;/+ 结束符`;
+    const nested = args.slice(i + 1, end).map((w) => w.replaceAll('{}', '$X'));
+    const parameters = expansion.parameters.slice(i + 1, end).map((w) => w.replaceAll('{}', '$X'));
+    const patterns = expansion.patterns?.slice(i + 1, end);
+    const cmd = nested[0];
+    if (cmd === 'pytest' || (!READERS.has(cmd) && !['sed', 'awk', 'find', 'sort', 'uniq', 'dd', 'base64', 'ssh-keygen'].includes(cmd)) ||
+        !segmentAllowed(nested, extra, braceExpansion, { ...expansion, kinds: nested.map(() => 'command'), parameters, patterns })) {
+      return `${a} 后的 ${cmd} 不是已放行的只读命令`;
+    }
+    i = end;
+  }
+  return '';
+}
+
+function ddIssue(args) {
+  if (args.some((a) => a.startsWith('of='))) return 'of= 会写入输出文件';
+  const bad = args.find((a) => !/^(?:if|bs|skip|count)=.+$/.test(a));
+  return bad === undefined ? '' : `不放行 ${bad}，仅支持 if=/bs=/skip=/count= 并输出到 stdout`;
 }
 
 // bash 的算术求值会递归展开其中的变量和 $(...)，从而执行文件/变量值里夹带的命令。算术出现在：
@@ -376,37 +518,40 @@ function braceExpansionsSafe(word) {
 }
 
 function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
-  const { words, kind } = core(raw, expansion.kinds);
+  const { words, kind, start, assignments } = core(raw, expansion.kinds);
   if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
-  if (!words.length) return true;
   // 只检查实际展开；单引号和转义保护的字面文本不参与。
   if (expansion.unsafeParameter) return false;
+  if (!assignments.every(assignmentAllowed)) return false;
+  if (!words.length) return true;
   // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
   if (words[0] === 'for') return kind === 'literal' && (words.length <= 2 || words[2] === 'in') &&
     words.slice(3).every((w) => !w.startsWith('-'));
-  // 单独的变量赋值（D=/mnt/...）无害；带命令的前缀赋值（X=1 cmd）不放行。
-  // 值不能以 - 开头或含空白，免得展开后变成参数（X=-delete; find . $X）；
-  // 也不能含字面的 $(，否则 [[ X -eq 0 ]] 之类的算术求值会执行它
-  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) {
-    return kind === 'assignment' && words.length === 1 &&
-      /^[A-Za-z_][A-Za-z0-9_]*=(?!-)\S*$/.test(words[0]) && !words[0].includes('$(');
-  }
+  if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) return false;
   if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
+  const parameters = expansion.parameters?.slice(start + 1) ?? args;
+  const patterns = expansion.patterns?.slice(start + 1);
   // 展开后的词可能变成被过滤的开关，不能把它当成普通文件参数。
-  if (/^(git|iconv|find|rg|sort|uniq|tree|file|date|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
-      (braceExpansion || args.some((a) => a.includes('$')) || (expansion.glob && expansion.fieldSplit))) return false;
+  if (/^(git|iconv|icacls|find|sed|awk|dd|base64|ssh-keygen|rg|sort|uniq|tree|file|date|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
+      (braceExpansion || parameters.some((a) => a.includes('$')) || (expansion.glob && expansion.fieldSplit))) return false;
   switch (cmd) {
     // 只放行直接、无参数的内建控制；timeout 后的同名外部程序仍拒绝。
     case ':': case 'continue': return kind === 'literal' && args.length === 0;
     case 'command': return kind === 'literal' && args[0] === '-v' && args.length > 1 &&
       args.slice(1).every((a) => /^[A-Za-z0-9_][A-Za-z0-9_.+-]*$/.test(a));
     case 'git': return gitAllowed(args);
+    case 'reg': return args[0] === 'query';
+    case 'icacls': return args.length === 1 && !/^[/-]/.test(args[0]);
+    case 'xargs': {
+      const rest = args[0] === '-r' ? args.slice(1) : args;
+      return rest.length === 1 && ['cat', 'sha256sum'].includes(rest[0]);
+    }
     case 'gzip': return ['-t', '--test'].includes(args[0]);
     // GNU tar can inherit execution options from TAR_OPTIONS; only list with it removed.
-    case 'env': return kind === 'literal' && args.length === 5 && args[0] === '-u' &&
+    case 'env': return args.length === 0 || (kind === 'literal' && args.length === 5 && args[0] === '-u' &&
       args[1] === 'TAR_OPTIONS' && args[2] === 'tar' && args[3] === '-tzvf' &&
-      !braceExpansion && !expansion.glob && /^(?!-)[^:$~]+$/.test(args[4]);
+      !braceExpansion && !expansion.glob && /^(?!-)[^:$~]+$/.test(args[4]));
     case 'bash': case 'sh': return args[0] === '-n' && args.length > 1 && !braceExpansion && !expansion.glob &&
       args.slice(1).every((a) => !/^[+-]/.test(a) && !a.includes('$'));
     case 'iconv': return !args.some((a) => /^-[cs]*o/.test(a) ||
@@ -431,7 +576,7 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       }
       return true;
     }
-    case 'find': return !args.some((a) => FIND_ACTIONS.has(a));
+    case 'find': return !findIssue(args, extra, braceExpansion, { ...expansion, parameters, patterns });
     case 'rg': return !args.some((a) => a.startsWith('--pre'));
     case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
       ['--output', '--compress-program', '--random-source'].some((flag) => flag.startsWith(a.split('=')[0]))));
@@ -443,9 +588,13 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
     // printf -v 能给任意变量赋任意值
     case 'printf': return !args[0]?.startsWith('-v') && !args[0]?.includes('$');
     case 'tree': return !args.some((a) => /^-[^-]*o/.test(a));
-    // 后面再出现开关（-i、--in-place、-e、-f）就可能写文件或执行命令；
-    // 文件参数里的 $ 和 { 也不放行：$(printf -- -i)、{-i,f} 展开后同样变成开关
-    case 'sed': return args[0] === '-n' && args.length >= 2 && SED_PRINT.test(args[1]) && args.slice(2).every((a) => !/^-|[{$]/.test(a));
+    case 'sed': return !sedIssue(args, patterns);
+    case 'awk': return !awkIssue(args, patterns);
+    case 'dd': return !ddIssue(args);
+    case 'base64': return args.includes('-d') || args.includes('--decode') ?
+      args.every((a) => !a.startsWith('-') || ['-', '-d', '--decode', '-i', '--ignore-garbage'].includes(a)) : false;
+    case 'ssh-keygen': return (args.length === 3 && args[0] === '-l' && args[1] === '-f') ||
+      (args.length === 2 && args[0] === '-lf');
     case 'python': case 'python3': return args[0] === '-m' && ['pytest', 'unittest'].includes(args[1]);
     case 'npm': case 'pnpm': case 'yarn': return args[0] === 'test' || (args[0] === 'run' && /^test/.test(args[1] ?? ''));
     case 'node': return args[0] === '--test' || args[0] === '--check';
@@ -465,11 +614,11 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   }
 }
 
-export function readOnlyCommand(command, extra = []) {
+export function readOnlyCommand(command, extra = [], variables = new Map()) {
   if (typeof command !== 'string' || !command.trim()) return false;
   const braceSegments = new Set();
   const expansions = new Map();
-  const segments = splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments, expansions);
+  const segments = splitCommand(command, (sub, vars) => readOnlyCommand(sub, extra, vars), braceSegments, expansions, variables);
   return segments !== null && segments.length > 0 && segments.every((w) => segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
 }
 
@@ -477,17 +626,26 @@ export function readOnlyCommand(command, extra = []) {
 function refusedPart(command, extra) {
   const braceSegments = new Set();
   const expansions = new Map();
-  const segments = typeof command === 'string' ? splitCommand(command, (sub) => readOnlyCommand(sub, extra), braceSegments, expansions) : [];
+  const segments = typeof command === 'string' ? splitCommand(command, (sub, vars) => readOnlyCommand(sub, extra, vars), braceSegments, expansions) : [];
   if (segments === null) {
     return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、$[...] 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
   }
   const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
   if (!bad) return '命令为空';
-  const words = core(bad, expansions.get(bad).kinds).words;
+  const { words: commandWords, start, assignments } = core(bad, expansions.get(bad).kinds);
+  const words = assignments.every(assignmentAllowed) ? commandWords : bad;
+  const args = words.slice(1);
+  const expansion = { ...expansions.get(bad), parameters: expansions.get(bad).parameters.slice(start + 1),
+    patterns: expansions.get(bad).patterns.slice(start + 1) };
   let hint = '';
   if (words[0] === 'tar' && words[1] === '-tzvf' && words.length === 3) {
     hint = '；列出本地压缩包可用 env -u TAR_OPTIONS tar -tzvf ./archive.tar.gz，换成实际文件路径';
-  } else if (['find', 'sed'].includes(words[0]) && words.slice(1).some((a) => a.includes('$'))) {
+  } else if (['find', 'sed', 'awk', 'dd'].includes(words[0])) {
+    const issue = ({ sed: () => sedIssue(args, expansion.patterns), awk: () => awkIssue(args, expansion.patterns), dd: () => ddIssue(args),
+      find: () => findIssue(args, extra, braceSegments.has(bad), expansion) })[words[0]]();
+    if (issue) hint = `；${issue}`;
+  }
+  if (!hint && ['find', 'sed'].includes(words[0]) && args.some((a) => a.includes('$'))) {
     hint = '；这类只读核验不接受含 $ 的参数，请直接写出固定路径和查询参数';
   }
   return `不放行的是「${words.join(' ').slice(0, 200)}」${hint}`;
