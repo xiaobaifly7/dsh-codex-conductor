@@ -330,7 +330,8 @@ test('bad JSON falls back without an error; oversized raw pages load once each',
   }
 });
 
-const settings = () => ({ model: 'old-model', effort: 'high', serviceTier: '', plannerAnswers: false, gemini: { model: 'gemini-old', effort: 'medium' } });
+const settings = () => ({ model: 'old-model', effort: 'high', serviceTier: '', plannerAnswers: false,
+  plannerReads: 'open', plannerReadAllowCount: 2, gemini: { model: 'gemini-old', effort: 'medium' } });
 function panelService() {
   const service = { cfg: settings(), status: { settings: settings(), runtime: { state: 'synchronized', active_tasks: 2, pending_settings: null } }, saveError: null };
   service.handle = (path, body) => {
@@ -355,6 +356,40 @@ function panelService() {
   };
   return service;
 }
+
+test('planner read switch saves pending products mode, preserves active mode, and applies open on confirmation', async (t) => {
+  const service = panelService(), host = clientHost(service.handle); t.after(() => host.dispose());
+  const label = '规划端只读 Codex 的产物，不直接读源码';
+  const toggle = () => nodes(host.tree).find((node) => node.type === 'checkbox' && node.props.label === label);
+  host.mount(host.exports.Panel); await host.flush();
+  assert.equal(toggle().props.checked, false);
+  assert.ok(text(host.tree).includes('规划端读取范围： 不限制读取'));
+  assert.ok(text(host.tree).includes('额外允许读取的路径： 2 条'));
+  assert.equal(nodes(host.tree).filter((node) => node.props?.label === label).length, 1);
+  toggle().props.onChange(true); await host.flush();
+  assert.equal(toggle().props.checked, true);
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(host.requests.find((r) => r.body), { path: '/settings', body: { plannerReads: 'products' } });
+  assert.equal(toggle().props.checked, true);
+  assert.ok(text(host.tree).includes('规划端读取范围： 不限制读取'));
+  host.poll(); await host.flush();
+  assert.equal(toggle().props.checked, true);
+  service.cfg.plannerReads = 'products';
+  service.status.settings.plannerReads = 'products';
+  service.status.runtime.pending_settings = null;
+  host.poll(); await host.flush();
+  assert.ok(text(host.tree).includes('规划端读取范围： 只读 Codex 的产物'));
+  toggle().props.onChange(false); await host.flush();
+  await click(host, '立即生效');
+  assert.equal(host.requests.filter((r) => r.body).length, 1);
+  await click(host, '确认立即生效');
+  assert.deepEqual(host.requests.filter((r) => r.body).at(-1),
+    { path: '/settings/apply', body: { changes: { plannerReads: 'open' }, confirm: true } });
+  host.poll(); await host.flush();
+  assert.equal(toggle().props.checked, false);
+  assert.ok(text(host.tree).includes('规划端读取范围： 不限制读取'));
+  assert.ok(!nodes(host.tree).some((node) => ['input', 'select', 'checkbox'].includes(node.type) && /白名单|额外允许/.test(node.props.label || '')));
+});
 
 test('pending editing merges previous changes, replaces them on save, and preserves running values', async (t) => {
   const service = panelService();

@@ -4,6 +4,24 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+### 0.9.66：规划端只读产物与独立核验
+
+默认 `plannerReads: open` 保持原有读取方式。改成 `products` 后，受护栏保护的会话只能直接读本会话 Codex / `gemini_write` 已产出的文件、任务报告、规划提示词，以及明确允许的文件或目录；目录列表仍可查看，源码调查交给 `codex_run`。常用设置里可开关“规划端只读 Codex 的产物，不直接读源码”，沿用保存、待生效和立即生效流程；状态区只显示额外允许路径的条数。
+
+```yaml
+- id: codex-conductor
+  config:
+    workspaces: ['E:\project']
+    plannerReads: products
+    plannerReadAllow:
+      - 'E:\project\RULES.md'
+      - '/mnt/e/project/review-inputs'
+```
+
+产物路径按会话缓存在插件进程内，任务结束拿到结果时更新，每会话最多 10,000 条、最多保留 100 个会话。未命中时每会话至多每 25 秒后台查询一次 runner；第一次读取仍被拒绝，刷新后可重试。查询失败提示“暂时无法确认是不是产物”，不会放行原料。允许目录包含子文件，产物文件不会因此放行其所在目录。 产物授权只认 runner 实际记录的改动和写入路径，不凭报告自报的文件列表扩大范围；读取任务报告和历史也限制在当前会话。 会话工作记录目录取自 DSH 现有的 sessionPersistence.locate(header)，只允许该会话日志所在目录；宿主未提供此接口时不猜目录。`cat/head/tail/wc/grep/sed/awk` 等内容读取、内容搜索和输入重定向都检查路径；变量、通配符或命令替换不能确定读取对象时拒绝。执行项目代码的测试命令也交给 Codex。
+
+规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录、主机访问和模型设置，只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后仍用 `codex_review` 记录原任务的验收。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
+
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 `0.9.43` 新增可选的 `gemini_write`，由 Gemini 写教程与文档正文，插件核对路径、字数和改动范围。
@@ -186,7 +204,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### 工作区护栏
 
-十个 Codex 工具始终注册；`gemini_write` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
+十一个 Codex 工具始终注册；`gemini_write` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
 
 - 拒绝直接写文件或执行任意代码的工具：`write`、`edit`、`pwsh`、`run_code`、`subagent_codex`，以及 `wsl-write`、`wsl-edit`、`wsl-term`、`wsl-bootstrap`、`actions_run`、`actions_configure`；MCP 工具按动作名拒绝（`write`、`edit`、`replace`、`insert`、`delete`、`execute` 等）。
 - Seep 的 `seep_r2_cmd` 是任意 radare2 命令入口，在受保护工作区交给 Codex 执行；`seep_r2_info`、`seep_status` 等结构化查询仍可用于只读核验。
@@ -238,7 +256,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 ## 配置
 
-默认提供十个工具，不启用护栏；Codex 用它自己的模型和登录配置，但默认不加载它配置的 MCP 和 hooks（见上文）。按插件 id 覆盖 `config`：
+默认提供十一个工具，不启用护栏；Codex 用它自己的模型和登录配置，但默认不加载它配置的 MCP 和 hooks（见上文）。按插件 id 覆盖 `config`：
 
 ```yaml
 - id: codex-conductor
@@ -348,6 +366,24 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+### 0.9.66: Products-only planner reads and independent verification
+
+`plannerReads: open` is the default and preserves existing read behavior. Set it to `products` to restrict guarded sessions to files produced by their own finished Codex / `gemini_write` tasks, task reports, the planner prompt, and explicitly allowed files or directories. Directory discovery remains available; delegate source investigation to `codex_run`. The common-settings switch follows the existing save / pending / apply-now flow. Status shows the effective mode and the number of allowlist entries without exposing an allowlist editor.
+
+```yaml
+- id: codex-conductor
+  config:
+    workspaces: ['E:\project']
+    plannerReads: products
+    plannerReadAllow:
+      - 'E:\project\RULES.md'
+      - '/mnt/e/project/review-inputs'
+```
+
+The plugin caches up to 10,000 product paths per session for at most 100 sessions, updating them when task results arrive. A miss triggers at most one background runner query per session every 25 seconds; that read is refused and can be retried after refresh. A failed refresh never grants access. Directory allowlist entries include descendants; a product file does not grant its parent directory. Product grants use recorded changes and write paths, not self-reported filenames. Report and history reads are also limited to the current session. The session work-record directory comes from the existing DSH sessionPersistence.locate(header) API; only that session log’s directory is allowed. Hosts without this API do not receive a guessed directory grant. Content readers, content searches and input redirections check their targets; uncertain shell targets using variables, globs or command substitution are refused. Commands that execute project tests are delegated to Codex too.
+
+Use `codex_verify` for factual checks after mechanically checking product presence, citations and matching numbers: `{"job_id":"original-job-id","focus":"Check figures and citations","samples":8,"wait_seconds":0}`. Sampling defaults to 8 and accepts 1–30; waiting follows `codex_run`. Only finished jobs owned by the current session qualify. Verification starts a fresh read-only thread with the original directory, host access and model settings, reads the original task, acceptance criteria, products and cited sources, and reports each checked claim, source, truth status and correction through the existing report schema. `context.verification_of` links the jobs in `codex_jobs` and `codex_status`. Record final acceptance of the original job with `codex_review`. As with existing `write=false` tasks, host-access mode enforces read-only work through the task instructions rather than an OS sandbox.
+
 `0.9.42` identifies a WSL connection failure when it prevents dispatch preflight, preserving the existing scope and continuation checks.
 
 `0.9.43` adds optional `gemini_write` for tutorial and documentation prose, with plugin checks for paths, character counts and changed files.
@@ -368,7 +404,7 @@ python3 runner/test_codex_runner.py
 
 `0.9.49` restores full opt-in `plannerAnswers`: the planner can answer blockers based on the user's original goal and known facts, skip pending-conflict write-scope preflight, and record `accepted_deviations`, including `kind: 'scope'`, without a user reply.
 
-A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [eleven Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
 `0.9.52` fixes missing panel routes and settings entries on cold startup by registering, cleaning up, and re-registering them as their services appear, disappear, and return, without affecting other functionality when services are absent.
 

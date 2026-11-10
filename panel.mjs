@@ -78,7 +78,9 @@ function runnerResult(value) {
 
 export function panelSettings(cfg) {
   return Object.fromEntries(['model', 'effort', 'readOnlyEffort', 'serviceTier', 'plannerAnswers', 'lockTimeoutSeconds', 'maxStorageMb']
-    .map((key) => [key, cfg[key]]).concat([['gemini', cfg.gemini ? { model: cfg.gemini.model, effort: cfg.gemini.effort } : null]]));
+    .map((key) => [key, cfg[key]]).concat([['plannerReads', cfg.plannerReads ?? 'open'],
+      ['plannerReadAllowCount', cfg.plannerReadAllow?.length ?? 0],
+      ['gemini', cfg.gemini ? { model: cfg.gemini.model, effort: cfg.gemini.effort } : null]]));
 }
 
 // No paths or runner commands come from HTTP input.

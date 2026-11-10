@@ -78,12 +78,28 @@ test('panel model names that look like YAML values remain strings', (t) => {
   }
 });
 
+test('planner read scope saves both modes and preserves the uneditable whitelist', (t) => {
+  const f = fixture(t);
+  for (const plannerReads of ['products', 'open']) {
+    const original = profile(f.moduleUrl).replace('    config:\n',
+      '    config:\n      plannerReads: open # read scope\n      plannerReadAllow:\n        - C:\\private\n        - /mnt/e/allowed\n');
+    writeFileSync(f.profileFile, original);
+    saveRuntimeSettings({ ...f, changes: { plannerReads } });
+    assert.equal(readFileSync(f.profileFile, 'utf8'), original.replace('plannerReads: open', `plannerReads: ${plannerReads}`));
+  }
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  saveRuntimeSettings({ ...f, changes: { plannerReads: 'products' } });
+  assert.match(readFileSync(f.profileFile, 'utf8'), /plannerReads: products/);
+});
+
 test('panel settings reject invalid values and unsupported YAML without changing the file', (t) => {
   const f = fixture(t);
   const text = `plugins:\n  - id: ${oldId}\n    name: ${f.moduleUrl}\n    config:\n      model: old\n`;
   for (const changes of [null, [], {}, { unknown: 1 }, { model: '' }, { model: 'a b' }, { model: 'a'.repeat(81) },
     { model: 'a\nother: injected' }, { effort: '' }, { effort: 'ultra' }, { readOnlyEffort: 'ultra' },
-    { plannerAnswers: 'true' }, { serviceTier: 'priority' }, { lockTimeoutSeconds: 0 }, { lockTimeoutSeconds: -1 },
+    { plannerAnswers: 'true' }, { plannerReads: true }, { plannerReads: 'all' }, { plannerReads: null },
+    { plannerReadAllow: [] }, { plannerReadAllowCount: 0 }, { serviceTier: 'priority' }, { lockTimeoutSeconds: 0 }, { lockTimeoutSeconds: -1 },
     { lockTimeoutSeconds: NaN }, { maxStorageMb: Infinity }, { maxStorageMb: null }, { maxStorageMb: '1' },
     { gemini: { model: 'new' } }]) {
     writeFileSync(f.profileFile, text);
@@ -530,6 +546,32 @@ function forbidCodexMutations(list) {
 }
 
 const runtimeExec = { agent: { id: 'runtime-owner' } };
+
+test('planner read scope persists while busy and applies through idle and immediate reloads', async (t) => {
+  for (const when of ['idle', 'now']) {
+    const f = fixture(t);
+    const original = profile(f.moduleUrl);
+    writeFileSync(f.profileFile, original);
+    let running = true;
+    const tool = runtimeTool(f, { conductor: forbidCodexMutations(async () => ({
+      jobs: running ? [{ job_id: 'J' }] : [], total: running ? 1 : 0,
+    })) });
+    const operation = tool.execute({ action: 'reload', when }, { panel: true }, { plannerReads: 'products' });
+    if (when === 'idle') {
+      const pending = await operation;
+      assert.equal(pending.status, 'waiting_for_idle');
+      assert.deepEqual(pending.pending_settings.changes, { plannerReads: 'products' });
+      assert.deepEqual(JSON.parse(readFileSync(path.join(f.root, 'pending-settings.json'))).changes, { plannerReads: 'products' });
+      assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+      running = false;
+    }
+    const expected = await requestedModule(f);
+    assert.match(readFileSync(f.profileFile, 'utf8'), /plannerReads: products/);
+    marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
+    if (when === 'now') assert.equal((await operation).status, 'reloaded');
+    assert.equal((await tool.execute({ action: 'status' })).pending_settings, null);
+  }
+});
 
 test('panel settings and reload token are committed together with a backup and exact load confirmation', async (t) => {
   const f = fixture(t);

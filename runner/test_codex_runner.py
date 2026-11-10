@@ -1610,6 +1610,157 @@ class RunnerTests(unittest.TestCase):
         return {"id": "b1", "kind": kind, "message": "A decision is needed", "question": "Which option?",
                 "resolution": "", **fields}
 
+    def test_products_include_only_owned_terminal_files_and_job_artifacts(self):
+        context = self.sample_context()
+        expected = set()
+        for status in ("completed", "failed", "cancelled"):
+            job = self.stored_job(status, {"status": status,
+                "files_changed": [{"path": f"{status}.txt", "change": "modified"}],
+                "write_paths": [f"{status}-written.txt"],
+                "structured": self.sample_report(files_changed=[f"{status}-report.txt"])},
+                context=context, scope=["raw"], write_paths=[f"{status}-declared.txt"])
+            for name in ("prompt.txt", "last_message.txt", "reviews.json", "stderr.log", "events.jsonl"):
+                (job / name).write_text("artifact")
+            (job / "unrelated.txt").write_text("not an artifact")
+            (job / "nested").mkdir()
+            expected.update(str(p.resolve()) for p in job.iterdir() if p.name not in ("nested", "unrelated.txt"))
+            expected.update(str((self.cwd / f"{status}{suffix}.txt").resolve())
+                            for suffix in ("", "-written", "-declared"))
+        for name, status, owner in (("other", "completed", "owner-b"), ("running", "running", "owner-a"),
+                                    ("unknown", "unknown", "owner-a")):
+            self.stored_job(name, {"status": status, "files_changed": [{"path": "raw.txt"}]},
+                            context=self.sample_context(owner))
+        self.stored_job("legacy", {"status": "completed", "files_changed": [{"path": "raw.txt"}]})
+        self.stored_job("pending", None, context=context)
+        result = self.control("products", "--owner", "owner-a")
+        self.assertEqual(result, {"status": "completed", "owner": "owner-a", "paths": result["paths"], "truncated": False})
+        self.assertEqual(set(result["paths"]), expected)
+        self.assertEqual(self.control("products", "--owner", "missing")["paths"], [])
+
+    def test_products_do_not_read_other_results_or_unfinished_job_records_or_spawn(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        owned = self.stored_job("owned", {"status": "completed"}, context=self.sample_context())
+        other = self.stored_job("other", {"status": "completed"}, context=self.sample_context("owner-b"))
+        pending = self.stored_job("pending", None, context=self.sample_context())
+        original = Path.read_text
+        reads = []
+
+        def read(path, *args, **kwargs):
+            self.assertNotEqual(path, other / "result.json")
+            self.assertNotEqual(path.parent, pending)
+            reads.append(path)
+            return original(path, *args, **kwargs)
+
+        before = {p: p.read_bytes() for p in Path(self.tmp.name).rglob("*") if p.is_file()}
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(Path, "read_text", read), \
+                mock.patch.object(codex_runner.subprocess, "run", side_effect=AssertionError("subprocess")), \
+                mock.patch.object(codex_runner.subprocess, "Popen", side_effect=AssertionError("subprocess")):
+            result = codex_runner.products(SimpleNamespace(owner="owner-a", limit=10000))
+        self.assertIn(owned / "result.json", reads)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(before, {p: p.read_bytes() for p in Path(self.tmp.name).rglob("*") if p.is_file()})
+
+    def test_products_deduplicate_normalized_files_without_granting_directories(self):
+        root = Path(self.env["CODEX_RUNNER_HOME"])
+        self.stored_job("normalized", {"status": "completed", "files_changed": [
+            {"path": "sub/../product.txt"}, {"path": str(self.cwd / "product.txt")},
+            {"path": str(self.cwd)}, {"path": str(root)}],
+            "structured": {"files_changed": ["invalid-report.txt"]}}, context=self.sample_context())
+        result = self.control("products", "--owner", "owner-a")
+        self.assertEqual(result["paths"].count(str((self.cwd / "product.txt").resolve())), 1)
+        self.assertNotIn(str(self.cwd.resolve()), result["paths"])
+        self.assertNotIn(str(root.resolve()), result["paths"])
+        self.assertNotIn(str((self.cwd / "invalid-report.txt").resolve()), result["paths"])
+        removed_cwd = self.cwd / "removed"
+        self.stored_job("removed", {"status": "completed", "write_paths": ["."]},
+                        cwd=str(removed_cwd), context=self.sample_context())
+        self.assertNotIn(str(removed_cwd.resolve()), self.control("products", "--owner", "owner-a")["paths"])
+
+    def test_products_bad_owned_records_fail_without_partial_paths(self):
+        self.stored_job("good", {"status": "completed"}, context=self.sample_context())
+        bad = self.stored_job("bad", {"status": "completed"}, context=self.sample_context())
+        cases = ["not json", "[]", "{}", json.dumps({"status": "completed", "files_changed": ["wrong shape"]}),
+                 json.dumps({"status": "completed", "files_changed": [{"path": ""}]}),
+                 json.dumps({"status": "completed", "write_paths": "not a list"}),
+                 json.dumps({"status": "completed", "context": self.sample_context("owner-b")})]
+        for contents in cases:
+            with self.subTest(contents=contents):
+                (bad / "result.json").write_text(contents)
+                result = self.control("products", "--owner", "owner-a")
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error_kind"], "invalid_record")
+                self.assertNotIn("paths", result)
+        (bad / "args.json").write_text(json.dumps({"context": {"owner": "owner-a"}}))
+        self.assertEqual(self.control("products", "--owner", "owner-a")["status"], "failed")
+
+    def test_products_validate_limits_and_bound_path_count(self):
+        self.stored_job("many", {"status": "completed", "write_paths": [f"file-{i}" for i in range(10001)]},
+                        context=self.sample_context())
+        for extra in ((), ("--limit", "10000"), ("--limit", "2")):
+            result = self.control("products", "--owner", "owner-a", *extra)
+            self.assertEqual(len(result["paths"]), int(extra[-1]) if extra else 10000)
+            self.assertTrue(result["truncated"])
+        for extra in ((), ("--owner", ""), ("--owner", "owner-a", "--limit", "0"),
+                      ("--owner", "owner-a", "--limit", "10001"), ("--owner", "owner-a", "--limit", "1.5")):
+            self.assertEqual(self.control("products", *extra)["error_kind"], "bad_arguments")
+        self.stored_job("exact", {"status": "completed"}, context=self.sample_context("exact-owner"))
+        self.assertFalse(self.control("products", "--owner", "exact-owner", "--limit", "2")["truncated"])
+
+    def test_products_exclude_symlinked_job_artifacts_and_resolve_product_paths(self):
+        job = self.stored_job("linked", {"status": "completed", "write_paths": ["link.txt"]},
+                              context=self.sample_context())
+        target = self.cwd / "actual.txt"
+        target.write_text("product")
+        try:
+            (self.cwd / "link.txt").symlink_to(target)
+            (job / "last_message.txt").symlink_to(target)
+            (job.parent / "alias").symlink_to(job, target_is_directory=True)
+        except OSError as e:
+            if os.name == "nt":
+                self.skipTest(f"symlinks are unavailable: {e}")
+            raise
+        result = self.control("products", "--owner", "owner-a")
+        self.assertEqual(set(result["paths"]), {str(target.resolve()), str((job / "args.json").resolve()),
+                                               str((job / "result.json").resolve())})
+        (job / "result.json").unlink()
+        (job / "result.json").symlink_to(target)
+        self.assertEqual(self.control("products", "--owner", "owner-a")["status"], "failed")
+
+    def test_verification_context_round_trips_without_becoming_a_continuation(self):
+        context = {**self.sample_context(), "write": False, "verification_of": "original-1"}
+        result = self.invoke("--context-json", "--model", "test-model", "--service-tier", "fast",
+                             prompt=json.dumps({"prompt": "verify independently", "context": context}), command="start")
+        result = self.control("status", result["job_id"], "--wait", "30")
+        self.assertEqual(result["context"], context)
+        self.assertEqual(result["task_options"], {"writable_roots": None, "use_user_config": False,
+                                                 "effort": None, "model": "test-model", "service_tier": "fast"})
+        listing = self.control("list", "--owner", "owner-a")["jobs"][0]
+        self.assertEqual(listing["context"]["verification_of"], "original-1")
+        self.assertIsNone(listing["parent_job_id"])
+        self.assertEqual(listing["task_options"], result["task_options"])
+        self.assertEqual(self.control("list", "--parent-job", "original-1")["total"], 0)
+        self.assertNotIn("resume", self.calls()[0]["argv"])
+        self.assertIn('sandbox_mode="read-only"', self.calls()[0]["argv"])
+
+    def test_verification_context_rejects_invalid_identifiers_without_spawning(self):
+        for value in (None, True, 1, [], {}, "", "../job", "has space", "job/name"):
+            with self.subTest(value=value):
+                context = {**self.sample_context(), "verification_of": value}
+                result = self.invoke("--context-json", prompt=json.dumps({"prompt": "verify", "context": context}))
+                self.assertEqual(result["error_kind"], "bad_arguments")
+        self.assertEqual(self.calls(), [])
+
+    def test_historical_results_recover_model_options_from_task_metadata(self):
+        old_options = {"writable_roots": None, "use_user_config": False, "effort": "high"}
+        self.stored_job("historical", {"status": "completed", "task_options": old_options},
+                        context=self.sample_context(), model="original-model", service_tier="fast", effort="high")
+        expected = {**old_options, "model": "original-model", "service_tier": "fast"}
+        self.assertEqual(self.control("status", "historical")["task_options"], expected)
+        self.assertEqual(self.control("list", "--owner", "owner-a")["jobs"][0]["task_options"], expected)
+
     def test_reports_accept_legacy_and_strict_optional_blockers(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

@@ -175,15 +175,41 @@ test('selftest rejects malformed requests and invalid, unclaimed or oversized re
   assert.equal((await f.request('POST', '/selftest/result', { ...request, result })).status, 200);
 });
 
-test('panel settings expose only editable fields and redact nested Gemini configuration', () => {
+test('panel settings expose editable fields and read scope counts while redacting private configuration', () => {
   const cfg = { model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, token: 'secret', runner: 'secret',
     gemini: { model: 'gemini', effort: 'low', command: 'secret' } };
   const expected = { model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
-    lockTimeoutSeconds: 1.5, maxStorageMb: 256, gemini: { model: 'gemini', effort: 'low' } };
+    lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' } };
   assert.deepEqual(panelSettings(cfg), expected);
   assert.deepEqual(cfg.gemini, { ...expected.gemini, command: 'secret' });
   assert.equal(panelSettings({ ...cfg, gemini: undefined }).gemini, null);
+  assert.deepEqual(panelSettings({ ...cfg, plannerReads: 'products', plannerReadAllow: ['C:\\private', '/mnt/e/allowed'] }),
+    { ...expected, plannerReads: 'products', plannerReadAllowCount: 2 });
+});
+
+test('panel read scope switch uses existing save and confirmed apply routes without allowing whitelist edits', async (t) => {
+  const f = fixture(t);
+  f.cfg.plannerReads = 'products';
+  f.cfg.plannerReadAllow = ['C:\\private'];
+  const status = await f.request('GET', '/status');
+  assert.equal(status.body.settings.plannerReads, 'products');
+  assert.equal(status.body.settings.plannerReadAllowCount, 1);
+  assert.equal(Object.hasOwn(status.body.settings, 'plannerReadAllow'), false);
+  for (const plannerReads of ['open', 'products']) {
+    assert.equal((await f.request('POST', '/settings', { plannerReads })).status, 200);
+    assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments,
+      [{ action: 'reload', when: 'idle' }, { panel: true }, { plannerReads }]);
+    assert.equal((await f.request('POST', '/settings/apply', { changes: { plannerReads }, confirm: true })).status, 200);
+    assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments,
+      [{ action: 'reload', when: 'now' }, { panel: true }, { plannerReads }]);
+  }
+  const calls = f.runtime.execute.mock.callCount();
+  for (const changes of [{ plannerReads: true }, { plannerReads: 'all' }, { plannerReadAllow: [] }, { plannerReadAllowCount: 0 }]) {
+    assert.equal((await f.request('POST', '/settings', changes)).status, 400);
+  }
+  assert.equal((await f.request('POST', '/settings/apply', { changes: { plannerReads: 'open' } })).status, 400);
+  assert.equal(f.runtime.execute.mock.callCount(), calls);
 });
 
 test('panel registers its prefix in an injection child and disposes with it', (t) => {

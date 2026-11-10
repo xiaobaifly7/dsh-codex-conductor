@@ -160,6 +160,8 @@ window.__ModuleLoader__.load({
           if (!allowed.includes(value)) throw new Error('请从列表中选择思考程度。');
         } else if (key === 'serviceTier') {
           if (!['', 'fast', 'ultrafast'].includes(value)) throw new Error('请从列表中选择服务速度。');
+        } else if (key === 'plannerReads') {
+          if (!['open', 'products'].includes(value)) throw new Error('请选择规划端的读取范围。');
         } else if (key === 'lockTimeoutSeconds' || key === 'maxStorageMb') {
           value = Number(raw);
           if (String(raw).trim() === '' || !Number.isFinite(value) || value <= 0) throw new Error('等待秒数和存储上限请填大于 0 的有限数字。');
@@ -215,6 +217,8 @@ window.__ModuleLoader__.load({
             statusRow('思考程度', activeSettings ? EFFORTS.find(([value]) => value === activeSettings.effort)?.[1] || activeSettings.effort || '跟随 Codex 配置' : '未读到', '控制 Codex 做任务时思考得多深入。'),
             statusRow('速度档', activeSettings ? activeSettings.serviceTier || '跟随 Codex 配置' : '未读到', '使用 Codex 配置或账号支持的 fast、ultrafast 档位。'),
             statusRow('自动回答 Codex 的问题', activeSettings ? activeSettings.plannerAnswers ? '已开启' : '已关闭' : '未读到', '打开后 DeepSeek 会替你回答 Codex 的问题并继续干活，不再等你'),
+            statusRow('规划端读取范围', activeSettings ? activeSettings.plannerReads === 'products' ? '只读 Codex 的产物' : '不限制读取' : '未读到', '这是当前正在生效的读取范围。'),
+            statusRow('额外允许读取的路径', activeSettings ? `${activeSettings.plannerReadAllowCount ?? 0} 条` : '未读到', '这里只显示数量，需要修改时请编辑插件配置。'),
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
             statusRow('正在执行的任务', runtime?.active_tasks ?? '未读到', '保存设置时，可等这些任务结束后自动生效。'),
             statusRow('最近 24 小时内需要关注的任务', attention ?? (errors.attention ? '未读到' : '正在读取…'), '只统计最近 24 小时内开始、需要你查看的任务。'),
@@ -481,6 +485,11 @@ window.__ModuleLoader__.load({
               h(Checkbox, { label: '自动回答 Codex 的问题', checked: Object.hasOwn(edits, 'plannerAnswers') ? edits.plannerAnswers : editingSettings.plannerAnswers === true,
                 disabled: !!busy, onChange: (value) => edit('plannerAnswers', value) }),
               h('small', null, '打开后 DeepSeek 会替你回答 Codex 的问题并继续干活，不再等你')),
+            h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '规划端只读 Codex 的产物，不直接读源码',
+                checked: (Object.hasOwn(edits, 'plannerReads') ? edits.plannerReads : editingSettings.plannerReads) === 'products',
+                disabled: !!busy, onChange: (value) => edit('plannerReads', value ? 'products' : 'open') }),
+              h('small', null, '打开后，源码和资料交给 Codex 去读，规划端只看产物；需要核对内容时也交给 Codex。')),
             h(Message, { text: validation, error: true }),
             h('div', { className: 'dcc-row dcc-actions' },
               h(Button, { variant: 'primary', disabled: !!busy || (!dirty && !(pending?.error && !pending.awaiting_load)) || !!validation,

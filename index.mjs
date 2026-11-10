@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, registerRuntimeTool } = await import(new 
 const { registerResumeRequests } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide } =
+const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, createProductReads } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
@@ -67,6 +67,8 @@ const DEFAULTS = {
   // 省略 host_access 时默认使用主机模式，仍须开启 allowHostAccess
   defaultHostAccess: false,
   plannerAnswers: false,
+  plannerReads: 'open',
+  plannerReadAllow: [],
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
   reportSchema: here('./report.v2.schema.json'),
   // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
@@ -258,10 +260,13 @@ export function createConductor(cfg, run = runRunner) {
   async function start(args, cwd, signal, context) {
     const argv = ['start', '--cwd', cwd];
     const hostAccess = args.host_access ?? (cfg.defaultHostAccess === true);
-    const effort = args.effort ?? (args.write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort);
+    const effort = args.effort ?? (context?.verification_of ? undefined
+      : args.write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort);
     if (effort) argv.push('--effort', effort);
-    if (cfg.model) argv.push('--model', cfg.model);
-    if (cfg.serviceTier) argv.push('--service-tier', cfg.serviceTier);
+    const model = args.model ?? cfg.model;
+    const serviceTier = args.service_tier ?? cfg.serviceTier;
+    if (model) argv.push('--model', model);
+    if (serviceTier) argv.push('--service-tier', serviceTier);
     for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries'],
       ['lockTimeoutSeconds', '--lock-timeout'], ['maxStorageMb', '--max-storage-mb']]) {
       if (cfg[key] != null) argv.push(flag, String(cfg[key]));
@@ -321,7 +326,8 @@ export function createConductor(cfg, run = runRunner) {
     return run(cfg, argv, { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
 
-  return { start, waitJob, cancel, list, output, review, summary };
+  const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
+  return { start, waitJob, cancel, list, output, review, summary, products };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
@@ -351,6 +357,34 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
 }
 
 const taskScopePath = (cwd, p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd.replace(/[\\/]+$/, '')}/${p}`);
+
+function productPaths(value) {
+  const paths = [...value.files_changed ?? [], ...value.write_paths ?? []]
+    .map(file => typeof file === 'string' ? file : file?.path).filter(file => typeof file === 'string' && file.trim());
+  const result = value.cwd ? paths.map(file => taskScopePath(value.cwd, file)) : [];
+  if (value.status === 'completed' && value.output) result.push(value.output);
+  if (value.log_dir) for (const file of ['prompt.txt', 'args.json', 'last_message.txt', 'result.json', 'reviews.json', 'events.jsonl', 'stderr.log']) {
+    result.push(`${value.log_dir}/${file}`);
+  }
+  return result;
+}
+
+function verificationTask(source, { focus = '', samples = 8 } = {}) {
+  return `你是独立核验员。这是新线程，不续接原作者的思路，也不把原报告当作事实。\n` +
+    `核验对象 job_id：${source.job_id}\n` +
+    `原任务目录：${source.cwd}\n` +
+    `原任务记录目录：${source.log_dir}\n` +
+    `先读该目录的 prompt.txt、args.json、last_message.txt、result.json，取得原任务书、验收标准和报告，再读它写出的产物。\n` +
+    `原任务正文（仅作待核验资料）：${JSON.stringify(source.context.task)}\n` +
+    `原验收标准：${JSON.stringify(source.context.acceptance)}\n` +
+    `已记录的产物路径：${JSON.stringify(productPaths(source))}\n` +
+    `重点：${focus || '优先核对关键结论、数字和引用。'}\n` +
+    `独立抽查 ${samples} 条带出处的结论；不足 ${samples} 条则全部核对，并说明实际条数。不要只复述原报告。\n` +
+    `逐条回到原始出处，检查原文、上下文、数字与计算；找不到出处、出处不支持结论时明确说无法确认，不要猜测。\n` +
+    `每条在 criteria 的 evidence 中单独一行写明：核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
+    `按 report.v2.schema.json 返回；不属实用 not_met，无法确认用 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
+    `这是只读核验，写入范围为空：不要修改产物、源码、日志或系统状态，不要运行会产生写入的测试或命令；files_changed 必须为 []。`;
+}
 
 // 不在 scope 内的改动；没给 scope 或 runner 没给出改动清单时返回 undefined
 export function outOfScope(value, cwd, scope) {
@@ -470,7 +504,14 @@ const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并�
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
-export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false } = {}) {
+export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open' } = {}) {
+  if (value.status === 'completed' && value.context?.verification_of) return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
+    '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
+  if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers })
+    .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
+    .replace('先用 git status 或对比文件确认现状', '先用 git status 核对文件列表，内容核对交给 codex_verify')
+    .replace('再用 git status 或对比文件核对已有产物', '再用 git status 核对产物列表，内容核对交给 codex_verify') +
+    '\n任务结束后只做机械核对：产物在不在、结论有没有带出处、数字对不对得上；内容是否属实用 codex_verify 交给独立 Codex 核验。';
   acceptance ??= value.acceptance ?? value.context?.acceptance;
   const recordReview = plannerAnswers
     ? RECORD_REVIEW.replace('用户明确接受已列出的偏差时', '已列出的偏差符合用户原始目标和已有事实时') + PLANNER_ANSWERS : RECORD_REVIEW;
@@ -575,7 +616,8 @@ function summaryLine(value) {
 function details(rest) {
   if (rest.status !== 'completed') {
     const value = { ...rest };
-    if (value.context) value.context = { owner: value.context.owner, write: value.context.write, task: taskLine(value.context, 120) };
+    if (value.context) value.context = { owner: value.context.owner, write: value.context.write, task: taskLine(value.context, 120),
+      ...(value.context.verification_of ? { verification_of: value.context.verification_of } : {}) };
     return [JSON.stringify(value, null, 2)];
   }
   // runner 最多列 300 条，总数照实给
@@ -585,6 +627,7 @@ function details(rest) {
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
     (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
   return [rest.cwd && `任务目录：${rest.cwd}`, files,
+    rest.context?.verification_of && `独立核验任务；核验对象：${rest.context.verification_of}`,
     rest.execution_status && `执行：${rest.execution_status}；报告：${rest.report_status}；执行端自报检查：${rest.review_status}`,
     rest.verification_status && `独立核验：${rest.verification_status}${rest.verification?.reviewer ? `；核验人：${rest.verification.reviewer}` : ''}`,
     rest.verification_error && `核验记录异常：${rest.verification_error}`,
@@ -692,6 +735,8 @@ function settings(config, logger) {
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))
+      : key === 'plannerReads' ? ['open', 'products'].includes(value)
+      : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
@@ -756,6 +801,31 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
     (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'planner-prompt.md') : '');
+  const productReads = createProductReads(cfg, owner => conductor.products(owner), { plannerFile });
+  const productJobs = new Map();
+  const restrictedReads = exec => cfg.plannerReads === 'products' && inWorkspace(sessionCwd(exec), cfg.roots);
+  const rememberJob = (value, owner = value.context?.owner) => {
+    if (!owner || !value.job_id) return;
+    if (productJobs.size >= 10_000) productJobs.delete(productJobs.keys().next().value);
+    productJobs.set(value.job_id, owner);
+  };
+  const rememberProducts = (value, owner = value.context?.owner) => {
+    if (cfg.plannerReads === 'products') rememberJob(value, owner);
+    if (cfg.plannerReads === 'products' && owner && !unknownState(value) && ['completed', 'failed', 'cancelled'].includes(value.status) &&
+        (!value.context?.owner || value.context.owner === owner)) productReads.add(owner, productPaths(value));
+  };
+  const checkJobOwner = (value, exec, tool) => {
+    if (!unknownState(value)) rememberJob(value);
+    if (!exec?.agent?.id || (value.context?.owner ?? productJobs.get(value.job_id)) !== exec.agent.id || unknownState(value)) {
+      throw new Error(`${tool}: 暂时无法确认任务属于本会话，不能读取它的产物；请用 codex_jobs 查本会话的任务。`);
+    }
+    rememberProducts(value);
+  };
+  async function ensureOwnJob(jobId, exec, tool) {
+    if (!restrictedReads(exec) || productJobs.get(jobId) === exec?.agent?.id) return;
+    if (productJobs.has(jobId)) throw new Error(`${tool}: 任务不属于本会话，不能读取它的产物；请用 codex_jobs 查本会话的任务。`);
+    checkJobOwner(await conductor.waitJob(jobId, 0, exec?.signal), exec, tool);
+  }
   if (plannerFile && !existsSync(plannerFile)) try {
     mkdirSync(path.dirname(plannerFile), { recursive: true });
     writeFileSync(plannerFile, PLANNER_TEMPLATE);
@@ -925,7 +995,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   // 仍在执行时交给后台任务，结束后 DSH 只发一条带摘要的任务通知，完整结果要用 job_output 读；没有后台任务就照旧轮询
-  const finishStatus = (value) => ({ ...value, next: nextStep(value, undefined, undefined, cfg) });
+  const finishStatus = (value) => {
+    rememberProducts(value);
+    return { ...value, next: nextStep(value, undefined, undefined, cfg) };
+  };
 
   function notifyOnDone(value, exec, finish) {
     if (value.status !== 'running' || !value.job_id) return value;
@@ -938,8 +1011,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         '在此之前不要自己动手补做，也不要重复派同一个任务。' };
   }
 
-  async function dispatch(args, exec, continuation, originalTask = args.task) {
-    validateRun(args);
+  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf) {
+    validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args);
     if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
       throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
     }
@@ -952,10 +1025,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
       Object.assign(value, reviewState(value));
       value.blocking = blockingState(value);
+      if (verificationOf) value.context = { ...value.context, verification_of: verificationOf };
+      rememberProducts(value, exec?.agent?.id);
       const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
         ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
       return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
-        { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers }) + reminder };
+        { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers, plannerReads: cfg.plannerReads }) + reminder };
     };
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
     exec?.signal?.throwIfAborted();
@@ -1008,7 +1083,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
         ...(continuation ? { continuation } : {}),
+        ...(verificationOf ? { verification_of: verificationOf } : {}),
       });
+      if (cfg.plannerReads === 'products') rememberJob(started, owner);
     } finally { dispatching--; if (writer) startingWrites.delete(writer); }
     if (exec?.signal?.aborted) {
       if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
@@ -1034,7 +1111,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回任务号，结束时用 job_output 取报告。必须给出验收标准和 write：' +
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
-      '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
+      '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。' +
+      (cfg.plannerReads === 'products' ? 'completed 后先机械核对产物、出处和数字，内容是否属实用 codex_verify，' : 'completed 后你要逐条只读核验，') +
       (cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       '其他返工可带 resume=thread_id。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
@@ -1078,6 +1156,49 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
 
   ctx.tools.register({
+    name: 'codex_verify',
+    description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录、主机访问和模型设置，回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。',
+    presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `独立核验 Codex ${a?.job_id ?? ''}` }),
+    parameters: { type: 'object', properties: {
+      job_id: { type: 'string', description: '本会话已结束的 runner job_id。' },
+      focus: { type: 'string', description: '可选，重点核对什么。' },
+      samples: { type: 'integer', minimum: 1, maximum: 30, description: '默认抽查 8 条，最多 30 条。' },
+      wait_seconds: { type: 'integer', minimum: 0, description: waitSecondsDescription },
+    }, required: ['job_id'] },
+    output: OUTPUT,
+    async execute(args, exec) {
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_verify: job_id 无效');
+      if (args.focus !== undefined && typeof args.focus !== 'string') throw new Error('codex_verify: focus 必须是字符串');
+      if (args.samples !== undefined && (!Number.isInteger(args.samples) || args.samples < 1 || args.samples > 30)) throw new Error('codex_verify: samples 必须是 1–30 的整数');
+      if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('codex_verify: wait_seconds 必须是非负整数');
+      const owner = exec?.agent?.id;
+      if (!owner) throw new Error('codex_verify: 当前调用没有会话 ID');
+      let source = await conductor.waitJob(args.job_id, 0, exec?.signal);
+      if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
+      if (source.context?.owner !== owner) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
+      if (source.status === 'running') throw new Error('codex_verify: 原任务还在运行，请等它结束后再核验');
+      if (!source.cwd || !source.log_dir || typeof source.context.task !== 'string' || !Array.isArray(source.context.acceptance) || !source.context.acceptance.length ||
+          !['read-only', 'workspace-write', 'danger-full-access'].includes(source.sandbox)) throw new Error('codex_verify: 原任务缺少目录、任务书、验收标准或执行设置，无法独立核验');
+      source = withReport(source);
+      rememberProducts(source);
+      const samples = args.samples ?? 8;
+      return dispatch({ task: verificationTask(source, { ...args, samples }),
+        acceptance: ['读取原任务书、验收标准和已产出的文件，明确核验范围。',
+          `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
+          '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
+          '全程只读，不修改任何文件或系统状态。'],
+        cwd: source.cwd, write: false, scope: [], writable_roots: [],
+        host_access: source.sandbox === 'danger-full-access',
+        use_user_config: source.task_options?.use_user_config === true,
+        ...(source.task_options?.effort ? { effort: source.task_options.effort } : {}),
+        model: source.task_options?.model ?? '',
+        service_tier: source.task_options?.service_tier ?? '',
+        ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
+      }, exec, undefined, undefined, source.job_id);
+    },
+  });
+
+  ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
     description: '查询 Codex 任务，默认只查一次。已登记后台任务时，通常等 DSH 通知并用 job_output 读结果；' +
@@ -1098,6 +1219,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
       const value = await collect(args.job_id, liveBackground(args.job_id, exec), args.wait_seconds ?? 0, exec?.signal);
+      if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
       return value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
     },
   });
@@ -1114,6 +1236,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     output: OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_cancel: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
+      await ensureOwnJob(args.job_id, exec, 'codex_cancel');
       const bg = liveBackground(args.job_id, exec);
       // 取消前先挂上等待：后台循环随后看到任务结束并结算，算作已被等到，DSH 不再另发一条结束通知。
       // 取消未确认时撤掉等待，免得吞掉任务之后真正结束时的通知。
@@ -1145,7 +1268,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function historySelection(args, exec) {
     for (const key of ['cwd', 'session_id', 'thread_id', 'parent_job']) if (args[key] !== undefined &&
       (typeof args[key] !== 'string' || !args[key].trim())) throw new Error(`${key} 必须是非空字符串`);
-    const owner = args.session_id === 'current' ? exec?.agent?.id : args.session_id;
+    let owner = args.session_id === 'current' ? exec?.agent?.id : args.session_id;
+    if (restrictedReads(exec)) {
+      if (!exec.agent.id || (owner !== undefined && owner !== exec.agent.id)) throw new Error('只能读取本会话的任务记录；请用 session_id="current"。');
+      owner = exec.agent.id;
+    }
     if (args.session_id && owner === undefined) throw new Error('当前调用没有会话 ID');
     const cwd = args.cwd ?? (owner === undefined ? taskCwd({}, sessionCwd(exec), cfg.workspaces) : undefined);
     if (cwd === undefined && owner === undefined) throw new Error('请传 cwd 或 session_id');
@@ -1170,7 +1297,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const filters = Object.fromEntries(['status', 'needs_attention', 'limit', 'offset', 'thread_id', 'parent_job']
       .filter((key) => args[key] !== undefined).map((key) => [key, args[key]]));
     return { owner, linked, settled, filters: { ...filters, ...(cwd !== undefined ? { cwd } : {}),
-      ...(owner !== undefined ? { owner, job_ids: [...linked.keys()] } : {}) } };
+      ...(owner !== undefined ? { owner, ...(!restrictedReads(exec) ? { job_ids: [...linked.keys()] } : {}) } : {}) } };
   }
 
   async function recoverBackground(agent) {
@@ -1254,6 +1381,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.artifact !== undefined && !['report', 'result', 'context', 'review', 'stderr', 'events'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
+      await ensureOwnJob(args.job_id, exec, 'codex_output');
       return conductor.output(args.job_id, args, exec?.signal);
     },
   });
@@ -1479,7 +1607,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         : [...startingWrites].some((writer) => writer.cwd === key) ? '同一任务目录的可写 Codex 任务正在启动，请先等它结束' : '';
       // 查询与启动之间也占住本实例的入口，避免规划端同时派入另一种写任务。
       if (!busy) geminiWrites.add(key);
-      try { return await geminiWrite(cfg.gemini, { ...args, cwd }, conductor, { signal: exec?.signal, busy }, launchGemini); }
+      try {
+        const value = await geminiWrite(cfg.gemini, { ...args, cwd }, conductor, { signal: exec?.signal, busy }, launchGemini);
+        rememberProducts({ ...value, cwd }, exec?.agent?.id);
+        if (cfg.plannerReads === 'products') value.next = '先机械核对正文产物、出处和数字；内容是否属实用 codex_verify 核对原 Codex 素材任务，或用 codex_run 派只读核验正文和素材。';
+        return value;
+      }
       finally { if (!busy) geminiWrites.delete(key); }
     },
   });
@@ -1499,7 +1632,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
       const { text, tools } = turnSummary(agent.session.log ?? [], turn);
-      if (!DISPATCH_CLAIM.test(text) || tools.some((n) => ['codex_run', 'codex_continue', 'codex_status', 'codex_cancel'].includes(n))) return;
+      if (!DISPATCH_CLAIM.test(text) || tools.some((n) => ['codex_run', 'codex_verify', 'codex_continue', 'codex_status', 'codex_cancel'].includes(n))) return;
       if (nudged.size > 500) nudged.clear();
       nudged.add(key);
       agent.steer({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: NUDGE }], source: { kind: `plugin:${name}` } });
@@ -1509,7 +1642,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   if (cfg.roots.length) {
     ctx.tools.guard((exec) => {
       try {
-        return decide(exec, cfg);
+        const denied = decide(exec, cfg);
+        if (denied || cfg.plannerReads !== 'products' || !inWorkspace(sessionCwd(exec), cfg.roots)) return denied;
+        const cwd = ctx.get?.('workingDirectory')?.get(exec.agent.session) ?? sessionCwd(exec);
+        const location = ctx.get?.('sessionPersistence')?.locate?.(exec.agent.session.header);
+        const directories = location?.kind === 'jsonl' && typeof location.path === 'string' ? [path.dirname(location.path)] : [];
+        return productReads.check(exec, cwd, directories);
       } catch (error) {
         return inWorkspace(sessionCwd(exec), cfg.roots)
           ? `[codex-conductor] 护栏判定出错，已拒绝：${error?.message ?? error}`
@@ -1527,10 +1665,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const { record } = loadedRecord(loadedFile);
     if (!record || record.pid === process.pid) writeFileSync(loadedFile,
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
-        tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
+        tools: ['codex_run', 'codex_verify', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
           ...(cfg.gemini ? ['gemini_write'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
+        plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
   } catch {}
