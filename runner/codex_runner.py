@@ -303,6 +303,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
     startup = acquire_file_lock(run_dir / "process.lock", blocking=True)
     try:
         with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
+            state["stderr_offset"] = stderr_log.tell()
             try:
                 proc = subprocess.Popen(cmd, cwd=args.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
@@ -457,7 +458,9 @@ def classify(state, run_dir):
     text = state["error"] or ""
     if not state["failed"] and not text:
         try:
-            text = (run_dir / "stderr.log").read_text("utf-8", "replace")[-2000:]
+            with open(run_dir / "stderr.log", "rb") as f:
+                f.seek(max(state["stderr_offset"], f.seek(0, os.SEEK_END) - 8000))
+                text = f.read().decode("utf-8", "replace")[-2000:]
         except OSError:
             text = ""
         state["error"] = text.strip()[-500:] or "Codex exited without turn.completed"
