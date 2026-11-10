@@ -1062,8 +1062,11 @@ test('a new write task cannot widen an overlapping pending scope before a real u
   const human = { type: 'user/message', at: 11_000, data: { source: { kind: 'user' } } };
   const notice = { type: 'user/message', at: 11_000, data: { source: { kind: 'tool-jobs' } } };
   const expansion = ['candidate.vhdx', 'step.ps1'];
-  for (const { scope, events, denied } of [
+  for (const { cwd = prior.cwd, scope, events, denied } of [
     { scope: expansion, events: [registered, settled, notice], denied: true },
+    { cwd: '/work/elsewhere/deep', scope: ['../../original', 'out'], events: [registered, settled, notice], denied: true },
+    { cwd: '/work', scope: undefined, events: [registered, settled], denied: true },
+    { cwd: '/work/elsewhere', scope: undefined, events: [registered, settled], denied: false },
     { scope: undefined, events: [registered, settled], denied: true },
     { scope: ['other.vhdx'], events: [registered, settled], denied: false },
     { scope: ['candidate.vhdx'], events: [registered, settled], denied: false },
@@ -1071,10 +1074,11 @@ test('a new write task cannot widen an overlapping pending scope before a real u
   ]) {
     const h = harness({ config: { listResult: { jobs: [row] }, startResult: { job_id: 'J', status: 'completed' } } });
     h.finals.PARENT = prior;
-    const pending = h.tools.codex_run.execute({ ...RUN, cwd: prior.cwd, scope, write: true }, { agent: agentAt(prior.cwd, events) });
+    const pending = h.tools.codex_run.execute({ ...RUN, cwd, scope, write: true }, { agent: agentAt(cwd, events) });
     if (denied) await assert.rejects(pending, /PARENT.*范围冲突.*用户回答/);
     else assert.equal((await pending).job_id, 'J');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, denied ? 0 : 1);
+    assert.ok(!h.calls.find(argv => argv[0] === 'list').includes('--cwd'));
   }
 });
 

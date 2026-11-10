@@ -826,11 +826,11 @@ export function outOfScope(value, cwd, scope) {
   return value.files_changed.map(f => f.path).filter(p => !roots.some(r => under(taskScopePath(cwd, p), r)));
 }
 
-function widensOverlappingScope(cwd, original, requested) {
+function widensOverlappingScope(previousCwd, original, cwd, requested) {
   if (!original?.length) return false;
-  if (!requested?.length) return true;
-  const before = original.map(p => taskScopePath(cwd, p));
-  const after = requested.map(p => taskScopePath(cwd, p));
+  if (!requested?.length && normPath(previousCwd) === normPath(cwd)) return true;
+  const before = original.map(p => taskScopePath(previousCwd, p));
+  const after = requested?.length ? requested.map(p => taskScopePath(cwd, p)) : [normPath(cwd)];
   return after.some(p => before.some(r => under(p, r) || under(r, p))) &&
     after.some(p => !before.some(r => under(p, r)));
 }
@@ -1391,7 +1391,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       if (!continuation && args.write && owner) {
         const log = exec.agent.session?.log ?? [];
         for (let offset = 0; offset !== null;) {
-          const history = await conductor.list({ owner, cwd, needs_attention: true, limit: 100, offset }, exec?.signal);
+          const history = await conductor.list({ owner, needs_attention: true, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw new Error('codex_run: 无法核对已有写入范围，未启动 Codex。');
           for (const job of history.jobs) {
@@ -1401,7 +1401,7 @@ export function apply(ctx, config = {}, run = runRunner) {
             exec?.signal?.throwIfAborted();
             if (unknownState(previous) || previous.job_id !== job.job_id) throw new Error(`codex_run: 无法核对原任务 ${job.job_id} 的写入范围，未启动 Codex。`);
             if (previous.blocking?.next_action === 'ask_user' &&
-                widensOverlappingScope(previous.cwd ?? cwd, previous.scope_paths ?? previous.scope, args.scope)) {
+                widensOverlappingScope(previous.cwd ?? cwd, previous.scope_paths ?? previous.scope, cwd, args.scope)) {
               throw new Error(`codex_run: 原任务 ${job.job_id} 的范围冲突仍需用户回答，未启动 Codex。请先向用户确认新增写入路径。`);
             }
           }
