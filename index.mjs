@@ -46,6 +46,13 @@ const DEFAULTS = {
   readOnlyEffort: '',
   serviceTier: '',
   waitSeconds: 0,
+  timeoutSeconds: null,
+  idleTimeoutSeconds: null,
+  retries: null,
+  workspaces: [],
+  denyTools: [],
+  allowCommands: [],
+  ignoreChanges: [],
   // 允许 codex_run 传 host_access=true，让 Codex 在沙箱外运行（能启动 Windows 程序）；默认关闭
   allowHostAccess: false,
   // 省略 host_access 时默认使用主机模式，仍须开启 allowHostAccess
@@ -738,6 +745,9 @@ export function createConductor(cfg, run = runRunner) {
     if (effort) argv.push('--effort', effort);
     if (cfg.model) argv.push('--model', cfg.model);
     if (cfg.serviceTier) argv.push('--service-tier', cfg.serviceTier);
+    for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries']]) {
+      if (cfg[key] != null) argv.push(flag, String(cfg[key]));
+    }
     // host_access 不管 write 都在沙箱外运行，write=false 的只读只靠提示约束
     if (hostAccess === true) argv.push('--sandbox', 'danger-full-access');
     else if (args.write === true) argv.push('--sandbox', 'workspace-write');
@@ -1146,6 +1156,17 @@ export function taskCwd(args, session, workspaces) {
 }
 
 function settings(config, logger) {
+  config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
+    const value = config[key];
+    if (value === undefined || value === '') return [key, fallback];
+    const valid = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries'].includes(key)
+      ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))
+      : key === 'codexRoute' ? value === null || (typeof value === 'object' && !Array.isArray(value))
+        : Array.isArray(fallback) ? Array.isArray(value)
+          : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
+    if (!valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 ${key}，使用默认值`);
+    return [key, valid ? value : fallback];
+  }));
   // workspaces 的条目可以是路径字符串，也可以是 {path, cwd}
   const workspaces = (Array.isArray(config.workspaces) ? config.workspaces : [])
     .map((w) => typeof w === 'string' ? { root: normPath(w) }
@@ -1161,8 +1182,7 @@ function settings(config, logger) {
     }
   });
   return {
-    ...DEFAULTS,
-    ...Object.fromEntries(Object.entries(config).filter(([k, v]) => k in DEFAULTS && v !== undefined && v !== '')),
+    ...config,
     workspaces,
     roots: workspaces.map((w) => w.root),
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),

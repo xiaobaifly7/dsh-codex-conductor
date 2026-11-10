@@ -3068,3 +3068,63 @@ test('runProcess removes abort listeners on success, error and timeout', async (
     assert.equal(getEventListeners(signal, 'abort').length, 0, command);
   }
 });
+
+
+test('settings warns and defaults each invalid entry without losing valid configuration', async () => {
+  const invalid = { distro: 1, python: false, runner: [], codexBin: {}, codexHome: false, runnerHome: 1,
+    routerCheckUrl: [], codexRoute: [], model: true, effort: {}, readOnlyEffort: 3, serviceTier: [],
+    waitSeconds: '100', allowHostAccess: 'false', defaultHostAccess: 1, reportSchema: null,
+    plannerPromptFile: [], runtimeProfileFile: {}, workspaces: {}, denyTools: 'edit', allowCommands: {}, ignoreChanges: 'logs' };
+  const warnings = [];
+  const tools = {};
+  let loaded;
+  apply({ tools: { register: t => { tools[t.name] = t; }, guard: () => {} }, on: () => {},
+    logger: { warn: text => warnings.push(text) } }, invalid, async (cfg) => {
+    loaded = cfg;
+    return { job_id: 'J', status: 'completed' };
+  });
+  assert.equal(warnings.length, Object.keys(invalid).length);
+  for (const key of Object.keys(invalid)) assert.ok(warnings.some(w => w.includes(key)), key);
+  await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+  assert.equal(loaded.python, 'python3');
+  assert.equal(loaded.waitSeconds, 0);
+  assert.equal(loaded.codexRoute, null);
+  assert.equal(loaded.allowHostAccess, false);
+  assert.equal(loaded.defaultHostAccess, false);
+  assert.ok(loaded.runner.endsWith('/runner/codex_runner.py'));
+  assert.equal(tools.codex_run.parameters.properties.timeoutSeconds, undefined);
+  const valid = harness({ config: { model: 'retained', waitSeconds: 0, codexRoute: null } });
+  await valid.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+  assert.ok(valid.calls[0].includes('retained'));
+});
+
+test('optional timeout and retry settings validate numbers and pass only configured runner flags', async () => {
+  const keys = { timeoutSeconds: '--timeout', idleTimeoutSeconds: '--idle-timeout', retries: '--retries' };
+  for (const config of [{}, { timeoutSeconds: null, idleTimeoutSeconds: undefined, retries: null },
+    { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0 }]) {
+    const h = harness({ config });
+    await h.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+    const argv = h.calls[0];
+    for (const [key, flag] of Object.entries(keys)) {
+      assert.equal(argv.includes(flag), config[key] != null, key);
+      if (config[key] != null) assert.equal(argv[argv.indexOf(flag) + 1], String(config[key]));
+    }
+  }
+  for (const [key, flag] of Object.entries(keys)) {
+    for (const value of ['100', false, [], {}, NaN, Infinity, -1, ...(key === 'retries' ? [0.5] : [0])]) {
+      const warnings = [];
+      const tools = {};
+      let argv;
+      apply({ tools: { register: t => { tools[t.name] = t; }, guard: () => {} }, on: () => {},
+        logger: { warn: text => warnings.push(text) } }, { [key]: value, model: 'retained' }, async (_cfg, args) => {
+        argv = args;
+        return { job_id: 'J', status: 'completed' };
+      });
+      assert.equal(warnings.length, 1, `${key}=${String(value)}`);
+      assert.ok(warnings[0].includes(key));
+      await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+      assert.equal(argv.includes(flag), false);
+      assert.ok(argv.includes('retained'));
+    }
+  }
+});
