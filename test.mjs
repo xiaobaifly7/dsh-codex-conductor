@@ -3492,7 +3492,9 @@ test('gemini_write inherits environment and injects all proxy variables only int
   assert.equal((await h.execute()).status, 'completed');
   const env = h.spawns[0].options.env;
   for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) assert.equal(env[key], proxy);
-  assert.equal(env.PATH, process.env.PATH);
+  // 展开后的副本区分大小写；Windows 上这个变量的实际键名可能是 Path。
+  const pathKey = Object.keys(process.env).find((key) => key.toUpperCase() === 'PATH');
+  assert.equal(env[pathKey], process.env[pathKey]);
   assert.equal(process.env.HTTPS_PROXY, original);
   const inherited = geminiFixture(t);
   assert.equal((await inherited.execute()).status, 'completed');
