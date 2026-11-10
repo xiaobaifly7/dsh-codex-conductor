@@ -2307,6 +2307,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["total"], 1)
         self.assertEqual([job["job_id"] for job in result["jobs"]], ["live"])
 
+    def test_global_history_reuses_paths_only_within_one_query(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for i in range(3):
+            self.stored_job(f"same-cwd-{i}", {"status": "completed"}, context=self.sample_context(), scope=["src"])
+        args = SimpleNamespace(command="list", owner=None, cwd=None, job_id=None,
+                               status=None, needs_attention=False, offset=0, limit=20)
+        realpath = os.path.realpath
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.os.path, "realpath", wraps=realpath) as resolve:
+            def cwd_reads():
+                return sum(os.fspath(call.args[0]) == str(self.cwd) for call in resolve.call_args_list)
+
+            history = codex_runner.list_jobs(args)
+            self.assertEqual(history["total"], 3)
+            self.assertEqual(cwd_reads(), 1)
+            self.assertEqual(codex_runner.list_jobs(args), history)
+            self.assertEqual(cwd_reads(), 2)
+            args.owner = "owner-a"
+            self.assertEqual(codex_runner.list_jobs(args), history)
+            self.assertEqual(cwd_reads(), 5)
+
     def test_history_pages_reuse_records_and_only_enrich_selected_jobs(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

@@ -14,7 +14,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.52` 修复冷启动时面板服务尚未就绪导致接口或设置入口未注册的问题，随服务出现、撤销和恢复自动注册与清理，缺少服务时不影响其他功能。
 
-### 0.9.55：设置里的“Codex 指挥”
+### 0.9.56：设置里的“Codex 指挥”
 
 在 DSH 设置页打开“Codex 指挥”，可以查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、查看报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。运行状态和设置先显示，任务历史和关注数量分别加载。
 
@@ -55,6 +55,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | `codex_watch` | 安静观察当前会话的原生 Codex 后台任务，首次重要变化时通知；停止观察不会取消 Codex |
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
+
+`0.9.55` 控制面板读取任务历史和关注数量时，只在本次查询内复用同一路径的解析结果，减少重复文件系统访问。
 
 `0.9.53` 控制面板先显示运行状态和设置；任务历史和关注数量独立加载，不阻塞其他内容。
 
@@ -324,6 +326,8 @@ python3 runner/test_codex_runner.py
 
 `0.9.48` permits more demonstrably read-only text and file checks and ordinary assignments, explains dangerous command forms, and preserves another live process's loaded record.
 
+`0.9.55` reuses path resolution within a single global history query for the panel, reducing repeated filesystem work.
+
 `0.9.53` shows runtime status and settings while task history and the attention count are still loading.
 
 `0.9.51` filters pending scope conflicts before paging the default write-scope preflight. The opt-in `plannerAnswers` behavior is unchanged.
@@ -334,7 +338,7 @@ A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL co
 
 `0.9.52` fixes missing panel routes and settings entries on cold startup by registering, cleaning up, and re-registering them as their services appear, disappear, and return, without affecting other functionality when services are absent.
 
-### 0.9.55: Codex control panel
+### 0.9.56: Codex control panel
 
 Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, read reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Runtime status and settings appear first; task history and attention counts load separately.
 
