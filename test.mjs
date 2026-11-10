@@ -3078,43 +3078,52 @@ test('runProcess removes abort listeners on success, error and timeout', async (
 
 
 test('settings warns and defaults each invalid entry without losing valid configuration', async () => {
-  const invalid = { distro: 1, python: false, runner: [], codexBin: {}, codexHome: false, runnerHome: 1,
+  const invalidTypes = { distro: 1, python: false, runner: [], codexBin: {}, codexHome: false, runnerHome: 1,
     routerCheckUrl: [], codexRoute: [], model: true, effort: {}, readOnlyEffort: 3, serviceTier: [],
     waitSeconds: '100', allowHostAccess: 'false', defaultHostAccess: 1, reportSchema: null,
     plannerPromptFile: [], runtimeProfileFile: {}, workspaces: {}, denyTools: 'edit', allowCommands: {}, ignoreChanges: 'logs' };
-  const warnings = [];
-  const tools = {};
-  let loaded;
-  apply({ tools: { register: t => { tools[t.name] = t; }, guard: () => {} }, on: () => {},
-    logger: { warn: text => warnings.push(text) } }, invalid, async (cfg) => {
-    loaded = cfg;
-    return { job_id: 'J', status: 'completed' };
-  });
-  assert.equal(warnings.length, Object.keys(invalid).length);
-  for (const key of Object.keys(invalid)) assert.ok(warnings.some(w => w.includes(key)), key);
-  await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
-  assert.equal(loaded.python, 'python3');
-  assert.equal(loaded.waitSeconds, 0);
-  assert.equal(loaded.codexRoute, null);
-  assert.equal(loaded.allowHostAccess, false);
-  assert.equal(loaded.defaultHostAccess, false);
-  assert.ok(loaded.runner.endsWith('/runner/codex_runner.py'));
-  assert.equal(tools.codex_run.parameters.properties.timeoutSeconds, undefined);
+  for (const invalid of [invalidTypes, { waitSeconds: '', allowHostAccess: '', defaultHostAccess: '',
+    workspaces: '', denyTools: '', allowCommands: '', ignoreChanges: '', codexRoute: '' }]) {
+    const warnings = [];
+    const tools = {};
+    let loaded;
+    apply({ tools: { register: t => { tools[t.name] = t; }, guard: () => {} }, on: () => {},
+      logger: { warn: text => warnings.push(text) } }, invalid, async (cfg) => {
+      loaded = cfg;
+      return { job_id: 'J', status: 'completed' };
+    });
+    assert.equal(warnings.length, Object.keys(invalid).length);
+    for (const key of Object.keys(invalid)) assert.ok(warnings.some(w => w.includes(key)), key);
+    await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+    assert.equal(loaded.python, 'python3');
+    assert.equal(loaded.waitSeconds, 0);
+    assert.equal(loaded.codexRoute, null);
+    assert.equal(loaded.allowHostAccess, false);
+    assert.equal(loaded.defaultHostAccess, false);
+    assert.ok(loaded.runner.endsWith('/runner/codex_runner.py'));
+    assert.equal(tools.codex_run.parameters.properties.timeoutSeconds, undefined);
+  }
   const valid = harness({ config: { model: 'retained', waitSeconds: 0, codexRoute: null } });
   await valid.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
   assert.ok(valid.calls[0].includes('retained'));
+  const warnings = [];
+  apply({ tools: { register: () => {}, guard: () => {} }, on: () => {},
+    logger: { warn: text => warnings.push(text) } },
+  { python: '', runner: '', timeoutSeconds: '', idleTimeoutSeconds: '', retries: '' });
+  assert.deepEqual(warnings, []);
 });
 
 test('optional timeout and retry settings validate numbers and pass only configured runner flags', async () => {
   const keys = { timeoutSeconds: '--timeout', idleTimeoutSeconds: '--idle-timeout', retries: '--retries' };
   for (const config of [{}, { timeoutSeconds: null, idleTimeoutSeconds: undefined, retries: null },
+    { timeoutSeconds: '', idleTimeoutSeconds: '', retries: '' },
     { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0 }]) {
     const h = harness({ config });
     await h.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
     const argv = h.calls[0];
     for (const [key, flag] of Object.entries(keys)) {
-      assert.equal(argv.includes(flag), config[key] != null, key);
-      if (config[key] != null) assert.equal(argv[argv.indexOf(flag) + 1], String(config[key]));
+      assert.equal(argv.includes(flag), config[key] != null && config[key] !== '', key);
+      if (config[key] != null && config[key] !== '') assert.equal(argv[argv.indexOf(flag) + 1], String(config[key]));
     }
   }
   for (const [key, flag] of Object.entries(keys)) {

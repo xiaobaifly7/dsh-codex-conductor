@@ -1158,8 +1158,9 @@ export function taskCwd(args, session, workspaces) {
 function settings(config, logger) {
   config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
     const value = config[key];
-    if (value === undefined || value === '') return [key, fallback];
-    const valid = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries'].includes(key)
+    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries'].includes(key);
+    if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
+    const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))
       : key === 'codexRoute' ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
