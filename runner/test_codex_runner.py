@@ -2264,6 +2264,26 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"keep", "explicit"})
         self.assertEqual(read.call_count, 2)
 
+    def test_running_list_skips_finished_artifacts(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        done = self.stored_job("finished", {"status": "completed"})
+        self.stored_job("live", None)
+        args = SimpleNamespace(command="list", owner=None, cwd=None, job_id=None,
+                               status="running", needs_attention=False, offset=0, limit=20)
+        read_text = Path.read_text
+
+        def read(path, *args, **kwargs):
+            self.assertNotEqual(path.parent, done)
+            return read_text(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(Path, "read_text", read):
+            result = codex_runner.list_jobs(args)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual([job["job_id"] for job in result["jobs"]], ["live"])
+
     def test_history_pages_reuse_records_and_only_enrich_selected_jobs(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

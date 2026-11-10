@@ -447,7 +447,7 @@ const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并�
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false } = {}) {
   acceptance ??= value.acceptance ?? value.context?.acceptance;
   const recordReview = plannerAnswers
-    ? RECORD_REVIEW.replace('用户明确接受已列出的偏差时', '已列出的偏差符合用户原始目标和已有事实时') + PLANNER_ANSWERS : RECORD_REVIEW;
+    ? RECORD_REVIEW.replace('用户明确接受已列出的偏差时', '原报告偏差符合用户原始目标和已有事实、范围外改动已获用户确认时') + PLANNER_ANSWERS : RECORD_REVIEW;
   if (!value.job_id && unknownState(value)) {
     return '这次未取得任务编号，无法确认 Codex 是否已经启动。先用 codex_jobs 按相同任务目录和原任务核对近期记录，找回 job_id 后再查状态，不要直接重派。';
   }
@@ -953,14 +953,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           offset = history.next_offset ?? null;
         }
       }
-      if (!cfg.plannerAnswers && !continuation && args.write && owner) {
+      if (!continuation && args.write && owner) {
         for (let offset = 0; offset !== null;) {
           const history = await conductor.list({ owner, needs_attention: true, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对已有写入范围', history);
           for (const job of history.jobs) {
             if (job.blocking?.next_action !== 'ask_user' || !job.blocking.blockers?.some(b => b.kind === 'task_conflict') ||
-                canAnswer(log, job, owner)) continue;
+                hasUserReply(log, job, owner)) continue;
             const scope = job.scope_paths ?? job.scope;
             if (unknownState(job) || typeof job.cwd !== 'string' || !job.cwd.trim() ||
                 (scope !== null && (!Array.isArray(scope) || scope.some(p => typeof p !== 'string' || !p.trim())))) {
@@ -1284,7 +1284,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     name: 'codex_review',
     description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
-      (cfg.plannerAnswers ? 'accepted_deviations=逐条通过且规划端按用户原始目标和已有事实接受原报告偏差或范围外改动。' + PLANNER_ANSWERS
+      (cfg.plannerAnswers ? 'accepted_deviations=逐条通过；规划端可按用户原始目标和已有事实接受原报告偏差，范围外改动仍须原会话用户确认。' + PLANNER_ANSWERS
         : 'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。') +
       '不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
@@ -1295,7 +1295,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           evidence: { type: 'string', minLength: 1 } }, required: ['index', 'status', 'evidence'] } },
       notes: { type: 'string', description: '没有补充说明可省略。' },
       accepted_deviations: { type: 'array', description: cfg.plannerAnswers
-        ? '规划端按用户原始目标和已有事实接受偏差或范围外改动时，逐项记录决定依据；没有时可省略。' + PLANNER_ANSWERS
+        ? '逐项记录接受依据：原报告偏差可由规划端按用户原始目标和已有事实判断；范围外改动须原会话用户确认。' + PLANNER_ANSWERS
         : '原会话用户在作业结束后明确接受偏差或范围外改动时，逐项记录确认依据；没有时可省略。', items: { type: 'object', additionalProperties: false,
         properties: { kind: { type: 'string', enum: ['reported', 'scope'] }, index: { type: 'integer', minimum: 1 },
           evidence: { type: 'string', minLength: 1 } }, required: ['kind', 'index', 'evidence'] } },
@@ -1313,7 +1313,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       exec?.signal?.throwIfAborted();
       const { job_id, notes = '', accepted_deviations = [], ...review } = args;
       if (Array.isArray(accepted_deviations) && accepted_deviations.length > 0 &&
-          !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
+          (!cfg.plannerAnswers || accepted_deviations.some(entry => entry?.kind === 'scope')) &&
+          !hasUserReply(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
       const result = await conductor.review(job_id, { ...review, notes, accepted_deviations }, owner, exec?.signal);

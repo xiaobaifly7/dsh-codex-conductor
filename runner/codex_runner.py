@@ -1302,8 +1302,12 @@ def matching_jobs(args):
             continue
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
         try:
+            finished = result_file.exists()
+            # Only terminal jobs publish result.json.
+            if args.status == "running" and finished:
+                continue
             task = task_record(job_dir)
-            result = json.loads(result_file.read_text("utf-8")) if result_file.exists() else None
+            result = json.loads(result_file.read_text("utf-8")) if finished else None
             value = {**task, **(result if result is not None else {})}
             record = {"task": task, "result": result}
         except (OSError, ValueError, TypeError):

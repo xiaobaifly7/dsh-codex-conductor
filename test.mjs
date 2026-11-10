@@ -11,6 +11,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 
+const packageVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
 const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
 process.env.LOCALAPPDATA = localAppData;
@@ -1235,14 +1237,17 @@ test('a new write task cannot widen an overlapping pending scope before a real u
   }
 });
 
-test('plannerAnswers skips scope history preflight for a new write task', async () => {
+test('plannerAnswers checks a pending write scope before dispatching', async () => {
   const source = withReport(workflowSource('task_conflict'));
   const h = harness({ config: { plannerAnswers: true, listResult: { jobs: [source] },
     startResult: { job_id: 'NEXT', status: 'completed' } } });
-  const value = await h.tools.codex_run.execute({ ...RUN, cwd: source.cwd, scope: ['src', 'step.ps1'], write: true },
-    { agent: agentAt('/work/current') });
-  assert.equal(value.job_id, 'NEXT');
-  assert.deepEqual(h.calls.map(argv => argv[0]), ['start']);
+  const args = { ...RUN, cwd: source.cwd, write: true };
+  const exec = { agent: agentAt('/work/current') };
+  await assert.rejects(h.tools.codex_run.execute({ ...args, scope: ['src', 'extra.csv'] }, exec),
+    /PARENT.*范围冲突.*用户回答/);
+  assert.deepEqual(h.calls.map(argv => argv[0]), ['list']);
+  const within = await h.tools.codex_run.execute({ ...args, scope: ['src'] }, exec);
+  assert.equal(within.job_id, 'NEXT');
 });
 
 test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
@@ -1521,6 +1526,21 @@ test('plannerAnswers lets the planner record accepted deviations without a user 
   assert.equal(h.calls.some(argv => argv[0] === 'start'), false);
 });
 
+test('plannerAnswers cannot accept out-of-scope changes without a real user reply', async () => {
+  const source = { ...workflowSource('implementation'), out_of_scope: ['extra.csv'] };
+  const h = harness({ config: { plannerAnswers: true,
+    reviewResult: { ...source, verification_status: 'accepted_deviations' } } });
+  h.finals.PARENT = source;
+  const args = { job_id: 'PARENT', status: 'accepted_deviations',
+    criteria: [{ index: 1, status: 'met', evidence: 'CSV 测试通过' }],
+    accepted_deviations: [{ kind: 'scope', index: 1, evidence: '保留额外文件' }] };
+  await assert.rejects(h.tools.codex_review.execute(args, { agent: agentAt('/work/current') }),
+    /用户确认.*未写入核验/);
+  assert.equal(h.calls.filter(argv => argv[0] === 'review').length, 0);
+  const approved = await h.tools.codex_review.execute(args, { agent: agentAt('/work/current', answeredParent) });
+  assert.equal(approved.verification_status, 'accepted_deviations');
+});
+
 test('codex_review sends every criterion in stdin and returns verification without rewriting the report', async () => {
   const source = workflowSource('implementation');
   source.context.acceptance.push('旧 CSV 文件保持不变');
@@ -1650,7 +1670,7 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.equal(loaded.allowHostAccess, true);
   assert.equal(loaded.defaultHostAccess, true);
   assert.equal(loaded.plannerAnswers, true);
-  assert.equal(loaded.version, '0.9.45');
+  assert.equal(loaded.version, '0.9.47');
   assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
   assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
   assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
@@ -1693,11 +1713,11 @@ test('apply preserves another live process loaded record and replaces own, stale
     const h = harness();
     const status = await h.tools.codex_runtime.execute({ action: 'status' });
     assert.equal(status.instance.module, own.module);
-    assert.equal(status.instance.version, '0.9.45');
+    assert.equal(status.instance.version, '0.9.47');
     if (row.keep) assert.equal(readFileSync(file, 'utf8'), original);
     else {
       assert.equal(status.loaded.pid, process.pid);
-      assert.equal(status.loaded.version, '0.9.45');
+      assert.equal(status.loaded.version, '0.9.47');
       assert.notEqual(status.loaded.loadedAt, '2000-01-01T00:00:00Z');
     }
   }
@@ -3043,7 +3063,7 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   const envelope = JSON.parse(starts[0].stdin);
   const { dispatcher, ...taskContext } = envelope.context;
   assert.equal(dispatcher.pid, process.pid);
-  assert.equal(dispatcher.version, '0.9.45');
+  assert.equal(dispatcher.version, '0.9.47');
   assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);
