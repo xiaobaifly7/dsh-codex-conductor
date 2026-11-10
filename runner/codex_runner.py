@@ -708,7 +708,7 @@ def execute(args, prompt, run_dir):
             if thread_id and args.sandbox != "read-only" and kind != "router_down":
                 prompt = ("The previous attempt was interrupted. Inspect the current state of the workspace, "
                           "then finish the original task without repeating completed work.")
-            elif args.sandbox == "read-only":
+            elif args.sandbox == "read-only" and kind != "router_down":
                 thread_id = None
 
         runner_event(run_dir, attempt, "finalizing", last_error_kind)
