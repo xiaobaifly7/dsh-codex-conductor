@@ -3148,7 +3148,7 @@ test('optional timeout and retry settings validate numbers and pass only configu
 
 test('pending scope checks fail closed on unverifiable list records without status queries', async () => {
   const prior = withReport(workflowSource('task_conflict'));
-  for (const change of [{ cwd: null }, { scope_paths: null, scope: null }, { scope_paths: 'src' },
+  for (const change of [{ cwd: null }, { scope_paths: undefined, scope: undefined }, { scope_paths: 'src' },
     { scope_paths: [null] }, { status: 'unknown' }, { error_kind: 'invalid_record' }]) {
     const h = harness({ config: { listResult: { jobs: [{ ...prior, ...change }] } } });
     await assert.rejects(h.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('/work/original') }), /无法核对.*写入范围/);
@@ -3195,4 +3195,15 @@ test('codex_summary renders error-kind totals for the full filtered range on eve
   assert.match(render({ ...summary, error_kinds: {} }), /错误分类（全部匹配任务）：无/);
   assert.match(render({ ...summary, error_kinds: undefined }), /错误分类（全部匹配任务）：未知/);
   assert.deepEqual(h.calls, [['summary', '--owner', 'S1', '--limit', '1', '--offset', '2']]);
+});
+
+
+test('pending tasks with explicitly null scope retain unrestricted dispatch semantics', async () => {
+  const prior = { ...withReport(workflowSource('task_conflict')), scope_paths: null, scope: null };
+  for (const scope of [undefined, ['src', 'other']]) {
+    const h = harness({ config: { listResult: { jobs: [prior] }, startResult: { job_id: 'J', status: 'completed' } } });
+    const value = await h.tools.codex_run.execute({ ...RUN, scope, write: true }, { agent: agentAt(prior.cwd) });
+    assert.equal(value.job_id, 'J');
+    assert.deepEqual(h.calls.map(argv => argv[0]), ['list', 'start']);
+  }
 });

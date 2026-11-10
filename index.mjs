@@ -1433,7 +1433,7 @@ export function apply(ctx, config = {}, run = runRunner) {
                 hasUserReply(log, job, owner)) continue;
             const scope = job.scope_paths ?? job.scope;
             if (unknownState(job) || typeof job.cwd !== 'string' || !job.cwd.trim() ||
-                !Array.isArray(scope) || scope.some(p => typeof p !== 'string' || !p.trim())) {
+                (scope !== null && (!Array.isArray(scope) || scope.some(p => typeof p !== 'string' || !p.trim())))) {
               throw new Error(`codex_run: 无法核对原任务 ${job.job_id} 的写入范围，未启动 Codex。`);
             }
             if (widensOverlappingScope(job.cwd, scope, cwd, args.scope)) {
