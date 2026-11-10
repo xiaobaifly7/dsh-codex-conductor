@@ -1385,17 +1385,21 @@ export function apply(ctx, config = {}, run = runRunner) {
     dispatchGeneration++;
     try {
       const owner = exec?.agent?.id;
-      if (!continuation && args.resume && owner) {
-        const history = await conductor.list({ owner, thread_id: args.resume, limit: 1 }, exec?.signal);
-        exec?.signal?.throwIfAborted();
-        if (!Array.isArray(history.jobs)) throw new Error('codex_run: 无法核对待续接线程的最近任务，未启动 Codex。');
-        const latest = history.jobs[0];
-        if (latest?.blocking?.next_action === 'ask_user') {
-          throw new Error(`codex_run: 原任务 ${latest.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再用 codex_continue 提交回答。`);
+      const log = exec?.agent?.session?.log ?? [];
+      if (args.resume && owner) {
+        const tool = continuation ? 'codex_continue' : 'codex_run';
+        // 新一轮的结果不能替代同线程更早问题的用户回复。
+        for (let offset = 0; offset !== null;) {
+          const history = await conductor.list({ owner, thread_id: args.resume, limit: 100, offset }, exec?.signal);
+          exec?.signal?.throwIfAborted();
+          if (!Array.isArray(history.jobs)) throw new Error(`${tool}: 无法核对待续接线程的任务，未启动 Codex。`);
+          const pending = history.jobs.find((job, index) => job.blocking?.next_action === 'ask_user' &&
+            ((!continuation && offset === 0 && index === 0) || !hasUserReply(log, job, owner)));
+          if (pending) throw new Error(`${tool}: 原任务 ${pending.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再按最新任务状态用 codex_continue 处理。`);
+          offset = history.next_offset ?? null;
         }
       }
       if (!continuation && args.write && owner) {
-        const log = exec.agent.session?.log ?? [];
         for (let offset = 0; offset !== null;) {
           const history = await conductor.list({ owner, needs_attention: true, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();

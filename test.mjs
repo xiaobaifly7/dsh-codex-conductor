@@ -960,7 +960,7 @@ function harness({ config = {}, jobs, agents, get = true } = {}) {
     // answer() 放弃后让后台循环出错退出，否则进程挂住不结束
     if (closed) return Promise.reject(new Error('harness closed'));
     if (argv[0] === 'start') return Promise.resolve(startResult ?? { job_id: `J${++n}`, status: 'running' });
-    if (argv[0] === 'list') return Promise.resolve(listResult ?? { jobs: [], total: 0 });
+    if (argv[0] === 'list') return Promise.resolve((typeof listResult === 'function' ? listResult(argv) : listResult) ?? { jobs: [], total: 0 });
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'review') return Promise.resolve(reviewResult);
     if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
@@ -1051,7 +1051,7 @@ test('codex_run cannot resume a thread whose latest owned task needs a user answ
   const h = harness({ config: { listResult: { jobs: [{ job_id: source.job_id, blocking: source.blocking }] } } });
   const exec = { agent: agentAt('/work/current') };
   await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id }, exec), /PARENT.*用户回答.*codex_continue/);
-  assert.deepEqual(h.calls, [['list', '--limit', '1', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
+  assert.deepEqual(h.calls, [['list', '--limit', '100', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
 });
 
 test('a new write task cannot widen an overlapping pending scope before a real user reply', async () => {
@@ -1099,6 +1099,30 @@ const answeredParent = [
   { type: 'job/settled', data: { jobId: 'bg1' } },
   { type: 'user/message', time: 11_000, data: { source: { kind: 'user' } } },
 ];
+
+test('both resume paths reject an older unanswered task on the same thread', async () => {
+  const parent = withReport(workflowSource('task_conflict'));
+  const latest = withReport({ ...workflowSource('implementation'), job_id: 'CHILD' });
+  const [registered, settled, human] = answeredParent;
+  const notice = { ...human, data: { source: { kind: 'tool-jobs' } } };
+  for (const tool of ['codex_run', 'codex_continue']) {
+    const listResult = (argv) => {
+      if (!argv.includes('--thread-id')) return { jobs: [], total: 0 };
+      return argv[argv.indexOf('--offset') + 1] === '0'
+        ? { jobs: [latest], next_offset: 1 } : { jobs: [parent] };
+    };
+    const h = harness({ config: { listResult, startResult: { job_id: 'NEXT', status: 'completed' } } });
+    h.finals.CHILD = latest;
+    const args = tool === 'codex_run'
+      ? { ...RUN, write: true, scope: ['src'], resume: parent.thread_id } : { job_id: 'CHILD', wait_seconds: 0 };
+    const invoke = (log) => h.tools[tool].execute(args, { agent: agentAt('/work/current', log) });
+    const log = [registered, settled, notice];
+    await assert.rejects(invoke(log), /PARENT.*用户回答.*未启动 Codex/);
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
+    assert.equal((await invoke([...log, human])).job_id, 'NEXT');
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
+  }
+});
 
 test('codex_continue requires a real reply after the report or review raised questions', async () => {
   const [registered, settled, human] = answeredParent;
@@ -1180,7 +1204,8 @@ test('codex_continue shares concurrent dispatch and reuses an existing child aft
   const results = await Promise.all([h.tools.codex_continue.execute(args, exec), h.tools.codex_continue.execute(args, exec)]);
   assert.deepEqual(results[0], results[1]);
   assert.equal(h.calls.filter((argv) => argv[0] === 'start').length, 1);
-  assert.equal(h.calls.filter((argv) => argv[0] === 'list').length, 1);
+  assert.equal(h.calls.filter((argv) => argv[0] === 'list' && argv.includes('--parent-job')).length, 1);
+  assert.equal(h.calls.filter((argv) => argv[0] === 'list' && argv.includes('--thread-id')).length, 1);
   const after = harness({ config: { listResult: { jobs: [{ job_id: 'CHILD' }], total: 1 } } });
   after.finals.PARENT = h.finals.PARENT;
   after.finals.CHILD = { job_id: 'CHILD', status: 'running', context: { ...h.finals.PARENT.context,
