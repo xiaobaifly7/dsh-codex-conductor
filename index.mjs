@@ -1586,7 +1586,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     name: 'gemini_write',
     description: '把教程、文档正文交给本机官方 agy 的 Gemini 写入单个文件，一章一章做；源码改动和素材笔记用 codex_run。' +
       '插件读取并内联 sources，内容会发送给 Google；同目录有可写 Codex 任务运行或排队、或任务查询失败时拒绝。' +
-      '结束后读回文件统计字符并列出快照改动与范围外写入；completed 后仍需对照素材核对内容。',
+      'max_chars 是正文硬上限，目标为上限的 80% 向下取整；首次超限自动压缩一次，两次调用共用 timeoutSeconds 预算，仍超限时请拆章。' +
+      '返回 attempts 和每次正文字数 attempt_chars；最终 failed 时恢复目标原内容，原先不存在则删除目标。' +
+      '可选 frontmatter 由插件校验、生成并去除模型重复块，不计入字数。结束后列出快照改动与范围外写入；completed 后仍需对照素材核对内容。',
     presentCall: (args) => ({ card: 'generic', kind: 'execute', title: `Gemini 写作 · ${args?.output ?? ''}` }),
     parameters: { type: 'object', properties: {
       prompt: { type: 'string', minLength: 10, description: '本章的写作要求，至少 10 个字符。' },
@@ -1596,8 +1598,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       cwd: { type: 'string', description: '任务目录，解析规则同 codex_run；Windows 路径或 /mnt/<盘符>/...。' },
       model: { type: 'string', description: `默认 ${cfg.gemini.model}。` },
       effort: { type: 'string', enum: ['low', 'medium', 'high'], description: `默认 ${cfg.gemini.effort}。` },
-      max_chars: { type: 'integer', minimum: 1, description: '总字符上限，含标点和空白，按落盘内容的 Unicode 字符核对。' },
+      max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },
+      frontmatter: { type: 'object', additionalProperties: false, required: ['title', 'tags'],
+        description: '启用后由插件生成七字段 YAML；title 和至少一个非空 tags 必填，单值最多 200 个 Unicode 字符且禁止换行和控制字符；仅 tags/aliases 可用字符串数组，aliases 允许空数组；不传则保留原有正文处理。',
+        properties: {
+          created: { type: 'string', maxLength: 200, description: '缺省当前本地时间 YYYY-MM-DDTHH:MM。' },
+          updated: { type: 'string', maxLength: 200, description: '缺省当前本地时间 YYYY-MM-DDTHH:MM。' },
+          title: { type: 'string', minLength: 1, maxLength: 200, description: '必填的非空笔记标题。' },
+          type: { type: 'string', enum: ['daily-note', 'project', 'topic', 'moc', 'resource', 'inbox', 'archive'], description: '缺省 resource。' },
+          status: { type: 'string', enum: ['active', 'draft', 'review', 'done', 'archived'], description: '缺省 draft。' },
+          tags: { anyOf: [{ type: 'string', minLength: 1, maxLength: 200 },
+            { type: 'array', minItems: 1, items: { type: 'string', minLength: 1, maxLength: 200 } }], description: '必填，至少一个非空标签。' },
+          aliases: { anyOf: [{ type: 'string', maxLength: 200 },
+            { type: 'array', items: { type: 'string', maxLength: 200 } }], description: '缺省 []，允许空数组。' },
+        } },
     }, required: ['prompt', 'sources', 'output'] },
     output: DATA_OUTPUT,
     async execute(args = {}, exec) {
@@ -1611,7 +1626,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       try {
         const value = await geminiWrite(cfg.gemini, { ...args, cwd }, conductor, { signal: exec?.signal, busy }, launchGemini);
         rememberProducts({ ...value, cwd }, exec?.agent?.id);
-        if (cfg.plannerReads === 'products') value.next = '先机械核对正文产物、出处和数字；内容是否属实用 codex_verify 核对原 Codex 素材任务，或用 codex_run 派只读核验正文和素材。';
+        if (cfg.plannerReads === 'products' && value.status === 'completed') value.next = '先机械核对正文产物、出处和数字；内容是否属实用 codex_verify 核对原 Codex 素材任务，或用 codex_run 派只读核验正文和素材。';
         return value;
       }
       finally { if (!busy) geminiWrites.delete(key); }

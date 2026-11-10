@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.68` 为 `gemini_write` 增加硬上限与 80% 目标、同一超时预算内的一次自动压缩、失败时目标文件恢复，以及插件生成且不计入字数的可选七字段 YAML frontmatter。
+
 ### 0.9.66：规划端只读产物与独立核验
 
 默认 `plannerReads: open` 保持原有读取方式。改成 `products` 后，受护栏保护的会话只能直接读本会话 Codex / `gemini_write` 已产出的文件、任务报告、规划提示词，以及明确允许的文件或目录；目录列表仍可查看，源码调查交给 `codex_run`。常用设置里可开关“规划端只读 Codex 的产物，不直接读源码”，沿用保存、待生效和立即生效流程；状态区只显示额外允许路径的条数。
@@ -322,9 +324,11 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 调用示例：`gemini_write({"prompt":"根据素材写第一章入门说明，事实不得超出素材。","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`。`prompt` 至少 10 个字符；`sources` 为 1–20 个已有文件，总大小最多 1 MiB。素材与输出可用绝对路径或相对任务目录的路径，`cwd` 选择规则同 `codex_run`，Windows 下也接受 `/mnt/<盘符>/...`。输出必须在任务目录内、不能与素材相同；已有目标须传 `overwrite=true`。单次可覆盖 `model / effort`。
 
-同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 字符计数（含标点和空白），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报。超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`；`next` 提示核对内容、超限重写或处理范围外改动，`usage` 透传 CLI 用量。
+可选 `frontmatter` 只接受 `created / updated / title / type / status / tags / aliases`，其中非空 `title` 和至少一个非空 `tags` 必填，`type / status / aliases` 缺省为 `resource / draft / []`，两个时间缺省为当前本地 `YYYY-MM-DDTHH:MM`；字符串或数组元素最多 200 个 Unicode 码点且禁止换行、控制字符，仅 `tags / aliases` 可为字符串数组，枚举值见工具参数说明。
 
-`files_changed` 来自目标所在目录及子目录的文件名、大小、mtime 快照，最多检查 1,000 个目录项，不跟随符号链接；达到上限会设置 `snapshot.truncated=true` 并注明未覆盖部分。`write_paths` 保存 stdout 的 `write_file` 路径旁证；除目标外的快照改动与写入事件列入 `out_of_scope`，需核实是否来自同时段其他进程。`accept-edits` 不是单文件沙箱；目录之外、快照未覆盖且没有写入事件的操作无法由这份清单证明，工具也不会自动回滚改动。
+同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 码点计数（含标题、Markdown 标记、标点、空白及换行），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报；传 `frontmatter` 时去掉模型自带块，再由插件生成，元数据不计入字数，不传则仍计整个文件。首次超限自动按原稿压缩一次，两次调用共用 `timeoutSeconds`，`attempts / attempt_chars` 返回调用次数和每次字数（启动前校验失败为 0 次，未能读回的字数为 `null`）；仍超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`，恢复目标原字节，原先不存在则删除目标。`next` 提示核对内容、两次超限后拆章或处理范围外改动，`usage` 透传最后一次 CLI 用量。
+
+`files_changed` 来自目标所在目录及子目录的文件名、大小、mtime 快照，最多检查 1,000 个目录项，不跟随符号链接；达到上限会设置 `snapshot.truncated=true` 并注明未覆盖部分。`write_paths` 保存两次调用 stdout 的 `write_file` 路径旁证；除目标外的快照改动与写入事件列入 `out_of_scope`，需核实是否来自同时段其他进程。清单保留恢复目标前的观察结果。`accept-edits` 不是单文件沙箱；目录之外、快照未覆盖且没有写入事件的操作无法由这份清单证明，范围外改动不会自动回滚。
 
 ## 单独使用 runner
 
@@ -365,6 +369,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.68` adds a hard limit and 80% target for `gemini_write`, one automatic compression attempt within the shared timeout budget, output restoration on failure, and optional plugin-generated seven-field YAML frontmatter excluded from character counts.
 
 ### 0.9.66: Products-only planner reads and independent verification
 
@@ -473,9 +479,11 @@ The last three values are the defaults; effort accepts `low / medium / high`. Pr
 
 `gemini_write` requires a `prompt` of at least 10 characters, 1–20 existing `sources` totaling at most 1 MiB, and one `output`. Source/output paths are absolute or relative to the task directory; `cwd` follows `codex_run` selection and accepts Windows or mounted `/mnt/<drive>/...` paths on Windows. Output must stay inside the task directory, differ from all sources, and requires `overwrite=true` when present. Per-call `model`, `effort` and positive `max_chars` are optional. For example: `gemini_write({"prompt":"Write chapter one using only the supplied facts.","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`.
 
-Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode characters including whitespace/punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`). CLI errors, missing output/result, timeout, cancellation, excess length or out-of-scope writes return `failed`; `next` requests content verification, rewriting or scope review, and `usage` passes through CLI usage.
+Optional `frontmatter` only accepts `created / updated / title / type / status / tags / aliases`: a nonempty `title` and at least one nonempty `tags` entry are required, `type / status / aliases` default to `resource / draft / []`, both timestamps default to local `YYYY-MM-DDTHH:MM`, and each string or array element is limited to 200 Unicode code points without line breaks or control characters; only `tags / aliases` accept string arrays, with enum values documented in the tool schema.
 
-`files_changed` compares names/sizes/mtimes under the output's parent directory recursively, without following symlinks, capped at 1,000 entries; `snapshot.truncated` discloses incomplete coverage. `write_paths` retains stdout `write_file` paths as supporting evidence; extra snapshot changes/events appear in `out_of_scope` and may include concurrent writers. The tool remains available inside guarded workspaces. `accept-edits` is not a single-file sandbox: unreported operations outside snapshot coverage cannot be established by this list, and changes are not automatically rolled back.
+Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode code points including headings, Markdown, whitespace and punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`); supplying `frontmatter` replaces model metadata with the plugin-generated header and excludes it from counts, otherwise the whole file still counts. The first excess triggers one compression of the previous draft under the same `timeoutSeconds` budget; `attempts / attempt_chars` report calls and their counts (0 calls for preflight validation failures, `null` for unreadable output). CLI errors, missing output/result, timeout, cancellation, excess length after compression or out-of-scope writes return `failed`, restoring the output's original bytes or deleting a newly created output; `next` requests content verification, chapter splitting after two excesses or scope review, and `usage` passes through the final CLI usage.
+
+`files_changed` compares names/sizes/mtimes under the output's parent directory recursively, without following symlinks, capped at 1,000 entries; `snapshot.truncated` discloses incomplete coverage. `write_paths` retains stdout `write_file` paths from both calls as supporting evidence; extra snapshot changes/events appear in `out_of_scope` and may include concurrent writers. These lists retain observations made before output restoration. The tool remains available inside guarded workspaces. `accept-edits` is not a single-file sandbox: unreported operations outside snapshot coverage cannot be established by this list, and out-of-scope changes are not automatically rolled back.
 
 ### Task lifecycle
 
