@@ -156,7 +156,6 @@ export function runnerArgv(cfg, args) {
 }
 
 // 跑一个命令，返回它输出的最后一行 JSON。timeoutMs 到了还没结束（WSL 卡死或起不来）就结束它并按 bridge_error 返回，
-// 不等 close：进程树没收干净时 close 可能一直不来
 export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onProgress } = {}) {
   if (signal?.aborted) return Promise.resolve({ status: 'failed', error_kind: 'bridge_error',
     error: `${command} 调用前已被中止`, retryable: true });
@@ -189,17 +188,22 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
       resolve({ status: 'failed', error_kind: 'bridge_error', retryable: true,
         error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束它（WSL 可能卡住或正在启动）` });
     }, 1000);
-    let lastLine = '';
     if (onProgress) {
       const lines = createInterface({ input: child.stdout });
       const fail = (error) => { cleanup(); child.kill(); reject(error); };
       lines.on('error', fail);
       lines.on('line', (line) => {
         if (!line.trim()) return;
-        lastLine = line;
         let value;
         try { value = JSON.parse(line); } catch { return; }
-        if (value?.status !== 'running') return;
+        if (typeof value?.status !== 'string') return;
+        if (value.status !== 'running') {
+          // 终态已经完整到达，不等只读查询进程关闭。
+          cleanup();
+          resolve(value);
+          child.kill();
+          return;
+        }
         ticks = 0;
         try { onProgress(value); } catch (error) { fail(error); }
       });
@@ -210,16 +214,13 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
     });
     child.on('close', (code) => {
       cleanup();
-      const stdout = onProgress ? lastLine : Buffer.concat(out).toString('utf8').trim();
-      try {
-        const value = JSON.parse(stdout.split('\n').at(-1));
-        if (onProgress && (typeof value?.status !== 'string' || value.status === 'running')) throw new Error();
-        resolve(value);
-      } catch {
-        const stderr = Buffer.concat(err).toString('utf8').trim().slice(-2000);
-        const detail = stderr || (onProgress ? 'status stream closed without a final result' : stdout.slice(-2000));
-        resolve({ status: 'failed', error_kind: 'bridge_error', error: `runner exited ${code}: ${detail}`, retryable: true });
+      const stdout = Buffer.concat(out).toString('utf8').trim();
+      if (!onProgress) {
+        try { resolve(JSON.parse(stdout.split('\n').at(-1))); return; } catch {}
       }
+      const stderr = Buffer.concat(err).toString('utf8').trim().slice(-2000);
+      const detail = stderr || (onProgress ? 'status stream closed without a final result' : stdout.slice(-2000));
+      resolve({ status: 'failed', error_kind: 'bridge_error', error: `runner exited ${code}: ${detail}`, retryable: true });
     });
     child.stdin.on('error', () => {});
     child.stdin.end(stdin ?? '');
