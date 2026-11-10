@@ -740,6 +740,25 @@ class RunnerTests(unittest.TestCase):
             router.assert_not_called()
             attempt.assert_not_called()
 
+    def test_lock_timeout_does_not_acquire_a_lock_released_after_the_deadline(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        args = SimpleNamespace(cwd=str(self.cwd), sandbox="workspace-write", lock_timeout=0.1)
+        elapsed = [0]
+        def advance(delay):
+            elapsed[0] += delay
+        with mock.patch.object(codex_runner, "acquire_write_lock", side_effect=[None, mock.Mock()]) as acquire, \
+                mock.patch.object(codex_runner, "time", wraps=time) as clock, \
+                mock.patch.object(codex_runner, "snapshot_before", side_effect=AssertionError("snapshot after lock deadline")) as snapshot:
+            clock.monotonic.side_effect = lambda: elapsed[0]
+            clock.sleep.side_effect = advance
+            result = codex_runner.execute(args, "do it", Path(self.tmp.name) / "late-lock")
+        self.assertEqual(result["error_kind"], "lock_timeout")
+        self.assertEqual(elapsed[0], 0.1)
+        acquire.assert_called_once()
+        snapshot.assert_not_called()
+
     def test_lock_timeout_rejects_nonpositive_or_nonfinite_values(self):
         for value in ("0", "-1", "nan", "inf", "-inf"):
             self.assertEqual(self.control("run", "--cwd", str(self.cwd), "--lock-timeout=" + value)["error_kind"], "bad_arguments")
