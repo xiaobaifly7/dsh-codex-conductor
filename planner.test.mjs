@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createProductReads, plannerReadTargets, readPath, shellReadTargets } from './guard.mjs';
+import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, shellReadTargets, wslPath } from './guard.mjs';
 import { apply, nextStep } from './index.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -62,7 +62,7 @@ test('products covers shell content commands, redirection, options and uncertain
     'grep --fil /repo/raw /repo/product', 'file --files-fr /repo/product',
     `jq -L/repo -n 'import "raw" as $data; $data'`, `jq -n 'include "raw"; .'`,
     'grep -R fact /repo/product', 'rg --follow fact /repo/product', 'rg -nL fact /repo/product',
-    'git -C status show HEAD:raw',
+    'git -C status show HEAD:raw', 'diff -r /repo/product /repo/product',
     'wc --files0-from=/repo/raw', 'sort --files0-from=/repo/raw', 'file -f /repo/raw', 'sha256sum -c /repo/product',
     'find /repo -exec cat {} \\;', 'ls /repo | xargs cat', 'npm test', 'node --check /repo/product',
     'git show HEAD:raw', 'git diff -- /repo/raw', 'cd /repo; cat product',
@@ -71,6 +71,21 @@ test('products covers shell content commands, redirection, options and uncertain
   assert.equal(scope.check(call('bash', { command: 'cat product', workdir: '/repo' }), '/other'), undefined);
   assert.match(scope.check(call('bash', { command: 'cat product', workdir: '../other' }), '/repo'), /原料/);
   assert.equal(scope.check(call('bash', { command: "echo 'literal text' | tr a-z A-Z" }), '/repo'), undefined);
+});
+
+test('products blocks indirect file inputs and Git content flags; open stays unchanged', () => {
+  const scope = createProductReads({}, async owner => ({ status: 'completed', owner, paths: [] }));
+  scope.add('S1', ['/repo/product']);
+  for (const command of [
+    'git status -v', 'git -C /repo status -vv', 'git status --verbose', 'git status --verb',
+    'git ls-files --eol', 'git ls-files --eo',
+    'date -uf /repo/raw', 'date --fil=/repo/raw', 'rg --files -nf /repo/raw',
+    `awk 'BEGIN { ARGV[1]="/repo/raw"; ARGC=2 } { print }' /repo/product`,
+    `awk 'BEGIN { ARGV[ARGC++]="/repo/raw" } 1' /repo/product`,
+  ]) {
+    assert.equal(readOnlyCommand(command, []), true, command);
+    assert.match(scope.check(call('wsl', { command }), '/repo'), /原料/, command);
+  }
 });
 
 test('directory discovery remains unrestricted and wc still reads content', () => {
@@ -99,6 +114,8 @@ test('allowlist files/directories and the prompt reuse path normalization and re
   symlinkSync(allowed, link, process.platform === 'win32' ? 'junction' : 'dir');
   assert.equal(scope.check(call('read', { file_path: path.join(link, 'nested.md') }, 'S1', root), root), undefined);
   const productScope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
+  productScope.add('S1', [wslPath(allowed)]);
+  assert.match(productScope.check(call('ops_grep', { path: allowed, pattern: 'text' }, 'S1', root), root), /原料/);
   productScope.add('S1', [path.join(link, 'nested.md')]);
   rmSync(link);
   symlinkSync(root, link, process.platform === 'win32' ? 'junction' : 'dir');

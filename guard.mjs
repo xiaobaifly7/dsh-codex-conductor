@@ -747,14 +747,21 @@ export function shellReadTargets(command, cwd) {
       continue;
     }
     if (cmd === 'git') {
-      const [sub] = gitArguments(args);
+      const [sub, ...rest] = gitArguments(args);
+      if (sub === 'status' && rest.some(a => /^--v|^-[^-]*v/.test(a))) return null;
+      if (sub === 'ls-files' && rest.some(a => a.startsWith('--eo'))) return null;
       if (['status', 'ls-files', 'ls-tree', 'rev-parse', 'describe', 'branch', 'remote', 'tag', 'check-ignore', '--version'].includes(sub)) continue;
       return null;
     }
-    if (cmd === 'date' && !args.some(a => /^-(?:f|-file)/.test(a))) continue;
+    if (cmd === 'date') {
+      if (args.some(a => /^--f|^-[^-]*f/.test(a))) return null;
+      continue;
+    }
     if (cmd === 'tr') continue; // Operates on stdin; any input redirection or upstream reader is checked separately.
     if (!CONTENT_COMMANDS.has(cmd)) return null;
     if (expansion.dynamicWords.slice(start).some(Boolean) || braces.has(raw)) return null;
+    // Recursive diff follows directory links, so its reads can escape the supplied roots.
+    if (cmd === 'diff' && args.some(a => /^-[^-]*r/.test(a) || a === '--recursive')) return null;
     if (['sha256sum', 'sha1sum', 'md5sum'].includes(cmd) && args.some(a => a === '--check' || /^-[^-]*c/.test(a))) return null;
     if (cmd === 'dd') {
       for (let i = 0; i < args.length; i++) if (args[i].startsWith('if=')) {
@@ -767,7 +774,7 @@ export function shellReadTargets(command, cwd) {
     }
     const search = ['grep', 'egrep', 'fgrep', 'rg'].includes(cmd);
     if (cmd === 'rg' && args.includes('--files')) {
-      if (args.some(a => /^(-f|--file(?:=|$)|--ignore-file)/.test(a))) return null;
+      if (args.some(a => /^(-[^-]*f|--file(?:=|$)|--ignore-file)/.test(a))) return null;
       continue;
     }
     if (search && args.some(a => a === '--follow' || (cmd === 'rg' ? /^-[^-]*L/.test(a) : /^-[^-]*R/.test(a)))) return null;
@@ -789,6 +796,8 @@ export function shellReadTargets(command, cwd) {
         (cmd === 'jq' && args.some(a => /^--(?:slurpfile|rawfile|from-file|argfile|run-tests|library-path)(?:=|$)|^-[^-]*[fL]/.test(a)))) return null;
     const parsed = fileArguments(args, takes, fileOptions);
     if (!parsed) return null;
+    // awk can replace its input paths through ARGV/ARGC.
+    if (cmd === 'awk' && /\b(?:ARGV|ARGC)\b/.test(parsed.operands[0]?.path ?? '')) return null;
     if (cmd === 'jq' && /\b(?:import|include)\b/.test(parsed.operands[0]?.path ?? '')) return null;
     const hasPattern = search && args.some(a => /^(-[ef]|--regexp(?:=|$)|--file(?:=|$))/.test(a));
     if ((search && !hasPattern) || ['sed', 'awk', 'jq'].includes(cmd)) parsed.operands.shift();
@@ -851,7 +860,7 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     for (const file of paths) {
       const key = readPath(file);
       if (!key) continue;
-      try { if (statSync(file).isDirectory()) continue; } catch {}
+      try { if (statSync(process.platform === 'win32' ? key : file).isDirectory()) continue; } catch {}
       if (state.paths.size >= limit && !state.paths.has(key)) state.paths.delete(state.paths.values().next().value);
       state.paths.add(key);
     }

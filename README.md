@@ -356,7 +356,7 @@ python3 runner/codex_runner.py forget-too-big --cwd DIR
 ## 测试
 
 ```text
-node --test test.mjs workflow.test.mjs runtime.test.mjs
+node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs
 python3 runner/test_codex_runner.py
 ```
 
@@ -580,7 +580,7 @@ A read-only subshell can omit the space after its opening parenthesis, for examp
 `>&` accepts only a complete numeric file descriptor, such as `2>&1`, and rejects file targets that merely start with digits.
 `env -u TAR_OPTIONS tar -tzvf ./archive.tar.gz` lists one literal local gzip archive. Extraction, remote archives, and extra options remain refused.
 
-Requires Windows/WSL2, Codex CLI, Python 3.11+ in WSL, and DSH `>=0.2.1-rc.2 <0.3.0`. Install `github:xiaobaifly7/dsh-codex-conductor`; see [installation](#安装). Tests: `node --test test.mjs workflow.test.mjs runtime.test.mjs` and `python3 runner/test_codex_runner.py`; mocks need no DSH/real Codex. Platform/tool-specific cases skip when unavailable. CI runs both on Ubuntu/Windows with Node 22/Python 3.12.
+Requires Windows/WSL2, Codex CLI, Python 3.11+ in WSL, and DSH `>=0.2.1-rc.2 <0.3.0`. Install `github:xiaobaifly7/dsh-codex-conductor`; see [installation](#安装). Tests: `node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs` and `python3 runner/test_codex_runner.py`; mocks need no DSH/real Codex. Platform/tool-specific cases skip when unavailable. CI runs both on Ubuntu/Windows with Node 22/Python 3.12.
 
 ## License
 
