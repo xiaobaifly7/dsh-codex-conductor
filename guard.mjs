@@ -500,7 +500,9 @@ const present = (v) => v !== undefined && v !== null && v !== false && v !== '' 
 export function decide(exec, cfg) {
   if (!inWorkspace(exec?.agent?.session?.header?.cwd, cfg.roots)) return undefined;
   const tool = String(exec?.name ?? '');
-  const deny = (reason) => `[codex-conductor] 本工作区按「你规划 → Codex 执行 → 你验收」运行，${reason}。${HINT}`;
+  if (tool === 'gemini_write' && cfg.gemini) return undefined;
+  const deny = (reason) => `[codex-conductor] 本工作区按「你规划 → Codex 执行 → 你验收」运行，${reason}。${HINT}` +
+    (cfg.gemini ? '教程/文档正文可用 gemini_write，一章一章做。' : '');
   if (DENY_TOOLS.has(tool) || cfg.denyTools.has(tool)) return deny(`${tool} 会直接改动文件或执行任意代码，已拒绝`);
   if (tool.startsWith('mcp__') && MCP_WRITE.test(tool.slice(tool.lastIndexOf('__') + 2))) {
     return deny(`${tool} 会改动文件或执行命令，已拒绝`);
@@ -515,4 +517,3 @@ export function decide(exec, cfg) {
   }
   return undefined;
 }
-

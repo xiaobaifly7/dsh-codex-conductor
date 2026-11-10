@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, registerRuntimeTool } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
+const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -67,6 +68,7 @@ const DEFAULTS = {
   // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
   plannerPromptFile: '',
   runtimeProfileFile: '',
+  gemini: null,
 };
 
 const PLANNER_TEMPLATE = `<!--
@@ -656,12 +658,28 @@ function settings(config, logger) {
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))
-      : key === 'codexRoute' ? value === null || (typeof value === 'object' && !Array.isArray(value))
+      : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
     if (!valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 ${key}，使用默认值`);
     return [key, valid ? value : fallback];
   }));
+  if (config.gemini) {
+    const gemini = config.gemini;
+    if (typeof gemini.command !== 'string' || !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)/.test(gemini.command.trim())) {
+      logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.command，必须是 agy.exe 的绝对 Windows 路径');
+      config.gemini = null;
+    } else {
+      config.gemini = { command: gemini.command.trim() };
+      for (const [key, fallback] of Object.entries({ proxy: '', model: 'gemini-4-argon', effort: 'medium', timeoutSeconds: 600 })) {
+        const value = gemini[key];
+        const valid = key === 'timeoutSeconds' ? Number.isFinite(value) && value > 0
+          : key === 'effort' ? ['low', 'medium', 'high'].includes(value) : typeof value === 'string' && value.trim().length > 0;
+        if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
+        config.gemini[key] = valid ? value : fallback;
+      }
+    }
+  }
   // workspaces 的条目可以是路径字符串，也可以是 {path, cwd}
   const workspaces = (Array.isArray(config.workspaces) ? config.workspaces : [])
     .map((w) => typeof w === 'string' ? { root: normPath(w) }
@@ -692,11 +710,13 @@ const BG_WAIT = 20;
 const CANCEL_SETTLE_MS = 30_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 
-export function apply(ctx, config = {}, run = runRunner) {
+export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const cfg = settings(config, ctx.logger);
   const conductor = createConductor(cfg, run);
   let dispatching = 0;
   let dispatchGeneration = 0;
+  const geminiWrites = new Set();
+  const startingWrites = new Set();
 
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
@@ -886,6 +906,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     }
     const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
     if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
+    const writer = cfg.gemini && (args.write || (args.host_access ?? cfg.defaultHostAccess)) ? { cwd: normPath(cwd) } : null;
+    if (writer && geminiWrites.has(writer.cwd)) throw new Error('codex_run: 同一任务目录的 gemini_write 尚未结束，请先等它结束');
     const finish = (result) => {
       const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);
       const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
@@ -901,6 +923,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     let started;
     dispatching++;
     dispatchGeneration++;
+    if (writer) startingWrites.add(writer);
     try {
       const owner = exec?.agent?.id;
       const log = exec?.agent?.session?.log ?? [];
@@ -944,7 +967,7 @@ export function apply(ctx, config = {}, run = runRunner) {
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
         ...(continuation ? { continuation } : {}),
       });
-    } finally { dispatching--; }
+    } finally { dispatching--; if (writer) startingWrites.delete(writer); }
     if (exec?.signal?.aborted) {
       if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
       exec.signal.throwIfAborted();
@@ -972,6 +995,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。completed 后你要逐条只读核验，' +
       '原任务需要用户回答时先询问，再用 codex_continue；其他返工可带 resume=thread_id。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
+      (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
       (cfg.allowHostAccess === true
         ? (cfg.defaultHostAccess === true
           ? '当前默认以 danger-full-access 运行：省略 host_access 也没有沙箱，可以启动 Windows 程序及访问主机网络；resume 同样生效。host_access=false 可为单次任务恢复沙箱。'
@@ -1380,6 +1404,37 @@ export function apply(ctx, config = {}, run = runRunner) {
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
 
+  if (cfg.gemini) ctx.tools.register({
+    name: 'gemini_write',
+    description: '把教程、文档正文交给本机官方 agy 的 Gemini 写入单个文件，一章一章做；源码改动和素材笔记用 codex_run。' +
+      '插件读取并内联 sources，内容会发送给 Google；同目录有可写 Codex 任务运行或排队、或任务查询失败时拒绝。' +
+      '结束后读回文件统计字符并列出快照改动与范围外写入；completed 后仍需对照素材核对内容。',
+    presentCall: (args) => ({ card: 'generic', kind: 'execute', title: `Gemini 写作 · ${args?.output ?? ''}` }),
+    parameters: { type: 'object', properties: {
+      prompt: { type: 'string', minLength: 10, description: '本章的写作要求，至少 10 个字符。' },
+      sources: { type: 'array', minItems: 1, maxItems: 20, items: { type: 'string' },
+        description: '1–20 个已有素材文件，绝对路径或相对任务目录；总大小最多 1 MiB，由插件读取并内联。' },
+      output: { type: 'string', description: '唯一目标文件，绝对路径或相对任务目录；必须在任务目录内且不能与素材相同。' },
+      cwd: { type: 'string', description: '任务目录，解析规则同 codex_run；Windows 路径或 /mnt/<盘符>/...。' },
+      model: { type: 'string', description: `默认 ${cfg.gemini.model}。` },
+      effort: { type: 'string', enum: ['low', 'medium', 'high'], description: `默认 ${cfg.gemini.effort}。` },
+      max_chars: { type: 'integer', minimum: 1, description: '总字符上限，含标点和空白，按落盘内容的 Unicode 字符核对。' },
+      overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },
+    }, required: ['prompt', 'sources', 'output'] },
+    output: DATA_OUTPUT,
+    async execute(args = {}, exec) {
+      args ??= {};
+      const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
+      const key = normPath(cwd);
+      const busy = geminiWrites.has(key) ? '同一任务目录的 gemini_write 尚未结束，请先等它结束'
+        : [...startingWrites].some((writer) => writer.cwd === key) ? '同一任务目录的可写 Codex 任务正在启动，请先等它结束' : '';
+      // 查询与启动之间也占住本实例的入口，避免规划端同时派入另一种写任务。
+      if (!busy) geminiWrites.add(key);
+      try { return await geminiWrite(cfg.gemini, { ...args, cwd }, conductor, { signal: exec?.signal, busy }, launchGemini); }
+      finally { if (!busy) geminiWrites.delete(key); }
+    },
+  });
+
   // 宿主重开会清空内存任务表；只接回本会话已经登记、但未收到结算的 runner 作业。
   const recoverAgent = (agent) => { void recoverBackground(agent).catch((error) => {
     ctx.logger?.warn?.(`[codex-conductor] 无法接回后台任务：${error?.message ?? error}`);
@@ -1421,7 +1476,8 @@ export function apply(ctx, config = {}, run = runRunner) {
     mkdirSync(dir, { recursive: true });
     writeFileSync(path.join(dir, 'loaded.json'),
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
-        tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime'],
+        tools: ['codex_run', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
+          ...(cfg.gemini ? ['gemini_write'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
