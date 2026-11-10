@@ -3183,6 +3183,18 @@ test('lock timeouts direct the planner to inspect current writers before waiting
 });
 
 
+test('a WSL bridge failure explains why preflight stopped without starting Codex', async () => {
+  for (const args of [{ ...RUN, write: true }, { ...RUN, resume: 'THREAD' }]) {
+    const h = harness({ config: { listResult: { status: 'failed', error_kind: 'bridge_error', error: 'PRIVATE BRIDGE TRACE' } } });
+    await assert.rejects(h.tools.codex_run.execute(args, { agent: agentAt('/work/original') }), (error) => {
+      assert.match(error.message, /无法核对.*未启动 Codex.*无法连接 WSL.*不要重复派活/);
+      assert.doesNotMatch(error.message, /PRIVATE BRIDGE TRACE/);
+      return true;
+    });
+    assert.deepEqual(h.calls.map(argv => argv[0]), ['list']);
+  }
+});
+
 test('pending scope checks fail closed on unverifiable list records without status queries', async () => {
   const prior = withReport(workflowSource('task_conflict'));
   for (const change of [{ cwd: null }, { scope_paths: undefined, scope: undefined }, { scope_paths: 'src' },

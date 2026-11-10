@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.41` 的任务历史显示派单版本和进程号，以及可查的 Harness 后台状态。
+`0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## 功能
 
@@ -254,7 +254,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.41` shows the dispatch version and process in job history, along with the live Harness background status when available.
+`0.9.42` identifies a WSL connection failure when it prevents dispatch preflight, preserving the existing scope and continuation checks.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
