@@ -14,9 +14,15 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.52` 修复冷启动时面板服务尚未就绪导致接口或设置入口未注册的问题，随服务出现、撤销和恢复自动注册与清理，缺少服务时不影响其他功能。
 
-### 0.9.50：设置里的“Codex 指挥”
+### 0.9.56：设置里的“Codex 指挥”
 
-在 DSH 设置页打开“Codex 指挥”，可以自动查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、分页阅读全文报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。保存设置会先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；确认实际加载后才显示生效。Codex 忙时先等任务结束再保存；重载按钮可以登记空闲等待。规划提示词保存前也会备份。
+在 DSH 设置页打开“Codex 指挥”，可以查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、查看报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。运行状态和设置先显示，任务历史和关注数量分别加载。
+
+空闲时保存设置会立即应用；Codex 忙时默认先保存为待生效设置，等待空闲后自动应用。待生效设置写在本机 `pending-settings.json`（与 `loaded.json` 同目录，通常是 `%LOCALAPPDATA%\dsh-codex-conductor`），重启后会恢复；它绑定当前环境配置的 `runtimeProfileFile`，避免误用到另一个实例。再次保存会覆盖之前的待生效设置，也可以撤销尚未应用的设置。等待期间每 5 秒检查一次是否空闲；应用失败时，会留下待生效设置和原因，方便查看和处理。实际应用时先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；只有确认新版本实际加载后才显示生效。规划提示词保存前也会备份。
+
+需要马上应用时，选择“立即生效”并确认即可热重载。热重载本身不会取消正在运行的 Codex，新设置用于后续派发，正在跑的任务继续按启动时的设置执行。加载后会复用仍在任务表中的原任务；当前已打开的会话中，已登记但未结算且归属可确认的任务会自动接回，不重复派发。未打开的会话在恢复时检查；缺少登记记录、归属不明或状态无法核对的任务不会自动接回。主动取消 Codex 任务、归档会话或中止正在同步等待结果的工具调用，仍可能取消对应任务，这与停止观察或热重载不同。
+
+任务报告提供易读视图和原文，支持 v2 和旧版格式。易读视图会先读完整份报告再解析，最多读取 256 Ki 字符（262,144 个字符）；超出上限或格式无法解析时，仍可分页查看原文，不把截断内容当成完整报告。面板的“最近 24 小时需要关注”按任务开始时间统计；“待关注”任务列表仍包含更早的历史任务，两者数量可能不同。
 
 面板沿用 DSH 的网页服务，不另开端口；`/dsh-codex-conductor/*` 的每个接口都调用 DSH 自己的登录及 Host/Origin 校验，缺少鉴权服务时拒绝访问。`webServer`、`settings` 或客户端槽位不存在时不影响原有工具。文件 URL 加载也支持前端：升级时保留完整包（包括 `package.json`、`client.js`、`panel.mjs`），仍用 `file:///…/index.mjs?v=…`，更换 entry ID 和 `v` 后由 DSH 热加载，无须重启宿主。`runtimeProfileFile` 须指向这个实例实际使用的 `cordis.patch.yml`；新版本先由用户部署。
 
@@ -332,9 +338,15 @@ A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL co
 
 `0.9.52` fixes missing panel routes and settings entries on cold startup by registering, cleaning up, and re-registering them as their services appear, disappear, and return, without affecting other functionality when services are absent.
 
-### 0.9.50: Codex control panel
+### 0.9.56: Codex control panel
 
-Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, page through full reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Settings saves back up and atomically update this plugin's profile fields while preserving comments and unrelated configuration; success requires the actual load marker. Wait for active Codex tasks before saving settings; the reload button can queue an idle observer. Prompt saves also create a backup.
+Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, read reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Runtime status and settings appear first; task history and attention counts load separately.
+
+Saving settings while idle applies them immediately. While Codex is busy, the default is to save pending settings and apply them automatically once idle. Pending settings are stored locally in `pending-settings.json`, beside `loaded.json` (normally in `%LOCALAPPDATA%\dsh-codex-conductor`), and restored after a restart. They are tied to the current environment's configured `runtimeProfileFile` so they cannot be applied to another instance by mistake. Saving again replaces the pending settings; you can also cancel settings that have not yet been applied. The idle check runs every 5 seconds. If applying fails, the pending settings and failure reason remain available. Applying settings backs up and atomically updates this plugin's profile fields, preserving comments and unrelated configuration; only the actual load marker confirms success. Prompt saves also create a backup.
+
+To apply settings now, choose **立即生效** and confirm the hot reload. The reload itself does not cancel running Codex tasks. New settings apply to later dispatches; running tasks retain their launch settings. After loading, the plugin reuses tasks still in the native task table and reconnects registered, unsettled tasks in open sessions when their ownership can be confirmed, without dispatching them again. Closed sessions are checked when restored. Tasks without registration records, with unknown ownership, or with unverifiable status are not automatically reconnected. Explicitly cancelling a Codex task, archiving its session, or aborting a tool call that is synchronously waiting for its result can still cancel the task; stopping an observer or hot reloading is different.
+
+Reports offer a readable view and the original text for both v2 and legacy formats. The readable view reads the entire report before parsing, up to 256 Ki characters (262,144 characters). Larger reports or reports that cannot be parsed remain available as paginated original text; truncated text is not treated as a complete report. The panel's last-24-hours attention count uses task start time. The attention list still includes older tasks, so its total can differ from that count.
 
 Every `/dsh-codex-conductor/*` endpoint explicitly uses DSH's own login and Host/Origin checks on its existing web server; no extra port is opened, and missing authentication fails closed. Missing optional web/settings/slot services leave the existing tools available. File-URL loading supports the client declaration: deploy the complete package, including `package.json`, `client.js`, and `panel.mjs`, keep `file:///…/index.mjs?v=…`, and change the entry ID and `v` token for a hot load without restarting DSH. Set `runtimeProfileFile` to that instance's real `cordis.patch.yml`; deployment is a separate user action.
 

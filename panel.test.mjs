@@ -5,9 +5,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
 import { createPanelApi, panelSettings, registerPanel, PANEL_PATH } from './panel.mjs';
+import './client-panel.test.mjs';
 
 const routes = [
   ['GET', '/status'], ['GET', '/attention'], ['GET', '/settings'], ['POST', '/settings', { model: 'new-model' }],
+  ['POST', '/settings/apply', { changes: { model: 'new-model' }, confirm: true }], ['POST', '/settings/cancel', {}],
   ['GET', '/jobs'], ['GET', '/output?job_id=job-1'],
   ['POST', '/cancel', { job_id: 'job-1', confirm: true }],
   ['GET', '/prompt'], ['POST', '/prompt', { text: 'updated' }], ['POST', '/reload', {}],
@@ -55,7 +57,8 @@ function fixture(t, options = {}) {
   const jobs = [{ job_id: 'job-1', started_at: 123, status: 'running', execution_status: 'running',
     context: { task: '🙂'.repeat(65), secret: 'private-context' }, verification_status: 'needs_changes',
     cwd: 'private-directory', report: { secret: 'private-report' } }];
-  const runtime = { execute: t.mock.fn(async (args) => args.action === 'status' ? state : { status: 'reloaded', saved: true }) };
+  const runtime = { execute: t.mock.fn(async (args) => args.action === 'status' ? state : { status: 'reloaded', saved: true }),
+    cancelPending: t.mock.fn(() => ({ cancelled: true })) };
   const conductor = {
     list: t.mock.fn(async () => ({ total: jobs.length, jobs })),
     output: t.mock.fn(async () => ({ text: '报告🙂', next_offset: 4, eof: true })),
@@ -188,13 +191,16 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments, [{ action: 'status' }]);
   assert.equal(f.conductor.list.mock.callCount(), 0);
-  assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 1 } });
-  assert.deepEqual(f.conductor.list.mock.calls[0].arguments, [{ needs_attention: true, limit: 1 }]);
+  assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 0 } });
+  assert.deepEqual(f.conductor.list.mock.calls[0].arguments, [{ needs_attention: true, limit: 100, offset: 0 }]);
   assert.deepEqual(await f.request('GET', '/settings'), { status: 200, body: panelSettings(f.cfg) });
   const settings = { model: 'codex/gpt-6:latest', plannerAnswers: true, gemini: { effort: 'high' } };
   assert.deepEqual(await f.request('POST', '/settings', settings),
     { status: 200, body: { saved: true, runtime: { status: 'reloaded', saved: true } } });
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, settings]);
+  assert.equal((await f.request('POST', '/settings/apply', { changes: settings, confirm: true })).body.saved, true);
+  assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'now' }, { panel: true }, settings]);
+  assert.deepEqual(await f.request('POST', '/settings/cancel', {}), { status: 200, body: { cancelled: true } });
   for (const [query, expected] of [['', {}], ['?filter=all', {}], ['?filter=running', { status: 'running' }],
     ['?filter=attention', { needs_attention: true }]]) {
     const response = await f.request('GET', '/jobs' + query);
@@ -222,6 +228,48 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, undefined]);
 });
 
+test('panel attention counts starts in the past 24 hours across pages and stops before old history', async (t) => {
+  const f = fixture(t);
+  const now = 1800000000;
+  t.mock.method(Date, 'now', () => now * 1000);
+  const recent = Array.from({ length: 101 }, (_, i) => ({ job_id: 'recent-' + i, started_at: now - i }));
+  const rows = [{ job_id: 'future', started_at: now + 1 }, { job_id: 'unknown', started_at: null }, ...recent,
+    { job_id: 'boundary', started_at: now - 86400 },
+    ...Array.from({ length: 524 }, (_, i) => ({ job_id: 'old-' + i, started_at: now - 86401 - i }))];
+  f.conductor.list.mock.mockImplementation(async ({ offset, limit, needs_attention }) => {
+    assert.equal(needs_attention, true);
+    return { total: rows.length, offset, jobs: rows.slice(offset, offset + limit) };
+  });
+  assert.deepEqual(await f.request('GET', '/attention'), { status: 200, body: { total: 102 } });
+  assert.deepEqual(f.conductor.list.mock.calls.map(({ arguments: [args] }) => args.offset), [0, 100]);
+  for (const page of [{ total: 1, jobs: [] }, { total: 1, jobs: null }, { total: -1, jobs: [] }]) {
+    f.conductor.list.mock.mockImplementation(async () => page);
+    rejected(await f.request('GET', '/attention'), 502, /列表.*请/);
+  }
+});
+
+test('panel settings immediately apply only with literal confirmation and cancellation obeys the save lock', async (t) => {
+  const f = fixture(t);
+  for (const confirm of [undefined, false, 'true', 1, null]) {
+    rejected(await f.request('POST', '/settings/apply', { changes: { effort: 'max' }, confirm }), 400, /确认/);
+  }
+  for (const changes of [undefined, {}, { effort: 'invalid' }, { runner: 'untrusted' }]) {
+    rejected(await f.request('POST', '/settings/apply', { changes, confirm: true }), 400);
+  }
+  rejected(await f.request('POST', '/settings/cancel', { file: 'untrusted' }), 400);
+  assert.deepEqual(f.calls(), [0, 0, 0, 0]);
+  assert.equal(f.runtime.cancelPending.mock.callCount(), 0);
+  let finish;
+  const entered = Promise.withResolvers();
+  f.runtime.execute.mock.mockImplementation(() => new Promise((resolve) => { finish = resolve; entered.resolve(); }));
+  const save = f.request('POST', '/settings', { effort: 'max' });
+  await entered.promise;
+  rejected(await f.request('POST', '/settings/cancel', {}), 409);
+  finish({ status: 'waiting_for_idle', saved: true, active_tasks: 1, pending_settings: { changes: { effort: 'max' } } });
+  assert.equal((await save).body.runtime.pending_settings.changes.effort, 'max');
+  assert.deepEqual(await f.request('POST', '/settings/cancel', {}), { status: 200, body: { cancelled: true } });
+});
+
 test('panel HTTP rejects unauthenticated requests and absent authentication on every route before side effects', async (t) => {
   for (const mode of ['logged-out', 'missing-service', 'missing-method']) {
     const f = fixture(t);
@@ -232,12 +280,13 @@ test('panel HTTP rejects unauthenticated requests and absent authentication on e
       rejected(await f.request(method, route, body), mode === 'logged-out' ? 401 : 503);
     }
     assert.deepEqual(f.calls(), [0, 0, 0, 0]);
+    assert.equal(f.runtime.cancelPending.mock.callCount(), 0);
     assert.deepEqual(readFileSync(f.plannerFile), before);
     assert.deepEqual(readdirSync(f.root), ['planner.md']);
   }
   const f = fixture(t);
   f.connection.requestRejection.mock.mockImplementation(() => 403);
-  rejected(await f.request('POST', '/prompt', undefined, { raw: '{', contentType: 'text/plain' }), 403);
+  rejected(await f.request('POST', '/prompt', undefined, { raw: '{', contentType: 'text/plain' }), 403, /来源.*DSH/);
   assert.deepEqual(f.calls(), [0, 0, 0, 0]);
 });
 
@@ -247,7 +296,7 @@ test('panel HTTP GET cannot write settings/prompt, cancel tasks or reload runtim
   for (const route of ['/status', '/settings', '/jobs', '/output?job_id=job-1', '/prompt']) {
     assert.equal((await f.request('GET', route, { model: 'overwrite', text: 'overwrite', confirm: true })).status, 200);
   }
-  for (const route of ['/cancel', '/reload']) rejected(await f.request('GET', route), 405);
+  for (const route of ['/cancel', '/reload', '/settings/apply', '/settings/cancel']) rejected(await f.request('GET', route), 405);
   assert.deepEqual(f.runtime.execute.mock.calls.map(({ arguments: args }) => args), [[{ action: 'status' }]]);
   assert.equal(f.conductor.cancel.mock.callCount(), 0);
   assert.deepEqual(readFileSync(f.plannerFile), original);
@@ -342,11 +391,11 @@ test('panel HTTP settings reject invalid enums/models/numbers, unknown fields an
   }
   for (const key of ['lockTimeoutSeconds', 'maxStorageMb']) {
     for (const value of [0, -1, null, '1', true]) patches.push({ [key]: value });
-    for (const value of [NaN, Infinity, -Infinity]) await assert.rejects(f.api('POST', PANEL_PATH + '/settings', {}, { [key]: value }), /设置/);
+    for (const value of [NaN, Infinity, -Infinity]) await assert.rejects(f.api('POST', PANEL_PATH + '/settings', {}, { [key]: value }), /无效/);
   }
-  for (const patch of patches) rejected(await f.request('POST', '/settings', patch), 400, /设置|字段/);
+  for (const patch of patches) rejected(await f.request('POST', '/settings', patch), 400, /无效|设置/);
   const absent = fixture(t, { api: { cfg: { model: 'existing' } } });
-  rejected(await absent.request('POST', '/settings', { gemini: { model: 'new', effort: 'low' } }), 400, /gemini/);
+  rejected(await absent.request('POST', '/settings', { gemini: { model: 'new', effort: 'low' } }), 400, /Gemini/);
   assert.deepEqual(f.calls(), [0, 0, 0, 0]);
   assert.deepEqual(absent.calls(), [0, 0, 0, 0]);
 });
@@ -359,7 +408,7 @@ test('panel HTTP cancel requires literal confirmation and mutation bodies reject
   for (const body of [{ confirm: true }, { job_id: 123, confirm: true }, { job_id: 'J', confirm: true, force: true }]) {
     rejected(await f.request('POST', '/cancel', body), 400);
   }
-  for (const route of ['/cancel', '/prompt', '/reload']) {
+  for (const route of ['/cancel', '/prompt', '/reload', '/settings/apply', '/settings/cancel']) {
     for (const body of [null, [], 'text', { unknown: true }]) rejected(await f.request('POST', route, body), 400);
   }
   for (const body of [{}, { text: null }, { text: 123 }, { text: 'safe', file: '../elsewhere' }]) {
@@ -389,8 +438,8 @@ test('panel HTTP reports runner failures, unconfirmed cancellation and unavailab
   rejected(await missing.request('GET', '/prompt'), 409);
   rejected(await missing.request('POST', '/prompt', { text: 'new' }), 409);
   const unreadable = fixture(t, { api: { plannerFile: path.join(f.root, 'missing.md') } });
-  rejected(await unreadable.request('GET', '/prompt'), 500, /ENOENT/);
-  rejected(await unreadable.request('POST', '/prompt', { text: 'new' }), 500, /ENOENT/);
+  rejected(await unreadable.request('GET', '/prompt'), 500, /本地文件.*请/);
+  rejected(await unreadable.request('POST', '/prompt', { text: 'new' }), 500, /本地文件.*请/);
   assert.equal(readFileSync(f.plannerFile, 'utf8'), '原有规划要求🙂\n');
 });
 
@@ -408,10 +457,11 @@ test('panel HTTP serializes settings/reload, retains saved failure state and rel
   finish({ status: 'reloaded', saved: true });
   assert.equal((await first).body.saved, true);
   f.runtime.execute.mock.mockImplementation(async () => ({ status: 'failed', saved: true, error: 'reload failed' }));
-  assert.deepEqual(await f.request('POST', '/settings', { effort: 'high' }),
-    { status: 409, body: { error: 'reload failed', saved: true } });
+  const failed = await f.request('POST', '/settings', { effort: 'high' });
+  rejected(failed, 409, /操作没有完成.*请/);
+  assert.equal(failed.body.saved, true);
   f.runtime.execute.mock.mockImplementation(async () => { throw new Error('runtime unavailable'); });
-  rejected(await f.request('POST', '/reload', {}), 500, /runtime unavailable/);
+  rejected(await f.request('POST', '/reload', {}), 500, /操作没有完成.*请/);
   f.runtime.execute.mock.mockImplementation(async () => ({ status: 'already_current' }));
   assert.deepEqual(await f.request('POST', '/reload', {}), { status: 200, body: { status: 'already_current' } });
 });
@@ -464,7 +514,7 @@ test('panel client follows late slots and settings declarations through removal 
   assert.equal(slots.register.mock.callCount(), 3);
 });
 
-test('panel client applies fast status before history and reuses the attention page count', async () => {
+test('panel client applies fast status before history and always reads the separate recent attention count', async () => {
   const source = readFileSync(new URL('./client.js', import.meta.url), 'utf8');
   for (const filter of ['all', 'attention']) {
     const effects = [], applied = [], routes = [];
@@ -479,7 +529,7 @@ test('panel client applies fast status before history and reuses the attention p
       async fetch(url) {
         const route = url.slice(PANEL_PATH.length);
         routes.push(route);
-        const value = route.startsWith('/jobs') || route === '/attention' ? await deferred :
+        const value = route.startsWith('/jobs') ? await deferred : route === '/attention' ? { total: 2 } :
           route === '/status' ? state : route === '/prompt' ? { text: 'prompt' } : {};
         return { ok: true, json: async () => value };
       },
@@ -495,11 +545,12 @@ test('panel client applies fast status before history and reuses the attention p
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(applied.includes(state), 'running status should render while history is pending');
       assert.ok(!applied.includes(history));
-      assert.equal(routes.includes('/attention'), filter !== 'attention');
+      assert.equal(routes.includes('/attention'), true);
       finish(history);
       await new Promise((resolve) => setImmediate(resolve));
       assert.ok(applied.includes(history));
-      assert.ok(applied.includes(history.total));
+      assert.ok(applied.includes(2));
+      assert.ok(!applied.includes(history.total));
     } finally {
       for (const cleanup of cleanups) cleanup();
       finish(history);

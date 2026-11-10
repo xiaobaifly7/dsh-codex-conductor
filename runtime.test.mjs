@@ -19,14 +19,15 @@ const windowsModule = 'file:///C:/Users/Example%20User/dsh-codex-conductor/index
 
 function fixture(t) {
   const root = mkdtempSync(path.join(tmpdir(), 'conductor-runtime-test-'));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const cleanups = [];
+  t.after(() => { for (const cleanup of cleanups) cleanup(); rmSync(root, { recursive: true, force: true }); });
   const directory = path.join(root, 'package');
   mkdirSync(directory);
   const pkg = path.join(directory, 'package.json');
   const entry = path.join(directory, 'index.mjs');
   writeFileSync(pkg, JSON.stringify({ type: 'module', version: '1.2.3' }));
   writeFileSync(entry, `import { runtimeIdentity } from ${JSON.stringify(runtimeUrl)};\nexport const loadedIdentity = runtimeIdentity(import.meta.url);\n`);
-  return { root, directory, pkg, entry, moduleUrl: pathToFileURL(entry).href + '?v=old',
+  return { root, directory, pkg, entry, cleanups, moduleUrl: pathToFileURL(entry).href + '?v=old',
     profileFile: path.join(root, 'profile.yml'), loadedFile: path.join(root, 'loaded.json') };
 }
 
@@ -468,11 +469,15 @@ function nativeJobs() {
 function runtimeTool(f, { jobs, conductor = { list: async () => ({ jobs: [], total: 0 }) },
   activeDispatches = () => 0, dispatchGeneration = () => 0, profileFile = f.profileFile, loadedIdentity = null } = {}) {
   let tool;
+  const cleanups = [];
   const ctx = { tools: { register(spec) { tool = spec; return spec; } },
+    effect(setup) { cleanups.push(setup()); },
     get(name) { assert.equal(name, 'jobs'); return jobs; } };
   const registered = registerRuntimeTool({ ctx, conductor, moduleUrl: f.moduleUrl, loadedIdentity,
     profileFile, loadedFile: f.loadedFile, activeDispatches, dispatchGeneration });
   assert.equal(registered, tool);
+  tool.dispose = () => { for (const cleanup of cleanups.splice(0)) cleanup(); };
+  f.cleanups.push(tool.dispose);
   return tool;
 }
 
@@ -512,15 +517,27 @@ test('panel settings and reload token are committed together with a backup and e
   assert.notEqual(result.expected_module, f.moduleUrl);
 });
 
-test('busy panel saves leave the profile unchanged, while its reload can wait without a conversation owner', async (t) => {
+test('busy panel saves persist, replace and cancel without changing the profile; plain reload can still wait', async (t) => {
   const f = fixture(t);
   const original = profile(f.moduleUrl);
   writeFileSync(f.profileFile, original);
   const jobs = nativeJobs();
   let running = true;
   const tool = runtimeTool(f, { jobs, conductor: { list: async () => ({ jobs: running ? [{ job_id: 'J' }] : [], total: running ? 1 : 0 }) } });
-  const failed = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true }, { model: 'new-model' });
-  assert.equal(failed.status, 'failed');
+  const pendingFile = path.join(f.root, 'pending-settings.json');
+  const saved = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true }, { model: 'new-model' });
+  assert.equal(saved.status, 'waiting_for_idle');
+  assert.equal(saved.saved, true);
+  assert.equal(saved.active_tasks, 1);
+  assert.deepEqual(saved.pending_settings.changes, { model: 'new-model' });
+  assert.deepEqual(JSON.parse(readFileSync(pendingFile)).changes, { model: 'new-model' });
+  const replaced = await tool.execute({ action: 'reload' }, { panel: true }, { effort: 'max' });
+  assert.deepEqual(replaced.pending_settings.changes, { effort: 'max' });
+  assert.equal((await tool.execute({ action: 'reload' }, { panel: true }, { model: 'invalid model' })).status, 'failed');
+  assert.deepEqual(JSON.parse(readFileSync(pendingFile)).changes, { effort: 'max' });
+  assert.deepEqual(tool.cancelPending(), { cancelled: true });
+  assert.equal(fs.existsSync(pendingFile), false);
+  assert.equal((await tool.execute({ action: 'status' })).pending_settings, null);
   assert.equal(readFileSync(f.profileFile, 'utf8'), original);
   const waiting = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true });
   assert.equal(waiting.status, 'waiting_for_idle');
@@ -531,6 +548,90 @@ test('busy panel saves leave the profile unchanged, while its reload can wait wi
   jobs.started[0].cancel();
   await jobs.started[0].done;
   assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+});
+
+test('pending settings survive a fresh runtime registration and automatically apply the latest save at idle', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  let running = true;
+  const options = { conductor: forbidCodexMutations(async () => ({ jobs: running ? [{ job_id: 'J' }] : [], total: running ? 1 : 0 })) };
+  const first = runtimeTool(f, options);
+  await first.execute({ action: 'reload' }, { panel: true }, { model: 'superseded' });
+  await first.execute({ action: 'reload' }, { panel: true }, { model: 'survives-restart', effort: 'max' });
+  first.dispose();
+  const second = runtimeTool(f, options);
+  assert.deepEqual((await second.execute({ action: 'status' })).pending_settings.changes, { model: 'survives-restart', effort: 'max' });
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  running = false;
+  const expected = await requestedModule(f);
+  assert.match(readFileSync(f.profileFile, 'utf8'), /model: survives-restart/);
+  assert.match(readFileSync(f.profileFile, 'utf8'), /effort: max/);
+  marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
+  assert.equal((await second.execute({ action: 'status' })).pending_settings, null);
+  assert.equal(fs.existsSync(path.join(f.root, 'pending-settings.json')), false);
+  assert.equal(readdirSync(f.root).filter((name) => name.endsWith('.bak')).length, 1);
+});
+
+test('queued settings are revalidated at idle and keep a visible error if the profile changes', async (t) => {
+  const f = fixture(t);
+  writeFileSync(f.profileFile, profile(f.moduleUrl));
+  let running = true;
+  const tool = runtimeTool(f, { conductor: forbidCodexMutations(async () => ({ jobs: running ? [{ job_id: 'J' }] : [], total: running ? 1 : 0 })) });
+  await tool.execute({ action: 'reload' }, { panel: true }, { model: 'new-model' });
+  const changed = profile(f.moduleUrl).replace('    config:\n', '    config: {}\n');
+  writeFileSync(f.profileFile, changed);
+  running = false;
+  const deadline = performance.now() + 8000;
+  let state;
+  do {
+    await delay(25);
+    state = await tool.execute({ action: 'status' });
+  } while (!state.pending_settings.error && performance.now() < deadline);
+  assert.match(state.pending_settings.error, /设置未能生效/);
+  assert.equal(readFileSync(f.profileFile, 'utf8'), changed);
+  tool.dispose();
+  const restarted = runtimeTool(f);
+  assert.match((await restarted.execute({ action: 'status' })).pending_settings.error, /设置未能生效/);
+  restarted.cancelPending();
+});
+
+test('immediate panel settings preserve running jobs and wait for the exact loaded marker', async (t) => {
+  const f = fixture(t);
+  writeFileSync(f.profileFile, profile(f.moduleUrl));
+  const tool = runtimeTool(f, { conductor: forbidCodexMutations(async () => ({ jobs: [{ job_id: 'J' }], total: 1 })) });
+  let settled = false;
+  const operation = tool.execute({ action: 'reload', when: 'now' }, { panel: true }, { model: 'immediate' })
+    .then((result) => { settled = true; return result; });
+  const expected = await requestedModule(f);
+  assert.equal(settled, false);
+  assert.match(readFileSync(f.profileFile, 'utf8'), /model: immediate/);
+  assert.throws(() => tool.cancelPending(), /不能撤销/);
+  marker(f, { ...runtimeIdentity(f.moduleUrl), module: expected });
+  const result = await operation;
+  assert.equal(result.status, 'reloaded');
+  assert.equal(result.active_tasks, 1);
+  assert.equal(result.pending_settings, null);
+});
+
+test('a profile write failure retains pending settings and its reason for the panel', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === f.profileFile) throw new Error('fixture profile is locked');
+    return rename(from, to);
+  });
+  syncBuiltinESMExports();
+  try {
+    const result = await runtimeTool(f).execute({ action: 'reload' }, { panel: true }, { model: 'new-model' });
+    assert.equal(result.status, 'failed');
+    assert.equal(result.saved, true);
+    assert.match(result.pending_settings.error, /fixture profile is locked/);
+    assert.deepEqual(JSON.parse(readFileSync(path.join(f.root, 'pending-settings.json'))).changes, { model: 'new-model' });
+    assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
 });
 
 test('runtime tool defaults to status and counts all runner pages by unique ID plus pending starts', async (t) => {

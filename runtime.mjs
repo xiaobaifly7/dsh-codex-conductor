@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, lstatSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, lstatSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
@@ -213,6 +213,10 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
     active_tasks: activeTasks, state, can_reload };
 }
 
+const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
+  serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
+  maxStorageMb: '任务记录上限', gemini: 'Gemini 设置' };
+
 export function validatePanelSettings(value, geminiConfigured = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
     throw new Error('请提交要修改的设置');
@@ -231,7 +235,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
         Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
     }
-    if (!valid) throw new Error(`设置 ${key} 的值无效`);
+    if (!valid) throw new Error(`${settingLabels[key] ?? '提交的设置'}无效，请检查填写内容后重新保存。`);
   }
   return value;
 }
@@ -377,9 +381,50 @@ export async function waitForRuntimeLoad({ loadedFile, expectedModule, timeoutMs
 
 
 export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity, profileFile, loadedFile, activeDispatches, dispatchGeneration }) {
+  const pendingFile = loadedFile ? path.join(path.dirname(loadedFile), 'pending-settings.json') : '';
+  let pendingController;
+  let disposed = false;
+  function readPending() {
+    if (!pendingFile) return null;
+    try {
+      const value = JSON.parse(readFileSync(pendingFile, 'utf8'));
+      if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('记录格式不正确');
+      return value;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      return { error: `无法读取待生效的设置：${error.message}。请重新保存设置，或撤销这次修改。` };
+    }
+  }
+  function writePending(value) {
+    if (!pendingFile) throw new Error('没有可用的本地保存目录，请配置本地数据目录后重试。');
+    mkdirSync(path.dirname(pendingFile), { recursive: true });
+    const temporary = `${pendingFile}.${randomUUID()}.tmp`;
+    const fd = openSync(temporary, 'wx', 0o600);
+    try {
+      try { writeFileSync(fd, JSON.stringify(value)); fsyncSync(fd); } finally { closeSync(fd); }
+      renameSync(temporary, pendingFile);
+    } catch (error) {
+      unlinkSync(temporary);
+      throw error;
+    }
+  }
+  function clearPending(id) {
+    if (id !== undefined && readPending()?.id !== id) return;
+    try { unlinkSync(pendingFile); } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  }
+  function pendingView() {
+    const value = readPending();
+    if (value?.expected_module === moduleUrl || (value?.expected_module && loadedRecord(loadedFile).record?.module === value.expected_module)) {
+      clearPending(value.id);
+      return null;
+    }
+    return value && { changes: value.changes, saved_at: value.saved_at, error: value.error,
+      ...(value.expected_module ? { awaiting_load: true } : {}) };
+  }
   const label = 'Codex runtime · 等待空闲后重载';
   const snapshot = (activeTasks, active_error = null) => ({
     ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks }), active_error,
+    pending_settings: pendingView(),
   });
   async function activeCount(signal) {
     const generation = dispatchGeneration();
@@ -407,16 +452,85 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     return { count: Math.max(starting, ids.size + activeDispatches()), generation };
   }
   const pendingReload = (current) => current.can_reload && current.profile_module !== moduleUrl;
-  async function reload(current, signal, changes) {
+  async function reload(current, signal, changes, pending) {
     signal?.throwIfAborted();
     if (current.state === 'synchronized' && !changes) return { ...current, status: 'already_current' };
-    const request = !changes && pendingReload(current) ? { expected_module: current.profile_module, reused: true } :
+    const request = pending?.expected_module ? { expected_module: pending.expected_module, saved: true, reused: true } :
+      !changes && pendingReload(current) ? { expected_module: current.profile_module, reused: true } :
       requestRuntimeReload({ moduleUrl, profileFile, changes });
+    if (pending && !pending.expected_module) writePending({ ...pending, expected_module: request.expected_module });
     const confirmation = await waitForRuntimeLoad({ loadedFile, expectedModule: request.expected_module, signal });
     return { ...snapshot(current.active_tasks, current.active_error), ...request, ...confirmation,
       status: confirmation.confirmed ? 'reloaded' : 'unconfirmed',
       ...(confirmation.confirmed ? {} : { next: '重载请求已提交，尚未确认加载。用 codex_runtime action=status 查询，不要重复重载。' }) };
   }
+  async function waitUntilIdle(current, generation, signal, progress, settings = false) {
+    let observed = current;
+    while ((observed.active_tasks > 0 || generation !== dispatchGeneration()) && (settings || observed.state !== 'synchronized')) {
+      progress?.('等待 Codex 空闲，在途任务数：' + observed.active_tasks);
+      await delay(5000, undefined, { signal });
+      const active = await activeCount(signal);
+      observed = snapshot(active.count);
+      generation = active.generation;
+    }
+    return observed;
+  }
+  async function applyPending(current, signal) {
+    const pending = readPending();
+    if (!pending) return { ...snapshot(current.active_tasks), status: 'already_current' };
+    try {
+      signal?.throwIfAborted();
+      if (pending.profile_file !== profileFile || pending.module_path !== modulePath(moduleUrl)) {
+        throw new Error('待生效的设置属于另一份安装或配置，请撤销后重新保存。');
+      }
+      // Revalidate against the current profile, including Gemini and supported YAML shapes.
+      const profile = profileRecord(profileFile, moduleUrl);
+      settingsEdits(profile, pending.changes);
+      const result = await reload(current, signal, pending.changes, pending);
+      if (readPending()?.id === pending.id) {
+        if (result.confirmed) clearPending(pending.id);
+        else writePending({ ...readPending(), error: '设置已写入，但尚未确认生效。请刷新运行状态；无需重复保存。' });
+      }
+      return { ...result, pending_settings: pendingView() };
+    } catch (error) {
+      if (!signal?.aborted && readPending()?.id === pending.id) {
+        writePending({ ...readPending(), error: `设置未能生效：${error.message} 请修改后重新保存，或撤销这次修改。` });
+      }
+      if (signal?.aborted) throw error;
+      return { ...snapshot(current.active_tasks), status: 'failed', saved: true, error: pendingView()?.error ?? error.message };
+    }
+  }
+  function startPending(current, generation) {
+    if (pendingController || disposed) return;
+    const controller = pendingController = new AbortController();
+    void (async () => {
+      try {
+        if (!current) {
+          const active = await activeCount(controller.signal);
+          current = snapshot(active.count);
+          generation = active.generation;
+        }
+        const pending = readPending();
+        if (!pending) return;
+        if (!pending.expected_module) current = await waitUntilIdle(current, generation, controller.signal, undefined, true);
+        await applyPending(current, controller.signal);
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          const pending = readPending();
+          if (pending) {
+            try { writePending({ ...pending, error: `无法自动生效：${error.message} 请刷新状态后重新保存，或撤销这次修改。` }); }
+            catch (failure) { ctx.logger?.warn?.(`无法保存待生效设置的错误原因：${failure.message}`); }
+          }
+        }
+      } finally { if (pendingController === controller) pendingController = undefined; }
+    })();
+  }
+  ctx.effect?.(() => () => { disposed = true; pendingController?.abort(); });
+  queueMicrotask(() => {
+    if (disposed) return;
+    const pending = pendingView();
+    if (pending && (!pending.error || pending.awaiting_load)) startPending();
+  });
   const tool = {
     name: 'codex_runtime',
     description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限及在途 Codex 任务数；reload 默认等空闲后重载，when=now 立即请求。' +
@@ -428,6 +542,14 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     } },
     output: { schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] },
+    cancelPending() {
+      const pending = readPending();
+      if (pending?.expected_module && pendingView()) throw new Error('设置已写入，不能撤销。请等待加载后再保存新的设置。');
+      clearPending();
+      pendingController?.abort();
+      pendingController = undefined;
+      return { cancelled: true };
+    },
     async execute(args = {}, exec, changes) {
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('codex_runtime: arguments must be an object');
       const { action = 'status', when = 'idle' } = args;
@@ -452,8 +574,23 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         }
         current = snapshot(count, active_error);
         if (action === 'status') return { ...current, status: 'status' };
-        if (changes && (active_error || count !== 0)) {
-          return { ...current, status: 'failed', error: active_error || '还有 Codex 任务正在运行，请等任务结束后再保存；配置尚未修改。' };
+        if (changes) {
+          const profile = profileRecord(profileFile, moduleUrl);
+          settingsEdits(profile, changes);
+          if (active_error && when === 'idle') return { ...current, status: 'failed', error: active_error };
+          if (!pendingFile) {
+            if (when === 'now' || count === 0) return await reload(current, exec?.signal, changes);
+            throw new Error('没有可用的本地保存目录，无法保存待生效的设置。请配置本地数据目录后重试。');
+          }
+          writePending({ id: randomUUID(), profile_file: profileFile, module_path: modulePath(moduleUrl),
+            changes, saved_at: new Date().toISOString() });
+          if (when === 'now' || count === 0) {
+            pendingController?.abort();
+            pendingController = undefined;
+            return await applyPending(current, exec?.signal);
+          }
+          startPending(current, generation);
+          return { ...snapshot(count, active_error), status: 'waiting_for_idle', saved: true };
         }
         const awaiting = pendingReload(current);
         if (active_error && when === 'idle' && !awaiting) {
@@ -478,14 +615,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
             const signal = controller.signal;
             const done = (async () => {
               try {
-                let observed = current;
-                while ((observed.active_tasks > 0 || generation !== dispatchGeneration()) && observed.state !== 'synchronized') {
-                  handle.updateProgress('等待 Codex 空闲，在途任务数：' + observed.active_tasks);
-                  await delay(5000, undefined, { signal });
-                  const active = await activeCount(signal);
-                  observed = snapshot(active.count);
-                  generation = active.generation;
-                }
+                const observed = await waitUntilIdle(current, generation, signal, (text) => handle.updateProgress(text));
                 const result = await reload(observed, signal);
                 return { status: 'completed', detail: result.status === 'unconfirmed' ? '重载请求已提交，尚未确认加载' : result.status,
                   result: JSON.stringify(result) };
