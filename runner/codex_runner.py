@@ -1365,7 +1365,7 @@ def job_output(args):
         value = {"job_id": args.job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
         return {**value, **review_summary(value)}
     source = job_dir / {"report": "last_message.txt", "result": "result.json", "context": "args.json",
-                        "review": "reviews.json"}[args.artifact]
+                        "review": "reviews.json", "stderr": "stderr.log", "events": "events.jsonl"}[args.artifact]
     value = job_status(args.job_id)
     base = {"job_id": args.job_id, "artifact": args.artifact, "execution_status": value.get("execution_status", value["status"]),
             "source_path": str(source), "offset": args.offset, "limit": args.limit}
@@ -1482,7 +1482,7 @@ def main():
     review.add_argument("--reviewer", required=True)
     output = sub.add_parser("output")
     output.add_argument("job_id", type=job_identifier)
-    output.add_argument("--artifact", choices=["report", "result", "context", "review"], default="report")
+    output.add_argument("--artifact", choices=["report", "result", "context", "review", "stderr", "events"], default="report")
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
