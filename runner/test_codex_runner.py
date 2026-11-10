@@ -2221,6 +2221,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(completed["error_kinds"], {"schema_invalid": 1})
         self.assertEqual(self.control("summary", "--owner", "missing")["error_kinds"], {})
 
+    def test_summary_counts_dead_workers_outside_the_selected_page(self):
+        jd = self.stored_job("dead-worker", None, context=self.sample_context())
+        (jd / "worker.start").write_text("no-longer-the-recorded-process")
+        self.stored_job("finished", {"status": "failed", "error_kind": "router_down"}, context=self.sample_context())
+        for offset in (0, 10):
+            page = self.control("summary", "--owner", "owner-a", "--limit", "1", "--offset", str(offset))
+            self.assertEqual(page["error_kinds"], {"worker_died": 1, "router_down": 1})
+
+    def test_history_preserves_invalid_metadata_status_and_owner_filtering(self):
+        self.stored_job("invalid-scope", {"status": "completed", "thread_id": "T"},
+                        context=self.sample_context(), scope=42)
+        self.assertEqual(self.control("status", "invalid-scope")["error_kind"], "invalid_record")
+        for command in ("list", "summary"):
+            with self.subTest(command=command):
+                value = self.control(command)
+                self.assertEqual(value["total"], 1)
+                if command == "list":
+                    self.assertEqual(value["jobs"][0]["error_kind"], "invalid_record")
+                else:
+                    self.assertEqual(value["groups"][0]["latest_job"]["execution_status"], "unknown")
+                self.assertEqual(self.control(command, "--owner", "owner-a")["total"], 0)
+
     def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
         context = self.sample_context()
         jd = self.stored_job("output", {"status": "completed"}, context=context)

@@ -1239,6 +1239,13 @@ def job_details(job):
 
 
 def matching_jobs(args):
+    def matches_metadata(value, job_id):
+        context = value.get("context")
+        if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
+                               job_id in (args.job_id or [])):
+            return False
+        return not args.cwd or bool(value.get("cwd") and tree_key(args.cwd) == tree_key(value["cwd"]))
+
     jobs = []
     root = HOME / "jobs"
     for job_dir in root.iterdir() if root.exists() else []:
@@ -1258,18 +1265,22 @@ def matching_jobs(args):
             record = {"task": task, "result": result}
         except (OSError, ValueError, TypeError):
             value, record = {}, None
-        context = value.get("context")
-        parent = (context or {}).get("continuation", {}).get("parent_job_id")
-        if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
-                               job_dir.name in (args.job_id or [])):
-            continue
-        if args.cwd and (not value.get("cwd") or tree_key(local_path(args.cwd)) != tree_key(value["cwd"])):
+        if not matches_metadata(value, job_dir.name):
             continue
         if record is not None:
-            record["metadata"] = job_metadata(job_dir, task=record["task"],
-                                             finished_at=result_file.stat().st_mtime if result_file.exists() else None,
-                                             thread_id=value.get("thread_id"))
-            value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
+            try:
+                record["metadata"] = job_metadata(job_dir, task=record["task"],
+                                                 finished_at=result_file.stat().st_mtime if result_file.exists() else None,
+                                                 thread_id=value.get("thread_id"))
+                value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
+            except (OSError, ValueError, TypeError):
+                record = None
+                value = job_status(job_dir.name)
+                value["_details"] = dict(value)
+                if not matches_metadata(value, job_dir.name):
+                    continue
+        context = value.get("context")
+        parent = (context or {}).get("continuation", {}).get("parent_job_id")
         if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
             continue
         if getattr(args, "parent_job", None) and parent != args.parent_job:
@@ -1320,6 +1331,8 @@ def summarize_jobs(args):
     groups = {}
     error_kinds = {}
     for job in matching_jobs(args):
+        if job["_record"] is None or job["_record"]["result"] is None:
+            job = job_details(job)
         if job.get("error_kind"):
             kind = job["error_kind"]
             error_kinds[kind] = error_kinds.get(kind, 0) + 1
