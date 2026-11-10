@@ -369,11 +369,12 @@ window.__ModuleLoader__.load({
     }
 
     function apply(ctx) {
-      const slots = ctx.get('slots');
-      if (!slots) return;
-      return slots.inject('settings.section', () => slots.register({
-        name: 'settings.section', id: 'dsh-codex-conductor', order: 80, label: () => 'Codex 指挥',
-      }, Panel));
+      ctx.inject(['slots'], (ctx) => {
+        const slots = ctx.get('slots');
+        return slots.inject('settings.section', () => slots.register({
+          name: 'settings.section', id: 'dsh-codex-conductor', order: 80, label: () => 'Codex 指挥',
+        }, Panel));
+      });
     }
 
     return { apply, Panel };
