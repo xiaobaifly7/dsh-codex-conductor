@@ -8,7 +8,10 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { deflateSync } from 'node:zlib';
 import { setTimeout as delay } from 'node:timers/promises';
-import { runtimeIdentity, runtimeStatus, requestRuntimeReload, waitForRuntimeLoad, registerRuntimeTool } from './runtime.mjs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import { runtimeIdentity, runtimeStatus, requestRuntimeReload, waitForRuntimeLoad, registerRuntimeTool,
+  saveRuntimeSettings, validatePanelSettings } from './runtime.mjs';
 
 const runtimeUrl = new URL('./runtime.mjs', import.meta.url).href;
 const oldId = 'codex-conductor-runtime-5e86941';
@@ -32,6 +35,86 @@ function git(directory, args) {
   assert.equal(result.status, 0, result.stderr || result.error?.message);
   return result.stdout.trim();
 }
+
+test('panel settings preserve comments, quotes, nested fields, other entries and original bytes in backup', (t) => {
+  const f = fixture(t);
+  const original = `# header\r\nplugins:\r\n  - id: ${oldId}\r\n    name: ${f.moduleUrl}\r\n    config:\r\n      model: 'old-model' # keep model note\r\n      effort: medium\r\n      serviceTier: fast\r\n      plannerAnswers: false # keep switch note\r\n      gemini:\r\n        command: 'C:\\agy.exe'\r\n        model: old-gemini # nested note\r\n        effort: low\r\n      unrelated: keep\r\n  - id: other\r\n    name: other\r\n    config:\r\n      model: old-model\r\n`;
+  writeFileSync(f.profileFile, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(original)]));
+  const before = readFileSync(f.profileFile);
+  const result = saveRuntimeSettings({ ...f, changes: { model: 'codex/gpt-6-astra', effort: 'max', serviceTier: 'ultrafast',
+    plannerAnswers: true, gemini: { model: 'gemini-4-argon', effort: 'high' } } });
+  const expected = original.replace("'old-model'", "'codex/gpt-6-astra'").replace('effort: medium', 'effort: max')
+    .replace('serviceTier: fast', 'serviceTier: ultrafast').replace('plannerAnswers: false', 'plannerAnswers: true')
+    .replace('model: old-gemini', 'model: gemini-4-argon').replace('effort: low', 'effort: high');
+  assert.deepEqual(readFileSync(result.backup), before);
+  assert.deepEqual(readFileSync(f.profileFile), Buffer.concat([before.subarray(0, 3), Buffer.from(expected)]));
+});
+
+test('panel settings insert absent fields/config using surrounding indentation without touching other scalars', (t) => {
+  const f = fixture(t);
+  for (const config of ['', '      config:\n        unrelated: keep\n',
+    '      config:\n        unrelated: keep\n        gemini:\n          command: agy\n']) {
+    const text = `- insert:\n    - id: ${oldId}\n      name: ${f.moduleUrl}\n${config}- id: other\n  config:\n    model: unchanged\n`;
+    writeFileSync(f.profileFile, text);
+    const changes = { model: 'next', readOnlyEffort: '', lockTimeoutSeconds: 3.5, maxStorageMb: 256,
+      ...(config.includes('gemini:') ? { gemini: { model: 'gemini', effort: 'medium' } } : {}) };
+    saveRuntimeSettings({ ...f, changes });
+    const saved = readFileSync(f.profileFile, 'utf8');
+    assert.ok(saved.includes('        model: next\n'));
+    assert.ok(saved.includes("        readOnlyEffort: ''\n"));
+    assert.ok(saved.includes('        lockTimeoutSeconds: 3.5\n'));
+    assert.ok(saved.endsWith('- id: other\n  config:\n    model: unchanged\n'));
+    if (config.includes('gemini:')) assert.ok(saved.includes('          model: gemini\n          effort: medium\n'));
+  }
+});
+
+test('panel model names that look like YAML values remain strings', (t) => {
+  const f = fixture(t);
+  for (const model of ['null', 'TRUE', '123', '-', ':', 'vendor:model']) {
+    writeFileSync(f.profileFile, profile(f.moduleUrl));
+    saveRuntimeSettings({ ...f, changes: { model } });
+    assert.ok(readFileSync(f.profileFile, 'utf8').includes('model: ' + JSON.stringify(model)));
+  }
+});
+
+test('panel settings reject invalid values and unsupported YAML without changing the file', (t) => {
+  const f = fixture(t);
+  const text = `plugins:\n  - id: ${oldId}\n    name: ${f.moduleUrl}\n    config:\n      model: old\n`;
+  for (const changes of [null, [], {}, { unknown: 1 }, { model: '' }, { model: 'a b' }, { model: 'a'.repeat(81) },
+    { model: 'a\nother: injected' }, { effort: '' }, { effort: 'ultra' }, { readOnlyEffort: 'ultra' },
+    { plannerAnswers: 'true' }, { serviceTier: 'priority' }, { lockTimeoutSeconds: 0 }, { lockTimeoutSeconds: -1 },
+    { lockTimeoutSeconds: NaN }, { maxStorageMb: Infinity }, { maxStorageMb: null }, { maxStorageMb: '1' },
+    { gemini: { model: 'new' } }]) {
+    writeFileSync(f.profileFile, text);
+    assert.throws(() => saveRuntimeSettings({ ...f, changes }));
+    assert.equal(readFileSync(f.profileFile, 'utf8'), text);
+  }
+  for (const value of [{ gemini: {} }, { gemini: { command: 'other' } }, { gemini: { effort: 'max' } }]) {
+    assert.throws(() => validatePanelSettings(value, true));
+  }
+  for (const config of ['    config: {}\n', '    config:\n      model: |\n        previous\n',
+    '    config:\n      model: old\n      model: duplicate\n']) {
+    const original = text.slice(0, text.indexOf('    config:')) + config;
+    writeFileSync(f.profileFile, original);
+    assert.throws(() => saveRuntimeSettings({ ...f, changes: { model: 'new' } }));
+    assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  }
+});
+
+test('failed atomic profile replacement leaves the original intact and removes the temporary file', (t) => {
+  const f = fixture(t);
+  const original = `plugins:\n  - id: ${oldId}\n    name: ${f.moduleUrl}\n    config:\n      model: old\n`;
+  writeFileSync(f.profileFile, original);
+  t.mock.method(fs, 'renameSync', () => { throw new Error('simulated rename failure'); });
+  syncBuiltinESMExports();
+  try {
+    assert.throws(() => saveRuntimeSettings({ ...f, changes: { model: 'new' } }), /simulated rename failure/);
+    assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+    assert.equal(readdirSync(f.root).some((file) => file.endsWith('.tmp')), false);
+    const backup = readdirSync(f.root).find((file) => file.endsWith('.bak'));
+    assert.equal(readFileSync(path.join(f.root, backup), 'utf8'), original);
+  } finally { t.mock.restoreAll(); syncBuiltinESMExports(); }
+});
 
 function repository(f) {
   git(f.directory, ['init', '--quiet', '--template=']);
@@ -409,6 +492,46 @@ function forbidCodexMutations(list) {
 }
 
 const runtimeExec = { agent: { id: 'runtime-owner' } };
+
+test('panel settings and reload token are committed together with a backup and exact load confirmation', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const tool = runtimeTool(f);
+  const loaded = (async () => {
+    const module = await requestedModule(f);
+    assert.match(readFileSync(f.profileFile, 'utf8'), /model: new-model/);
+    marker(f, { ...runtimeIdentity(f.moduleUrl), module });
+  })();
+  const result = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true }, { model: 'new-model' });
+  await loaded;
+  assert.equal(result.saved, true);
+  assert.equal(result.status, 'reloaded');
+  assert.equal(result.confirmed, true);
+  assert.equal(readFileSync(result.backup, 'utf8'), original);
+  assert.notEqual(result.expected_module, f.moduleUrl);
+});
+
+test('busy panel saves leave the profile unchanged, while its reload can wait without a conversation owner', async (t) => {
+  const f = fixture(t);
+  const original = profile(f.moduleUrl);
+  writeFileSync(f.profileFile, original);
+  const jobs = nativeJobs();
+  let running = true;
+  const tool = runtimeTool(f, { jobs, conductor: { list: async () => ({ jobs: running ? [{ job_id: 'J' }] : [], total: running ? 1 : 0 }) } });
+  const failed = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true }, { model: 'new-model' });
+  assert.equal(failed.status, 'failed');
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+  const waiting = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true });
+  assert.equal(waiting.status, 'waiting_for_idle');
+  assert.equal(jobs.started[0].owner, undefined);
+  const repeated = await tool.execute({ action: 'reload', when: 'idle' }, { panel: true });
+  assert.equal(repeated.reused, true);
+  assert.equal(jobs.started.length, 1);
+  jobs.started[0].cancel();
+  await jobs.started[0].done;
+  assert.equal(readFileSync(f.profileFile, 'utf8'), original);
+});
 
 test('runtime tool defaults to status and counts all runner pages by unique ID plus pending starts', async (t) => {
   const f = fixture(t);

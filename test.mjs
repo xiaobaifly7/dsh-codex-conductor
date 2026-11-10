@@ -10,6 +10,7 @@ import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
+import './panel.test.mjs';
 
 const packageVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
 
@@ -34,6 +35,8 @@ test('entry reload queries re-evaluate workflow, runtime, guard and gemini helpe
         'export const runtimeIdentity = () => ({}), loadedRecord = () => ({ record: null }), registerRuntimeTool = () => {};\n');
       writeFileSync(path.join(dir, 'gemini.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('gemini-${version}');\nexport const geminiWrite = () => ({});\n`);
+      writeFileSync(path.join(dir, 'panel.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('panel-${version}');\nexport const registerPanel = () => {};\n`);
       writeFileSync(path.join(dir, 'guard.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
         readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));
@@ -41,7 +44,7 @@ test('entry reload queries re-evaluate workflow, runtime, guard and gemini helpe
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'panel-new', 'panel-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
@@ -1667,7 +1670,7 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.equal(loaded.allowHostAccess, true);
   assert.equal(loaded.defaultHostAccess, true);
   assert.equal(loaded.plannerAnswers, true);
-  assert.equal(loaded.version, '0.9.49');
+  assert.equal(loaded.version, packageVersion);
   assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
   assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
   assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
@@ -1710,11 +1713,11 @@ test('apply preserves another live process loaded record and replaces own, stale
     const h = harness();
     const status = await h.tools.codex_runtime.execute({ action: 'status' });
     assert.equal(status.instance.module, own.module);
-    assert.equal(status.instance.version, '0.9.49');
+    assert.equal(status.instance.version, packageVersion);
     if (row.keep) assert.equal(readFileSync(file, 'utf8'), original);
     else {
       assert.equal(status.loaded.pid, process.pid);
-      assert.equal(status.loaded.version, '0.9.49');
+      assert.equal(status.loaded.version, packageVersion);
       assert.notEqual(status.loaded.loadedAt, '2000-01-01T00:00:00Z');
     }
   }
@@ -3060,7 +3063,7 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   const envelope = JSON.parse(starts[0].stdin);
   const { dispatcher, ...taskContext } = envelope.context;
   assert.equal(dispatcher.pid, process.pid);
-  assert.equal(dispatcher.version, '0.9.49');
+  assert.equal(dispatcher.version, packageVersion);
   assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);
