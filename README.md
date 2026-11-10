@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.73` 明确续接参数：新任务省略 `resume`；原任务补答阻塞问题时用 `codex_continue(job_id)`；手动续接只填写工具真实返回的 Codex `thread_id`，不要生成编号或混用 DSH 会话号、任务编号。
+
 `0.9.72` 将尚未生成的报告作为正常等待状态返回，报告随任务结束后的自动刷新打开，自检优先检查已结束任务并记录运行中报告尚未生成，`codex_output` 提示等完成通知后再读。
 
 `0.9.70` 为面板状态、任务、关注数和报告读取设置 15 秒整体上限，为任务列表、状态和报告查询及 `codex_jobs`、`codex_status`、`codex_runtime` 的任务统计设置 10 秒查询预算（显式等待另加等待时长），随包 runner 的完整 JSON 到达即返回，查询失败明确报错且不取消 Codex 任务。
@@ -375,6 +377,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.73` clarifies continuation IDs: omit `resume` for new tasks, use `codex_continue(job_id)` for blocker answers on existing jobs, and only pass a Codex `thread_id` actually returned by a tool when resuming manually. Do not invent IDs or substitute Harness session IDs or job IDs.
 
 `0.9.72` treats reports awaiting generation as a normal pending state, opens them on the next automatic refresh after task completion, prefers finished tasks in panel self-tests while recording pending reports, and tells `codex_output` readers to wait for the completion notification.
 
