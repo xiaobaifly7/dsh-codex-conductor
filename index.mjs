@@ -672,21 +672,24 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env } = {}
     // 用 1 秒一跳的 interval，而不是一个长 setTimeout：Windows 上 libuv 计时走 QueryPerformanceCounter，含睡眠时间，
     // 一个长 setTimeout 会在电脑睡眠唤醒后立刻判超时、误杀在飞的 status；interval 睡眠期间只补一跳（约 1 秒），不会误杀，
     // 也不会因 timeoutMs 超过 2^31 而被 Node 夹成 1 毫秒立刻触发。
+    const cleanup = () => {
+      clearInterval(timer);
+      signal?.removeEventListener('abort', onAbort);
+    };
     let ticks = 0;
     const timer = timeoutMs && setInterval(() => {
       if (++ticks * 1000 < timeoutMs) return;
-      clearInterval(timer);
+      cleanup();
       child.kill();
       resolve({ status: 'failed', error_kind: 'bridge_error', retryable: true,
         error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束它（WSL 可能卡住或正在启动）` });
     }, 1000);
     child.on('error', (error) => {
-      clearInterval(timer);
+      cleanup();
       resolve({ status: 'failed', error_kind: 'bridge_error', error: error.message, retryable: true });
     });
     child.on('close', (code) => {
-      clearInterval(timer);
-      signal?.removeEventListener('abort', onAbort);
+      cleanup();
       const lines = Buffer.concat(out).toString('utf8').trim().split('\n');
       try {
         resolve(JSON.parse(lines.at(-1)));

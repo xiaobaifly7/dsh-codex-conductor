@@ -1,6 +1,7 @@
 // node --test test.mjs
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
+import { getEventListeners } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -3073,4 +3074,17 @@ test('history accepts and forwards the unknown execution filter', async () => {
   assert.ok(h.tools.codex_jobs.parameters.properties.status.enum.includes('unknown'));
   await h.tools.codex_jobs.execute({ cwd: '/mock/work', status: 'unknown' }, {});
   assert.deepEqual(h.calls, [['list', '--limit', '20', '--offset', '0', '--cwd', '/mock/work', '--status', 'unknown']]);
+});
+
+
+test('runProcess removes abort listeners on success, error and timeout', async () => {
+  for (const [command, argv, timeoutMs] of [
+    [process.execPath, ['-e', 'console.log("{}")'], 5000],
+    ['dsh-conductor-no-such-command', [], 5000],
+    [process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], 1],
+  ]) {
+    const { signal } = new AbortController();
+    await runProcess(command, argv, { signal, timeoutMs });
+    assert.equal(getEventListeners(signal, 'abort').length, 0, command);
+  }
 });
