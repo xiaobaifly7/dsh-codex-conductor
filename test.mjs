@@ -3173,3 +3173,17 @@ test('codex_output exposes stderr and events as repeatable Unicode log pages', a
     await assert.rejects(tool.execute({ job_id: 'J', artifact: 'unknown' }, {}), /artifact/);
   }
 });
+
+
+test('codex_summary renders error-kind totals for the full filtered range on every page', async () => {
+  const summary = { total: 3, total_jobs: 9, groups: [], offset: 2, next_offset: null,
+    error_kinds: { router_down: 4, idle_timeout: 2, schema_invalid: 1 } };
+  const h = harness({ config: { summaryResult: summary } });
+  const value = await h.tools.codex_summary.execute({ limit: 1, offset: 2 }, { agent: agentAt('/work') });
+  assert.deepEqual(value, summary);
+  const render = input => h.tools.codex_summary.output.render({}, input)[0].text;
+  assert.match(render(value), /错误分类（全部匹配任务）：router_down=4、idle_timeout=2、schema_invalid=1/);
+  assert.match(render({ ...summary, error_kinds: {} }), /错误分类（全部匹配任务）：无/);
+  assert.match(render({ ...summary, error_kinds: undefined }), /错误分类（全部匹配任务）：未知/);
+  assert.deepEqual(h.calls, [['summary', '--owner', 'S1', '--limit', '1', '--offset', '2']]);
+});
