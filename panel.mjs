@@ -100,9 +100,12 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile }) {
 }
 
 export function registerPanel({ ctx, ...options }) {
-  const web = ctx.get?.('webServer');
-  const settings = ctx.get?.('settings');
-  if (!web?.register || !settings) return;
+  return ctx.inject?.(['webServer', 'settings'], (ctx) => registerReadyPanel({ ctx, ...options }));
+}
+
+function registerReadyPanel({ ctx, ...options }) {
+  const web = ctx.get('webServer');
+  if (!web?.register) return;
   ctx.get?.('jobs')?.attachController?.('codex-conductor-panel');
   const api = createPanelApi(options);
   const unregister = web.register({ kind: 'prefix', path: PANEL_PATH, async handler(req, res) {
@@ -140,6 +143,5 @@ export function registerPanel({ ctx, ...options }) {
       send(error.status ?? 500, { error: error.message, ...(error.saved ? { saved: true } : {}) });
     }
   } });
-  ctx.effect?.(() => unregister);
   return unregister;
 }

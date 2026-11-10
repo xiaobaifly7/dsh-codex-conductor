@@ -12,6 +12,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.49` 恢复默认关闭的 `plannerAnswers` 开启时的完整放宽：规划端可按用户原始目标和已有事实代答阻塞问题，跳过待答范围冲突的写入范围预检，并自行登记包含 `kind: 'scope'` 的 `accepted_deviations`，无需用户回复。
 
+`0.9.51` 修复冷启动时面板服务尚未就绪导致接口或设置入口未注册的问题，随服务出现、撤销和恢复自动注册与清理，缺少服务时不影响其他功能。
+
 ### 0.9.50：设置里的“Codex 指挥”
 
 在 DSH 设置页打开“Codex 指挥”，可以自动查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、分页阅读全文报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。保存设置会先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；确认实际加载后才显示生效。Codex 忙时先等任务结束再保存；重载按钮可以登记空闲等待。规划提示词保存前也会备份。
@@ -303,6 +305,8 @@ python3 runner/test_codex_runner.py
 `0.9.49` restores full opt-in `plannerAnswers`: the planner can answer blockers based on the user's original goal and known facts, skip pending-conflict write-scope preflight, and record `accepted_deviations`, including `kind: 'scope'`, without a user reply.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [ten Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+
+`0.9.51` fixes missing panel routes and settings entries on cold startup by registering, cleaning up, and re-registering them as their services appear, disappear, and return, without affecting other functionality when services are absent.
 
 ### 0.9.50: Codex control panel
 

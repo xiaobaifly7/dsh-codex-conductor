@@ -13,6 +13,35 @@ const routes = [
   ['GET', '/prompt'], ['POST', '/prompt', { text: 'updated' }], ['POST', '/reload', {}],
 ];
 
+// Model Cordis injection ownership: only changed dependencies restart a child callback.
+function serviceContext(t, services = {}) {
+  const injections = new Set();
+  const ctx = {
+    get: (name) => services[name],
+    inject: t.mock.fn((dependencies, callback) => {
+      let cleanup;
+      const injection = { dependencies, update() {
+        cleanup?.();
+        cleanup = dependencies.every((name) => services[name] != null) ? callback(Object.create(ctx)) : undefined;
+      } };
+      injections.add(injection);
+      injection.update();
+      const fiber = { dispose() {
+        injections.delete(injection);
+        cleanup?.();
+        cleanup = undefined;
+      } };
+      t.after(() => fiber.dispose());
+      return fiber;
+    }),
+    set(name, value) {
+      services[name] = value;
+      for (const injection of injections) if (injection.dependencies.includes(name)) injection.update();
+    },
+  };
+  return ctx;
+}
+
 function fixture(t, options = {}) {
   const root = mkdtempSync(path.join(tmpdir(), 'conductor-panel-test-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -34,14 +63,15 @@ function fixture(t, options = {}) {
   };
   const connection = { requestRejection: t.mock.fn(() => undefined) };
   const web = { register: t.mock.fn((route) => { handler = route.handler; return unregister; }) };
-  const unregister = t.mock.fn();
+  const unregister = t.mock.fn(() => { handler = undefined; });
   const settings = {};
   let handler;
   const services = { webServer: web, settings, connection, ...options.services };
-  const ctx = { get: (name) => services[name], effect: t.mock.fn() };
+  const ctx = serviceContext(t, services);
   const apiOptions = { cfg, conductor, runtime, plannerFile, ...options.api };
   const registration = registerPanel({ ctx, ...apiOptions });
   async function request(method, route, body, { raw, chunks, contentType = 'application/json' } = {}) {
+    if (!handler) return { status: 404 };
     const bytes = Buffer.from(raw ?? (body === undefined ? '' : JSON.stringify(body)));
     const req = { method, url: PANEL_PATH + route, headers: { 'content-type': contentType },
       async *[Symbol.asyncIterator]() { yield* chunks ?? [bytes]; } };
@@ -77,25 +107,79 @@ test('panel settings expose only editable fields and redact nested Gemini config
   assert.equal(panelSettings({ ...cfg, gemini: undefined }).gemini, null);
 });
 
-test('panel registers its prefix and disposal only with available web/settings services', (t) => {
+test('panel registers its prefix in an injection child and disposes with it', (t) => {
   const f = fixture(t);
+  assert.deepEqual(f.ctx.inject.mock.calls[0].arguments[0], ['webServer', 'settings']);
   assert.equal(f.web.register.mock.callCount(), 1);
   const [route] = f.web.register.mock.calls[0].arguments;
   assert.equal(route.kind, 'prefix');
   assert.equal(route.path, PANEL_PATH);
-  assert.equal(f.registration, f.unregister);
-  assert.equal(f.ctx.effect.mock.calls[0].arguments[0](), f.unregister);
-  for (const services of [{ webServer: undefined }, { settings: undefined }, { webServer: {} }]) {
-    const missing = fixture(t, { services });
-    assert.equal(missing.registration, undefined);
-    assert.equal(missing.web.register.mock.callCount(), 0);
-    assert.equal(missing.ctx.effect.mock.callCount(), 0);
-  }
+  f.registration.dispose();
+  assert.equal(f.unregister.mock.callCount(), 1);
   const jobs = { attachController: t.mock.fn() };
   fixture(t, { services: { jobs } });
   assert.deepEqual(jobs.attachController.mock.calls[0].arguments, ['codex-conductor-panel']);
   assert.doesNotThrow(() => fixture(t, { services: { jobs: {} } }));
+});
+
+test('panel stays idle without optional services, including a headless context', async (t) => {
+  for (const services of [{ webServer: undefined }, { settings: undefined }, { webServer: {} }]) {
+    const missing = fixture(t, { services });
+    assert.equal((await missing.request('GET', '/status')).status, 404);
+    assert.equal(missing.web.register.mock.callCount(), 0);
+    missing.registration.dispose();
+    assert.equal(missing.unregister.mock.callCount(), 0);
+  }
+  const headless = serviceContext(t);
+  assert.doesNotThrow(() => registerPanel({ ctx: headless }));
   assert.equal(registerPanel({ ctx: {} }), undefined);
+});
+
+test('panel registers when web/settings services arrive after plugin load in either order', async (t) => {
+  for (const order of [['webServer', 'settings'], ['settings', 'webServer']]) {
+    const f = fixture(t, { services: { webServer: undefined, settings: undefined } });
+    const services = { webServer: f.web, settings: {} };
+    assert.equal((await f.request('GET', '/status')).status, 404);
+    f.ctx.set(order[0], services[order[0]]);
+    assert.equal(f.web.register.mock.callCount(), 0);
+    f.ctx.set(order[1], services[order[1]]);
+    assert.equal(f.web.register.mock.callCount(), 1);
+    assert.equal((await f.request('GET', '/status')).status, 200);
+  }
+});
+
+test('panel unregisters when either dependency disappears and registers again on return', async (t) => {
+  for (const dependency of ['webServer', 'settings']) {
+    const f = fixture(t);
+    const service = f.services[dependency];
+    f.ctx.set(dependency, undefined);
+    assert.equal(f.unregister.mock.callCount(), 1);
+    assert.equal((await f.request('GET', '/status')).status, 404);
+    f.ctx.set(dependency, service);
+    assert.equal(f.web.register.mock.callCount(), 2);
+    assert.equal((await f.request('GET', '/status')).status, 200);
+    f.registration.dispose();
+    assert.equal(f.unregister.mock.callCount(), 2);
+    f.ctx.set(dependency, service);
+    assert.equal(f.web.register.mock.callCount(), 2);
+    assert.equal((await f.request('GET', '/status')).status, 404);
+  }
+});
+
+test('panel reads the current connection on every request as authentication appears and disappears', async (t) => {
+  const f = fixture(t, { services: { connection: undefined } });
+  rejected(await f.request('GET', '/status'), 503);
+  const connection = { requestRejection: () => 401 };
+  f.ctx.set('connection', connection);
+  rejected(await f.request('GET', '/status'), 401);
+  f.ctx.set('connection', f.connection);
+  assert.equal((await f.request('GET', '/status')).status, 200);
+  f.ctx.set('connection', undefined);
+  rejected(await f.request('GET', '/status'), 503);
+  f.ctx.set('connection', connection);
+  rejected(await f.request('GET', '/status'), 401);
+  assert.equal(f.web.register.mock.callCount(), 1);
+  assert.equal(f.unregister.mock.callCount(), 0);
 });
 
 test('panel HTTP implements every valid route using only stub runtime/conductor', async (t) => {
@@ -329,7 +413,7 @@ test('panel HTTP serializes settings/reload, retains saved failure state and rel
   assert.deepEqual(await f.request('POST', '/reload', {}), { status: 200, body: { status: 'already_current' } });
 });
 
-test('panel client registers the Chinese settings slot without rendering or contacting services', () => {
+test('panel client follows late slots and settings declarations through removal and return', (t) => {
   let module;
   vm.runInNewContext(readFileSync(new URL('./client.js', import.meta.url), 'utf8'), {
     window: { __ModuleLoader__: { load: (value) => { module = value; } } },
@@ -340,18 +424,39 @@ test('panel client registers the Chinese settings slot without rendering or cont
     assert.equal(name, '@deepseek-ai/dsh-client-ui-primitives');
     return {};
   });
-  const calls = [];
-  const unregister = () => {};
+  const declarations = serviceContext(t);
+  const unregister = t.mock.fn();
   const slots = {
-    inject: (name, callback) => { calls.push(['inject', name]); return callback(); },
-    register: (options, component) => { calls.push(['register', options, component]); return unregister; },
+    inject: t.mock.fn((name, callback) => {
+      const fiber = declarations.inject([name], callback);
+      return () => fiber.dispose();
+    }),
+    register: t.mock.fn(() => unregister),
   };
-  assert.equal(exports.apply({ get: (name) => { assert.equal(name, 'slots'); return slots; } }), unregister);
-  assert.deepEqual(calls[0], ['inject', 'settings.section']);
-  const [, options, component] = calls[1];
+  const ctx = serviceContext(t);
+  assert.equal(exports.apply(ctx), undefined);
+  assert.deepEqual(Array.from(ctx.inject.mock.calls[0].arguments[0]), ['slots']);
+  assert.equal(slots.inject.mock.callCount(), 0);
+  ctx.set('slots', slots);
+  assert.equal(slots.inject.mock.calls[0].arguments[0], 'settings.section');
+  assert.equal(slots.register.mock.callCount(), 0);
+  declarations.set('settings.section', {});
+  const [options, component] = slots.register.mock.calls[0].arguments;
   assert.equal(options.name, 'settings.section');
   assert.equal(options.id, 'dsh-codex-conductor');
   assert.equal(options.label(), 'Codex 指挥');
   assert.equal(component, exports.Panel);
-  assert.equal(exports.apply({ get: () => undefined }), undefined);
+  declarations.set('settings.section', undefined);
+  assert.equal(unregister.mock.callCount(), 1);
+  declarations.set('settings.section', {});
+  assert.equal(slots.register.mock.callCount(), 2);
+  ctx.set('slots', undefined);
+  assert.equal(unregister.mock.callCount(), 2);
+  ctx.set('slots', slots);
+  assert.equal(slots.register.mock.callCount(), 3);
+  const fiber = ctx.inject.mock.calls[0].result;
+  fiber.dispose();
+  assert.equal(unregister.mock.callCount(), 3);
+  ctx.set('slots', slots);
+  assert.equal(slots.register.mock.callCount(), 3);
 });
