@@ -1327,6 +1327,35 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered tree")):
             self.assertEqual(codex_runner.snapshot_before(str(root), None), (None, None))
 
+    def test_forget_too_big_removes_only_the_normalized_key_and_is_idempotent(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        codex_runner.remember_too_big(str(self.cwd))
+        cache = codex_runner.HOME / codex_runner.TOO_BIG_FILE
+        data = json.loads(cache.read_text())
+        # The CLI also removes entries that have already expired.
+        data[codex_runner.tree_key(str(root))] = time.time() - 8 * 86400
+        cache.write_text(json.dumps(data))
+        result = self.control("forget-too-big", "--cwd", str(root / "keep" / ".."))
+        self.assertEqual(result, {"status": "completed", "removed": True})
+        remaining = {codex_runner.tree_key(str(self.cwd)): data[codex_runner.tree_key(str(self.cwd))]}
+        self.assertEqual(json.loads(cache.read_text()), remaining)
+        self.assertEqual(self.control("forget-too-big", "--cwd", str(root)), {"status": "completed", "removed": False})
+        self.assertEqual(json.loads(cache.read_text()), remaining)
+        self.assertEqual(self.calls(), [])
+
+    def test_forget_too_big_reports_absent_or_invalid_cache_without_overwriting_it(self):
+        codex_runner, root = self.big_tree()
+        cache = codex_runner.HOME / codex_runner.TOO_BIG_FILE
+        self.assertEqual(self.control("forget-too-big", "--cwd", str(root)), {"status": "completed", "removed": False})
+        self.assertFalse(cache.exists())
+        cache.parent.mkdir(parents=True)
+        for content in ("not JSON", "[]"):
+            cache.write_text(content)
+            self.assertEqual(self.control("forget-too-big", "--cwd", str(root))["error_kind"], "invalid_record")
+            self.assertEqual(cache.read_text(), content)
+        self.assertEqual(self.calls(), [])
+
     def test_snapshot_io_failure_does_not_remember_a_tree_as_too_big(self):
         codex_runner, root = self.big_tree()
         real_stat = os.stat
@@ -1361,6 +1390,8 @@ class RunnerTests(unittest.TestCase):
             value = {"cwd": "/mnt/c/WORK/project", "scope_paths": ["/mnt/C/work/PROJECT/Src"],
                      "files_changed": [{"path": "src/File.py"}, {"path": "src-other/File.py"}]}
             self.assertEqual(codex_runner.out_of_scope_paths(value), ["src-other/File.py"])
+            self.assertTrue(self.control("forget-too-big", "--cwd", "c:\\work\\PROJECT")["removed"])
+            self.assertNotIn(codex_runner.tree_key("/mnt/C/Work/Project"), codex_runner.too_big_trees())
 
     def test_stale_too_big_entry_is_ignored(self):
         codex_runner, root = self.big_tree()
