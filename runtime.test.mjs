@@ -641,16 +641,73 @@ test('now reload preserves active tasks and reports success only after the exact
   assert.equal(jobs.started.length, 0);
 });
 
+test('rechecking a submitted reload keeps the same target even with active tasks', async (t) => {
+  const f = fixture(t);
+  writeFileSync(f.profileFile, profile(f.moduleUrl));
+  const request = requestRuntimeReload({ moduleUrl: f.moduleUrl, profileFile: f.profileFile });
+  const submitted = readFileSync(f.profileFile);
+  const tool = runtimeTool(f, { conductor: forbidCodexMutations(async () => ({ jobs: [{ job_id: 'J1' }], total: 1 })) });
+  for (const when of ['now', 'idle']) {
+    marker(f);
+    const controller = new AbortController();
+    const operation = tool.execute({ action: 'reload', when }, { ...runtimeExec, signal: controller.signal });
+    try {
+      await delay(65);
+      assert.deepEqual(readFileSync(f.profileFile), submitted);
+      marker(f, { ...runtimeIdentity(f.moduleUrl), module: request.expected_module });
+      const result = await operation;
+      assert.equal(result.status, 'reloaded');
+      assert.equal(result.reused, true);
+      assert.equal(result.expected_module, request.expected_module);
+    } finally { controller.abort(); await operation; }
+  }
+});
+
+test('default reload confirmation still accepts the exact marker after 24 seconds', async (t) => {
+  const f = fixture(t);
+  const expectedModule = new URL('?v=target', f.moduleUrl).href;
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  const observation = waitForRuntimeLoad({ loadedFile: f.loadedFile, expectedModule });
+  now = 24_000;
+  await delay(75);
+  marker(f, { ...runtimeIdentity(f.moduleUrl), module: expectedModule });
+  assert.equal((await observation).confirmed, true);
+});
+
 test('reload marker timeout stays explicitly unconfirmed', async (t) => {
   const f = fixture(t);
   writeFileSync(f.profileFile, profile(f.moduleUrl));
+  let reads = 0;
+  t.mock.method(performance, 'now', () => reads++ ? 30_001 : 0);
   const result = await runtimeTool(f).execute({ action: 'reload', when: 'now' }, runtimeExec);
+  assert.match(result.next, /status.*不要重复重载/);
   assert.equal(result.status, 'unconfirmed');
   assert.equal(result.confirmed, false);
   assert.equal(result.timed_out, true);
   assert.equal(result.loaded, null);
   assert.equal(typeof result.error, 'string');
   assert.notEqual(result.expected_module, f.moduleUrl);
+});
+
+test('idle observer reports an unconfirmed request without reporting a load failure', async (t) => {
+  const f = fixture(t);
+  writeFileSync(f.profileFile, profile(f.moduleUrl));
+  const jobs = nativeJobs();
+  let pending = 1;
+  let reads = 0;
+  t.mock.method(performance, 'now', () => reads++ ? 30_001 : 0);
+  const tool = runtimeTool(f, { jobs, activeDispatches: () => pending });
+  await tool.execute({ action: 'reload' }, runtimeExec);
+  const observer = jobs.started[0];
+  t.after(() => observer.cancel());
+  pending = 0;
+  const outcome = await observer.done;
+  assert.equal(outcome.status, 'completed');
+  assert.match(outcome.detail, /尚未确认加载/);
+  const result = JSON.parse(outcome.result);
+  assert.equal(result.status, 'unconfirmed');
+  assert.equal(result.confirmed, false);
 });
 
 test('idle observation fails honestly on bridge loss without writing the profile', async (t) => {
