@@ -1670,7 +1670,7 @@ export function apply(ctx, config = {}, run = runRunner) {
 
   ctx.tools.register({
     name: 'codex_output',
-    description: '只读、可重复地分段读取 Codex 完整原始报告、runner 结果或原任务与验收上下文。' +
+    description: '只读、可重复地分段读取 Codex 完整原始报告、runner 结果、原任务与验收上下文或诊断日志。' +
       'job_output 截断或已经消费结果时，用本工具找回；不会消费报告、启动或恢复任务。' +
       'offset 和 next_offset 按 Unicode 字符计算，按 next_offset 接着读取，直至 eof=true。',
     presentCall: (a) => ({ card: 'generic', kind: 'read', title: `Codex 完整结果 ${a?.job_id ?? ''}` }),
@@ -1678,7 +1678,7 @@ export function apply(ctx, config = {}, run = runRunner) {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: 'runner job_id；可用 codex_jobs 找回，不是 Harness 的 background_job_id。' },
-        artifact: { type: 'string', enum: ['report', 'result', 'context', 'review'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准；review 独立核验历史。默认 report。' },
+        artifact: { type: 'string', enum: ['report', 'result', 'context', 'review', 'stderr', 'events'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准；review 独立核验历史；stderr 标准错误日志；events JSONL 事件日志。默认 report。' },
         offset: { type: 'integer', minimum: 0, description: 'Unicode 字符起点，默认 0。' },
         limit: { type: 'integer', minimum: 1, maximum: 8000, description: '每段最多字符数，默认 4000。' },
       },
@@ -1687,7 +1687,7 @@ export function apply(ctx, config = {}, run = runRunner) {
     output: DATA_OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_output: job_id 无效');
-      if (args.artifact !== undefined && !['report', 'result', 'context', 'review'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
+      if (args.artifact !== undefined && !['report', 'result', 'context', 'review', 'stderr', 'events'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
       return conductor.output(args.job_id, args, exec?.signal);

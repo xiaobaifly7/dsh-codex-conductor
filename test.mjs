@@ -3153,3 +3153,23 @@ test('pending scope checks fail closed on unverifiable list records without stat
   assert.equal(h.calls.length, 2);
   assert.ok(h.calls.every(argv => argv[0] === 'list'));
 });
+
+
+test('codex_output exposes stderr and events as repeatable Unicode log pages', async () => {
+  for (const artifact of ['stderr', 'events']) {
+    const page = { job_id: 'J', artifact, text: '诊断😀', offset: 7, next_offset: 10, eof: false };
+    const h = harness({ config: { outputResult: page } });
+    const tool = h.tools.codex_output;
+    assert.ok(tool.parameters.properties.artifact.enum.includes(artifact));
+    assert.ok(tool.parameters.properties.artifact.description.includes(artifact));
+    const args = { job_id: 'J', artifact, offset: 7, limit: 3 };
+    assert.deepEqual(await tool.execute(args, {}), page);
+    assert.deepEqual(await tool.execute(args, {}), page);
+    assert.deepEqual(h.calls, Array(2).fill(['output', 'J', '--artifact', artifact, '--offset', '7', '--limit', '3']));
+    const missing = { job_id: 'J', artifact, text: '', eof: true, next_offset: null, note: '没有该内容' };
+    const absent = harness({ config: { outputResult: missing } });
+    assert.deepEqual(await absent.tools.codex_output.execute({ job_id: 'J', artifact }, {}), missing);
+    assert.deepEqual(absent.calls, [['output', 'J', '--artifact', artifact, '--offset', '0', '--limit', '4000']]);
+    await assert.rejects(tool.execute({ job_id: 'J', artifact: 'unknown' }, {}), /artifact/);
+  }
+});
