@@ -1520,6 +1520,7 @@ def main():
 
     if args.command == "_worker":
         job_dir = HOME / "jobs" / args.job_id
+        record_pid(job_dir / "worker.pid", os.getpid())
         task = argparse.Namespace(**json.loads((job_dir / "args.json").read_text("utf-8")))
         try:
             result = execute(task, (job_dir / "prompt.txt").read_text("utf-8"), job_dir)

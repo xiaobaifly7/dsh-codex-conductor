@@ -2350,6 +2350,26 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(sorted(d.name for d in (codex_runner.HOME / subdir).iterdir()),
                                  ["queued", "recently-finished", "running"])
 
+    def test_worker_registers_its_own_process_identity_before_execution(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("self-register", None)
+        (jd / "worker.pid").unlink()
+        (jd / "prompt.txt").write_text("do it")
+
+        def execute(*unused):
+            self.assertEqual(codex_runner.recorded_pid(jd / "worker.pid"), os.getpid())
+            self.assertEqual((jd / "worker.start").read_text(), codex_runner.process_start(os.getpid()))
+            return {"status": "completed"}
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(sys, "argv", [str(RUNNER), "_worker", jd.name]), \
+                mock.patch.object(codex_runner, "execute", side_effect=execute):
+            codex_runner.main()
+        self.assertEqual(json.loads((jd / "result.json").read_text())["status"], "completed")
+
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
