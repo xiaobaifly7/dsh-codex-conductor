@@ -1670,7 +1670,7 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.equal(loaded.allowHostAccess, true);
   assert.equal(loaded.defaultHostAccess, true);
   assert.equal(loaded.plannerAnswers, true);
-  assert.equal(loaded.version, '0.9.47');
+  assert.equal(loaded.version, '0.9.48');
   assert.deepEqual(loaded.codexRoute, { provider: 'magpie', origin: 'http://127.0.0.1:3426' });
   assert.deepEqual(loaded.routerCheck, { transport: 'tcp', origin: 'http://127.0.0.1:3440' });
   assert.doesNotMatch(JSON.stringify(loaded), /route-test|probe-test/);
@@ -1713,11 +1713,11 @@ test('apply preserves another live process loaded record and replaces own, stale
     const h = harness();
     const status = await h.tools.codex_runtime.execute({ action: 'status' });
     assert.equal(status.instance.module, own.module);
-    assert.equal(status.instance.version, '0.9.47');
+    assert.equal(status.instance.version, '0.9.48');
     if (row.keep) assert.equal(readFileSync(file, 'utf8'), original);
     else {
       assert.equal(status.loaded.pid, process.pid);
-      assert.equal(status.loaded.version, '0.9.47');
+      assert.equal(status.loaded.version, '0.9.48');
       assert.notEqual(status.loaded.loadedAt, '2000-01-01T00:00:00Z');
     }
   }
@@ -3063,7 +3063,7 @@ test('codex_run dispatches 22 criteria verbatim through stdin and renders every 
   const envelope = JSON.parse(starts[0].stdin);
   const { dispatcher, ...taskContext } = envelope.context;
   assert.equal(dispatcher.pid, process.pid);
-  assert.equal(dispatcher.version, '0.9.47');
+  assert.equal(dispatcher.version, '0.9.48');
   assert.deepEqual(taskContext, { owner: 'S1', task: args.task, acceptance, write: false });
   assert.ok(envelope.prompt.includes(acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
   assert.deepEqual(value.acceptance, acceptance);

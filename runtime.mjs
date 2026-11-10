@@ -245,7 +245,7 @@ export function requestRuntimeReload({ moduleUrl, profileFile }) {
   return { expected_module, requested_revision, requested_at };
 }
 
-export async function waitForRuntimeLoad({ loadedFile, expectedModule, timeoutMs = 15000, signal }) {
+export async function waitForRuntimeLoad({ loadedFile, expectedModule, timeoutMs = 30_000, signal }) {
   modulePath(expectedModule);
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw new RangeError('timeoutMs must be a nonnegative finite number');
   const deadline = performance.now() + timeoutMs;
@@ -292,18 +292,21 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     // 查询期间取得 job_id 的派发仍计入在途任务，避免误判空闲。
     return { count: Math.max(starting, ids.size + activeDispatches()), generation };
   }
+  const pendingReload = (current) => current.can_reload && current.profile_module !== moduleUrl;
   async function reload(current, signal) {
     signal?.throwIfAborted();
     if (current.state === 'synchronized') return { ...current, status: 'already_current' };
-    const request = requestRuntimeReload({ moduleUrl, profileFile });
+    const request = pendingReload(current) ? { expected_module: current.profile_module, reused: true } :
+      requestRuntimeReload({ moduleUrl, profileFile });
     const confirmation = await waitForRuntimeLoad({ loadedFile, expectedModule: request.expected_module, signal });
     return { ...snapshot(current.active_tasks, current.active_error), ...request, ...confirmation,
-      status: confirmation.confirmed ? 'reloaded' : 'unconfirmed' };
+      status: confirmation.confirmed ? 'reloaded' : 'unconfirmed',
+      ...(confirmation.confirmed ? {} : { next: '重载请求已提交，尚未确认加载。用 codex_runtime action=status 查询，不要重复重载。' }) };
   }
   return ctx.tools.register({
     name: 'codex_runtime',
     description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限及在途 Codex 任务数；reload 默认等空闲后重载，when=now 立即请求。' +
-      '不会取消或启动 Codex 任务。只有加载标记确认新模块后才报告生效；后台取消只停止观察。',
+      '不会取消或启动 Codex 任务。已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。',
     presentCall: (args) => ({ card: 'generic', kind: args?.action === 'reload' ? 'write' : 'read', title: 'Codex runtime' }),
     parameters: { type: 'object', properties: {
       action: { type: 'string', enum: ['status', 'reload'], default: 'status' },
@@ -335,11 +338,14 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
         }
         current = snapshot(count, active_error);
         if (action === 'status') return { ...current, status: 'status' };
-        if (active_error && when === 'idle') {
+        const awaiting = pendingReload(current);
+        if (active_error && when === 'idle' && !awaiting) {
           return { ...current, status: 'failed', error_kind: 'active_count_unavailable', error: active_error };
         }
         if (!current.can_reload) throw new Error(current.profile_error);
-        if (current.state === 'synchronized' || when === 'now' || current.active_tasks === 0) return await reload(current, exec?.signal);
+        if (awaiting || current.state === 'synchronized' || when === 'now' || current.active_tasks === 0) {
+          return await reload(current, exec?.signal);
+        }
         const owner = exec?.agent?.id;
         const jobs = ctx.get?.('jobs');
         if (owner === undefined || !jobs?.start || !jobs?.list) {
@@ -364,7 +370,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
                   generation = active.generation;
                 }
                 const result = await reload(observed, signal);
-                return { status: result.status === 'unconfirmed' ? 'failed' : 'completed', detail: result.status,
+                return { status: 'completed', detail: result.status === 'unconfirmed' ? '重载请求已提交，尚未确认加载' : result.status,
                   result: JSON.stringify(result) };
               } catch (error) {
                 const result = { status: signal.aborted ? 'cancelled' : 'failed', error: String(error?.message ?? error),
