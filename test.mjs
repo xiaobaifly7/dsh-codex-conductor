@@ -2842,13 +2842,13 @@ test('every runner call has an upper bound: status gets its wait plus slack, sta
   assert.deepEqual(seen, [['start', 120000], ['status', 90000], ['cancel', 120000], ['status', 660000], ['cancel', 120000]]);
 });
 
-test('runProcess streams progress and requires a terminal status', async () => {
+test('runProcess streams progress and accepts the final line before process exit', async () => {
   const progress = [];
   const opts = { onProgress: (row) => progress.push(row.phase), timeoutMs: 4000 };
   const script = 'console.log(JSON.stringify({status:"running",phase:"lock_wait"}));' +
     'console.log(JSON.stringify({status:"running",phase:"codex_running"}));';
   const result = await runProcess(process.execPath, ['-e', script +
-    'console.log(JSON.stringify({status:"completed"}));'], opts);
+    'console.log(JSON.stringify({status:"completed"}));setInterval(() => {}, 1000);'], opts);
   assert.deepEqual(progress, ['lock_wait', 'codex_running']);
   assert.deepEqual(result, { status: 'completed' });
   const incomplete = await runProcess(process.execPath, ['-e', script], opts);
