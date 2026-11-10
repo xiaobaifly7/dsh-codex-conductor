@@ -2190,7 +2190,9 @@ class RunnerTests(unittest.TestCase):
 
         with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "home"):
             job_dir = self.old_job({"sandbox": "workspace-write", "resume": None})
+            codex_runner.runner_event(job_dir, 1, "retry_wait", "router_down", time.time() + 30)
             status = codex_runner.job_status(job_dir.name)
+            self.assertEqual((status["phase"], status["attempt"], status["retry_at"]), ("interrupted", 1, None))
             self.assertEqual((status["status"], status["error_kind"], status["retryable"], status["thread_id"], status["sandbox"]),
                              ("failed", "worker_died", True, "T-old", "workspace-write"))
             with mock.patch.object(sys, "argv", [str(RUNNER), "cancel", job_dir.name]), \

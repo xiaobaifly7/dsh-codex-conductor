@@ -2505,7 +2505,9 @@ test('codex_cancel on a job that had already ended does not tell the agent to se
 
 test('a dead writer is told its edits may be partial and unlisted; a read-only dead job is not', () => {
   const dead = (sandbox) => ({ status: 'failed', error_kind: 'worker_died', retryable: true, sandbox, thread_id: sandbox === 'read-only' ? null : 'T' });
-  assert.match(nextStep(dead('workspace-write')), /可能已改了部分文件且没有改动清单/);
+  const next = nextStep(dead('workspace-write'));
+  assert.match(next, /可能已改了部分文件且没有改动清单[\s\S]*先用 codex_output[\s\S]*核对已有产物[\s\S]*只有确认有缺项[\s\S]*resume/);
+  assert.doesNotMatch(next, /再派一次/);
   assert.match(nextStep(dead('danger-full-access')), /可能已改了部分文件且没有改动清单/);
   assert.doesNotMatch(nextStep(dead('read-only')), /可能已改了部分文件/);
 });

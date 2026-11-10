@@ -1165,7 +1165,9 @@ def enriched_status(job_id, job_dir, value):
     if activity["attempt"] is None:
         activity["attempt"] = result.get("attempts")
     activity["last_error_kind"] = result.get("error_kind") or activity["last_error_kind"]
-    if activity["phase"] == "codex_running" and result.get("last_activity") == "reconnecting":
+    if result.get("error_kind") == "worker_died":
+        activity.update(phase="interrupted", retry_at=None)
+    elif activity["phase"] == "codex_running" and result.get("last_activity") == "reconnecting":
         activity["phase"] = "codex_reconnecting"
     return {**result, **activity}
 

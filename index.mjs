@@ -982,11 +982,13 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       return `${cause}${attempts ? `（已尝试 ${attempts} 次）` : ''}。先确认 Codex 到模型服务的连接恢复，恢复前不要重派。` +
         `连接恢复后，用 codex_run 沿用原任务和授权${resumable && value.thread_id ? '，把原 thread_id 填入 resume 续跑。' : '再派。'}`;
     }
-    // worker_died 的可写任务：退出前可能已改了部分文件，续跑后的改动清单也不含这些
-    const partial = value.error_kind === 'worker_died' && !readOnly
-      ? '退出前 Codex 可能已改了部分文件且没有改动清单，续跑后的清单也不含它们，核验前先用 git status 或对比文件确认现状。' : '';
-    return (resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
-      : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。') + partial;
+    if (value.error_kind === 'worker_died' && !readOnly) {
+      return '执行进程已中断，退出前可能已改了部分文件且没有改动清单。先用 codex_output（artifact=context）取回原任务和验收标准，再用 git status 或对比文件核对已有产物。' +
+        '产物齐全就报告核验结果；只有确认有缺项才按原授权补做。' +
+        (resumable && value.thread_id ? '用 codex_run 的 resume 带上原 thread_id，只补缺项。' : '没有可续接线程时另派，只补缺项。');
+    }
+    return resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
+      : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。';
   }
   const alerts = [
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',
