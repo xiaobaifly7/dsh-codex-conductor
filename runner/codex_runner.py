@@ -210,10 +210,14 @@ def acquire_file_lock(path, blocking=False):
 
 
 def write_lock_key(cwd):
-    path = os.path.normcase(os.path.realpath(local_path(cwd)))
+    return hashlib.sha1(tree_key(cwd).encode("utf-8")).hexdigest()[:16]
+
+
+def normalized_path(path):
+    path = os.path.normcase(os.path.normpath(path))
     if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path):
         path = path.lower()  # Windows-backed paths ignore case, unlike native Linux paths.
-    return hashlib.sha1(path.encode("utf-8")).hexdigest()[:16]
+    return path
 
 
 def acquire_write_lock(cwd):
@@ -489,23 +493,20 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
         if not isinstance(error, FileNotFoundError):
             raise error
 
-    try:
-        for top in scope or [root]:
+    for top in scope or [root]:
+        if time.time() > deadline:
+            return None
+        if not os.path.isdir(top):
+            add(top)  # a scoped file, or one that does not exist yet
+            continue
+        for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
             if time.time() > deadline:
                 return None
-            if not os.path.isdir(top):
-                add(top)  # a scoped file, or one that does not exist yet
-                continue
-            for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
+            dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
+            for name in filenames:
                 if time.time() > deadline:
                     return None
-                dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
-                for name in filenames:
-                    if time.time() > deadline:
-                        return None
-                    add(os.path.join(dirpath, name))
-    except OSError:
-        return None
+                add(os.path.join(dirpath, name))
     return files if time.time() <= deadline else None
 
 
@@ -520,7 +521,7 @@ def too_big_trees():
 
 
 def tree_key(cwd):
-    return os.path.normcase(os.path.realpath(cwd))
+    return normalized_path(os.path.realpath(local_path(cwd)))
 
 
 def remember_too_big(cwd):
@@ -556,12 +557,18 @@ def snapshot_before(cwd, scope_args):
     for a full snapshot, and before is None when only Codex's events can be used."""
     cwd = os.path.realpath(cwd)
     if tree_key(cwd) not in too_big_trees():
-        before = snapshot(cwd)
+        try:
+            before = snapshot(cwd)
+        except OSError:
+            return None, None
         if before is not None:
             return before, None
         remember_too_big(cwd)
     scope = [scope_path(cwd, s) for s in scope_args or []]
-    return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
+    try:
+        return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
+    except OSError:
+        return None, scope
 
 
 def ignore_patterns(ignore):
@@ -579,7 +586,10 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
     Paths matching an ignore regex (files other processes keep writing) are dropped before the 300-entry cap."""
     root = os.path.realpath(root)
     scope = [os.path.realpath(s) for s in scope] if scope else scope
-    after = snapshot(root, scope=scope) if before is not None else None
+    try:
+        after = snapshot(root, scope=scope) if before is not None else None
+    except OSError:
+        after = None
     rel = lambda p: os.path.relpath(os.path.realpath(os.path.join(root, p)), root).replace(os.sep, "/")
     events = {}
     for p, k in event_changes:
@@ -927,15 +937,11 @@ def valid_report(report):
 def out_of_scope_paths(value):
     outside = list(value.get("out_of_scope") or [])
     if value.get("cwd") and value.get("scope_paths"):
-        def report_path(path):
-            # Historical paths must not follow symlinks created after execution.
-            path = os.path.normcase(os.path.normpath(path))
-            return path.lower() if not IS_WIN and re.match(r"^/mnt/[A-Za-z](/|$)", path) else path
-
-        roots = [report_path(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
+        # Historical paths must not follow symlinks created after execution.
+        roots = [normalized_path(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
         for change in value.get("files_changed") or []:
             if isinstance(change, dict) and isinstance(change.get("path"), str):
-                path = report_path(os.path.join(value["cwd"], change["path"]))
+                path = normalized_path(os.path.join(value["cwd"], change["path"]))
                 if not any(path == r.rstrip(os.sep) or path.startswith(r) for r in roots):
                     outside.append(change["path"])
     return list(dict.fromkeys(outside))
