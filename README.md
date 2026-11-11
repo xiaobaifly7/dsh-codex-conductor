@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.80` 统一派单后留在本轮长等、按需补读报告及一次验收的流程；中止纯观察不取消 Codex，未登记后台的同步派单中止仍取消。完善 `products` 与 Obsidian 读取守卫及产物恢复的有界等待；Gemini 成功输出仅在当前实例登记，跨重载自动恢复未实现，正文须由只读 Codex 任务核对本次输出与素材；保留完成通知及空闲会话唤醒。
+
 `0.9.79` 新增独立的本机 `send-request.json` 入口，以用户身份向已结束的空闲会话提交新任务；原有恢复入口保持不变。
 
 `0.9.78` 修正规划端原料读取被拒时的产物推断文案；自动唤醒完成通知滞留的 blocked 空闲会话，每批最多两次；短时间内重复查询没有实质变化的运行中任务时返回简短成功回执。
@@ -18,7 +20,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `0.9.73` 明确续接参数：新任务省略 `resume`；原任务补答阻塞问题时用 `codex_continue(job_id)`；手动续接只填写工具真实返回的 Codex `thread_id`，不要生成编号或混用 DSH 会话号、任务编号。
 
-`0.9.72` 将尚未生成的报告作为正常等待状态返回，报告随任务结束后的自动刷新打开，自检优先检查已结束任务并记录运行中报告尚未生成，`codex_output` 提示等完成通知后再读。
+`0.9.72` 将尚未生成的报告作为正常等待状态返回，报告随任务结束后的自动刷新打开，自检优先检查已结束任务并记录运行中报告尚未生成，`codex_output` 在报告尚未生成时提示等待任务完成后再补读。
 
 `0.9.70` 为面板状态、任务、关注数和报告读取设置 15 秒整体上限，为任务列表、状态和报告查询及 `codex_jobs`、`codex_status`、`codex_runtime` 的任务统计设置 10 秒查询预算（显式等待另加等待时长），随包 runner 的完整 JSON 到达即返回，查询失败明确报错且不取消 Codex 任务。
 
@@ -40,9 +42,11 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
       - '/mnt/e/project/review-inputs'
 ```
 
-产物路径按会话缓存在插件进程内，任务结束拿到结果时更新，每会话最多 10,000 条、最多保留 100 个会话。未命中时每会话至多每 25 秒后台查询一次 runner；第一次读取仍被拒绝，刷新后可重试。查询失败提示“暂时无法确认是不是产物”，不会放行原料。允许目录包含子文件，产物文件不会因此放行其所在目录。 产物授权只认 runner 实际记录的改动和写入路径，不凭报告自报的文件列表扩大范围；读取任务报告和历史也限制在当前会话。 会话工作记录目录取自 DSH 现有的 sessionPersistence.locate(header)，只允许该会话日志所在目录；宿主未提供此接口时不猜目录。`cat/head/tail/wc/grep/sed/awk` 等内容读取、内容搜索和输入重定向都检查路径；变量、通配符或命令替换不能确定读取对象时拒绝。执行项目代码的测试命令也交给 Codex。
+产物路径按会话缓存在当前插件实例内，任务结束拿到结果时更新，每会话最多 10,000 条、最多保留 100 个会话；Gemini 成功输出可在当前实例登记，但跨重载自动恢复尚未实现。产物登记尚未恢复完成时，先等待最多 3 秒取得恢复结果；只有恢复仍为 `pending`（包括等待超时但恢复尚未完成）时，才提示“暂时无法确认读取权限”，不据此断言它是原料，也不放行读取。恢复成功后，未命中产物或白名单的读取按原料读取拒绝；恢复已结束但失败时，提示“产物登记恢复失败，该路径未获读取授权”，不将该路径断言为原料。未命中时每会话至多每 25 秒后台查询一次 runner，刷新确认后可重试。允许目录包含子文件，产物文件不会因此放行其所在目录。 产物授权只认 runner 实际记录的 `files_changed` / `write_paths` 及当前实例登记的 Gemini 成功输出，不凭只读任务读取过的路径或报告自报的文件列表扩大范围；读取任务报告和历史也限制在当前会话。 会话工作记录目录取自 DSH 现有的 sessionPersistence.locate(header)，只允许该会话日志所在目录；宿主未提供此接口时不猜目录。`cat/head/tail/wc/grep/sed/awk` 等内容读取、内容搜索和输入重定向都检查路径；变量、通配符或命令替换不能确定读取对象时拒绝。Obsidian 的 `obsidian_read`、`obsidian_search` 和 frontmatter 查询也遵循本会话产物与路径白名单，目录和文件列表仍放行。执行项目代码的测试命令也交给 Codex。
 
-规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录、主机访问和模型设置，只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后仍用 `codex_review` 记录原任务的验收。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
+`products` 模式下的拒绝提示简短说明原因：调查交给 `codex_run`，产物内容核对交给 Codex 核验任务。被守卫拒绝后，不换语言、命令或工具入口重试。
+
+规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录、主机访问和模型设置，只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后用 `codex_review` 记录原任务的验收。同一版本已完成验收、产物未变且没有新证据时，不再追加核验；`codex_review` 只记录验收，不另派调查。Gemini 正文的核对见下文，不能用旧素材任务的 `codex_verify` 替代。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
 
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
@@ -60,7 +64,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 空闲指没有 Codex 活任务，且宿主所有会话均没有 `status === 'running'` 的回合，包括等待模型回复的回合；无法读取会话状态时拒绝等空闲重载。空闲时保存设置会立即应用；否则默认先保存为待生效设置，等待空闲后自动应用。待生效设置写在本机 `pending-settings.json`（与 `loaded.json` 同目录，通常是 `%LOCALAPPDATA%\dsh-codex-conductor`），重启后会恢复；它绑定当前环境配置的 `runtimeProfileFile`，避免误用到另一个实例。再次保存会覆盖之前的待生效设置，也可以撤销尚未应用的设置。等待期间每 5 秒检查一次是否空闲；面板每 7 秒刷新活任务数、运行中会话数与剩余秒数。最长等待 10 分钟，超时停止自动重载，不强制应用，保留待生效设置和原因；请重新保存、撤销，或明确确认立即生效。实际应用时先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；只有确认新版本实际加载后才显示生效。规划提示词保存前也会备份。
 
-需要马上应用时，选择“立即生效”并确认即可热重载。Codex 后台任务继续按启动时的设置执行并会接回，新设置用于后续派发；但宿主重载插件可能中止正在进行的 DeepSeek 回合，即使回合正在等待模型回复、没有调用本插件工具也一样。要保留当前回合，请使用等空闲生效。加载后会复用仍在任务表中的原任务；当前已打开的会话中，已登记但未结算且归属可确认的任务会自动接回，不重复派发。未打开的会话在恢复时检查；缺少登记记录、归属不明或状态无法核对的任务不会自动接回。主动取消 Codex 任务、归档会话或中止正在同步等待结果的工具调用，仍可能取消对应任务。
+需要马上应用时，选择“立即生效”并确认即可热重载。Codex 后台任务继续按启动时的设置执行并会接回，新设置用于后续派发；但宿主重载插件可能中止正在进行的 DeepSeek 回合，即使回合正在等待模型回复、没有调用本插件工具也一样。要保留当前回合，请使用等空闲生效。加载后会复用仍在任务表中的原任务；当前已打开的会话中，已登记但未结算且归属可确认的任务会自动接回，不重复派发。未打开的会话在恢复时检查；缺少登记记录、归属不明或状态无法核对的任务不会自动接回。主动取消 Codex 任务、归档会话仍可能取消对应任务；未登记后台的派单在同步等待时被中止仍会取消 Codex。中止 `codex_status`、`job_output` 等纯观察只停止观察，不取消 Codex。
 
 任务报告提供易读视图和原文，支持 v2 和旧版格式。易读视图会先读完整份报告再解析，最多读取 256 Ki 字符（262,144 个字符）；超出上限或格式无法解析时，仍可分页查看原文，不把截断内容当成完整报告。面板的“最近 24 小时需要关注”按任务开始时间统计；“待关注”任务列表仍包含更早的历史任务，两者数量可能不同。
 
@@ -118,7 +122,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `autoWakeBlockedInbox` 默认 `true`：插件观察到自己登记的 Codex 后台任务完成通知进入 owner 的 inbox 后，如果该会话随后以 `blocked` 结束，通知仍在 pending 且 agent 已空闲，就复用上述 inbox 唤醒入口，无需恢复请求文件。第一次等 1 秒，第二次等 5 秒；同一批仍滞留的通知最多自动唤醒两次，新加入的通知不重置该批预算。仍被拒且通知仍在时，警告日志显示“自动唤醒已用尽”。通知被领取、正常回合结束、agent 被移除或插件卸载时停止；运行中的会话不唤醒。不新增用户消息、不重发推进提示、不修改 inbox。配置设为 `false` 可关闭，手动恢复不受影响。
 
-自动恢复只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条恢复路径。
+自动恢复只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条通知唤醒路径；成功输出仅在当前实例登记，跨重载自动恢复尚未实现。
 
 ## 功能
 
@@ -127,7 +131,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | 工具 | 作用 |
 | --- | --- |
 | `codex_run` | 把任务交给 WSL 里的 Codex；登记后台任务后直接返回任务号。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
-| `codex_status` | 默认只查一次；120 秒内无实质变化的重复查询返回简短成功回执；需要同步等待时显式传 `wait_seconds`。后台任务通常等完成通知即可 |
+| `codex_status` | 派单后留在本轮，用 runner `job_id` 与 `wait_seconds: 3600` 长等，仍在运行就继续等同一任务。120 秒内无实质变化的重复查询保留短回执，并引导长等、不结束本轮 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
 | `codex_output` | 按 Unicode 字符分页、可重复读取完整原始报告、结果 JSON、原任务与验收上下文或 stderr / events 日志；读取不消费结果，也不启动或恢复任务 |
@@ -178,13 +182,15 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - worker 启动后自行登记 PID 与进程创建时刻，父进程提前断开也可继续查询和取消。worker 死亡时，若已有 Codex PID 仍通过原有身份核对，结果会带 `residual_codex_pid`、`retryable=false` 和明确说明；须处理残留进程后再重派。状态查询只标记，不主动结束该进程。
 - WSL 重启后，runner 按「开机 ID + 本发行版 init 的启动时刻」认出重启前的任务（`wsl --shutdown`、Windows 重启换开机 ID，`wsl --terminate`、发行版自行停止换 init 启动时刻），报 `worker_died`，阶段为 `interrupted`。可写任务先核对原验收和已落盘产物；确认还有缺项时才补做，已开始会话的任务保留原 `thread_id`，状态查询和取消还会核对进程创建时刻，避免把同次启动内复用 PID 的其他进程当成本任务；重试等待期间也不沿用已退出 Codex 的进程记录。升级前未记录创建时刻的旧任务仍按启动批次和存活状态判断。`codex_cancel` 对已经结束的任务直接返回它的结果与对应下一步，不会叫 agent 重派。
 
-- 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，`codex_run` 一启动 Codex 就把它登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run` 和 `codex_continue` 登记成功后返回 `background_job_id`，不等待完成。Codex 结束后 DSH 发一条摘要通知，收到后把返回的 `background_job_id` 填到 `job_output` 的 `job_id` 参数中，取一次完整结果（含逐条汇报和下一步）。通知前如需查进度，用 `codex_status` 查询 runner 的 `job_id`。通知也附上可直接调用的 `codex_output` 参数；监控中断时附上 `codex_status` 参数。用户明确要求同步等待时，用原 runner `job_id` 调用 `codex_status` 并传正数 `wait_seconds`。
+- 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，Codex 派单会登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run`、`codex_continue`、`codex_verify` 派单时传 `wait_seconds: 0`；登记成功后立即返回 `background_job_id`，不等待完成。做完独立的规划工作后，留在本轮，用返回的 runner `job_id` 调 `codex_status({"job_id":"runner-job-id","wait_seconds":3600})`；仍为 `running` 就继续长等同一任务，不零等待轮询、不重复派单。3600 秒是单次状态等待预算，与执行超时、排队和重试预算分开。
 
-- 同一个 runner 任务只登记一个后台任务（按 DSH 任务表判断，插件重载后也不重复）；对已登记的任务调用 `codex_status` 或 `codex_cancel` 会经 DSH 任务表等待，结果不会再作为通知重复送一次。等待中途停止工具调用时，插件结束这个后台任务（同时在 WSL 里取消 Codex），等它结算完再返回；取消未确认时保留任务编号并提示用 `codex_status` 查询，任务仍可能在运行。归档会话时，DSH 可能结束其中仍在运行的后台任务，Codex 任务随之取消。后台等待本身出错时送回 `monitor_failed`，提示 Codex 任务可能仍在运行、先用 `codex_status` 查询。没有 jobs 服务、登记失败或没有 agent 时，任务表里没有这一行，`codex_run` 直接等 runner 到 `wait_seconds`，之后照旧用 `codex_status` 轮询。
+- 等待调用已返回报告就直接验收，不再重复取报告。只有摘要、缺内容或截断时，才把 Harness `background_job_id` 填到 `job_output` 的 `job_id` 中补读；该入口不可用或没有后台编号时，用 runner `job_id` 调 `codex_output(artifact="report")`，按 `next_offset` 补齐至 `eof=true`。调用报错或被中止时先确认原任务状态，不据此重派。完成通知及会话空闲唤醒机制保留；通知附可直接调用的 `codex_output` 参数，监控中断时附 `codex_status` 参数，不作为派单后结束本轮的理由。
 
-`codex_status` 每次仍查询实时状态；同一会话、同一工具、同一 job 在上次完整回执后的 120 秒内没有实质变化时，重复查询只返回“仍在执行、无实质变化、现在请结束本轮”的简短成功回执，有后台任务时同时提示完成后自动通知。阶段、尝试轮次、错误、实际活动、报告或阻塞信息变化，以及完成、失败或未知状态，均返回完整内容；活动秒数和重试倒计时单独变化不算进展。短回执不延后下一次完整回执的时间，`wait_seconds > 0` 不缩短。
+- 同一个 runner 任务只登记一个后台任务（按 DSH 任务表判断，插件重载后也不重复）；对已登记任务的状态等待不重复发送同一完成结果。中止 `codex_status`、`job_output`、`codex_watch` 等纯观察，只停止本次观察，不结束后台任务或取消 Codex。显式 `codex_cancel` 和归档会话的取消机制保留；取消未确认时保留任务编号并提示用 `codex_status` 查询，任务仍可能在运行。后台监控本身出错时送回 `monitor_failed`，提示先确认原任务状态。没有 jobs 服务、登记失败或没有 agent 时，`codex_run` / `codex_continue` / `codex_verify` 按 `wait_seconds` 同步等待（默认 `0`）；中止这类未登记后台的派单同步等待仍会取消 Codex。派单返回运行中任务后仍按上述方式在本轮长等。
 
-原生 `job_output` 先照常执行归属校验与消费读取；仅对本插件自己的运行中 Codex job，在没有新模型输出且状态不变时应用同样的短回执，`wait: true` 不缩短。`codex_jobs` / `job_list` 的列表和 `codex_output` 的产物分页保持完整。去重记录只在当前插件实例内，重载后首次查询返回完整状态；它减少回执内容量，外部推进提示产生的模型回合仍由宿主控制。
+`codex_status` 每次仍查询实时状态；同一会话、同一工具、同一 job 在上次完整回执后的 120 秒内没有实质变化时，重复查询只返回“仍在执行、无实质变化”的简短成功回执，并引导用同一 runner `job_id` 调 `codex_status(wait_seconds: 3600)` 留在本轮长等；有后台任务时保留自动完成通知，不要求结束本轮。阶段、尝试轮次、错误、实际活动、报告或阻塞信息变化，以及完成、失败或未知状态，均返回完整内容；活动秒数和重试倒计时单独变化不算进展。短回执不延后下一次完整回执的时间，`wait_seconds > 0` 不缩短。
+
+原生 `job_output` 先照常执行归属校验与消费读取；仅对本插件自己的运行中 Codex job，在没有新模型输出且状态不变时应用同样的短回执，`wait: true` 不缩短；短回执同样引导本轮长等，中止读取只停止观察。`codex_jobs` / `job_list` 的列表和 `codex_output` 的产物分页保持完整。去重记录只在当前插件实例内，重载后首次查询返回完整状态；它减少回执内容量，外部推进提示产生的模型回合仍由宿主控制。
 
 ### 权限
 
@@ -330,7 +336,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `effort` | Codex 配置 | 默认推理强度，`codex_run` 的 `effort` 可单次覆盖 |
 | `readOnlyEffort` | 同 `effort` | 只读任务（`write=false`）的默认推理强度，留空时用 `effort` |
 | `serviceTier` | Codex 配置 | 例如 `fast`（Codex 的 Fast 模式） |
-| `waitSeconds` | `0` | 无法登记后台任务时，`codex_run` / `codex_continue` 默认等待的秒数 |
+| `waitSeconds` | `0` | 无法登记后台任务时，`codex_run` / `codex_continue` / `codex_verify` 默认同步等待的秒数；登记后台后立即返回，随后在本轮用 `codex_status(wait_seconds: 3600)` 等待 |
 | `autoWakeBlockedInbox` | `true` | 本插件后台完成通知滞留时，自动唤醒随后被门禁拒绝的空闲会话；同批最多两次（1 秒、5 秒），用尽写警告日志；设为 `false` 关闭 |
 | `timeoutSeconds` | 留空（runner 为 `3600`） | 每次 Codex 尝试的总超时秒数，须为正有限数字，可含小数；不含等待写锁的时间 |
 | `lockTimeoutSeconds` | 留空（无限等待） | 等待目录写锁的超时秒数，须为正有限数字，可含小数；超时不启动 Codex，返回可重试的 `lock_timeout` |
@@ -371,9 +377,15 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 可选 `frontmatter` 只接受 `created / updated / title / type / status / tags / aliases`，其中非空 `title` 和至少一个非空 `tags` 必填，`type / status / aliases` 缺省为 `resource / draft / []`，两个时间缺省为当前本地 `YYYY-MM-DDTHH:MM`；字符串或数组元素最多 200 个 Unicode 码点且禁止换行、控制字符，仅 `tags / aliases` 可为字符串数组，枚举值见工具参数说明。
 
-同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 码点计数（含标题、Markdown 标记、标点、空白及换行），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报；传 `frontmatter` 时去掉模型自带块，再由插件生成，元数据不计入字数，不传则仍计整个文件。首次超限自动按原稿压缩一次，两次调用共用 `timeoutSeconds`，`attempts / attempt_chars` 返回调用次数和每次字数（启动前校验失败为 0 次，未能读回的字数为 `null`）；仍超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`，恢复目标原字节，原先不存在则删除目标。`next` 提示核对内容、两次超限后拆章或处理范围外改动，`usage` 透传最后一次 CLI 用量。
+同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 码点计数（含标题、Markdown 标记、标点、空白及换行），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报；传 `frontmatter` 时去掉模型自带块，再由插件生成，元数据不计入字数，不传则仍计整个文件。首次超限自动按原稿压缩一次，两次调用共用 `timeoutSeconds`，`attempts / attempt_chars` 返回调用次数和每次字数（启动前校验失败为 0 次，未能读回的字数为 `null`）；仍超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`，恢复目标原字节，原先不存在则删除目标。`next` 提示用只读 `codex_run` 核对本次 `output` 与本次 `sources`、两次超限后拆章或处理范围外改动，`usage` 透传最后一次 CLI 用量。
 
 `files_changed` 来自目标所在目录及子目录的文件名、大小、mtime 快照，最多检查 1,000 个目录项，不跟随符号链接；达到上限会设置 `snapshot.truncated=true` 并注明未覆盖部分。`write_paths` 保存两次调用 stdout 的 `write_file` 路径旁证；除目标外的快照改动与写入事件列入 `out_of_scope`，需核实是否来自同时段其他进程。清单保留恢复目标前的观察结果。`accept-edits` 不是单文件沙箱；目录之外、快照未覆盖且没有写入事件的操作无法由这份清单证明，范围外改动不会自动回滚。
+
+Gemini 成功输出可在当前插件实例登记，跨重载自动恢复尚未实现。重载后，可恢复并读取 Codex 实际生成的核验报告，通过该报告验收；若需直接读取原 Gemini 正文，须由用户明确将该路径加入 `plannerReadAllow`。只读任务读取过正文或在报告中自报其路径，不会将正文登记为产物。
+
+成功后必须派一个只读 `codex_run`（`write=false`），核对本次 `output` 正文与本次 `sources`：逐条检查事实支撑及原验收要求。对旧素材任务重跑 `codex_verify` 不能替代本次正文核对；已有核对结果且正文未变、没有新证据时，不再为了核验核对报告另派任务。`gemini_write` 是前台调用，不对它使用 `codex_status`；核对用的 Codex 任务遵循上述本轮长等规则。
+
+向用户用大白话说明完成内容、核对结果和剩余问题；执行结束尚未验收时说“已经做完，正在核对”。无需附任务号、线程号或内部状态名，用户要求排查时再提供。
 
 ## 单独使用 runner
 
@@ -415,6 +427,8 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`0.9.80` unifies same-turn long waits after dispatch, report reads only when needed, and one review per product version. Aborting observation leaves Codex running; aborting synchronous dispatch without background registration still cancels it. Products-only and Obsidian guards use bounded waits for product recovery; successful Gemini outputs are registered only in the current instance, with automatic recovery across reloads not implemented, and a read-only Codex task must check each new output against its sources. Completion notices and idle-session wakes remain available.
+
 `0.9.79` adds a separate local `send-request.json` entry that submits a new task as a user message to an idle, finished session, while preserving the existing resume entry.
 
 `0.9.78` removes unsupported artifact-identity wording from planner read denials, automatically wakes idle blocked owners with stranded completion notices at most twice per batch, and returns concise successful receipts for repeated unchanged running-job checks.
@@ -429,7 +443,7 @@ python3 runner/test_codex_runner.py
 
 `0.9.73` clarifies continuation IDs: omit `resume` for new tasks, use `codex_continue(job_id)` for blocker answers on existing jobs, and only pass a Codex `thread_id` actually returned by a tool when resuming manually. Do not invent IDs or substitute Harness session IDs or job IDs.
 
-`0.9.72` treats reports awaiting generation as a normal pending state, opens them on the next automatic refresh after task completion, prefers finished tasks in panel self-tests while recording pending reports, and tells `codex_output` readers to wait for the completion notification.
+`0.9.72` treats reports awaiting generation as a normal pending state, opens them on the next automatic refresh after task completion, prefers finished tasks in panel self-tests while recording pending reports, and tells `codex_output` readers to wait for task completion before reading a pending report.
 
 `0.9.70` bounds panel status, jobs, attention and report reads to 15 seconds, gives list/status/report queries and the query phase of `codex_jobs`, `codex_status` and `codex_runtime` a 10-second budget (plus any explicit wait), and returns bundled-runner JSON without waiting for pipe closure or cancelling Codex tasks on query failure.
 
@@ -451,9 +465,11 @@ python3 runner/test_codex_runner.py
       - '/mnt/e/project/review-inputs'
 ```
 
-The plugin caches up to 10,000 product paths per session for at most 100 sessions, updating them when task results arrive. A miss triggers at most one background runner query per session every 25 seconds; that read is refused and can be retried after refresh. A failed refresh never grants access. Directory allowlist entries include descendants; a product file does not grant its parent directory. Product grants use recorded changes and write paths, not self-reported filenames. Report and history reads are also limited to the current session. The session work-record directory comes from the existing DSH sessionPersistence.locate(header) API; only that session log’s directory is allowed. Hosts without this API do not receive a guessed directory grant. Content readers, content searches and input redirections check their targets; uncertain shell targets using variables, globs or command substitution are refused. Commands that execute project tests are delegated to Codex too.
+The current plugin instance caches up to 10,000 product paths per session for at most 100 sessions, updating them when task results arrive. Successful Gemini outputs are registered in the current instance, but automatic recovery across reloads is not implemented. If product registration is still being restored, first wait up to 3 seconds for recovery. Only a recovery that remains `pending`, including a wait timeout while recovery is unfinished, means “temporarily unable to confirm read authorization”; it neither proves the file is raw input nor grants access. After successful recovery, reads that match neither a product nor the allowlist are refused as raw-input reads. If recovery has finished with a failure, the response is “Product registration recovery failed; this path is not authorized for reading,” without asserting that the path is raw input. A miss triggers at most one background runner query per session every 25 seconds; retry after refresh confirms access. Directory allowlist entries include descendants; a product file does not grant its parent directory. Product grants use recorded runner `files_changed` / `write_paths` plus successful Gemini outputs registered in the current instance. Paths merely read by a read-only task or self-reported in a report do not expand access. Report and history reads are also limited to the current session. The session work-record directory comes from the existing DSH sessionPersistence.locate(header) API; only that session log’s directory is allowed. Hosts without this API do not receive a guessed directory grant. Content readers, content searches and input redirections check their targets; uncertain shell targets using variables, globs or command substitution are refused. Obsidian `obsidian_read`, `obsidian_search` and frontmatter queries follow the same session-product and path allowlist rules; directory and file listings remain allowed. Commands that execute project tests are delegated to Codex too.
 
-Use `codex_verify` for factual checks after mechanically checking product presence, citations and matching numbers: `{"job_id":"original-job-id","focus":"Check figures and citations","samples":8,"wait_seconds":0}`. Sampling defaults to 8 and accepts 1–30; waiting follows `codex_run`. Only finished jobs owned by the current session qualify. Verification starts a fresh read-only thread with the original directory, host access and model settings, reads the original task, acceptance criteria, products and cited sources, and reports each checked claim, source, truth status and correction through the existing report schema. `context.verification_of` links the jobs in `codex_jobs` and `codex_status`. Record final acceptance of the original job with `codex_review`. As with existing `write=false` tasks, host-access mode enforces read-only work through the task instructions rather than an OS sandbox.
+Products-only denials briefly explain the reason: delegate investigation to `codex_run` and product-content checks to a Codex verification task. After a guard denial, do not retry through another language, command or tool entry.
+
+Use `codex_verify` for factual checks after mechanically checking product presence, citations and matching numbers: `{"job_id":"original-job-id","focus":"Check figures and citations","samples":8,"wait_seconds":0}`. Sampling defaults to 8 and accepts 1–30; waiting follows `codex_run`. Only finished jobs owned by the current session qualify. Verification starts a fresh read-only thread with the original directory, host access and model settings, reads the original task, acceptance criteria, products and cited sources, and reports each checked claim, source, truth status and correction through the existing report schema. `context.verification_of` links the jobs in `codex_jobs` and `codex_status`. Record final acceptance of the original job with `codex_review`. Once review is done for the same product version, do not add verification unless the product changes or new evidence appears; `codex_review` records acceptance without starting another investigation. Gemini prose requires the output check described below; verifying an old source-material job with `codex_verify` is no substitute. As with existing `write=false` tasks, host-access mode enforces read-only work through the task instructions rather than an OS sandbox.
 
 `0.9.42` identifies a WSL connection failure when it prevents dispatch preflight, preserving the existing scope and continuation checks.
 
@@ -485,7 +501,7 @@ Open **Codex 指挥** in DSH Settings to view the loaded/source version, executi
 
 Idle means no active Codex tasks and no session with `status === 'running'`, including turns waiting for a model response; unavailable session status refuses an idle reload. Saving settings while idle applies them immediately; otherwise pending settings are saved and applied once idle. Pending settings are stored locally in `pending-settings.json`, beside `loaded.json` (normally in `%LOCALAPPDATA%\dsh-codex-conductor`), and restored after a restart. They are tied to the current environment's configured `runtimeProfileFile` so they cannot be applied to another instance by mistake. Saving again replaces the pending settings; you can also cancel settings that have not yet been applied. The idle check runs every 5 seconds, and the panel refreshes task counts, running session counts and remaining seconds every 7 seconds. After 10 minutes, automatic reload stops without forcing application, retaining pending settings and the reason; save again, cancel pending settings, or explicitly confirm immediate application. Applying settings backs up and atomically updates this plugin's profile fields, preserving comments and unrelated configuration; only the actual load marker confirms success. Prompt saves also create a backup.
 
-To apply settings now, choose **立即生效** and confirm the hot reload. Codex background tasks continue with their launch settings and reconnect; new settings apply to later dispatches. However, the host's plugin reload may abort an ongoing DeepSeek turn, including a turn waiting for a model response without calling this plugin's tools. Choose idle application to preserve current turns. After loading, the plugin reuses tasks still in the native task table and reconnects registered, unsettled tasks in open sessions when their ownership can be confirmed, without dispatching them again. Closed sessions are checked when restored. Tasks without registration records, with unknown ownership, or with unverifiable status are not automatically reconnected. Explicitly cancelling a Codex task, archiving its session, or aborting a tool call that is synchronously waiting for its result can still cancel the task.
+To apply settings now, choose **立即生效** and confirm the hot reload. Codex background tasks continue with their launch settings and reconnect; new settings apply to later dispatches. However, the host's plugin reload may abort an ongoing DeepSeek turn, including a turn waiting for a model response without calling this plugin's tools. Choose idle application to preserve current turns. After loading, the plugin reuses tasks still in the native task table and reconnects registered, unsettled tasks in open sessions when their ownership can be confirmed, without dispatching them again. Closed sessions are checked when restored. Tasks without registration records, with unknown ownership, or with unverifiable status are not automatically reconnected. Explicit cancellation and session archival can still cancel Codex. Aborting synchronous dispatch without background registration also cancels it; aborting pure observation through `codex_status`, `job_output` or similar tools only stops observation.
 
 Reports offer a readable view and the original text for both v2 and legacy formats. The readable view reads the entire report before parsing, up to 256 Ki characters (262,144 characters). Larger reports or reports that cannot be parsed remain available as paginated original text; truncated text is not treated as a complete report. The panel's last-24-hours attention count uses task start time. The attention list still includes older tasks, so its total can differ from that count.
 
@@ -543,11 +559,11 @@ Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.j
 
 `autoWakeBlockedInbox` defaults to `true`. After observing a completion notice for its own registered Codex background job enter the owner's inbox, conductor waits for a subsequent blocked turn and an idle agent. If the notice is still pending, it reuses the manual inbox wake path after 1 second, then 5 seconds, with at most two automatic attempts per outstanding batch. New notices do not reset that batch's budget. A still-blocked, still-pending batch logs “自动唤醒已用尽” when exhausted. Running agents, removed agents and plugin teardown suppress wakes. No user message, advancement prompt or inbox edit is made. Set the configuration to `false` to disable it; manual resume remains available.
 
-Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this recovery path.
+Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this notification-wake path; successful outputs are registered only in the current instance, without automatic recovery across reloads.
 
-`codex_status` still reads live state on every call. Repeated unchanged checks for the same owner, tool and job within 120 seconds of the last full receipt return a brief successful running/unchanged receipt that asks the planner to end the turn, with an automatic-completion-notice reminder when a background job exists. Phases, attempts, errors, actual activity, reports and blocker changes return full details, as do terminal and unknown states. Activity-age and retry-countdown changes alone are ignored. Brief receipts do not extend the full-receipt interval, and positive `wait_seconds` bypasses dampening.
+`codex_status` still reads live state on every call. Repeated unchanged checks for the same owner, tool and job within 120 seconds of the last full receipt return a brief successful running/unchanged receipt directing the planner to stay in the current turn and wait with the same runner `job_id` via `codex_status(wait_seconds: 3600)`. Background completion notices remain available; the receipt does not ask the planner to end the turn. Phases, attempts, errors, actual activity, reports and blocker changes return full details, as do terminal and unknown states. Activity-age and retry-countdown changes alone are ignored. Brief receipts do not extend the full-receipt interval, and positive `wait_seconds` bypasses dampening.
 
-Native `job_output` retains the original ownership and consuming-read behavior before shortening only unchanged running conductor jobs with no new model output. `wait: true` bypasses dampening. `codex_jobs` / `job_list` listings and `codex_output` pages stay complete. Query signatures live only in the current plugin instance, so the first check after reload is complete. This reduces receipt content; external advancement prompts can still cause model turns.
+Native `job_output` retains the original ownership and consuming-read behavior before shortening only unchanged running conductor jobs with no new model output. `wait: true` bypasses dampening; brief receipts also direct same-turn long waits, and aborting the read only stops observation. `codex_jobs` / `job_list` listings and `codex_output` pages stay complete. Query signatures live only in the current plugin instance, so the first check after reload is complete. This reduces receipt content; external advancement prompts can still cause model turns.
 
 ### Gemini tutorial and documentation writing (off by default)
 
@@ -570,9 +586,15 @@ The last three values are the defaults; effort accepts `low / medium / high`. Pr
 
 Optional `frontmatter` only accepts `created / updated / title / type / status / tags / aliases`: a nonempty `title` and at least one nonempty `tags` entry are required, `type / status / aliases` default to `resource / draft / []`, both timestamps default to local `YYYY-MM-DDTHH:MM`, and each string or array element is limited to 200 Unicode code points without line breaks or control characters; only `tags / aliases` accept string arrays, with enum values documented in the tool schema.
 
-Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode code points including headings, Markdown, whitespace and punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`); supplying `frontmatter` replaces model metadata with the plugin-generated header and excludes it from counts, otherwise the whole file still counts. The first excess triggers one compression of the previous draft under the same `timeoutSeconds` budget; `attempts / attempt_chars` report calls and their counts (0 calls for preflight validation failures, `null` for unreadable output). CLI errors, missing output/result, timeout, cancellation, excess length after compression or out-of-scope writes return `failed`, restoring the output's original bytes or deleting a newly created output; `next` requests content verification, chapter splitting after two excesses or scope review, and `usage` passes through the final CLI usage.
+Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode code points including headings, Markdown, whitespace and punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`); supplying `frontmatter` replaces model metadata with the plugin-generated header and excludes it from counts, otherwise the whole file still counts. The first excess triggers one compression of the previous draft under the same `timeoutSeconds` budget; `attempts / attempt_chars` report calls and their counts (0 calls for preflight validation failures, `null` for unreadable output). CLI errors, missing output/result, timeout, cancellation, excess length after compression or out-of-scope writes return `failed`, restoring the output's original bytes or deleting a newly created output; `next` requests a read-only `codex_run` check of this invocation's `output` against its `sources`, chapter splitting after two excesses or scope review, and `usage` passes through the final CLI usage.
 
 `files_changed` compares names/sizes/mtimes under the output's parent directory recursively, without following symlinks, capped at 1,000 entries; `snapshot.truncated` discloses incomplete coverage. `write_paths` retains stdout `write_file` paths from both calls as supporting evidence; extra snapshot changes/events appear in `out_of_scope` and may include concurrent writers. These lists retain observations made before output restoration. The tool remains available inside guarded workspaces. `accept-edits` is not a single-file sandbox: unreported operations outside snapshot coverage cannot be established by this list, and out-of-scope changes are not automatically rolled back.
+
+Successful Gemini outputs are registered in the current plugin instance, but automatic recovery across reloads is not implemented. After a reload, recover and read the verification report actually generated by Codex to assess acceptance. To read the original Gemini prose directly, the user must explicitly add its path to `plannerReadAllow`. Reading the prose in a read-only task or listing its path in a report does not register the prose as a product.
+
+After each successful write, dispatch a read-only `codex_run` (`write=false`) to check this invocation's output prose against this invocation's sources, covering factual support and the original acceptance criteria. Re-running `codex_verify` on an old material job cannot replace checking the new prose. Once that check exists, do not dispatch another task merely to verify its report unless the prose changes or new evidence appears. `gemini_write` is a foreground call, so do not use `codex_status` for Gemini itself; its Codex checking task follows the same-turn waiting rules below.
+
+Explain completed work, check results and remaining gaps in plain language. If execution has finished but acceptance is pending, say “The work is finished; I am checking it.” Job IDs, thread IDs and internal state names are unnecessary unless the user asks for diagnostics.
 
 ### Task lifecycle
 
@@ -602,9 +624,11 @@ Recovery and pending scope checks reuse paginated task records instead of a sepa
 
 WSL restarts are recognized by boot ID and distro init start time, including shutdown, termination and auto-stop. Earlier tasks become `worker_died` with phase `interrupted`. Check existing artifacts against the original acceptance criteria before filling gaps; writers retain a started thread for resumption. Status/cancellation also check process creation time to avoid same-boot PID reuse; finished Codex identities are not retained during retry waits. Older records without creation times retain boot/liveness checks. Cancellation ends the task's process tree; an already-ended task returns its result and matching next step instead of requesting redispatch.
 
-With DSH background jobs, each `codex_run` immediately registers one row, reused across plugin reloads. Progress refreshes about every 20 seconds with last-activity age and latest action. Once registered, dispatch returns `background_job_id` without waiting for completion. If the user asks to wait in the current turn, call `codex_status` on the runner `job_id` with a positive `wait_seconds`; otherwise status checks are immediate. After the one-line completion notification, pass the returned `background_job_id` as `job_output`’s `job_id` once to read the full report and next step. If you need progress before the notification, use `codex_status` with the runner `job_id`. Status/cancel waits do not send a duplicate notification. The notice also gives the exact `codex_output` call, or `codex_status` when monitoring was interrupted.
+With DSH background jobs, Codex dispatch immediately registers one row, reused across plugin reloads. Progress refreshes about every 20 seconds with last-activity age and latest action. Dispatch `codex_run`, `codex_continue` and `codex_verify` with `wait_seconds: 0`; successful registration returns `background_job_id` immediately. Finish independent planning work, then stay in the current turn and call `codex_status({"job_id":"runner-job-id","wait_seconds":3600})` using the returned runner `job_id`. If it is still `running`, wait again on the same job; do not poll with zero waits or redispatch. The 3600-second status wait is separate from execution, queue and retry budgets.
 
-Finished rows retain output. Aborting a waiting call cancels Codex; session archival can also cancel it. Unconfirmed cancellation keeps its ID and requires a status check; `monitor_failed` means Codex may still run. Only without native job registration does dispatch wait directly up to its `wait_seconds` (default `0`).
+If the wait already returns the report, review it directly. Only a summary, missing content or truncation calls for `job_output`, using the Harness `background_job_id` as its `job_id`. If that entry is unavailable or there is no background ID, use `codex_output(artifact="report")` with the runner `job_id`, following `next_offset` to `eof=true`. On errors or aborted calls, confirm the original job's status before taking further action. Completion notices and idle-session wakes remain available, with exact `codex_output` calls or `codex_status` calls after interrupted monitoring; they do not justify ending the turn after dispatch. Status waits do not redeliver the same completion result.
+
+Finished rows retain output. Aborting pure observation through `codex_status`, `job_output`, `codex_watch` or similar tools only stops observation and leaves Codex and its background job running. Explicit `codex_cancel` and session-archival cancellation remain available. Unconfirmed cancellation keeps its ID and requires a status check; `monitor_failed` means Codex may still run. Without native job registration (no jobs service, failed registration or no agent), `codex_run` / `codex_continue` / `codex_verify` wait synchronously up to `wait_seconds` (default `0`); aborting that dispatch wait still cancels Codex. If dispatch returns a running job, continue the same-turn long wait described above.
 
 `codex_watch` observes native task changes without model polling or idle WSL calls. `attention` reports failures, blockers and report problems; `all` also includes starts/normal completion. It ends after the first matching change; stopping it only stops observation and preserves normal completion notifications.
 

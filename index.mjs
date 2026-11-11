@@ -5,8 +5,8 @@
 //   · 结构化派活：codex_run 的任务、必填验收标准、执行约束和允许范围经 stdin 交给 runner，
 //     要求 Codex 按 report.v2.schema.json 逐条回报；结果里标出自报未满足、偏离计划和范围外的改动
 //   · 等待与取消：start 后立即登记 DSH 后台任务（任务表里看得到进度和结束摘要），经任务表等结果；
-//     到点仍在执行就留在后台，Codex 结束后 DSH 发任务通知，agent 再读结果（没有 jobs 服务就用有界的 `status --wait` 照旧轮询）；
-//     中途停止时在 WSL 里 cancel，Linux 侧进程树由 runner 自己清理（taskkill wsl.exe 清不到）
+//     agent 留在本轮用 codex_status 长等待；空闲会话仍由结束通知唤醒。
+//     停止观察不取消任务；未登记后台的派单同步等待被取消时，仍由 runner 清理 Codex 进程树。
 //   · 护栏：config.workspaces 内的会话，写文件类工具一律拒绝，shell 只放行只读核验命令
 //   · 防虚报：回合结束时声称已派 Codex、却没调用 codex_* 也没有在跑的任务，就提醒它补上或更正
 //
@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, registerRuntimeTool, queryWithTimeout, QU
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, createProductReads } =
+const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
@@ -266,11 +266,8 @@ export function createConductor(cfg, run = runRunner) {
     const value = signal?.aborted ? undefined
       : follow ? await run(cfg, argv, { signal, timeoutMs: wait * 1000 + BRIDGE_SLACK_MS, onProgress })
         : await query(argv, signal, wait * 1000 + QUERY_TIMEOUT_MS);
-    if (signal?.aborted) {
-      await cancel(jobId, signal);
-      signal.throwIfAborted();
-    }
-    const note = value.status === 'running' ? { note: `等了 ${seconds} 秒仍在执行，任务在后台继续；用 codex_status 接着等。` } : {};
+    signal?.throwIfAborted();
+    const note = value.status === 'running' ? { note: `等了 ${seconds} 秒仍在执行，任务在后台继续；${waitForJob(jobId)}` } : {};
     return { job_id: jobId, ...value, ...note };
   }
 
@@ -517,10 +514,17 @@ function sameCriteria(report, acceptance) {
 
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
 const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并在给用户的汇报里写明替用户做了哪些决定；拿不准，或回答意味着删除数据、改动用户没提过的目录时，仍然先问用户。';
+const USER_REPORT = '向用户汇报时先用大白话说明完成情况、核对结果和剩余问题，不必带任务号和内部状态名。';
+const WAIT_GUIDANCE = '任务仍在运行时留在本轮，用返回的 runner job_id 调 codex_status 并传 wait_seconds: 3600；等满仍在运行就继续等同一任务。' +
+  '等待已返回报告就直接验收；只有摘要、缺内容或截断时才用 job_output 或 codex_output 补读。';
+const waitForJob = (jobId) => `留在本轮，用 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })}) 等它结束；` +
+  '等满仍在运行就继续等同一任务，返回报告后直接验收，不要零等待轮询或重复派单。';
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open' } = {}) {
+  const blocking = blockingState(value);
+  if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
   if (value.status === 'completed' && value.context?.verification_of) return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers })
@@ -539,9 +543,9 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       `用 codex_jobs 核对正确 job_id；先用 codex_status 查询，不要直接重派。`;
   }
   if (value.status === 'running') {
-    if (value.phase === 'lock_wait') return `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。用 codex_status 等待这个 job_id，不要重复派活；需要退出队列时用 codex_cancel，只取消本任务。`;
-    if (value.phase === 'codex_reconnecting') return `任务 ${value.job_id} 正在重连模型服务。用 codex_status 查询原任务，不要重复派活。`;
-    return `任务 ${value.job_id} 仍在执行，用 codex_status 等结果，不要自己动手补做。`;
+    if (value.phase === 'lock_wait') return `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。${waitForJob(value.job_id)}需要退出队列时用 codex_cancel，只取消本任务，不要重复派活。`;
+    if (value.phase === 'codex_reconnecting') return `任务 ${value.job_id} 正在重连模型服务。${waitForJob(value.job_id)}不要重复派活。`;
+    return `任务 ${value.job_id} 仍在执行。${waitForJob(value.job_id)}不要自己动手补做。`;
   }
   // 取消会保留恢复信息，但不会重建中断前的改动清单。
   if (value.status === 'cancelled') {
@@ -549,12 +553,10 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     return 'Codex 任务已取消（用户停止、会话归档或调用中止）：不要自行续跑或重派，先问用户。' +
       '如果这是可写任务，取消前可能已改了部分文件且没有改动清单，核验前先用 git status 或对比文件确认现状。';
   }
-  const blocking = blockingState(value);
   const report = value.report ?? {};
   const original = sameCriteria(report, acceptance);
   const list = !original && Array.isArray(acceptance) ? acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n') : '';
   if (value.status === 'completed' || blocking.blockers.length || ['verified', 'accepted_deviations', 'needs_changes', 'invalid'].includes(value.verification_status)) {
-    if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
     if (blocking.next_action === 'ask_user') {
       const environment = blocking.blockers.some((b) => b.kind === 'environment');
       const guidance = plannerAnswers
@@ -576,7 +578,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   // 只读任务用 --ephemeral 运行；只有它续跑的写任务线程还能续。
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
-    if (!value.retryable) return '这次失败不可重试：把 error 原样告诉用户，不要改为自己动手。';
+    if (!value.retryable) return '这次失败不可重试：先用大白话说明哪一步没做成和实际影响，必要时附原始错误，不要改为自己动手。';
     if (value.error_kind === 'lock_timeout') {
       return '等待写锁超时，尚未启动 Codex。先用 codex_jobs 查询同目录正在运行的任务，再决定等待还是用 codex_cancel 取消持锁任务；不要直接重派。';
     }
@@ -682,7 +684,7 @@ function render(value) {
     ...(extra.length ? ['--- 详细字段 ---', ...extra] : []),
     ...(blockers.blockers.length ? ['--- 阻塞与待回答问题 ---', ...blockers.blockers.map((b) =>
       `${b.id} [${b.kind}] ${b.message}${b.question ? `\n需要回答：${b.question}` : ''}${b.resolution ? `\n解除条件/已有信息：${b.resolution}` : ''}`)] : []),
-    ...(next ? ['--- 下一步 ---', next] : []),
+    ...(next ? ['--- 下一步 ---', next, USER_REPORT] : []),
   ].join('\n') }];
 }
 
@@ -832,7 +834,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (seconds === 0 && previous?.signature === signature && now - previous.at < 120_000) {
       return { job_id: value.job_id, status: 'running', unchanged: true,
         rendered: `任务 ${value.job_id} 仍在执行；自上次查询以来无实质变化。` +
-          (value.background_job_id ? '完成后会自动通知；' : '稍后再查；') + '现在请结束本轮，不要继续轮询。' };
+          waitForJob(value.job_id) };
     }
     if (statusQueries.size >= 10_000) statusQueries.delete(statusQueries.keys().next().value);
     statusQueries.set(key, { signature, at: now });
@@ -961,7 +963,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   // 登记 DSH 后台任务（同一个 runner 任务只登记一个），结束后由 DSH 把结果送回会话；
-  // 没有 jobs 服务、没有 agent 或登记失败时返回 undefined，调用方照旧轮询
+  // 没有 jobs 服务、没有 agent 或登记失败时返回 undefined，调用方直接等待 runner。
   // label：任务表里这一行的标题，带上任务摘要才看得出是哪件事；codex_status 补登记时不知道任务，只用 job_id
   function background(jobId, exec, finish, label = `Codex ${jobId}`) {
     if (!exec?.agent) return undefined;
@@ -1011,14 +1013,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         view = await queryWithTimeout((signal) => bg.jobs.wait(bg.id, Math.max(1, seconds * 1000), bg.owner, signal),
           signal, seconds * 1000 + QUERY_TIMEOUT_MS);
       } catch (error) {
-        // 中途停止：结束后台任务（它的 cancel 会取消 runner 任务），等它结算完再抛出，免得之后又冒出一条结束通知。
-        // 抛一条明确的错误：jobs.wait 的中止拒绝直接抛出会被 DSH 渲染成 Error: [object Object]
+        // 只撤销这次观察，后台任务及其空闲会话通知继续保留。
         if (signal?.aborted) {
-          bg.jobs.kill(bg.id, bg.owner, 'tool call aborted');
-          const settled = await bg.jobs.wait(bg.id, CANCEL_SETTLE_MS, bg.owner).catch(() => undefined);
-          const ended = settled?.status === 'killed' || settled?.status === 'completed';
-          throw new Error(`Codex 任务 ${jobId} 的等待已被中止；` + (ended ? '任务已结束。'
-            : `取消未确认，任务可能仍在运行，用 codex_status 查询 ${jobId}，不要重派。`));
+          throw new Error(`Codex 任务 ${jobId} 的等待已被中止；仅停止观察，未取消任务。${waitForJob(jobId)}`);
         }
         throw error;
       }
@@ -1036,7 +1033,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return withReport(await conductor.waitJob(jobId, bg ? 0 : seconds, signal));
   }
 
-  // 仍在执行时交给后台任务，结束后 DSH 只发一条带摘要的任务通知，完整结果要用 job_output 读；没有后台任务就照旧轮询
+  // 后台监控与本轮长等待共用同一任务；空闲会话仍能收到完成通知。
   const finishStatus = (value) => {
     rememberProducts(value);
     return { ...value, next: nextStep(value, undefined, undefined, cfg) };
@@ -1047,13 +1044,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const id = background(value.job_id, exec, finish)?.id;
     if (id === undefined) return value;
     const outputCall = `job_output(${JSON.stringify({ job_id: id })})`;
-    const statusCall = `codex_status(${JSON.stringify({ job_id: value.job_id })})`;
     return { ...value, background_job_id: id,
-      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），收到后用 ${outputCall} 读取一次完整结果（含逐条汇报和下一步）。` +
-        `完成通知前不要用 job_output 轮询；需要查进度时用 ${statusCall}。` +
-        'job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id。',
-      next: `等 DSH 的完成通知，再用 ${outputCall} 读取一次完整结果。需要重读或分页时用 codex_output。` +
-        '在此之前不要自己动手补做，也不要重复派同一个任务。' };
+      note: `已登记为后台任务 ${id}。${waitForJob(value.job_id)}` +
+        '会话空闲时，DSH 的完成通知仍会唤醒会话。job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id。',
+      next: `${waitForJob(value.job_id)}等待已经返回报告就直接验收；只有摘要、缺内容或截断时才用 ${outputCall} 补读，或用 codex_output 分页。` +
+        '等待期间不要自己动手补做。' };
   }
 
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf) {
@@ -1140,7 +1135,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     let value;
     if (started.status === 'running' && started.job_id) {
       const bg = background(started.job_id, exec, finish, label);
-      value = await collect(started.job_id, bg, bg ? 0 : (args.wait_seconds ?? cfg.waitSeconds), exec?.signal);
+      try {
+        value = await collect(started.job_id, bg, bg ? 0 : (args.wait_seconds ?? cfg.waitSeconds), exec?.signal);
+      } catch (error) {
+        if (!bg && exec?.signal?.aborted) await conductor.cancel(started.job_id, exec.signal);
+        throw error;
+      }
     } else {
       value = withReport(started);
     }
@@ -1148,12 +1148,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
-    '登记成功时直接返回任务号；需要同步等待时用该 job_id 调 codex_status。';
+    '登记成功时直接返回任务号；' + WAIT_GUIDANCE + '未登记后台时中止派单的同步等待仍会取消该 Codex 任务。';
   ctx.tools.register({
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回两个任务号；收到结束通知后，把 background_job_id 填入 job_output 的 job_id 取报告。必须给出验收标准和 write：' +
+    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回两个任务号；' + WAIT_GUIDANCE + '必须给出验收标准和 write：' +
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。' +
@@ -1202,7 +1202,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   ctx.tools.register({
     name: 'codex_verify',
-    description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录、主机访问和模型设置，回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。',
+    description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录、主机访问和模型设置，回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `独立核验 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string', description: '本会话已结束的 runner job_id。' },
@@ -1221,7 +1221,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       let source = await conductor.waitJob(args.job_id, 0, exec?.signal);
       if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
       if (source.context?.owner !== owner) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
-      if (source.status === 'running') throw new Error('codex_verify: 原任务还在运行，请等它结束后再核验');
+      if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
       if (!source.cwd || !source.log_dir || typeof source.context.task !== 'string' || !Array.isArray(source.context.acceptance) || !source.context.acceptance.length ||
           !['read-only', 'workspace-write', 'danger-full-access'].includes(source.sandbox)) throw new Error('codex_verify: 原任务缺少目录、任务书、验收标准或执行设置，无法独立核验');
       source = withReport(source);
@@ -1246,14 +1246,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
-    description: '查询 Codex 任务，默认只查一次。已登记后台任务时，通常等 DSH 通知并用 job_output 读结果；' +
-      '只有用户明确要求本轮同步等待时才传正数。仍在执行时返回最近活动、距上次活动的秒数、阶段和尝试轮次。' +
+    description: '等待 Codex 任务。' + WAIT_GUIDANCE +
+      '中止本工具或 job_output 的纯观察等待只停止观察，不取消 Codex；需要取消任务时用 codex_cancel 或后台任务的显式取消。仍在执行时返回最近活动、距上次活动的秒数、阶段和尝试轮次。' +
       '用 codex_output 分段读取原任务、验收标准和已回传的报告。',
     parameters: {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: 'codex_run 返回的 job_id。' },
-        wait_seconds: { type: 'integer', description: '默认 0，只查一次；用户明确要求等待时传最多等待的秒数。' },
+        wait_seconds: { type: 'integer', description: '任务运行中传 3600，在本轮等待；等满仍在运行就继续等待同一 job_id。省略或 0 仅即时查询，不用于重复轮询。中止等待不会取消 Codex。' },
       },
       required: ['job_id'],
     },
@@ -1442,7 +1442,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       await ensureOwnJob(args.job_id, exec, 'codex_output');
       const value = await conductor.output(args.job_id, args, exec?.signal);
       return value.error_kind === 'artifact_pending' || (value.status === 'pending' && !value.error_kind && !value.error)
-        ? { ...value, note: '任务还在运行，报告尚未生成；等完成通知后再读' }
+        ? { ...value, note: `任务还在运行，报告尚未生成；${waitForJob(args.job_id)}` }
         : value;
     },
   });
@@ -1454,7 +1454,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
       (cfg.plannerAnswers ? 'answers 用阻塞问题的 id，可由规划端回答；' + PLANNER_ANSWERS : 'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；') +
       '缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
-      '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。',
+      '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string' },
@@ -1611,7 +1611,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
               const alerts = [];
               for (const [backgroundId, item] of changes) {
                 if (mode === 'attention' && ['running', 'stopping'].includes(item.status)) continue;
-                // 观察中止不能传给 waitJob；它的 signal 代表取消业务任务。
+                // 当前查询有界完成后再退出观察；不取消正在执行的 Codex。
                 const value = withReport(await conductor.waitJob(item.job_id, 0));
                 const closed = ['verified', 'accepted_deviations'].includes(value.verification_status);
                 const attention = !closed && (!['running', 'completed', 'cancelled'].includes(value.status) ||
@@ -1686,7 +1686,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       try {
         const value = await geminiWrite(cfg.gemini, { ...args, cwd }, conductor, { signal: exec?.signal, busy }, launchGemini);
         rememberProducts({ ...value, cwd }, exec?.agent?.id);
-        if (cfg.plannerReads === 'products' && value.status === 'completed') value.next = '先机械核对正文产物、出处和数字；内容是否属实用 codex_verify 核对原 Codex 素材任务，或用 codex_run 派只读核验正文和素材。';
+        if (value.status === 'completed') value.next = '先机械核对正文产物、出处和数字；用 codex_run 派只读任务，核对本次 output 与本次 sources。' + USER_REPORT;
         return value;
       }
       finally { if (!busy) geminiWrites.delete(key); }
@@ -1727,7 +1727,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const owned = ctx.get?.('jobs')?.list(exec.agent.id).find((item) => item.id === job.id && item.owner === exec.agent.id &&
       item.kind === 'codex' && /^Codex [^\s·]+(?: · |$)/.test(item.label ?? ''));
     if (!owned) return result;
-    const short = dampenStatus({ job_id: job.id, status: job.status, last_activity: job.detail,
+    const runnerId = /^Codex ([^\s·]+)/.exec(owned.label)[1];
+    const short = dampenStatus({ job_id: runnerId, status: job.status, last_activity: job.detail,
       output: value.text, background_job_id: job.id }, exec, 'job_output');
     if (!short) return result;
     return { ...result, value: { ...value, text: short.rendered, job: { ...job, detail: '状态无实质变化' } },
@@ -1735,6 +1736,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
 
   if (cfg.roots.length) {
+    const guardError = (exec, error) => inWorkspace(sessionCwd(exec), cfg.roots)
+      ? cfg.plannerReads === 'products' ? `[codex-conductor] 护栏判定出错。${PRODUCT_DENY_HINT}`
+        : `[codex-conductor] 护栏判定出错，已拒绝：${error?.message ?? error}` : undefined;
     ctx.tools.guard((exec) => {
       try {
         const denied = decide(exec, cfg);
@@ -1742,11 +1746,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const cwd = ctx.get?.('workingDirectory')?.get(exec.agent.session) ?? sessionCwd(exec);
         const location = ctx.get?.('sessionPersistence')?.locate?.(exec.agent.session.header);
         const directories = location?.kind === 'jsonl' && typeof location.path === 'string' ? [path.dirname(location.path)] : [];
-        return productReads.check(exec, cwd, directories);
+        return productReads.check(exec, cwd, directories).catch(error => guardError(exec, error));
       } catch (error) {
-        return inWorkspace(sessionCwd(exec), cfg.roots)
-          ? `[codex-conductor] 护栏判定出错，已拒绝：${error?.message ?? error}`
-          : undefined;
+        return guardError(exec, error);
       }
     });
   }

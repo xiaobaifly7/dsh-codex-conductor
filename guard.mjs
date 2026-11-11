@@ -664,7 +664,8 @@ function refusedPart(command, extra) {
 const present = (v) => v !== undefined && v !== null && v !== false && v !== '' &&
   !(typeof v === 'object' && Object.keys(v).length === 0);
 
-export const PRODUCT_HINT = '这是原料，规划端不直接读。需要里面的事实就用 codex_run 派给 Codex 去查；要核对 Codex 的产物就用 codex_verify。';
+export const PRODUCT_DENY_HINT = '已拒绝。调查交给 codex_run；核对产物交给核验任务 codex_verify。不要换命令、语言或工具入口重试。';
+export const PRODUCT_HINT = `这是原料，规划端不直接读。${PRODUCT_DENY_HINT}`;
 
 // Use the same mount/case normalization as scopes; resolve local links before comparing.
 export function readPath(file, cwd = '') {
@@ -822,9 +823,52 @@ export function shellReadTargets(command, cwd) {
   return targets;
 }
 
-export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd) {
+const OBSIDIAN_PATH_KEYS = ['path', 'file_path', 'filePath', 'relative_path', 'relativePath', 'file', 'paths', 'files'];
+
+function frontmatterWrite(exec) {
+  if (String(exec?.name ?? '').split('__').at(-1) !== 'obsidian_frontmatter') return false;
+  const args = exec.arguments ?? {};
+  return ['action', 'operation', 'mode'].some(key => args[key] !== undefined && !/^(read|get)$/i.test(args[key])) ||
+    ['content', 'frontmatter', 'data', 'updates', 'value', 'values', 'properties'].some(key => args[key] !== undefined);
+}
+
+function obsidianVaultRoot(allow) {
+  const roots = new Set();
+  for (const entry of allow) {
+    const file = readPath(entry);
+    if (!file) continue;
+    let root = '';
+    for (let ancestor = file; ancestor && ancestor !== '.'; ancestor = path.posix.dirname(ancestor)) {
+      const native = process.platform === 'win32' ? ancestor : ancestor.replace(/^([a-z]):(?=\/|$)/i, '/mnt/$1');
+      try { if (statSync(`${native}/.obsidian`).isDirectory()) { root = ancestor; break; } } catch {}
+      if (path.posix.dirname(ancestor) === ancestor) break;
+    }
+    // A configured rule file under obsidian/study also identifies the vault without a local mount.
+    root ||= /^(.*\/obsidian\/study)(?:\/|$)/i.exec(file)?.[1] ?? '';
+    if (root) roots.add(root);
+  }
+  return roots.size === 1 ? [...roots][0] : '';
+}
+
+export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd, plannerReadAllow = []) {
   const name = String(exec?.name ?? '').split('__').at(-1);
   const args = exec.arguments ?? {};
+  if (name === 'obsidian_list') return [];
+  if (['obsidian_read', 'obsidian_search', 'obsidian_frontmatter'].includes(name)) {
+    if (frontmatterWrite(exec)) return null;
+    // No host schema is present: check every supplied alias rather than guessing its precedence.
+    const values = OBSIDIAN_PATH_KEYS.filter(key => args[key] !== undefined).map(key => args[key]);
+    if (!values.length || values.some(value => Array.isArray(value) && !value.length)) return null;
+    const inputs = values.flat(); // An unscoped search may read the entire vault.
+    const root = obsidianVaultRoot(plannerReadAllow);
+    const targets = inputs.flatMap(input => {
+      const files = input && typeof input === 'object' && !Array.isArray(input)
+        ? OBSIDIAN_PATH_KEYS.filter(key => input[key] !== undefined).map(key => input[key]) : [input];
+      if (!files.length) return [''];
+      return files.map(file => readPath(file, root));
+    });
+    return targets.length && targets.every(Boolean) ? targets : null;
+  }
   const ops = name.startsWith('ops_');
   if (ops) cwd = exec?.agent?.session?.header?.cwd;
   const directory = ops ? (name === 'ops_bash' ? args.workdir : undefined) : args.workdir ?? args.cwd;
@@ -842,7 +886,7 @@ export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd
   return targets.every(Boolean) ? targets : null;
 }
 
-export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '' } = {}) {
+export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '', refreshTimeoutMs = 3_000 } = {}) {
   const sessions = new Map();
   const limit = 10_000;
   const stateFor = (owner) => {
@@ -874,8 +918,8 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
       try { return statSync(native).isDirectory() && under(file, key); } catch { return false; }
     });
   };
-  return { add, check(exec, cwd, directories = []) {
-    const targets = plannerReadTargets(exec, cwd);
+  return { add, async check(exec, cwd, directories = []) {
+    const targets = plannerReadTargets(exec, cwd, cfg.plannerReadAllow);
     if (targets?.length === 0) return undefined;
     const owner = exec?.agent?.id;
     const state = owner ? stateFor(owner) : undefined;
@@ -888,7 +932,19 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
         state.failed = false;
       }).catch(() => { state.failed = true; }).finally(() => { state.pending = null; });
     }
-    // 会话登记的刷新状态不能说明当前被拒路径可能是产物。
+    if (targets && state?.pending) {
+      let timer;
+      try {
+        await Promise.race([state.pending, new Promise(resolve => { timer = setTimeout(resolve, refreshTimeoutMs); })]);
+      } finally { clearTimeout(timer); }
+      if (targets.every(file => allowed(file, state, directories))) return undefined;
+      if (state.pending) return `[codex-conductor] 暂时无法确认读取权限，仅同一读取可稍后重试一次，再不行交 Codex。${PRODUCT_DENY_HINT}`;
+    }
+    if (!targets && String(exec?.name ?? '').split('__').at(-1).startsWith('obsidian_')) {
+      return `[codex-conductor] 无法确定 vault 读取范围：需要明确的文件路径；相对路径需由 plannerReadAllow 确定唯一 vault 根，内容搜索不得无范围，frontmatter 只可读取。${PRODUCT_DENY_HINT}`;
+    }
+    if (targets && state?.failed) return `[codex-conductor] 产物登记恢复失败，该路径未获读取授权。${PRODUCT_DENY_HINT}`;
+    // A completed recovery does not make an unrelated raw path a possible product.
     return `[codex-conductor] ${PRODUCT_HINT}`;
   } };
 }
@@ -898,9 +954,11 @@ export function decide(exec, cfg) {
   if (!inWorkspace(exec?.agent?.session?.header?.cwd, cfg.roots)) return undefined;
   const tool = String(exec?.name ?? '');
   if (tool === 'gemini_write' && cfg.gemini) return undefined;
-  const deny = (reason) => `[codex-conductor] 本工作区按「你规划 → Codex 执行 → 你验收」运行，${reason}。${HINT}` +
+  const deny = (reason) => cfg.plannerReads === 'products' ? `[codex-conductor] ${PRODUCT_DENY_HINT}` :
+    `[codex-conductor] 本工作区按「你规划 → Codex 执行 → 你验收」运行，${reason}。${HINT}` +
     (cfg.gemini ? '教程/文档正文可用 gemini_write，一章一章做。' : '');
   if (DENY_TOOLS.has(tool) || cfg.denyTools.has(tool)) return deny(`${tool} 会直接改动文件或执行任意代码，已拒绝`);
+  if (frontmatterWrite(exec)) return deny(`${tool} 请求修改 frontmatter，已拒绝`);
   if (tool.startsWith('mcp__') && MCP_WRITE.test(tool.slice(tool.lastIndexOf('__') + 2))) {
     return deny(`${tool} 会改动文件或执行命令，已拒绝`);
   }
@@ -908,9 +966,9 @@ export function decide(exec, cfg) {
   if (!blocked) return undefined;
   const args = exec.arguments ?? {};
   const used = blocked.filter((k) => present(args[k]));
-  if (used.length) return cfg.plannerReads === 'products' ? `[codex-conductor] ${PRODUCT_HINT}` : deny(`${tool} 带了 ${used.join(' / ')} 参数，已拒绝`);
+  if (used.length) return deny(`${tool} 带了 ${used.join(' / ')} 参数，已拒绝`);
   if (!readOnlyCommand(args.command, cfg.allowCommands)) {
-    return cfg.plannerReads === 'products' ? `[codex-conductor] ${PRODUCT_HINT}` : deny(`这条命令不在只读核验范围内，${refusedPart(args.command, cfg.allowCommands)}`);
+    return cfg.plannerReads === 'products' ? deny() : deny(`这条命令不在只读核验范围内，${refusedPart(args.command, cfg.allowCommands)}`);
   }
   return undefined;
 }

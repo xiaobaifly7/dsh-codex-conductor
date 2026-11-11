@@ -11,7 +11,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const call = (name, args = {}, owner = 'S1', cwd = '/repo') => ({ name, arguments: args, agent: { id: owner, session: { header: { cwd } } } });
 
-test('products blocks file/search readers including MCP aliases and every mixed target', () => {
+test('products blocks file/search readers including MCP aliases and every mixed target', async () => {
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
   scope.add('S1', ['/repo/product.md']);
   for (const [name, args] of [
@@ -24,20 +24,22 @@ test('products blocks file/search readers including MCP aliases and every mixed 
     ['mcp__serena__get_symbols_overview', { relative_path: '/repo/product.md' }],
     ...['ops_inspect_local_file', 'ops_read_pdf', 'ops_read_docx', 'ops_read_table', 'ops_diff'].map(name => [name, { path: '/repo/product.md' }]),
   ]) {
-    assert.equal(scope.check(call(name, args), '/repo'), undefined, name);
-    assert.match(scope.check(call(name, { ...args, paths: ['/repo/product.md', '/repo/raw.js'] }), '/repo'), /codex_run.*codex_verify/, name);
+    assert.equal(await scope.check(call(name, args), '/repo'), undefined, name);
+    const denied = await scope.check(call(name, { ...args, paths: ['/repo/product.md', '/repo/raw.js'] }), '/repo');
+    assert.match(denied, /codex_run.*codex_verify/, name);
+    for (const text of ['已拒绝', '原料', '不要换命令、语言或工具入口重试']) assert.ok(denied.includes(text), `${name}: ${text}`);
   }
-  assert.match(scope.check(call('read', { file_path: '/repo/product.md' }, 'S2'), '/repo'), /原料/);
-  assert.match(scope.check(call('ops_grep', { pattern: 'fact' }), '/repo'), /原料/);
-  assert.match(scope.check(call('ops_read_files', {}), '/repo'), /原料/);
-  assert.match(scope.check(call('mcp__serena__find_referencing_symbols', { relative_path: '/repo/product.md' }), '/repo'), /原料/);
-  assert.equal(scope.check(call('ops_read_files', { files: [{ path: 'product.md' }] }), '/different-live-directory'), undefined);
-  assert.match(scope.check(call('ops_read_files', { files: [{ path: 'product.md' }], cwd: '/repo' }, 'S1', '/other'), '/repo'), /原料/);
-  assert.match(scope.check(call('ops_grep', { path: 'product.md', outputMode: 'count' }, 'S1', '/other'), '/repo'), /原料/);
+  assert.match(await scope.check(call('read', { file_path: '/repo/product.md' }, 'S2'), '/repo'), /原料/);
+  assert.match(await scope.check(call('ops_grep', { pattern: 'fact' }), '/repo'), /原料/);
+  assert.match(await scope.check(call('ops_read_files', {}), '/repo'), /原料/);
+  assert.match(await scope.check(call('mcp__serena__find_referencing_symbols', { relative_path: '/repo/product.md' }), '/repo'), /原料/);
+  assert.equal(await scope.check(call('ops_read_files', { files: [{ path: 'product.md' }] }), '/different-live-directory'), undefined);
+  assert.match(await scope.check(call('ops_read_files', { files: [{ path: 'product.md' }], cwd: '/repo' }, 'S1', '/other'), '/repo'), /原料/);
+  assert.match(await scope.check(call('ops_grep', { path: 'product.md', outputMode: 'count' }, 'S1', '/other'), '/repo'), /原料/);
   assert.deepEqual(plannerReadTargets(call('ops_glob', { pattern: '**/*.js' })), []);
 });
 
-test('products covers shell content commands, redirection, options and uncertain paths', () => {
+test('products covers shell content commands, redirection, options and uncertain paths', async () => {
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
   scope.add('S1', ['/repo/product']);
   const commands = [
@@ -50,9 +52,9 @@ test('products covers shell content commands, redirection, options and uncertain
   ];
   for (const template of commands) {
     const raw = template.replaceAll('FILE', '/repo/raw');
-    assert.match(scope.check(call('wsl', { command: raw }), '/repo'), /原料/, raw);
+    assert.match(await scope.check(call('wsl', { command: raw }), '/repo'), /原料/, raw);
     const product = template.replaceAll('FILE', '/repo/product');
-    assert.equal(scope.check(call('wsl', { command: product }), '/repo'), undefined, product);
+    assert.equal(await scope.check(call('wsl', { command: product }), '/repo'), undefined, product);
   }
   for (const command of [
     'cat $FILE', 'FILE=/repo/product; cat "$FILE"', 'cat /repo/*', 'cat /repo/{product,raw}', 'cat $(echo /repo/product)',
@@ -67,14 +69,14 @@ test('products covers shell content commands, redirection, options and uncertain
     'wc --files0-from=/repo/raw', 'sort --files0-from=/repo/raw', 'file -f /repo/raw', 'sha256sum -c /repo/product',
     'find /repo -exec cat {} \\;', 'ls /repo | xargs cat', 'npm test', 'node --check /repo/product',
     'git show HEAD:raw', 'git diff -- /repo/raw', 'cd /repo; cat product',
-  ]) assert.match(scope.check(call('ops_bash', { command }), '/repo'), /原料/, command);
-  assert.equal(scope.check(call('bash', { command: 'cat /repo/product | grep fact | head -5' }), '/repo'), undefined);
-  assert.equal(scope.check(call('bash', { command: 'cat product', workdir: '/repo' }), '/other'), undefined);
-  assert.match(scope.check(call('bash', { command: 'cat product', workdir: '../other' }), '/repo'), /原料/);
-  assert.equal(scope.check(call('bash', { command: "echo 'literal text' | tr a-z A-Z" }), '/repo'), undefined);
+  ]) assert.match(await scope.check(call('ops_bash', { command }), '/repo'), /原料/, command);
+  assert.equal(await scope.check(call('bash', { command: 'cat /repo/product | grep fact | head -5' }), '/repo'), undefined);
+  assert.equal(await scope.check(call('bash', { command: 'cat product', workdir: '/repo' }), '/other'), undefined);
+  assert.match(await scope.check(call('bash', { command: 'cat product', workdir: '../other' }), '/repo'), /原料/);
+  assert.equal(await scope.check(call('bash', { command: "echo 'literal text' | tr a-z A-Z" }), '/repo'), undefined);
 });
 
-test('products blocks indirect file inputs and Git content flags; open stays unchanged', () => {
+test('products blocks indirect file inputs and Git content flags; open stays unchanged', async () => {
   const scope = createProductReads({}, async owner => ({ status: 'completed', owner, paths: [] }));
   scope.add('S1', ['/repo/product']);
   for (const command of [
@@ -85,21 +87,21 @@ test('products blocks indirect file inputs and Git content flags; open stays unc
     `awk 'BEGIN { ARGV[ARGC++]="/repo/raw" } 1' /repo/product`,
   ]) {
     assert.equal(readOnlyCommand(command, []), true, command);
-    assert.match(scope.check(call('wsl', { command }), '/repo'), /原料/, command);
+    assert.match(await scope.check(call('wsl', { command }), '/repo'), /原料/, command);
   }
 });
 
-test('directory discovery remains unrestricted and wc still reads content', () => {
+test('directory discovery remains unrestricted and wc still reads content', async () => {
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
   for (const command of ['ls -la /other', 'ls /other/*', "find /other -name '*.js' -type f", 'stat /other/raw',
     'du -s /other', 'rg --files /other', 'git status --short', 'pwd']) {
-    assert.equal(scope.check(call('wsl', { command }), '/repo'), undefined, command);
+    assert.equal(await scope.check(call('wsl', { command }), '/repo'), undefined, command);
   }
-  for (const tool of ['glob', 'ops_glob', 'mcp__fs__list_directory']) assert.equal(scope.check(call(tool, { path: '/other' }), '/repo'), undefined);
-  assert.match(scope.check(call('wsl', { command: 'wc -l /other/raw' }), '/repo'), /原料/);
+  for (const tool of ['glob', 'ops_glob', 'mcp__fs__list_directory']) assert.equal(await scope.check(call(tool, { path: '/other' }), '/repo'), undefined);
+  assert.match(await scope.check(call('wsl', { command: 'wc -l /other/raw' }), '/repo'), /原料/);
 });
 
-test('allowlist files/directories and the prompt reuse path normalization and resolve local links', t => {
+test('allowlist files/directories and the prompt reuse path normalization and resolve local links', async t => {
   const root = mkdtempSync(path.join(tmpdir(), 'planner-paths-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const allowed = path.join(root, 'allowed');
@@ -107,24 +109,24 @@ test('allowlist files/directories and the prompt reuse path normalization and re
   const file = path.join(root, 'file.md'), prompt = path.join(root, 'prompt.md'), raw = path.join(root, 'raw.md');
   for (const p of [file, prompt, raw, path.join(allowed, 'nested.md')]) writeFileSync(p, 'text');
   const scope = createProductReads({ plannerReadAllow: [allowed, file] }, async owner => ({ status: 'completed', owner, paths: [] }), { plannerFile: prompt });
-  for (const p of [file, prompt, path.join(allowed, 'nested.md')]) assert.equal(scope.check(call('read', { file_path: p }, 'S1', root), root), undefined);
-  assert.match(scope.check(call('read', { file_path: raw }, 'S1', root), root), /原料/);
-  assert.match(scope.check(call('read', { file_path: `${file}/child` }, 'S1', root), root), /原料/);
+  for (const p of [file, prompt, path.join(allowed, 'nested.md')]) assert.equal(await scope.check(call('read', { file_path: p }, 'S1', root), root), undefined);
+  assert.match(await scope.check(call('read', { file_path: raw }, 'S1', root), root), /原料/);
+  assert.match(await scope.check(call('read', { file_path: `${file}/child` }, 'S1', root), root), /原料/);
   assert.equal(readPath('C:\\Work\\OUT.md'), readPath('/mnt/c/work/OUT.md'));
   const link = path.join(root, 'link');
   symlinkSync(allowed, link, process.platform === 'win32' ? 'junction' : 'dir');
-  assert.equal(scope.check(call('read', { file_path: path.join(link, 'nested.md') }, 'S1', root), root), undefined);
+  assert.equal(await scope.check(call('read', { file_path: path.join(link, 'nested.md') }, 'S1', root), root), undefined);
   const productScope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
   productScope.add('S1', [wslPath(allowed)]);
-  assert.match(productScope.check(call('ops_grep', { path: allowed, pattern: 'text' }, 'S1', root), root), /原料/);
+  assert.match(await productScope.check(call('ops_grep', { path: allowed, pattern: 'text' }, 'S1', root), root), /原料/);
   productScope.add('S1', [path.join(link, 'nested.md')]);
   rmSync(link);
   symlinkSync(root, link, process.platform === 'win32' ? 'junction' : 'dir');
-  assert.match(productScope.check(call('read', { file_path: path.join(link, 'raw.md') }, 'S1', root), root), /原料/);
+  assert.match(await productScope.check(call('read', { file_path: path.join(link, 'raw.md') }, 'S1', root), root), /原料/);
   assert.ok(shellReadTargets(`cat ${quote(file)}`, root).includes(readPath(file)));
 });
 
-test('products allows only the current DSH session artifact directory', t => {
+test('products allows only the current DSH session artifact directory', async t => {
   const root = mkdtempSync(path.join(tmpdir(), 'planner-records-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   for (const owner of ['S1', 'S2']) {
@@ -148,43 +150,56 @@ test('products allows only the current DSH session artifact directory', t => {
     return guard(exec);
   };
   for (const owner of ['S1', 'S2']) {
-    assert.equal(read(owner, path.join(root, owner, 'progress.md')), undefined);
-    assert.match(read(owner, path.join(root, owner === 'S1' ? 'S2' : 'S1', 'progress.md')), /原料/);
-    assert.match(read(owner, path.join(root, 'raw.js')), /原料/);
+    assert.equal(await read(owner, path.join(root, owner, 'progress.md')), undefined);
+    assert.match(await read(owner, path.join(root, owner === 'S1' ? 'S2' : 'S1', 'progress.md')), /原料/);
+    assert.match(await read(owner, path.join(root, 'raw.js')), /原料/);
   }
 });
 
 test('product refresh is session-scoped, coalesced, throttled, fail-closed and bounded', async () => {
   let time = 0;
   const calls = [];
-  let result = owner => ({ status: 'completed', owner, paths: ['/repo/product'] });
+  let finishRefresh;
+  let result = () => new Promise(resolve => { finishRefresh = resolve; });
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => { calls.push(owner); return result(owner); }, { now: () => time });
   const read = (file, owner = 'S1') => scope.check(call('read', { file_path: file }, owner), '/repo');
-  assert.match(read('/repo/product'), /原料/);
-  read('/repo/product');
+  let settled = false;
+  const first = read('/repo/product').then(value => { settled = true; return value; });
+  const concurrent = read('/repo/product');
+  const raw = read('/repo/raw');
   await tick();
   assert.deepEqual(calls, ['S1']);
-  assert.equal(read('/repo/product'), undefined);
-  for (let i = 0; i < 30; i++) assert.match(read(`/repo/raw${i}`), /原料/);
+  assert.equal(settled, false, 'the first read must wait for product recovery');
+  finishRefresh({ status: 'completed', owner: 'S1', paths: ['/repo/product'] });
+  assert.equal(await first, undefined);
+  assert.equal(await concurrent, undefined);
+  assert.match(await raw, /原料/);
+  assert.equal(await read('/repo/product'), undefined);
+  for (let i = 0; i < 30; i++) assert.match(await read(`/repo/raw${i}`), /原料/);
+  time = 24_999;
+  assert.match(await read('/repo/raw'), /原料/);
   assert.deepEqual(calls, ['S1']);
   time = 25_000;
   result = () => { throw new Error('runner unavailable'); };
-  read('/repo/raw');
-  await tick();
-  assert.match(read('/repo/raw'), /原料/);
+  const failed = await read('/repo/raw');
+  assert.match(failed, /产物登记恢复失败.*已拒绝/);
+  assert.doesNotMatch(failed, /暂时无法确认/);
+  assert.equal(await read('/repo/raw'), failed);
   assert.deepEqual(calls, ['S1', 'S1']);
-  assert.equal(read('/repo/product'), undefined);
-  assert.match(read('/repo/product', 'S2'), /原料/);
-  await tick();
+  assert.equal(await read('/repo/product'), undefined);
+  result = owner => ({ status: 'completed', owner, paths: [] });
+  assert.match(await read('/repo/product', 'S2'), /原料/);
   assert.deepEqual(calls, ['S1', 'S1', 'S2']);
   time += 25_000;
   result = () => ({ status: 'completed', owner: 'S2', paths: ['/repo/other-session'] });
-  read('/repo/other-session');
-  await tick();
-  assert.match(read('/repo/other-session'), /原料/);
+  const wrongOwner = await read('/repo/other-session');
+  assert.match(wrongOwner, /产物登记恢复失败.*已拒绝/);
+  assert.doesNotMatch(wrongOwner, /暂时无法确认/);
+  assert.equal(await read('/repo/other-session'), wrongOwner);
+  result = owner => ({ status: 'completed', owner, paths: [] });
   scope.add('cap', Array.from({ length: 10_001 }, (_, i) => `/repo/file${i}`));
-  assert.match(read('/repo/file0', 'cap'), /原料/);
-  assert.equal(read('/repo/file10000', 'cap'), undefined);
+  assert.match(await read('/repo/file0', 'cap'), /原料/);
+  assert.equal(await read('/repo/file10000', 'cap'), undefined);
 });
 
 test('apply updates products on completion while open mode keeps its guard and guidance', async t => {
@@ -210,14 +225,14 @@ test('apply updates products on completion while open mode keeps its guard and g
   };
   const h = create('products');
   await h.tools.codex_run.execute({ task: 'Write the requested product.', acceptance: ['Product exists'], write: true }, call('codex_run'));
-  for (const file of ['/repo/product.md', '/repo/extra.md', '/jobs/J1/last_message.txt']) assert.equal(h.guard(call('read', { file_path: file })), undefined);
-  assert.match(h.guard(call('read', { file_path: '/repo/raw.js' })), /原料/);
-  assert.match(h.guard(call('read', { file_path: '/repo/product.md' }, 'S2')), /原料/);
-  assert.equal(h.guard(call('read', { file_path: '/repo/raw.js' }, 'S1', '/outside')), undefined);
-  assert.match(h.guard(call('write', { path: '/repo/product.md' })), /已拒绝/);
+  for (const file of ['/repo/product.md', '/repo/extra.md', '/jobs/J1/last_message.txt']) assert.equal(await h.guard(call('read', { file_path: file })), undefined);
+  assert.match(await h.guard(call('read', { file_path: '/repo/raw.js' })), /原料/);
+  assert.match(await h.guard(call('read', { file_path: '/repo/product.md' }, 'S2')), /原料/);
+  assert.equal(await h.guard(call('read', { file_path: '/repo/raw.js' }, 'S1', '/outside')), undefined);
+  assert.match(await h.guard(call('write', { path: '/repo/product.md' })), /已拒绝/);
   const open = create('open');
-  assert.equal(open.guard(call('read', { file_path: '/repo/raw.js' })), undefined);
-  assert.equal(open.guard(call('wsl', { command: 'cat /repo/raw.js' })), undefined);
+  assert.equal(await open.guard(call('read', { file_path: '/repo/raw.js' })), undefined);
+  assert.equal(await open.guard(call('wsl', { command: 'cat /repo/raw.js' })), undefined);
   assert.deepEqual(open.calls, []);
   const job = { job_id: 'J', status: 'completed' };
   assert.equal(nextStep(job), nextStep(job, undefined, undefined, { plannerReads: 'open' }));

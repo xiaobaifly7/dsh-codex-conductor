@@ -57,6 +57,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
       return { job_id: 'VERIFY-1', status: 'running' };
     }
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
+    if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
   };
   const previousLocalAppData = process.env.LOCALAPPDATA;
@@ -116,6 +117,20 @@ test('codex_verify exposes only its four inputs and sample/wait bounds', () => {
   assert.equal(parameters.properties.wait_seconds.minimum, 0);
 });
 
+test('dispatch descriptions keep waiting on the current runner job and accept the returned report', () => {
+  const { tools } = harness();
+  for (const name of ['codex_run', 'codex_continue', 'codex_verify']) {
+    for (const text of [tools[name].description, tools[name].parameters.properties.wait_seconds.description]) {
+      for (const required of ['本轮', 'runner', 'job_id', 'codex_status', '报告', '验收']) {
+        assert.ok(text.includes(required), `${name}: ${required}`);
+      }
+      assert.match(text, /wait_seconds\s*:\s*3600/, name);
+      assert.match(text, /留在本轮/, name);
+      assert.match(text, /报告.*直接验收/, name);
+    }
+  }
+});
+
 for (const [field, values] of [
   ['job_id', [undefined, null, '', ' ', '../SOURCE-1', 'SOURCE/1', 'SOURCE 1', 1]],
   ['focus', [null, 1, {}, []]],
@@ -153,7 +168,7 @@ test('codex_verify rejects another session and unknown ownership without dispatc
 
 test('codex_verify rejects running and unknown states, including bridge failures', async () => {
   for (const [patch, message] of [
-    [{ status: 'running' }, /还在运行/], [{ status: 'unknown' }, /状态未知/],
+    [{ status: 'running' }, /还在运行[\s\S]*codex_status\(\{"job_id":"SOURCE-1","wait_seconds":3600\}\)/], [{ status: 'unknown' }, /状态未知/],
     [{ status: undefined }, /状态未知/], [{ status: 'queued' }, /状态未知/],
     [{ status: 'failed', error_kind: 'unknown_job' }, /状态未知/],
     [{ status: 'failed', error_kind: 'bridge_error' }, /状态未知/],
@@ -258,8 +273,8 @@ test('self-reported changes cannot grant planner access to unwritten source file
   const h = harness({ source, config: { plannerReads: 'products' } });
   await h.verify();
   const read = file => h.guard({ ...exec, name: 'read', arguments: { file_path: file } });
-  assert.equal(read('/work/original/docs/result.md'), undefined);
-  assert.match(read('/work/original/src/raw.js'), /原料/);
+  assert.equal(await read('/work/original/docs/result.md'), undefined);
+  assert.match(await read('/work/original/src/raw.js'), /原料/);
   assert.doesNotMatch(h.payload().prompt, /\/work\/original\/src\/raw\.js/);
 });
 
@@ -288,6 +303,10 @@ test('wait uses normal dispatch defaults and bounds without a background service
     const h = harness({ running: true, config: { waitSeconds: 7 } });
     const result = await h.verify({ wait_seconds: wait });
     assert.equal(result.status, 'running');
+    assert.equal(result.job_id, 'VERIFY-1');
+    assert.equal(result.background_job_id, undefined);
+    assert.match(result.next, /VERIFY-1/);
+    assert.match(result.next, /codex_status/);
     assert.deepEqual(h.calls.filter(call => call.argv[0] === 'status').map(call => call.argv),
       [['status', 'SOURCE-1', '--wait', '0'], ['status', 'VERIFY-1', '--wait', String(expected)]]);
   }
@@ -329,8 +348,11 @@ test('verification reuses background registration, result processing and status/
   const jobs = backgroundJobs();
   const h = harness({ jobs, running: true, config: { plannerReads: 'products' } });
   const result = await h.verify({ wait_seconds: 60 });
+  assert.equal(result.job_id, 'VERIFY-1');
   assert.equal(result.background_job_id, 'background-1');
   assert.equal(result.status, 'running');
+  assert.match(result.next, /VERIFY-1/);
+  assert.match(result.next, /codex_status/);
   assert.match(result.note, /job_output/);
   assert.equal(jobs.entries.length, 1);
   const job = jobs.entries[0];
@@ -370,11 +392,13 @@ test('open nextStep remains the default; products points mechanical checks to co
   assert.equal(nextStep(completed, undefined, undefined, { plannerReads: 'open' }), open);
   assert.match(open, /用只读检查逐条核验/);
   assert.doesNotMatch(open, /codex_verify/);
+  assert.doesNotMatch(open, /本轮已关闭/);
   const products = nextStep(completed, undefined, undefined, { plannerReads: 'products' });
   assert.match(products, /先对产物做机械核对/);
   assert.match(products, /产物在不在、结论有没有带出处、数字对不对得上/);
   assert.match(products, /内容是否属实用 codex_verify/);
   assert.doesNotMatch(products, /用只读检查逐条核验/);
+  assert.doesNotMatch(products, /本轮已关闭/);
   for (const plannerReads of ['open', 'products']) {
     const h = harness({ config: { plannerReads } });
     const result = await h.verify();
@@ -383,5 +407,21 @@ test('open nextStep remains the default; products points mechanical checks to co
     assert.match(result.next, /先机械核对抽查条数、出处与证据是否齐全.*codex_review/);
     assert.match(result.next, /不把核验结束当作全部通过/);
     assert.equal(h.tools.codex_run.description.includes('codex_verify'), plannerReads === 'products');
+  }
+});
+
+test('nextStep closes verified and accepted_deviations jobs before products or verification guidance', () => {
+  for (const verification_status of ['verified', 'accepted_deviations']) {
+    for (const plannerReads of ['open', 'products']) {
+      for (const verification_of of [undefined, 'ORIGINAL-1']) {
+        const completed = { ...sourceJob(), report: report(), verification_status };
+        if (verification_of) completed.context.verification_of = verification_of;
+        const next = nextStep(completed, undefined, undefined, { plannerReads });
+        assert.match(next, /本轮已关闭/);
+        assert.ok(next.includes(verification_status));
+        assert.match(next, /codex_output artifact=review/);
+        assert.doesNotMatch(next, /codex_verify|codex_review|机械核对|独立核验已结束/);
+      }
+    }
   }
 });

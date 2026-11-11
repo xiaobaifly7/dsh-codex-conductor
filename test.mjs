@@ -1008,7 +1008,7 @@ test('turn summary reads the last reply and the tools of one turn', () => {
   assert.deepEqual(turnSummary(log, 5), { text: '已派 Codex 去做', tools: ['tool_call', 'codex_status'] });
 });
 
-test('conductor start only starts; waitJob waits with a bounded status call and cancels on abort', async () => {
+test('conductor start only starts; waitJob waits with a bounded status call and stops only observation on abort', async () => {
   const calls = [];
   const run = (_cfg, argv, opts) => {
     calls.push({ argv, stdin: opts?.stdin });
@@ -1041,8 +1041,9 @@ test('conductor start only starts; waitJob waits with a bounded status call and 
   const ac = new AbortController();
   const pending = c.waitJob('J2', 600, ac.signal);
   ac.abort();
-  await assert.rejects(pending);
-  assert.deepEqual(calls.at(-1).argv, ['cancel', 'J2']);
+  await assert.rejects(pending, { name: 'AbortError' });
+  assert.deepEqual(calls.at(-1).argv, ['status', 'J2', '--wait', '600']);
+  assert.equal(calls.some(({ argv }) => argv[0] === 'cancel'), false);
 });
 
 test('apply registers eleven tools in order, a guard and the false-dispatch check', () => {
@@ -1151,6 +1152,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'review') return Promise.resolve(reviewResult);
     if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
+    if (argv[0] === 'products') return Promise.resolve({ status: 'completed', owner: argv[2], paths: [] });
     if (argv[0] === 'status' && argv[3] === '20') return new Promise((resolve) =>
       (waiters[argv[1]] ??= []).push({ resolve, onProgress: options.onProgress }));
     // 下一轮事件循环才答：后台循环的等待参数若不是 20，也不会只靠微任务空转、饿死 answer()
@@ -2147,10 +2149,10 @@ test('dispatch with a positive wait still returns a DSH background job without w
   const first = await tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, exec);
   assert.equal(first.status, 'running');
   assert.equal(first.background_job_id, 'bg1');
-  // DSH 的结束通知只有一行摘要，完整结果要用 job_output 读
-  assert.match(first.note, /任务通知[\s\S]*job_output\(\{"job_id":"bg1"\}\) 读取一次完整结果/);
-  assert.match(first.note, /完成通知前不要用 job_output 轮询；需要查进度时用 codex_status\(\{"job_id":"J1"\}\)/);
-  assert.match(first.next, /等 DSH 的完成通知，再用 job_output\(\{"job_id":"bg1"\}\) 读取一次完整结果。需要重读或分页时用 codex_output/);
+  assert.match(first.note, /留在本轮[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*会话空闲[\s\S]*完成通知/);
+  assert.match(first.note, /job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id/);
+  assert.match(first.next, /codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*返回报告就直接验收[\s\S]*只有摘要、缺内容或截断[\s\S]*job_output\(\{"job_id":"bg1"\}\)[\s\S]*codex_output/);
+  assert.doesNotMatch(first.next, /等 DSH 的完成通知|结束本轮/);
   // 到点仍在执行：经任务表等，不直接等 runner；runner 只收到后台循环的查询
   assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20', '--follow']]);
   assert.equal(jobs.started[0].spec.owner, 'S1');
@@ -2251,7 +2253,8 @@ test('codex_status dampens unchanged live queries for 120 seconds without cachin
   const repeated = await query();
   assert.equal(repeated.unchanged, true);
   assert.equal(repeated.isError, undefined);
-  assert.match(h.tools.codex_status.output.render({}, repeated)[0].text, /仍在执行[\s\S]*无实质变化[\s\S]*结束本轮/);
+  assert.match(h.tools.codex_status.output.render({}, repeated)[0].text, /仍在执行[\s\S]*无实质变化[\s\S]*codex_status\(\{"job_id":"J","wait_seconds":3600\}\)/);
+  assert.doesNotMatch(repeated.rendered, /结束本轮|稍后再查/);
   assert.ok(JSON.stringify(repeated).length < JSON.stringify(first).length / 5);
   assert.equal(h.calls.filter((args) => args[0] === 'status').length, 2);
   t.mock.timers.tick(119_999);
@@ -2318,7 +2321,7 @@ test('background status dampening ignores age counters but preserves stage chang
     seconds_since_last_event: 70, last_activity: '读取源码' });
   const short = await query();
   assert.equal(short.unchanged, true);
-  assert.match(short.rendered, /完成后会自动通知/);
+  assert.match(short.rendered, /留在本轮[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)/);
   await h.answer(first.job_id, { job_id: first.job_id, status: 'running', phase: 'finalizing', attempt: 1 });
   assert.equal((await query()).unchanged, undefined);
   await h.answer(first.job_id, { job_id: first.job_id, status: 'completed' });
@@ -2348,7 +2351,8 @@ test('job_output dampening runs after the tool, preserves consuming reads and on
   const short = await query();
   assert.equal(reads, 2);
   assert.equal(short.isError, false);
-  assert.match(short.content[0].text, /无实质变化[\s\S]*自动通知[\s\S]*结束本轮/);
+  assert.match(short.content[0].text, /无实质变化[\s\S]*codex_status\(\{"job_id":"J","wait_seconds":3600\}\)/);
+  assert.doesNotMatch(short.content[0].text, /结束本轮|"job_id":"bg1"/);
   assert.equal(short.value.text, short.content[0].text);
   t.mock.timers.tick(120_000);
   assert.match((await query()).content[0].text, /读取源码/);
@@ -2428,7 +2432,7 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   assert.equal((await cancel).status, 'cancelled');
   assert.deepEqual(jobs.unawaited, []);
 
-  // 中途停止 codex_status：经 DSH 结束后台任务，runner 侧随之取消；等它结算完才抛出
+  // 中止 codex_status 只撤销观察；任务继续，完成时仍能发空闲会话通知。
   await tools.codex_run.execute(RUN, exec);
   const stop = new AbortController();
   const aborted = tools.codex_status.execute({ job_id: 'J3', wait_seconds: 600 }, { ...exec, signal: stop.signal });
@@ -2436,12 +2440,13 @@ test('codex_status and codex_cancel on a background job wait through DSH, so no 
   aborted.catch(() => { rejected = true; });
   stop.abort();
   await tick();
-  assert.equal(jobs.started[2].status, 'stopping');
-  assert.deepEqual(calls.at(-1), ['cancel', 'J3']);
-  assert.equal(rejected, false);
-  await answer('J3', { status: 'cancelled' });
-  await assert.rejects(aborted, /已被中止/);
-  assert.deepEqual(jobs.unawaited, []);
+  assert.equal(jobs.started[2].status, 'running');
+  assert.equal(calls.some(argv => argv[0] === 'cancel' && argv[1] === 'J3'), false);
+  assert.equal(rejected, true);
+  await assert.rejects(aborted, /已被中止[\s\S]*仅停止观察，未取消任务/);
+  await answer('J3', { status: 'completed' });
+  await jobs.started[2].done;
+  assert.deepEqual(jobs.unawaited, ['bg3']);
 
   // 后台监控自己出错时存的只是提示，不原样交回：改查 runner，仍在运行就重新登记
   await tools.codex_run.execute(RUN, exec);
@@ -2588,7 +2593,7 @@ test('native cancellation failures stay visible while stopping and allow another
 
 test('directory lock queue tells the planner to wait and distinguishes cancellation from partial execution', () => {
   const queued = { job_id: 'J1', status: 'running', phase: 'lock_wait', attempt: 0 };
-  assert.match(nextStep(queued), /等待同目录写锁[\s\S]*尚未启动 Codex[\s\S]*codex_status[\s\S]*不要重复派活[\s\S]*codex_cancel/);
+  assert.match(nextStep(queued), /等待同目录写锁[\s\S]*尚未启动 Codex[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*codex_cancel[\s\S]*只取消本任务[\s\S]*不要重复派活/);
   const cancelled = nextStep({ ...queued, status: 'cancelled' });
   assert.match(cancelled, /已取消排队[\s\S]*尚未启动 Codex[\s\S]*没有取消持锁任务/);
   assert.doesNotMatch(cancelled, /可能已改|git status/);
@@ -3006,7 +3011,7 @@ test('every runner call has an upper bound: status gets its wait plus 10 s, star
   const pending = c.waitJob('J', 600, ac.signal);
   ac.abort();
   await assert.rejects(pending);
-  assert.deepEqual(seen, [['start', 120000], ['status', 40000], ['cancel', 120000], ['status', 610000], ['cancel', 120000]]);
+  assert.deepEqual(seen, [['start', 120000], ['status', 40000], ['cancel', 120000], ['status', 610000]]);
 });
 
 test('runProcess streams progress and accepts the final line before process exit', async () => {
@@ -3232,7 +3237,7 @@ test('a running poll resets the consecutive bridge_error count, so blips spread 
   assert.doesNotMatch(done.result, /monitor_failed/);
 });
 
-test('an aborted start or poll keeps the job id when cancellation fails', async () => {
+test('an aborted start or foreground dispatch wait keeps the job id when cancellation fails', async () => {
   for (const phase of ['start', 'status']) {
     const stop = new AbortController();
     const calls = [];
@@ -3243,34 +3248,87 @@ test('an aborted start or poll keeps the job id when cancellation fails', async 
         ? { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' }
         : { job_id: 'J7', status: 'running' };
     };
-    let pending;
-    if (phase === 'start') {
-      const tools = {};
-      apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {} }, {}, run);
-      pending = tools.codex_run.execute({ ...RUN, cwd: 'F:\\proj' }, { signal: stop.signal });
-    } else pending = createConductor({}, run).waitJob('J7', 1, stop.signal);
+    const tools = {};
+    apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {} }, {}, run);
+    const pending = tools.codex_run.execute({ ...RUN, cwd: 'F:\\proj' }, { signal: stop.signal });
     await assert.rejects(pending, /J7[^\n]*取消未确认[\s\S]*WSL unavailable[\s\S]*codex_status 查询 J7/);
-    assert.deepEqual(calls, [phase, 'cancel']);
+    assert.deepEqual(calls, phase === 'start' ? ['start', 'cancel'] : ['start', 'status', 'cancel']);
   }
 });
 
-test('an aborted background wait distinguishes unconfirmed cancellation from a stopped task', async () => {
+test('an aborted background observation never requests cancellation and preserves its completion notice', async () => {
   const jobs = fakeJobs();
-  const wait = jobs.wait.bind(jobs);
-  jobs.wait = (id, ms, ...rest) => ms === 30_000 && jobs.started[0].status === 'stopping'
-    ? Promise.resolve(jobs.view(jobs.started[0])) : wait(id, ms, ...rest);
-  const { tools, answer } = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' } } });
+  const { tools, answer, calls } = harness({ jobs, config: { cancelResult: { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' } } });
   const stop = new AbortController();
   const exec = { agent: agentAt('F:\\work\\项目') };
   const { job_id } = await tools.codex_run.execute(RUN, exec);
   const pending = tools.codex_status.execute({ job_id, wait_seconds: 600 }, { ...exec, signal: stop.signal });
-  const rejected = assert.rejects(pending, /J1[^\n]*已被中止[\s\S]*取消未确认[\s\S]*codex_status 查询 J1/);
+  const rejected = assert.rejects(pending, /J1[^\n]*已被中止[\s\S]*仅停止观察，未取消任务[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)/);
   await tick();
   stop.abort();
   await rejected;
+  assert.equal(jobs.started[0].status, 'running');
+  assert.equal(calls.some(argv => argv[0] === 'cancel'), false);
   await answer('J1', { status: 'completed' });
   await jobs.started[0].done;
   assert.deepEqual(jobs.unawaited, ['bg1']);
+});
+
+test('an aborted codex_status without background registration leaves the runner job alive', async () => {
+  const calls = [];
+  const stop = new AbortController();
+  const tools = {};
+  apply({ tools: { register(tool) { tools[tool.name] = tool; } }, on() {} }, {}, async (_cfg, argv) => {
+    calls.push(argv);
+    stop.abort();
+    return { job_id: 'OBSERVED', status: 'running' };
+  });
+  await assert.rejects(tools.codex_status.execute({ job_id: 'OBSERVED', wait_seconds: 3600 }, { signal: stop.signal }), { name: 'AbortError' });
+  assert.deepEqual(calls, [['status', 'OBSERVED', '--wait', '3600']]);
+});
+
+test('aborting job_output observation preserves the host error and never cancels Codex', async () => {
+  const jobs = fakeJobs();
+  const h = harness({ jobs });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  await h.tools.codex_run.execute(RUN, exec);
+  const stop = new AbortController();
+  const error = new Error('observation stopped');
+  await assert.rejects(h.handlers['tools/execute']({ ...exec, signal: stop.signal, name: 'job_output',
+    arguments: { job_id: 'bg1', wait: true } }, async () => {
+    stop.abort();
+    throw error;
+  }), error);
+  assert.equal(jobs.started[0].status, 'running');
+  assert.equal(h.calls.some(argv => argv[0] === 'cancel'), false);
+  await h.answer('J1', { status: 'completed' });
+  await jobs.started[0].done;
+  assert.deepEqual(jobs.unawaited, ['bg1']);
+});
+
+test('non-retryable failures explain the impact before raw errors and keep internal fields in tool output', async () => {
+  const value = { job_id: 'FAILED-JOB', thread_id: 'FAILED-THREAD', status: 'failed', retryable: false,
+    error_kind: 'validation_error', error: 'internal failure detail' };
+  const guidance = nextStep(value);
+  assert.match(guidance, /先用大白话说明哪一步没做成和实际影响[\s\S]*必要时附原始错误/);
+  assert.doesNotMatch(guidance, /把 error 原样告诉用户/);
+  const h = harness({ config: { startResult: value } });
+  const result = await h.tools.codex_run.execute(RUN, { agent: agentAt('F:\\work\\项目') });
+  const text = h.tools.codex_run.output.render({}, result)[0].text;
+  assert.match(text, /job_id: FAILED-JOB  thread_id: FAILED-THREAD/);
+  assert.match(text, /internal failure detail/);
+  assert.match(text, /向用户汇报[\s\S]*不必带任务号和内部状态名/);
+});
+
+test('products guard errors delegate without listing commands that the same mode refuses', async () => {
+  let guard;
+  apply({ tools: { register() {}, guard(value) { guard = value; } }, on() {}, get(key) {
+    if (key === 'workingDirectory') return { get() { throw new Error('directory unavailable'); } };
+  } }, { workspaces: ['/repo'], plannerReads: 'products' });
+  const denied = await guard({ name: 'read', arguments: { path: '/repo/raw.md' }, agent: agentAt('/repo') });
+  assert.match(denied, /护栏判定出错[\s\S]*已拒绝[\s\S]*codex_run[\s\S]*codex_verify/);
+  assert.match(denied, /不要换命令、语言或工具入口重试/);
+  assert.doesNotMatch(denied, /git diff|sha256sum|pytest|npm test/);
 });
 
 test('malformed report containers fall back to the original reply without hiding task status', async () => {
@@ -3309,7 +3367,7 @@ test('dispatch reminders use jobs owned by the agent and survive a plugin reload
   assert.equal(nudges.length, count + 2);
 });
 
-test('a pre-aborted signal skips execution and status polling but still cancels the known job', async () => {
+test('a pre-aborted observation skips execution and status polling without cancelling the known job', async () => {
   const stop = new AbortController();
   stop.abort();
   const value = await runProcess(process.execPath, ['-e', 'console.log(JSON.stringify({ unexpected: true }))'], { signal: stop.signal });
@@ -3318,7 +3376,7 @@ test('a pre-aborted signal skips execution and status polling but still cancels 
   const { tools, calls, finals } = harness({ get: false });
   finals.J9 = { job_id: 'J9', status: 'running' };
   await assert.rejects(tools.codex_status.execute({ job_id: 'J9', wait_seconds: 600 }, { signal: stop.signal }), { name: 'AbortError' });
-  assert.deepEqual(calls, [['cancel', 'J9']]);
+  assert.deepEqual(calls, []);
 });
 
 test('canonical runner paths keep alias scopes consistent for run, status and cancel', async () => {
@@ -3433,7 +3491,8 @@ test('history filters preserve session links and output reads are bounded, repea
 });
 
 test('codex_output explains pending artifacts in execute and rendered output without changing runner fields', async () => {
-  const note = '任务还在运行，报告尚未生成；等完成通知后再读';
+  const note = '任务还在运行，报告尚未生成；留在本轮，用 codex_status({"job_id":"J","wait_seconds":3600}) 等它结束；' +
+    '等满仍在运行就继续等同一任务，返回报告后直接验收，不要零等待轮询或重复派单。';
   for (const status of [
     { status: 'pending', error_kind: 'artifact_pending', retryable: true },
     { status: 'pending' },
@@ -3447,7 +3506,7 @@ test('codex_output explains pending artifacts in execute and rendered output wit
     assert.deepEqual(value, { ...pending, note });
     assert.deepEqual(await tool.execute(request, {}), value);
     const rendered = tool.output.render(request, value)[0].text;
-    assert.ok(rendered.includes(note));
+    assert.ok(JSON.parse(rendered).note.includes(note));
     assert.deepEqual(JSON.parse(rendered), { ...pending, note });
     assert.equal(pending.note, undefined);
   }
@@ -3654,7 +3713,7 @@ test('native cancel keeps unknown records and nonterminal replies unconfirmed ac
   }
 });
 
-test('an aborted start or poll preserves its job id for every unconfirmed cancel response', async () => {
+test('an aborted start or foreground dispatch wait preserves its job id for every unconfirmed cancel response', async () => {
   for (const cancelResult of unconfirmedCancels) {
     for (const phase of ['start', 'status']) {
       const stop = new AbortController();
@@ -3664,18 +3723,15 @@ test('an aborted start or poll preserves its job id for every unconfirmed cancel
         if (argv[0] === phase) stop.abort();
         return argv[0] === 'cancel' ? cancelResult : { job_id: 'J-uncertain', status: 'running' };
       };
-      let pending;
-      if (phase === 'start') {
-        const tools = {};
-        apply({ tools: { register: (t) => { tools[t.name] = t; }, guard() {} }, on() {} }, {}, run);
-        pending = tools.codex_run.execute({ ...RUN, cwd: '/mock/work' }, { signal: stop.signal });
-      } else pending = createConductor({}, run).waitJob('J-uncertain', 0, stop.signal);
+      const tools = {};
+      apply({ tools: { register: (t) => { tools[t.name] = t; }, guard() {} }, on() {} }, {}, run);
+      const pending = tools.codex_run.execute({ ...RUN, cwd: '/mock/work' }, { signal: stop.signal });
       await assert.rejects(pending, (error) => {
         assert.match(error.message, /J-uncertain[^\n]*取消未确认[\s\S]*可能仍在运行[\s\S]*codex_jobs[\s\S]*codex_status[\s\S]*不要重派/);
         assert.ok(error.message.includes(cancelResult.error ?? cancelResult.status));
         return true;
       });
-      assert.deepEqual(calls, [phase, 'cancel']);
+      assert.deepEqual(calls, phase === 'start' ? ['start', 'cancel'] : ['start', 'status', 'cancel']);
     }
   }
   for (const result of [{ status: 'cancelled' }, { status: 'completed' }, { status: 'failed', error_kind: 'idle_timeout' }]) {
@@ -3975,7 +4031,8 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   assert.deepEqual(value.out_of_scope, []);
   assert.deepEqual(value.files_changed, [{ path: value.output, change: 'added' }]);
   assert.deepEqual(value.write_paths, [value.output]);
-  assert.match(value.next, /核对正文内容/);
+  assert.match(value.next, /codex_run.*只读.*核对本次 output 与本次 sources/);
+  assert.doesNotMatch(value.next, /codex_verify|原 Codex 素材任务/);
   assert.deepEqual(JSON.parse(h.tools.gemini_write.output.render({}, value)[0].text), value);
   const spawned = h.spawns[0];
   assert.equal(spawned.command, GEMINI.command);
@@ -3997,12 +4054,13 @@ test('products mode remembers this session\'s gemini output without granting its
   const h = geminiFixture(t, { config: { plannerReads: 'products' } });
   const result = await h.execute();
   assert.equal(result.status, 'completed');
-  assert.equal(h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), undefined);
-  assert.match(h.guards[0]({ ...call('read', { file_path: path.join(h.cwd, 'notes.md') }, h.cwd), agent: agentAt(h.cwd) }), /原料/);
+  assert.equal(await h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), undefined);
+  assert.match(await h.guards[0]({ ...call('read', { file_path: path.join(h.cwd, 'notes.md') }, h.cwd), agent: agentAt(h.cwd) }), /原料/);
   const other = agentAt(h.cwd);
   other.id = 'S2';
-  assert.match(h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: other }), /原料/);
-  assert.match(result.next, /机械核对.*codex_verify/);
+  assert.match(await h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: other }), /原料/);
+  assert.match(result.next, /机械核对.*codex_run.*只读.*本次 output 与本次 sources/);
+  assert.doesNotMatch(result.next, /codex_verify|原 Codex 素材任务/);
 });
 
 test('gemini_write rejects running and queued Codex writers and unavailable history', async (t) => {
