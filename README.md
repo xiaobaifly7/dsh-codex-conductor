@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.78` 修正规划端原料读取被拒时的产物推断文案；自动唤醒完成通知滞留的 blocked 空闲会话，每批最多两次；短时间内重复查询没有实质变化的运行中任务时返回简短成功回执。
+
 `0.9.77` 修复后台任务共享目录写锁时可能插队的问题。
 
 `0.9.76` 修复插件热加载后本会话仍在运行的后台任务首次查状态可能被误拒的问题。
@@ -94,7 +96,11 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `message` 可省略，默认“继续”，最多 2000 个 Unicode 字符。`sessions` 最多 20 项，ID 仅接受 `[A-Za-z0-9_-]{1,100}`，重复 ID 只处理一次。插件加载、热重载和目录文件通知时检查请求；没有请求文件就不会续接。请求先原子改名认领，再逐个处理：不存在、正在运行或最后一个回合不是 `interrupted` / `blocked` 的会话跳过；其余优先恢复可恢复的目标。没有可恢复目标时，`interrupted` 沿用提交用户消息的方式；`blocked` 仅在 inbox 有待处理输入时调用宿主现有的 `wakeDriver()` 唤醒，不新增消息、不重发被拒的推进提示，也不自行改写 inbox；没有待处理输入仍以 `not_interrupted` 跳过。宿主缺少 agent、inbox 查询或唤醒接口时记录错误并继续处理其他会话。未在窗口打开的会话也可加载后续接。
 
-同目录的 `resume-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、整批状态 `processed` / `rejected`，以及 `sessions` 数组中的 `sessionId`、`status`（`resumed` / `skipped`）、`reason`、`method`（`goal` / `message` / `inbox` / `null`）；出错时另有 `error`。`pending_inbox_woken` 表示“已请求会话处理还在排队的输入”，只表示唤醒已发起；若门禁再次拒绝，不自动重试，也不补回宿主已领取的输入。输入不合法时整批拒绝，不提交任何消息。目录监听不可用时会记警告，仍在加载时检查。结果只保留最近一批；提交下一批前先核对本批时间并读取结果。已认领的请求不在重启后自动重放，避免重复提交。
+同目录的 `resume-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、整批状态 `processed` / `rejected`，以及 `sessions` 数组中的 `sessionId`、`status`（`resumed` / `skipped`）、`reason`、`method`（`goal` / `message` / `inbox` / `null`）；出错时另有 `error`。`pending_inbox_woken` 表示“已请求会话处理还在排队的输入”，只表示唤醒已发起；每份手动请求只尝试一次，也不补回宿主已领取的输入。输入不合法时整批拒绝，不提交任何消息。目录监听不可用时会记警告，仍在加载时检查。结果只保留最近一批；提交下一批前先核对本批时间并读取结果。已认领的请求不在重启后自动重放，避免重复提交。
+
+`autoWakeBlockedInbox` 默认 `true`：插件观察到自己登记的 Codex 后台任务完成通知进入 owner 的 inbox 后，如果该会话随后以 `blocked` 结束，通知仍在 pending 且 agent 已空闲，就复用上述 inbox 唤醒入口，无需恢复请求文件。第一次等 1 秒，第二次等 5 秒；同一批仍滞留的通知最多自动唤醒两次，新加入的通知不重置该批预算。仍被拒且通知仍在时，警告日志显示“自动唤醒已用尽”。通知被领取、正常回合结束、agent 被移除或插件卸载时停止；运行中的会话不唤醒。不新增用户消息、不重发推进提示、不修改 inbox。配置设为 `false` 可关闭，手动恢复不受影响。
+
+自动恢复只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条恢复路径。
 
 ## 功能
 
@@ -103,7 +109,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | 工具 | 作用 |
 | --- | --- |
 | `codex_run` | 把任务交给 WSL 里的 Codex；登记后台任务后直接返回任务号。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
-| `codex_status` | 默认只查一次；需要同步等待时显式传 `wait_seconds`。后台任务通常等完成通知即可 |
+| `codex_status` | 默认只查一次；120 秒内无实质变化的重复查询返回简短成功回执；需要同步等待时显式传 `wait_seconds`。后台任务通常等完成通知即可 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
 | `codex_output` | 按 Unicode 字符分页、可重复读取完整原始报告、结果 JSON、原任务与验收上下文或 stderr / events 日志；读取不消费结果，也不启动或恢复任务 |
@@ -157,6 +163,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，`codex_run` 一启动 Codex 就把它登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run` 和 `codex_continue` 登记成功后返回 `background_job_id`，不等待完成。Codex 结束后 DSH 发一条摘要通知，收到后把返回的 `background_job_id` 填到 `job_output` 的 `job_id` 参数中，取一次完整结果（含逐条汇报和下一步）。通知前如需查进度，用 `codex_status` 查询 runner 的 `job_id`。通知也附上可直接调用的 `codex_output` 参数；监控中断时附上 `codex_status` 参数。用户明确要求同步等待时，用原 runner `job_id` 调用 `codex_status` 并传正数 `wait_seconds`。
 
 - 同一个 runner 任务只登记一个后台任务（按 DSH 任务表判断，插件重载后也不重复）；对已登记的任务调用 `codex_status` 或 `codex_cancel` 会经 DSH 任务表等待，结果不会再作为通知重复送一次。等待中途停止工具调用时，插件结束这个后台任务（同时在 WSL 里取消 Codex），等它结算完再返回；取消未确认时保留任务编号并提示用 `codex_status` 查询，任务仍可能在运行。归档会话时，DSH 可能结束其中仍在运行的后台任务，Codex 任务随之取消。后台等待本身出错时送回 `monitor_failed`，提示 Codex 任务可能仍在运行、先用 `codex_status` 查询。没有 jobs 服务、登记失败或没有 agent 时，任务表里没有这一行，`codex_run` 直接等 runner 到 `wait_seconds`，之后照旧用 `codex_status` 轮询。
+
+`codex_status` 每次仍查询实时状态；同一会话、同一工具、同一 job 在上次完整回执后的 120 秒内没有实质变化时，重复查询只返回“仍在执行、无实质变化、现在请结束本轮”的简短成功回执，有后台任务时同时提示完成后自动通知。阶段、尝试轮次、错误、实际活动、报告或阻塞信息变化，以及完成、失败或未知状态，均返回完整内容；活动秒数和重试倒计时单独变化不算进展。短回执不延后下一次完整回执的时间，`wait_seconds > 0` 不缩短。
+
+原生 `job_output` 先照常执行归属校验与消费读取；仅对本插件自己的运行中 Codex job，在没有新模型输出且状态不变时应用同样的短回执，`wait: true` 不缩短。`codex_jobs` / `job_list` 的列表和 `codex_output` 的产物分页保持完整。去重记录只在当前插件实例内，重载后首次查询返回完整状态；它减少回执内容量，外部推进提示产生的模型回合仍由宿主控制。
 
 ### 权限
 
@@ -303,6 +313,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `readOnlyEffort` | 同 `effort` | 只读任务（`write=false`）的默认推理强度，留空时用 `effort` |
 | `serviceTier` | Codex 配置 | 例如 `fast`（Codex 的 Fast 模式） |
 | `waitSeconds` | `0` | 无法登记后台任务时，`codex_run` / `codex_continue` 默认等待的秒数 |
+| `autoWakeBlockedInbox` | `true` | 本插件后台完成通知滞留时，自动唤醒随后被门禁拒绝的空闲会话；同批最多两次（1 秒、5 秒），用尽写警告日志；设为 `false` 关闭 |
 | `timeoutSeconds` | 留空（runner 为 `3600`） | 每次 Codex 尝试的总超时秒数，须为正有限数字，可含小数；不含等待写锁的时间 |
 | `lockTimeoutSeconds` | 留空（无限等待） | 等待目录写锁的超时秒数，须为正有限数字，可含小数；超时不启动 Codex，返回可重试的 `lock_timeout` |
 | `idleTimeoutSeconds` | 留空（runner 为 `600`） | 空闲超时秒数，须为正有限数字，可含小数；命令执行期间暂停，命令完成后恢复 |
@@ -376,7 +387,7 @@ python3 runner/codex_runner.py forget-too-big --cwd DIR
 ## 测试
 
 ```text
-node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs
+node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs planner.test.mjs verify.test.mjs guard.test.mjs
 python3 runner/test_codex_runner.py
 ```
 
@@ -385,6 +396,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.78` removes unsupported artifact-identity wording from planner read denials, automatically wakes idle blocked owners with stranded completion notices at most twice per batch, and returns concise successful receipts for repeated unchanged running-job checks.
 
 `0.9.77` prevents later background writers from jumping ahead on a shared directory lock.
 
@@ -490,7 +503,15 @@ Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.j
 
 `message` is optional, defaults to `继续`, and accepts at most 2000 Unicode characters. Supply at most 20 session IDs matching `[A-Za-z0-9_-]{1,100}`; duplicate IDs are handled once. The plugin checks on load, hot reload and directory notifications. Without a request file, nothing resumes. It atomically claims the file before processing: missing sessions, running sessions, and sessions whose last turn did not end as `interrupted` or `blocked` are skipped. Eligible sessions resume a resumable goal first. Otherwise, `interrupted` retains the user-message path; `blocked` calls the host's existing `wakeDriver()` only when the inbox has pending input, without adding messages, resending rejected advancement prompts, or editing the inbox. An empty inbox still skips with `not_interrupted`. Missing agents, inbox queries or wake methods record an error without stopping the batch. Sessions do not need to be open in a window.
 
-`resume-result.json` contains claim time `requestedAt`, completion time `completedAt`, batch `status` (`processed` / `rejected`), and a `sessions` array with `sessionId`, `status` (`resumed` / `skipped`), `reason`, and `method` (`goal` / `message` / `inbox` / `null`); failures also include `error`. `pending_inbox_woken` means a wake was requested to process queued input; it does not guarantee admission. Another gate rejection triggers no automatic retry or restoration of input already claimed by the host. Invalid input rejects the whole batch without submitting messages. If directory watching is unavailable, a warning is logged and the load-time check remains. Only the latest result is retained; check its timestamp and read it before submitting another batch. Claimed requests are not replayed after a restart, preventing duplicate submissions.
+`resume-result.json` contains claim time `requestedAt`, completion time `completedAt`, batch `status` (`processed` / `rejected`), and a `sessions` array with `sessionId`, `status` (`resumed` / `skipped`), `reason`, and `method` (`goal` / `message` / `inbox` / `null`); failures also include `error`. `pending_inbox_woken` means a wake was requested to process queued input; it does not guarantee admission. Each manual request attempts once and does not restore input already claimed by the host. Invalid input rejects the whole batch without submitting messages. If directory watching is unavailable, a warning is logged and the load-time check remains. Only the latest result is retained; check its timestamp and read it before submitting another batch. Claimed requests are not replayed after a restart, preventing duplicate submissions.
+
+`autoWakeBlockedInbox` defaults to `true`. After observing a completion notice for its own registered Codex background job enter the owner's inbox, conductor waits for a subsequent blocked turn and an idle agent. If the notice is still pending, it reuses the manual inbox wake path after 1 second, then 5 seconds, with at most two automatic attempts per outstanding batch. New notices do not reset that batch's budget. A still-blocked, still-pending batch logs “自动唤醒已用尽” when exhausted. Running agents, removed agents and plugin teardown suppress wakes. No user message, advancement prompt or inbox edit is made. Set the configuration to `false` to disable it; manual resume remains available.
+
+Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this recovery path.
+
+`codex_status` still reads live state on every call. Repeated unchanged checks for the same owner, tool and job within 120 seconds of the last full receipt return a brief successful running/unchanged receipt that asks the planner to end the turn, with an automatic-completion-notice reminder when a background job exists. Phases, attempts, errors, actual activity, reports and blocker changes return full details, as do terminal and unknown states. Activity-age and retry-countdown changes alone are ignored. Brief receipts do not extend the full-receipt interval, and positive `wait_seconds` bypasses dampening.
+
+Native `job_output` retains the original ownership and consuming-read behavior before shortening only unchanged running conductor jobs with no new model output. `wait: true` bypasses dampening. `codex_jobs` / `job_list` listings and `codex_output` pages stay complete. Query signatures live only in the current plugin instance, so the first check after reload is complete. This reduces receipt content; external advancement prompts can still cause model turns.
 
 ### Gemini tutorial and documentation writing (off by default)
 

@@ -39,7 +39,7 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
         `globalThis[${JSON.stringify(traceKey)}].push('runtime-${version}');\n` +
         'export const runtimeIdentity = () => ({}), loadedRecord = () => ({ record: null }), registerRuntimeTool = () => {};\n');
       writeFileSync(path.join(dir, 'resume.mjs'),
-        `globalThis[${JSON.stringify(traceKey)}].push('resume-${version}');\nexport const registerResumeRequests = () => {};\n`);
+        `globalThis[${JSON.stringify(traceKey)}].push('resume-${version}');\nexport const registerResumeRequests = () => {}, registerAutoWake = () => {};\n`);
       writeFileSync(path.join(dir, 'gemini.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('gemini-${version}');\nexport const geminiWrite = () => ({});\n`);
       writeFileSync(path.join(dir, 'panel.mjs'),
@@ -1729,6 +1729,15 @@ test('runtime status shows loaded service tier and sanitized gateway settings', 
   assert.deepEqual(fallback.routerCheck, { transport: 'http', origin: 'http://127.0.0.1:3426' });
 });
 
+test('automatic inbox wake is enabled by default and the typed configuration can disable its listeners', () => {
+  for (const [setting, enabled] of [[undefined, true], [false, false], ['false', true]]) {
+    const h = harness({ config: { autoWakeBlockedInbox: setting } });
+    assert.equal(typeof h.handlers['agent/inbox/inserted'], enabled ? 'function' : 'undefined');
+    assert.equal(JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8')).autoWakeBlockedInbox, enabled);
+    assert.equal(h.warnings.some(text => text.includes('autoWakeBlockedInbox')), typeof setting === 'string');
+  }
+});
+
 test('apply preserves another live process loaded record and replaces own, stale or corrupt records', async (t) => {
   const file = path.join(localAppData, 'dsh-codex-conductor', 'loaded.json');
   harness();
@@ -2227,6 +2236,135 @@ test('without a jobs service, a failing start() or an agent, codex_run keeps pol
   const { tools } = harness({ jobs });
   await tools.codex_status.execute({ job_id: 'J9', wait_seconds: 0 }, {});
   assert.equal(jobs.started.length, 0);
+});
+
+test('codex_status dampens unchanged live queries for 120 seconds without caching runner state', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const h = harness();
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  h.finals.J = { job_id: 'J', status: 'running', phase: 'codex_running', attempt: 1,
+    seconds_since_last_event: 1, last_activity: '正在检查源码', context: { owner: 'S1', task: 'LONG '.repeat(1000) } };
+  const query = (args = {}, caller = exec) => h.tools.codex_status.execute({ job_id: 'J', ...args }, caller);
+  const first = await query();
+  assert.equal(first.unchanged, undefined);
+  h.finals.J.seconds_since_last_event = 99;
+  const repeated = await query();
+  assert.equal(repeated.unchanged, true);
+  assert.equal(repeated.isError, undefined);
+  assert.match(h.tools.codex_status.output.render({}, repeated)[0].text, /仍在执行[\s\S]*无实质变化[\s\S]*结束本轮/);
+  assert.ok(JSON.stringify(repeated).length < JSON.stringify(first).length / 5);
+  assert.equal(h.calls.filter((args) => args[0] === 'status').length, 2);
+  t.mock.timers.tick(119_999);
+  assert.equal((await query()).unchanged, true);
+  t.mock.timers.tick(1);
+  assert.equal((await query()).unchanged, undefined);
+  assert.equal((await query()).unchanged, true);
+  assert.equal((await query({ wait_seconds: 1 })).unchanged, undefined);
+  assert.equal((await query({}, { agent: { ...exec.agent, id: 'S2' } })).unchanged, undefined);
+  assert.equal((await query({ job_id: 'K' })).unchanged, undefined);
+  assert.equal((await query({}, {})).unchanged, undefined);
+  assert.equal((await query({}, {})).unchanged, undefined);
+});
+
+test('codex_status always exposes phase, questions, errors and terminal changes', async () => {
+  const h = harness();
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const query = () => h.tools.codex_status.execute({ job_id: 'J' }, exec);
+  const live = { job_id: 'J', status: 'running', phase: 'codex_running', attempt: 1 };
+  h.finals.J = { ...live };
+  await query();
+  assert.equal((await query()).unchanged, true);
+  for (const change of [
+    { phase: 'codex_reconnecting' }, { attempt: 2 }, { last_error_kind: 'network' },
+    { last_activity: '正在运行测试' },
+    { structured: workflowSource().structured },
+    { structured: { ...workflowSource().structured, summary: '等待确认编码' } },
+    { status: 'completed' }, { status: 'failed', error: 'worker stopped' },
+    { status: 'unknown', error_kind: 'bridge_error', error: 'bridge unavailable' },
+  ]) {
+    h.finals.J = { ...h.finals.J, ...change };
+    const value = await query();
+    assert.equal(value.unchanged, undefined, JSON.stringify(change));
+    assert.equal(value.status, change.status ?? 'running');
+  }
+  h.finals.J = { ...workflowSource(), job_id: 'J' };
+  for (let i = 0; i < 2; i++) {
+    const value = await query();
+    assert.equal(value.unchanged, undefined);
+    assert.match(h.tools.codex_status.output.render({}, value)[0].text, /是否保留旧 CSV 格式/);
+  }
+});
+
+test('codex_status dampening preserves products-only ownership checks on every query', async () => {
+  const h = harness({ config: { plannerReads: 'products' } });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  h.finals.J = { job_id: 'J', status: 'running', context: { owner: 'S1' } };
+  await h.tools.codex_status.execute({ job_id: 'J' }, exec);
+  assert.equal((await h.tools.codex_status.execute({ job_id: 'J' }, exec)).unchanged, true);
+  h.finals.J.context.owner = 'S2';
+  await assert.rejects(h.tools.codex_status.execute({ job_id: 'J' }, exec), /不能读取它的产物/);
+});
+
+test('background status dampening ignores age counters but preserves stage changes and completion', async () => {
+  const jobs = fakeJobs();
+  const h = harness({ jobs });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const first = await h.tools.codex_run.execute(RUN, exec);
+  const query = () => h.tools.codex_status.execute({ job_id: first.job_id }, exec);
+  await h.answer(first.job_id, { job_id: first.job_id, status: 'running', phase: 'codex_running', attempt: 1,
+    seconds_since_last_event: 1, last_activity: '读取源码' });
+  await query();
+  await h.answer(first.job_id, { job_id: first.job_id, status: 'running', phase: 'codex_running', attempt: 1,
+    seconds_since_last_event: 70, last_activity: '读取源码' });
+  const short = await query();
+  assert.equal(short.unchanged, true);
+  assert.match(short.rendered, /完成后会自动通知/);
+  await h.answer(first.job_id, { job_id: first.job_id, status: 'running', phase: 'finalizing', attempt: 1 });
+  assert.equal((await query()).unchanged, undefined);
+  await h.answer(first.job_id, { job_id: first.job_id, status: 'completed' });
+  await jobs.started[0].done;
+  assert.equal((await query()).unchanged, undefined);
+});
+
+test('job_output dampening runs after the tool, preserves consuming reads and only shortens owned conductor jobs', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'] });
+  const jobs = fakeJobs();
+  let finish;
+  const id = jobs.start({ owner: 'S1', kind: 'codex', label: 'Codex J · investigate',
+    run: () => ({ done: new Promise((resolve) => { finish = resolve; }), cancel() {} }) });
+  t.after(async () => { finish({ status: 'completed', result: 'finished' }); await jobs.started[0].done; });
+  const h = harness({ jobs });
+  const exec = { name: 'job_output', arguments: { job_id: id }, agent: agentAt('F:\\work\\项目') };
+  const job = { id, kind: 'codex', label: 'Codex J · investigate', status: 'running',
+    detail: 'Codex 执行中 · 第 1 轮，距上次活动 1 秒：读取源码', startedAt: 1 };
+  let reads = 0;
+  const query = (overrides = {}, snapshot = job, text = '') => h.handlers['tools/execute']({ ...exec, ...overrides }, async () => {
+    reads++;
+    return { isError: false, value: { text, job: snapshot }, content: [{ type: 'text', text: `${text}\n[status: ${snapshot.status}, ${snapshot.detail}]` }] };
+  });
+  const first = await query();
+  assert.match(first.content[0].text, /读取源码/);
+  job.detail = 'Codex 执行中 · 第 1 轮，距上次活动 60 秒：读取源码';
+  const short = await query();
+  assert.equal(reads, 2);
+  assert.equal(short.isError, false);
+  assert.match(short.content[0].text, /无实质变化[\s\S]*自动通知[\s\S]*结束本轮/);
+  assert.equal(short.value.text, short.content[0].text);
+  t.mock.timers.tick(120_000);
+  assert.match((await query()).content[0].text, /读取源码/);
+  assert.match((await query({ arguments: { job_id: id, wait: true } })).content[0].text, /读取源码/);
+  job.detail = '整理最终结果';
+  assert.match((await query()).content[0].text, /整理最终结果/);
+  assert.match((await query({}, job, 'new model output')).value.text, /new model output/);
+  assert.match((await query({}, job, 'new model output')).value.text, /new model output/);
+  assert.equal((await query({}, { ...job, status: 'completed' }, 'final result')).value.text, 'final result');
+  assert.equal((await query({}, { ...job, status: 'failed' }, 'failure')).value.text, 'failure');
+  assert.match((await query({ agent: { ...exec.agent, id: 'S2' } })).content[0].text, /整理最终结果/);
+  assert.match((await query({ name: 'job_list' })).content[0].text, /整理最终结果/);
+  jobs.started[0].spec.kind = 'shell';
+  assert.match((await query()).content[0].text, /整理最终结果/);
+  const denial = { isError: true, content: [{ type: 'text', text: 'ownership denied' }] };
+  assert.equal(await h.handlers['tools/execute'](exec, async () => denial), denial);
 });
 
 test('codex_status with an explicit wait returns the stored DSH result', async () => {

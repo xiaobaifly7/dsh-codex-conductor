@@ -888,7 +888,8 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
         state.failed = false;
       }).catch(() => { state.failed = true; }).finally(() => { state.pending = null; });
     }
-    return `[codex-conductor] ${state?.pending || state?.failed ? '暂时无法确认是不是产物。' : ''}${PRODUCT_HINT}`;
+    // 会话登记的刷新状态不能说明当前被拒路径可能是产物。
+    return `[codex-conductor] ${PRODUCT_HINT}`;
   } };
 }
 

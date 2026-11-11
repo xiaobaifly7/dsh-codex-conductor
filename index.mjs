@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
-const { registerResumeRequests } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
+const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, createProductReads } =
@@ -53,6 +53,7 @@ const DEFAULTS = {
   readOnlyEffort: '',
   serviceTier: '',
   waitSeconds: 0,
+  autoWakeBlockedInbox: true,
   timeoutSeconds: null,
   idleTimeoutSeconds: null,
   retries: null,
@@ -812,6 +813,30 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   let dispatchGeneration = 0;
   const geminiWrites = new Set();
   const startingWrites = new Set();
+  const statusQueries = new Map();
+  function dampenStatus(value, exec, tool, seconds = 0) {
+    const owner = exec?.agent?.id;
+    if (!owner) return;
+    const key = JSON.stringify([owner, tool, value.job_id]);
+    if (value.status !== 'running' || unknownState(value) || value.output) {
+      statusQueries.delete(key);
+      return;
+    }
+    // 原生进度里的活动秒数和重试倒计时会变，阶段与实际活动不因此改变。
+    const activity = value.last_activity?.replace(/，距上次活动 [^：]* 秒：/, '：').replace(/约 \d+ 秒后重试/g, '等待重试');
+    const signature = JSON.stringify([value.status, value.phase, value.attempt, value.last_error_kind, value.retry_at,
+      value.error_kind, value.error, activity, value.blocking, value.report, value.final_message,
+      value.report_status, value.review_status, value.verification_status]);
+    const now = Date.now();
+    const previous = statusQueries.get(key);
+    if (seconds === 0 && previous?.signature === signature && now - previous.at < 120_000) {
+      return { job_id: value.job_id, status: 'running', unchanged: true,
+        rendered: `任务 ${value.job_id} 仍在执行；自上次查询以来无实质变化。` +
+          (value.background_job_id ? '完成后会自动通知；' : '稍后再查；') + '现在请结束本轮，不要继续轮询。' };
+    }
+    if (statusQueries.size >= 10_000) statusQueries.delete(statusQueries.keys().next().value);
+    statusQueries.set(key, { signature, at: now });
+  }
 
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
@@ -1249,7 +1274,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         return collect(args.job_id, bg, seconds, exec?.signal);
       }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
-      return value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
+      const result = value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
+      return dampenStatus(result, exec, 'codex_status', seconds) ?? result;
     },
   });
 
@@ -1673,6 +1699,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }); };
   ctx.on('agent/created', ({ agent }) => recoverAgent(agent));
   for (const agent of ctx.get?.('agents')?.list?.() ?? []) recoverAgent(agent);
+  registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
@@ -1687,6 +1714,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       nudged.add(key);
       agent.steer({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: NUDGE }], source: { kind: `plugin:${name}` } });
     } catch {}
+  });
+
+  // tools/execute 在宿主的单调 guard 之后；先执行原工具，保留 ownership、消费与实时状态语义。
+  ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name !== 'job_output' || exec.arguments?.wait === true || !exec.agent?.id) return next();
+    const result = await next();
+    if (result.isError) return result;
+    const value = result.value;
+    const job = value?.job;
+    if (!job || typeof value.text !== 'string') return result;
+    const owned = ctx.get?.('jobs')?.list(exec.agent.id).find((item) => item.id === job.id && item.owner === exec.agent.id &&
+      item.kind === 'codex' && /^Codex [^\s·]+(?: · |$)/.test(item.label ?? ''));
+    if (!owned) return result;
+    const short = dampenStatus({ job_id: job.id, status: job.status, last_activity: job.detail,
+      output: value.text, background_job_id: job.id }, exec, 'job_output');
+    if (!short) return result;
+    return { ...result, value: { ...value, text: short.rendered, job: { ...job, detail: '状态无实质变化' } },
+      content: [{ type: 'text', text: short.rendered }] };
   });
 
   if (cfg.roots.length) {
@@ -1719,6 +1764,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           ...(cfg.gemini ? ['gemini_write'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
+        autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
