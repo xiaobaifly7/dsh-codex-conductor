@@ -588,13 +588,13 @@ test('filtered arguments cannot hide flags in command substitutions', () => {
     'find . $(echo -delete)', "find . $(echo -exec) sh -c 'id' \\;",
     'git diff $(echo --output=pwned)', 'sort $(echo -o pwned) f',
     'uniq $(echo input output)', 'iconv $(echo -o out) in', 'rg $(echo --pre=sh) x',
-    'tree $(echo -o out)', 'printf $(echo -v) target value',
+    'tree $(echo -o out)', 'printf $(echo -v) target value', 'printf -- "$(echo -v)"',
     'node --check $(echo --eval=code)', 'go test $(echo -exec=sh) ./...',
     'cargo test $(echo --config=runner)', 'make test $(echo --eval=code)',
     'npm test $(echo --script-shell=sh)', 'pnpm test $(echo --script-shell=sh)',
     'yarn test $(echo --use=code)',
   ]) assert.equal(readOnlyCommand(c), false, c);
-  for (const c of ['cat $(ls)', 'printf "%s\\n" "$f" "$(wc -c < f)"', 'printf -- "$(echo -v)"']) {
+  for (const c of ['cat $(ls)', 'printf "%s\\n" "$f" "$(wc -c < f)"']) {
     assert.equal(readOnlyCommand(c), true, c);
   }
 });

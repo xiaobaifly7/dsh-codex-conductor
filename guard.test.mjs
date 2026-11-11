@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createProductReads, plannerReadTargets, readPath, decide, PRODUCT_HINT, PRODUCT_DENY_HINT } from './guard.mjs';
+import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, PRODUCT_HINT, PRODUCT_DENY_HINT } from './guard.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const call = (name, args, owner = 'S1') => ({
@@ -18,6 +18,54 @@ const deferred = () => {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 };
+
+test('rg file enumeration stays unrestricted with literal paths and glob options', async () => {
+  const scope = createProductReads({}, completed);
+  for (const command of [
+    'rg --files', 'rg --files /repo', "rg --files -g '*.mjs' /repo",
+    "rg --hidden --files --glob='*.mjs' -tjs /repo", 'rg --files -g--json /repo',
+    'rg --files -- --json',
+  ]) {
+    const exec = call('wsl', { command });
+    assert.equal(readOnlyCommand(command), true, command);
+    assert.deepEqual(plannerReadTargets(exec), [], command);
+    assert.equal(await scope.check(exec), undefined, command);
+  }
+});
+
+test('rg search modes and operand spellings cannot bypass products through --files', async () => {
+  const scope = createProductReads({}, completed);
+  for (const flag of ['--json', '--count', '--count-matches', '--files-with-matches', '--files-without-match', '-c', '-l', '-nc']) {
+    for (const flags of [`--files ${flag}`, `${flag} --files`]) {
+      const command = `rg ${flags} fact /repo/raw.js`;
+      assert.equal(await scope.check(call('wsl', { command })), denial, command);
+    }
+  }
+  for (const command of [
+    'rg -g --files fact /repo/raw.js', 'rg -- fact /repo/raw.js --files',
+    'rg --files --ignore-file /repo/raw.js', 'rg --files -nf /repo/raw.js',
+  ]) assert.equal(await scope.check(call('wsl', { command })), denial, command);
+});
+
+test('printf refuses expanded options and assigning format conversions', () => {
+  for (const command of [
+    'printf {-v,PATH} %s /usr/bin', 'printf -[v] PATH %s /usr/bin', 'printf * PATH %s /usr/bin',
+    'printf "$format" PATH', 'printf %n PATH', 'printf -- %n PATH', "printf '%%%n' PATH",
+    "printf '%5n' PATH", "printf '%05.2lln' PATH", "printf '%s%n' text PATH",
+    'printf -- "$format" PATH', 'printf -- $(echo %n) PATH',
+    'timeout 1s printf {-v,PATH} %s /usr/bin',
+    'find . -exec printf {-v,PATH} %s /usr/bin \\;',
+  ]) {
+    assert.equal(readOnlyCommand(command), false, command);
+    for (const mode of ['open', 'products']) assert.equal(typeof decide(call('wsl', { command }), config(mode)), 'string', command);
+  }
+  for (const command of [
+    "printf '%s\\n' hello", "printf '%%n'", "printf '%%%%n'", 'printf -- %s %n',
+    'printf %s "$value"', "printf '%s' '{-v,PATH}'", 'printf %s {a,b}',
+    "printf '%s' '-[v]'", String.raw`printf \%s hello`, 'printf -- -v',
+    'find . -exec printf %s {} \\;',
+  ]) assert.equal(readOnlyCommand(command), true, command);
+});
 
 test('product refresh waits for recovery without labeling unrelated raw paths as possible artifacts', async () => {
   const recovery = deferred();

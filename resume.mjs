@@ -223,7 +223,7 @@ export function registerAutoWake({ ctx, enabled = true }) {
       ['completed', 'failed', 'killed'].includes(job.status));
     if (!job) return;
     let batch = batches.get(agent.id);
-    if (batch && (batch.agent !== agent || (agent.status === 'idle' && !pendingNotices(agent, batch)))) {
+    if (batch && (batch.agent !== agent || !pendingNotices(agent, batch))) {
       forget(agent.id);
       batch = undefined;
     }
