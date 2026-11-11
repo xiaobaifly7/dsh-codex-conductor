@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.81` 修复 `products` 模式把 Promise 返回宿主同步 `tools.guard`、导致无关工具也报 JSON 序列化错误的问题。guard 始终同步返回放行或拒绝；尚待恢复的产物读取在异步 `tools/execute` 中最多等待 3 秒，确认权限前不执行原工具。新增覆盖两种读取模式、工作区边界和任意工具名的同步契约测试，以及恢复成功、失败和超时的执行前拦截测试。
+
 `0.9.80` 统一派单后留在本轮长等、按需补读报告及一次验收的流程；中止纯观察不取消 Codex，未登记后台的同步派单中止仍取消。完善 `products` 与 Obsidian 读取守卫及产物恢复的有界等待；Gemini 成功输出仅在当前实例登记，跨重载自动恢复未实现，正文须由只读 Codex 任务核对本次输出与素材；保留完成通知及空闲会话唤醒。
 
 `0.9.79` 新增独立的本机 `send-request.json` 入口，以用户身份向已结束的空闲会话提交新任务；原有恢复入口保持不变。
@@ -426,6 +428,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.81` fixes Promise returns from the synchronous host `tools.guard` in products mode, which caused JSON serialization errors even for unrelated tools. Guards always return synchronously; reads awaiting product recovery wait up to three seconds in asynchronous `tools/execute` middleware before the original tool can run. New contract tests cover both read modes, workspace boundaries and arbitrary tool names, plus interception before dispatch on recovery success, failure and timeout.
 
 `0.9.80` unifies same-turn long waits after dispatch, report reads only when needed, and one review per product version. Aborting observation leaves Codex running; aborting synchronous dispatch without background registration still cancels it. Products-only and Obsidian guards use bounded waits for product recovery; successful Gemini outputs are registered only in the current instance, with automatic recovery across reloads not implemented, and a read-only Codex task must check each new output against its sources. Completion notices and idle-session wakes remain available.
 

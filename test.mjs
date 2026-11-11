@@ -1141,7 +1141,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, listResult, outputResult, reviewResult, summaryResult, ...pluginConfig } = config;
+  const { startResult, cancelResult, listResult, outputResult, reviewResult, summaryResult, productsResult, ...pluginConfig } = config;
   const run = (_cfg, argv, options = {}) => {
     calls.push(argv);
     requests.push({ argv, ...options });
@@ -1152,7 +1152,8 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'review') return Promise.resolve(reviewResult);
     if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
-    if (argv[0] === 'products') return Promise.resolve({ status: 'completed', owner: argv[2], paths: [] });
+    if (argv[0] === 'products') return Promise.resolve((typeof productsResult === 'function' ? productsResult(argv) : productsResult) ??
+      { status: 'completed', owner: argv[2], paths: [] });
     if (argv[0] === 'status' && argv[3] === '20') return new Promise((resolve) =>
       (waiters[argv[1]] ??= []).push({ resolve, onProgress: options.onProgress }));
     // 下一轮事件循环才答：后台循环的等待参数若不是 20，也不会只靠微任务空转、饿死 answer()
@@ -1181,6 +1182,129 @@ const tick = () => new Promise((r) => setImmediate(r));
 const nudges = [];
 const agentAt = (cwd, log = []) => ({ id: 'S1', session: { header: { cwd }, log }, steer: (m) => nudges.push(m) });
 const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: false, wait_seconds: 0 };
+
+function hostGuardReason(h, exec) {
+  // 宿主 ToolLayer.guardReason 同步使用返回值，绝不 await；所有非 undefined 值都会成为拒绝理由。
+  for (const guard of h.guards) {
+    const reason = guard(exec);
+    assert.ok(reason === undefined || typeof reason === 'string', `${exec.name}: guard returned ${typeof reason}`);
+    if (reason !== undefined) return reason;
+  }
+}
+
+async function hostExecute(h, exec, next) {
+  const reason = hostGuardReason(h, exec);
+  const result = reason === undefined ? await h.handlers['tools/execute'](exec, next)
+    : { isError: true, error: { message: reason }, content: [{ type: 'text', text: `Error: ${reason}` }] };
+  // 宿主把 guard 拒绝及中间件结果物化为无损 JSON，不能只靠 JSON.stringify 吞掉 Promise/undefined。
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  return result;
+}
+
+test('host guard contract returns only undefined or strings across modes, workspaces and arbitrary tools', async () => {
+  const tools = [
+    ['mcp__hindsight_recall__recall', { query: 'context' }], ['tool_describe', { name: 'read' }],
+    ['tool_search', { query: 'read' }], ['codex_status', { job_id: 'J' }], ['job_output', { job_id: 'bg1' }],
+    ['codex_continue', { job_id: 'J' }], ['arbitrary_unrelated_tool', {}], ['edit', {}],
+    ['read', { path: '/repo/raw.js' }], ['read', { path: '/repo/report.md' }], ['read', { path: '/repo/allowed.md' }],
+    ['read', {}], ['wsl', { command: 'cat /repo/raw.js' }], ['wsl', { command: 'ls /repo' }],
+    ['mcp__notes__obsidian_read', { path: '/repo/raw.js' }], ['obsidian_search', { path: '/repo/raw.js', query: 'fact' }],
+    ['mcp__notes__obsidian_frontmatter', { path: '/repo/raw.js', action: 'get' }],
+    ['obsidian_frontmatter', { path: '/repo/raw.js', action: 'set', content: {} }], ['obsidian_list', {}], ['gemini_write', {}],
+  ];
+  for (const plannerReads of ['open', 'products']) {
+    const h = harness({ config: { workspaces: ['/repo'], plannerReads, plannerReadAllow: ['/repo/allowed.md'],
+      productsResult: { status: 'completed', owner: 'S1', paths: ['/repo/report.md'] } } });
+    // 首次恢复前及恢复后都检查原始返回值；await guard 会掩盖 0.9.80 的线上故障。
+    for (let pass = 0; pass < 2; pass++) {
+      for (const cwd of ['/repo', '/repo/sub', '/elsewhere', '']) for (const [name, args] of tools) {
+        const exec = { name, arguments: Object.freeze(args), agent: agentAt(cwd) };
+        const reason = hostGuardReason(h, exec);
+        if (!cwd.startsWith('/repo')) assert.equal(reason, undefined, `${plannerReads}: ${name} outside workspace`);
+      }
+      for (const [name, args] of tools) assert.equal(hostGuardReason(h, { name, arguments: args }), undefined);
+      await tick();
+    }
+    const success = { isError: false, value: { ok: true }, content: [{ type: 'text', text: 'ok' }] };
+    for (const [name, args] of tools.slice(0, 7)) {
+      assert.equal(await hostExecute(h, { name, arguments: args, agent: agentAt('/repo') }, async () => success), success);
+    }
+    assert.equal(hostGuardReason(h, { name: 'read', arguments: { path: '/repo/report.md' }, agent: agentAt('/repo') }), undefined);
+    const raw = hostGuardReason(h, { name: 'read', arguments: { path: '/repo/raw.js' }, agent: agentAt('/repo') });
+    if (plannerReads === 'products') assert.match(raw, /原料/);
+    else assert.equal(raw, undefined);
+  }
+});
+
+test('products middleware refuses lookup failures after the synchronous guard', async () => {
+  const h = { guards: [], handlers: {} };
+  let unavailable = false;
+  apply({ tools: { register() {}, guard: g => h.guards.push(g) }, on: (name, handler) => { h.handlers[name] = handler; },
+    get(key) {
+      if (key === 'workingDirectory') return { get() {
+        if (unavailable) throw new Error('directory unavailable');
+        return '/repo';
+      } };
+    } }, { workspaces: ['/repo'], plannerReads: 'products' },
+    async (_cfg, argv) => ({ status: 'completed', owner: argv[2], paths: ['/repo/report.md'] }));
+  const exec = { name: 'read', arguments: { path: '/repo/report.md' }, agent: agentAt('/repo') };
+  assert.equal(hostGuardReason(h, exec), undefined);
+  unavailable = true;
+  const denied = await h.handlers['tools/execute'](exec, async () => assert.fail('lookup failure dispatched'));
+  assert.equal(denied.isError, true);
+  assert.match(denied.error.message, /护栏判定出错.*已拒绝/);
+  assert.deepEqual(JSON.parse(JSON.stringify(denied)), denied);
+  assert.deepEqual(denied.content, [{ type: 'text', text: `Error: ${denied.error.message}` }]);
+});
+
+test('products middleware waits before dispatch and returns guard-equivalent errors for raw reads', async () => {
+  const recovery = Promise.withResolvers();
+  const h = harness({ config: { workspaces: ['/repo'], plannerReads: 'products',
+    plannerReadAllow: ['/repo/allowed.md'], productsResult: recovery.promise } });
+  const exec = file => ({ name: 'read', arguments: { path: file }, agent: agentAt('/repo') });
+  const success = { isError: false, value: { text: 'product' }, content: [{ type: 'text', text: 'product' }] };
+  const dispatched = [];
+  const read = file => hostExecute(h, exec(file), async () => { dispatched.push(file); return success; });
+  const product = read('/repo/report.md');
+  const raw = read('/repo/raw.js');
+  await tick();
+  assert.deepEqual(dispatched, []);
+  assert.equal(h.calls.filter(argv => argv[0] === 'products').length, 1);
+  assert.equal(await read('/repo/allowed.md'), success);
+  recovery.resolve({ status: 'completed', owner: 'S1', paths: ['/repo/report.md'] });
+  assert.equal(await product, success);
+  const denied = await raw;
+  assert.deepEqual(denied, { isError: true, error: { message: hostGuardReason(h, exec('/repo/raw.js')) },
+    content: [{ type: 'text', text: `Error: ${denied.error.message}` }] });
+  assert.deepEqual(dispatched, ['/repo/allowed.md', '/repo/report.md']);
+  assert.equal(hostGuardReason(h, exec('/repo/report.md')), undefined);
+  assert.match(hostGuardReason(h, exec('/repo/raw.js')), /原料/);
+  // 中间件自身也检查，不能依赖某个 exec 对象上的延后标记。
+  assert.equal((await h.handlers['tools/execute']({ ...exec('/repo/raw.js') }, async () => assert.fail('raw read dispatched'))).isError, true);
+});
+
+test('products middleware refuses failed or timed-out recovery without dispatching', { timeout: 10_000 }, async () => {
+  for (const failure of ['failed', 'timeout']) {
+    const recovery = Promise.withResolvers();
+    const h = harness({ config: { workspaces: ['/repo'], plannerReads: 'products', productsResult: recovery.promise } });
+    const exec = { name: 'read', arguments: { path: '/repo/report.md' }, agent: agentAt('/repo') };
+    assert.equal(hostGuardReason(h, exec), undefined);
+    const result = hostExecute(h, exec, async () => assert.fail('unconfirmed read dispatched'));
+    if (failure === 'failed') recovery.reject(new Error('runner unavailable'));
+    const denied = await result;
+    assert.equal(denied.isError, true);
+    assert.match(denied.error.message, failure === 'failed' ? /恢复失败.*未获读取授权/ : /暂时无法确认.*稍后重试一次/);
+    assert.deepEqual(denied.content, [{ type: 'text', text: `Error: ${denied.error.message}` }]);
+    assert.equal(h.calls.filter(argv => argv[0] === 'products').length, 1);
+    if (failure === 'timeout') {
+      recovery.resolve({ status: 'completed', owner: 'S1', paths: ['/repo/report.md'] });
+      await tick();
+      assert.equal(hostGuardReason(h, exec), undefined);
+      const success = { isError: false, value: {}, content: [] };
+      assert.equal(await hostExecute(h, exec, async () => success), success);
+    }
+  }
+});
 
 function workflowSource(kind = 'user_input') {
   return { job_id: 'PARENT', status: 'completed', thread_id: 'THREAD', cwd: '/work/original', sandbox: 'workspace-write',
@@ -3320,12 +3444,12 @@ test('non-retryable failures explain the impact before raw errors and keep inter
   assert.match(text, /向用户汇报[\s\S]*不必带任务号和内部状态名/);
 });
 
-test('products guard errors delegate without listing commands that the same mode refuses', async () => {
+test('products guard errors delegate without listing commands that the same mode refuses', () => {
   let guard;
   apply({ tools: { register() {}, guard(value) { guard = value; } }, on() {}, get(key) {
     if (key === 'workingDirectory') return { get() { throw new Error('directory unavailable'); } };
   } }, { workspaces: ['/repo'], plannerReads: 'products' });
-  const denied = await guard({ name: 'read', arguments: { path: '/repo/raw.md' }, agent: agentAt('/repo') });
+  const denied = guard({ name: 'read', arguments: { path: '/repo/raw.md' }, agent: agentAt('/repo') });
   assert.match(denied, /护栏判定出错[\s\S]*已拒绝[\s\S]*codex_run[\s\S]*codex_verify/);
   assert.match(denied, /不要换命令、语言或工具入口重试/);
   assert.doesNotMatch(denied, /git diff|sha256sum|pytest|npm test/);
@@ -4054,11 +4178,12 @@ test('products mode remembers this session\'s gemini output without granting its
   const h = geminiFixture(t, { config: { plannerReads: 'products' } });
   const result = await h.execute();
   assert.equal(result.status, 'completed');
-  assert.equal(await h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), undefined);
-  assert.match(await h.guards[0]({ ...call('read', { file_path: path.join(h.cwd, 'notes.md') }, h.cwd), agent: agentAt(h.cwd) }), /原料/);
+  assert.equal(hostGuardReason(h, { ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), undefined);
+  const denied = exec => hostExecute(h, exec, async () => assert.fail('Gemini source or another owner\'s product dispatched'));
+  assert.match((await denied({ ...call('read', { file_path: path.join(h.cwd, 'notes.md') }, h.cwd), agent: agentAt(h.cwd) })).error.message, /原料/);
   const other = agentAt(h.cwd);
   other.id = 'S2';
-  assert.match(await h.guards[0]({ ...call('read', { file_path: result.output }, h.cwd), agent: other }), /原料/);
+  assert.match((await denied({ ...call('read', { file_path: result.output }, h.cwd), agent: other })).error.message, /原料/);
   assert.match(result.next, /机械核对.*codex_run.*只读.*本次 output 与本次 sources/);
   assert.doesNotMatch(result.next, /codex_verify|原 Codex 素材任务/);
 });
