@@ -2007,6 +2007,23 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.control("list", "--needs-attention")["total"], 0)
         self.assertEqual(self.control("list")["jobs"][0]["verification"], value["verification"])
 
+    def test_review_deviation_errors_list_allowed_missing_and_extra_indexes(self):
+        report = self.sample_report(deviations=["First deviation", "Second deviation"])
+        self.stored_job("review-hints", {"status": "completed", "structured": report,
+                        "files_changed": [{"path": "outside.txt", "change": "modified"}]},
+                        context=self.sample_context(), scope=["allowed"])
+        allowed = "[('reported', 1), ('reported', 2), ('scope', 1)]"
+        cases = [([{"kind": "scope", "index": 2, "evidence": "checked"},
+                   {"kind": "reported", "index": 1, "evidence": "checked"}],
+                  "[('reported', 2), ('scope', 1)]", "[('scope', 2)]"),
+                 ([], allowed, "[]"),
+                 ([{"kind": "scope", "index": [], "evidence": "checked"}], allowed, "[]")]
+        for deviations, missing, extra in cases:
+            with self.subTest(deviations=deviations):
+                result = self.submit_review("review-hints", self.sample_review(accepted_deviations=deviations))
+                self.assertEqual(result["error_kind"], "bad_arguments")
+                self.assertIn(f"allowed={allowed}, missing={missing}, extra={extra}", result["error"])
+
     def test_review_blockers_drive_continuation_questions_without_rewriting_report(self):
         report = self.sample_report()
         self.stored_job("review-blocked", {"status": "completed", "structured": report}, context=self.sample_context())

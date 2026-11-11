@@ -1154,17 +1154,21 @@ def validate_review(review, value):
     acknowledged = set()
     if not isinstance(review["accepted_deviations"], list):
         raise ValueError("accepted_deviations must be an array")
+    submitted = {(d["kind"], d["index"]) for d in review["accepted_deviations"]
+                 if isinstance(d, dict) and isinstance(d.get("kind"), str) and type(d.get("index")) is int}
+    deviation_hint = (f"; allowed={sorted(expected)}, missing={sorted(expected - submitted)}, "
+                      f"extra={sorted(submitted - expected)}")
     for deviation in review["accepted_deviations"]:
         if (not isinstance(deviation, dict) or set(deviation) != {"kind", "index", "evidence"} or
                 not isinstance(deviation["kind"], str) or type(deviation["index"]) is not int or
                 (deviation["kind"], deviation["index"]) not in expected or
                 not isinstance(deviation["evidence"], str) or not deviation["evidence"].strip() or
                 (deviation["kind"], deviation["index"]) in acknowledged):
-            raise ValueError("Deviation acknowledgements require real unique indexes and nonempty evidence")
+            raise ValueError("Deviation acknowledgements require real unique indexes and nonempty evidence" + deviation_hint)
         acknowledged.add((deviation["kind"], deviation["index"]))
     if review["status"] != "needs_changes":
         if (any(c["status"] != "met" for c in criteria) or acknowledged != expected or review.get("blockers")):
-            raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers")
+            raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers" + deviation_hint)
     return review
 
 
