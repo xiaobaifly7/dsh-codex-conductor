@@ -1155,6 +1155,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     name: 'codex_run',
     description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回两个任务号；' + WAIT_GUIDANCE + '必须给出验收标准和 write：' +
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
+      '同一授权范围内，一单完成一个可验收结果，路径、平台和参数适配在单内处理。' +
+      '教程修订后的终检与目录导航同一单：write=true，scope 只含目录页，正文与素材只读。不要同时要求写入和禁止 mtime 变化。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。' +
       (cfg.plannerReads === 'products' ? 'completed 后先机械核对产物、出处和数字，内容是否属实用 codex_verify，' : 'completed 后你要逐条只读核验，') +
@@ -1480,8 +1482,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (children.jobs.length) {
           const child = withReport(await conductor.waitJob(children.jobs[0].job_id, 0));
           const bg = liveBackground(child.job_id, exec);
-          return { ...child, reused: true, ...(bg ? { background_job_id: bg.id } : {}),
-            next: `原任务已有后续轮次 ${child.job_id}，没有重复派活。补充信息或修正请基于该轮次。\n${nextStep(child, undefined, undefined, cfg)}` };
+          return { ...child, reused: true, reused_existing_child: true, submitted: false, ...(bg ? { background_job_id: bg.id } : {}),
+            next: `本次 answers/resolution 未应用，继续使用 job ${child.job_id}；要补充新内容请对 ${child.job_id} 调 codex_continue。\n${nextStep(child, undefined, undefined, cfg)}` };
         }
         const plan = prepareContinuation(source, args, owner);
         const needsReply = plan.ready && plan.blocking.questions.length > 0 &&
@@ -1503,7 +1505,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
       (cfg.plannerAnswers ? 'accepted_deviations=逐条通过且规划端按用户原始目标和已有事实接受原报告偏差或范围外改动。' + PLANNER_ANSWERS
         : 'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。') +
-      '不能把 Codex 自报 met 当作独立核验。只能记录当前会话拥有的任务。',
+      '不能把 Codex 自报 met 当作独立核验。审计/核对类任务逐项判断是否完成核对：已完成记 met；被审正文的缺陷写入 notes/结论，不因此记 needs_changes。' +
+      'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
@@ -1548,6 +1551,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     name: 'codex_summary',
     description: '只读汇总当前会话的多轮 Codex 任务；相同 thread_id 归为一组，无线程的独立列出。' +
+      '上下文压缩或接手后先调 codex_summary，再按需读具体 job。' +
       '显示最新验收、待办、交付文件、累计已结束耗时、用量及筛选范围内的错误分类统计。thread_total 是线程累计值，不把每轮累计值重复相加。' +
       '可传 cwd 查一个项目，或 session_id 查指定会话；默认每页 10 组，用 limit 和 offset 翻页。不会启动或继续任务。',
     presentCall: () => ({ card: 'generic', kind: 'read', title: 'Codex 多轮任务汇总' }),

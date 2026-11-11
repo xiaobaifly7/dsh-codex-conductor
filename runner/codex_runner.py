@@ -8,6 +8,7 @@
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
 """
 import argparse
+from collections import Counter
 from contextlib import closing, suppress
 import errno
 from functools import cache
@@ -1170,13 +1171,21 @@ def validate_review(review, value):
     indexes = []
     for criterion in criteria:
         if (not isinstance(criterion, dict) or set(criterion) != {"index", "status", "evidence"} or
-                type(criterion["index"]) is not int or not 1 <= criterion["index"] <= len(acceptance) or
+                type(criterion["index"]) is not int or
                 not isinstance(criterion["status"], str) or criterion["status"] not in ("met", "not_met", "blocked") or
                 not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip()):
             raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence")
         indexes.append(criterion["index"])
     if sorted(indexes) != list(range(1, len(acceptance) + 1)):
-        raise ValueError("Review must cover every acceptance criterion exactly once")
+        counts = Counter(indexes)
+        expected = set(range(1, len(acceptance) + 1))
+        missing = sorted(expected - counts.keys())
+        missing_criteria = {i: (acceptance[i - 1]["criterion"] if isinstance(acceptance[i - 1], dict)
+                                else acceptance[i - 1])[:60] for i in missing}
+        raise ValueError("Review must cover every acceptance criterion exactly once"
+                         f"; acceptance_count={len(acceptance)}, out_of_range={sorted(counts.keys() - expected)}, "
+                         f"duplicates={sorted(i for i, count in counts.items() if count > 1)}, "
+                         f"missing={missing}, missing_criteria={missing_criteria}")
     reported = report.get("deviations", []) if isinstance(report, dict) else []
     if not isinstance(reported, list) or any(not isinstance(d, str) for d in reported):
         raise ValueError("Reported deviations cannot be indexed")

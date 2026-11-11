@@ -2220,6 +2220,33 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["error_kind"], "bad_arguments")
                 self.assertIn(f"allowed={allowed}, missing={missing}, extra={extra}", result["error"])
 
+    def test_review_criteria_errors_list_count_out_of_range_duplicate_and_missing_indexes(self):
+        acceptance = [f"验收 {i}：" + "原文😀" * 25 for i in range(1, 19)]
+        report = self.sample_report(criteria=[{"criterion": item, "status": "met", "evidence": "checked"}
+                                             for item in acceptance])
+        cases = [(list(range(1, 20)), [19], [], []),
+                 ([*range(1, 18), 17], [], [17], [18]),
+                 ([19, 0, 19, *range(3, 19)], [0, 19], [19], [1, 2]),
+                 ([], [], [], list(range(1, 19)))]
+        for source in ("context", "legacy"):
+            task = {"context": {**self.sample_context(), "acceptance": acceptance}} if source == "context" else {}
+            jd = self.stored_job(f"criteria-hints-{source}", {"status": "completed", "structured": report}, **task)
+            for indexes, outside, duplicates, missing in cases:
+                with self.subTest(source=source, indexes=indexes):
+                    criteria = [{"index": i, "status": "met", "evidence": "checked"} for i in indexes]
+                    result = self.submit_review(jd.name, self.sample_review(criteria=criteria))
+                    self.assertEqual(result["error_kind"], "bad_arguments")
+                    self.assertIn(f"acceptance_count=18, out_of_range={outside}, duplicates={duplicates}, "
+                                  f"missing={missing}", result["error"])
+                    snippets = {i: acceptance[i - 1][:60] for i in missing}
+                    self.assertIn(f"missing_criteria={snippets}", result["error"])
+                    self.assertFalse((jd / "reviews.json").exists())
+            criteria = [{"index": i, "status": "met", "evidence": "checked"} for i in range(18, 0, -1)]
+            result = self.submit_review(jd.name, self.sample_review(criteria=criteria))
+            self.assertEqual(result["verification_status"], "verified")
+            self.assertEqual(result["verification"]["criteria"], criteria)
+            self.assertEqual(result["structured"], report)
+
     def test_review_blockers_drive_continuation_questions_without_rewriting_report(self):
         report = self.sample_report()
         self.stored_job("review-blocked", {"status": "completed", "structured": report}, context=self.sample_context())
