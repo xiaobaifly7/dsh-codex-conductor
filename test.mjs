@@ -2342,6 +2342,32 @@ test('after a plugin reload the live background job is reused, not registered ag
   await jobs.started[0].done;
 });
 
+test('reloaded native waits verify runner ownership before reading the job', async (t) => {
+  const jobs = fakeJobs();
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  const before = harness({ jobs });
+  await before.tools.codex_run.execute(RUN, exec);
+  t.after(async () => {
+    await before.answer('J1', { status: 'completed' });
+    await jobs.started[0].done;
+  });
+
+  const reloaded = () => harness({ jobs, config: { plannerReads: 'products' } });
+  const owned = reloaded();
+  owned.finals.J1 = { job_id: 'J1', status: 'running', context: { owner: 'S1' } };
+  const wait = t.mock.method(jobs, 'wait');
+  const value = await owned.tools.codex_status.execute({ job_id: 'J1', wait_seconds: 0 }, exec);
+  assert.equal(value.background_job_id, 'bg1');
+  assert.deepEqual(owned.calls, [['status', 'J1', '--wait', '0']]);
+  assert.equal(wait.mock.callCount(), 1);
+
+  const foreign = reloaded();
+  foreign.finals.J1 = { job_id: 'J1', status: 'running', context: { owner: 'S2' } };
+  await assert.rejects(foreign.tools.codex_status.execute({ job_id: 'J1', wait_seconds: 0 }, exec), /暂时无法确认任务属于本会话/);
+  assert.equal(wait.mock.callCount(), 1);
+  assert.equal(jobs.started.length, 1);
+});
+
 test('reattaches pending owned jobs on reload or agent creation without redispatching', async () => {
   for (const alreadyLive of [true, false]) {
     const jobs = fakeJobs();

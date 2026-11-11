@@ -1239,8 +1239,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
       const seconds = Math.min(args.wait_seconds ?? 0, 86_400);
-      const value = await queryWithTimeout(() => collect(args.job_id, liveBackground(args.job_id, exec), seconds, exec?.signal),
-        undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
+      const value = await queryWithTimeout(async (signal) => {
+        const bg = liveBackground(args.job_id, exec);
+        // 原生后台状态不一定带 runner 归属，热加载后的首次等待先查持久化任务。
+        if (bg && restrictedReads(exec)) {
+          await ensureOwnJob(args.job_id, exec, 'codex_status');
+          signal.throwIfAborted();
+        }
+        return collect(args.job_id, bg, seconds, exec?.signal);
+      }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
       return value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
     },

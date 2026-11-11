@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.76` 修复插件热加载后本会话仍在运行的后台任务首次查状态可能被误拒的问题。
+
 `0.9.75` 在派单返回中给出可直接调用的报告和状态参数：`job_output` 的 `job_id` 填 Harness 的 `background_job_id`，`codex_status` 和 `codex_output` 用 runner `job_id`。
 
 `0.9.74` 让续接请求可以唤醒最后一轮被门禁阻止、且 inbox 仍有待处理输入的空闲会话，由宿主领取原有输入，不新增用户消息或重发推进提示。
@@ -381,6 +383,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.76` fixes the first status check for a session’s running background job after a plugin reload.
 
 `0.9.75` gives ready-to-use report and status calls: pass the Harness `background_job_id` as `job_output`’s `job_id`, and use the runner `job_id` for `codex_status` and `codex_output`.
 
