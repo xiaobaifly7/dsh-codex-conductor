@@ -67,7 +67,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   value = object(value) ? value : {};
   const blocking = blockingState(value);
   const refuse = (next, remaining_questions = blocking.questions) => ({ ready: false, blocking, next, remaining_questions });
-  if (executionOf(value) === 'running') return refuse(`原任务 ${value.job_id ?? '（缺少 job_id）'} 仍在运行，使用原 job_id 调用 codex_status 查询，不启动新任务。`);
+  if (executionOf(value) === 'running') return refuse(`原任务 ${value.job_id ?? '（缺少 job_id）'} 仍在运行，留在本轮，使用原 runner job_id 调用 codex_status 并传 wait_seconds: 3600；等满仍在运行就继续等同一任务，返回报告后直接验收，不启动新任务。`);
   const context = value.context;
   if (!nonempty(owner) || !object(context) || !nonempty(context.owner) || context.owner !== owner) {
     return refuse('原任务归属未知或不属于当前 owner，不能准备续跑。');

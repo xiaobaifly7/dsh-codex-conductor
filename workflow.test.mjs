@@ -48,6 +48,7 @@ test('running always waits, even when a previous report or review is present', (
   const result = plan(value);
   assert.equal(result.ready, false);
   assert.match(result.next, /job-123.*codex_status/);
+  assert.match(result.next, /留在本轮.*runner job_id.*wait_seconds: 3600.*返回报告后直接验收/);
   assert.equal(result.args, undefined);
 });
 
