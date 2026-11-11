@@ -918,7 +918,8 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
       try { return statSync(native).isDirectory() && under(file, key); } catch { return false; }
     });
   };
-  return { add, async check(exec, cwd, directories = []) {
+  // null 仅表示须由异步 tools/execute 等待恢复，不能直接作为宿主 guard 的返回值。
+  const checkSync = (exec, cwd, directories = []) => {
     const targets = plannerReadTargets(exec, cwd, cfg.plannerReadAllow);
     if (targets?.length === 0) return undefined;
     const owner = exec?.agent?.id;
@@ -932,20 +933,26 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
         state.failed = false;
       }).catch(() => { state.failed = true; }).finally(() => { state.pending = null; });
     }
-    if (targets && state?.pending) {
-      let timer;
-      try {
-        await Promise.race([state.pending, new Promise(resolve => { timer = setTimeout(resolve, refreshTimeoutMs); })]);
-      } finally { clearTimeout(timer); }
-      if (targets.every(file => allowed(file, state, directories))) return undefined;
-      if (state.pending) return `[codex-conductor] 暂时无法确认读取权限，仅同一读取可稍后重试一次，再不行交 Codex。${PRODUCT_DENY_HINT}`;
-    }
+    if (targets && state?.pending) return null;
     if (!targets && String(exec?.name ?? '').split('__').at(-1).startsWith('obsidian_')) {
       return `[codex-conductor] 无法确定 vault 读取范围：需要明确的文件路径；相对路径需由 plannerReadAllow 确定唯一 vault 根，内容搜索不得无范围，frontmatter 只可读取。${PRODUCT_DENY_HINT}`;
     }
     if (targets && state?.failed) return `[codex-conductor] 产物登记恢复失败，该路径未获读取授权。${PRODUCT_DENY_HINT}`;
     // A completed recovery does not make an unrelated raw path a possible product.
     return `[codex-conductor] ${PRODUCT_HINT}`;
+  };
+  return { add, checkSync, async check(exec, cwd, directories = []) {
+    const result = checkSync(exec, cwd, directories);
+    if (result !== null) return result;
+    let timer;
+    try {
+      await Promise.race([sessions.get(exec.agent.id).pending,
+        new Promise(resolve => { timer = setTimeout(resolve, refreshTimeoutMs); })]);
+    } finally { clearTimeout(timer); }
+    const recovered = checkSync(exec, cwd, directories);
+    return recovered === null
+      ? `[codex-conductor] 暂时无法确认读取权限，仅同一读取可稍后重试一次，再不行交 Codex。${PRODUCT_DENY_HINT}`
+      : recovered;
   } };
 }
 

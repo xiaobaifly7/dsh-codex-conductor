@@ -1716,8 +1716,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } catch {}
   });
 
-  // tools/execute 在宿主的单调 guard 之后；先执行原工具，保留 ownership、消费与实时状态语义。
+  const guardError = (exec, error) => inWorkspace(sessionCwd(exec), cfg.roots)
+    ? cfg.plannerReads === 'products' ? `[codex-conductor] 护栏判定出错。${PRODUCT_DENY_HINT}`
+      : `[codex-conductor] 护栏判定出错，已拒绝：${error?.message ?? error}` : undefined;
+  const productReadLocation = (exec) => {
+    const cwd = ctx.get?.('workingDirectory')?.get(exec.agent.session) ?? sessionCwd(exec);
+    const location = ctx.get?.('sessionPersistence')?.locate?.(exec.agent.session.header);
+    return [cwd, location?.kind === 'jsonl' && typeof location.path === 'string' ? [path.dirname(location.path)] : []];
+  };
+  // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
+    if (restrictedReads(exec)) {
+      let denied;
+      try { denied = await productReads.check(exec, ...productReadLocation(exec)); }
+      catch (error) { denied = guardError(exec, error); }
+      if (denied !== undefined) return { isError: true, error: { message: denied },
+        content: [{ type: 'text', text: `Error: ${denied}` }] };
+    }
+    // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。
     if (exec.name !== 'job_output' || exec.arguments?.wait === true || !exec.agent?.id) return next();
     const result = await next();
     if (result.isError) return result;
@@ -1736,17 +1752,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
 
   if (cfg.roots.length) {
-    const guardError = (exec, error) => inWorkspace(sessionCwd(exec), cfg.roots)
-      ? cfg.plannerReads === 'products' ? `[codex-conductor] 护栏判定出错。${PRODUCT_DENY_HINT}`
-        : `[codex-conductor] 护栏判定出错，已拒绝：${error?.message ?? error}` : undefined;
     ctx.tools.guard((exec) => {
       try {
         const denied = decide(exec, cfg);
         if (denied || cfg.plannerReads !== 'products' || !inWorkspace(sessionCwd(exec), cfg.roots)) return denied;
-        const cwd = ctx.get?.('workingDirectory')?.get(exec.agent.session) ?? sessionCwd(exec);
-        const location = ctx.get?.('sessionPersistence')?.locate?.(exec.agent.session.header);
-        const directories = location?.kind === 'jsonl' && typeof location.path === 'string' ? [path.dirname(location.path)] : [];
-        return productReads.check(exec, cwd, directories).catch(error => guardError(exec, error));
+        // null 是内部延后判定；上面的中间件必须判定通过后才调用 next()。
+        return productReads.checkSync(exec, ...productReadLocation(exec)) ?? undefined;
       } catch (error) {
         return guardError(exec, error);
       }

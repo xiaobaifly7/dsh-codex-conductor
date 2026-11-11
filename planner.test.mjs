@@ -11,6 +11,15 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const call = (name, args = {}, owner = 'S1', cwd = '/repo') => ({ name, arguments: args, agent: { id: owner, session: { header: { cwd } } } });
 
+async function executionDenial(guard, execute, exec) {
+  const reason = guard(exec);
+  assert.ok(reason === undefined || typeof reason === 'string', 'host guards must return synchronously');
+  if (reason !== undefined) return reason;
+  const result = await execute(exec, async () => ({ isError: false, value: {}, content: [] }));
+  assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
+  return result.isError ? result.error.message : undefined;
+}
+
 test('products blocks file/search readers including MCP aliases and every mixed target', async () => {
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
   scope.add('S1', ['/repo/product.md']);
@@ -135,10 +144,12 @@ test('products allows only the current DSH session artifact directory', async t 
   }
   writeFileSync(path.join(root, 'raw.js'), 'raw source');
   let guard;
+  let execute;
   const previous = process.env.LOCALAPPDATA;
   process.env.LOCALAPPDATA = root;
   try {
-    apply({ tools: { register() {}, guard(value) { guard = value; } }, on() {},
+    apply({ tools: { register() {}, guard(value) { guard = value; } },
+      on(name, handler) { if (name === 'tools/execute') execute = handler; },
       get(key) { return key === 'sessionPersistence' ? {
         locate(header) { return { kind: 'jsonl', path: path.join(root, header.id, 'events.v4.jsonl') }; },
       } : undefined; } }, { workspaces: [root], plannerReads: 'products' },
@@ -147,7 +158,7 @@ test('products allows only the current DSH session artifact directory', async t 
   const read = (owner, file) => {
     const exec = call('read', { file_path: file }, owner, root);
     exec.agent.session.header.id = owner;
-    return guard(exec);
+    return executionDenial(guard, execute, exec);
   };
   for (const owner of ['S1', 'S2']) {
     assert.equal(await read(owner, path.join(root, owner, 'progress.md')), undefined);
@@ -208,10 +219,12 @@ test('apply updates products on completion while open mode keeps its guard and g
   const mount = '/repo';
   const create = mode => {
     const tools = {}, guards = [], calls = [];
+    let execute;
     const previous = process.env.LOCALAPPDATA;
     process.env.LOCALAPPDATA = root;
     try {
-      apply({ tools: { register: tool => tools[tool.name] = tool, guard: guard => guards.push(guard) }, on() {} },
+      apply({ tools: { register: tool => tools[tool.name] = tool, guard: guard => guards.push(guard) },
+        on(name, handler) { if (name === 'tools/execute') execute = handler; } },
         { workspaces: [mount], plannerReads: mode }, async (_cfg, argv) => {
           calls.push(argv);
           if (argv[0] === 'list') return { jobs: [], total: 0 };
@@ -221,18 +234,18 @@ test('apply updates products on completion while open mode keeps its guard and g
           throw new Error(`Unexpected ${argv[0]}`);
         });
     } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
-    return { tools, guard: guards[0], calls };
+    return { tools, guard: guards[0], calls, check: exec => executionDenial(guards[0], execute, exec) };
   };
   const h = create('products');
   await h.tools.codex_run.execute({ task: 'Write the requested product.', acceptance: ['Product exists'], write: true }, call('codex_run'));
-  for (const file of ['/repo/product.md', '/repo/extra.md', '/jobs/J1/last_message.txt']) assert.equal(await h.guard(call('read', { file_path: file })), undefined);
-  assert.match(await h.guard(call('read', { file_path: '/repo/raw.js' })), /原料/);
-  assert.match(await h.guard(call('read', { file_path: '/repo/product.md' }, 'S2')), /原料/);
-  assert.equal(await h.guard(call('read', { file_path: '/repo/raw.js' }, 'S1', '/outside')), undefined);
-  assert.match(await h.guard(call('write', { path: '/repo/product.md' })), /已拒绝/);
+  for (const file of ['/repo/product.md', '/repo/extra.md', '/jobs/J1/last_message.txt']) assert.equal(h.guard(call('read', { file_path: file })), undefined);
+  assert.match(await h.check(call('read', { file_path: '/repo/raw.js' })), /原料/);
+  assert.match(await h.check(call('read', { file_path: '/repo/product.md' }, 'S2')), /原料/);
+  assert.equal(h.guard(call('read', { file_path: '/repo/raw.js' }, 'S1', '/outside')), undefined);
+  assert.match(h.guard(call('write', { path: '/repo/product.md' })), /已拒绝/);
   const open = create('open');
-  assert.equal(await open.guard(call('read', { file_path: '/repo/raw.js' })), undefined);
-  assert.equal(await open.guard(call('wsl', { command: 'cat /repo/raw.js' })), undefined);
+  assert.equal(open.guard(call('read', { file_path: '/repo/raw.js' })), undefined);
+  assert.equal(open.guard(call('wsl', { command: 'cat /repo/raw.js' })), undefined);
   assert.deepEqual(open.calls, []);
   const job = { job_id: 'J', status: 'completed' };
   assert.equal(nextStep(job), nextStep(job, undefined, undefined, { plannerReads: 'open' }));

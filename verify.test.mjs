@@ -34,6 +34,7 @@ function sourceJob() {
 
 function harness({ source = sourceJob(), config = {}, running = false, jobs } = {}) {
   const tools = {};
+  const handlers = {};
   const calls = [];
   let guard;
   let payload;
@@ -63,7 +64,8 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
   const previousLocalAppData = process.env.LOCALAPPDATA;
   process.env.LOCALAPPDATA = localAppData;
   try {
-    apply({ tools: { register(tool) { tools[tool.name] = tool; }, guard(value) { guard = value; } }, on() {},
+    apply({ tools: { register(tool) { tools[tool.name] = tool; }, guard(value) { guard = value; } },
+      on(name, handler) { handlers[name] = handler; },
       get(key) { return key === 'jobs' ? jobs : undefined; } },
     { workspaces: ['/work'], allowHostAccess: true, waitSeconds: 0, model: 'new-default-model',
       effort: 'high', readOnlyEffort: 'medium', serviceTier: 'new-default-tier', ...config }, run);
@@ -73,6 +75,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
   }
   return { tools, calls, verify: (args = {}, caller = exec) => tools.codex_verify.execute({ job_id: 'SOURCE-1', ...args }, caller),
     guard: caller => guard(caller),
+    execute: (caller, next) => handlers['tools/execute'](caller, next),
     start: () => calls.find(call => call.argv[0] === 'start'), payload: () => payload,
     finishBackground: () => { assert.ok(finishBackground, 'background watcher must be running'); finishBackground(); } };
 }
@@ -272,7 +275,14 @@ test('self-reported changes cannot grant planner access to unwritten source file
   source.structured.files_changed.push('src/raw.js');
   const h = harness({ source, config: { plannerReads: 'products' } });
   await h.verify();
-  const read = file => h.guard({ ...exec, name: 'read', arguments: { file_path: file } });
+  const read = async file => {
+    const caller = { ...exec, name: 'read', arguments: { file_path: file } };
+    const reason = h.guard(caller);
+    assert.ok(reason === undefined || typeof reason === 'string', 'host guards must return synchronously');
+    if (reason !== undefined) return reason;
+    const result = await h.execute(caller, async () => ({ isError: false, value: {}, content: [] }));
+    return result.isError ? result.error.message : undefined;
+  };
   assert.equal(await read('/work/original/docs/result.md'), undefined);
   assert.match(await read('/work/original/src/raw.js'), /原料/);
   assert.doesNotMatch(h.payload().prompt, /\/work\/original\/src\/raw\.js/);
