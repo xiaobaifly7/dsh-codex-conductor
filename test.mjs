@@ -1183,6 +1183,19 @@ const nudges = [];
 const agentAt = (cwd, log = []) => ({ id: 'S1', session: { header: { cwd }, log }, steer: (m) => nudges.push(m) });
 const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: false, wait_seconds: 0 };
 
+test('tool descriptions guide audit judgement, dispatch scope and context recovery', () => {
+  for (const plannerAnswers of [false, true]) {
+    const { tools } = harness({ config: { plannerAnswers } });
+    assert.match(tools.codex_review.description, /审计\/核对类任务逐项判断是否完成核对：已完成记 met/);
+    assert.match(tools.codex_review.description, /正文的缺陷写入 notes\/结论，不因此记 needs_changes/);
+    assert.match(tools.codex_review.description, /Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正/);
+    assert.match(tools.codex_run.description, /同一授权范围内，一单完成一个可验收结果，路径、平台和参数适配在单内处理/);
+    assert.match(tools.codex_run.description, /教程修订后的终检与目录导航同一单：write=true，scope 只含目录页，正文与素材只读/);
+    assert.match(tools.codex_run.description, /不要同时要求写入和禁止 mtime 变化/);
+    assert.match(tools.codex_summary.description, /上下文压缩或接手后先调 codex_summary，再按需读具体 job/);
+  }
+});
+
 function hostGuardReason(h, exec) {
   // 宿主 ToolLayer.guardReason 同步使用返回值，绝不 await；所有非 undefined 值都会成为拒绝理由。
   for (const guard of h.guards) {
@@ -1604,9 +1617,16 @@ test('codex_continue shares concurrent dispatch and reuses an existing child aft
   after.finals.PARENT = h.finals.PARENT;
   after.finals.CHILD = { job_id: 'CHILD', status: 'running', context: { ...h.finals.PARENT.context,
     continuation: { parent_job_id: 'PARENT', answers: [], resolution: '' } } };
-  const reused = await after.tools.codex_continue.execute(args, { agent: agentAt('/work/current') });
+  const original = structuredClone(after.finals.CHILD);
+  const reused = await after.tools.codex_continue.execute({ ...args,
+    answers: [{ id: 'format', answer: '改用新格式' }], resolution: '新的补充信息' }, { agent: agentAt('/work/current') });
   assert.equal(reused.reused, true);
+  assert.equal(reused.reused_existing_child, true);
+  assert.equal(reused.submitted, false);
   assert.equal(reused.job_id, 'CHILD');
+  assert.match(reused.next, /本次 answers\/resolution 未应用，继续使用 job CHILD；要补充新内容请对 CHILD 调 codex_continue/);
+  assert.ok(after.tools.codex_continue.output.render({}, reused)[0].text.includes(reused.next));
+  assert.deepEqual(after.finals.CHILD, original);
   assert.equal(after.calls.filter((argv) => argv[0] === 'start').length, 0);
   const query = after.calls.find((argv) => argv[0] === 'list');
   assert.equal(query[query.indexOf('--parent-job') + 1], 'PARENT');
