@@ -733,6 +733,199 @@ class RunnerTests(unittest.TestCase):
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
 
+    def test_residual_codex_blocks_writers_only_while_its_identity_matches(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        residual = self.stored_job("residual", None)
+        waiter = self.stored_job("waiter", None)
+        (residual / "worker.pid").write_text("123")
+        (residual / "worker.start").write_text("old-worker")
+        (residual / "codex.pid").write_text("456")
+        (residual / "codex.start").write_text("original-codex")
+        (residual / "boot_id").write_text("same-boot")
+        for finished in (False, True):
+            if finished:
+                (residual / "result.json").write_text('{"status":"failed"}')
+            for start, boot, blocked in (("original-codex", "same-boot", True),
+                                         ("reused-codex", "same-boot", False),
+                                         ("original-codex", "new-boot", False)):
+                with self.subTest(finished=finished, start=start, boot=boot), \
+                        mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "boot_id", return_value=boot), \
+                        mock.patch.object(codex_runner, "process_start",
+                                          side_effect=lambda pid: start if pid == 456 else "reused-worker"):
+                    roots = codex_runner.write_lock_roots(str(self.cwd), "workspace-write", None)
+                    self.assertEqual(codex_runner.earlier_writer_waiting(waiter, roots), blocked)
+
+    def test_parent_child_writers_wait_and_sibling_writers_can_claim_locks(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        holder = self.stored_job("holder", None)
+        waiter = self.stored_job("waiter", None)
+        # A later submission that already claimed its locks must also block an earlier one.
+        os.utime(holder / "args.json", ns=(2_000_000_000, 2_000_000_000))
+        os.utime(waiter / "args.json", ns=(1_000_000_000, 1_000_000_000))
+        left, right, shared = (Path(self.tmp.name) / name for name in ("left", "right", "shared"))
+        cases = [(self.cwd, [], self.cwd / "src", [], True),
+                 (self.cwd / "src", [], self.cwd, [], True),
+                 (self.cwd / "src", [], self.cwd / "src2", [], False),
+                 (self.cwd / "src", [], self.cwd / "tests", [], False),
+                 (left, [str(shared)], right, [str(shared / "nested")], True),
+                 (left, [str(shared / "nested")], right, [str(shared)], True),
+                 (left, [str(shared / "left")], right, [str(shared / "right")], False)]
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            for cwd, extra, next_cwd, next_extra, blocked in cases:
+                with self.subTest(cwd=cwd, extra=extra, next_cwd=next_cwd, next_extra=next_extra):
+                    task = {"cwd": str(cwd), "sandbox": "workspace-write", "writable_roots": extra}
+                    (holder / "args.json").write_text(json.dumps(task))
+                    os.utime(holder / "args.json", ns=(2_000_000_000, 2_000_000_000))
+                    locks = [codex_runner.acquire_write_lock(p) for p in
+                             codex_runner.write_lock_roots(str(cwd), "workspace-write", extra).values()]
+                    try:
+                        roots = codex_runner.write_lock_roots(str(next_cwd), "workspace-write", next_extra)
+                        self.assertEqual(codex_runner.earlier_writer_waiting(waiter, roots), blocked)
+                        if blocked:
+                            args = SimpleNamespace(cwd=str(next_cwd), sandbox="workspace-write",
+                                                   writable_roots=next_extra, lock_timeout=0.001)
+                            with mock.patch.object(codex_runner, "snapshot_before",
+                                                   side_effect=AssertionError("overlapping writer started")):
+                                result = codex_runner.execute(args, "do it", waiter)
+                            self.assertEqual(result["error_kind"], "lock_timeout")
+                            self.assertEqual(codex_runner.runner_activity(waiter / "events.jsonl")["phase"], "lock_wait")
+                        else:
+                            for path in roots.values():
+                                with codex_runner.acquire_write_lock(path):
+                                    pass
+                    finally:
+                        for lock in locks:
+                            lock.close()
+                    self.assertFalse(codex_runner.earlier_writer_waiting(waiter, roots))
+            (holder / "args.json").write_text(json.dumps({"cwd": str(self.cwd), "sandbox": "workspace-write"}))
+            os.utime(holder / "args.json", ns=(0, 0))
+            with mock.patch.object(codex_runner, "job_status", return_value={"status": "running"}):
+                roots = codex_runner.write_lock_roots(str(self.cwd / "src"), "workspace-write", None)
+                self.assertTrue(codex_runner.earlier_writer_waiting(waiter, roots))
+
+    def test_stale_multiple_root_record_does_not_link_independent_writers(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        left, right = self.cwd / "left", self.cwd / "right"
+        stale = self.stored_job("stale", None, cwd=str(left), sandbox="workspace-write",
+                                writable_roots=[str(right)])
+        (stale / "worker.start").write_text("dead-worker")
+        waiter = self.stored_job("waiter", None, cwd=str(right))
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "process_start", return_value=None), \
+                codex_runner.acquire_write_lock(str(left)):
+            roots = codex_runner.write_lock_roots(str(right), "workspace-write", None)
+            self.assertFalse(codex_runner.earlier_writer_waiting(waiter, roots))
+            with codex_runner.acquire_write_lock(str(right)):
+                pass
+
+    def test_launch_records_absolute_cwd_for_lock_discovery(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        for command, sandbox in (("run", "workspace-write"), ("run", "read-only"), ("start", "workspace-write")):
+            with self.subTest(command=command, sandbox=sandbox), \
+                    mock.patch.object(codex_runner, "HOME", home), \
+                    mock.patch.object(sys, "argv", [str(RUNNER), command, "--cwd", ".", "--sandbox", sandbox]), \
+                    mock.patch.object(codex_runner, "read_task_input", return_value="do it"), \
+                    mock.patch.object(codex_runner, "execute", return_value={"status": "completed"}) as execute, \
+                    mock.patch.object(codex_runner, "record_pid"), \
+                    mock.patch.object(codex_runner.subprocess, "Popen") as spawn, \
+                    mock.patch.object(codex_runner, "emit") as emit:
+                if command == "run":
+                    with self.assertRaises(SystemExit) as stopped:
+                        codex_runner.main()
+                    self.assertEqual(stopped.exception.code, 0)
+                    directory = execute.call_args.args[2]
+                    self.assertEqual(execute.call_args.args[0].cwd, os.path.realpath("."))
+                    self.assertFalse((directory / "args.json").exists())
+                    record = directory / "write-lock.json"
+                    if sandbox == "read-only":
+                        self.assertFalse(record.exists())
+                        continue
+                    task = json.loads(record.read_text("utf-8"))
+                    self.assertEqual(set(task), {"cwd", "sandbox", "writable_roots"})
+                else:
+                    spawn.return_value.pid = 123
+                    codex_runner.main()
+                    directory = home / "jobs" / emit.call_args.args[0]["job_id"]
+                    task = json.loads((directory / "args.json").read_text("utf-8"))
+                self.assertEqual(task["cwd"], os.path.realpath("."))
+
+    def test_foreground_lock_record_blocks_overlapping_jobs_without_context(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        run_dir = home / "runs" / "foreground"
+        run_dir.mkdir(parents=True)
+        shared = Path(self.tmp.name) / "shared"
+        task = {"cwd": str(self.cwd), "sandbox": "workspace-write", "writable_roots": [str(shared)]}
+        (run_dir / "write-lock.json").write_text(json.dumps(task), "utf-8")
+        waiter = self.stored_job("waiter", None)
+        with mock.patch.object(codex_runner, "HOME", home), \
+                codex_runner.acquire_write_lock(str(self.cwd)), \
+                codex_runner.acquire_write_lock(str(shared)):
+            for path, blocked in ((self.cwd / "src", True), (shared / "nested", True),
+                                  (Path(self.tmp.name) / "independent", False)):
+                with self.subTest(path=path):
+                    roots = codex_runner.write_lock_roots(str(path), "workspace-write", None)
+                    self.assertEqual(codex_runner.earlier_writer_waiting(waiter, roots), blocked)
+        self.assertFalse((run_dir / "args.json").exists())
+
+    def test_writer_admission_serializes_overlap_check_and_claim(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "workspace-write",
+                                  "--lock-timeout", "0.1", "--retries", "0"])
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        (home / "locks").mkdir(parents=True)
+        admission = home / "locks" / "admission.lock"
+        elapsed = [0]
+        def advance(delay):
+            elapsed[0] += delay
+        acquire = codex_runner.acquire_write_lock
+        def claim(root):
+            self.assertIsNone(codex_runner.acquire_file_lock(admission))
+            return acquire(root)
+        def check(*unused):
+            self.assertIsNone(codex_runner.acquire_file_lock(admission))
+            return False
+        def snapshot(*unused):
+            with codex_runner.acquire_file_lock(admission):
+                self.assertIsNone(acquire(str(self.cwd)))
+            return None, None
+
+        with mock.patch.object(codex_runner, "HOME", home):
+            with codex_runner.acquire_file_lock(admission), \
+                    mock.patch.object(codex_runner, "earlier_writer_waiting") as blocked, \
+                    mock.patch.object(codex_runner, "acquire_write_lock") as claimed, \
+                    mock.patch.object(codex_runner, "snapshot_before") as snapshots, \
+                    mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                    mock.patch.object(codex_runner.time, "sleep", side_effect=advance):
+                result = codex_runner.execute(args, "do it", Path(self.tmp.name) / "busy-admission")
+            self.assertEqual(result["error_kind"], "lock_timeout")
+            blocked.assert_not_called()
+            claimed.assert_not_called()
+            snapshots.assert_not_called()
+            with mock.patch.object(codex_runner, "earlier_writer_waiting", side_effect=check), \
+                    mock.patch.object(codex_runner, "acquire_write_lock", side_effect=claim), \
+                    mock.patch.object(codex_runner, "snapshot_before", side_effect=snapshot), \
+                    mock.patch.object(codex_runner, "router_reachable", return_value=False), \
+                    mock.patch.object(codex_runner, "files_changed", return_value={}):
+                result = codex_runner.execute(args, "do it", Path(self.tmp.name) / "free-admission")
+            self.assertEqual(result["error_kind"], "router_down")
+
     def test_lock_timeout_fails_queued_writer_without_touching_owner(self):
         jobs = []
         try:
@@ -789,7 +982,8 @@ class RunnerTests(unittest.TestCase):
         elapsed = [0]
         def advance(delay):
             elapsed[0] += delay
-        with mock.patch.object(codex_runner, "acquire_write_lock", side_effect=[None, mock.Mock()]) as acquire, \
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "acquire_write_lock", side_effect=[None, mock.Mock()]) as acquire, \
                 mock.patch.object(codex_runner, "time", wraps=time) as clock, \
                 mock.patch.object(codex_runner, "snapshot_before", side_effect=AssertionError("snapshot after lock deadline")) as snapshot:
             clock.monotonic.side_effect = lambda: elapsed[0]
@@ -867,7 +1061,8 @@ class RunnerTests(unittest.TestCase):
         held = mock.Mock()
         error = OSError(errno.EIO, "injected lock error")
         args = SimpleNamespace(cwd=str(self.cwd), sandbox="workspace-write", writable_roots=["../shared"])
-        with mock.patch.object(codex_runner, "acquire_write_lock", side_effect=[held, None, error]), \
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "acquire_write_lock", side_effect=[held, None, error]), \
                 mock.patch.object(codex_runner.time, "sleep", side_effect=lambda delay: held.close.assert_called_once()), \
                 mock.patch.object(codex_runner, "run_attempt") as attempt:
             result = codex_runner.execute(args, "do it", Path(self.tmp.name) / "waiting")
@@ -901,7 +1096,8 @@ class RunnerTests(unittest.TestCase):
                 outcomes = [None, error] if waiting else [error]
                 args = SimpleNamespace(cwd=str(self.cwd), sandbox="danger-full-access")
                 run_dir = Path(self.tmp.name) / f"lock-error-{waiting}"
-                with mock.patch.object(codex_runner, "acquire_write_lock", side_effect=outcomes) as acquire, \
+                with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "acquire_write_lock", side_effect=outcomes) as acquire, \
                         mock.patch.object(codex_runner, "run_attempt") as attempt, \
                         mock.patch.object(codex_runner, "snapshot_before") as snapshot, \
                         mock.patch.object(codex_runner.time, "sleep"):
@@ -2677,6 +2873,57 @@ class RunnerTests(unittest.TestCase):
                 else:
                     self.assertEqual(value["groups"][0]["latest_job"]["execution_status"], "unknown")
                 self.assertEqual(self.control(command, "--owner", "owner-a")["total"], 0)
+
+    def test_output_large_file_small_pages_use_bounded_reads(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("bounded-output", {"status": "completed"})
+        # The runner resolves job paths; on Windows CI the temp dir is an 8.3 short name.
+        source = Path(os.path.realpath(jd)) / "last_message.txt"
+        large = " " * 65535 + "\r\n漢😀" + "漢😀\r\n" * 262144
+        cases = [(large, offset) for offset in (0, 65534, 65535, 65536, 65537,
+                                               len(large) - 2, len(large), len(large) + 1)]
+        cases += [("", 0), (" \t\r\n" * 20000, 100000)]
+        check = self
+        class Counted(io.TextIOWrapper):
+            def read(self, size=-1):
+                check.assertGreater(size, 0)
+                check.assertLessEqual(size, 65536)
+                sizes.append(size)
+                return super().read(size)
+        def open_output(path, mode, **kwargs):
+            self.assertEqual(Path(path), source)
+            self.assertEqual(mode, "r")
+            self.assertEqual(kwargs, {"encoding": "utf-8", "newline": ""})
+            return Counted(io.FileIO(path, "r"), **kwargs)
+
+        for content, offset in cases:
+            with self.subTest(chars=len(content), offset=offset):
+                source.write_bytes(content.encode("utf-8"))
+                sizes = []
+                args = SimpleNamespace(job_id=jd.name, artifact="report", offset=offset, limit=3)
+                with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "job_status", return_value={"status": "completed"}), \
+                        mock.patch.object(codex_runner, "open", side_effect=open_output, create=True) as opened:
+                    page = codex_runner.job_output(args)
+                opened.assert_called_once()
+                self.assertTrue(sizes)
+                if len(content) > 65536:
+                    self.assertGreater(len(sizes), 1)
+                expected = {"job_id": jd.name, "artifact": "report", "execution_status": "completed",
+                            "source_path": str(source), "offset": offset, "limit": 3}
+                if not content.strip():
+                    expected.update(status="failed", error_kind="artifact_empty", retryable=False)
+                elif offset >= len(content):
+                    expected.update(status="failed", error_kind="offset_out_of_range", retryable=False,
+                                    total_chars=len(content), next_offset=None, eof=True)
+                else:
+                    text = content[offset:offset + 3]
+                    end = offset + len(text)
+                    expected.update(status="completed", text=text, total_chars=len(content),
+                                    next_offset=end if end < len(content) else None, eof=end >= len(content))
+                self.assertEqual(page, expected)
 
     def test_output_unicode_pagination_is_complete_repeatable_and_controlled(self):
         context = self.sample_context()

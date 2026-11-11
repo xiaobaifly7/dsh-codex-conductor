@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.83` 封住两处守卫绕过：`rg --files` 混用 `--json` 等搜索参数，以及 `printf` 借花括号展开出 `-v` 或用 `%n` 给变量赋值。会话运行中收到的新任务通知，在旧通知处理完后重新获得唤醒次数。worker 退出后它启动的 Codex 若仍存活，继续挡住同目录的写任务；父目录和子目录的写任务改为互斥排队。`codex_output` 分页按块读取，不再整读文件。
+
 `0.9.82` 复核被拒时，报错会列出允许、缺失和多余的偏差索引，规划端一次就能改对，不再反复盲试 `codex_review`。`npm test` 和 CI 补跑 `guard.test.mjs`、`planner.test.mjs`、`verify.test.mjs`。
 
 `0.9.81` 修复 `products` 模式把 Promise 返回宿主同步 `tools.guard`、导致无关工具也报 JSON 序列化错误的问题。guard 始终同步返回放行或拒绝；尚待恢复的产物读取在异步 `tools/execute` 中最多等待 3 秒，确认权限前不执行原工具。新增覆盖两种读取模式、工作区边界和任意工具名的同步契约测试，以及恢复成功、失败和超时的执行前拦截测试。
@@ -177,7 +179,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 - 路由失败不丢弃只读任务已有的 resume 线程。写任务自动重试时，只有本轮收到命令、文件改动或助手消息的实际工作事件，才改用“检查现状并完成原任务”的提示；仅启动线程、开始 turn 或出现配置警告时保留完整提示，避免丢掉用户续接回答。失败分类只读取本轮新增的 stderr，完整日志仍跨尝试保留。
 
-- 可写任务锁住任务目录；`workspace-write` 还会锁住本次显式指定的额外可写根。因此，不同 `cwd` 共用同一额外可写根的任务也会互斥。任一所需目录的写锁被占用时，后来的任务自动等待，状态为 `running`、阶段为 `lock_wait`，面板显示“排队等待目录写锁”。获得锁之前不会启动 Codex、检查路由或拍改动快照；取消这个排队任务不会取消持锁任务。继续用原 `job_id` 等待，不要重新派活。需要同一写锁的后台任务按提交顺序启动；`--timeout` 仍只限制每次 Codex 尝试，不包含排队时间，不想继续等时用 `codex_cancel`。`lockTimeoutSeconds`（runner 的 `--lock-timeout SECONDS`）可限制排队秒数，留空时无限等待；使用单调时钟，超时以 `lock_timeout` 失败且 `retryable=true`，不启动 Codex、不拍快照，也不影响持锁任务。此时先用 `codex_jobs` 查同目录正在运行的任务，再决定等待还是取消持锁任务，不要直接重派。
+- 可写任务锁住任务目录；`workspace-write` 还会锁住本次显式指定的额外可写根。因此，不同 `cwd` 共用同一额外可写根的任务也会互斥。规范化后相同或存在父子关系的写入根会互斥，互不重叠的目录仍可并发；worker 退出后，经 PID 身份核对仍存活的残留 Codex 会继续占用写入根，直到其退出。任一所需目录的写锁被占用时，后来的任务自动等待，状态为 `running`、阶段为 `lock_wait`，面板显示“排队等待目录写锁”。获得锁之前不会启动 Codex、检查路由或拍改动快照；取消这个排队任务不会取消持锁任务。继续用原 `job_id` 等待，不要重新派活。需要同一写锁的后台任务按提交顺序启动；`--timeout` 仍只限制每次 Codex 尝试，不包含排队时间，不想继续等时用 `codex_cancel`。`lockTimeoutSeconds`（runner 的 `--lock-timeout SECONDS`）可限制排队秒数，留空时无限等待；使用单调时钟，超时以 `lock_timeout` 失败且 `retryable=true`，不启动 Codex、不拍快照，也不影响持锁任务。此时先用 `codex_jobs` 查同目录正在运行的任务，再决定等待还是取消持锁任务，不要直接重派。
 
 - 插件每次调用 `wsl.exe` 都有上限：`start` 和 `cancel` 120 秒，`status` 在它自己的等待秒数之外再留 60 秒。计时按 1 秒一跳，电脑睡眠唤醒不会立刻误判超时。WSL 卡住或起不来时按 `bridge_error` 返回，工具调用不会一直挂着；已知 `job_id` 的任务这时提示先用 `codex_status` 查询，不要直接重派，后台监控也会容忍偶发的一两次 `bridge_error`。
 
@@ -431,6 +433,8 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`0.9.83` closes two guard bypasses (`rg --files` mixed with search flags such as `--json`, and `printf` assigning variables through `-v` brace expansion or `%n`), gives a fresh wake budget to task notices that arrive after older notices were consumed, keeps writers out of a directory while a residual Codex from a dead worker is still alive, makes parent and child directories mutually exclusive for writers, and pages `codex_output` without reading whole files.
+
 `0.9.82` review errors now list the allowed, missing and extra deviation indexes, so the planner can fix a rejected `codex_review` in one try instead of guessing. `npm test` and CI now also run `guard.test.mjs`, `planner.test.mjs` and `verify.test.mjs`.
 
 `0.9.81` fixes Promise returns from the synchronous host `tools.guard` in products mode, which caused JSON serialization errors even for unrelated tools. Guards always return synchronously; reads awaiting product recovery wait up to three seconds in asynchronous `tools/execute` middleware before the original tool can run. New contract tests cover both read modes, workspace boundaries and arbitrary tool names, plus interception before dispatch on recovery success, failure and timeout.
@@ -612,7 +616,7 @@ Explain completed work, check results and remaining gaps in plain language. If e
 
 The bundled runner handles background execution, retries, timeouts, idle/reconnect detection and thread resumption; disconnecting a wait does not stop it. Unsent prompts survive route retries, and PID/event-log write failures terminate and reap children. Closing stdout while still alive does not bypass the configured timeout, idle or reconnect budget.
 
-Writers lock `cwd`; `workspace-write` also locks explicitly supplied `writable_roots`, so different working directories sharing an extra root serialize. Queued jobs remain `running` with phase `lock_wait`; Codex, route checks and snapshots start after all required locks are obtained. Cancelling a waiter leaves its holder alone. Wait on the original ID. Background jobs sharing a required lock start in submission order; per-attempt `--timeout` excludes lock waiting. Optional `lockTimeoutSeconds` (runner `--lock-timeout SECONDS`) bounds queue time using a monotonic clock; omission waits indefinitely. Expiry fails with `lock_timeout`, `retryable=true`, without Codex or a snapshot and without affecting the holder. Use `codex_jobs` to inspect running jobs in the same directory before deciding to wait or cancel the holder; do not immediately redispatch.
+Writers lock `cwd`; `workspace-write` also locks explicitly supplied `writable_roots`, so different working directories sharing an extra root serialize. Equal or ancestor/descendant roots serialize after normalization, while disjoint directories can run concurrently; a residual Codex whose PID identity still matches retains its roots after its worker exits until Codex stops. Queued jobs remain `running` with phase `lock_wait`; Codex, route checks and snapshots start after all required locks are obtained. Cancelling a waiter leaves its holder alone. Wait on the original ID. Background jobs sharing a required lock start in submission order; per-attempt `--timeout` excludes lock waiting. Optional `lockTimeoutSeconds` (runner `--lock-timeout SECONDS`) bounds queue time using a monotonic clock; omission waits indefinitely. Expiry fails with `lock_timeout`, `retryable=true`, without Codex or a snapshot and without affecting the holder. Use `codex_jobs` to inspect running jobs in the same directory before deciding to wait or cancel the holder; do not immediately redispatch.
 
 Each `wsl.exe` call is bounded: `start`/`cancel` 120 seconds, `status` its wait plus 60 seconds. One-second ticks avoid false timeouts after host sleep. Hung WSL returns `bridge_error`; query a known `job_id` before redispatching. Monitoring tolerates occasional transient bridge errors.
 

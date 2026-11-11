@@ -242,23 +242,49 @@ def write_lock_roots(cwd, sandbox, writable_roots):
 
 
 def earlier_writer_waiting(run_dir, roots):
-    if run_dir.parent != HOME / "jobs":
-        return False
-    position = ((run_dir / "args.json").stat().st_mtime_ns, run_dir.name)
-    for job_dir in job_directories():
-        if job_dir == run_dir or (job_dir / "result.json").exists():
+    position = ((run_dir / "args.json").stat().st_mtime_ns, run_dir.name) \
+        if run_dir.parent == HOME / "jobs" else None
+    paths = [Path(tree_key(p)) for p in roots.values()]
+    directories = list(job_directories())
+    runs = HOME / "runs"
+    if runs.exists():
+        directories.extend(d for d in runs.iterdir() if d.is_dir())
+    for job_dir in directories:
+        if job_dir == run_dir:
+            continue
+        try:
+            codex_pid = recorded_pid(job_dir / "codex.pid")
+            finished = (job_dir / "result.json").exists()
+            if finished and codex_pid is None:
+                continue
+            task = task_record(job_dir)
+            if not task.get("cwd"):
+                continue
+            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"))
+            other_paths = [Path(tree_key(p)) for p in other_roots.values()]
+            overlapping_roots = [root for root, path in zip(other_roots.values(), other_paths)
+                                 if any(path.is_relative_to(p) or p.is_relative_to(path) for p in paths)]
+        except (OSError, ValueError, TypeError):
+            continue
+        if not overlapping_roots:
+            continue
+        if codex_pid is not None:
+            return True
+        if finished:
+            continue
+        # A writer may hold its locks before publishing Codex's PID, even if submitted later.
+        for root in overlapping_roots:
+            lock = acquire_write_lock(root)
+            if lock is None:
+                return True
+            lock.close()
+        if position is None or job_dir.parent != HOME / "jobs":
             continue
         try:
             other = ((job_dir / "args.json").stat().st_mtime_ns, job_dir.name)
         except FileNotFoundError:
             continue
-        if other >= position:
-            continue
-        job = job_status(job_dir.name)
-        if job["status"] != "running" or not job.get("cwd"):
-            continue
-        other_roots = write_lock_roots(job["cwd"], job["sandbox"], job["task_options"]["writable_roots"])
-        if not roots.keys().isdisjoint(other_roots):
+        if other < position and job_status(job_dir.name)["status"] == "running":
             return True
     return False
 
@@ -710,22 +736,27 @@ def execute(args, prompt, run_dir):
                 lock_timeout = getattr(args, "lock_timeout", None)
                 deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
+                (HOME / "locks").mkdir(parents=True, exist_ok=True)
                 while True:
                     if waiting and deadline is not None and time.monotonic() >= deadline:
                         return {**base, "status": "failed", "error_kind": "lock_timeout",
                                 "error": "Timed out waiting for directory write locks; Codex was not started.",
                                 "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
-                    for key in sorted(roots):
-                        lock = acquire_write_lock(roots[key])
-                        if lock is None:
-                            break
-                        locks.append(lock)
-                    else:
-                        if not earlier_writer_waiting(run_dir, roots):
-                            break
-                    for lock in locks:
-                        lock.close()
-                    locks.clear()
+                    admission = acquire_file_lock(HOME / "locks" / "admission.lock")
+                    if admission is not None:
+                        with admission:
+                            # Keep overlap checks and all directory claims in one critical section.
+                            if not earlier_writer_waiting(run_dir, roots):
+                                for key in sorted(roots):
+                                    lock = acquire_write_lock(roots[key])
+                                    if lock is None:
+                                        break
+                                    locks.append(lock)
+                                else:
+                                    break
+                            for lock in locks:
+                                lock.close()
+                            locks.clear()
                     if not waiting:
                         runner_event(run_dir, 0, "lock_wait")
                         waiting = True
@@ -972,12 +1003,12 @@ def job_directory(job_id):
 
 
 def task_record(job_dir):
-    path = job_dir / "args.json"
+    path = job_dir / ("write-lock.json" if job_dir.parent == HOME / "runs" else "args.json")
     if not path.exists():
         return {}
     task = json.loads(path.read_text("utf-8"))
     if not isinstance(task, dict):
-        raise ValueError("args.json must be an object")
+        raise ValueError(f"{path.name} must be an object")
     if task.get("context") is not None:
         task_context(task["context"])
     return task
@@ -1629,20 +1660,31 @@ def job_output(args):
             if context is None:
                 return {**base, "status": "failed", "error_kind": "legacy_context_missing", "retryable": False}
             content = json.dumps(context, ensure_ascii=False)
+            total_chars = len(content)
+            has_content = bool(content.strip())
+            text = content[args.offset:args.offset + args.limit]
         else:
+            total_chars = 0
+            has_content = False
+            text = ""
             with open(source, "r", encoding="utf-8", newline="") as f:
-                content = f.read()
+                while chunk := f.read(65536):
+                    start = max(0, args.offset - total_chars)
+                    stop = min(len(chunk), args.offset + args.limit - total_chars)
+                    if start < stop:
+                        text += chunk[start:stop]
+                    total_chars += len(chunk)
+                    has_content = has_content or bool(chunk.strip())
     except (OSError, ValueError):
         return {**base, "status": "failed", "error_kind": "artifact_read_failed", "retryable": False}
-    if not content.strip():
+    if not has_content:
         return {**base, "status": "failed", "error_kind": "artifact_empty", "retryable": False}
-    if args.offset >= len(content):
+    if args.offset >= total_chars:
         return {**base, "status": "failed", "error_kind": "offset_out_of_range", "retryable": False,
-                "total_chars": len(content), "next_offset": None, "eof": True}
-    text = content[args.offset:args.offset + args.limit]
-    end = min(len(content), args.offset + len(text))
-    return {**base, "status": "completed", "text": text, "total_chars": len(content),
-            "next_offset": end if end < len(content) else None, "eof": end >= len(content)}
+                "total_chars": total_chars, "next_offset": None, "eof": True}
+    end = args.offset + len(text)
+    return {**base, "status": "completed", "text": text, "total_chars": total_chars,
+            "next_offset": end if end < total_chars else None, "eof": end >= total_chars}
 
 
 def worker_died(job_id, job_dir, task=None):
@@ -1828,7 +1870,7 @@ def main():
             emit({**value, **review_summary(value)})
         return
     if args.command in ("run", "start"):
-        args.cwd = local_path(args.cwd)
+        args.cwd = os.path.realpath(local_path(args.cwd))
         prompt = read_task_input(args, parser)
         if args.command == "start" or args.max_storage_mb is not None:
             prune_old("jobs")
@@ -1839,6 +1881,12 @@ def main():
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         run_dir.mkdir(parents=True)
+        if args.sandbox != "read-only":
+            task = {k: getattr(args, k) for k in ("cwd", "sandbox", "writable_roots")}
+            (run_dir / "write-lock.json").write_text(json.dumps(task), "utf-8")
+        boot = boot_id()
+        if boot:
+            (run_dir / "boot_id").write_text(boot)
         record_pid(run_dir / "worker.pid", os.getpid())
         result = execute(args, prompt, run_dir)
         result.update(review_summary(result))
