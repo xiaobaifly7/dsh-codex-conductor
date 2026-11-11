@@ -1021,10 +1021,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (value.status !== 'running' || !value.job_id) return value;
     const id = background(value.job_id, exec, finish)?.id;
     if (id === undefined) return value;
+    const outputCall = `job_output(${JSON.stringify({ job_id: id })})`;
+    const statusCall = `codex_status(${JSON.stringify({ job_id: value.job_id })})`;
     return { ...value, background_job_id: id,
-      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），收到后用 job_output 读取 ${id} 的完整结果一次（含逐条汇报和下一步）。` +
-        `完成通知前不要用 job_output 轮询；需要查进度时用 codex_status 查询 runner job_id=${value.job_id}。`,
-      next: '等 DSH 的完成通知，再用 job_output 读取一次完整结果。需要重读或分页时用 codex_output。' +
+      note: `已登记为后台任务 ${id}：Codex 结束后 DSH 会发一条任务通知（只有一行摘要），收到后用 ${outputCall} 读取一次完整结果（含逐条汇报和下一步）。` +
+        `完成通知前不要用 job_output 轮询；需要查进度时用 ${statusCall}。` +
+        'job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id。',
+      next: `等 DSH 的完成通知，再用 ${outputCall} 读取一次完整结果。需要重读或分页时用 codex_output。` +
         '在此之前不要自己动手补做，也不要重复派同一个任务。' };
   }
 
@@ -1125,7 +1128,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回任务号，结束时用 job_output 取报告。必须给出验收标准和 write：' +
+    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回两个任务号；收到结束通知后，把 background_job_id 填入 job_output 的 job_id 取报告。必须给出验收标准和 write：' +
       '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
       '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。' +
