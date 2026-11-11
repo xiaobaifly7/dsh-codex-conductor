@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.84` `gemini_write` 失败回滚后，回执如实反映磁盘上的结果（`rolled_back`、`target_exists`、`restored_to`，回滚前的字数等统计移到 `before_rollback`）。生成稿另存到 `%LOCALAPPDATA%\dsh-codex-conductor\gemini-drafts`（保留最近 20 份），回执给出 `draft_path`，可以复核后复用，不必整章重写。快照里有、但 CLI 写入事件没记录的变化，单列为 `unattributed_changes`。失败判定规则不变。
+
 `0.9.83` 封住两处守卫绕过：`rg --files` 混用 `--json` 等搜索参数，以及 `printf` 借花括号展开出 `-v` 或用 `%n` 给变量赋值。会话运行中收到的新任务通知，在旧通知处理完后重新获得唤醒次数。worker 退出后它启动的 Codex 若仍存活，继续挡住同目录的写任务；父目录和子目录的写任务改为互斥排队。`codex_output` 分页按块读取，不再整读文件。
 
 `0.9.82` 复核被拒时，报错会列出允许、缺失和多余的偏差索引，规划端一次就能改对，不再反复盲试 `codex_review`。`npm test` 和 CI 补跑 `guard.test.mjs`、`planner.test.mjs`、`verify.test.mjs`。
@@ -432,6 +434,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.84` makes a failed `gemini_write` report what is actually on disk after rollback (`rolled_back`, `target_exists`, `restored_to`, counts moved to `before_rollback`), saves the generated draft under `%LOCALAPPDATA%\dsh-codex-conductor\gemini-drafts` (newest 20) and returns `draft_path` for review and reuse, and lists snapshot changes not explained by CLI write events as `unattributed_changes`. Failure rules are unchanged.
 
 `0.9.83` closes two guard bypasses (`rg --files` mixed with search flags such as `--json`, and `printf` assigning variables through `-v` brace expansion or `%n`), gives a fresh wake budget to task notices that arrive after older notices were consumed, keeps writers out of a directory while a residual Codex from a dead worker is still alive, makes parent and child directories mutually exclusive for writers, and pages `codex_output` without reading whole files.
 
