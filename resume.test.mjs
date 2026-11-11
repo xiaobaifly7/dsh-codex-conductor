@@ -4,10 +4,9 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { processResumeRequest, registerResumeRequests, registerAutoWake } from './resume.mjs';
+import { processResumeRequest, processSendRequest, registerResumeRequests, registerAutoWake } from './resume.mjs';
 
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
-const claimPattern = new RegExp(`^resume-request\\.${uuid}\\.processing\\.json$`);
 const interrupted = () => ({ type: 'turn/end', data: { reason: { kind: 'interrupted' } } });
 const blocked = () => ({ type: 'turn/end', data: { reason: { kind: 'blocked' } } });
 const start = () => ({ type: 'turn/start', data: {} });
@@ -17,15 +16,16 @@ const goal = (extra = {}) => ({ id: 'goal-1', revision: 7, phase: 'paused', acti
 const row = (sessionId, reason, method = null) => ({ sessionId,
   status: method ? 'resumed' : 'skipped', reason, method });
 
-function fixture(t) {
+function fixture(t, kind = 'resume') {
   const directory = fs.mkdtempSync(path.join(tmpdir(), 'conductor-resume-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const file = (name) => path.join(directory, name);
   const agents = new Map(), events = new Map(), goalViews = new Map();
   const calls = [], messages = [], resumes = [], wakes = [], warnings = [], cleanups = [];
+  const claimPattern = new RegExp(`^${kind}-request\\.${uuid}\\.processing\\.json$`);
   const claims = () => fs.readdirSync(directory).filter(name => claimPattern.test(name));
   const assertClaimed = () => {
-    assert.equal(fs.existsSync(file('resume-request.json')), false);
+    assert.equal(fs.existsSync(file(`${kind}-request.json`)), false);
     assert.equal(claims().length, 1, 'claim exists before any service call');
   };
   const services = {
@@ -58,8 +58,8 @@ function fixture(t) {
     events.set(id, history);
     return agent;
   };
-  const write = (request) => fs.writeFileSync(file('resume-request.json'), JSON.stringify(request));
-  const saved = () => JSON.parse(fs.readFileSync(file('resume-result.json'), 'utf8'));
+  const write = (request) => fs.writeFileSync(file(`${kind}-request.json`), JSON.stringify(request));
+  const saved = () => JSON.parse(fs.readFileSync(file(`${kind}-result.json`), 'utf8'));
   const verify = (result) => {
     for (const key of ['requestedAt', 'completedAt']) {
       assert.equal(typeof result[key], 'string');
@@ -68,10 +68,11 @@ function fixture(t) {
     assert.ok(Date.parse(result.completedAt) >= Date.parse(result.requestedAt));
     assert.deepEqual(saved(), result);
     assert.equal(claims().length, 0);
-    assert.equal(fs.existsSync(file('resume-request.json')), false);
+    assert.equal(fs.existsSync(file(`${kind}-request.json`)), false);
     return result;
   };
-  const run = async (request) => { write(request); return verify(await processResumeRequest({ ctx, directory })); };
+  const process = kind === 'send' ? processSendRequest : processResumeRequest;
+  const run = async (request) => { write(request); return verify(await process({ ctx, directory })); };
   return { ctx, directory, file, agents, events, goalViews, services, calls, messages, resumes, wakes, warnings,
     cleanups, claims, add, write, saved, verify, run };
 }
@@ -387,6 +388,119 @@ test('resume: failed result write/rename preserves claim and previous result wit
   });
 });
 
+test('send: completed idle sessions receive exact user text and source without exposing the message', async (t) => {
+  for (const [name, message] of [['custom text', '  新任务😀\n保留空白  '], ['4000 Unicode code points', '😀'.repeat(4000)]]) {
+    await t.test(name, async (t) => {
+      const f = fixture(t, 'send'), agent = f.add('A', [start(), end()]);
+      f.goalViews.set(agent, goal());
+      const result = await f.run({ sessionId: 'A', message });
+      assert.deepEqual(result, { requestedAt: result.requestedAt, sessionId: 'A', status: 'sent',
+        reason: 'message_submitted', completedAt: result.completedAt });
+      assert.equal(f.messages.length, 1);
+      const sent = f.messages[0].message;
+      assert.match(sent.id, new RegExp(`^${uuid}$`));
+      assert.deepEqual(sent, { id: sent.id, role: 'user', content: [{ type: 'text', text: message }],
+        source: { kind: 'user' } });
+      assert.deepEqual(f.calls, [['resolve', 'A'], ['read', 'A']]);
+      assert.deepEqual(f.resumes, []);
+      assert.deepEqual(f.wakes, []);
+      assert.equal(fs.readFileSync(f.file('send-result.json'), 'utf8').includes(message), false);
+      assert.equal(JSON.stringify(f.warnings).includes(message), false);
+      assert.equal(await processSendRequest(f), undefined);
+      assert.equal(f.messages.length, 1);
+      assert.equal(fs.existsSync(f.file('resume-result.json')), false);
+    });
+  }
+});
+
+test('send: running sessions skip before reading history or submitting', async (t) => {
+  const f = fixture(t, 'send');
+  f.add('A', [start(), end()]).status = 'running';
+  const result = await f.run({ sessionId: 'A', message: 'Next task' });
+  assert.equal(result.status, 'skipped');
+  assert.equal(result.reason, 'running');
+  assert.deepEqual(f.calls, [['resolve', 'A']]);
+  assert.deepEqual(f.messages, []);
+});
+
+test('send: rejects missing fields, batches, empty messages, invalid IDs and overlong Unicode before service calls', async (t) => {
+  const f = fixture(t, 'send');
+  f.add('A');
+  const invalid = [null, [], {}, 'request', { sessionId: 'A' }, { message: 'Next task' },
+    { sessions: ['A'], message: 'Next task' }, { sessionId: 'A', sessions: [], message: 'Next task' },
+    ...['', 'A\n', '../A', 'a'.repeat(101), ['A'], null, 1].map(sessionId => ({ sessionId, message: 'Next task' })),
+    ...['', ' \t\n', null, 1, [], {}, 'a'.repeat(4001), '😀'.repeat(4001)]
+      .map(message => ({ sessionId: 'A', message }))];
+  for (const request of invalid) {
+    const result = await f.run(request);
+    assert.equal(result.status, 'skipped', JSON.stringify(request));
+    assert.equal(result.reason, 'invalid_request');
+    assert.ok(result.error);
+  }
+  const privateText = 'private malformed message';
+  fs.writeFileSync(f.file('send-request.json'), `{"sessionId":"A","message":"${privateText}" invalid`);
+  const malformed = f.verify(await processSendRequest(f));
+  assert.equal(malformed.status, 'skipped');
+  assert.equal(malformed.reason, 'invalid_request');
+  assert.equal(fs.readFileSync(f.file('send-result.json'), 'utf8').includes(privateText), false);
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.messages, []);
+});
+
+test('send: unavailable agents and interfaces skip without throwing or exposing host error text', async (t) => {
+  for (const stage of ['not-found', 'agent', 'controller', 'resolve', 'query', 'read', 'agents', 'followup', 'failure']) {
+    await t.test(stage, async (t) => {
+      const f = fixture(t, 'send'), agent = f.add('A', [start(), end()]);
+      const message = 'private host error message';
+      if (stage === 'not-found') f.agents.delete('A');
+      if (stage === 'agent') f.services.sessionController.resolveAgent = async () => ({});
+      if (stage === 'controller') delete f.services.sessionController;
+      if (stage === 'resolve') delete f.services.sessionController.resolveAgent;
+      if (stage === 'query') delete f.services.sessionQuery;
+      if (stage === 'read') delete f.services.sessionQuery.readSession;
+      if (stage === 'agents') delete f.services.agents;
+      if (stage === 'followup') delete agent.followup;
+      if (stage === 'failure') agent.followup = () => { throw new Error(message); };
+      const result = await f.run({ sessionId: 'A', message });
+      assert.equal(result.sessionId, 'A');
+      assert.equal(result.status, 'skipped');
+      assert.equal(result.reason, 'error');
+      assert.ok(result.error);
+      assert.equal(fs.readFileSync(f.file('send-result.json'), 'utf8').includes(message), false);
+      assert.equal(JSON.stringify(f.warnings).includes(message), false);
+      assert.deepEqual(f.messages, []);
+    });
+  }
+});
+
+test('send: rechecks running status and agent identity after asynchronous history reads', async (t) => {
+  for (const change of ['running', 'replace', 'remove']) await t.test(change, async (t) => {
+    const f = fixture(t, 'send'), agent = f.add('A', [start(), end()]);
+    f.services.sessionQuery.readSession = async () => {
+      await Promise.resolve();
+      if (change === 'running') agent.status = 'running';
+      else if (change === 'replace') f.agents.set('A', { ...agent });
+      else f.agents.delete('A');
+      return { events: [end()] };
+    };
+    const result = await f.run({ sessionId: 'A', message: 'Next task' });
+    assert.equal(result.status, 'skipped');
+    assert.equal(result.reason, change === 'running' ? 'running' : 'session_changed');
+    assert.deepEqual(f.messages, []);
+  });
+});
+
+test('send: parallel claimers submit once and never replay a claimed request', async (t) => {
+  const f = fixture(t, 'send');
+  f.add('A', [start(), end()]);
+  f.write({ sessionId: 'A', message: 'Next task' });
+  const results = await Promise.all([processSendRequest(f), processSendRequest(f)]);
+  assert.equal(results.filter(value => value === undefined).length, 1);
+  assert.equal(f.verify(results.find(Boolean)).status, 'sent');
+  assert.equal(await processSendRequest(f), undefined);
+  assert.equal(f.messages.length, 1);
+});
+
 function watchFixture(t, f, failure = false) {
   const watcher = new EventEmitter();
   watcher.close = t.mock.fn();
@@ -489,6 +603,30 @@ test('resume watcher: creation/error failures warn while initial and explicit ch
     await w.check();
     assert.deepEqual(f.saved().sessions, [row('B', 'message_submitted', 'message')]);
   });
+});
+
+test('send watcher: startup and filename notifications share one watcher that closes on unload', async (t) => {
+  const f = fixture(t, 'send');
+  for (const id of ['A', 'B', 'C']) f.add(id, [start(), end()]);
+  f.write({ sessionId: 'A', message: 'First task' });
+  const w = watchFixture(t, f);
+  await w.check();
+  assert.equal(f.saved().status, 'sent');
+  assert.deepEqual(f.messages.map(value => value.id), ['A']);
+  f.write({ sessionId: 'B', message: 'Second task' });
+  await w.notify('change', 'send-result.json');
+  assert.equal(f.messages.length, 1);
+  await w.notify('rename', Buffer.from('send-request.json'));
+  f.verify(f.saved());
+  assert.deepEqual(f.messages.map(value => value.id), ['A', 'B']);
+  f.write({ sessionId: 'C', message: 'After unload' });
+  const queued = w.notify('change', 'send-request.json');
+  w.dispose();
+  await queued;
+  await w.notify('rename', null);
+  assert.equal(w.watcher.close.mock.callCount(), 1);
+  assert.equal(fs.existsSync(f.file('send-request.json')), true);
+  assert.equal(f.messages.length, 2);
 });
 
 function autoWakeFixture(t, enabled = true) {

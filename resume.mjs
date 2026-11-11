@@ -2,13 +2,16 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 
+function validSessionId(id) {
+  return typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
+}
+
 function validateRequest(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) ||
       !Array.isArray(request.sessions) || request.sessions.length > 20) {
     throw new Error('sessions must be an array of at most 20 session IDs');
   }
-  if (request.sessions.some((id) => typeof id !== 'string' || id.length < 1 || id.length > 100 ||
-      /[^A-Za-z0-9_-]/.test(id))) {
+  if (request.sessions.some((id) => !validSessionId(id))) {
     throw new Error('session IDs must match [A-Za-z0-9_-]{1,100}');
   }
   const message = request.message === undefined ? '继续' : request.message;
@@ -16,6 +19,15 @@ function validateRequest(request) {
     throw new Error('message must be a string of at most 2000 Unicode characters');
   }
   return { sessions: [...new Set(request.sessions)], message };
+}
+
+function validateSendRequest(request) {
+  if (!request || typeof request !== 'object' || Array.isArray(request) ||
+      Object.hasOwn(request, 'sessions') || !validSessionId(request.sessionId) ||
+      typeof request.message !== 'string' || !request.message.trim() || [...request.message].length > 4000) {
+    throw new Error('invalid send request');
+  }
+  return { sessionId: request.sessionId, message: request.message };
 }
 
 function resumePendingInbox(agent, sessionId) {
@@ -33,16 +45,16 @@ function resumePendingInbox(agent, sessionId) {
   }
 }
 
-async function resumeSession(ctx, sessionId, message) {
+async function resumeSession(ctx, sessionId, message, send = false) {
   let method = null;
-  const skipped = (reason) => ({ sessionId, status: 'skipped', reason, method: null });
+  const skipped = (reason) => ({ sessionId, status: 'skipped', reason, ...(send ? {} : { method: null }) });
   try {
     const controller = ctx.get('sessionController');
     const query = ctx.get('sessionQuery');
     const agents = ctx.get('agents');
     const resolved = await controller.resolveAgent(sessionId);
     if (resolved.error) {
-      if (resolved.error.code === 'session/not-found') return skipped('not_found');
+      if (!send && resolved.error.code === 'session/not-found') return skipped('not_found');
       throw resolved.error;
     }
     const { agent } = resolved;
@@ -51,54 +63,70 @@ async function resumeSession(ctx, sessionId, message) {
     const { events } = await query.readSession(sessionId);
     if (agents.get(sessionId) !== agent) return skipped('session_changed');
     if (agent.status === 'running') return skipped('running');
-    const lastTurn = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
-    const ended = lastTurn?.type === 'turn/end' ? lastTurn.data?.reason?.kind : undefined;
-    // After a restart another plugin may try to advance the disarmed goal; the host rejects that turn as "blocked"
-    // before any step runs, so the session is still waiting to be resumed.
-    if (ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
-    const goals = ctx.get('goals');
-    const goal = goals?.get(agent);
-    if (goal && ['active', 'paused', 'blocked'].includes(goal.phase) &&
-        (goal.phase !== 'active' || goal.activation === 'disarmed') && goal.roundsStarted < goal.maxGoalRounds) {
-      method = 'goal';
-      // The native goal driver submits the next round; a user prompt here would duplicate it.
-      goals.resume(agent, { id: goal.id, revision: goal.revision });
-      return { sessionId, status: 'resumed', reason: 'goal_resumed', method };
+    if (!send) {
+      const lastTurn = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
+      const ended = lastTurn?.type === 'turn/end' ? lastTurn.data?.reason?.kind : undefined;
+      // After a restart another plugin may try to advance the disarmed goal; the host rejects that turn as "blocked"
+      // before any step runs, so the session is still waiting to be resumed.
+      if (ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
+      const goals = ctx.get('goals');
+      const goal = goals?.get(agent);
+      if (goal && ['active', 'paused', 'blocked'].includes(goal.phase) &&
+          (goal.phase !== 'active' || goal.activation === 'disarmed') && goal.roundsStarted < goal.maxGoalRounds) {
+        method = 'goal';
+        // The native goal driver submits the next round; a user prompt here would duplicate it.
+        goals.resume(agent, { id: goal.id, revision: goal.revision });
+        return { sessionId, status: 'resumed', reason: 'goal_resumed', method };
+      }
+      // A rejected turn alone says nothing was cut short, so it never justifies sending a prompt.
+      if (ended === 'blocked') return resumePendingInbox(agent, sessionId);
+      method = 'message';
     }
-    // A rejected turn alone says nothing was cut short, so it never justifies sending a prompt.
-    if (ended === 'blocked') return resumePendingInbox(agent, sessionId);
-    method = 'message';
     agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
-    return { sessionId, status: 'resumed', reason: 'message_submitted', method };
+    return send ? { sessionId, status: 'sent', reason: 'message_submitted' }
+      : { sessionId, status: 'resumed', reason: 'message_submitted', method };
   } catch (error) {
+    // Host errors may quote the submitted text; never publish them for the send entry.
+    if (send) return { ...skipped('error'), error: 'Session message submission failed or required host interfaces are unavailable' };
     return { sessionId, status: 'skipped', reason: 'error', method, error: String(error?.message ?? error) };
   }
 }
 
-export async function processResumeRequest({ ctx, directory }) {
-  const claimed = path.join(directory, `resume-request.${randomUUID()}.processing.json`);
+async function processRequest({ ctx, directory }, kind) {
+  const send = kind === 'send';
+  const claimed = path.join(directory, `${kind}-request.${randomUUID()}.processing.json`);
   try {
-    fs.renameSync(path.join(directory, 'resume-request.json'), claimed);
+    fs.renameSync(path.join(directory, `${kind}-request.json`), claimed);
   } catch (error) {
     if (error.code === 'ENOENT') return;
     throw error;
   }
-  const result = { requestedAt: new Date().toISOString(), status: 'processed', sessions: [] };
+  const requestedAt = new Date().toISOString();
+  const result = send ? { requestedAt, sessionId: null, status: 'skipped', reason: 'invalid_request' }
+    : { requestedAt, status: 'processed', sessions: [] };
   let request;
   try {
-    request = validateRequest(JSON.parse(fs.readFileSync(claimed, 'utf8').replace(/^\uFEFF/, '')));
+    const input = JSON.parse(fs.readFileSync(claimed, 'utf8').replace(/^\uFEFF/, ''));
+    if (send && validSessionId(input?.sessionId)) result.sessionId = input.sessionId;
+    request = send ? validateSendRequest(input) : validateRequest(input);
   } catch (error) {
-    result.status = 'rejected';
-    result.error = String(error?.message ?? error);
+    if (send) result.error = 'Invalid send request: supply one valid sessionId and a non-empty message of at most 4000 Unicode characters, without sessions';
+    else {
+      result.status = 'rejected';
+      result.error = String(error?.message ?? error);
+    }
   }
-  if (request) for (const sessionId of request.sessions) {
-    result.sessions.push(await resumeSession(ctx, sessionId, request.message));
+  if (request) {
+    if (send) Object.assign(result, await resumeSession(ctx, request.sessionId, request.message, true));
+    else for (const sessionId of request.sessions) {
+      result.sessions.push(await resumeSession(ctx, sessionId, request.message));
+    }
   }
   result.completedAt = new Date().toISOString();
-  const temporary = path.join(directory, `resume-result.${randomUUID()}.tmp`);
+  const temporary = path.join(directory, `${kind}-result.${randomUUID()}.tmp`);
   try {
     fs.writeFileSync(temporary, JSON.stringify(result, null, 2) + '\n');
-    fs.renameSync(temporary, path.join(directory, 'resume-result.json'));
+    fs.renameSync(temporary, path.join(directory, `${kind}-result.json`));
   } finally {
     fs.rmSync(temporary, { force: true });
   }
@@ -107,12 +135,22 @@ export async function processResumeRequest({ ctx, directory }) {
   return result;
 }
 
+export function processResumeRequest(options) {
+  return processRequest(options, 'resume');
+}
+
+export function processSendRequest(options) {
+  return processRequest(options, 'send');
+}
+
 export function registerResumeRequests({ ctx, directory }) {
   let stopped = false;
   let pending = Promise.resolve();
-  const warn = (error) => ctx.logger?.warn?.(`[codex-conductor] resume request: ${error?.message ?? error}`);
+  const warn = (error) => ctx.logger?.warn?.(`[codex-conductor] local request: ${error?.message ?? error}`);
   const check = () => {
-    pending = pending.then(() => stopped ? undefined : processResumeRequest({ ctx, directory })).catch(warn);
+    for (const kind of ['resume', 'send']) {
+      pending = pending.then(() => stopped ? undefined : processRequest({ ctx, directory }, kind)).catch(warn);
+    }
     return pending;
   };
   ctx.effect(() => {
@@ -120,7 +158,7 @@ export function registerResumeRequests({ ctx, directory }) {
     try {
       fs.mkdirSync(directory, { recursive: true });
       watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
-        if (filename == null || filename.toString() === 'resume-request.json') return check();
+        if (filename == null || ['resume-request.json', 'send-request.json'].includes(filename.toString())) return check();
       });
       watcher.on('error', (error) => { warn(error); watcher.close(); });
     } catch (error) { warn(error); }

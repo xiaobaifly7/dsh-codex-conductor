@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.79` 新增独立的本机 `send-request.json` 入口，以用户身份向已结束的空闲会话提交新任务；原有恢复入口保持不变。
+
 `0.9.78` 修正规划端原料读取被拒时的产物推断文案；自动唤醒完成通知滞留的 blocked 空闲会话，每批最多两次；短时间内重复查询没有实质变化的运行中任务时返回简短成功回执。
 
 `0.9.77` 修复后台任务共享目录写锁时可能插队的问题。
@@ -85,6 +87,22 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 `GET /dsh-codex-conductor/selftest/request` 返回 `{"request":null}` 或 `{"request":{"id":"…","claim":"…"}}`；`POST /dsh-codex-conductor/selftest/result` 接收 `{"id":"…","claim":"…","result":{…}}`，请求体上限 64 KiB，严格校验字段，认领凭据只能成功提交一次。请求文件上限 4 KiB，仅允许 `id`。结果只保留最近一次；非法请求或未完成的认领保留为 `panel-selftest-request.<claim>.processing.json`，不会自动重放。没有结果或结果中有错误时，不能据此宣称桌面验收通过。
 
 部署注意：`@deepseek-ai/dsh-client-hmr` 通过 `/plugins/events` 向已打开窗口推送模块图或重建通知；正常条目的前端 revision 变化才会清缓存并重新执行模块。revision 来自 `client.js` 的修改时间、创建/元数据变更时间和大小，不是 profile token。只换 profile token 不保证前端重载；revision 未变且条目未被移除重建时，需要刷新窗口或重启 DSH。部署新版 `client.js` 并收到变化后的 revision 时，可以在页面内热替换，无须整窗刷新。
+
+### 0.9.79：从本机向空闲会话提交新消息
+
+要让已经正常结束的会话接着做新任务，向 `%LOCALAPPDATA%\dsh-codex-conductor\send-request.json` 写入以下 JSON（与 `loaded.json` 同目录）。建议先写临时文件，再在同目录改名发布，避免读到未写完的 JSON：
+
+```json
+{"sessionId":"session-example","message":"请继续处理这个新任务"}
+```
+
+两个字段都必填：`sessionId` 只接受单个会话 ID，格式为 `[A-Za-z0-9_-]{1,100}`；`message` 必须是非空、非纯空白字符串，最多 4000 个 Unicode 字符，发送的文本不会裁剪首尾空白。`sessions` 数组不受支持，包含该字段的请求会被拒绝。这个入口会通过 `agent.followup` **以用户身份**（`role: 'user'`、`source: {kind: 'user'}`）向会话发消息，因此只应由本机操作者使用，不应向模型、远程调用者或不可信文件写入者开放。
+
+插件在加载、热重载和目录通知时检查请求，沿用恢复入口的原子认领和串行处理；提交前异步读取会话，再复核 agent 身份及运行状态。运行中的会话跳过。与 `resume-request.json` 的区别是：发送入口允许正常结束的空闲会话接收新消息，直接提交用户消息；恢复入口仍只处理 `interrupted` / `blocked` 的恢复情形，正常结束的会话仍跳过。
+
+同目录的 `send-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、`sessionId`、`status`、`reason`，出错时另有 `error`。成功为 `sent / message_submitted`；跳过为 `skipped / running`（正在运行）、`skipped / session_changed`（读取期间 agent 被替换或移除）、`skipped / error`（取不到 agent、宿主接口缺失或提交失败）或 `skipped / invalid_request`（JSON、字段或长度不合法，不提交消息）。无法取得合法会话 ID 时 `sessionId` 为 `null`。结果文件和插件日志不记录消息正文；宿主错误也不引用正文。
+
+结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
 ### 0.9.52：从本机请求续接被中断的会话
 
@@ -397,6 +415,8 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`0.9.79` adds a separate local `send-request.json` entry that submits a new task as a user message to an idle, finished session, while preserving the existing resume entry.
+
 `0.9.78` removes unsupported artifact-identity wording from planner read denials, automatically wakes idle blocked owners with stranded completion notices at most twice per batch, and returns concise successful receipts for repeated unchanged running-job checks.
 
 `0.9.77` prevents later background writers from jumping ahead on a shared directory lock.
@@ -492,6 +512,22 @@ The atomically replaced `panel-selftest-result.json` in the same directory conta
 `GET /dsh-codex-conductor/selftest/request` returns `{"request":null}` or `{"request":{"id":"…","claim":"…"}}`. `POST /dsh-codex-conductor/selftest/result` accepts `{"id":"…","claim":"…","result":{…}}`, strictly validates fields, limits the body to 64 KiB, and accepts a claim only once. The request file allows only `id` and is limited to 4 KiB. Only the latest result is retained. Invalid or unfinished requests remain as `panel-selftest-request.<claim>.processing.json` and are never replayed automatically. A missing result or a result containing errors is not proof of a successful desktop check.
 
 Deployment: `@deepseek-ai/dsh-client-hmr` pushes graph/rebuild events to open windows through `/plugins/events`. Healthy entries clear their cached code and execute again when their client revision changes. That revision comes from `client.js` mtime, ctime and size, not the profile token. Changing only that token does not guarantee a client reload; if the revision stays unchanged and the entry is not removed/recreated, refresh the window or restart DSH. Deploying an updated `client.js` and receiving its changed revision permits in-page replacement without a whole-window refresh.
+
+### 0.9.79: Submit a new message to an idle session from a local file
+
+To give a normally completed session a new task, write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\send-request.json`, alongside `loaded.json`. Write a temporary file first, then rename it in the same directory to avoid a partial request:
+
+```json
+{"sessionId":"session-example","message":"Please work on this new task"}
+```
+
+Both fields are required. `sessionId` accepts one session ID matching `[A-Za-z0-9_-]{1,100}`. `message` must be a non-empty, non-whitespace string of at most 4000 Unicode characters; its original whitespace is preserved. Requests containing a `sessions` field are rejected. This entry calls `agent.followup` **as the user** (`role: 'user'`, `source: {kind: 'user'}`), so only the local operator should use it. Do not expose it to models, remote callers, or untrusted file writers.
+
+Checks run on load, hot reload and directory notifications, sharing the resume entry's atomic claim and serial processing. After asynchronously reading the session, the plugin rechecks agent identity and running status before submission. Running sessions are skipped. Unlike `resume-request.json`, the send entry accepts normally completed idle sessions and submits a user message directly. The resume entry retains its `interrupted` / `blocked` recovery rules and continues to skip normally completed sessions.
+
+`send-result.json` contains claim time `requestedAt`, completion time `completedAt`, `sessionId`, `status`, `reason`, and `error` on failures. Success is `sent / message_submitted`. Skips are `skipped / running` (busy), `skipped / session_changed` (agent replaced or removed during the read), `skipped / error` (unavailable agent, missing host interface or failed submission), and `skipped / invalid_request` (invalid JSON, fields or length; no submission). `sessionId` is `null` when no valid ID can be obtained. Results and plugin logs omit the message body, including any body quoted by host errors.
+
+After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
 
 ### 0.9.52: Resume interrupted sessions from a local file
 
