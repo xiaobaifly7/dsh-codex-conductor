@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { processResumeRequest, registerResumeRequests } from './resume.mjs';
+import { processResumeRequest, registerResumeRequests, registerAutoWake } from './resume.mjs';
 
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const claimPattern = new RegExp(`^resume-request\\.${uuid}\\.processing\\.json$`);
@@ -489,4 +489,166 @@ test('resume watcher: creation/error failures warn while initial and explicit ch
     await w.check();
     assert.deepEqual(f.saved().sessions, [row('B', 'message_submitted', 'message')]);
   });
+});
+
+function autoWakeFixture(t, enabled = true) {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const bus = new EventEmitter();
+  const cleanups = [], wakes = [], warnings = [], infos = [], messages = [];
+  const jobs = new Map();
+  const session = { id: 'S1', log: [] };
+  const inbox = { nextStep: [], nextTurn: [], get hasPending() { return this.nextStep.length + this.nextTurn.length > 0; } };
+  const agent = { id: session.id, session, status: 'running', inbox,
+    followup(message) { messages.push(message); }, steer(message) { messages.push(message); },
+    wakeDriver() {
+      wakes.push([...inbox.nextStep, ...inbox.nextTurn]);
+      agent.status = 'running';
+      turnStart();
+    } };
+  const agents = new Map([[agent.id, agent]]);
+  const services = { agents, jobs: { list: () => [...jobs.values()] } };
+  const ctx = { get: name => services[name], on: (event, fn) => bus.on(event, fn),
+    effect(setup) { cleanups.push(setup()); },
+    logger: { warn: text => warnings.push(text), info: text => infos.push(text) } };
+  const event = value => { session.log.push(value); bus.emit('session/event', session, value); };
+  const turnStart = () => event({ type: 'turn/start', data: {} });
+  const idle = () => { agent.status = 'idle'; bus.emit('agent/status', { agent, status: 'idle' }); };
+  const endTurn = (kind = 'blocked', becomeIdle = true) => {
+    event({ type: 'turn/end', data: { reason: { kind } } });
+    if (becomeIdle) idle();
+  };
+  let n = 0;
+  const notice = ({ job = {}, source = {}, target = 'nextStep', id } = {}) => {
+    const native = { id: `B${++n}`, owner: agent.id, kind: 'codex', label: `Codex J${n} · test`, status: 'completed', ...job };
+    jobs.set(native.id, native);
+    const message = { id: id ?? `notice-${n}`, role: 'user', content: [{ type: 'text', text: `background job ${native.id} (codex: ${native.label}) finished` }],
+      source: { kind: 'tool-jobs', form: 'notice', ...source } };
+    inbox[target].push(message);
+    bus.emit('agent/inbox/inserted', { agent, message });
+    return message;
+  };
+  const dispose = () => { for (const cleanup of cleanups.splice(0)) cleanup(); };
+  t.after(dispose);
+  registerAutoWake({ ctx, enabled });
+  return { agent, inbox, agents, services, bus, session, wakes, warnings, infos, messages, notice, event, idle, endTurn, dispose,
+    tick: ms => t.mock.timers.tick(ms) };
+}
+
+test('auto wake: a delivered conductor notice followed by blocked waits for idle and preserves the inbox', t => {
+  const f = autoWakeFixture(t);
+  const notice = f.notice();
+  f.endTurn('blocked', false);
+  f.tick(10_000);
+  assert.deepEqual(f.wakes, [], 'turn/end still owns the running driver');
+  f.idle();
+  f.tick(999);
+  assert.equal(f.wakes.length, 0);
+  f.tick(1);
+  assert.deepEqual(f.wakes, [[notice]]);
+  assert.deepEqual(f.inbox.nextStep, [notice]);
+  assert.deepEqual(f.messages, []);
+  assert.match(f.infos[0], /自动唤醒 1\/2/);
+});
+
+test('auto wake: repeated blocked turns and restored notices exhaust two increasing retries without resetting the batch', t => {
+  const f = autoWakeFixture(t);
+  const notice = f.notice();
+  f.endTurn();
+  f.tick(1000);
+  f.bus.emit('agent/inbox/inserted', { agent: f.agent, message: notice });
+  f.notice();
+  f.endTurn();
+  f.tick(4999);
+  assert.equal(f.wakes.length, 1);
+  f.tick(1);
+  assert.equal(f.wakes.length, 2);
+  f.endTurn();
+  assert.equal(f.warnings.filter(text => text.includes('自动唤醒已用尽')).length, 1);
+  for (let i = 0; i < 5; i++) {
+    f.idle();
+    f.endTurn();
+    f.tick(60_000);
+  }
+  assert.equal(f.wakes.length, 2);
+  assert.equal(f.warnings.filter(text => text.includes('自动唤醒已用尽')).length, 1);
+  assert.deepEqual(f.messages, []);
+});
+
+test('auto wake: a consumed batch ends retries and a later distinct notice gets its own budget', t => {
+  const f = autoWakeFixture(t);
+  f.notice();
+  f.endTurn();
+  f.tick(1000);
+  f.inbox.nextStep.length = 0;
+  f.endTurn();
+  f.tick(60_000);
+  assert.equal(f.wakes.length, 1);
+  f.agent.status = 'running';
+  const second = f.notice({ target: 'nextTurn' });
+  f.endTurn();
+  f.tick(1000);
+  assert.deepEqual(f.wakes[1], [second]);
+});
+
+test('auto wake: unrelated, unowned, unnotified and nonterminal jobs and nonblocked endings never wake', async t => {
+  for (const scenario of ['foreign-kind', 'foreign-label', 'foreign-owner', 'running-job', 'other-source', 'no-notice', 'completed', 'interrupted', 'old-blocked']) {
+    await t.test(scenario, t => {
+      const f = autoWakeFixture(t);
+      if (scenario === 'old-blocked') f.endTurn();
+      if (scenario !== 'no-notice') f.notice({
+        job: scenario === 'foreign-kind' ? { kind: 'shell' } : scenario === 'foreign-label' ? { label: 'other plugin' }
+          : scenario === 'foreign-owner' ? { owner: 'S2' } : scenario === 'running-job' ? { status: 'running' } : {},
+        source: scenario === 'other-source' ? { kind: 'user' } : {},
+      });
+      if (scenario !== 'old-blocked') f.endTurn(['completed', 'interrupted'].includes(scenario) ? scenario : 'blocked');
+      f.tick(60_000);
+      assert.equal(f.wakes.length, 0);
+      assert.deepEqual(f.messages, []);
+    });
+  }
+});
+
+test('auto wake: consumed notices, running or replaced agents, missing services and disposal suppress scheduled wakes', async t => {
+  for (const scenario of ['consumed', 'running', 'removed', 'replaced', 'missing-agents', 'missing-jobs', 'disposed-agent', 'unload']) {
+    await t.test(scenario, t => {
+      const f = autoWakeFixture(t);
+      if (scenario === 'missing-jobs') delete f.services.jobs;
+      f.notice();
+      f.endTurn();
+      if (scenario === 'consumed') f.inbox.nextStep.length = 0;
+      if (scenario === 'running') f.agent.status = 'running';
+      if (scenario === 'removed') f.agents.delete(f.agent.id);
+      if (scenario === 'replaced') f.agents.set(f.agent.id, { ...f.agent });
+      if (scenario === 'missing-agents') delete f.services.agents;
+      if (scenario === 'disposed-agent') f.bus.emit('agent/disposed', { agent: f.agent });
+      if (scenario === 'unload') f.dispose();
+      assert.doesNotThrow(() => f.tick(60_000));
+      assert.equal(f.wakes.length, 0);
+      assert.deepEqual(f.messages, []);
+      if (scenario === 'unload') {
+        f.notice(); f.endTurn(); f.tick(60_000);
+        assert.equal(f.wakes.length, 0, 'retired listeners cannot schedule new attempts');
+      }
+    });
+  }
+});
+
+test('auto wake: failed wake calls are contained and still consume the finite budget', t => {
+  const f = autoWakeFixture(t);
+  let attempts = 0;
+  f.agent.wakeDriver = () => { attempts++; throw new Error('wake unavailable'); };
+  f.notice(); f.endTurn();
+  assert.doesNotThrow(() => f.tick(1000));
+  assert.doesNotThrow(() => f.tick(5000));
+  f.tick(60_000);
+  assert.equal(attempts, 2);
+  assert.equal(f.warnings.filter(text => text.includes('自动唤醒失败')).length, 2);
+  assert.equal(f.warnings.filter(text => text.includes('自动唤醒已用尽')).length, 1);
+});
+
+test('auto wake: configuration disables all automatic attempts', t => {
+  const f = autoWakeFixture(t, false);
+  f.notice(); f.endTurn(); f.tick(60_000);
+  assert.deepEqual(f.wakes, []);
+  assert.equal(f.bus.eventNames().length, 0);
 });

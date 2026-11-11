@@ -18,6 +18,21 @@ function validateRequest(request) {
   return { sessions: [...new Set(request.sessions)], message };
 }
 
+function resumePendingInbox(agent, sessionId) {
+  let method = null;
+  try {
+    const hasPending = agent.inbox?.hasPending;
+    if (hasPending === undefined) throw new Error('agent.inbox.hasPending is unavailable');
+    if (!hasPending) return { sessionId, status: 'skipped', reason: 'not_interrupted', method };
+    method = 'inbox';
+    // shortcut: wakeDriver is loop-specific; use a public wake-only API when the host provides one.
+    agent.wakeDriver();
+    return { sessionId, status: 'resumed', reason: 'pending_inbox_woken', method };
+  } catch (error) {
+    return { sessionId, status: 'skipped', reason: 'error', method, error: String(error?.message ?? error) };
+  }
+}
+
 async function resumeSession(ctx, sessionId, message) {
   let method = null;
   const skipped = (reason) => ({ sessionId, status: 'skipped', reason, method: null });
@@ -51,15 +66,7 @@ async function resumeSession(ctx, sessionId, message) {
       return { sessionId, status: 'resumed', reason: 'goal_resumed', method };
     }
     // A rejected turn alone says nothing was cut short, so it never justifies sending a prompt.
-    if (ended === 'blocked') {
-      const hasPending = agent.inbox?.hasPending;
-      if (hasPending === undefined) throw new Error('agent.inbox.hasPending is unavailable');
-      if (!hasPending) return skipped('not_interrupted');
-      method = 'inbox';
-      // shortcut: wakeDriver is loop-specific; use a public wake-only API when the host provides one.
-      agent.wakeDriver();
-      return { sessionId, status: 'resumed', reason: 'pending_inbox_woken', method };
-    }
+    if (ended === 'blocked') return resumePendingInbox(agent, sessionId);
     method = 'message';
     agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
     return { sessionId, status: 'resumed', reason: 'message_submitted', method };
@@ -121,4 +128,93 @@ export function registerResumeRequests({ ctx, directory }) {
     return () => { stopped = true; watcher?.close(); };
   });
   return check;
+}
+
+export function registerAutoWake({ ctx, enabled = true }) {
+  if (!enabled) return;
+  const batches = new Map();
+  const delays = [1000, 5000];
+  let stopped = false;
+  const warn = (message) => ctx.logger?.warn?.(`[codex-conductor] ${message}`);
+  const forget = (id) => {
+    clearTimeout(batches.get(id)?.timer);
+    batches.delete(id);
+  };
+  const pendingNotices = (agent, batch) => agent.inbox?.hasPending &&
+    [...agent.inbox.nextStep, ...agent.inbox.nextTurn].some(message => batch.notices.has(message.id));
+  const schedule = (agent, batch) => {
+    if (stopped || !batch.blocked || batch.timer || agent.status !== 'idle') return;
+    if (ctx.get?.('agents')?.get(agent.id) !== agent || !pendingNotices(agent, batch)) {
+      forget(agent.id);
+      return;
+    }
+    if (batch.attempts >= delays.length) {
+      if (!batch.exhausted) warn(`会话 ${agent.id} 自动唤醒已用尽（${delays.length}/${delays.length}），待处理通知仍留在 inbox。`);
+      batch.exhausted = true;
+      return;
+    }
+    batch.timer = setTimeout(() => {
+      batch.timer = undefined;
+      try {
+        if (stopped || batches.get(agent.id) !== batch || !batch.blocked || agent.status !== 'idle') return;
+        if (ctx.get?.('agents')?.get(agent.id) !== agent || !pendingNotices(agent, batch)) {
+          forget(agent.id);
+          return;
+        }
+        batch.attempts++;
+        const result = resumePendingInbox(agent, agent.id);
+        if (result.status === 'resumed') ctx.logger?.info?.(`[codex-conductor] 会话 ${agent.id} 自动唤醒 ${batch.attempts}/${delays.length}：处理已排队的任务通知。`);
+        else if (result.error) warn(`会话 ${agent.id} 自动唤醒失败：${result.error}`);
+        schedule(agent, batch);
+      } catch (error) { warn(`自动唤醒检查失败：${error?.message ?? error}`); }
+    }, delays[batch.attempts]);
+    batch.timer.unref?.();
+  };
+  const listen = (name, handler) => ctx.on(name, (...args) => {
+    if (stopped) return;
+    try { handler(...args); } catch (error) { warn(`自动唤醒检查失败：${error?.message ?? error}`); }
+  });
+  // tool-jobs emits this only after inserting its notice; a settled job alone may have been awaited.
+  listen('agent/inbox/inserted', ({ agent, message }) => {
+    if (message.source?.kind !== 'tool-jobs' || message.source.form !== 'notice' ||
+        ctx.get?.('agents')?.get(agent.id) !== agent) return;
+    const text = message.content?.find(block => block.type === 'text')?.text;
+    const id = /^background job (\S+)(?:\s|$)/.exec(text ?? '')?.[1];
+    const job = id && ctx.get?.('jobs')?.list(agent.id).find(job => job.id === id && job.owner === agent.id &&
+      job.kind === 'codex' && /^Codex [A-Za-z0-9][A-Za-z0-9_-]*(?: · |$)/.test(job.label ?? '') &&
+      ['completed', 'failed', 'killed'].includes(job.status));
+    if (!job) return;
+    let batch = batches.get(agent.id);
+    if (batch && (batch.agent !== agent || (agent.status === 'idle' && !pendingNotices(agent, batch)))) {
+      forget(agent.id);
+      batch = undefined;
+    }
+    if (!batch) {
+      batch = { agent, notices: new Set(), attempts: 0, blocked: false };
+      batches.set(agent.id, batch);
+    }
+    batch.notices.add(message.id);
+  });
+  listen('session/event', (session, event) => {
+    if (event.type !== 'turn/start' && event.type !== 'turn/end') return;
+    const batch = batches.get(session.id);
+    if (!batch || batch.agent.session !== session) return;
+    clearTimeout(batch.timer);
+    batch.timer = undefined;
+    batch.blocked = event.type === 'turn/end' && event.data?.reason?.kind === 'blocked';
+    if (batch.blocked) schedule(batch.agent, batch);
+    else if (event.type === 'turn/end') forget(session.id);
+  });
+  // turn/end is appended while still running; kick() publishes idle only after releasing the driver.
+  listen('agent/status', ({ agent, status }) => {
+    const batch = batches.get(agent.id);
+    if (status === 'idle' && batch?.agent === agent) schedule(agent, batch);
+  });
+  listen('agent/disposed', ({ agent }) => {
+    if (batches.get(agent.id)?.agent === agent) forget(agent.id);
+  });
+  ctx.effect?.(() => () => {
+    stopped = true;
+    for (const id of batches.keys()) forget(id);
+  });
 }

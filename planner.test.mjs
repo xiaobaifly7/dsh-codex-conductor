@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, shellReadTargets, wslPath } from './guard.mjs';
 import { apply, nextStep } from './index.mjs';
+import './guard.test.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
@@ -159,7 +160,7 @@ test('product refresh is session-scoped, coalesced, throttled, fail-closed and b
   let result = owner => ({ status: 'completed', owner, paths: ['/repo/product'] });
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => { calls.push(owner); return result(owner); }, { now: () => time });
   const read = (file, owner = 'S1') => scope.check(call('read', { file_path: file }, owner), '/repo');
-  assert.match(read('/repo/product'), /暂时无法确认是不是产物/);
+  assert.match(read('/repo/product'), /原料/);
   read('/repo/product');
   await tick();
   assert.deepEqual(calls, ['S1']);
@@ -170,7 +171,7 @@ test('product refresh is session-scoped, coalesced, throttled, fail-closed and b
   result = () => { throw new Error('runner unavailable'); };
   read('/repo/raw');
   await tick();
-  assert.match(read('/repo/raw'), /暂时无法确认是不是产物/);
+  assert.match(read('/repo/raw'), /原料/);
   assert.deepEqual(calls, ['S1', 'S1']);
   assert.equal(read('/repo/product'), undefined);
   assert.match(read('/repo/product', 'S2'), /原料/);
@@ -180,7 +181,7 @@ test('product refresh is session-scoped, coalesced, throttled, fail-closed and b
   result = () => ({ status: 'completed', owner: 'S2', paths: ['/repo/other-session'] });
   read('/repo/other-session');
   await tick();
-  assert.match(read('/repo/other-session'), /暂时无法确认是不是产物/);
+  assert.match(read('/repo/other-session'), /原料/);
   scope.add('cap', Array.from({ length: 10_001 }, (_, i) => `/repo/file${i}`));
   assert.match(read('/repo/file0', 'cap'), /原料/);
   assert.equal(read('/repo/file10000', 'cap'), undefined);

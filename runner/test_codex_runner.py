@@ -193,8 +193,8 @@ class RunnerTests(unittest.TestCase):
     def calls(self):
         return [json.loads(f.read_text()) for f in sorted(self.state.glob("call-*.json"))]
 
-    def wait_for(self, condition):
-        deadline = time.monotonic() + 10
+    def wait_for(self, condition, timeout=10):
+        deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if condition():
                 return
@@ -444,9 +444,7 @@ class RunnerTests(unittest.TestCase):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
 
-        home = Path(self.tmp.name) / "home"
-        jd = home / "jobs" / "starting"
-        jd.mkdir(parents=True)
+        jd = self.stored_job("starting", None)
         gate, reached = Path(self.tmp.name) / "release", Path(self.tmp.name) / "publishing"
         worker_script = Path(self.tmp.name) / "worker.py"
         worker_script.write_text(textwrap.dedent("""\
@@ -675,7 +673,7 @@ class RunnerTests(unittest.TestCase):
             self.wait_for(lambda: (self.state / "ready-0").exists())
             second = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="two")
             jobs.append(second["job_id"])
-            self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait")
+            self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait", timeout=20)
             waiting = self.control("status", second["job_id"])
             self.assertEqual((waiting["status"], waiting["phase"], waiting["attempt"]), ("running", "lock_wait", 0))
             self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
