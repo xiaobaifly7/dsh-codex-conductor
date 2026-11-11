@@ -3,7 +3,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter, getEventListeners } from 'node:events';
 import { spawnSync } from 'node:child_process';
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -4156,7 +4156,10 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   assert.ok(value.duration_s >= 0);
   assert.deepEqual(value.out_of_scope, []);
   assert.deepEqual(value.files_changed, [{ path: value.output, change: 'added' }]);
+  assert.deepEqual(value.unattributed_changes, []);
   assert.deepEqual(value.write_paths, [value.output]);
+  assert.equal(Object.hasOwn(value, 'before_rollback'), false);
+  assert.equal(Object.hasOwn(value, 'draft_path'), false);
   assert.match(value.next, /codex_run.*只读.*核对本次 output 与本次 sources/);
   assert.doesNotMatch(value.next, /codex_verify|原 Codex 素材任务/);
   assert.deepEqual(JSON.parse(h.tools.gemini_write.output.render({}, value)[0].text), value);
@@ -4270,17 +4273,28 @@ test('gemini_write lists snapshot changes and out-of-scope write events separate
     writeFileSync(path.join(options.cwd, 'notes.md'), '范围外素材被修改');
     mkdirSync(path.join(options.cwd, 'extra'));
     writeFileSync(path.join(options.cwd, 'extra', 'other.md'), '其他正文');
-    for (const file of ['chapter.md', 'event-only.md']) geminiEvent(child,
+    rmSync(path.join(options.cwd, 'removed.md'));
+    for (const file of ['./extra/../chapter.md', 'extra/./other.md', 'event-only.md']) geminiEvent(child,
       { event: 'step_update', step_update: { step_type: 'tool', tool_name: 'write_file', tool_info: { parameters: { Path: file } } } });
     geminiDone(child);
   } });
+  writeFileSync(path.join(h.cwd, 'removed.md'), '调用前存在');
   const value = await h.execute();
   assert.equal(value.status, 'failed');
-  assert.deepEqual(value.files_changed.map(f => [path.relative(h.cwd, f.path).replace(/\\/g, '/'), f.change]).sort(),
-    [['chapter.md', 'added'], ['extra/other.md', 'added'], ['notes.md', 'modified']]);
-  assert.deepEqual(value.out_of_scope.map(f => path.relative(h.cwd, f).replace(/\\/g, '/')).sort(), ['event-only.md', 'extra/other.md', 'notes.md']);
-  assert.deepEqual(value.write_paths, ['chapter.md', 'event-only.md']);
+  assert.equal(value.rolled_back, true);
+  assert.equal(value.target_exists, false);
+  assert.equal(value.restored_to, 'absent');
+  assert.deepEqual(value.before_rollback.files_changed.map(f => [path.relative(h.cwd, f.path).replace(/\\/g, '/'), f.change]).sort(),
+    [['chapter.md', 'added'], ['extra/other.md', 'added'], ['notes.md', 'modified'], ['removed.md', 'deleted']]);
+  assert.deepEqual(value.before_rollback.unattributed_changes.map(f => [path.relative(h.cwd, f.path).replace(/\\/g, '/'), f.change]).sort(),
+    [['notes.md', 'modified'], ['removed.md', 'deleted']]);
+  assert.deepEqual(value.out_of_scope.map(f => path.relative(h.cwd, f).replace(/\\/g, '/')).sort(),
+    ['event-only.md', 'extra/other.md', 'notes.md', 'removed.md']);
+  assert.deepEqual(value.write_paths, ['./extra/../chapter.md', 'extra/./other.md', 'event-only.md']);
+  assert.match(value.snapshot.note, /归属.*(待|需).*核实/);
   assert.match(value.next, /处理范围外改动/);
+  assert.match(value.next, /不存在/);
+  assert.equal(readFileSync(value.draft_path, 'utf8'), '正文');
   assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
 });
 
@@ -4314,15 +4328,27 @@ test('gemini_write detects max_chars from the file instead of the model response
   } });
   const value = await h.execute({ max_chars: 5, model: 'test-model', effort: 'low' });
   assert.equal(value.status, 'failed');
-  assert.equal(value.chars, 6);
-  assert.equal(value.cjk_chars, 2);
-  assert.equal(value.over_limit, true);
+  assert.equal(value.before_rollback.chars, 6);
+  assert.equal(value.before_rollback.cjk_chars, 2);
+  assert.equal(value.before_rollback.over_limit, true);
+  assert.deepEqual(value.before_rollback.unattributed_changes, [{ path: value.output, change: 'added' }]);
+  assert.equal(value.rolled_back, true);
+  assert.equal(value.target_exists, false);
+  assert.equal(value.restored_to, 'absent');
+  for (const field of ['chars', 'cjk_chars', 'over_limit', 'files_changed', 'unattributed_changes']) {
+    assert.equal(Object.hasOwn(value, field), false, field);
+  }
   assert.equal(value.attempts, 2);
   assert.deepEqual(value.attempt_chars, [6, 6]);
   assert.equal(value.model, 'test-model');
   assert.equal(value.effort, 'low');
   assert.deepEqual(value.usage, { total_tokens: 99 });
   assert.match(value.next, /自动压缩后仍超过 max_chars.*拆成更小的章节/);
+  assert.match(value.next, /不存在/);
+  assert.match(value.next, /draft_path/);
+  assert.match(value.next, /重试|Codex|codex/);
+  assert.doesNotMatch(value.next, /核对已有文件/);
+  assert.equal(readFileSync(value.draft_path, 'utf8'), '汉字😀abc');
   assert.match(h.spawns[0].prompt, /不得超过 5/);
   assert.equal(h.spawns.length, 2);
   assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
@@ -4330,15 +4356,138 @@ test('gemini_write detects max_chars from the file instead of the model response
 });
 
 test('gemini_write restores the original output bytes when both attempts exceed max_chars', async (t) => {
-  const h = geminiFixture(t);
+  const drafts = ['第一稿正文很长😀\n', '最终稿正文仍然超限𠀀\r\n'];
+  let attempt = 0;
+  const h = geminiFixture(t, { action: ({ child, options }) => {
+    const output = path.join(options.cwd, 'chapter.md');
+    writeFileSync(output, drafts[attempt++]);
+    geminiEvent(child, { event: 'step_update', step_update: { step_type: 'tool', tool_name: 'write_file', tool_info: { parameters: { Path: output } } } });
+    geminiDone(child);
+  } });
   const output = path.join(h.cwd, 'chapter.md');
   const original = Buffer.from([0xef, 0xbb, 0xbf, 0xff, 0x00, 0x0d, 0x0a]);
   writeFileSync(output, original);
   const value = await h.execute({ max_chars: 3, overwrite: true });
   assert.equal(value.status, 'failed');
   assert.equal(value.attempts, 2);
-  assert.deepEqual(value.attempt_chars, [10, 10]);
+  assert.deepEqual(value.attempt_chars, drafts.map(draft => [...draft].length));
+  assert.equal(value.rolled_back, true);
+  assert.equal(value.target_exists, true);
+  assert.equal(value.restored_to, 'original_content');
+  assert.equal(value.before_rollback.chars, [...drafts[1]].length);
+  assert.equal(value.before_rollback.cjk_chars, (drafts[1].match(/\p{Script=Han}/gu) ?? []).length);
+  assert.equal(value.before_rollback.over_limit, true);
+  assert.deepEqual(value.before_rollback.files_changed, [{ path: output, change: 'modified' }]);
+  assert.deepEqual(value.before_rollback.unattributed_changes, []);
+  for (const field of ['chars', 'cjk_chars', 'over_limit', 'files_changed', 'unattributed_changes']) {
+    assert.equal(Object.hasOwn(value, field), false, field);
+  }
+  assert.deepEqual(value.write_paths, [output]);
+  assert.equal(path.dirname(value.draft_path), path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-drafts'));
+  assert.equal(readFileSync(value.draft_path, 'utf8'), drafts[1]);
+  assert.match(value.next, /已恢复.*原(始)?内容/);
+  assert.match(value.next, /draft_path/);
+  assert.match(value.next, /拆成更小的章节/);
   assert.deepEqual(readFileSync(output), original);
+});
+
+test('gemini_write rolls back ERROR despite an already-written response and preserves the final draft', async (t) => {
+  const body = '最终读到正文𠀀😀\r\n';
+  const frontmatter = { created: '2026-11-10T08:09', updated: '2026-11-11T10:11', title: '失败草稿',
+    type: 'resource', status: 'draft', tags: ['课程'], aliases: [] };
+  for (const metadata of [undefined, frontmatter]) {
+    const h = geminiFixture(t, { action: ({ child, options }) => {
+      const output = path.join(options.cwd, 'chapter.md');
+      writeFileSync(output, (metadata ? '\uFEFF---\r\ntitle: wrong\r\n...\r\n' : '') + body);
+      geminiEvent(child, { event: 'step_update', step_update: { step_type: 'tool', tool_name: 'write_file', tool_info: { parameters: { Path: './chapter.md' } } } });
+      geminiDone(child, 0, { status: 'ERROR', response: '已写入' });
+    } });
+    const value = await h.execute(metadata ? { frontmatter: metadata } : {});
+    assert.equal(value.status, 'failed');
+    assert.match(value.error, /result ERROR.*已写入/);
+    assert.equal(value.attempts, 1);
+    assert.deepEqual(value.out_of_scope, []);
+    assert.equal(value.rolled_back, true);
+    assert.equal(value.target_exists, false);
+    assert.equal(value.restored_to, 'absent');
+    assert.deepEqual(value.attempt_chars, [[...body].length]);
+    assert.deepEqual(value.write_paths, ['./chapter.md']);
+    assert.deepEqual(value.before_rollback.files_changed, [{ path: value.output, change: 'added' }]);
+    assert.deepEqual(value.before_rollback.unattributed_changes, []);
+    assert.equal(value.before_rollback.over_limit, false);
+    assert.equal(path.dirname(value.draft_path), path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-drafts'));
+    const header = metadata ? '---\ncreated: "2026-11-10T08:09"\nupdated: "2026-11-11T10:11"\n' +
+      'title: "失败草稿"\ntype: "resource"\nstatus: "draft"\ntags: ["课程"]\naliases: []\n---\n' : '';
+    assert.equal(readFileSync(value.draft_path, 'utf8'), header + body);
+    assert.equal(Object.hasOwn(value, 'draft_error'), false);
+    assert.match(value.next, /不存在/);
+    assert.match(value.next, /draft_path/);
+    assert.match(value.next, /重试|Codex|codex/);
+    assert.doesNotMatch(value.next, /核对已有文件|本次 output 与本次 sources/);
+    assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
+  }
+});
+
+test('gemini_write retains only twenty drafts including the newest failed draft', async (t) => {
+  const h = geminiFixture(t, { action: ({ child, options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), '最新失败稿😀\n');
+    geminiDone(child, 0, { status: 'ERROR', response: '已写入' });
+  } });
+  const root = mkdtempSync(path.join(localAppData, 'gemini-retention-'));
+  const directory = path.join(root, 'dsh-codex-conductor', 'gemini-drafts');
+  mkdirSync(directory, { recursive: true });
+  const oldFiles = [];
+  for (let i = 0; i < 20; i++) {
+    const file = path.join(directory, `2000-01-01T00-00-${String(i).padStart(2, '0')}-000Z-00000000-0000-4000-8000-000000000000.md`);
+    writeFileSync(file, `老稿 ${i}`);
+    oldFiles.push(path.basename(file));
+  }
+  const previous = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = root;
+  let value;
+  try { value = await h.execute(); }
+  finally { process.env.LOCALAPPDATA = previous; }
+  assert.equal(value.status, 'failed');
+  assert.equal(value.rolled_back, true);
+  assert.equal(value.target_exists, false);
+  assert.equal(value.restored_to, 'absent');
+  assert.equal(path.dirname(value.draft_path), directory);
+  assert.equal(readFileSync(value.draft_path, 'utf8'), '最新失败稿😀\n');
+  const retained = readdirSync(directory);
+  assert.equal(retained.length, 20);
+  assert.deepEqual(retained.sort(), [...oldFiles.slice(1), path.basename(value.draft_path)].sort());
+  assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
+});
+
+test('gemini_write reports draft save errors independently and still restores the original output', async (t) => {
+  const h = geminiFixture(t, { action: ({ child, options }) => {
+    writeFileSync(path.join(options.cwd, 'chapter.md'), '未保存的失败稿');
+    geminiDone(child, 0, { status: 'ERROR', response: '已写入' });
+  } });
+  const output = path.join(h.cwd, 'chapter.md');
+  const original = Buffer.from([0xef, 0xbb, 0xbf, 0xff, 0x00, 0x0d, 0x0a]);
+  writeFileSync(output, original);
+  const root = mkdtempSync(path.join(localAppData, 'gemini-draft-error-'));
+  const directory = path.join(root, 'dsh-codex-conductor');
+  mkdirSync(directory);
+  const blocker = path.join(directory, 'gemini-drafts');
+  writeFileSync(blocker, '普通文件阻止建立草稿目录');
+  const previous = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = root;
+  let value;
+  try { value = await h.execute({ overwrite: true }); }
+  finally { process.env.LOCALAPPDATA = previous; }
+  assert.equal(value.status, 'failed');
+  assert.match(value.error, /result ERROR.*已写入/);
+  assert.equal(typeof value.draft_error, 'string');
+  assert.ok(value.draft_error.length > 0);
+  assert.equal(Object.hasOwn(value, 'draft_path'), false);
+  assert.equal(value.rolled_back, true);
+  assert.equal(value.target_exists, true);
+  assert.equal(value.restored_to, 'original_content');
+  assert.match(value.next, /已恢复.*原(始)?内容/);
+  assert.deepEqual(readFileSync(output), original);
+  assert.equal(readFileSync(blocker, 'utf8'), '普通文件阻止建立草稿目录');
 });
 
 test('gemini_write generates escaped seven-field frontmatter without counting it', async (t) => {

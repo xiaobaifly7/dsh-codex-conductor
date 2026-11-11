@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
-import { lstatSync, mkdirSync, opendirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 const { normPath, under } = await import(new URL(`./guard.mjs${new URL(import.meta.url).search}`, import.meta.url));
 
 const SOURCE_LIMIT = 1024 * 1024;
 const SNAPSHOT_LIMIT = 1000;
+const DRAFT_LIMIT = 20;
 const EFFORTS = ['low', 'medium', 'high'];
 const FRONTMATTER_FIELDS = ['created', 'updated', 'title', 'type', 'status', 'tags', 'aliases'];
 const NOTE_TYPES = ['daily-note', 'project', 'topic', 'moc', 'resource', 'inbox', 'archive'];
@@ -145,10 +147,10 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
 
 export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = {}, launch = spawn) {
   const started = performance.now();
-  let restoreOutput;
+  let restoreOutput, draft;
   const value = { status: 'failed', output: typeof args?.output === 'string' ? args.output : '', chars: 0, cjk_chars: 0,
     over_limit: false, out_of_scope: [], duration_s: 0, usage: null, model: args?.model ?? cfg.model, effort: args?.effort ?? cfg.effort,
-    files_changed: [], write_paths: [], attempts: 0, attempt_chars: [] };
+    files_changed: [], write_paths: [], unattributed_changes: [], rolled_back: false, attempts: 0, attempt_chars: [] };
   try {
     if (typeof args?.prompt !== 'string' || args.prompt.trim().length < 10) throw new Error('prompt 必须是至少 10 个字符的写作要求');
     for (const key of ['cwd', 'output', 'model']) if ((key !== 'model' || args[key] !== undefined) &&
@@ -216,6 +218,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
       }
       if (original !== null) writeFileSync(value.output, original);
       else if (info) unlinkSync(value.output);
+      value.restored_to = original === null ? 'absent' : 'original_content';
     };
     const deadline = performance.now() + cfg.timeoutSeconds * 1000;
     for (;;) {
@@ -232,7 +235,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
         const stamp = outputStamp();
         if (stamp) after.files.set(value.output, stamp);
         value.snapshot = { directory, limit: SNAPSHOT_LIMIT, truncated: before.truncated || after.truncated,
-          note: '仅扫描目标所在目录及子目录，不跟随符号链接；达到上限时其余路径未覆盖，write_paths 仅为 CLI 事件旁证。' };
+          note: '仅扫描目标所在目录及子目录，不跟随符号链接；达到上限时其余路径未覆盖。files_changed 为快照观测，write_paths 为 CLI 写入事件旁证；unattributed_changes 未匹配写入事件，归属待核实。' };
         for (const [file, info] of after.files) {
           const previous = before.files.get(file);
           if (!previous || previous.size !== info.size || previous.mtime !== info.mtime) {
@@ -243,7 +246,10 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
           if (!after.files.has(file)) value.files_changed.push({ path: file, change: 'deleted' });
         }
       } catch (error) { errors.push(`无法核对目录改动：${error.message}`); }
-      const changed = [...value.files_changed.map((file) => file.path), ...value.write_paths.map((file) => path.resolve(cwd, nativePath(file)))];
+      const eventPaths = value.write_paths.map((file) => path.resolve(cwd, nativePath(file)));
+      const eventKeys = new Set(eventPaths.map(normPath));
+      value.unattributed_changes = value.files_changed.filter((file) => !eventKeys.has(normPath(file.path)));
+      const changed = [...value.files_changed.map((file) => file.path), ...eventPaths];
       value.out_of_scope = [...new Map(changed.filter((file) => normPath(file) !== outputKey).map((file) => [normPath(file), file])).values()];
       let content;
       value.chars = 0;
@@ -253,6 +259,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
         if (normPath(realPath(value.output)) !== outputKey || !statSync(value.output).isFile()) throw new Error('output 已被替换成其他路径或不是文件');
         content = readFileSync(value.output, 'utf8');
         if (header) content = content.replace(/^\uFEFF?---[ \t]*\r?\n(?:[^\n]*\n)*?(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/, '');
+        draft = header + content;
         value.chars = [...content].length;
         value.cjk_chars = (content.match(/\p{Script=Han}/gu) ?? []).length;
         value.over_limit = args.max_chars !== undefined && value.chars > args.max_chars;
@@ -275,17 +282,48 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
         }
       }
       value.status = 'completed';
+      value.target_exists = true;
       break;
     }
   } catch (error) {
     let message = error?.message ?? error;
-    try { restoreOutput?.(); }
-    catch (restoreError) { message = `恢复 output 失败：${restoreError.message}；${message}`; }
+    if (restoreOutput) {
+      value.before_rollback = {};
+      for (const key of ['chars', 'cjk_chars', 'over_limit', 'files_changed', 'unattributed_changes']) {
+        value.before_rollback[key] = value[key];
+        delete value[key];
+      }
+      if (draft !== undefined) try {
+        if (!process.env.LOCALAPPDATA) throw new Error('LOCALAPPDATA 未设置，无法保存失败稿');
+        const directory = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-drafts');
+        mkdirSync(directory, { recursive: true });
+        const name = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.md`;
+        const file = path.join(directory, name);
+        writeFileSync(file, draft, { flag: 'wx' });
+        value.draft_path = file;
+        for (const old of readdirSync(directory).filter((entry) => entry.endsWith('.md') && entry !== name).sort().slice(0, -(DRAFT_LIMIT - 1))) {
+          unlinkSync(path.join(directory, old));
+        }
+      } catch (draftError) { value.draft_error = `保存或清理失败稿失败：${draftError.message}`; }
+      try { restoreOutput(); value.rolled_back = true; }
+      catch (restoreError) { message = `恢复 output 失败：${restoreError.message}；${message}`; }
+      try { value.target_exists = !!lstatSync(value.output, { throwIfNoEntry: false }); }
+      catch (stateError) {
+        value.target_exists = null;
+        message = `无法确认 output 是否存在：${stateError.message}；${message}`;
+      }
+    }
     value.error = `gemini_write: ${message}`.slice(0, 2000);
   }
   value.duration_s = (performance.now() - started) / 1000;
-  value.next = value.out_of_scope.length ? '先核实并处理范围外改动，再核对正文内容。'
-    : value.over_limit && value.attempts === 2 ? '自动压缩后仍超过 max_chars，请拆成更小的章节后分别写作。'
-      : value.status === 'completed' ? '对照素材核对正文内容，再继续下一章。' : '先处理 error 并核对已有文件，再决定是否重写这一章。';
+  if (restoreOutput && value.status === 'failed') {
+    value.next = !value.rolled_back ? '恢复 output 失败，先处理 error 并确认目标状态。'
+      : value.target_exists === null ? '目标已回滚，但无法确认当前是否存在，请先处理 error。'
+        : value.target_exists ? '目标已恢复原内容，本次生成稿未写入。' : '目标未写入，回滚后不存在。';
+    if (value.out_of_scope.length) value.next += '先核实并处理范围外改动，未匹配事件的快照变化归属待核实。';
+    if (value.before_rollback.over_limit && value.attempts === 2) value.next += '自动压缩后仍超过 max_chars，请拆成更小的章节后分别写作。';
+    value.next += value.draft_path ? '可用 draft_path 复核失败稿，处理 error 后重试或交 Codex 按原授权落盘；失败稿尚未判通过。'
+      : '先处理 error，再决定是否重试；没有可复用的 draft_path，请查看 draft_error（如有）。';
+  } else value.next = value.status === 'completed' ? '对照素材核对正文内容，再继续下一章。' : '先处理 error 后再决定是否重试。';
   return value;
 }
