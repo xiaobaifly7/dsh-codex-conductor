@@ -1152,7 +1152,7 @@ def blocking_summary(value):
             "next_action": action}
 
 
-def validate_review(review, value):
+def validate_review(review, value, submitting=False):
     fields = {"status", "criteria", "notes", "accepted_deviations"}
     if (not isinstance(review, dict) or not fields <= set(review) or set(review) - fields - {"blockers"} or
             not isinstance(review["status"], str) or
@@ -1209,6 +1209,11 @@ def validate_review(review, value):
     if review["status"] != "needs_changes":
         if (any(c["status"] != "met" for c in criteria) or acknowledged != expected or review.get("blockers")):
             raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers" + deviation_hint)
+    # Only new submissions: older stored reviews may already hold this contradiction and must stay readable.
+    elif submitting and all(c["status"] == "met" for c in criteria) and not review.get("blockers") and not expected:
+        raise ValueError("所有验收项都 met 且无阻塞/偏差时不能记 needs_changes；"
+                         "被审对象（正文、产品）的缺陷写进 notes 或结论，审计任务本身记 verified；"
+                         "若确有执行缺口，把对应 criterion 标 not_met 或加 blocker 并给出证据。")
     return review
 
 
@@ -1246,7 +1251,7 @@ def review_job(args, review):
         raise ValueError("Cannot review a running or unknown job")
     if not isinstance(args.reviewer, str) or not args.reviewer.strip():
         raise ValueError("reviewer must be nonempty")
-    validate_review(review, value)
+    validate_review(review, value, submitting=True)
     lock_path = job_dir / "reviews.lock"
     if not lock_path.resolve().is_relative_to(job_dir.resolve()):
         raise ValueError("reviews lock is outside job directory")

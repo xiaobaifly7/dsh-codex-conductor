@@ -1188,6 +1188,7 @@ test('tool descriptions guide audit judgement, dispatch scope and context recove
     const { tools } = harness({ config: { plannerAnswers } });
     assert.match(tools.codex_review.description, /审计\/核对类任务逐项判断是否完成核对：已完成记 met/);
     assert.match(tools.codex_review.description, /正文的缺陷写入 notes\/结论，不因此记 needs_changes/);
+    assert.match(tools.codex_review.description, /全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes/);
     assert.match(tools.codex_review.description, /Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正/);
     assert.match(tools.codex_run.description, /同一授权范围内，一单完成一个可验收结果，路径、平台和参数适配在单内处理/);
     assert.match(tools.codex_run.description, /教程修订后的终检与目录导航同一单：write=true，scope 只含目录页，正文与素材只读/);

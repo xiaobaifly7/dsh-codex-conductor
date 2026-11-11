@@ -1506,6 +1506,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       (cfg.plannerAnswers ? 'accepted_deviations=逐条通过且规划端按用户原始目标和已有事实接受原报告偏差或范围外改动。' + PLANNER_ANSWERS
         : 'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。') +
       '不能把 Codex 自报 met 当作独立核验。审计/核对类任务逐项判断是否完成核对：已完成记 met；被审正文的缺陷写入 notes/结论，不因此记 needs_changes。' +
+      '全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes。' +
       'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
