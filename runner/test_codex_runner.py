@@ -692,6 +692,49 @@ class RunnerTests(unittest.TestCase):
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
 
+    @unittest.skipIf(os.name == "nt", "requires POSIX process suspension")
+    def test_earlier_waiting_writer_cannot_be_overtaken(self):
+        import signal
+        jobs = []
+        stopped = None
+
+        def start(prompt):
+            job_id = self.invoke("--sandbox", "danger-full-access", command="start",
+                                 mode="gated_ok", prompt=prompt)["job_id"]
+            jobs.append(job_id)
+            return job_id
+
+        try:
+            first = start("one")
+            self.wait_for(lambda: (self.state / "ready-0").exists())
+            older = start("two")
+            self.wait_for(lambda: self.control("status", older).get("phase") == "lock_wait")
+            pid_file = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / older / "worker.pid"
+            pid = int(pid_file.read_text())
+            os.kill(pid, signal.SIGSTOP)
+            stopped = pid
+            later = start("three")
+            self.wait_for(lambda: self.control("status", later).get("phase") == "lock_wait")
+
+            (self.state / "release-0").touch()
+            self.assertEqual(self.control("status", first, "--wait", "10")["status"], "completed")
+            self.assertEqual(self.control("status", later, "--wait", "1").get("phase"), "lock_wait")
+
+            os.kill(stopped, signal.SIGCONT)
+            stopped = None
+            self.wait_for(lambda: (self.state / "ready-1").exists())
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            (self.state / "release-1").touch()
+            self.wait_for(lambda: (self.state / "ready-2").exists())
+            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two", "three"])
+            (self.state / "release-2").touch()
+            self.assertEqual(self.control("status", later, "--wait", "10")["status"], "completed")
+        finally:
+            if stopped is not None:
+                os.kill(stopped, signal.SIGCONT)
+            for job_id in reversed(jobs):
+                self.control("cancel", job_id)
+
     def test_lock_timeout_fails_queued_writer_without_touching_owner(self):
         jobs = []
         try:

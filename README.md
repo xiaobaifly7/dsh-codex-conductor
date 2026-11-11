@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.77` 修复后台任务共享目录写锁时可能插队的问题。
+
 `0.9.76` 修复插件热加载后本会话仍在运行的后台任务首次查状态可能被误拒的问题。
 
 `0.9.75` 在派单返回中给出可直接调用的报告和状态参数：`job_output` 的 `job_id` 填 Harness 的 `background_job_id`，`codex_status` 和 `codex_output` 用 runner `job_id`。
@@ -143,7 +145,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 - 路由失败不丢弃只读任务已有的 resume 线程。写任务自动重试时，只有本轮收到命令、文件改动或助手消息的实际工作事件，才改用“检查现状并完成原任务”的提示；仅启动线程、开始 turn 或出现配置警告时保留完整提示，避免丢掉用户续接回答。失败分类只读取本轮新增的 stderr，完整日志仍跨尝试保留。
 
-- 可写任务锁住任务目录；`workspace-write` 还会锁住本次显式指定的额外可写根。因此，不同 `cwd` 共用同一额外可写根的任务也会互斥。任一所需目录的写锁被占用时，后来的任务自动等待，状态为 `running`、阶段为 `lock_wait`，面板显示“排队等待目录写锁”。获得锁之前不会启动 Codex、检查路由或拍改动快照；取消这个排队任务不会取消持锁任务。继续用原 `job_id` 等待，不要重新派活。多个等待任务不保证严格先来先服务；`--timeout` 仍只限制每次 Codex 尝试，不包含排队时间，不想继续等时用 `codex_cancel`。`lockTimeoutSeconds`（runner 的 `--lock-timeout SECONDS`）可限制排队秒数，留空时无限等待；使用单调时钟，超时以 `lock_timeout` 失败且 `retryable=true`，不启动 Codex、不拍快照，也不影响持锁任务。此时先用 `codex_jobs` 查同目录正在运行的任务，再决定等待还是取消持锁任务，不要直接重派。
+- 可写任务锁住任务目录；`workspace-write` 还会锁住本次显式指定的额外可写根。因此，不同 `cwd` 共用同一额外可写根的任务也会互斥。任一所需目录的写锁被占用时，后来的任务自动等待，状态为 `running`、阶段为 `lock_wait`，面板显示“排队等待目录写锁”。获得锁之前不会启动 Codex、检查路由或拍改动快照；取消这个排队任务不会取消持锁任务。继续用原 `job_id` 等待，不要重新派活。需要同一写锁的后台任务按提交顺序启动；`--timeout` 仍只限制每次 Codex 尝试，不包含排队时间，不想继续等时用 `codex_cancel`。`lockTimeoutSeconds`（runner 的 `--lock-timeout SECONDS`）可限制排队秒数，留空时无限等待；使用单调时钟，超时以 `lock_timeout` 失败且 `retryable=true`，不启动 Codex、不拍快照，也不影响持锁任务。此时先用 `codex_jobs` 查同目录正在运行的任务，再决定等待还是取消持锁任务，不要直接重派。
 
 - 插件每次调用 `wsl.exe` 都有上限：`start` 和 `cancel` 120 秒，`status` 在它自己的等待秒数之外再留 60 秒。计时按 1 秒一跳，电脑睡眠唤醒不会立刻误判超时。WSL 卡住或起不来时按 `bridge_error` 返回，工具调用不会一直挂着；已知 `job_id` 的任务这时提示先用 `codex_status` 查询，不要直接重派，后台监控也会容忍偶发的一两次 `bridge_error`。
 
@@ -384,6 +386,8 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`0.9.77` prevents later background writers from jumping ahead on a shared directory lock.
+
 `0.9.76` fixes the first status check for a session’s running background job after a plugin reload.
 
 `0.9.75` gives ready-to-use report and status calls: pass the Harness `background_job_id` as `job_output`’s `job_id`, and use the runner `job_id` for `codex_status` and `codex_output`.
@@ -521,7 +525,7 @@ Running/queued Codex writers or a failed task query block execution; pending loc
 
 The bundled runner handles background execution, retries, timeouts, idle/reconnect detection and thread resumption; disconnecting a wait does not stop it. Unsent prompts survive route retries, and PID/event-log write failures terminate and reap children. Closing stdout while still alive does not bypass the configured timeout, idle or reconnect budget.
 
-Writers lock `cwd`; `workspace-write` also locks explicitly supplied `writable_roots`, so different working directories sharing an extra root serialize. Queued jobs remain `running` with phase `lock_wait`; Codex, route checks and snapshots start after all required locks are obtained. Cancelling a waiter leaves its holder alone. Wait on the original ID; admission is not strictly FIFO, and per-attempt `--timeout` excludes lock waiting. Optional `lockTimeoutSeconds` (runner `--lock-timeout SECONDS`) bounds queue time using a monotonic clock; omission waits indefinitely. Expiry fails with `lock_timeout`, `retryable=true`, without Codex or a snapshot and without affecting the holder. Use `codex_jobs` to inspect running jobs in the same directory before deciding to wait or cancel the holder; do not immediately redispatch.
+Writers lock `cwd`; `workspace-write` also locks explicitly supplied `writable_roots`, so different working directories sharing an extra root serialize. Queued jobs remain `running` with phase `lock_wait`; Codex, route checks and snapshots start after all required locks are obtained. Cancelling a waiter leaves its holder alone. Wait on the original ID. Background jobs sharing a required lock start in submission order; per-attempt `--timeout` excludes lock waiting. Optional `lockTimeoutSeconds` (runner `--lock-timeout SECONDS`) bounds queue time using a monotonic clock; omission waits indefinitely. Expiry fails with `lock_timeout`, `retryable=true`, without Codex or a snapshot and without affecting the holder. Use `codex_jobs` to inspect running jobs in the same directory before deciding to wait or cancel the holder; do not immediately redispatch.
 
 Each `wsl.exe` call is bounded: `start`/`cancel` 120 seconds, `status` its wait plus 60 seconds. One-second ticks avoid false timeouts after host sleep. Hung WSL returns `bridge_error`; query a known `job_id` before redispatching. Monitoring tolerates occasional transient bridge errors.
 

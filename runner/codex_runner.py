@@ -232,6 +232,37 @@ def acquire_write_lock(cwd):
     return acquire_file_lock(locks / f"{write_lock_key(cwd)}.lock")
 
 
+def write_lock_roots(cwd, sandbox, writable_roots):
+    if sandbox == "read-only":
+        return {}
+    roots = [cwd]
+    if sandbox == "workspace-write":
+        roots.extend(os.path.join(cwd, local_path(p)) for p in writable_roots or [])
+    return {write_lock_key(p): p for p in roots}
+
+
+def earlier_writer_waiting(run_dir, roots):
+    if run_dir.parent != HOME / "jobs":
+        return False
+    position = ((run_dir / "args.json").stat().st_mtime_ns, run_dir.name)
+    for job_dir in job_directories():
+        if job_dir == run_dir or (job_dir / "result.json").exists():
+            continue
+        try:
+            other = ((job_dir / "args.json").stat().st_mtime_ns, job_dir.name)
+        except FileNotFoundError:
+            continue
+        if other >= position:
+            continue
+        job = job_status(job_dir.name)
+        if job["status"] != "running" or not job.get("cwd"):
+            continue
+        other_roots = write_lock_roots(job["cwd"], job["sandbox"], job["task_options"]["writable_roots"])
+        if not roots.keys().isdisjoint(other_roots):
+            return True
+    return False
+
+
 def local_path(path):
     """DeepSeek often passes Windows paths; inside WSL map X:\\... to /mnt/x/...."""
     m = re.match(r"^([A-Za-z]):[\\/]*(.*)$", path)
@@ -675,10 +706,7 @@ def execute(args, prompt, run_dir):
     try:
         if args.sandbox != "read-only":
             try:
-                roots = [args.cwd]
-                if args.sandbox == "workspace-write":
-                    roots += [os.path.join(args.cwd, local_path(p)) for p in getattr(args, "writable_roots", None) or []]
-                roots = {write_lock_key(p): p for p in roots}
+                roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None))
                 lock_timeout = getattr(args, "lock_timeout", None)
                 deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
@@ -693,14 +721,14 @@ def execute(args, prompt, run_dir):
                             break
                         locks.append(lock)
                     else:
-                        break
+                        if not earlier_writer_waiting(run_dir, roots):
+                            break
                     for lock in locks:
                         lock.close()
                     locks.clear()
                     if not waiting:
                         runner_event(run_dir, 0, "lock_wait")
                         waiting = True
-                    # shortcut: waiters are not FIFO; add ordered admission if task ordering is required.
                     delay = 0.25 if deadline is None else min(0.25, max(0, deadline - time.monotonic()))
                     time.sleep(delay)
             except OSError as error:
