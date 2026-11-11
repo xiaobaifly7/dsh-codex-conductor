@@ -2879,7 +2879,8 @@ class RunnerTests(unittest.TestCase):
         import codex_runner
 
         jd = self.stored_job("bounded-output", {"status": "completed"})
-        source = jd / "last_message.txt"
+        # The runner resolves job paths; on Windows CI the temp dir is an 8.3 short name.
+        source = Path(os.path.realpath(jd)) / "last_message.txt"
         large = " " * 65535 + "\r\n漢😀" + "漢😀\r\n" * 262144
         cases = [(large, offset) for offset in (0, 65534, 65535, 65536, 65537,
                                                len(large) - 2, len(large), len(large) + 1)]
