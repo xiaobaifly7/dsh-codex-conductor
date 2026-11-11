@@ -1758,11 +1758,13 @@ test('codex_review distinguishes rejected arguments from a reviewed failed execu
   const record = { status: 'needs_changes',
     criteria: [{ index: 1, status: 'not_met', evidence: 'still fails' }], notes: 'checked', accepted_deviations: [] };
   const review = { job_id: 'PARENT', ...record };
+  const error = "Invalid review: Deviation acknowledgements require real unique indexes and nonempty evidence; " +
+    "allowed=[('reported', 1), ('scope', 1)], missing=[('scope', 1)], extra=[('scope', 2)]";
   const h = harness({ config: { reviewResult: { status: 'failed', error_kind: 'bad_arguments',
-    error: 'Invalid review: invalid deviation index', retryable: false } } });
+    error, retryable: false } } });
   h.finals.PARENT = source;
   await assert.rejects(h.tools.codex_review.execute(review, { agent: agentAt('/work/current') }),
-    /codex_review:.*复核.*invalid deviation index.*codex_status/);
+    err => err.message.includes(error) && /codex_review:.*复核.*codex_status/.test(err.message));
   assert.deepEqual(h.finals.PARENT, original);
   assert.ok(h.calls.every((argv) => ['status', 'review'].includes(argv[0])));
 
