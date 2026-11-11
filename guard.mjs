@@ -423,7 +423,8 @@ function findIssue(args, extra, braceExpansion, expansion) {
     const patterns = expansion.patterns?.slice(i + 1, end);
     const cmd = nested[0];
     if (cmd === 'pytest' || (!READERS.has(cmd) && !['sed', 'awk', 'find', 'sort', 'uniq', 'dd', 'base64', 'ssh-keygen'].includes(cmd)) ||
-        !segmentAllowed(nested, extra, braceExpansion, { ...expansion, kinds: nested.map(() => 'command'), parameters, patterns })) {
+        !segmentAllowed(nested, extra, braceExpansion, { ...expansion, kinds: nested.map(() => 'command'), parameters, patterns,
+          dynamicWords: expansion.dynamicWords?.slice(i + 1, end) })) {
       return `${a} 后的 ${cmd} 不是已放行的只读命令`;
     }
     i = end;
@@ -595,8 +596,13 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       const files = args.filter((a, i) => a === '-' || !a.startsWith('-') || (end >= 0 && i > end));
       return !expansion.glob && (files.length <= 1 || (files.length === 2 && files[1] === '-'));
     }
-    // printf -v 能给任意变量赋任意值
-    case 'printf': return !args[0]?.startsWith('-v') && !args[0]?.includes('$');
+    // Both -v and %n assign variables; -- only ends option parsing, not format interpretation.
+    case 'printf': {
+      const format = args[0] === '--' ? 1 : 0;
+      return !args[0]?.startsWith('-v') && args.slice(0, format + 1).every((_, i) =>
+        !expansion.dynamicWords?.[start + i + 1] && !patterns?.[i] && !parameters[i]?.includes('$')) &&
+        !/%[-+ #0']*(?:\d+|\*)?(?:\.(?:\d+|\*)?)?[hlLjzt]*n/.test((args[format] ?? '').replace(/%%/g, ''));
+    }
     case 'tree': return !args.some((a) => /^-[^-]*o/.test(a));
     case 'sed': return !sedIssue(args, patterns);
     case 'awk': return !awkIssue(args, patterns);
@@ -719,6 +725,22 @@ function fileArguments(args, takes = [], fileOptions = []) {
   return { files, operands };
 }
 
+function rgFilesOnly(args) {
+  const takes = ['-g', '--glob', '--iglob', '-t', '--type', '-T', '--type-not', '-d', '--max-depth',
+    '-j', '--threads', '--sort', '--sortr', '--max-filesize'];
+  let files = false;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--') break;
+    if (arg === '--files') { files = true; continue; }
+    const option = arg.startsWith('--') ? arg.split('=')[0] : arg.slice(0, 2);
+    if (takes.includes(option)) {
+      if (arg === option && args[++i] === undefined) return false;
+    } else if (arg.startsWith('-') && !/^(?:-[0uLq]+|--(?:hidden|no-hidden|no-ignore(?:-(?:dot|exclude|global|parent|vcs))?|follow|no-follow|null|quiet|no-messages|no-config|one-file-system))$/.test(arg)) return false;
+  }
+  return files;
+}
+
 export function shellReadTargets(command, cwd) {
   const expansions = new Map(), braces = new Set(), targets = [];
   let unknown = false;
@@ -775,7 +797,7 @@ export function shellReadTargets(command, cwd) {
     }
     const search = ['grep', 'egrep', 'fgrep', 'rg'].includes(cmd);
     if (cmd === 'rg' && args.includes('--files')) {
-      if (args.some(a => /^(-[^-]*f|--file(?:=|$)|--ignore-file)/.test(a))) return null;
+      if (!rgFilesOnly(args)) return null;
       continue;
     }
     if (search && args.some(a => a === '--follow' || (cmd === 'rg' ? /^-[^-]*L/.test(a) : /^-[^-]*R/.test(a)))) return null;

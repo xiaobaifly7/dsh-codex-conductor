@@ -728,6 +728,41 @@ test('auto wake: a consumed batch ends retries and a later distinct notice gets 
   assert.deepEqual(f.wakes[1], [second]);
 });
 
+test('auto wake: a notice arriving while running renews exhausted retries only after the old batch is consumed', async t => {
+  for (const consumed of [true, false]) await t.test(consumed ? 'consumed' : 'still pending', t => {
+    const f = autoWakeFixture(t);
+    const first = f.notice();
+    f.endTurn();
+    f.tick(1000);
+    f.endTurn();
+    f.tick(5000);
+    f.endTurn();
+    assert.equal(f.wakes.length, 2);
+    f.agent.status = 'running';
+    f.event({ type: 'turn/start', data: {} });
+    if (consumed) f.inbox.nextStep.length = 0;
+    const second = f.notice({ target: 'nextTurn' });
+    f.endTurn('blocked', false);
+    f.tick(60_000);
+    assert.equal(f.wakes.length, 2, 'a running driver must not be woken');
+    f.idle();
+    f.tick(999);
+    assert.equal(f.wakes.length, 2);
+    f.tick(1);
+    if (consumed) {
+      assert.deepEqual(f.wakes[2], [second]);
+      assert.match(f.infos[2], /自动唤醒 1\/2/);
+      f.endTurn();
+      f.tick(5000);
+      assert.equal(f.wakes.length, 4, 'the new batch has both retries');
+    } else {
+      f.tick(60_000);
+      assert.equal(f.wakes.length, 2, 'pending old notices keep the exhausted budget');
+      assert.deepEqual([...f.inbox.nextStep, ...f.inbox.nextTurn], [first, second]);
+    }
+  });
+});
+
 test('auto wake: unrelated, unowned, unnotified and nonterminal jobs and nonblocked endings never wake', async t => {
   for (const scenario of ['foreign-kind', 'foreign-label', 'foreign-owner', 'running-job', 'other-source', 'no-notice', 'completed', 'interrupted', 'old-blocked']) {
     await t.test(scenario, t => {
