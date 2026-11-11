@@ -2203,6 +2203,68 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.control("list", "--needs-attention")["total"], 0)
         self.assertEqual(self.control("list")["jobs"][0]["verification"], value["verification"])
 
+    def test_review_rejects_all_met_needs_changes_without_gaps(self):
+        for i, review_fields in enumerate(({}, {"blockers": []})):
+            with self.subTest(case=i):
+                jd = self.stored_job(f"inconsistent-review-{i}",
+                                     {"status": "completed", "structured": self.sample_report()},
+                                     context=self.sample_context())
+                original = (jd / "result.json").read_bytes()
+                review = self.sample_review(status="needs_changes", notes="The audited product has defects",
+                                            **review_fields)
+                result = self.submit_review(jd.name, review)
+                self.assertEqual(result["error_kind"], "bad_arguments")
+                self.assertRegex(result["error"], r"所有验收项都 met.*不能记 needs_changes.*notes.*verified.*not_met.*blocker.*证据")
+                self.assertFalse((jd / "reviews.json").exists())
+                for status in ("verified", "accepted_deviations"):
+                    value = self.submit_review(jd.name, {**review, "status": status})
+                    self.assertEqual(value["verification_status"], status)
+                    self.assertEqual(value["verification"]["notes"], review["notes"])
+                self.assertEqual((jd / "result.json").read_bytes(), original)
+
+    def test_stored_all_met_needs_changes_stays_readable_and_appendable(self):
+        jd = self.stored_job("legacy-inconsistent-review",
+                             {"status": "completed", "structured": self.sample_report()},
+                             context=self.sample_context())
+        old = {**self.sample_review(status="needs_changes", notes="written before the check"),
+               "reviewer": "planner", "time": 1.0}
+        (jd / "reviews.json").write_text(json.dumps({"history": [old], "latest": old}), "utf-8")
+        value = self.submit_review(jd.name, self.sample_review(status="verified"))
+        self.assertEqual(value["verification_status"], "verified")
+        history = json.loads((jd / "reviews.json").read_text("utf-8"))["history"]
+        self.assertEqual([entry["status"] for entry in history], ["needs_changes", "verified"])
+
+    def test_needs_changes_still_records_unmet_blocked_or_unaccepted_gaps(self):
+        acceptance = ["First criterion", "Second criterion"]
+        criteria = [{"index": i, "status": "met", "evidence": "checked"} for i in (1, 2)]
+        report = self.sample_report(criteria=[{"criterion": item, "status": "met", "evidence": "checked"}
+                                             for item in acceptance])
+        cases = [(status, {}, {"criteria": [criteria[0], {**criteria[1], "status": status}]})
+                 for status in ("not_met", "blocked")]
+        cases += [("blocker", {}, {"blockers": [self.blocker("implementation", resolution="Fix the gap")]}),
+                  ("reported", {"structured": {**report, "deviations": ["unconfirmed deviation"]}}, {}),
+                  ("scope", {"out_of_scope": ["outside.txt"]}, {}),
+                  ("scope-files", {"files_changed": [{"path": "outside.txt", "change": "modified"}]}, {}),
+                  ("partial", {"structured": {**report, "deviations": ["accepted deviation"]},
+                               "out_of_scope": ["outside.txt"]},
+                   {"accepted_deviations": [{"kind": "reported", "index": 1, "evidence": "explicitly accepted"}]}),
+                  ("accepted", {"structured": {**report, "deviations": ["accepted deviation"]},
+                                "out_of_scope": ["outside.txt"]},
+                   {"accepted_deviations": [{"kind": kind, "index": 1, "evidence": "explicitly accepted"}
+                                            for kind in ("reported", "scope")]})]
+        for name, result_fields, review_fields in cases:
+            with self.subTest(case=name):
+                jd = self.stored_job(f"review-gap-{name}",
+                                     {"status": "completed", "structured": report, **result_fields},
+                                     context={**self.sample_context(), "acceptance": acceptance}, scope=["allowed"])
+                review = self.sample_review(status="needs_changes", criteria=criteria)
+                review.update(review_fields)
+                value = self.submit_review(jd.name, review)
+                self.assertEqual(value["verification_status"], "needs_changes")
+                saved = {k: value["verification"][k] for k in review}
+                self.assertEqual(saved, review)
+                self.assertEqual(json.loads((jd / "reviews.json").read_text("utf-8"))["latest"], value["verification"])
+
     def test_review_deviation_errors_list_allowed_missing_and_extra_indexes(self):
         report = self.sample_report(deviations=["First deviation", "Second deviation"])
         self.stored_job("review-hints", {"status": "completed", "structured": report,

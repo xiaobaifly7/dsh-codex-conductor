@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.86` 新提交的复核如果所有验收项都是 `met`，又没有阻塞和偏差，就不能记成 `needs_changes`；被审正文的问题写进 notes。已经存下的旧复核不重新检查。
+
 `0.9.85` 复核没有覆盖全部验收时，报错会列出 `acceptance_count`、`out_of_range`、`duplicates`、`missing`，以及每条缺失验收的开头原文。`codex_continue` 碰上已有子任务、直接复用时，回执带 `submitted: false`，并写明这次的 answers/resolution 没有生效。`codex_review`、`codex_run`、`codex_summary` 的工具说明里加上了审计复核、一单一个可验收结果、先看汇总这三条规则。
 
 `0.9.84` `gemini_write` 失败回滚后，回执如实反映磁盘上的结果（`rolled_back`、`target_exists`、`restored_to`，回滚前的字数等统计移到 `before_rollback`）。生成稿另存到 `%LOCALAPPDATA%\dsh-codex-conductor\gemini-drafts`（保留最近 20 份），回执给出 `draft_path`，可以复核后复用，不必整章重写。快照里有、但 CLI 写入事件没记录的变化，单列为 `unattributed_changes`。失败判定规则不变。
@@ -224,6 +226,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 独立核验使用 `codex_review`：`criteria` 用原验收标准从 1 开始的 `index`，逐项提供 `status` 和实际 `evidence`；结论为 `verified / needs_changes / accepted_deviations`。通过结论要求各项实际通过；默认 `plannerAnswers=false` 时，有报告偏差或范围外改动，接受前必须等作业结束后的原会话用户确认，再在 `accepted_deviations` 中按 `reported / scope` 与 1 起始编号逐项记录依据。历史存入任务目录的 `reviews.json`，原 `result.json` 和 Codex 报告不改写；可用 `codex_output` 的 `artifact="review"` 分页重读。
 
+所有验收项均为 `met`、无活动 blocker 且无报告偏差或范围外改动时，插件拒绝 `needs_changes`，不自动改判；被审正文或产品的缺陷写入 `notes` / 结论，审计任务本身记 `verified`，真实执行缺口须记为 `not_met` / `blocked` 或添加有证据的 blocker。
+
 `codex_summary()` 默认汇总当前会话；传 `cwd` 可汇总一个项目，`thread_id` 可只看一个线程。默认每页 10 组，沿用筛选和 `limit`，用 `next_offset` 作为下次的 `offset` 翻页；总组数和总轮数始终按全部匹配记录计算。没有线程号的任务独立成组。最新轮次的执行状态与独立核验结论分开显示，不能据此宣称整个项目永久无问题。线程累计 token 只取最新可用累计值；混合或未知统计口径会明确标出，耗时只加总已结束轮次。
 
 汇总的 `error_kinds` 按本次筛选范围统计各错误类型的任务数，包括同一线程中的不同轮次；文字结果显示一行错误分类计数。统计覆盖全部匹配任务，不随当前页变化，也不增加筛选参数。
@@ -436,6 +440,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.86` rejects a new `needs_changes` review whose criteria are all `met` with no blockers and no deviations; defects in the audited content go in notes. Stored reviews are not re-checked.
 
 `0.9.85` makes review coverage errors list `acceptance_count`, `out_of_range`, `duplicates`, `missing` and the start of each missing criterion; marks `codex_continue` calls that reuse an existing child with `submitted: false` and says the new answers or resolution were not applied; and adds the audit-review, one-result-per-job and summary-first rules to the `codex_review`, `codex_run` and `codex_summary` descriptions.
 
@@ -676,6 +682,8 @@ Completed output uses original acceptance text when count/numbering match; next 
 Rows/results start with a summary such as `completed · 12 met / 1 blocked · 3 files · 148 s`; read-only tasks omit file counts. Failed/cancelled summaries show status, error kind and duration. Result headers retain job/thread IDs. Rows use `Codex <job_id> · <task first line>`; running chat cards show `Codex · <task first line>` with resume/host-access labels, then the summary once done.
 
 `codex_review` records independent per-criterion evidence in `reviews.json`, preserving original reports/results. Passing conclusions require every criterion to pass. With the default `plannerAnswers=false`, recording acceptance of reported deviations or out-of-scope changes requires an explicit user reply in the original session after the job ends. Use `verified / needs_changes / accepted_deviations`. Re-read with `codex_output artifact="review"`; record gaps before continuing under original permissions.
+
+The plugin rejects `needs_changes` when all criteria are `met`, no active blockers remain and there are no reported deviations or out-of-scope changes, without changing the verdict automatically; put defects in the audited prose or product in `notes` / conclusions, record the completed audit as `verified`, and mark real execution gaps as `not_met` / `blocked` or add a blocker with evidence.
 
 `codex_summary` groups actual threads, separating unthreaded jobs; default selection is the current session, with `cwd`/`thread_id` filters. It returns 10 groups per page by default; keep the same filters and `limit`, and pass `next_offset` as `offset` to continue. Group and round totals cover all matches. Top-level `error_kinds` and one rendered line count each error kind across all matching jobs, including separate rounds in the same thread, independent of the displayed page; no new filter is added. It shows files, open items and finished-round durations while keeping execution and verification separate, without claiming permanent project-wide correctness. Resumed usage is `usage_scope: "thread_total"`: take the latest cumulative value, never sum it repeatedly. Mixed/unknown accounting is marked; read-only retries after an actual Codex failure start fresh and omit that cumulative mark, while route-check failures preserve the resumed thread.
 
