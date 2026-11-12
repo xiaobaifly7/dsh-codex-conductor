@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.89` `gemini_write` 成功后的下一步提示，原来是"自己对照素材核对正文"，改成"派一单 Codex 只读核对这一章，同一单挂上目录入口"。`codex_continue` 的 job_id 报错改为提示先用 `codex_jobs` 找回原任务编号再续接，不要另开新单。
+
 `0.9.88` `codex_run` 现在会拒绝 schema 之外的顶层参数：任务正文误填进 `prompt`/`message`/`content` 会直接报错，不再被静默丢弃。`codex_output`、`codex_continue`、`codex_review`、`codex_verify` 在 `job_id` 缺失或非法时，也给出和 `codex_status` 一样的"用 codex_jobs 找回编号"提示。
 
 `0.9.87` Codex 的最终报告如果只是字符串里有原始控制字符，或者有非法的反斜杠转义（多见于证据里引用的 Windows 路径或正则），就修复后再解析，不再把整单判为 `schema_invalid`。修复后的报告仍要通过报告校验，修过的地方记在 `final_message_repaired`；JSON 结构本身损坏的仍判失败。
@@ -444,6 +446,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.89` changes the hint after a successful `gemini_write` from "check the chapter against its sources yourself" to "dispatch a read-only Codex check that also adds the directory entry", and makes the `codex_continue` job_id error say to recover the id with `codex_jobs` and continue the original job instead of opening a new one.
 
 `0.9.88` makes `codex_run` reject top-level parameters outside its schema, so a task spec misplaced in a `prompt`/`message`/`content` field errors instead of being silently dropped; and gives `codex_output`, `codex_continue`, `codex_review` and `codex_verify` the same "use codex_jobs to recover the id" hint on a missing or invalid `job_id` that `codex_status` already has.
 

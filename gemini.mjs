@@ -324,6 +324,6 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
     if (value.before_rollback.over_limit && value.attempts === 2) value.next += '自动压缩后仍超过 max_chars，请拆成更小的章节后分别写作。';
     value.next += value.draft_path ? '可用 draft_path 复核失败稿，处理 error 后重试或交 Codex 按原授权落盘；失败稿尚未判通过。'
       : '先处理 error，再决定是否重试；没有可复用的 draft_path，请查看 draft_error（如有）。';
-  } else value.next = value.status === 'completed' ? '对照素材核对正文内容，再继续下一章。' : '先处理 error 后再决定是否重试。';
+  } else value.next = value.status === 'completed' ? '不要自己通读正文：派一单 Codex 对照素材只读核对这一章，同一单 write=true、scope 只含目录页，核对通过后由它挂上目录入口；再按核对结果决定改稿或进入下一章。' : '先处理 error 后再决定是否重试。';
   return value;
 }
