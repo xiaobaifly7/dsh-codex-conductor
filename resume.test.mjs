@@ -423,11 +423,32 @@ test('send: running sessions skip before reading history or submitting', async (
   assert.deepEqual(f.messages, []);
 });
 
+test('send: whenRunning queue submits once to a running session, including one that starts running mid-read', async (t) => {
+  for (const when of ['before', 'after']) await t.test(when, async (t) => {
+    const f = fixture(t, 'send'), agent = f.add('A', [start(), end()]);
+    if (when === 'before') agent.status = 'running';
+    else f.services.sessionQuery.readSession = async () => { await Promise.resolve(); agent.status = 'running'; return { events: [end()] }; };
+    const result = await f.run({ sessionId: 'A', message: 'Wrap up', whenRunning: 'queue' });
+    assert.equal(result.status, 'sent');
+    assert.equal(result.reason, 'message_queued');
+    assert.equal(f.messages.length, 1);
+    assert.deepEqual(f.messages[0].message.content, [{ type: 'text', text: 'Wrap up' }]);
+    assert.deepEqual(f.messages[0].message.source, { kind: 'user' });
+  });
+  const f = fixture(t, 'send'), agent = f.add('A', [start(), end()]);
+  agent.status = 'running';
+  f.services.sessionQuery.readSession = async () => { f.agents.set('A', { ...agent }); return { events: [end()] }; };
+  const replaced = await f.run({ sessionId: 'A', message: 'Wrap up', whenRunning: 'queue' });
+  assert.equal(replaced.reason, 'session_changed');
+  assert.deepEqual(f.messages, []);
+});
+
 test('send: rejects missing fields, batches, empty messages, invalid IDs and overlong Unicode before service calls', async (t) => {
   const f = fixture(t, 'send');
   f.add('A');
   const invalid = [null, [], {}, 'request', { sessionId: 'A' }, { message: 'Next task' },
     { sessions: ['A'], message: 'Next task' }, { sessionId: 'A', sessions: [], message: 'Next task' },
+    ...['steer', true, null, ''].map(whenRunning => ({ sessionId: 'A', message: 'Next task', whenRunning })),
     ...['', 'A\n', '../A', 'a'.repeat(101), ['A'], null, 1].map(sessionId => ({ sessionId, message: 'Next task' })),
     ...['', ' \t\n', null, 1, [], {}, 'a'.repeat(4001), '😀'.repeat(4001)]
       .map(message => ({ sessionId: 'A', message }))];
