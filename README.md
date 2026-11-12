@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.90` 新增配置 `gemini.defaultMaxChars`（正整数）：`gemini_write` 调用没传 `max_chars` 时，就用它作为正文硬上限；显式传了 `max_chars` 仍以传入值为准。这样即使规划端忘了传，章节篇幅也有上限。
+`0.9.90` 新增配置 `gemini.forceEffort`（为 true 时一律使用配置里的推理强度，忽略调用方传入的值）和 `gemini.defaultMaxChars`（正整数）：`gemini_write` 调用没传 `max_chars` 时，就用它作为正文硬上限；显式传了 `max_chars` 仍以传入值为准。这样即使规划端忘了传，章节篇幅也有上限。
 
 `0.9.89` `gemini_write` 成功后的下一步提示，原来是"自己对照素材核对正文"，改成"派一单 Codex 只读核对这一章，同一单挂上目录入口"。`codex_continue` 的 job_id 报错改为提示先用 `codex_jobs` 找回原任务编号再续接，不要另开新单。
 
@@ -449,7 +449,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.90` adds `gemini.defaultMaxChars`: when a `gemini_write` call omits `max_chars`, this positive integer is used as the hard limit (an explicit `max_chars` still wins), so chapter length stays capped even when the planner forgets to pass it.
+`0.9.90` adds `gemini.forceEffort` (when true the configured effort overrides any value the caller passes) and `gemini.defaultMaxChars`: when a `gemini_write` call omits `max_chars`, this positive integer is used as the hard limit (an explicit `max_chars` still wins), so chapter length stays capped even when the planner forgets to pass it.
 
 `0.9.89` changes the hint after a successful `gemini_write` from "check the chapter against its sources yourself" to "dispatch a read-only Codex check that also adds the directory entry", and makes the `codex_continue` job_id error say to recover the id with `codex_jobs` and continue the original job instead of opening a new one.
 
