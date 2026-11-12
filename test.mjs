@@ -1183,6 +1183,40 @@ const nudges = [];
 const agentAt = (cwd, log = []) => ({ id: 'S1', session: { header: { cwd }, log }, steer: (m) => nudges.push(m) });
 const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: false, wait_seconds: 0 };
 
+test('codex_run rejects unknown top-level keys before invoking the runner', async () => {
+  for (const allowHostAccess of [false, true]) {
+    const h = harness({ config: { allowHostAccess } });
+    for (const extra of [{ prompt: '详细规格'.repeat(500) }, { message: '正文', content: '正文', typo: true }]) {
+      await assert.rejects(h.tools.codex_run.execute({ ...RUN, ...extra }, { agent: agentAt('/work/current') }), error => {
+        for (const key of Object.keys(extra)) assert.ok(error.message.includes(key));
+        assert.match(error.message, /codex_run 的任务正文写在 task，不是 prompt\/message\/content/);
+        return true;
+      });
+    }
+    assert.deepEqual(h.calls, []);
+  }
+});
+
+test('codex_run accepts minimal calls and every declared parameter with host access on or off', async () => {
+  for (const allowHostAccess of [false, true]) {
+    const h = harness({ config: { allowHostAccess, startResult: { job_id: 'J', status: 'completed' } } });
+    const exec = { agent: agentAt('/work/current') };
+    for (const write of [false, true]) {
+      assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
+      for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
+        const args = { ...RUN, write, ...access, scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
+          cwd: '/work/original', resume: 'THREAD', use_user_config: true, effort: 'low', wait_seconds: 1 };
+        assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
+        assert.equal((await h.tools.codex_run.execute(args, exec)).job_id, 'J');
+        const context = JSON.parse(h.requests.at(-1).stdin).context;
+        assert.equal(context.task, RUN.task);
+        assert.deepEqual(context.acceptance, RUN.acceptance);
+        assert.equal(context.write, write);
+      }
+    }
+  }
+});
+
 test('tool descriptions guide audit judgement, dispatch scope and context recovery', () => {
   for (const plannerAnswers of [false, true]) {
     const { tools } = harness({ config: { plannerAnswers } });
@@ -1558,7 +1592,8 @@ test('plannerAnswers applies complete planner answers without a user reply and k
 });
 
 test('codex_continue dispatches 22 original criteria with original context, permissions and options', async () => {
-  for (const sandbox of ['workspace-write', 'danger-full-access', 'read-only']) {
+  for (const [sandbox, allowHostAccess] of [['workspace-write', true], ['danger-full-access', true],
+    ['read-only', true], ['workspace-write', false]]) {
     const source = { ...workflowSource(), finished_at: 10 };
     source.context.acceptance = Array.from({ length: 22 }, (_, i) => `验收 ${i + 1}：保留 "CSV" 原文与数据 😀`);
     source.structured.criteria = source.context.acceptance.map((criterion) =>
@@ -1571,7 +1606,7 @@ test('codex_continue dispatches 22 original criteria with original context, perm
     source.final_message = 'WHOLE-HISTORY-MUST-NOT-BE-COPIED';
     source.context.continuation = { parent_job_id: 'GRANDPARENT', answers: [], resolution: '历史处理记录' };
     const before = structuredClone(source);
-    const h = harness({ config: { allowHostAccess: true, defaultHostAccess: true, effort: 'max',
+    const h = harness({ config: { allowHostAccess, defaultHostAccess: allowHostAccess, effort: 'max',
       startResult: { job_id: 'CHILD', status: 'completed' } } });
     h.finals.PARENT = source;
     const answers = [{ id: ' format ', answer: ' 保留旧 CSV 格式 ' }];
@@ -1803,7 +1838,7 @@ test('existing-job tools reject malformed runner IDs before invoking the runner'
   const rejected = { status: 'failed', error_kind: 'bad_arguments', error: 'invalid job_id', retryable: false };
   const h = harness({ config: { cancelResult: rejected } });
   const exec = { agent: agentAt('/work/current') };
-  const invalid = ['bad id', '../escape', 'J/1', 'bg:J', '-J', 'J1\n', 'J1\r\n', '', ' ', null, 42];
+  const invalid = ['bad id', '../escape', 'J/1', 'bg:J', '-J', 'J1\n', 'J1\r\n', '', ' ', null, 42, undefined];
   for (const id of invalid) h.finals[id] = rejected;
   for (const name of ['codex_status', 'codex_cancel', 'codex_output', 'codex_continue', 'codex_review']) {
     for (const id of invalid) {
@@ -1811,8 +1846,13 @@ test('existing-job tools reject malformed runner IDs before invoking the runner'
       if (name === 'codex_status') args.wait_seconds = 0;
       if (name === 'codex_review') Object.assign(args, { status: 'verified',
         criteria: [{ index: 1, status: 'met', evidence: 'checked' }], notes: 'checked', accepted_deviations: [] });
-      await assert.rejects(h.tools[name].execute(args, exec), /job_id/);
+      await assert.rejects(h.tools[name].execute(args, exec), {
+        message: `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
+      });
     }
+    for (const args of [undefined, {}]) await assert.rejects(h.tools[name].execute(args, exec), {
+      message: `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
+    });
   }
   assert.equal(h.calls.length, 0);
 
@@ -2225,7 +2265,13 @@ test('host_access runs Codex with danger-full-access, and only when allowHostAcc
   const done = { startResult: { job_id: 'J', status: 'completed' } };
   const exec = { agent: agentAt('F:\\work\\项目') };
   const off = harness({ config: done });
-  await assert.rejects(off.tools.codex_run.execute({ ...RUN, host_access: true }, exec), /allowHostAccess/);
+  for (const host_access of [true, false]) {
+    await assert.rejects(off.tools.codex_run.execute({ ...RUN, host_access }, exec), error => {
+      assert.match(error.message, /allowHostAccess/);
+      assert.doesNotMatch(error.message, /未知参数/);
+      return true;
+    });
+  }
   assert.equal(off.calls.length, 0);
   assert.equal(off.tools.codex_run.parameters.properties.host_access, undefined);
   assert.match(off.tools.codex_run.description, /启动不了 Windows 程序[^。]*这类检查你自己跑/);

@@ -1149,7 +1149,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
     '登记成功时直接返回任务号；' + WAIT_GUIDANCE + '未登记后台时中止派单的同步等待仍会取消该 Codex 任务。';
-  ctx.tools.register({
+  const runTool = {
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
@@ -1199,8 +1199,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       required: ['task', 'acceptance', 'write'],
     },
     output: OUTPUT,
-    execute: dispatch,
-  });
+    async execute(args, exec) {
+      if (Object.hasOwn(args ?? {}, 'host_access') && cfg.allowHostAccess !== true) {
+        throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access');
+      }
+      const unknown = Object.keys(args ?? {}).filter(key => !Object.hasOwn(runTool.parameters.properties, key));
+      if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
+      return dispatch(args, exec);
+    },
+  };
+  ctx.tools.register(runTool);
 
   ctx.tools.register({
     name: 'codex_verify',
@@ -1214,7 +1222,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_verify: job_id 无效');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_verify: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       if (args.focus !== undefined && typeof args.focus !== 'string') throw new Error('codex_verify: focus 必须是字符串');
       if (args.samples !== undefined && (!Number.isInteger(args.samples) || args.samples < 1 || args.samples > 30)) throw new Error('codex_verify: samples 必须是 1–30 的整数');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('codex_verify: wait_seconds 必须是非负整数');
@@ -1437,7 +1445,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
     output: DATA_OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_output: job_id 无效');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_output: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       if (args.artifact !== undefined && !['report', 'result', 'context', 'review', 'stderr', 'events'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
@@ -1467,7 +1475,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_continue: job_id 无效');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_continue: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       const owner = exec?.agent?.id;
       if (!owner) throw new Error('codex_continue: 当前调用没有会话 ID');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('wait_seconds 必须是非负整数');
@@ -1527,7 +1535,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id', 'status', 'criteria'] },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_review: job_id 无效');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_review: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       const owner = exec?.agent?.id;
       const source = await conductor.waitJob(args.job_id, 0);
       if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');

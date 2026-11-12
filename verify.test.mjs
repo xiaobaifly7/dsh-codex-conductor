@@ -142,11 +142,14 @@ for (const [field, values] of [
 ]) test(`codex_verify rejects invalid ${field} before any runner call`, async () => {
   const h = harness();
   for (const value of values) {
-    await assert.rejects(h.verify({ [field]: value }), new RegExp(`codex_verify: ${field}`), String(value));
+    await assert.rejects(h.verify({ [field]: value }), field === 'job_id'
+      ? { message: 'codex_verify: job_id 无效；请用 codex_jobs 找回 runner 任务编号' }
+      : new RegExp(`codex_verify: ${field}`), String(value));
   }
   if (field === 'job_id') {
-    await assert.rejects(h.tools.codex_verify.execute(undefined, exec), /job_id/);
-    await assert.rejects(h.tools.codex_verify.execute({}, exec), /job_id/);
+    for (const args of [undefined, {}]) await assert.rejects(h.tools.codex_verify.execute(args, exec), {
+      message: 'codex_verify: job_id 无效；请用 codex_jobs 找回 runner 任务编号',
+    });
   }
   assert.deepEqual(h.calls, []);
 });
