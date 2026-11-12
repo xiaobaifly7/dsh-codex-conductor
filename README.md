@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.94` 修复 Windows 后台任务启动时调用方与 worker 并发发布 PID 文件的竞态，并改进测试的条件等待、进程清理和失败诊断。
+
 `0.9.93` Gemini 改用无 stdout 进度超时（默认 600 秒）与共享总上限（默认 1800 秒），回执增加进度统计；成功正文禁止规划端读取/搜索，并从本会话已有回执恢复限制；新增 `reuse_draft`，可跳过 agy 重新校验、提交保留稿，超限仍拒绝。
 
 `0.9.92` 新增重启后自动续接 `autoResume`，并支持通过本机 `goal-request.json` 修改指定会话的当前 Goal 目标和轮数上限。
@@ -468,6 +470,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.94` fixes a Windows race where the background-job caller and its worker published the PID file at the same time, and makes the runner tests wait on conditions, stop workers before cleanup and report exit code and stderr on failure.
 
 `0.9.93` adds stdout-idle and total Gemini deadlines with progress receipts, blocks planner reads/searches of successful prose with session-receipt recovery, and accepts `reuse_draft` for validated resubmission without agy.
 

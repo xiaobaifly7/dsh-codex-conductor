@@ -129,7 +129,7 @@ FAKE_CODEX = textwrap.dedent(r"""
         active.mkdir()  # A second model running concurrently must fail the test.
         try:
             (state / f"ready-{calls}").touch()
-            deadline = time.monotonic() + 30
+            deadline = time.monotonic() + 120
             while not (state / f"release-{calls}").exists():
                 if time.monotonic() >= deadline:
                     raise RuntimeError("test release gate timed out")
@@ -160,6 +160,7 @@ def alive(pid):
 class RunnerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
+        self.started_jobs = set()
         root = Path(self.tmp.name)
         self.fake = root / "fake_codex.py"
         self.fake.write_text(FAKE_CODEX)
@@ -175,33 +176,90 @@ class RunnerTests(unittest.TestCase):
         self.addCleanup(environment.stop)
 
     def tearDown(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for job_dir in self.started_jobs:
+            with codex_runner.acquire_file_lock(job_dir / "process.lock", blocking=True):
+                for name in ("codex.pid", "worker.pid"):
+                    pid = codex_runner.recorded_pid(job_dir / name)
+                    if pid is not None:
+                        self.stop_process(pid)
         child = self.state / "child.pid"
         if child.exists():
-            if os.name == "nt":
-                subprocess.run(["taskkill", "/PID", child.read_text(), "/T", "/F"], capture_output=True)
-            else:
-                try:
-                    os.kill(int(child.read_text()), 9)
-                except ProcessLookupError:
-                    pass
+            self.stop_process(int(child.read_text()))
         self.tmp.cleanup()
+
+    def stop_process(self, pid):
+        if os.name != "nt":
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass
+            self.wait_for(lambda: not alive(pid))
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel.OpenProcess(0x100001, False, pid)  # SYNCHRONIZE | PROCESS_TERMINATE
+        if not handle:
+            if ctypes.get_last_error() == 87:  # The process has already exited.
+                return
+            raise ctypes.WinError(ctypes.get_last_error())
+        handle = wintypes.HANDLE(handle)
+        try:
+            if kernel.WaitForSingleObject(handle, 0) == 258:
+                if not kernel.TerminateProcess(handle, 1):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            self.assertEqual(kernel.WaitForSingleObject(handle, 30000), 0, f"PID {pid} did not exit")
+        finally:
+            kernel.CloseHandle(handle)
 
     def invoke(self, *extra, mode="warnings_then_ok", prompt="do it", command="run", env=None):
         args = [sys.executable, "-B", str(RUNNER), command, "--cwd", str(self.cwd), "--backoff", "0.1", *extra]
-        p = subprocess.run(args, input=prompt.encode("utf-8"), capture_output=True, timeout=60,
-                           env={**self.env, "FAKE_MODE": mode, **(env or {})})
-        return json.loads(p.stdout.decode("utf-8"))
+        jobs = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs"
+        previous = set(jobs.glob("*")) if command == "start" else set()
+        try:
+            p = subprocess.run(args, input=prompt.encode("utf-8"), capture_output=True, timeout=60,
+                               env={**self.env, "FAKE_MODE": mode, **(env or {})})
+        finally:
+            if command == "start":
+                self.started_jobs.update(set(jobs.glob("*")) - previous)
+        return self.command_json(p)
+
+    def command_json(self, p):
+        try:
+            return json.loads(p.stdout.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self.fail(f"runner returned invalid JSON: argv={p.args!r}, returncode={p.returncode}\n"
+                      f"stdout={p.stdout!r}\nstderr={p.stderr.decode('utf-8', 'replace')}")
 
     def calls(self):
         return [json.loads(f.read_text()) for f in sorted(self.state.glob("call-*.json"))]
 
-    def wait_for(self, condition, timeout=10):
+    def wait_for(self, condition, timeout=30):
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if condition():
                 return
             time.sleep(.01)
-        self.fail("test condition did not become ready")
+        self.fail(f"test condition did not become ready within {timeout}s")
+
+    def test_failed_start_reports_diagnostics_and_tracks_the_worker_for_cleanup(self):
+        run = subprocess.run
+
+        def lose_response(*args, **kwargs):
+            p = run(*args, **kwargs)
+            self.wait_for(lambda: (self.state / "ready-0").exists())
+            p.stdout, p.stderr, p.returncode = b"", b"startup failed", 1
+            return p
+
+        with mock.patch.object(subprocess, "run", side_effect=lose_response):
+            with self.assertRaisesRegex(AssertionError, r"(?s)returncode=1.*stdout=b''.*stderr=startup failed"):
+                self.invoke(command="start", mode="gated_ok")
+        self.assertEqual(len(self.started_jobs), 1)
 
     def test_warning_items_do_not_fail_the_run(self):
         r = self.invoke()
@@ -729,7 +787,11 @@ class RunnerTests(unittest.TestCase):
             self.wait_for(lambda: (self.state / "ready-0").exists())
             second = self.invoke("--sandbox", "danger-full-access", command="start", mode="gated_ok", prompt="two")
             jobs.append(second["job_id"])
-            self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait", timeout=20)
+            def waiting_for_lock():
+                status = self.control("status", second["job_id"])
+                self.assertEqual(status["status"], "running", status)
+                return status.get("phase") == "lock_wait"
+            self.wait_for(waiting_for_lock, timeout=60)
             waiting = self.control("status", second["job_id"])
             self.assertEqual((waiting["status"], waiting["phase"], waiting["attempt"]), ("running", "lock_wait", 0))
             self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
@@ -737,10 +799,10 @@ class RunnerTests(unittest.TestCase):
             second_dir = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / second["job_id"]
             self.assertFalse((second_dir / "codex.pid").exists())
             (self.state / "release-0").touch()
-            self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
+            self.assertEqual(self.control("status", first["job_id"], "--wait", "30")["status"], "completed")
             self.wait_for(lambda: (self.state / "ready-1").exists())
             (self.state / "release-1").touch()
-            self.assertEqual(self.control("status", second["job_id"], "--wait", "20")["status"], "completed")
+            self.assertEqual(self.control("status", second["job_id"], "--wait", "30")["status"], "completed")
             self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
         finally:
             for job_id in reversed(jobs):
@@ -909,7 +971,13 @@ class RunnerTests(unittest.TestCase):
                     task = json.loads(record.read_text("utf-8"))
                     self.assertEqual(set(task), {"cwd", "sandbox", "writable_roots"})
                 else:
-                    spawn.return_value.pid = 123
+                    def spawn_worker(argv, **kwargs):
+                        lock = codex_runner.acquire_file_lock(home / "jobs" / argv[-1] / "process.lock")
+                        if lock is not None:
+                            lock.close()
+                        self.assertIsNone(lock, "the caller must hold the startup lock before spawning")
+                        return SimpleNamespace(pid=123)
+                    spawn.side_effect = spawn_worker
                     codex_runner.main()
                     directory = home / "jobs" / emit.call_args.args[0]["job_id"]
                     task = json.loads((directory / "args.json").read_text("utf-8"))
@@ -1267,7 +1335,7 @@ class RunnerTests(unittest.TestCase):
 
     def control(self, *args):
         p = subprocess.run([sys.executable, "-B", str(RUNNER), *args], capture_output=True, timeout=60, env=self.env)
-        return json.loads(p.stdout.decode("utf-8"))
+        return self.command_json(p)
 
     def test_start_outlives_the_caller_and_status_returns_the_result(self):
         job = self.invoke(command="start", mode="slow_ok")
@@ -3465,7 +3533,53 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(sys, "argv", [str(RUNNER), "_worker", jd.name]), \
                 mock.patch.object(codex_runner, "execute", side_effect=execute):
             codex_runner.main()
+            with mock.patch.object(codex_runner, "record_pid") as record:
+                codex_runner.main()
+                record.assert_not_called()
         self.assertEqual(json.loads((jd / "result.json").read_text())["status"], "completed")
+
+    def test_worker_waits_for_the_callers_pid_publication(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("startup-lock", None)
+        (jd / "prompt.txt").write_text("do it")
+        codex_runner.record_pid(jd / "worker.pid", os.getpid())
+        reached = Path(self.tmp.name) / "worker-lock-attempt"
+        script = textwrap.dedent("""
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(sys.argv[1]).parent))
+            import codex_runner
+            reached = Path(sys.argv[3])
+            acquire = codex_runner.acquire_file_lock
+            def observe_lock(path, *args, **kwargs):
+                if path.name == "process.lock":
+                    reached.touch()
+                return acquire(path, *args, **kwargs)
+            codex_runner.acquire_file_lock = observe_lock
+            codex_runner.execute = lambda *args: {"status": "completed"}
+            sys.argv = [sys.argv[1], "_worker", sys.argv[2]]
+            codex_runner.main()
+        """)
+        worker = None
+        try:
+            with codex_runner.acquire_file_lock(jd / "process.lock", blocking=True):
+                worker = subprocess.Popen([sys.executable, "-B", "-c", script, str(RUNNER), jd.name, str(reached)],
+                                          env={**self.env, "FAKE_MODE": "warnings_then_ok"},
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=os.name != "nt")
+                self.wait_for(lambda: reached.exists() or worker.poll() is not None)
+                self.assertTrue(reached.exists())
+                self.assertEqual(codex_runner.recorded_pid(jd / "worker.pid"), os.getpid())
+            stdout, stderr = worker.communicate(timeout=30)
+            self.assertEqual(worker.returncode, 0, (stdout, stderr))
+            self.assertEqual(int((jd / "worker.pid").read_text()), worker.pid)
+            self.assertEqual(json.loads((jd / "result.json").read_text())["status"], "completed")
+        finally:
+            if worker is not None:
+                if worker.poll() is None:
+                    self.stop_process(worker.pid)
+                worker.communicate(timeout=30)
 
     def test_dead_worker_marks_only_identity_checked_residual_codex_processes(self):
         sys.path.insert(0, str(RUNNER.parent))
