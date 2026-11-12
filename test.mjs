@@ -1847,11 +1847,11 @@ test('existing-job tools reject malformed runner IDs before invoking the runner'
       if (name === 'codex_review') Object.assign(args, { status: 'verified',
         criteria: [{ index: 1, status: 'met', evidence: 'checked' }], notes: 'checked', accepted_deviations: [] });
       await assert.rejects(h.tools[name].execute(args, exec), {
-        message: `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
+        message: name === 'codex_continue' ? 'codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单' : `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
       });
     }
     for (const args of [undefined, {}]) await assert.rejects(h.tools[name].execute(args, exec), {
-      message: `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
+      message: name === 'codex_continue' ? 'codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单' : `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
     });
   }
   assert.equal(h.calls.length, 0);

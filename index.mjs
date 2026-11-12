@@ -1475,7 +1475,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_continue: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单');
       const owner = exec?.agent?.id;
       if (!owner) throw new Error('codex_continue: 当前调用没有会话 ID');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('wait_seconds 必须是非负整数');
