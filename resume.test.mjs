@@ -4,27 +4,40 @@ import fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { processResumeRequest, processSendRequest, registerResumeRequests, registerAutoWake } from './resume.mjs';
+import { performance } from 'node:perf_hooks';
+import { processResumeRequest, processSendRequest, processGoalRequest, processAutoResume, registerResumeRequests, registerAutoWake } from './resume.mjs';
 
 const uuid = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
 const interrupted = () => ({ type: 'turn/end', data: { reason: { kind: 'interrupted' } } });
 const blocked = () => ({ type: 'turn/end', data: { reason: { kind: 'blocked' } } });
+const aborted = cause => ({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: cause } } } });
 const start = () => ({ type: 'turn/start', data: {} });
 const end = () => ({ type: 'turn/end', data: { reason: { kind: 'completed' } } });
 const goal = (extra = {}) => ({ id: 'goal-1', revision: 7, phase: 'paused', activation: 'disarmed',
   roundsStarted: 1, maxGoalRounds: 3, ...extra });
 const row = (sessionId, reason, method = null) => ({ sessionId,
   status: method ? 'resumed' : 'skipped', reason, method });
+const autoDefaults = { enabled: true, maxAgeHours: 12,
+  message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] };
 
 function fixture(t, kind = 'resume') {
   const directory = fs.mkdtempSync(path.join(tmpdir(), 'conductor-resume-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const file = (name) => path.join(directory, name);
-  const agents = new Map(), events = new Map(), goalViews = new Map();
-  const calls = [], messages = [], resumes = [], wakes = [], warnings = [], cleanups = [];
+  const agents = new Map(), events = new Map(), rawEvents = new Map(), goalViews = new Map(), headers = new Map();
+  const calls = [], messages = [], resumes = [], edits = [], wakes = [], warnings = [], cleanups = [];
+  const readyCallbacks = new Set();
+  const bus = new EventEmitter(), rootFiber = { state: 0 };
+  agents.list = () => [...agents.values()];
+  const autoResume = kind === 'autoresume' ? { ...autoDefaults, exclude: [] } : undefined;
   const claimPattern = new RegExp(`^${kind}-request\\.${uuid}\\.processing\\.json$`);
   const claims = () => fs.readdirSync(directory).filter(name => claimPattern.test(name));
   const assertClaimed = () => {
+    if (autoResume) {
+      assert.equal(JSON.parse(fs.readFileSync(file('autoresume-state.json'), 'utf8')).hostProcess,
+        `${process.pid}:${performance.timeOrigin}`, 'reserve this process before any scan or submission');
+      return;
+    }
     assert.equal(fs.existsSync(file(`${kind}-request.json`)), false);
     assert.equal(claims().length, 1, 'claim exists before any service call');
   };
@@ -35,27 +48,68 @@ function fixture(t, kind = 'resume') {
       return agents.has(id) ? { agent: agents.get(id) }
         : { error: { code: 'session/not-found', message: 'missing fixture session' } };
     } },
-    sessionQuery: { async readSession(id) {
+    sessionQuery: { async listSessions() {
       assertClaimed();
-      calls.push(['read', id]);
+      calls.push(['list']);
+      return [...headers.values()].map(header => ({ header, title: 'fixture session' }));
+    }, async readSession(id) {
+      assertClaimed();
+      calls.push([autoResume ? 'queryRead' : 'read', id]);
       return { events: events.get(id), inheritedEventCount: 0 };
     } },
+    sessionPersistence: {
+      locate(header) {
+        assertClaimed();
+        assert.deepEqual(header, headers.get(header.id));
+        calls.push(['locate', header.id]);
+        return { path: file(`${header.id}.artifact`) };
+      },
+      async open(id, mode, options) {
+        assertClaimed();
+        assert.equal(mode, 'read');
+        calls.push(['rawOpen', id]);
+        return {
+          async read(offset, limit, readOptions) {
+            assert.equal(offset, 0);
+            assert.equal(limit, undefined);
+            assert.equal(readOptions.signal, options.signal);
+            calls.push(['rawRead', id]);
+            return { events: rawEvents.get(id) };
+          },
+          async close() { calls.push(['rawClose', id]); },
+        };
+      },
+    },
     agents,
     goals: { get: agent => goalViews.get(agent), resume(agent, value) {
       assertClaimed();
       resumes.push({ agent, value });
+    }, edit(agent, value, changes) {
+      assertClaimed();
+      edits.push({ agent, value, changes });
+    } },
+    appReady: { onReady(callback) {
+      readyCallbacks.add(callback);
+      return () => readyCallbacks.delete(callback);
     } },
   };
-  const ctx = { get(name) { assertClaimed(); return services[name]; },
+  const ctx = { root: { fiber: rootFiber }, on: (event, callback) => bus.on(event, callback),
+    get: name => services[name],
     logger: { warn: (...args) => warnings.push(args.join(' ')) },
     effect(setup) { cleanups.push(setup()); } };
   t.after(() => { for (const cleanup of cleanups.splice(0)) cleanup(); });
-  const add = (id, history = [start(), interrupted()]) => {
-    const agent = { status: 'idle', inbox: { hasPending: false },
+  const add = (id, history = autoResume ? [start()] : [start(), interrupted()]) => {
+    const agent = { id, status: 'idle', inbox: { hasPending: false },
       wakeDriver() { assertClaimed(); wakes.push(id); this.status = 'running'; },
       followup(message) { assertClaimed(); messages.push({ id, message }); } };
     agents.set(id, agent);
-    events.set(id, history);
+    const raw = autoResume ? history.map(event => ({ time: Date.now(), ...event })) : history;
+    rawEvents.set(id, raw);
+    const lastTurn = raw.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
+    events.set(id, autoResume && lastTurn?.type === 'turn/start'
+      ? [...raw, { ...interrupted(), time: raw.at(-1).time }] : [...raw]);
+    if (autoResume) fs.writeFileSync(file(`${id}.artifact`), '');
+    headers.set(id, { id, createdAt: Date.now() });
     return agent;
   };
   const write = (request) => fs.writeFileSync(file(`${kind}-request.json`), JSON.stringify(request));
@@ -71,9 +125,12 @@ function fixture(t, kind = 'resume') {
     assert.equal(fs.existsSync(file(`${kind}-request.json`)), false);
     return result;
   };
-  const process = kind === 'send' ? processSendRequest : processResumeRequest;
-  const run = async (request) => { write(request); return verify(await process({ ctx, directory })); };
-  return { ctx, directory, file, agents, events, goalViews, services, calls, messages, resumes, wakes, warnings,
+  const processRequest = kind === 'goal' ? processGoalRequest : kind === 'send' ? processSendRequest : processResumeRequest;
+  const run = async (request) => { write(request); return verify(await processRequest({ ctx, directory })); };
+  const artifact = id => file(`${id}.artifact`);
+  const modified = (id, time) => fs.utimesSync(artifact(id), time / 1000, time / 1000);
+  return { ctx, directory, file, artifact, modified, agents, events, rawEvents, goalViews, headers, services, calls, messages, resumes, edits, wakes, warnings,
+    autoResume, bus, rootFiber, readyCallbacks, ready: () => { for (const callback of readyCallbacks) callback(); },
     cleanups, claims, add, write, saved, verify, run };
 }
 
@@ -648,6 +705,619 @@ test('send watcher: startup and filename notifications share one watcher that cl
   assert.equal(w.watcher.close.mock.callCount(), 1);
   assert.equal(fs.existsSync(f.file('send-request.json')), true);
   assert.equal(f.messages.length, 2);
+});
+
+test('goal: objective, round budget or both edit active, paused and blocked goals with the current ID/revision', async (t) => {
+  const f = fixture(t, 'goal'), agent = f.add('session-edit');
+  const changes = [{ objective: '完成当前任务' }, { maxGoalRounds: 1 },
+    { objective: '更新后的任务', maxGoalRounds: Number.MAX_SAFE_INTEGER }];
+  for (const [i, phase] of ['active', 'paused', 'blocked'].entries()) {
+    const current = goal({ phase, id: `goal-current-${i}`, revision: 21 + i });
+    f.goalViews.set(agent, current);
+    const result = await f.run({ sessionId: 'session-edit', ...changes[i] });
+    assert.equal(result.sessionId, 'session-edit');
+    assert.equal(result.status, 'edited');
+    assert.equal(result.reason, 'edited');
+    assert.deepEqual(Object.keys(result).sort(), ['completedAt', 'reason', 'requestedAt', 'sessionId', 'status']);
+    assert.deepEqual(f.edits.at(-1), { agent, value: { id: current.id, revision: current.revision }, changes: changes[i] });
+  }
+  assert.deepEqual(f.calls, Array.from({ length: 3 }, () => ['resolve', 'session-edit']));
+  assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.resumes, []);
+});
+
+test('goal: requires at least one change, a nonempty objective and a positive safe-integer budget', async (t) => {
+  const f = fixture(t, 'goal');
+  f.goalViews.set(f.add('session-edit'), goal());
+  const invalid = [null, [], {}, { sessionId: 'session-edit' },
+    ...['', ' ', null, 1, [], {}].map(objective => ({ sessionId: 'session-edit', objective, maxGoalRounds: 2 })),
+    ...[0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, null, '3', true].map(maxGoalRounds =>
+      ({ sessionId: 'session-edit', objective: 'valid objective', maxGoalRounds })),
+    ...['', '../session-edit', 'bad\nid', 'x'.repeat(101), null].map(sessionId => ({ sessionId, maxGoalRounds: 2 }))];
+  for (const request of invalid) {
+    const result = await f.run(request);
+    assert.equal(result.status, 'skipped', JSON.stringify(request));
+    assert.equal(result.reason, 'invalid_request');
+    assert.ok(result.error);
+  }
+  fs.writeFileSync(f.file('goal-request.json'), '{broken');
+  assert.equal(f.verify(await processGoalRequest(f)).reason, 'invalid_request');
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(f.edits, []);
+});
+
+test('goal: missing sessions, absent/complete goals and host failures report distinct reasons', async (t) => {
+  for (const stage of ['missing', 'no-goal', 'complete', 'controller', 'resolve', 'get', 'edit']) {
+    await t.test(stage, async (t) => {
+      const f = fixture(t, 'goal'), agent = f.add('session-edit');
+      f.goalViews.set(agent, goal({ phase: stage === 'complete' ? 'complete' : 'paused' }));
+      if (stage === 'missing') f.agents.delete('session-edit');
+      if (stage === 'no-goal') f.goalViews.delete(agent);
+      if (stage === 'controller') delete f.services.sessionController;
+      if (stage === 'resolve') f.services.sessionController.resolveAgent = async () => ({ error: { code: 'host-failed' } });
+      if (stage === 'get' || stage === 'edit') f.services.goals[stage] = () => { throw new Error('private host text'); };
+      const result = await f.run({ sessionId: 'session-edit', maxGoalRounds: 4 });
+      assert.equal(result.status, 'skipped');
+      assert.equal(result.reason, stage === 'missing' ? 'session_not_found'
+        : ['no-goal', 'complete'].includes(stage) ? 'no_active_goal' : 'error');
+      if (result.reason === 'error') assert.ok(result.error);
+      assert.deepEqual(f.edits, []);
+      assert.deepEqual(f.messages, []);
+    });
+  }
+});
+
+test('goal watcher: startup, notifications and tmp+rename consume once through the shared watcher', async (t) => {
+  const f = fixture(t, 'goal');
+  for (const id of ['session-A', 'session-B', 'session-C']) f.goalViews.set(f.add(id), goal());
+  f.write({ sessionId: 'session-A', objective: 'First objective' });
+  const w = watchFixture(t, f);
+  await w.check();
+  f.verify(f.saved());
+  assert.equal(f.edits.length, 1);
+  f.write({ sessionId: 'session-B', maxGoalRounds: 5 });
+  await w.notify('change', 'goal-result.json');
+  assert.equal(f.edits.length, 1);
+  await w.notify('change', 'goal-request.json');
+  f.verify(f.saved());
+  const temporary = f.file('goal-request.json.tmp');
+  fs.writeFileSync(temporary, JSON.stringify({ sessionId: 'session-C', objective: 'Renamed objective' }));
+  await w.notify('change', 'goal-request.json.tmp');
+  assert.equal(f.edits.length, 2);
+  fs.renameSync(temporary, f.file('goal-request.json'));
+  await w.notify('rename', Buffer.from('goal-request.json'));
+  f.verify(f.saved());
+  await w.notify('rename', null);
+  await w.check();
+  assert.equal(await processGoalRequest(f), undefined);
+  assert.deepEqual(f.edits.map(({ agent }) => agent), ['session-A', 'session-B', 'session-C'].map(id => f.agents.get(id)));
+  w.dispose();
+  assert.equal(w.watcher.close.mock.callCount(), 1);
+});
+
+test('goal: concurrent consumers and a failed result publication never replay an edit', async (t) => {
+  for (const failure of [false, true]) await t.test(failure ? 'publish failure' : 'parallel claim', async (t) => {
+    const f = fixture(t, 'goal');
+    f.goalViews.set(f.add('session-edit'), goal());
+    f.write({ sessionId: 'session-edit', maxGoalRounds: 4 });
+    if (failure) {
+      const rename = fs.renameSync;
+      t.mock.method(fs, 'renameSync', (from, to) => {
+        if (to === f.file('goal-result.json')) throw new Error('result publication failed');
+        return rename(from, to);
+      });
+      await assert.rejects(processGoalRequest(f), /result publication failed/);
+      assert.equal(f.claims().length, 1);
+    } else {
+      const results = await Promise.all([processGoalRequest(f), processGoalRequest(f)]);
+      assert.equal(results.filter(Boolean).length, 1);
+      f.verify(results.find(Boolean));
+    }
+    assert.equal(await processGoalRequest(f), undefined);
+    assert.equal(f.edits.length, 1);
+  });
+});
+
+test('auto resume: raw interrupted is a manual stop; only error, unterminated and disarmed active work resume', async (t) => {
+  const f = fixture(t, 'autoresume');
+  for (const [name, history] of [['interrupted', [start(), interrupted()]],
+    ['error', [start(), { type: 'turn/end', data: { reason: { kind: 'error' } } }]],
+    ['unterminated', [start()]], ['completed', [start(), end()]], ['disarmed', [start(), end()]],
+    ['armed', [start(), interrupted()]], ['exhausted', [start(), interrupted()]]]) {
+    const agent = f.add(`session-${name}`, history);
+    if (name === 'disarmed' || name === 'armed') f.goalViews.set(agent, goal({ phase: 'active', activation: name }));
+    if (name === 'exhausted') f.goalViews.set(agent, goal({ phase: 'active', roundsStarted: 3 }));
+  }
+  const result = await processAutoResume(f);
+  const expected = [row('session-interrupted', 'interrupted_without_shutdown_marker'), row('session-error', 'message_submitted', 'message'),
+    row('session-unterminated', 'message_submitted', 'message'), row('session-completed', 'not_interrupted'),
+    row('session-disarmed', 'goal_resumed', 'goal'), row('session-armed', 'native_goal_driver'), row('session-exhausted', 'goal_round_limit')];
+  assert.deepEqual(result.sessions.map(({ basis, ...entry }) => entry), expected);
+  assert.equal(result.status, 'processed');
+  assert.deepEqual(f.saved(), result);
+  assert.deepEqual(f.messages.map(({ id, message }) => ({ id, role: message.role, text: message.content[0].text })),
+    ['error', 'unterminated'].map(name => ({ id: `session-${name}`, role: 'user', text: autoDefaults.message })));
+  assert.deepEqual(f.resumes, [{ agent: f.agents.get('session-disarmed'), value: { id: 'goal-1', revision: 7 } }]);
+  assert.deepEqual(result.sessions.map(entry => entry.basis.lastTurn), ['interrupted', 'error', 'unterminated', 'completed', 'completed', 'interrupted', 'interrupted']);
+  for (const entry of result.sessions) {
+    assert.equal(entry.basis.updatedAt, fs.statSync(f.artifact(entry.sessionId)).mtimeMs);
+    assert.deepEqual(f.calls.filter(([, id]) => id === entry.sessionId).map(([operation]) => operation),
+      ['locate', 'rawOpen', 'rawRead', 'rawClose', 'resolve', 'queryRead']);
+  }
+  const open = result.sessions.find(entry => entry.sessionId === 'session-unterminated');
+  assert.equal(open.basis.lastTurn, 'unterminated');
+  assert.equal(open.basis.loadedLastTurn, 'interrupted', 'synthetic query endings must not turn a raw open turn into a user stop');
+  assert.equal(f.rawEvents.get('session-unterminated').at(-1).type, 'turn/start');
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')),
+    { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: expected.filter(entry => entry.status === 'resumed').map(entry => entry.sessionId) });
+});
+
+test('auto resume: metadata mtime filters old sessions before any raw/query read or resolve', async (t) => {
+  const f = fixture(t, 'autoresume');
+  const now = Date.now(), old = now - 13 * 3600_000;
+  f.add('session-old', [{ ...start(), time: now }]);
+  f.modified('session-old', old);
+  f.add('session-fresh', [{ ...start(), time: old }]);
+  f.modified('session-fresh', now);
+  f.headers.get('session-fresh').createdAt = old;
+  f.add('session-empty-old', []);
+  f.modified('session-empty-old', old);
+  f.add('session-empty-fresh', []);
+  const result = await processAutoResume(f);
+  assert.deepEqual(result.sessions.map(({ sessionId, reason }) => [sessionId, reason]), [
+    ['session-old', 'too_old'], ['session-fresh', 'message_submitted'],
+    ['session-empty-old', 'too_old'], ['session-empty-fresh', 'not_interrupted']]);
+  for (const entry of result.sessions) assert.equal(entry.basis.updatedAt, fs.statSync(f.artifact(entry.sessionId)).mtimeMs);
+  for (const id of ['session-old', 'session-empty-old']) {
+    assert.deepEqual(f.calls.filter(([, sessionId]) => sessionId === id), [['locate', id]],
+      'old metadata prevents persistence.open/read and query.readSession even with recent header/history');
+  }
+  assert.equal(result.sessions[1].basis.lastTurn, 'unterminated');
+  assert.equal(result.sessions[1].basis.loadedLastTurn, 'interrupted');
+  assert.deepEqual(f.calls.filter(([op]) => op === 'resolve').map(([, id]) => id), ['session-fresh', 'session-empty-fresh']);
+  assert.deepEqual(f.messages.map(({ id }) => id), ['session-fresh']);
+});
+
+test('auto resume: paused and blocked goals stay untouched for every last turn; active goals honor activation and budget', async (t) => {
+  const f = fixture(t, 'autoresume');
+  const endings = { interrupted: interrupted(), completed: end(), blocked: blocked(),
+    error: { type: 'turn/end', data: { reason: { kind: 'error' } } }, unterminated: start() };
+  const cases = [
+    ['paused', goal({ phase: 'paused' }), 'goal_paused'],
+    ['blocked', goal({ phase: 'blocked' }), 'goal_blocked'],
+    ['active', goal({ phase: 'active' }), 'goal_resumed'],
+    ['armed', goal({ phase: 'active', activation: 'armed' }), 'native_goal_driver'],
+    ['exhausted', goal({ phase: 'active', roundsStarted: 3 }), 'goal_round_limit'],
+    ['complete', goal({ phase: 'complete' }), null],
+  ];
+  const expected = [];
+  for (const [phase, view, reason] of cases) for (const [ending, event] of Object.entries(endings)) {
+    const id = `session-${phase}-${ending}`;
+    const agent = f.add(id, [start(), event]);
+    agent.inbox.hasPending = true;
+    f.goalViews.set(agent, view);
+    expected.push(row(id, reason ?? (['error', 'unterminated'].includes(ending) ? 'message_submitted'
+      : ending === 'interrupted' ? 'interrupted_without_shutdown_marker' : 'not_interrupted'),
+    phase === 'active' ? 'goal' : phase === 'complete' && ['error', 'unterminated'].includes(ending) ? 'message' : null));
+  }
+  const result = await processAutoResume(f);
+  assert.deepEqual(result.sessions.map(({ basis, ...entry }) => entry), expected);
+  assert.deepEqual(f.resumes.map(({ agent }) => agent), Object.keys(endings).map(ending => f.agents.get(`session-active-${ending}`)));
+  assert.deepEqual(f.messages.map(({ id }) => id), ['session-complete-error', 'session-complete-unterminated']);
+  assert.deepEqual(f.wakes, [], 'paused/blocked goals must not wake even a pending inbox');
+});
+
+test('auto resume: shutdown pending permits interrupted/disposed/parent recovery but never user stops or paused/blocked goals', async (t) => {
+  const endings = [
+    ['interrupted', interrupted(), 'interrupted_without_shutdown_marker', 'message_submitted'],
+    ['completed', end(), 'not_interrupted', 'not_interrupted'],
+    ['error', { type: 'turn/end', data: { reason: { kind: 'error' } } }, 'message_submitted', 'message_submitted'],
+    ['unterminated', start(), 'message_submitted', 'message_submitted'],
+    ['user', aborted('user'), 'user_stopped', 'user_stopped'],
+    ['disposed', aborted('disposed'), 'interrupted_without_shutdown_marker', 'message_submitted'],
+    ['parent', aborted('parent'), 'interrupted_without_shutdown_marker', 'message_submitted'],
+    ['other', aborted('other'), 'interrupted_without_shutdown_marker', 'interrupted_without_shutdown_marker'],
+  ];
+  const phases = [
+    ['none', undefined, null], ['complete', goal({ phase: 'complete' }), null],
+    ['paused', goal({ phase: 'paused' }), 'goal_paused'], ['blocked', goal({ phase: 'blocked' }), 'goal_blocked'],
+    ['active', goal({ phase: 'active' }), 'goal_resumed'],
+    ['armed', goal({ phase: 'active', activation: 'armed' }), 'native_goal_driver'],
+    ['exhausted', goal({ phase: 'active', roundsStarted: 3 }), 'goal_round_limit'],
+  ];
+  for (const pending of [false, true]) await t.test(pending ? 'previous shutdown pending' : 'no shutdown marker', async (t) => {
+    const f = fixture(t, 'autoresume');
+    const expected = [], bases = [], pendingIds = [];
+    for (const [phase, view, goalReason] of phases) for (const [ending, event, withoutMarker, withMarker] of endings) {
+      const id = `session-${phase}-${ending}`;
+      const agent = f.add(id, [start(), event]);
+      agent.inbox.hasPending = true;
+      if (view) f.goalViews.set(agent, view);
+      if (pending) pendingIds.push(id);
+      const reason = ending === 'user' ? 'user_stopped' : goalReason ?? (pending ? withMarker : withoutMarker);
+      expected.push(row(id, reason, reason === 'goal_resumed' ? 'goal' : reason === 'message_submitted' ? 'message' : null));
+      const lastTurn = ending === 'unterminated' ? 'unterminated' : event.data.reason.kind;
+      bases.push({ lastTurn, loadedLastTurn: ending === 'unterminated' ? 'interrupted' : lastTurn,
+        cancelCause: event.data.reason?.reason?.kind ?? null, shutdownPending: pending,
+        goalPhase: view?.phase ?? null, goalActivation: view?.activation ?? null });
+    }
+    f.add('session-not-in-pending', [start(), interrupted()]);
+    expected.push(row('session-not-in-pending', 'interrupted_without_shutdown_marker'));
+    bases.push({ lastTurn: 'interrupted', loadedLastTurn: 'interrupted', cancelCause: null,
+      shutdownPending: false, goalPhase: null, goalActivation: null });
+    fs.writeFileSync(f.file('autoresume-state.json'), JSON.stringify({ hostProcess: 'previous-host:1', resumed: [], pending: pendingIds }));
+    const result = await processAutoResume(f);
+    assert.deepEqual(result.sessions.map(({ basis, ...entry }) => entry), expected);
+    assert.deepEqual(result.sessions.map(({ basis: { updatedAt, agentStatus, ...basis } }) => basis), bases);
+    assert.deepEqual(f.messages.map(({ id }) => id), expected.filter(entry => entry.method === 'message').map(entry => entry.sessionId));
+    assert.deepEqual(f.resumes.map(({ agent }) => agent.id), expected.filter(entry => entry.method === 'goal').map(entry => entry.sessionId));
+    assert.deepEqual(f.wakes, []);
+    assert.deepEqual(f.saved(), result);
+  });
+});
+
+test('auto resume: an eligible raw turn still submits a message when resolved history becomes blocked with pending inbox', async (t) => {
+  const f = fixture(t, 'autoresume');
+  const endings = [['error', { type: 'turn/end', data: { reason: { kind: 'error' } } }],
+    ['unterminated', start()], ['interrupted', interrupted()], ['disposed', aborted('disposed')], ['parent', aborted('parent')]];
+  for (const [name, event] of endings) {
+    const id = `session-${name}`;
+    f.add(id, [start(), event]).inbox.hasPending = true;
+    f.events.set(id, [start(), blocked()]);
+  }
+  fs.writeFileSync(f.file('autoresume-state.json'), JSON.stringify({ hostProcess: 'previous-host:1', resumed: [],
+    pending: ['session-interrupted', 'session-disposed', 'session-parent'] }));
+  const result = await processAutoResume(f);
+  assert.deepEqual(result.sessions.map(({ basis, ...entry }) => entry),
+    endings.map(([name]) => row(`session-${name}`, 'message_submitted', 'message')));
+  assert.deepEqual(result.sessions.map(({ basis }) => [basis.lastTurn, basis.loadedLastTurn, basis.cancelCause, basis.shutdownPending]), [
+    ['error', 'blocked', null, false], ['unterminated', 'blocked', null, false], ['interrupted', 'blocked', null, true],
+    ['aborted', 'blocked', 'disposed', true], ['aborted', 'blocked', 'parent', true]]);
+  assert.deepEqual(f.messages.map(({ id }) => id), endings.map(([name]) => `session-${name}`));
+  assert.deepEqual(f.resumes, []);
+  assert.deepEqual(f.wakes, []);
+});
+
+test('auto resume: raw handles close on success, failed reads and failed host resolution', async (t) => {
+  for (const failure of ['none', 'raw-read', 'resolve']) await t.test(failure, async (t) => {
+    const f = fixture(t, 'autoresume');
+    f.add('session-handle');
+    const open = f.services.sessionPersistence.open;
+    f.services.sessionPersistence.open = async (...args) => {
+      const handle = await open(...args);
+      const read = handle.read;
+      handle.read = async (...args) => {
+        const result = await read(...args);
+        if (failure === 'raw-read') throw new Error('raw read failed');
+        return result;
+      };
+      return handle;
+    };
+    if (failure === 'resolve') f.services.sessionController.resolveAgent = async () => { throw new Error('resolve failed'); };
+    const result = await processAutoResume(f);
+    assert.equal(result.sessions[0].reason, failure === 'none' ? 'message_submitted' : 'error');
+    assert.equal(f.calls.filter(([op]) => op === 'rawClose').length, 1);
+    if (failure !== 'none') {
+      assert.deepEqual(f.messages, []);
+      assert.deepEqual(f.resumes, []);
+    }
+  });
+});
+
+test('auto resume: excluded, fork and running sessions are skipped without loading history', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-excluded');
+  f.add('fork-session-child');
+  f.add('session-running').status = 'running';
+  f.autoResume.exclude.push('session-excluded');
+  const result = await processAutoResume(f);
+  assert.deepEqual(result.sessions.map(({ reason }) => reason), ['excluded', 'fork', 'running']);
+  assert.deepEqual(f.calls, [['list']]);
+  assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.resumes, []);
+});
+
+test('auto resume: disabled or already aborted scanning makes no state or service calls', async (t) => {
+  for (const disabled of [false, true]) await t.test(disabled ? 'disabled' : 'aborted', async (t) => {
+    const f = fixture(t, 'autoresume');
+    f.autoResume.enabled = !disabled;
+    const controller = new AbortController();
+    if (!disabled) controller.abort();
+    assert.equal(await processAutoResume({ ...f, signal: controller.signal }), undefined);
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(fs.readdirSync(f.directory), []);
+  });
+});
+
+test('auto resume: reserves before the first await, preventing concurrent scans and module reload replay', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-once');
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const list = f.services.sessionQuery.listSessions;
+  f.services.sessionQuery.listSessions = async () => {
+    const records = await list();
+    entered.resolve();
+    await release.promise;
+    return records;
+  };
+  const first = processAutoResume(f);
+  t.after(() => release.resolve());
+  await entered.promise;
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')),
+    { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: [] });
+  const reloaded = await import(`./resume.mjs?auto-resume-test=${path.basename(f.directory)}`);
+  assert.equal(await processAutoResume(f), undefined);
+  assert.equal(await reloaded.processAutoResume(f), undefined);
+  assert.deepEqual(f.calls, [['list']]);
+  release.resolve();
+  await first;
+  assert.equal(await reloaded.processAutoResume(f), undefined);
+  assert.equal(f.messages.length, 1);
+});
+
+test('auto resume: publication failure cannot repeat scanning, but a different process identity can', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-once');
+  const rename = fs.renameSync;
+  const publishing = t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === f.file('autoresume-result.json')) throw new Error('result publication failed');
+    return rename(from, to);
+  });
+  await assert.rejects(processAutoResume(f), /result publication failed/);
+  assert.equal(await processAutoResume(f), undefined);
+  assert.equal(f.calls.filter(([op]) => op === 'list').length, 1);
+  assert.equal(f.messages.length, 1);
+  publishing.mock.restore();
+  fs.writeFileSync(f.file('autoresume-state.json'), JSON.stringify({ hostProcess: `${process.pid}:${performance.timeOrigin - 1}`, resumed: ['session-once'] }));
+  const result = await processAutoResume(f);
+  assert.equal(result.sessions[0].status, 'resumed');
+  assert.equal(f.calls.filter(([op]) => op === 'list').length, 2);
+  assert.equal(f.messages.length, 2);
+});
+
+test('auto resume watcher: appReady gates scanning and repeated ready callbacks do not replay', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-ready');
+  const w = watchFixture(t, f);
+  await w.check();
+  assert.deepEqual(f.calls, []);
+  assert.equal(fs.existsSync(f.file('autoresume-state.json')), false);
+  assert.equal(f.readyCallbacks.size, 1);
+  f.ready();
+  await w.check();
+  assert.equal(f.messages.length, 1);
+  f.ready();
+  await w.notify('rename', null);
+  await w.check();
+  assert.equal(f.calls.filter(([op]) => op === 'list').length, 1);
+  w.dispose();
+  assert.equal(f.readyCallbacks.size, 0);
+  assert.equal(w.watcher.close.mock.callCount(), 1);
+});
+
+test('auto resume watcher: shutdown after successful submission preserves pending against the scanner state write', async (t) => {
+  const f = fixture(t, 'autoresume');
+  const agent = f.add('session-shutdown-race');
+  const followup = agent.followup;
+  let shutdownSnapshot;
+  agent.followup = function (message) {
+    followup.call(this, message);
+    this.status = 'running';
+    queueMicrotask(() => {
+      f.rootFiber.state = 5;
+      f.bus.emit('internal/status', f.rootFiber);
+      shutdownSnapshot = JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8'));
+    });
+  };
+  const w = watchFixture(t, f);
+  f.ready();
+  await w.check();
+  assert.equal(f.messages.length, 1);
+  assert.deepEqual(f.saved().sessions.map(({ basis, ...entry }) => entry),
+    [row(agent.id, 'message_submitted', 'message')]);
+  assert.deepEqual(shutdownSnapshot, { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: [], pending: [agent.id] });
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')), shutdownSnapshot);
+  assert.deepEqual(f.warnings, []);
+});
+
+test('auto resume watcher: root shutdown synchronously snapshots only running agents and preserves resumed IDs', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-running-A').status = 'running';
+  f.add('session-idle');
+  f.add('session-running-B').status = 'running';
+  const state = { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: ['session-already-resumed'], pending: ['stale'] };
+  fs.writeFileSync(f.file('autoresume-state.json'), JSON.stringify(state));
+  const list = t.mock.method(f.agents, 'list', () => [...f.agents.values()]);
+  const w = watchFixture(t, f);
+  await w.check();
+  assert.equal(f.bus.listenerCount('internal/status'), 1);
+  f.rootFiber.state = 5;
+  f.bus.emit('internal/status', f.rootFiber);
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')),
+    { ...state, pending: ['session-running-A', 'session-running-B'] }, 'snapshot must be written before the event handler returns');
+  assert.equal(list.mock.callCount(), 1);
+  assert.deepEqual(f.calls, [], 'root shutdown must not start scanning');
+});
+
+test('auto resume watcher: shutdown before scanning starts initializes current-process state instead of preserving another host', async (t) => {
+  for (const previous of [undefined, { hostProcess: 'previous-host:1', resumed: ['old'], pending: ['old'] }]) {
+    await t.test(previous ? 'previous host' : 'no state', async (t) => {
+      const f = fixture(t, 'autoresume');
+      f.add('session-running').status = 'running';
+      if (previous) fs.writeFileSync(f.file('autoresume-state.json'), JSON.stringify(previous));
+      const w = watchFixture(t, f);
+      await w.check();
+      f.rootFiber.state = 5;
+      f.bus.emit('internal/status', f.rootFiber);
+      assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')),
+        { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: [], pending: ['session-running'] });
+      assert.deepEqual(f.calls, []);
+    });
+  }
+});
+
+test('auto resume watcher: plugin fiber changes, reload cleanup and disposed listeners never write pending', async (t) => {
+  for (const existing of [false, true]) await t.test(existing ? 'existing state' : 'no state', async (t) => {
+    const f = fixture(t, 'autoresume');
+    f.add('session-running').status = 'running';
+    const stateFile = f.file('autoresume-state.json');
+    const original = JSON.stringify({ hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: ['keep'] });
+    if (existing) fs.writeFileSync(stateFile, original);
+    const unchanged = () => {
+      assert.equal(fs.existsSync(stateFile), existing);
+      if (existing) assert.equal(fs.readFileSync(stateFile, 'utf8'), original);
+    };
+    const list = t.mock.method(f.agents, 'list', () => assert.fail('only root shutdown may snapshot agents'));
+    const w = watchFixture(t, f);
+    await w.check();
+    f.bus.emit('internal/status', { state: 5 });
+    f.rootFiber.state = 4;
+    f.bus.emit('internal/status', f.rootFiber);
+    unchanged();
+    w.dispose();
+    unchanged();
+    f.rootFiber.state = 5;
+    f.bus.emit('internal/status', f.rootFiber);
+    f.bus.emit('internal/status', { state: 5 });
+    unchanged();
+    const reloaded = watchFixture(t, f);
+    await reloaded.check();
+    f.bus.emit('internal/status', { state: 5 });
+    reloaded.dispose();
+    f.bus.emit('internal/status', f.rootFiber);
+    unchanged();
+    assert.equal(list.mock.callCount(), 0);
+    assert.deepEqual(f.warnings, []);
+    assert.deepEqual(f.calls, []);
+  });
+});
+
+test('auto resume watcher: disabled configuration registers no shutdown/ready listener and never writes state', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.autoResume.enabled = false;
+  f.add('session-running').status = 'running';
+  delete f.ctx.root;
+  const list = t.mock.method(f.agents, 'list', () => assert.fail('disabled auto resume must not snapshot agents'));
+  const w = watchFixture(t, f);
+  await w.check();
+  assert.equal(f.bus.listenerCount('internal/status'), 0);
+  assert.equal(f.readyCallbacks.size, 0);
+  f.rootFiber.state = 5;
+  f.bus.emit('internal/status', f.rootFiber);
+  w.dispose();
+  f.bus.emit('internal/status', f.rootFiber);
+  assert.equal(fs.existsSync(f.file('autoresume-state.json')), false);
+  assert.equal(list.mock.callCount(), 0);
+  assert.deepEqual(f.calls, []);
+});
+
+test('auto resume watcher: cleanup or root shutdown at every async stage prevents submission and closes raw handles', async (t) => {
+  for (const stop of ['cleanup', 'root-shutdown']) for (const hasGoal of [false, true])
+    for (const stage of ['before-ready', 'list', 'stat', 'raw-open', 'raw-read', 'raw-close', 'resolve', 'query-read']) {
+    await t.test(`${stop} / ${hasGoal ? 'goal' : 'message'} / ${stage}`, { timeout: 5000 }, async (t) => {
+      const f = fixture(t, 'autoresume');
+      const agent = f.add('session-stop');
+      if (hasGoal) f.goalViews.set(agent, goal({ phase: 'active' }));
+      const entered = Promise.withResolvers(), release = Promise.withResolvers();
+      let signal;
+      const pause = async () => { entered.resolve(); await release.promise; };
+      const list = f.services.sessionQuery.listSessions;
+      f.services.sessionQuery.listSessions = async () => {
+        const result = await list();
+        if (stage === 'list') await pause();
+        return result;
+      };
+      const stat = fs.promises.stat;
+      t.mock.method(fs.promises, 'stat', async (...args) => {
+        const result = await stat(...args);
+        if (stage === 'stat' && args[0] === f.artifact('session-stop')) await pause();
+        return result;
+      });
+      const open = f.services.sessionPersistence.open;
+      f.services.sessionPersistence.open = async (...args) => {
+        signal = args[2].signal;
+        assert.ok(signal instanceof AbortSignal);
+        const handle = await open(...args);
+        for (const method of ['read', 'close']) {
+          const original = handle[method];
+          handle[method] = async (...args) => {
+            const result = await original(...args);
+            if (stage === `raw-${method}`) await pause();
+            return result;
+          };
+        }
+        if (stage === 'raw-open') await pause();
+        return handle;
+      };
+      const resolve = f.services.sessionController.resolveAgent;
+      f.services.sessionController.resolveAgent = async (id) => {
+        const result = await resolve(id);
+        if (stage === 'resolve') await pause();
+        return result;
+      };
+      const read = f.services.sessionQuery.readSession;
+      f.services.sessionQuery.readSession = async (id) => {
+        const result = await read(id);
+        if (stage === 'query-read') await pause();
+        return result;
+      };
+      t.after(() => release.resolve());
+      const w = watchFixture(t, f);
+      if (stage !== 'before-ready') { f.ready(); await entered.promise; }
+      if (stop === 'cleanup') w.dispose();
+      else {
+        t.mock.method(f.agents, 'list', () => {
+          if (signal) assert.equal(signal.aborted, true, 'root shutdown aborts scanning before taking the pending snapshot');
+          return [...f.agents.values()];
+        });
+        f.rootFiber.state = 5;
+        f.bus.emit('internal/status', f.rootFiber);
+      }
+      release.resolve();
+      f.ready();
+      await w.check();
+      assert.deepEqual(f.messages, []);
+      assert.deepEqual(f.resumes, []);
+      assert.equal(f.readyCallbacks.size, stop === 'cleanup' ? 0 : 1);
+      if (stage === 'before-ready') assert.deepEqual(f.calls, []);
+      else if (stage === 'list') {
+        assert.equal(f.saved().status, 'stopped');
+        assert.deepEqual(f.saved().sessions, []);
+        assert.deepEqual(f.calls, [['list']]);
+      } else {
+        assert.equal(f.saved().sessions[0].reason, 'unloaded');
+        if (['stat', 'raw-open', 'raw-read', 'raw-close'].includes(stage)) assert.equal(f.calls.some(([op]) => op === 'resolve'), false);
+        if (stage === 'resolve') assert.equal(f.calls.some(([op]) => op === 'queryRead'), false);
+      }
+      if (signal) assert.equal(signal.aborted, true);
+      assert.equal(f.calls.filter(([op]) => op === 'rawClose').length, f.calls.filter(([op]) => op === 'rawOpen').length);
+      w.dispose();
+    });
+  }
+});
+
+test('resume watcher: root shutdown aborts only automatic scanning; manual requests remain usable until cleanup', async (t) => {
+  const f = fixture(t);
+  f.autoResume = { ...autoDefaults, exclude: [] };
+  f.add('session-manual');
+  const w = watchFixture(t, f);
+  await w.check();
+  f.rootFiber.state = 5;
+  f.bus.emit('internal/status', f.rootFiber);
+  f.ready();
+  await w.check();
+  assert.deepEqual(f.calls, [], 'root shutdown cancels automatic work even before the plugin cleanup');
+  f.write({ sessions: ['session-manual'] });
+  await w.notify('rename', 'resume-request.json');
+  f.verify(f.saved());
+  assert.deepEqual(f.saved().sessions, [row('session-manual', 'message_submitted', 'message')]);
+  assert.equal(f.messages.length, 1);
+  f.write({ sessions: ['session-manual'] });
+  w.dispose();
+  await w.notify('rename', 'resume-request.json');
+  await w.check();
+  assert.equal(f.messages.length, 1);
+  assert.equal(fs.existsSync(f.file('resume-request.json')), true);
 });
 
 function autoWakeFixture(t, enabled = true) {

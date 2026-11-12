@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.92` 新增重启后自动续接 `autoResume`，并支持通过本机 `goal-request.json` 修改指定会话的当前 Goal 目标和轮数上限。
+
 `0.9.91` `send-request.json` 支持 `"whenRunning":"queue"`：会话正在运行时不再跳过，消息会排进它的下一轮（和界面上会话忙时选择排队发送是同一条路），当前回合不会被打断，原生 Goal 也会先让出这一轮；结果里的 `reason` 为 `message_queued`。不带这个字段时，运行中的会话照旧跳过。
 
 `0.9.90` 新增配置 `gemini.forceEffort`（为 true 时一律使用配置里的推理强度，忽略调用方传入的值）和 `gemini.defaultMaxChars`（正整数）：`gemini_write` 调用没传 `max_chars` 时，就用它作为正文硬上限；显式传了 `max_chars` 仍以传入值为准。这样即使规划端忘了传，章节篇幅也有上限。
@@ -130,6 +132,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.92：从本机修改会话 Goal
+
+向同目录的 `goal-request.json` 写入 `{"sessionId":"session-example","objective":"新的目标","maxGoalRounds":20}`，建议先写临时文件再改名发布。`objective` 和 `maxGoalRounds` 至少提供一个：目标须为非空字符串，轮数须为正安全整数。插件加载指定会话，读取当前未完成 Goal（包括 paused / blocked），用其最新 `id` / `revision` 调用宿主 `goals.edit`，保留原 phase 和激活状态；修改会记录在该会话的持久日志中。这个入口与 send / resume 共用目录监视、串行处理、原子认领及 tmp + rename 结果发布；发布成功后消费请求，不自动重放已认领文件。`goal-result.json` 包含 `requestedAt`、`completedAt`、`sessionId`、`status`、`reason`；`reason` 区分 `edited`、`no_active_goal`（无 Goal 或已完成）、`session_not_found`、`invalid_request`、`error`。仅供本机操作者使用。
+
 ### 0.9.52：从本机请求续接被中断的会话
 
 向 `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.json` 写入以下 JSON（与 `loaded.json` 同目录）。建议先写临时文件，再在同目录改名发布，避免插件读到未写完的 JSON：
@@ -138,13 +144,17 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 {"sessions":["session-example"],"message":"继续"}
 ```
 
-`message` 可省略，默认“继续”，最多 2000 个 Unicode 字符。`sessions` 最多 20 项，ID 仅接受 `[A-Za-z0-9_-]{1,100}`，重复 ID 只处理一次。插件加载、热重载和目录文件通知时检查请求；没有请求文件就不会续接。请求先原子改名认领，再逐个处理：不存在、正在运行或最后一个回合不是 `interrupted` / `blocked` 的会话跳过；其余优先恢复可恢复的目标。没有可恢复目标时，`interrupted` 沿用提交用户消息的方式；`blocked` 仅在 inbox 有待处理输入时调用宿主现有的 `wakeDriver()` 唤醒，不新增消息、不重发被拒的推进提示，也不自行改写 inbox；没有待处理输入仍以 `not_interrupted` 跳过。宿主缺少 agent、inbox 查询或唤醒接口时记录错误并继续处理其他会话。未在窗口打开的会话也可加载后续接。
+`message` 可省略，默认“继续”，最多 2000 个 Unicode 字符。`sessions` 最多 20 项，ID 仅接受 `[A-Za-z0-9_-]{1,100}`，重复 ID 只处理一次。插件加载、热重载和目录文件通知时检查手动请求。请求先原子改名认领，再逐个处理：不存在、正在运行或最后一个回合不是 `interrupted` / `blocked` 的会话跳过；其余优先恢复可恢复的目标。没有可恢复目标时，`interrupted` 沿用提交用户消息的方式；`blocked` 仅在 inbox 有待处理输入时调用宿主现有的 `wakeDriver()` 唤醒，不新增消息、不重发被拒的推进提示，也不自行改写 inbox；没有待处理输入仍以 `not_interrupted` 跳过。宿主缺少 agent、inbox 查询或唤醒接口时记录错误并继续处理其他会话。未在窗口打开的会话也可加载后续接。
 
 同目录的 `resume-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、整批状态 `processed` / `rejected`，以及 `sessions` 数组中的 `sessionId`、`status`（`resumed` / `skipped`）、`reason`、`method`（`goal` / `message` / `inbox` / `null`）；出错时另有 `error`。`pending_inbox_woken` 表示“已请求会话处理还在排队的输入”，只表示唤醒已发起；每份手动请求只尝试一次，也不补回宿主已领取的输入。输入不合法时整批拒绝，不提交任何消息。目录监听不可用时会记警告，仍在加载时检查。结果只保留最近一批；提交下一批前先核对本批时间并读取结果。已认领的请求不在重启后自动重放，避免重复提交。
 
+`autoResume` 默认 `{"enabled":true,"maxAgeHours":12,"message":"Harness 已重启，接着上次中断的地方继续。","exclude":[]}`。宿主就绪后每个进程扫描一次主会话，先用持久化文件的修改时间筛掉超龄会话，不读取它们的事件；只对窗口内会话读取尚未补齐收尾的原始日志。空闲会话仅在 Goal 为 active + disarmed 且轮数未用完时恢复原生 Goal 驱动；没有活动 Goal 时，仅原始末回合未写 `turn/end` 或以 `error` 结束才发续接消息。paused / blocked 的 Goal 自动模式一律不动；已写入的普通 `interrupted` 不作为自动续接依据，避免重新拉起用户停止的对话。正常完成、正在运行、超时、`exclude` 中的会话和 ID 无 `session-` 前缀的 BTW 旁支均跳过；手工 `resume-request` 行为保持不变。`message` 最多 2000 个 Unicode 字符，`maxAgeHours` 须为正数，`exclude` 为会话 ID 数组；设 `enabled:false` 关闭。`autoresume-state.json` 记录 PID 加进程启动时间标识及已续接会话，扫描开始前即登记该进程，因此同进程热重载不会重复扫描或续接。`autoresume-result.json` 保留最近一批的时间、整批状态及每个会话的 `sessionId`、`basis`（原始/加载后回合类型、Goal 状态或跳过依据）、`status`、`reason`、`method`；续接成功只表示已提交，不保证新回合完成。
+
 `autoWakeBlockedInbox` 默认 `true`：插件观察到自己登记的 Codex 后台任务完成通知进入 owner 的 inbox 后，如果该会话随后以 `blocked` 结束，通知仍在 pending 且 agent 已空闲，就复用上述 inbox 唤醒入口，无需恢复请求文件。第一次等 1 秒，第二次等 5 秒；同一批仍滞留的通知最多自动唤醒两次，新加入的通知不重置该批预算。仍被拒且通知仍在时，警告日志显示“自动唤醒已用尽”。通知被领取、正常回合结束、agent 被移除或插件卸载时停止；运行中的会话不唤醒。不新增用户消息、不重发推进提示、不修改 inbox。配置设为 `false` 可关闭，手动恢复不受影响。
 
-自动恢复只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条通知唤醒路径；成功输出仅在当前实例登记，跨重载自动恢复尚未实现。
+正常卸载根宿主时，插件在 Agent 被取消前把仍 running 的会话写入 `autoresume-state.json` 的 `pending` 名单；普通插件热重载不记录名单。下次进程启动时，名单内以 `interrupted` 或 `aborted/disposed`、`aborted/parent` 收尾的会话也可续接；已完成、paused / blocked Goal 和显式 `aborted/user` 仍跳过。没有名单的 `interrupted` / teardown 收尾不会自动拉起，结果以 `interrupted_without_shutdown_marker` 说明；`basis.cancelCause` 保留嵌套取消原因。这依赖关闭流程实际卸载根宿主；直接强杀走原始未闭合回合的判定。
+
+上述通知唤醒只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条通知唤醒路径；成功输出仅在当前实例登记，跨重载自动恢复尚未实现。
 
 ## 功能
 
@@ -362,6 +372,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `serviceTier` | Codex 配置 | 例如 `fast`（Codex 的 Fast 模式） |
 | `waitSeconds` | `0` | 无法登记后台任务时，`codex_run` / `codex_continue` / `codex_verify` 默认同步等待的秒数；登记后台后立即返回，随后在本轮用 `codex_status(wait_seconds: 3600)` 等待 |
 | `autoWakeBlockedInbox` | `true` | 本插件后台完成通知滞留时，自动唤醒随后被门禁拒绝的空闲会话；同批最多两次（1 秒、5 秒），用尽写警告日志；设为 `false` 关闭 |
+| `autoResume` | `{enabled:true,maxAgeHours:12,message:"Harness 已重启，接着上次中断的地方继续。",exclude:[]}` | 宿主就绪后，每进程自动续接一次最近中断或活动 Goal 未驱动的主会话；同进程热重载不重复 |
 | `timeoutSeconds` | 留空（runner 为 `3600`） | 每次 Codex 尝试的总超时秒数，须为正有限数字，可含小数；不含等待写锁的时间 |
 | `lockTimeoutSeconds` | 留空（无限等待） | 等待目录写锁的超时秒数，须为正有限数字，可含小数；超时不启动 Codex，返回可重试的 `lock_timeout` |
 | `idleTimeoutSeconds` | 留空（runner 为 `600`） | 空闲超时秒数，须为正有限数字，可含小数；命令执行期间暂停，命令完成后恢复 |
@@ -450,6 +461,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.92` adds restart recovery through `autoResume` and a local `goal-request.json` entry to edit a session's current goal objective and round cap.
 
 `0.9.91` lets `send-request.json` take `"whenRunning":"queue"`: a running session then receives the message in its next turn (the same path as the UI's Queue mode) instead of being skipped. The current turn is not cancelled and the native goal yields to the queued message; the result reason is `message_queued`. Without the field, running sessions are still skipped.
 
@@ -591,6 +604,10 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
 
+### 0.9.92: Edit a session's goal from a local file
+
+Write `{"sessionId":"session-example","objective":"New objective","maxGoalRounds":20}` to `goal-request.json` in the same directory, preferably by renaming a temporary file. Supply a non-empty `objective` and/or a positive safe-integer `maxGoalRounds`. The plugin loads the session and edits its current unfinished goal (including paused / blocked), using the latest `id` / `revision` with `goals.edit`; phase and activation stay unchanged, and the host persists the edit in session history. It shares send / resume watching, serial processing, atomic claiming and tmp + rename results; successful publication consumes the claim, and claimed requests are never replayed. `goal-result.json` contains timestamps, `sessionId`, `status` and `reason`: `edited`, `no_active_goal` (absent or complete), `session_not_found`, `invalid_request`, or `error`. This entry is for the local operator only.
+
 ### 0.9.52: Resume interrupted sessions from a local file
 
 Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.json`, alongside `loaded.json`. Write a temporary file first, then rename it in the same directory so the plugin cannot read a partial request:
@@ -599,11 +616,15 @@ Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.j
 {"sessions":["session-example"],"message":"Continue"}
 ```
 
-`message` is optional, defaults to `继续`, and accepts at most 2000 Unicode characters. Supply at most 20 session IDs matching `[A-Za-z0-9_-]{1,100}`; duplicate IDs are handled once. The plugin checks on load, hot reload and directory notifications. Without a request file, nothing resumes. It atomically claims the file before processing: missing sessions, running sessions, and sessions whose last turn did not end as `interrupted` or `blocked` are skipped. Eligible sessions resume a resumable goal first. Otherwise, `interrupted` retains the user-message path; `blocked` calls the host's existing `wakeDriver()` only when the inbox has pending input, without adding messages, resending rejected advancement prompts, or editing the inbox. An empty inbox still skips with `not_interrupted`. Missing agents, inbox queries or wake methods record an error without stopping the batch. Sessions do not need to be open in a window.
+`message` is optional, defaults to `继续`, and accepts at most 2000 Unicode characters. Supply at most 20 session IDs matching `[A-Za-z0-9_-]{1,100}`; duplicate IDs are handled once. The plugin checks for manual requests on load, hot reload and directory notifications. It atomically claims the file before processing: missing sessions, running sessions, and sessions whose last turn did not end as `interrupted` or `blocked` are skipped. Eligible sessions resume a resumable goal first. Otherwise, `interrupted` retains the user-message path; `blocked` calls the host's existing `wakeDriver()` only when the inbox has pending input, without adding messages, resending rejected advancement prompts, or editing the inbox. An empty inbox still skips with `not_interrupted`. Missing agents, inbox queries or wake methods record an error without stopping the batch. Sessions do not need to be open in a window.
 
 `resume-result.json` contains claim time `requestedAt`, completion time `completedAt`, batch `status` (`processed` / `rejected`), and a `sessions` array with `sessionId`, `status` (`resumed` / `skipped`), `reason`, and `method` (`goal` / `message` / `inbox` / `null`); failures also include `error`. `pending_inbox_woken` means a wake was requested to process queued input; it does not guarantee admission. Each manual request attempts once and does not restore input already claimed by the host. Invalid input rejects the whole batch without submitting messages. If directory watching is unavailable, a warning is logged and the load-time check remains. Only the latest result is retained; check its timestamp and read it before submitting another batch. Claimed requests are not replayed after a restart, preventing duplicate submissions.
 
+`autoResume` defaults to `{"enabled":true,"maxAgeHours":12,"message":"Harness 已重启，接着上次中断的地方继续。","exclude":[]}`. After host readiness, one scan per process first filters main sessions by persistence-file modification time; old sessions never have their events read. Only recent sessions have their raw, unrepaired history inspected. An idle active/disarmed goal resumes through the native driver while budget remains. Without an active goal, a message is submitted only when the original last turn has no `turn/end` or ended with `error`. Paused/blocked goals are never touched automatically, and a stored `interrupted` ending alone does not resume a user-stopped conversation. Completed, running, old or excluded sessions and BTW forks without a `session-` ID prefix are skipped; manual resume behavior is unchanged. `message` accepts at most 2000 Unicode characters; `maxAgeHours` must be positive and `exclude` contains session IDs. Set `enabled:false` to disable. `autoresume-state.json` records PID plus process start identity and resumed IDs before and during the scan, preventing duplicate scans on hot reload. `autoresume-result.json` retains timestamps, batch status and each session's `sessionId`, `basis` (original and loaded turn endings, goal state or skip evidence), `status`, `reason`, and `method`. Success confirms submission rather than completion.
+
 `autoWakeBlockedInbox` defaults to `true`. After observing a completion notice for its own registered Codex background job enter the owner's inbox, conductor waits for a subsequent blocked turn and an idle agent. If the notice is still pending, it reuses the manual inbox wake path after 1 second, then 5 seconds, with at most two automatic attempts per outstanding batch. New notices do not reset that batch's budget. A still-blocked, still-pending batch logs “自动唤醒已用尽” when exhausted. Running agents, removed agents and plugin teardown suppress wakes. No user message, advancement prompt or inbox edit is made. Set the configuration to `false` to disable it; manual resume remains available.
+
+When the root host starts unloading, the plugin records still-running sessions in `autoresume-state.json` as `pending` before agent cancellation; an ordinary plugin hot reload does not record this list. A later process may also resume listed sessions ending `interrupted`, `aborted/disposed`, or `aborted/parent`. Completed sessions, paused/blocked goals, and explicit `aborted/user` stops still skip. Without this marker, interrupted/teardown endings skip with `interrupted_without_shutdown_marker`; `basis.cancelCause` retains the nested cancellation cause. This requires shutdown to unload the root host; a direct kill instead uses the original unterminated-turn test.
 
 Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this notification-wake path; successful outputs are registered only in the current instance, without automatic recovery across reloads.
 
