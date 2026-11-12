@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.91` `send-request.json` 支持 `"whenRunning":"queue"`：会话正在运行时不再跳过，消息会排进它的下一轮（和界面上会话忙时选择排队发送是同一条路），当前回合不会被打断，原生 Goal 也会先让出这一轮；结果里的 `reason` 为 `message_queued`。不带这个字段时，运行中的会话照旧跳过。
+
 `0.9.90` 新增配置 `gemini.forceEffort`（为 true 时一律使用配置里的推理强度，忽略调用方传入的值）和 `gemini.defaultMaxChars`（正整数）：`gemini_write` 调用没传 `max_chars` 时，就用它作为正文硬上限；显式传了 `max_chars` 仍以传入值为准。这样即使规划端忘了传，章节篇幅也有上限。
 
 `0.9.89` `gemini_write` 成功后的下一步提示，原来是"自己对照素材核对正文"，改成"派一单 Codex 只读核对这一章，同一单挂上目录入口"。`codex_continue` 的 job_id 报错改为提示先用 `codex_jobs` 找回原任务编号再续接，不要另开新单。
@@ -448,6 +450,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.91` lets `send-request.json` take `"whenRunning":"queue"`: a running session then receives the message in its next turn (the same path as the UI's Queue mode) instead of being skipped. The current turn is not cancelled and the native goal yields to the queued message; the result reason is `message_queued`. Without the field, running sessions are still skipped.
 
 `0.9.90` adds `gemini.forceEffort` (when true the configured effort overrides any value the caller passes) and `gemini.defaultMaxChars`: when a `gemini_write` call omits `max_chars`, this positive integer is used as the hard limit (an explicit `max_chars` still wins), so chapter length stays capped even when the planner forgets to pass it.
 
