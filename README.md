@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.95` 统一 Gemini 正文的单次可写核对指引，续接拒绝回执首行明确未启动及原因，并增加事件类型统计，仅在正文增量或写文件事件后启用 Gemini 空闲超时，启动与思考阶段保留 1800 秒默认总上限。
+
 `0.9.94` 修复 Windows 后台任务启动时调用方与 worker 并发发布 PID 文件的竞态，并改进测试的条件等待、进程清理和失败诊断。
 
 `0.9.93` Gemini 改用无 stdout 进度超时（默认 600 秒）与共享总上限（默认 1800 秒），回执增加进度统计；成功正文禁止规划端读取/搜索，并从本会话已有回执恢复限制；新增 `reuse_draft`，可跳过 agy 重新校验、提交保留稿，超限仍拒绝。
@@ -413,7 +415,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 `model / effort / timeoutSeconds / idleTimeoutSeconds` 的默认值如上，两个超时均须为正有限秒数，`effort` 支持 `low / medium / high`；`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
 
-任意 stdout 字节都视为进度，包括未组成完整 JSON 的片段和思考事件；stderr 不续时。首稿与压缩共用 `timeoutSeconds` 总预算，CLI 的 `--print-timeout` 同步总上限；超时或取消后等待子进程关闭，再保稿、回滚。回执的 `stdout_bytes / event_count` 是所有尝试累计的 stdout 字节数/已解析 JSON 事件数，`last_progress_s` 是最后一次尝试关闭时距最后 stdout 的秒数（无输出则从启动计），`timeout_kind` 为 `idle / total / null`。现有记录只有一例 552 秒的 high 成功调用，没有原始事件流，无法证明思考期间持续有事件；600 秒覆盖该样本，若实际存在更长静默思考，应调整 `idleTimeoutSeconds`。
+启动与思考阶段只受 `timeoutSeconds` 总上限约束；收到非空 `agent_response.text_delta` 或 `tool/write_file` 步骤后才启用 `idleTimeoutSeconds`，之后任意 stdout 字节（含不完整 JSON）均续时，stderr 不续时。首稿与压缩共用总预算（默认 1800 秒），CLI 的 `--print-timeout` 同步总上限；超时或取消后等待子进程关闭，再保稿、回滚。回执累计记录 `stdout_bytes / event_count / event_types`，步骤类型以 `step_update:<step_type>` 计数，`last_event_type` 为最后已解析事件的同类标签，不保存事件正文；`last_progress_s` 是最后一次尝试关闭时距最后 stdout 的秒数（无输出则从启动计），`timeout_kind` 为 `idle / total / null`。本机 agy 帮助与内置发布说明确认顶层事件为 `init / step_update / result`；程序的 `DeriveStepType` 区分 `user_input / agent_response / tool / finish / subagent / system_message / checkpoint / error_message / unknown`，`PollPrintmode` 在生成文本增量前调用 `StripThoughts`，因此不能依赖思考心跳。历史 1545 字节、2 个事件的失败回执没有类型记录，无法反推那两个事件的性质。
 
 调用示例：`gemini_write({"prompt":"根据素材写第一章入门说明，事实不得超出素材。","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`。`prompt` 至少 10 个字符；`sources` 为 1–20 个已有文件，总大小最多 1 MiB。素材与输出可用绝对路径或相对任务目录的路径，`cwd` 选择规则同 `codex_run`，Windows 下也接受 `/mnt/<盘符>/...`。输出必须在任务目录内、不能与素材相同；已有目标须传 `overwrite=true`。单次可覆盖 `model / effort`。
 
@@ -427,7 +429,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 
 在护栏工作区内，成功生成和成功复用的正文按会话登记；重载时从本会话日志中的 `gemini_write` 成功回执恢复，不另建持久化文件。正文限制优先于产物和 `plannerReadAllow`，在 `open / products` 下均拦截规划端的 Obsidian、普通读取及已识别内容搜索，目录搜索包含正文也拒绝；目录枚举仍可用。Codex 执行端仍可正常读取正文，规划端通过其核对报告验收。
 
-成功提示统一为：“正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。”任务须对照本次 `output` 与本次 `sources`，检查事实支撑及原验收要求，按核对结果处理正文。对旧素材任务重跑 `codex_verify` 不能替代本次正文核对；已有核对结果且正文未变、没有新证据时，不再为了核验核对报告另派任务。`gemini_write` 是前台调用，不对它使用 `codex_status`；核对用的 Codex 任务遵循上述本轮长等规则。
+成功与拒读提示统一为：“该正文由 gemini_write 写出，规划端不读取。下一步派一单 codex_run（write=true，scope 只含该正文文件），在同一单里核对事实与可读性、就地修正写法问题和句子级错误，报告问题位置和改动；不要另派只读核对或清理单，也不要换工具、搜索或命令绕读。”任务须对照本次 `output` 与本次 `sources` 及原验收要求。对旧素材任务重跑 `codex_verify` 不能替代本次正文核对；已有核对结果且正文未变、没有新证据时，不再为了核验核对报告另派任务。`gemini_write` 是前台调用，不对它使用 `codex_status`；核对用的 Codex 任务遵循上述本轮长等规则。
 
 向用户用大白话说明完成内容、核对结果和剩余问题；执行结束尚未验收时说“已经做完，正在核对”。无需附任务号、线程号或内部状态名，用户要求排查时再提供。
 
@@ -470,6 +472,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.95` unifies Gemini prose guidance into one writable check, leads refused continuation receipts with the reason and explicit not-started status, and adds event-type counts while enabling Gemini idle timing only after prose deltas or file-write events, retaining the default 1800-second total deadline during startup and thinking.
 
 `0.9.94` fixes a Windows race where the background-job caller and its worker published the PID file at the same time, and makes the runner tests wait on conditions, stop workers before cleanup and report exit code and stderr on failure.
 
@@ -663,7 +667,7 @@ Use `codex_run` for source changes, investigation and material notes; use `gemin
 
 The model, effort and two timeout values shown are the defaults; both timeouts accept positive finite seconds, and effort accepts `low / medium / high`. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
 
-Any stdout bytes renew the idle timer, including incomplete JSON and thinking events; stderr does not. Generation and compression share the total `timeoutSeconds` deadline, also passed to CLI `--print-timeout`. Timeout/cancellation waits for child close before draft preservation and rollback. Receipts include accumulated `stdout_bytes / event_count` (parsed JSON events), `last_progress_s` (seconds since the last stdout, or launch if silent, at the last attempt's close), and `timeout_kind` (`idle / total / null`). Historical records include a 552-second high-effort success but no raw event stream, so continuous thinking events are unconfirmed; 600 seconds covers that sample, and longer silent thinking may require a higher `idleTimeoutSeconds`.
+Startup and thinking use only the total `timeoutSeconds` deadline; a nonempty `agent_response.text_delta` or `tool/write_file` step enables `idleTimeoutSeconds`, after which any stdout bytes, including incomplete JSON, renew it; stderr does not. Generation and compression share the total deadline (1800 seconds by default), also passed to CLI `--print-timeout`. Timeout/cancellation waits for child close before draft preservation and rollback. Receipts accumulate `stdout_bytes / event_count / event_types`, labeling steps as `step_update:<step_type>`; `last_event_type` uses the same label for the last parsed event, without saving event bodies. `last_progress_s` measures seconds since the last stdout, or launch if silent, at the last attempt's close; `timeout_kind` is `idle / total / null`. Local agy help and embedded release notes confirm `init / step_update / result` events. Its `DeriveStepType` distinguishes `user_input / agent_response / tool / finish / subagent / system_message / checkpoint / error_message / unknown`, and `PollPrintmode` calls `StripThoughts` before producing text deltas, so thinking heartbeats cannot be assumed. The historical failure receipt with 1545 bytes and two events has no event types, leaving their nature unknown.
 
 `gemini_write` requires a `prompt` of at least 10 characters, 1–20 existing `sources` totaling at most 1 MiB, and one `output`. Source/output paths are absolute or relative to the task directory; `cwd` follows `codex_run` selection and accepts Windows or mounted `/mnt/<drive>/...` paths on Windows. Output must stay inside the task directory, differ from all sources, and requires `overwrite=true` when present. Per-call `model`, `effort` and positive `max_chars` are optional. For example: `gemini_write({"prompt":"Write chapter one using only the supplied facts.","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`.
 
@@ -677,7 +681,7 @@ Pass a failed receipt's `draft_path` as `reuse_draft`, together with the normal 
 
 In guarded workspaces, successful generated and reused prose is registered by session and restored from that session's existing successful `gemini_write` receipts after reload, without a new persistence file. Prose denial precedes product and `plannerReadAllow` grants in both `open / products`: planner Obsidian reads, ordinary reads and recognized content searches are refused, including directory searches containing the prose. Directory discovery and Codex execution-side access remain available; assess the prose through the Codex checking report.
 
-After each successful write, do not read the prose in the planner; dispatch one Codex checking task with `write=true` and `scope` containing only that prose. Check this invocation's output against its sources and original acceptance criteria, then handle the checking results. Re-running `codex_verify` on an old material job cannot replace checking the new prose. Once that check exists, do not dispatch another task merely to verify its report unless the prose changes or new evidence appears. `gemini_write` is a foreground call, so do not use `codex_status` for Gemini itself; its Codex checking task follows the same-turn waiting rules below.
+Success and read-denial guidance both delegate one `codex_run` task with `write=true` and `scope` containing only the prose file; the planner does not read it. In that same task, check this invocation's output against its sources and original acceptance criteria for facts and readability, fix wording and sentence-level errors in place, and report locations and changes. Do not dispatch separate read-only checks or cleanup tasks, or bypass the read guard with other tools, searches or commands. Re-running `codex_verify` on an old material job cannot replace checking the new prose. Once that check exists, do not dispatch another task merely to verify its report unless the prose changes or new evidence appears. `gemini_write` is a foreground call, so do not use `codex_status` for Gemini itself; its Codex checking task follows the same-turn waiting rules below.
 
 Explain completed work, check results and remaining gaps in plain language. If execution has finished but acceptance is pending, say “The work is finished; I am checking it.” Job IDs, thread IDs and internal state names are unnecessary unless the user asks for diagnostics.
 

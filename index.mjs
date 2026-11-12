@@ -614,6 +614,10 @@ const MARK = { met: '✓', not_met: '✗', blocked: '⛔' };
 // 每条证据最多显示的字数：Codex 的答复本来就不是完成证据，全文留在 runner 任务目录的 last_message.txt
 const EVIDENCE_LIMIT = 800;
 
+function continuationError(message) {
+  return new Error(`续接未启动：${message}\ncontinuation_ready=false`);
+}
+
 // 一行摘要，任务表的 detail 和结果第一行都以它开头，如 completed · 12 met / 1 blocked · 3 files · 148 s
 function summaryLine(value) {
   const criteria = value.report?.criteria ?? [];
@@ -621,13 +625,15 @@ function summaryLine(value) {
     .filter(([, n]) => n).map(([s, n]) => `${n} ${s}`).join(' / ');
   const files = value.files_changed_total ?? value.files_changed?.length;
   const done = value.status === 'completed';
-  return [String(value.status), done ? counts : value.error_kind, done && files !== undefined && `${files} files`,
+  const summary = [String(value.status), done ? counts : value.error_kind, done && files !== undefined && `${files} files`,
     typeof value.duration_s === 'number' && `${Math.round(value.duration_s)} s`,
     ['verified', 'accepted_deviations'].includes(value.verification_status) && `已核验 ${value.verification_status}`,
     done && !['verified', 'accepted_deviations'].includes(value.verification_status) && value.review_status === 'needs_attention' && '待关注',
     done && !['verified', 'accepted_deviations'].includes(value.verification_status) && value.review_status === 'needs_verification' && '待核验',
     done && value.verification_status === 'needs_changes' && '核验待修',
     done && value.report_status === 'invalid' && '报告异常'].filter(Boolean).join(' · ');
+  return value.continuation_ready === false
+    ? `续接未启动：${value.next?.split('\n')[0]} · continuation_ready=false\n原任务状态：${summary}` : summary;
 }
 
 // 已完成的结果只留核验用得上的：任务目录和一行改动清单；失败、取消、仍在执行的保留全部字段，便于排查。
@@ -646,6 +652,7 @@ function details(rest) {
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
     (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
   return [rest.cwd && `任务目录：${rest.cwd}`, files,
+    rest.continuation_ready === false && 'continuation_ready=false',
     rest.context?.verification_of && `独立核验任务；核验对象：${rest.context.verification_of}`,
     rest.execution_status && `执行：${rest.execution_status}；报告：${rest.report_status}；执行端自报检查：${rest.review_status}`,
     rest.verification_status && `独立核验：${rest.verification_status}${rest.verification?.reviewer ? `；核验人：${rest.verification.reviewer}` : ''}`,
@@ -1074,14 +1081,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf) {
-    validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args);
+    const reject = message => continuation ? continuationError(message) : new Error(message);
+    try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
+    catch (error) { throw continuation ? continuationError(error.message) : error; }
     if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
-      throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
+      throw reject('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
     }
     const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
-    if (!cwd) throw new Error('codex_run: 当前会话没有工作区，请传 cwd');
+    if (!cwd) throw reject('codex_run: 当前会话没有工作区，请传 cwd');
     const writer = cfg.gemini && (args.write || (args.host_access ?? cfg.defaultHostAccess)) ? { cwd: normPath(cwd) } : null;
-    if (writer && geminiWrites.has(writer.cwd)) throw new Error('codex_run: 同一任务目录的 gemini_write 尚未结束，请先等它结束');
+    if (writer && geminiWrites.has(writer.cwd)) throw reject('codex_run: 同一任务目录的 gemini_write 尚未结束，请先等它结束');
     const finish = (result) => {
       const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);
       const value = { ...result, acceptance: args.acceptance, ...(outside ? { out_of_scope: outside } : {}) };
@@ -1104,7 +1113,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const owner = exec?.agent?.id;
       const log = exec?.agent?.session?.log ?? [];
       const tool = continuation ? 'codex_continue' : 'codex_run';
-      const preflightUnavailable = (reason, value) => new Error(`${tool}: ${reason}，未启动 Codex。` +
+      const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
         (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
       if (args.resume && owner) {
         // 新一轮的结果不能替代同线程更早问题的用户回复。
@@ -1114,7 +1123,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对待续接线程的任务', history);
           const pending = history.jobs.find((job, index) => job.blocking?.next_action === 'ask_user' &&
             ((!continuation && offset === 0 && index === 0) || !canAnswer(log, job, owner)));
-          if (pending) throw new Error(cfg.plannerAnswers
+          if (pending) throw reject(cfg.plannerAnswers
             ? `${tool}: 原任务 ${pending.job_id} 有待答问题，未启动 Codex。请用 codex_continue 提交 answers。${PLANNER_ANSWERS}`
             : `${tool}: 原任务 ${pending.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再按最新任务状态用 codex_continue 处理。`);
           offset = history.next_offset ?? null;
@@ -1497,18 +1506,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单');
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw continuationError('codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单');
       const owner = exec?.agent?.id;
-      if (!owner) throw new Error('codex_continue: 当前调用没有会话 ID');
-      if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('wait_seconds 必须是非负整数');
+      if (!owner) throw continuationError('codex_continue: 当前调用没有会话 ID');
+      if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw continuationError('wait_seconds 必须是非负整数');
       const key = `${owner}:${args.job_id}`;
       if (continuations.has(key)) return continuations.get(key);
       const pending = (async () => {
         const source = withReport(await conductor.waitJob(args.job_id, 0));
         exec?.signal?.throwIfAborted();
-        if (source.context?.owner !== owner) throw new Error('codex_continue: 原任务归属未知或不属于当前会话');
+        if (source.context?.owner !== owner) throw continuationError('codex_continue: 原任务归属未知或不属于当前会话');
         const children = await conductor.list({ owner, parent_job: args.job_id, limit: 1 }, exec?.signal);
-        if (!Array.isArray(children.jobs)) throw new Error(`codex_continue: 无法核对已有续接：${children.error ?? children.status}`);
+        if (!Array.isArray(children.jobs)) throw continuationError(`codex_continue: 无法核对已有续接：${children.error ?? children.status}`);
         if (children.jobs.length) {
           const child = withReport(await conductor.waitJob(children.jobs[0].job_id, 0));
           const bg = liveBackground(child.job_id, exec);
@@ -1682,7 +1691,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '把教程、文档正文交给本机官方 agy 的 Gemini 写入单个文件，一章一章做；源码改动和素材笔记用 codex_run。' +
       '插件读取并内联 sources，内容会发送给 Google；同目录有可写 Codex 任务运行或排队、或任务查询失败时拒绝。' +
       'max_chars 是正文硬上限，目标为上限的 80% 向下取整；首次超限自动压缩一次，两次调用共用 timeoutSeconds 预算，仍超限时请拆章。' +
-      '任意 stdout 字节视为进度，idleTimeoutSeconds 无进度超时，timeoutSeconds 为总上限；回执含 stdout_bytes/event_count/last_progress_s/timeout_kind。' +
+      '正文增量或 write_file 事件后才启用 idleTimeoutSeconds，之后任意 stdout 字节续期；启动和思考阶段只受 timeoutSeconds 总上限约束。回执含 stdout_bytes/event_count/event_types/last_event_type/last_progress_s/timeout_kind，不记录事件正文。' +
       'reuse_draft 仅接受插件草稿目录内 .md，跳过 agy，沿用校验与回滚，超限直接拒绝；成功正文禁止规划端读取或搜索，交 Codex 核对。' +
       '返回 attempts 和每次正文字数 attempt_chars；最终 failed 时恢复目标原内容，原先不存在则删除目标。' +
       '可选 frontmatter 由插件校验、生成并去除模型重复块，不计入字数。结束后列出快照改动与范围外写入；completed 后仍需对照素材核对内容。',
@@ -1727,7 +1736,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor, { signal: exec?.signal, busy }, launchGemini);
         if (value.status === 'completed') {
           productReads.addGemini(exec?.agent?.id, [value.output]);
-          value.next = '正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。';
         }
         return value;
       }

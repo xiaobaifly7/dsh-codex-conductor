@@ -672,7 +672,8 @@ const present = (v) => v !== undefined && v !== null && v !== false && v !== '' 
 
 export const PRODUCT_DENY_HINT = '已拒绝。调查交给 codex_run；核对产物交给核验任务 codex_verify。不要换命令、语言或工具入口重试。';
 export const PRODUCT_HINT = `这是原料，规划端不直接读。${PRODUCT_DENY_HINT}`;
-export const GEMINI_READ_DENY = '[codex-conductor] 该文件是本会话 gemini_write 已写出的正文，规划端不再读取正文。请用 codex_run 派只读核对任务，对照本次 output 与 sources，返回问题位置和必要短摘录。不要换工具、搜索或命令重试读取全文。';
+export const GEMINI_CHECK_HINT = '该正文由 gemini_write 写出，规划端不读取。下一步派一单 codex_run（write=true，scope 只含该正文文件），在同一单里核对事实与可读性、就地修正写法问题和句子级错误，报告问题位置和改动；不要另派只读核对或清理单，也不要换工具、搜索或命令绕读。';
+export const GEMINI_READ_DENY = `[codex-conductor] ${GEMINI_CHECK_HINT}`;
 
 // Use the same mount/case normalization as scopes; resolve local links before comparing.
 export function readPath(file, cwd = '') {
