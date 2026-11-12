@@ -122,7 +122,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 两个字段都必填：`sessionId` 只接受单个会话 ID，格式为 `[A-Za-z0-9_-]{1,100}`；`message` 必须是非空、非纯空白字符串，最多 4000 个 Unicode 字符，发送的文本不会裁剪首尾空白。`sessions` 数组不受支持，包含该字段的请求会被拒绝。这个入口会通过 `agent.followup` **以用户身份**（`role: 'user'`、`source: {kind: 'user'}`）向会话发消息，因此只应由本机操作者使用，不应向模型、远程调用者或不可信文件写入者开放。
 
-插件在加载、热重载和目录通知时检查请求，沿用恢复入口的原子认领和串行处理；提交前异步读取会话，再复核 agent 身份及运行状态。运行中的会话跳过。与 `resume-request.json` 的区别是：发送入口允许正常结束的空闲会话接收新消息，直接提交用户消息；恢复入口仍只处理 `interrupted` / `blocked` 的恢复情形，正常结束的会话仍跳过。
+插件在加载、热重载和目录通知时检查请求，沿用恢复入口的原子认领和串行处理；提交前异步读取会话，再复核 agent 身份及运行状态。运行中的会话默认跳过；请求里加 `"whenRunning":"queue"` 时，运行中的会话也会收到这条消息：它被排进下一轮（`next-turn`），和界面里会话忙时选择排队发送走同一条路，当前回合不会被打断，原生 Goal 也会先让出这一轮；结果中的 `reason` 为 `message_queued`。`whenRunning` 只接受 `"queue"`。与 `resume-request.json` 的区别是：发送入口允许正常结束的空闲会话接收新消息，直接提交用户消息；恢复入口仍只处理 `interrupted` / `blocked` 的恢复情形，正常结束的会话仍跳过。
 
 同目录的 `send-result.json` 包含认领时间 `requestedAt`、完成时间 `completedAt`、`sessionId`、`status`、`reason`，出错时另有 `error`。成功为 `sent / message_submitted`；跳过为 `skipped / running`（正在运行）、`skipped / session_changed`（读取期间 agent 被替换或移除）、`skipped / error`（取不到 agent、宿主接口缺失或提交失败）或 `skipped / invalid_request`（JSON、字段或长度不合法，不提交消息）。无法取得合法会话 ID 时 `sessionId` 为 `null`。结果文件和插件日志不记录消息正文；宿主错误也不引用正文。
 

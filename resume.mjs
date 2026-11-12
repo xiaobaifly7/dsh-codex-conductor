@@ -24,10 +24,11 @@ function validateRequest(request) {
 function validateSendRequest(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) ||
       Object.hasOwn(request, 'sessions') || !validSessionId(request.sessionId) ||
-      typeof request.message !== 'string' || !request.message.trim() || [...request.message].length > 4000) {
+      typeof request.message !== 'string' || !request.message.trim() || [...request.message].length > 4000 ||
+      (Object.hasOwn(request, 'whenRunning') && request.whenRunning !== 'queue')) {
     throw new Error('invalid send request');
   }
-  return { sessionId: request.sessionId, message: request.message };
+  return { sessionId: request.sessionId, message: request.message, queue: request.whenRunning === 'queue' };
 }
 
 function resumePendingInbox(agent, sessionId) {
@@ -45,7 +46,7 @@ function resumePendingInbox(agent, sessionId) {
   }
 }
 
-async function resumeSession(ctx, sessionId, message, send = false) {
+async function resumeSession(ctx, sessionId, message, send = false, queue = false) {
   let method = null;
   const skipped = (reason) => ({ sessionId, status: 'skipped', reason, ...(send ? {} : { method: null }) });
   try {
@@ -58,11 +59,12 @@ async function resumeSession(ctx, sessionId, message, send = false) {
       throw resolved.error;
     }
     const { agent } = resolved;
-    if (agent.status === 'running') return skipped('running');
+    // queue: a running agent's followup lands in next-turn, the same path as the UI's Queue mode.
+    if (agent.status === 'running' && !queue) return skipped('running');
     // Resolve first: the host closes a crashed, unterminated turn as interrupted.
     const { events } = await query.readSession(sessionId);
     if (agents.get(sessionId) !== agent) return skipped('session_changed');
-    if (agent.status === 'running') return skipped('running');
+    if (agent.status === 'running' && !queue) return skipped('running');
     if (!send) {
       const lastTurn = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
       const ended = lastTurn?.type === 'turn/end' ? lastTurn.data?.reason?.kind : undefined;
@@ -82,8 +84,9 @@ async function resumeSession(ctx, sessionId, message, send = false) {
       if (ended === 'blocked') return resumePendingInbox(agent, sessionId);
       method = 'message';
     }
+    const queued = agent.status === 'running';
     agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
-    return send ? { sessionId, status: 'sent', reason: 'message_submitted' }
+    return send ? { sessionId, status: 'sent', reason: queued ? 'message_queued' : 'message_submitted' }
       : { sessionId, status: 'resumed', reason: 'message_submitted', method };
   } catch (error) {
     // Host errors may quote the submitted text; never publish them for the send entry.
@@ -110,14 +113,14 @@ async function processRequest({ ctx, directory }, kind) {
     if (send && validSessionId(input?.sessionId)) result.sessionId = input.sessionId;
     request = send ? validateSendRequest(input) : validateRequest(input);
   } catch (error) {
-    if (send) result.error = 'Invalid send request: supply one valid sessionId and a non-empty message of at most 4000 Unicode characters, without sessions';
+    if (send) result.error = 'Invalid send request: supply one valid sessionId and a non-empty message of at most 4000 Unicode characters, without sessions; whenRunning may only be \"queue\"';
     else {
       result.status = 'rejected';
       result.error = String(error?.message ?? error);
     }
   }
   if (request) {
-    if (send) Object.assign(result, await resumeSession(ctx, request.sessionId, request.message, true));
+    if (send) Object.assign(result, await resumeSession(ctx, request.sessionId, request.message, true, request.queue));
     else for (const sessionId of request.sessions) {
       result.sessions.push(await resumeSession(ctx, sessionId, request.message));
     }
