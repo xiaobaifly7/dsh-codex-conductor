@@ -1949,17 +1949,21 @@ def main():
         boot = boot_id()
         if boot:
             (job_dir / "boot_id").write_text(boot)
-        worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
-                                  start_new_session=not IS_WIN, close_fds=True)
-        record_pid(job_dir / "worker.pid", worker.pid)
+        # Windows cannot replace a PID file while another publisher is replacing it.
+        with acquire_file_lock(job_dir / "process.lock", blocking=True):
+            worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
+                                      start_new_session=not IS_WIN, close_fds=True)
+            record_pid(job_dir / "worker.pid", worker.pid)
         emit({"job_id": job_id, "status": "running"})
         return
 
     if args.command == "_worker":
         job_dir = HOME / "jobs" / args.job_id
-        record_pid(job_dir / "worker.pid", os.getpid())
+        with acquire_file_lock(job_dir / "process.lock", blocking=True):
+            if recorded_pid(job_dir / "worker.pid") != os.getpid():
+                record_pid(job_dir / "worker.pid", os.getpid())
         task = argparse.Namespace(**json.loads((job_dir / "args.json").read_text("utf-8")))
         try:
             result = execute(task, (job_dir / "prompt.txt").read_text("utf-8"), job_dir)
