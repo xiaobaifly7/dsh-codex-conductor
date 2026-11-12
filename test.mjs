@@ -4365,6 +4365,18 @@ test('gemini_write lists snapshot changes and out-of-scope write events separate
   assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
 });
 
+test('gemini.defaultMaxChars caps calls that omit max_chars and yields to an explicit value', async (t) => {
+  const capped = geminiFixture(t, { config: { gemini: { defaultMaxChars: 50 } } });
+  assert.equal((await capped.execute({})).status, 'completed');
+  assert.match(capped.spawns[0].prompt, /正文硬上限为 50 个 Unicode 码点/);
+  const explicit = geminiFixture(t, { config: { gemini: { defaultMaxChars: 50 } } });
+  assert.equal((await explicit.execute({ max_chars: 30 })).status, 'completed');
+  assert.match(explicit.spawns[0].prompt, /正文硬上限为 30 个 Unicode 码点/);
+  const uncapped = geminiFixture(t);
+  assert.equal((await uncapped.execute({})).status, 'completed');
+  assert.doesNotMatch(uncapped.spawns[0].prompt, /正文硬上限/);
+});
+
 test('gemini_write automatically compresses the previous draft once within the hard limit', async (t) => {
   const drafts = ['第一稿：事实来自素材[1]。\n', '事实[1]。\n'];
   let attempt = 0;

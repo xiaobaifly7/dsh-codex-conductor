@@ -775,6 +775,11 @@ function settings(config, logger) {
         if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
         config.gemini[key] = valid ? value : fallback;
       }
+      // Applied when a call omits max_chars, so length stays capped even if the planner forgets it.
+      if (gemini.defaultMaxChars !== undefined) {
+        if (Number.isSafeInteger(gemini.defaultMaxChars) && gemini.defaultMaxChars > 0) config.gemini.defaultMaxChars = gemini.defaultMaxChars;
+        else logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.defaultMaxChars，必须是正整数');
+      }
     }
   }
   // workspaces 的条目可以是路径字符串，也可以是 {path, cwd}
@@ -1671,7 +1676,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       cwd: { type: 'string', description: '任务目录，解析规则同 codex_run；Windows 路径或 /mnt/<盘符>/...。' },
       model: { type: 'string', description: `默认 ${cfg.gemini.model}。` },
       effort: { type: 'string', enum: ['low', 'medium', 'high'], description: `默认 ${cfg.gemini.effort}。` },
-      max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' },
+      max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' +
+        (cfg.gemini.defaultMaxChars ? `不传时默认 ${cfg.gemini.defaultMaxChars}。` : '') },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },
       frontmatter: { type: 'object', additionalProperties: false, required: ['title', 'tags'],
         description: '启用后由插件生成七字段 YAML；title 和至少一个非空 tags 必填，单值最多 200 个 Unicode 字符且禁止换行和控制字符；仅 tags/aliases 可用字符串数组，aliases 允许空数组；不传则保留原有正文处理。',
@@ -1697,7 +1703,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 查询与启动之间也占住本实例的入口，避免规划端同时派入另一种写任务。
       if (!busy) geminiWrites.add(key);
       try {
-        const value = await geminiWrite(cfg.gemini, { ...args, cwd }, conductor, { signal: exec?.signal, busy }, launchGemini);
+        const value = await geminiWrite(cfg.gemini, { ...args, cwd,
+          ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor, { signal: exec?.signal, busy }, launchGemini);
         rememberProducts({ ...value, cwd }, exec?.agent?.id);
         if (value.status === 'completed') value.next = '先机械核对正文产物、出处和数字；用 codex_run 派只读任务，核对本次 output 与本次 sources。' + USER_REPORT;
         return value;
