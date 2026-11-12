@@ -74,16 +74,20 @@ test('apply waits for session services and processes a pending local resume requ
     apply({ tools: { register() {} }, on() {}, inject(names, callback) {
       // The panel also waits for its own services through inject; only the session one matters here.
       if (names.includes('sessionController')) {
-        assert.deepEqual(names, ['agents', 'sessionController', 'sessionQuery']);
+        assert.deepEqual(names, ['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady']);
         activate = callback;
       }
-    } });
+    } }, { autoResume: { enabled: false } });
   } finally { process.env.LOCALAPPDATA = previous; }
   assert.equal(readFileSync(path.join(directory, 'resume-request.json'), 'utf8').includes('session-load'), true);
   const services = {
     agents: { get: () => agent },
     sessionController: { resolveAgent: async () => ({ agent }) },
-    sessionQuery: { readSession: async () => ({ events: [{ type: 'turn/end', data: { reason: { kind: 'interrupted' } } }] }) },
+    sessionQuery: { listSessions: async () => assert.fail('manual entry must not scan sessions'),
+      readSession: async () => ({ events: [{ type: 'turn/end', data: { reason: { kind: 'interrupted' } } }] }) },
+    sessionPersistence: { open: () => assert.fail('manual entry must not read raw history') },
+    goals: { get: () => undefined },
+    appReady: { onReady: () => assert.fail('disabled auto resume must not subscribe to readiness') },
   };
   activate({ get: (name) => services[name], effect: (factory) => { dispose = factory(); } });
   const message = await submitted.promise;
@@ -91,6 +95,97 @@ test('apply waits for session services and processes a pending local resume requ
   assert.equal(message.content[0].text, '继续');
   await tick();
   assert.equal(JSON.parse(readFileSync(path.join(directory, 'resume-result.json'), 'utf8')).sessions[0].status, 'resumed');
+});
+
+test('apply auto resume: injected services wait for appReady and receive merged default/custom configuration', async (t) => {
+  for (const setting of [undefined, { message: '自定义续接消息', maxAgeHours: 2, exclude: ['session-excluded'] }]) {
+    await t.test(setting ? 'configured' : 'defaults', { timeout: 5000 }, async (t) => {
+      const root = mkdtempSync(path.join(tmpdir(), 'conductor-autoresume-load-'));
+      const directory = path.join(root, 'dsh-codex-conductor');
+      const cleanups = [];
+      t.after(() => { for (const cleanup of cleanups) cleanup(); rmSync(root, { recursive: true, force: true }); });
+      let activate, onReady, scans = 0, canceled = false;
+      const previous = process.env.LOCALAPPDATA;
+      process.env.LOCALAPPDATA = root;
+      try {
+        apply({ tools: { register() {} }, on() {}, inject(names, callback) {
+          if (names.includes('sessionController')) {
+            assert.deepEqual(names, ['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady']);
+            activate = callback;
+          }
+        } }, { autoResume: setting });
+      } finally { process.env.LOCALAPPDATA = previous; }
+      const loaded = JSON.parse(readFileSync(path.join(directory, 'loaded.json'), 'utf8'));
+      assert.deepEqual(loaded.autoResume, { enabled: true, maxAgeHours: setting?.maxAgeHours ?? 12, excludeCount: setting ? 1 : 0 });
+      const submitted = Promise.withResolvers();
+      const agent = { id: 'session-load', status: 'idle', followup: submitted.resolve };
+      const now = Date.now();
+      const artifact = path.join(root, 'session-load.artifact');
+      writeFileSync(artifact, '');
+      const historyCalls = [];
+      const bus = new EventEmitter(), rootFiber = { state: 0 };
+      const agents = new Map([[agent.id, agent]]);
+      agents.list = () => [...agents.values()];
+      const services = {
+        agents,
+        sessionController: { resolveAgent: async () => ({ agent }) },
+        sessionQuery: {
+          async listSessions() {
+            scans++;
+            assert.equal(typeof onReady, 'function');
+            assert.equal(JSON.parse(readFileSync(path.join(directory, 'autoresume-state.json'), 'utf8')).resumed.length, 0);
+            return [{ header: { id: agent.id, createdAt: now } }];
+          },
+          readSession: async () => {
+            historyCalls.push('queryRead');
+            return { events: [{ type: 'turn/end', time: now, data: { reason: { kind: 'interrupted' } } }] };
+          },
+        },
+        sessionPersistence: {
+          locate(header) { assert.equal(header.id, agent.id); return { path: artifact }; },
+          async open(id, mode, { signal }) {
+            assert.equal(id, agent.id);
+            assert.equal(mode, 'read');
+            assert.ok(signal instanceof AbortSignal);
+            historyCalls.push('rawOpen');
+            return {
+              async read(offset, limit, options) {
+                assert.equal(offset, 0);
+                assert.equal(limit, undefined);
+                assert.equal(options.signal, signal);
+                historyCalls.push('rawRead');
+                return { events: [{ type: 'turn/start', time: now, data: {} }] };
+              },
+              async close() { historyCalls.push('rawClose'); },
+            };
+          },
+        },
+        goals: { get: () => undefined },
+        appReady: { onReady(callback) { onReady = callback; return () => { canceled = true; }; } },
+      };
+      activate({ root: { fiber: rootFiber }, on: (event, callback) => bus.on(event, callback),
+        get: name => services[name], effect: factory => cleanups.push(factory()) });
+      await tick();
+      assert.equal(scans, 0);
+      assert.equal(readdirSync(directory).includes('autoresume-state.json'), false);
+      onReady();
+      const message = await submitted.promise;
+      assert.equal(message.role, 'user');
+      assert.equal(message.content[0].text, setting?.message ?? 'Harness 已重启，接着上次中断的地方继续。');
+      await tick();
+      assert.equal(JSON.parse(readFileSync(path.join(directory, 'autoresume-result.json'), 'utf8')).sessions[0].reason, 'message_submitted');
+      assert.deepEqual(historyCalls, ['rawOpen', 'rawRead', 'rawClose', 'queryRead']);
+      onReady();
+      await tick();
+      assert.equal(scans, 1);
+      rootFiber.state = 5;
+      agent.status = 'running';
+      bus.emit('internal/status', rootFiber);
+      assert.deepEqual(JSON.parse(readFileSync(path.join(directory, 'autoresume-state.json'), 'utf8')).pending, [agent.id]);
+      for (const cleanup of cleanups.splice(0)) cleanup();
+      assert.equal(canceled, true);
+    });
+  }
 });
 
 test('assignments and loop lists cannot smuggle flags into allowed commands', () => {
@@ -4039,6 +4134,55 @@ test('settings warns and defaults each invalid entry without losing valid config
     logger: { warn: text => warnings.push(text) } },
   { python: '', runner: '', timeoutSeconds: '', idleTimeoutSeconds: '', retries: '' });
   assert.deepEqual(warnings, []);
+});
+
+test('auto resume settings: defaults and partial overrides retain exact message and sanitize loaded metadata', async () => {
+  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] };
+  for (const overrides of [undefined, {}, { enabled: false }, { maxAgeHours: 0.5 },
+    { message: '😀'.repeat(2000), exclude: ['session-private', 'session_2'] }]) {
+    const tools = {}, warnings = [];
+    let actual;
+    apply({ tools: { register: tool => { tools[tool.name] = tool; } }, on() {},
+      logger: { warn: text => warnings.push(text) } }, { autoResume: overrides }, async cfg => {
+      actual = cfg.autoResume;
+      return { job_id: 'J', status: 'completed' };
+    });
+    await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+    const expected = { ...defaults, ...overrides };
+    assert.deepEqual(actual, expected);
+    assert.deepEqual(warnings, []);
+    const loaded = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
+    assert.deepEqual(loaded.autoResume, { enabled: expected.enabled, maxAgeHours: expected.maxAgeHours, excludeCount: expected.exclude.length });
+    assert.equal(JSON.stringify(loaded).includes('session-private'), false);
+    assert.equal(Object.hasOwn(loaded.autoResume, 'message'), false);
+  }
+});
+
+test('auto resume settings: invalid outer and nested fields warn and default independently', async () => {
+  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] };
+  const cases = [
+    ...[null, false, 'enabled', []].map(value => ({ value, key: 'autoResume', expected: defaults })),
+    ...[0, -1, NaN, Infinity, '12'].map(value => ({ value: { enabled: false, maxAgeHours: value },
+      key: 'autoResume.maxAgeHours', expected: { ...defaults, enabled: false } })),
+    { value: { enabled: 'false', maxAgeHours: 2 }, key: 'autoResume.enabled', expected: { ...defaults, maxAgeHours: 2 } },
+    ...[null, 1, '😀'.repeat(2001)].map(message => ({ value: { message, enabled: false },
+      key: 'autoResume.message', expected: { ...defaults, enabled: false } })),
+    ...['session-one', [null], [''], ['../session-one'], ['session-one\n'], ['x'.repeat(101)]].map(exclude =>
+      ({ value: { exclude, message: '保留有效消息' }, key: 'autoResume.exclude', expected: { ...defaults, message: '保留有效消息' } })),
+  ];
+  for (const { value, key, expected } of cases) {
+    const tools = {}, warnings = [];
+    let actual;
+    apply({ tools: { register: tool => { tools[tool.name] = tool; } }, on() {},
+      logger: { warn: text => warnings.push(text) } }, { autoResume: value }, async cfg => {
+      actual = cfg.autoResume;
+      return { job_id: 'J', status: 'completed' };
+    });
+    await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+    assert.deepEqual(actual, expected, key);
+    assert.equal(warnings.length, 1, key);
+    assert.ok(warnings[0].includes(key), warnings[0]);
+  }
 });
 
 test('optional timeout, retry and storage settings validate numbers and pass only configured runner flags', async () => {

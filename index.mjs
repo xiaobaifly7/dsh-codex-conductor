@@ -54,6 +54,7 @@ const DEFAULTS = {
   serviceTier: '',
   waitSeconds: 0,
   autoWakeBlockedInbox: true,
+  autoResume: { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] },
   timeoutSeconds: null,
   idleTimeoutSeconds: null,
   retries: null,
@@ -755,10 +756,21 @@ function settings(config, logger) {
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
+      : key === 'autoResume' ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
     if (!valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 ${key}，使用默认值`);
+    return [key, valid ? value : fallback];
+  }));
+  const autoResume = config.autoResume;
+  config.autoResume = Object.fromEntries(Object.entries(DEFAULTS.autoResume).map(([key, fallback]) => {
+    const value = autoResume[key];
+    const valid = key === 'enabled' ? typeof value === 'boolean'
+      : key === 'maxAgeHours' ? Number.isFinite(value) && value > 0
+      : key === 'message' ? typeof value === 'string' && [...value].length <= 2000
+      : Array.isArray(value) && value.every(id => typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id));
+    if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoResume.${key}，使用默认值`);
     return [key, valid ? value : fallback];
   }));
   if (config.gemini) {
@@ -1803,12 +1815,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
+        autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
   } catch {}
   const resumeDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
-  if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery'], (resumeCtx) => {
-    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory });
+  if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
+    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume });
   });
 }

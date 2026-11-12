@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
+
+// Stable across module reloads; timeOrigin distinguishes reused PIDs.
+const HOST_PROCESS = `${process.pid}:${performance.timeOrigin}`;
 
 function validSessionId(id) {
   return typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
@@ -31,6 +35,35 @@ function validateSendRequest(request) {
   return { sessionId: request.sessionId, message: request.message, queue: request.whenRunning === 'queue' };
 }
 
+function validateGoalRequest(request) {
+  if (!request || typeof request !== 'object' || Array.isArray(request) || !validSessionId(request.sessionId) ||
+      (request.objective === undefined && request.maxGoalRounds === undefined) ||
+      (Object.hasOwn(request, 'objective') && (typeof request.objective !== 'string' || !request.objective.trim())) ||
+      (Object.hasOwn(request, 'maxGoalRounds') && (!Number.isSafeInteger(request.maxGoalRounds) || request.maxGoalRounds < 1))) {
+    throw new Error('invalid goal request');
+  }
+  const { sessionId, objective, maxGoalRounds } = request;
+  return { sessionId, ...(objective === undefined ? {} : { objective }),
+    ...(maxGoalRounds === undefined ? {} : { maxGoalRounds }) };
+}
+
+async function editGoal(ctx, { sessionId, ...changes }) {
+  const result = (status, reason) => ({ sessionId, status, reason });
+  try {
+    const resolved = await ctx.get('sessionController').resolveAgent(sessionId);
+    if (resolved.error?.code === 'session/not-found') return result('skipped', 'session_not_found');
+    if (resolved.error) throw resolved.error;
+    const { agent } = resolved;
+    const goals = ctx.get('goals');
+    const goal = goals.get(agent);
+    if (!goal || goal.phase === 'complete') return result('skipped', 'no_active_goal');
+    goals.edit(agent, { id: goal.id, revision: goal.revision }, changes);
+    return result('edited', 'edited');
+  } catch {
+    return { ...result('skipped', 'error'), error: 'Goal edit failed or required host interfaces are unavailable' };
+  }
+}
+
 function resumePendingInbox(agent, sessionId) {
   let method = null;
   try {
@@ -46,10 +79,14 @@ function resumePendingInbox(agent, sessionId) {
   }
 }
 
-async function resumeSession(ctx, sessionId, message, send = false, queue = false) {
+async function resumeSession(ctx, sessionId, message, { send = false, queue = false, automatic, signal } = {}) {
   let method = null;
-  const skipped = (reason) => ({ sessionId, status: 'skipped', reason, ...(send ? {} : { method: null }) });
+  const basis = {};
+  const result = (status, reason, method = null) => ({ sessionId, status, reason,
+    ...(send ? {} : { method }), ...(automatic ? { basis } : {}) });
+  const skipped = (reason) => result('skipped', reason);
   try {
+    if (signal?.aborted) return skipped('unloaded');
     const controller = ctx.get('sessionController');
     const query = ctx.get('sessionQuery');
     const agents = ctx.get('agents');
@@ -59,44 +96,73 @@ async function resumeSession(ctx, sessionId, message, send = false, queue = fals
       throw resolved.error;
     }
     const { agent } = resolved;
+    if (signal?.aborted) return skipped('unloaded');
+    if (automatic) basis.agentStatus = agent.status;
     // queue: a running agent's followup lands in next-turn, the same path as the UI's Queue mode.
     if (agent.status === 'running' && !queue) return skipped('running');
     // Resolve first: the host closes a crashed, unterminated turn as interrupted.
     const { events } = await query.readSession(sessionId);
+    if (signal?.aborted) return skipped('unloaded');
     if (agents.get(sessionId) !== agent) return skipped('session_changed');
+    if (automatic) basis.agentStatus = agent.status;
     if (agent.status === 'running' && !queue) return skipped('running');
     if (!send) {
       const lastTurn = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
       const ended = lastTurn?.type === 'turn/end' ? lastTurn.data?.reason?.kind : undefined;
       // After a restart another plugin may try to advance the disarmed goal; the host rejects that turn as "blocked"
       // before any step runs, so the session is still waiting to be resumed.
-      if (ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
+      if (!automatic && ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
       const goals = ctx.get('goals');
       const goal = goals?.get(agent);
+      if (automatic) {
+        Object.assign(basis, { lastTurn: automatic.lastTurn, loadedLastTurn: ended ?? 'none',
+          cancelCause: automatic.cancelCause, shutdownPending: automatic.shutdownPending,
+          goalPhase: goal?.phase ?? null, goalActivation: goal?.activation ?? null });
+        if (automatic.lastTurn === 'aborted' && automatic.cancelCause === 'user') return skipped('user_stopped');
+        if (goal?.phase === 'paused' || goal?.phase === 'blocked') return skipped(`goal_${goal.phase}`);
+        // An armed goal is already owned by the native round driver; never add a competing prompt.
+        if (goal?.phase === 'active' && goal.activation === 'armed') return skipped('native_goal_driver');
+        if (goal?.phase === 'active' && goal.roundsStarted >= goal.maxGoalRounds) return skipped('goal_round_limit');
+        if (goal?.phase !== 'active' && automatic.lastTurn !== 'unterminated' && automatic.lastTurn !== 'error' &&
+            !(automatic.shutdownPending && (automatic.lastTurn === 'interrupted' ||
+              (automatic.lastTurn === 'aborted' && ['disposed', 'parent'].includes(automatic.cancelCause))))) {
+          return skipped(['interrupted', 'aborted'].includes(automatic.lastTurn) ? 'interrupted_without_shutdown_marker' : 'not_interrupted');
+        }
+      }
       if (goal && ['active', 'paused', 'blocked'].includes(goal.phase) &&
           (goal.phase !== 'active' || goal.activation === 'disarmed') && goal.roundsStarted < goal.maxGoalRounds) {
         method = 'goal';
         // The native goal driver submits the next round; a user prompt here would duplicate it.
         goals.resume(agent, { id: goal.id, revision: goal.revision });
-        return { sessionId, status: 'resumed', reason: 'goal_resumed', method };
+        return result('resumed', 'goal_resumed', method);
       }
       // A rejected turn alone says nothing was cut short, so it never justifies sending a prompt.
-      if (ended === 'blocked') return resumePendingInbox(agent, sessionId);
+      if (!automatic && ended === 'blocked') return resumePendingInbox(agent, sessionId);
       method = 'message';
     }
     const queued = agent.status === 'running';
     agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
-    return send ? { sessionId, status: 'sent', reason: queued ? 'message_queued' : 'message_submitted' }
-      : { sessionId, status: 'resumed', reason: 'message_submitted', method };
+    return result(send ? 'sent' : 'resumed', queued ? 'message_queued' : 'message_submitted', method);
   } catch (error) {
     // Host errors may quote the submitted text; never publish them for the send entry.
     if (send) return { ...skipped('error'), error: 'Session message submission failed or required host interfaces are unavailable' };
-    return { sessionId, status: 'skipped', reason: 'error', method, error: String(error?.message ?? error) };
+    return { ...result('skipped', 'error', method), error: String(error?.message ?? error) };
+  }
+}
+
+function writeJson(directory, name, value) {
+  const temporary = path.join(directory, `${name}.${randomUUID()}.tmp`);
+  try {
+    fs.writeFileSync(temporary, JSON.stringify(value, null, 2) + '\n');
+    fs.renameSync(temporary, path.join(directory, `${name}.json`));
+  } finally {
+    fs.rmSync(temporary, { force: true });
   }
 }
 
 async function processRequest({ ctx, directory }, kind) {
   const send = kind === 'send';
+  const goal = kind === 'goal';
   const claimed = path.join(directory, `${kind}-request.${randomUUID()}.processing.json`);
   try {
     fs.renameSync(path.join(directory, `${kind}-request.json`), claimed);
@@ -105,34 +171,30 @@ async function processRequest({ ctx, directory }, kind) {
     throw error;
   }
   const requestedAt = new Date().toISOString();
-  const result = send ? { requestedAt, sessionId: null, status: 'skipped', reason: 'invalid_request' }
+  const result = send || goal ? { requestedAt, sessionId: null, status: 'skipped', reason: 'invalid_request' }
     : { requestedAt, status: 'processed', sessions: [] };
   let request;
   try {
     const input = JSON.parse(fs.readFileSync(claimed, 'utf8').replace(/^\uFEFF/, ''));
-    if (send && validSessionId(input?.sessionId)) result.sessionId = input.sessionId;
-    request = send ? validateSendRequest(input) : validateRequest(input);
+    if ((send || goal) && validSessionId(input?.sessionId)) result.sessionId = input.sessionId;
+    request = goal ? validateGoalRequest(input) : send ? validateSendRequest(input) : validateRequest(input);
   } catch (error) {
-    if (send) result.error = 'Invalid send request: supply one valid sessionId and a non-empty message of at most 4000 Unicode characters, without sessions; whenRunning may only be \"queue\"';
+    if (goal) result.error = 'Invalid goal request: supply a valid sessionId and a non-empty objective and/or positive safe-integer maxGoalRounds';
+    else if (send) result.error = 'Invalid send request: supply one valid sessionId and a non-empty message of at most 4000 Unicode characters, without sessions; whenRunning may only be \"queue\"';
     else {
       result.status = 'rejected';
       result.error = String(error?.message ?? error);
     }
   }
   if (request) {
-    if (send) Object.assign(result, await resumeSession(ctx, request.sessionId, request.message, true, request.queue));
+    if (goal) Object.assign(result, await editGoal(ctx, request));
+    else if (send) Object.assign(result, await resumeSession(ctx, request.sessionId, request.message, { send: true, queue: request.queue }));
     else for (const sessionId of request.sessions) {
       result.sessions.push(await resumeSession(ctx, sessionId, request.message));
     }
   }
   result.completedAt = new Date().toISOString();
-  const temporary = path.join(directory, `${kind}-result.${randomUUID()}.tmp`);
-  try {
-    fs.writeFileSync(temporary, JSON.stringify(result, null, 2) + '\n');
-    fs.renameSync(temporary, path.join(directory, `${kind}-result.json`));
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
+  writeJson(directory, `${kind}-result`, result);
   // Keep the claimed file if publishing the result fails; never replay it automatically.
   fs.unlinkSync(claimed);
   return result;
@@ -146,12 +208,96 @@ export function processSendRequest(options) {
   return processRequest(options, 'send');
 }
 
-export function registerResumeRequests({ ctx, directory }) {
+export function processGoalRequest(options) {
+  return processRequest(options, 'goal');
+}
+
+export async function processAutoResume({ ctx, directory, autoResume, signal }) {
+  if (!autoResume.enabled || signal?.aborted) return;
+  const stateFile = path.join(directory, 'autoresume-state.json');
+  let previous;
+  try { previous = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+  if (previous?.hostProcess === HOST_PROCESS) return;
+  const state = { hostProcess: HOST_PROCESS, resumed: [] };
+  // Reserve the process before awaiting anything, including across overlapping hot reloads.
+  writeJson(directory, 'autoresume-state', state);
+  const requestedAt = new Date().toISOString();
+  const result = { requestedAt, status: 'processed', sessions: [] };
+  const cutoff = Date.now() - autoResume.maxAgeHours * 3600_000;
+  try {
+    const query = ctx.get('sessionQuery');
+    const persistence = ctx.get('sessionPersistence');
+    const records = await query.listSessions();
+    for (const { header } of records) {
+      if (signal?.aborted) { result.status = 'stopped'; break; }
+      const sessionId = header.id;
+      const skipped = (reason, basis) => ({ sessionId, status: 'skipped', reason, method: null, basis });
+      let entry;
+      try {
+        if (autoResume.exclude.includes(sessionId)) entry = skipped('excluded', { excluded: true });
+        else if (!sessionId.startsWith('session-')) entry = skipped('fork', { mainSession: false });
+        else if (ctx.get('agents').get(sessionId)?.status === 'running') entry = skipped('running', { agentStatus: 'running' });
+        else {
+          // listSessions has no update time; stat avoids decompressing old JSONL logs.
+          const { mtimeMs: updatedAt } = await fs.promises.stat(persistence.locate(header).path);
+          if (updatedAt < cutoff) entry = skipped('too_old', { updatedAt, cutoff });
+          else {
+            // query.readSession also synthesizes interrupted endings, so inspect the raw read handle first.
+            const handle = await persistence.open(sessionId, 'read', { signal });
+            let events;
+            try { ({ events } = await handle.read(0, undefined, { signal })); }
+            finally { await handle.close(); }
+            const lastTurn = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
+            const automatic = { lastTurn: lastTurn?.type === 'turn/start' ? 'unterminated' : lastTurn?.data?.reason?.kind ?? 'none',
+              cancelCause: lastTurn?.data?.reason?.reason?.kind ?? null,
+              shutdownPending: previous?.pending?.includes(sessionId) ?? false };
+            entry = await resumeSession(ctx, sessionId, autoResume.message, { automatic, signal });
+          }
+          entry.basis = { updatedAt, ...entry.basis };
+        }
+      } catch (error) {
+        entry = { ...skipped('error', {}), error: String(error?.message ?? error) };
+      }
+      result.sessions.push(entry);
+      if (entry.status === 'resumed' && !signal?.aborted) {
+        state.resumed.push(sessionId);
+        writeJson(directory, 'autoresume-state', state);
+      }
+    }
+  } catch (error) {
+    result.status = 'error';
+    result.error = String(error?.message ?? error);
+  }
+  result.completedAt = new Date().toISOString();
+  writeJson(directory, 'autoresume-result', result);
+  return result;
+}
+
+export function registerResumeRequests({ ctx, directory, autoResume }) {
   let stopped = false;
   let pending = Promise.resolve();
+  const controller = new AbortController();
   const warn = (error) => ctx.logger?.warn?.(`[codex-conductor] local request: ${error?.message ?? error}`);
+  if (autoResume?.enabled) {
+    // Root unloading precedes agent cancellation; plugin hot reload changes a different fiber.
+    const rootFiber = ctx.root.fiber;
+    const agents = ctx.get('agents');
+    ctx.on('internal/status', fiber => {
+      if (stopped || fiber !== rootFiber || fiber.state !== 5) return;
+      controller.abort();
+      try {
+        let state;
+        try { state = JSON.parse(fs.readFileSync(path.join(directory, 'autoresume-state.json'), 'utf8')); }
+        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        if (state?.hostProcess !== HOST_PROCESS) state = { hostProcess: HOST_PROCESS, resumed: [] };
+        state.pending = agents.list().filter(agent => agent.status === 'running').map(agent => agent.id);
+        writeJson(directory, 'autoresume-state', state);
+      } catch (error) { warn(error); }
+    });
+  }
   const check = () => {
-    for (const kind of ['resume', 'send']) {
+    for (const kind of ['resume', 'send', 'goal']) {
       pending = pending.then(() => stopped ? undefined : processRequest({ ctx, directory }, kind)).catch(warn);
     }
     return pending;
@@ -161,12 +307,15 @@ export function registerResumeRequests({ ctx, directory }) {
     try {
       fs.mkdirSync(directory, { recursive: true });
       watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
-        if (filename == null || ['resume-request.json', 'send-request.json'].includes(filename.toString())) return check();
+        if (filename == null || ['resume-request.json', 'send-request.json', 'goal-request.json'].includes(filename.toString())) return check();
       });
       watcher.on('error', (error) => { warn(error); watcher.close(); });
     } catch (error) { warn(error); }
     void check();
-    return () => { stopped = true; watcher?.close(); };
+    const cancelReady = autoResume?.enabled ? ctx.get('appReady').onReady(() => {
+      pending = pending.then(() => stopped ? undefined : processAutoResume({ ctx, directory, autoResume, signal: controller.signal })).catch(warn);
+    }) : undefined;
+    return () => { stopped = true; controller.abort(); cancelReady?.(); watcher?.close(); };
   });
   return check;
 }
