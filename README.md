@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.88` `codex_run` 现在会拒绝 schema 之外的顶层参数：任务正文误填进 `prompt`/`message`/`content` 会直接报错，不再被静默丢弃。`codex_output`、`codex_continue`、`codex_review`、`codex_verify` 在 `job_id` 缺失或非法时，也给出和 `codex_status` 一样的"用 codex_jobs 找回编号"提示。
+
 `0.9.87` Codex 的最终报告如果只是字符串里有原始控制字符，或者有非法的反斜杠转义（多见于证据里引用的 Windows 路径或正则），就修复后再解析，不再把整单判为 `schema_invalid`。修复后的报告仍要通过报告校验，修过的地方记在 `final_message_repaired`；JSON 结构本身损坏的仍判失败。
 
 `0.9.86` 新提交的复核如果所有验收项都是 `met`，又没有阻塞和偏差，就不能记成 `needs_changes`；被审正文的问题写进 notes。已经存下的旧复核不重新检查。
@@ -442,6 +444,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.88` makes `codex_run` reject top-level parameters outside its schema, so a task spec misplaced in a `prompt`/`message`/`content` field errors instead of being silently dropped; and gives `codex_output`, `codex_continue`, `codex_review` and `codex_verify` the same "use codex_jobs to recover the id" hint on a missing or invalid `job_id` that `codex_status` already has.
 
 `0.9.87` recovers Codex final reports that fail strict JSON parsing only because of raw control characters or invalid backslash escapes (often Windows paths or regexes quoted in evidence). The repaired report must still pass report validation; the repair is recorded in `final_message_repaired`. Broken structure still fails as `schema_invalid`.
 
