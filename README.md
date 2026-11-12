@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.93` Gemini 改用无 stdout 进度超时（默认 600 秒）与共享总上限（默认 1800 秒），回执增加进度统计；成功正文禁止规划端读取/搜索，并从本会话已有回执恢复限制；新增 `reuse_draft`，可跳过 agy 重新校验、提交保留稿，超限仍拒绝。
+
 `0.9.92` 新增重启后自动续接 `autoResume`，并支持通过本机 `goal-request.json` 修改指定会话的当前 Goal 目标和轮数上限。
 
 `0.9.91` `send-request.json` 支持 `"whenRunning":"queue"`：会话正在运行时不再跳过，消息会排进它的下一轮（和界面上会话忙时选择排队发送是同一条路），当前回合不会被打断，原生 Goal 也会先让出这一轮；结果里的 `reason` 为 `message_queued`。不带这个字段时，运行中的会话照旧跳过。
@@ -54,7 +56,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### 0.9.66：规划端只读产物与独立核验
 
-默认 `plannerReads: open` 保持原有读取方式。改成 `products` 后，受护栏保护的会话只能直接读本会话 Codex / `gemini_write` 已产出的文件、任务报告、规划提示词，以及明确允许的文件或目录；目录列表仍可查看，源码调查交给 `codex_run`。常用设置里可开关“规划端只读 Codex 的产物，不直接读源码”，沿用保存、待生效和立即生效流程；状态区只显示额外允许路径的条数。
+默认 `plannerReads: open`，护栏工作区内的 Gemini 成功正文仍禁止规划端读取。改成 `products` 后，受护栏保护的会话只能直接读本会话 Codex 已产出的文件、任务报告、规划提示词，以及明确允许的文件或目录；目录列表仍可查看，源码调查交给 `codex_run`。常用设置里可开关“规划端只读 Codex 的产物，不直接读源码”，沿用保存、待生效和立即生效流程；状态区只显示额外允许路径的条数。
 
 ```yaml
 - id: codex-conductor
@@ -66,7 +68,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
       - '/mnt/e/project/review-inputs'
 ```
 
-产物路径按会话缓存在当前插件实例内，任务结束拿到结果时更新，每会话最多 10,000 条、最多保留 100 个会话；Gemini 成功输出可在当前实例登记，但跨重载自动恢复尚未实现。产物登记尚未恢复完成时，先等待最多 3 秒取得恢复结果；只有恢复仍为 `pending`（包括等待超时但恢复尚未完成）时，才提示“暂时无法确认读取权限”，不据此断言它是原料，也不放行读取。恢复成功后，未命中产物或白名单的读取按原料读取拒绝；恢复已结束但失败时，提示“产物登记恢复失败，该路径未获读取授权”，不将该路径断言为原料。未命中时每会话至多每 25 秒后台查询一次 runner，刷新确认后可重试。允许目录包含子文件，产物文件不会因此放行其所在目录。 产物授权只认 runner 实际记录的 `files_changed` / `write_paths` 及当前实例登记的 Gemini 成功输出，不凭只读任务读取过的路径或报告自报的文件列表扩大范围；读取任务报告和历史也限制在当前会话。 会话工作记录目录取自 DSH 现有的 sessionPersistence.locate(header)，只允许该会话日志所在目录；宿主未提供此接口时不猜目录。`cat/head/tail/wc/grep/sed/awk` 等内容读取、内容搜索和输入重定向都检查路径；变量、通配符或命令替换不能确定读取对象时拒绝。Obsidian 的 `obsidian_read`、`obsidian_search` 和 frontmatter 查询也遵循本会话产物与路径白名单，目录和文件列表仍放行。执行项目代码的测试命令也交给 Codex。
+产物路径按会话缓存在当前插件实例内，任务结束拿到结果时更新，每会话最多 10,000 条、最多保留 100 个会话；Gemini 成功正文另行登记为规划端禁读路径，并从本会话已有成功回执恢复，优先于产物和白名单。产物登记尚未恢复完成时，先等待最多 3 秒取得恢复结果；只有恢复仍为 `pending`（包括等待超时但恢复尚未完成）时，才提示“暂时无法确认读取权限”，不据此断言它是原料，也不放行读取。恢复成功后，未命中产物或白名单的读取按原料读取拒绝；恢复已结束但失败时，提示“产物登记恢复失败，该路径未获读取授权”，不将该路径断言为原料。未命中时每会话至多每 25 秒后台查询一次 runner，刷新确认后可重试。允许目录包含子文件，产物文件不会因此放行其所在目录。 产物授权只认 runner 实际记录的 `files_changed` / `write_paths`，Gemini 正文始终优先禁读，不凭只读任务读取过的路径或报告自报的文件列表扩大范围；读取任务报告和历史也限制在当前会话。 会话工作记录目录取自 DSH 现有的 sessionPersistence.locate(header)，只允许该会话日志所在目录；宿主未提供此接口时不猜目录。`cat/head/tail/wc/grep/sed/awk` 等内容读取、内容搜索和输入重定向都检查路径；变量、通配符或命令替换不能确定读取对象时拒绝。Obsidian 的 `obsidian_read`、`obsidian_search` 和 frontmatter 查询也遵循本会话产物与路径白名单，目录和文件列表仍放行。执行项目代码的测试命令也交给 Codex。
 
 `products` 模式下的拒绝提示简短说明原因：调查交给 `codex_run`，产物内容核对交给 Codex 核验任务。被守卫拒绝后，不换语言、命令或工具入口重试。
 
@@ -154,7 +156,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 正常卸载根宿主时，插件在 Agent 被取消前把仍 running 的会话写入 `autoresume-state.json` 的 `pending` 名单；普通插件热重载不记录名单。下次进程启动时，名单内以 `interrupted` 或 `aborted/disposed`、`aborted/parent` 收尾的会话也可续接；已完成、paused / blocked Goal 和显式 `aborted/user` 仍跳过。没有名单的 `interrupted` / teardown 收尾不会自动拉起，结果以 `interrupted_without_shutdown_marker` 说明；`basis.cancelCause` 保留嵌套取消原因。这依赖关闭流程实际卸载根宿主；直接强杀走原始未闭合回合的判定。
 
-上述通知唤醒只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条通知唤醒路径；成功输出仅在当前实例登记，跨重载自动恢复尚未实现。
+上述通知唤醒只追踪本次加载后实际观察到的本插件任务通知，不扫描重放历史通知；唤醒不保证门禁放行，宿主已领取且未退回的输入无法补回。目前 `gemini_write` 直接返回前台执行结果，没有独立后台 job 或完成通知，因此不进入这条通知唤醒路径；成功正文的禁读登记从本会话已有回执恢复。
 
 ## 功能
 
@@ -403,22 +405,27 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
       proxy: 'http://127.0.0.1:7890'
       model: gemini-4-argon
       effort: medium
-      timeoutSeconds: 600
+      timeoutSeconds: 1800
+      idleTimeoutSeconds: 600
 ```
 
-`model / effort / timeoutSeconds` 的默认值如上，`effort` 支持 `low / medium / high`；`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
+`model / effort / timeoutSeconds / idleTimeoutSeconds` 的默认值如上，两个超时均须为正有限秒数，`effort` 支持 `low / medium / high`；`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
+
+任意 stdout 字节都视为进度，包括未组成完整 JSON 的片段和思考事件；stderr 不续时。首稿与压缩共用 `timeoutSeconds` 总预算，CLI 的 `--print-timeout` 同步总上限；超时或取消后等待子进程关闭，再保稿、回滚。回执的 `stdout_bytes / event_count` 是所有尝试累计的 stdout 字节数/已解析 JSON 事件数，`last_progress_s` 是最后一次尝试关闭时距最后 stdout 的秒数（无输出则从启动计），`timeout_kind` 为 `idle / total / null`。现有记录只有一例 552 秒的 high 成功调用，没有原始事件流，无法证明思考期间持续有事件；600 秒覆盖该样本，若实际存在更长静默思考，应调整 `idleTimeoutSeconds`。
 
 调用示例：`gemini_write({"prompt":"根据素材写第一章入门说明，事实不得超出素材。","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`。`prompt` 至少 10 个字符；`sources` 为 1–20 个已有文件，总大小最多 1 MiB。素材与输出可用绝对路径或相对任务目录的路径，`cwd` 选择规则同 `codex_run`，Windows 下也接受 `/mnt/<盘符>/...`。输出必须在任务目录内、不能与素材相同；已有目标须传 `overwrite=true`。单次可覆盖 `model / effort`。
 
 可选 `frontmatter` 只接受 `created / updated / title / type / status / tags / aliases`，其中非空 `title` 和至少一个非空 `tags` 必填，`type / status / aliases` 缺省为 `resource / draft / []`，两个时间缺省为当前本地 `YYYY-MM-DDTHH:MM`；字符串或数组元素最多 200 个 Unicode 码点且禁止换行、控制字符，仅 `tags / aliases` 可为字符串数组，枚举值见工具参数说明。
 
-同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 码点计数（含标题、Markdown 标记、标点、空白及换行），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报；传 `frontmatter` 时去掉模型自带块，再由插件生成，元数据不计入字数，不传则仍计整个文件。首次超限自动按原稿压缩一次，两次调用共用 `timeoutSeconds`，`attempts / attempt_chars` 返回调用次数和每次字数（启动前校验失败为 0 次，未能读回的字数为 `null`）；仍超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`，恢复目标原字节，原先不存在则删除目标。`next` 提示用只读 `codex_run` 核对本次 `output` 与本次 `sources`、两次超限后拆章或处理范围外改动，`usage` 透传最后一次 CLI 用量。
+同目录有可写 Codex 任务在运行、启动或排队时拒绝，任务查询失败也拒绝；同一插件实例中 Gemini 写作未结束时也拒绝新可写 Codex 派单。调用使用 `accept-edits`，在提示词前后固定要求只写目标、不读写其他文件、不执行命令、只用内联事实、完成后只回复“已写入”。插件读回文件确认非空，`chars` 按 Unicode 码点计数（含标题、Markdown 标记、标点、空白及换行），`cjk_chars` 统计汉字，`over_limit` 按 `max_chars` 核对，不采信模型自报；传 `frontmatter` 时去掉模型自带块，再由插件生成，元数据不计入字数，不传则仍计整个文件。首次超限自动按原稿压缩一次，两次调用共用 `timeoutSeconds`，`attempts / attempt_chars` 返回调用次数和每次字数（启动前校验失败为 0 次，未能读回的字数为 `null`）；仍超限、范围外改动、超时、取消或 CLI/文件错误返回 `status="failed"`，恢复目标原字节，原先不存在则删除目标。`next` 提示派 Codex 核对本次正文（`write=true、scope` 只含该正文）、两次超限后拆章或处理范围外改动，`usage` 透传最后一次 CLI 用量。
 
 `files_changed` 来自目标所在目录及子目录的文件名、大小、mtime 快照，最多检查 1,000 个目录项，不跟随符号链接；达到上限会设置 `snapshot.truncated=true` 并注明未覆盖部分。`write_paths` 保存两次调用 stdout 的 `write_file` 路径旁证；除目标外的快照改动与写入事件列入 `out_of_scope`，需核实是否来自同时段其他进程。清单保留恢复目标前的观察结果。`accept-edits` 不是单文件沙箱；目录之外、快照未覆盖且没有写入事件的操作无法由这份清单证明，范围外改动不会自动回滚。
 
-Gemini 成功输出可在当前插件实例登记，跨重载自动恢复尚未实现。重载后，可恢复并读取 Codex 实际生成的核验报告，通过该报告验收；若需直接读取原 Gemini 正文，须由用户明确将该路径加入 `plannerReadAllow`。只读任务读取过正文或在报告中自报其路径，不会将正文登记为产物。
+失败回执若含 `draft_path`，可在下一次 `gemini_write` 传入 `reuse_draft: "<draft_path>"`，并照常提供 `prompt / sources / output / cwd`。只接受插件 `%LOCALAPPDATA%/dsh-codex-conductor/gemini-drafts` 真实目录内的 `.md` 文件，不能与 output/sources 相同；跳过 agy，但仍检查非空、Unicode 字数、frontmatter、改动范围和写任务互斥，失败照常保稿/回滚。复用超 `max_chars` 直接拒绝，不压缩、不放宽上限；回执 `reused_draft=true、attempts=0、usage=null`。这些检查不能证明历史调用没有越界，也不能代替事实核对。
 
-成功后必须派一个只读 `codex_run`（`write=false`），核对本次 `output` 正文与本次 `sources`：逐条检查事实支撑及原验收要求。对旧素材任务重跑 `codex_verify` 不能替代本次正文核对；已有核对结果且正文未变、没有新证据时，不再为了核验核对报告另派任务。`gemini_write` 是前台调用，不对它使用 `codex_status`；核对用的 Codex 任务遵循上述本轮长等规则。
+在护栏工作区内，成功生成和成功复用的正文按会话登记；重载时从本会话日志中的 `gemini_write` 成功回执恢复，不另建持久化文件。正文限制优先于产物和 `plannerReadAllow`，在 `open / products` 下均拦截规划端的 Obsidian、普通读取及已识别内容搜索，目录搜索包含正文也拒绝；目录枚举仍可用。Codex 执行端仍可正常读取正文，规划端通过其核对报告验收。
+
+成功提示统一为：“正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。”任务须对照本次 `output` 与本次 `sources`，检查事实支撑及原验收要求，按核对结果处理正文。对旧素材任务重跑 `codex_verify` 不能替代本次正文核对；已有核对结果且正文未变、没有新证据时，不再为了核验核对报告另派任务。`gemini_write` 是前台调用，不对它使用 `codex_status`；核对用的 Codex 任务遵循上述本轮长等规则。
 
 向用户用大白话说明完成内容、核对结果和剩余问题；执行结束尚未验收时说“已经做完，正在核对”。无需附任务号、线程号或内部状态名，用户要求排查时再提供。
 
@@ -461,6 +468,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.93` adds stdout-idle and total Gemini deadlines with progress receipts, blocks planner reads/searches of successful prose with session-receipt recovery, and accepts `reuse_draft` for validated resubmission without agy.
 
 `0.9.92` adds restart recovery through `autoResume` and a local `goal-request.json` entry to edit a session's current goal objective and round cap.
 
@@ -512,7 +521,7 @@ python3 runner/test_codex_runner.py
 
 ### 0.9.66: Products-only planner reads and independent verification
 
-`plannerReads: open` is the default and preserves existing read behavior. Set it to `products` to restrict guarded sessions to files produced by their own finished Codex / `gemini_write` tasks, task reports, the planner prompt, and explicitly allowed files or directories. Directory discovery remains available; delegate source investigation to `codex_run`. The common-settings switch follows the existing save / pending / apply-now flow. Status shows the effective mode and the number of allowlist entries without exposing an allowlist editor.
+`plannerReads: open` is the default; successful Gemini prose remains blocked in guarded workspaces. Set it to `products` to restrict guarded sessions to files produced by their own finished Codex tasks, task reports, the planner prompt, and explicitly allowed files or directories. Directory discovery remains available; delegate source investigation to `codex_run`. The common-settings switch follows the existing save / pending / apply-now flow. Status shows the effective mode and the number of allowlist entries without exposing an allowlist editor.
 
 ```yaml
 - id: codex-conductor
@@ -524,7 +533,7 @@ python3 runner/test_codex_runner.py
       - '/mnt/e/project/review-inputs'
 ```
 
-The current plugin instance caches up to 10,000 product paths per session for at most 100 sessions, updating them when task results arrive. Successful Gemini outputs are registered in the current instance, but automatic recovery across reloads is not implemented. If product registration is still being restored, first wait up to 3 seconds for recovery. Only a recovery that remains `pending`, including a wait timeout while recovery is unfinished, means “temporarily unable to confirm read authorization”; it neither proves the file is raw input nor grants access. After successful recovery, reads that match neither a product nor the allowlist are refused as raw-input reads. If recovery has finished with a failure, the response is “Product registration recovery failed; this path is not authorized for reading,” without asserting that the path is raw input. A miss triggers at most one background runner query per session every 25 seconds; retry after refresh confirms access. Directory allowlist entries include descendants; a product file does not grant its parent directory. Product grants use recorded runner `files_changed` / `write_paths` plus successful Gemini outputs registered in the current instance. Paths merely read by a read-only task or self-reported in a report do not expand access. Report and history reads are also limited to the current session. The session work-record directory comes from the existing DSH sessionPersistence.locate(header) API; only that session log’s directory is allowed. Hosts without this API do not receive a guessed directory grant. Content readers, content searches and input redirections check their targets; uncertain shell targets using variables, globs or command substitution are refused. Obsidian `obsidian_read`, `obsidian_search` and frontmatter queries follow the same session-product and path allowlist rules; directory and file listings remain allowed. Commands that execute project tests are delegated to Codex too.
+The current plugin instance caches up to 10,000 product paths per session for at most 100 sessions, updating them when task results arrive. Successful Gemini prose is separately registered as planner-unreadable and restored from existing successful session receipts before product/allowlist checks. If product registration is still being restored, first wait up to 3 seconds for recovery. Only a recovery that remains `pending`, including a wait timeout while recovery is unfinished, means “temporarily unable to confirm read authorization”; it neither proves the file is raw input nor grants access. After successful recovery, reads that match neither a product nor the allowlist are refused as raw-input reads. If recovery has finished with a failure, the response is “Product registration recovery failed; this path is not authorized for reading,” without asserting that the path is raw input. A miss triggers at most one background runner query per session every 25 seconds; retry after refresh confirms access. Directory allowlist entries include descendants; a product file does not grant its parent directory. Product grants use recorded runner `files_changed` / `write_paths`; Gemini prose denial always takes precedence. Paths merely read by a read-only task or self-reported in a report do not expand access. Report and history reads are also limited to the current session. The session work-record directory comes from the existing DSH sessionPersistence.locate(header) API; only that session log’s directory is allowed. Hosts without this API do not receive a guessed directory grant. Content readers, content searches and input redirections check their targets; uncertain shell targets using variables, globs or command substitution are refused. Obsidian `obsidian_read`, `obsidian_search` and frontmatter queries follow the same session-product and path allowlist rules; directory and file listings remain allowed. Commands that execute project tests are delegated to Codex too.
 
 Products-only denials briefly explain the reason: delegate investigation to `codex_run` and product-content checks to a Codex verification task. After a guard denial, do not retry through another language, command or tool entry.
 
@@ -626,7 +635,7 @@ Write the following JSON to `%LOCALAPPDATA%\dsh-codex-conductor\resume-request.j
 
 When the root host starts unloading, the plugin records still-running sessions in `autoresume-state.json` as `pending` before agent cancellation; an ordinary plugin hot reload does not record this list. A later process may also resume listed sessions ending `interrupted`, `aborted/disposed`, or `aborted/parent`. Completed sessions, paused/blocked goals, and explicit `aborted/user` stops still skip. Without this marker, interrupted/teardown endings skip with `interrupted_without_shutdown_marker`; `basis.cancelCause` retains the nested cancellation cause. This requires shutdown to unload the root host; a direct kill instead uses the original unterminated-turn test.
 
-Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this notification-wake path; successful outputs are registered only in the current instance, without automatic recovery across reloads.
+Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this notification-wake path; successful prose restrictions are restored from existing receipts in the same session.
 
 `codex_status` still reads live state on every call. Repeated unchanged checks for the same owner, tool and job within 120 seconds of the last full receipt return a brief successful running/unchanged receipt directing the planner to stay in the current turn and wait with the same runner `job_id` via `codex_status(wait_seconds: 3600)`. Background completion notices remain available; the receipt does not ask the planner to end the turn. Phases, attempts, errors, actual activity, reports and blocker changes return full details, as do terminal and unknown states. Activity-age and retry-countdown changes alone are ignored. Brief receipts do not extend the full-receipt interval, and positive `wait_seconds` bypasses dampening.
 
@@ -644,22 +653,27 @@ Use `codex_run` for source changes, investigation and material notes; use `gemin
       proxy: 'http://127.0.0.1:7890'
       model: gemini-4-argon
       effort: medium
-      timeoutSeconds: 600
+      timeoutSeconds: 1800
+      idleTimeoutSeconds: 600
 ```
 
-The last three values are the defaults; effort accepts `low / medium / high`. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
+The model, effort and two timeout values shown are the defaults; both timeouts accept positive finite seconds, and effort accepts `low / medium / high`. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
+
+Any stdout bytes renew the idle timer, including incomplete JSON and thinking events; stderr does not. Generation and compression share the total `timeoutSeconds` deadline, also passed to CLI `--print-timeout`. Timeout/cancellation waits for child close before draft preservation and rollback. Receipts include accumulated `stdout_bytes / event_count` (parsed JSON events), `last_progress_s` (seconds since the last stdout, or launch if silent, at the last attempt's close), and `timeout_kind` (`idle / total / null`). Historical records include a 552-second high-effort success but no raw event stream, so continuous thinking events are unconfirmed; 600 seconds covers that sample, and longer silent thinking may require a higher `idleTimeoutSeconds`.
 
 `gemini_write` requires a `prompt` of at least 10 characters, 1–20 existing `sources` totaling at most 1 MiB, and one `output`. Source/output paths are absolute or relative to the task directory; `cwd` follows `codex_run` selection and accepts Windows or mounted `/mnt/<drive>/...` paths on Windows. Output must stay inside the task directory, differ from all sources, and requires `overwrite=true` when present. Per-call `model`, `effort` and positive `max_chars` are optional. For example: `gemini_write({"prompt":"Write chapter one using only the supplied facts.","sources":["notes.md"],"output":"chapter-01.md","cwd":"D:/work/course","max_chars":2500})`.
 
 Optional `frontmatter` only accepts `created / updated / title / type / status / tags / aliases`: a nonempty `title` and at least one nonempty `tags` entry are required, `type / status / aliases` default to `resource / draft / []`, both timestamps default to local `YYYY-MM-DDTHH:MM`, and each string or array element is limited to 200 Unicode code points without line breaks or control characters; only `tags / aliases` accept string arrays, with enum values documented in the tool schema.
 
-Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode code points including headings, Markdown, whitespace and punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`); supplying `frontmatter` replaces model metadata with the plugin-generated header and excludes it from counts, otherwise the whole file still counts. The first excess triggers one compression of the previous draft under the same `timeoutSeconds` budget; `attempts / attempt_chars` report calls and their counts (0 calls for preflight validation failures, `null` for unreadable output). CLI errors, missing output/result, timeout, cancellation, excess length after compression or out-of-scope writes return `failed`, restoring the output's original bytes or deleting a newly created output; `next` requests a read-only `codex_run` check of this invocation's `output` against its `sources`, chapter splitting after two excesses or scope review, and `usage` passes through the final CLI usage.
+Running/queued Codex writers or a failed task query block execution; pending local starts are also checked, and the same plugin instance blocks new Codex writers while Gemini is active. Fixed instructions surround the prompt: write only the output, read/write no other files, execute no commands, use only inline facts, and reply only “已写入”. The plugin reads the actual nonempty output, counts Unicode code points including headings, Markdown, whitespace and punctuation (`chars`) and Han characters (`cjk_chars`), and checks `max_chars` (`over_limit`); supplying `frontmatter` replaces model metadata with the plugin-generated header and excludes it from counts, otherwise the whole file still counts. The first excess triggers one compression of the previous draft under the same `timeoutSeconds` budget; `attempts / attempt_chars` report calls and their counts (0 calls for preflight validation failures, `null` for unreadable output). CLI errors, missing output/result, timeout, cancellation, excess length after compression or out-of-scope writes return `failed`, restoring the output's original bytes or deleting a newly created output; `next` requests a Codex check of the current prose (`write=true`, `scope` containing only that prose), chapter splitting after two excesses or scope review, and `usage` passes through the final CLI usage.
 
 `files_changed` compares names/sizes/mtimes under the output's parent directory recursively, without following symlinks, capped at 1,000 entries; `snapshot.truncated` discloses incomplete coverage. `write_paths` retains stdout `write_file` paths from both calls as supporting evidence; extra snapshot changes/events appear in `out_of_scope` and may include concurrent writers. These lists retain observations made before output restoration. The tool remains available inside guarded workspaces. `accept-edits` is not a single-file sandbox: unreported operations outside snapshot coverage cannot be established by this list, and out-of-scope changes are not automatically rolled back.
 
-Successful Gemini outputs are registered in the current plugin instance, but automatic recovery across reloads is not implemented. After a reload, recover and read the verification report actually generated by Codex to assess acceptance. To read the original Gemini prose directly, the user must explicitly add its path to `plannerReadAllow`. Reading the prose in a read-only task or listing its path in a report does not register the prose as a product.
+Pass a failed receipt's `draft_path` as `reuse_draft`, together with the normal `prompt / sources / output / cwd`, to skip agy and resubmit a preserved draft. Only real `.md` files inside the plugin's `%LOCALAPPDATA%/dsh-codex-conductor/gemini-drafts` directory qualify; drafts must differ from output and sources. The same nonempty-body, Unicode, frontmatter, scope, writer-exclusion and rollback checks apply. Excess length is rejected directly without compression or a relaxed limit. Receipts include `reused_draft=true`, `attempts=0`, and `usage=null`. Validation cannot establish the historical call's scope or factual correctness.
 
-After each successful write, dispatch a read-only `codex_run` (`write=false`) to check this invocation's output prose against this invocation's sources, covering factual support and the original acceptance criteria. Re-running `codex_verify` on an old material job cannot replace checking the new prose. Once that check exists, do not dispatch another task merely to verify its report unless the prose changes or new evidence appears. `gemini_write` is a foreground call, so do not use `codex_status` for Gemini itself; its Codex checking task follows the same-turn waiting rules below.
+In guarded workspaces, successful generated and reused prose is registered by session and restored from that session's existing successful `gemini_write` receipts after reload, without a new persistence file. Prose denial precedes product and `plannerReadAllow` grants in both `open / products`: planner Obsidian reads, ordinary reads and recognized content searches are refused, including directory searches containing the prose. Directory discovery and Codex execution-side access remain available; assess the prose through the Codex checking report.
+
+After each successful write, do not read the prose in the planner; dispatch one Codex checking task with `write=true` and `scope` containing only that prose. Check this invocation's output against its sources and original acceptance criteria, then handle the checking results. Re-running `codex_verify` on an old material job cannot replace checking the new prose. Once that check exists, do not dispatch another task merely to verify its report unless the prose changes or new evidence appears. `gemini_write` is a foreground call, so do not use `codex_status` for Gemini itself; its Codex checking task follows the same-turn waiting rules below.
 
 Explain completed work, check results and remaining gaps in plain language. If execution has finished but acceptance is pending, say “The work is finished; I am checking it.” Job IDs, thread IDs and internal state names are unnecessary unless the user asks for diagnostics.
 
