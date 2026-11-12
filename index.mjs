@@ -780,9 +780,9 @@ function settings(config, logger) {
       config.gemini = null;
     } else {
       config.gemini = { command: gemini.command.trim() };
-      for (const [key, fallback] of Object.entries({ proxy: '', model: 'gemini-4-argon', effort: 'medium', timeoutSeconds: 600 })) {
+      for (const [key, fallback] of Object.entries({ proxy: '', model: 'gemini-4-argon', effort: 'medium', timeoutSeconds: 1800, idleTimeoutSeconds: 600 })) {
         const value = gemini[key];
-        const valid = key === 'timeoutSeconds' ? Number.isFinite(value) && value > 0
+        const valid = ['timeoutSeconds', 'idleTimeoutSeconds'].includes(key) ? Number.isFinite(value) && value > 0
           : key === 'effort' ? ['low', 'medium', 'high'].includes(value) : typeof value === 'string' && value.trim().length > 0;
         if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
         config.gemini[key] = valid ? value : fallback;
@@ -1682,6 +1682,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '把教程、文档正文交给本机官方 agy 的 Gemini 写入单个文件，一章一章做；源码改动和素材笔记用 codex_run。' +
       '插件读取并内联 sources，内容会发送给 Google；同目录有可写 Codex 任务运行或排队、或任务查询失败时拒绝。' +
       'max_chars 是正文硬上限，目标为上限的 80% 向下取整；首次超限自动压缩一次，两次调用共用 timeoutSeconds 预算，仍超限时请拆章。' +
+      '任意 stdout 字节视为进度，idleTimeoutSeconds 无进度超时，timeoutSeconds 为总上限；回执含 stdout_bytes/event_count/last_progress_s/timeout_kind。' +
+      'reuse_draft 仅接受插件草稿目录内 .md，跳过 agy，沿用校验与回滚，超限直接拒绝；成功正文禁止规划端读取或搜索，交 Codex 核对。' +
       '返回 attempts 和每次正文字数 attempt_chars；最终 failed 时恢复目标原内容，原先不存在则删除目标。' +
       '可选 frontmatter 由插件校验、生成并去除模型重复块，不计入字数。结束后列出快照改动与范围外写入；completed 后仍需对照素材核对内容。',
     presentCall: (args) => ({ card: 'generic', kind: 'execute', title: `Gemini 写作 · ${args?.output ?? ''}` }),
@@ -1696,6 +1698,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' +
         (cfg.gemini.defaultMaxChars ? `不传时默认 ${cfg.gemini.defaultMaxChars}。` : '') },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },
+      reuse_draft: { type: 'string', description: '失败回执的 draft_path：只接受插件 gemini-drafts 目录内 .md，与 output/sources 分开；跳过 agy，按本次参数重新校验、落盘，超 max_chars 直接拒绝，不自动压缩。' },
       frontmatter: { type: 'object', additionalProperties: false, required: ['title', 'tags'],
         description: '启用后由插件生成七字段 YAML；title 和至少一个非空 tags 必填，单值最多 200 个 Unicode 字符且禁止换行和控制字符；仅 tags/aliases 可用字符串数组，aliases 允许空数组；不传则保留原有正文处理。',
         properties: {
@@ -1722,8 +1725,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       try {
         const value = await geminiWrite(cfg.gemini, { ...args, cwd,
           ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor, { signal: exec?.signal, busy }, launchGemini);
-        rememberProducts({ ...value, cwd }, exec?.agent?.id);
-        if (value.status === 'completed') value.next = '先机械核对正文产物、出处和数字；用 codex_run 派只读任务，核对本次 output 与本次 sources。' + USER_REPORT;
+        if (value.status === 'completed') {
+          productReads.addGemini(exec?.agent?.id, [value.output]);
+          value.next = '正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。';
+        }
         return value;
       }
       finally { if (!busy) geminiWrites.delete(key); }
@@ -1763,7 +1768,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
-    if (restrictedReads(exec)) {
+    if (inWorkspace(sessionCwd(exec), cfg.roots)) {
       let denied;
       try { denied = await productReads.check(exec, ...productReadLocation(exec)); }
       catch (error) { denied = guardError(exec, error); }
@@ -1792,7 +1797,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     ctx.tools.guard((exec) => {
       try {
         const denied = decide(exec, cfg);
-        if (denied || cfg.plannerReads !== 'products' || !inWorkspace(sessionCwd(exec), cfg.roots)) return denied;
+        if (denied || !inWorkspace(sessionCwd(exec), cfg.roots)) return denied;
         // null 是内部延后判定；上面的中间件必须判定通过后才调用 next()。
         return productReads.checkSync(exec, ...productReadLocation(exec)) ?? undefined;
       } catch (error) {

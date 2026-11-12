@@ -672,6 +672,7 @@ const present = (v) => v !== undefined && v !== null && v !== false && v !== '' 
 
 export const PRODUCT_DENY_HINT = '已拒绝。调查交给 codex_run；核对产物交给核验任务 codex_verify。不要换命令、语言或工具入口重试。';
 export const PRODUCT_HINT = `这是原料，规划端不直接读。${PRODUCT_DENY_HINT}`;
+export const GEMINI_READ_DENY = '[codex-conductor] 该文件是本会话 gemini_write 已写出的正文，规划端不再读取正文。请用 codex_run 派只读核对任务，对照本次 output 与 sources，返回问题位置和必要短摘录。不要换工具、搜索或命令重试读取全文。';
 
 // Use the same mount/case normalization as scopes; resolve local links before comparing.
 export function readPath(file, cwd = '') {
@@ -915,7 +916,8 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     let state = sessions.get(owner);
     if (!state) {
       if (sessions.size >= 100) sessions.delete(sessions.keys().next().value);
-      state = { paths: new Set(), refreshed: -Infinity, pending: null, failed: false };
+      state = { paths: new Set(), gemini: new Set(), calls: new Set(), log: null, scanned: 0,
+        refreshed: -Infinity, pending: null, failed: false };
       sessions.set(owner, state);
     }
     return state;
@@ -940,12 +942,43 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
       try { return statSync(native).isDirectory() && under(file, key); } catch { return false; }
     });
   };
+  const addGemini = (owner, paths) => {
+    if (!owner) return;
+    for (const file of paths) {
+      const key = readPath(file);
+      if (key) stateFor(owner).gemini.add(key);
+    }
+  };
+  const recoverGemini = (state, exec) => {
+    const log = exec?.agent?.session?.log;
+    if (!Array.isArray(log)) return;
+    if (state.log !== log || log.length < state.scanned) {
+      state.log = log;
+      state.scanned = 0;
+      state.calls.clear();
+    }
+    for (; state.scanned < log.length; state.scanned++) {
+      const event = log[state.scanned];
+      if (event.type === 'tool/call' && event.data?.name === 'gemini_write') state.calls.add(event.data.callId);
+      const message = event.type === 'tool/result' && event.data?.message;
+      if (!message || message.isError || !state.calls.delete(message.toolCallId)) continue;
+      for (const block of message.content ?? []) {
+        if (block.type !== 'text') continue;
+        let receipt;
+        try { receipt = JSON.parse(block.text); } catch { continue; }
+        if (receipt?.status === 'completed') addGemini(exec.agent.id, [receipt.output]);
+      }
+    }
+  };
   // null 仅表示须由异步 tools/execute 等待恢复，不能直接作为宿主 guard 的返回值。
   const checkSync = (exec, cwd, directories = []) => {
-    const targets = plannerReadTargets(exec, cwd, cfg.plannerReadAllow);
-    if (targets?.length === 0) return undefined;
     const owner = exec?.agent?.id;
     const state = owner ? stateFor(owner) : undefined;
+    if (state) recoverGemini(state, exec);
+    const targets = plannerReadTargets(exec, cwd, [...cfg.plannerReadAllow ?? [], ...state?.gemini ?? []]);
+    if (targets?.length === 0) return undefined;
+    if (state?.gemini.size && (!targets || targets.some(file => [...state.gemini].some(body => under(body, file))))) return GEMINI_READ_DENY;
+    if (cfg.plannerReads === 'open') return undefined;
     if (targets && targets.every(file => allowed(file, state, directories))) return undefined;
     if (targets && state && !state.pending && now() - state.refreshed >= 25_000) {
       state.refreshed = now();
@@ -963,7 +996,7 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     // A completed recovery does not make an unrelated raw path a possible product.
     return `[codex-conductor] ${PRODUCT_HINT}`;
   };
-  return { add, checkSync, async check(exec, cwd, directories = []) {
+  return { add, addGemini, checkSync, async check(exec, cwd, directories = []) {
     const result = checkSync(exec, cwd, directories);
     if (result !== null) return result;
     let timer;

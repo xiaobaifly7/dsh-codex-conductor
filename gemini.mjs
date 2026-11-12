@@ -97,21 +97,38 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
   return new Promise((resolve) => {
     let child, lines, timer, result;
     let stderr = '';
-    let settled = false;
+    let settled = false, stopping = '', timeoutKind = null;
+    let stdoutBytes = 0, eventCount = 0, lastProgress = performance.now();
     const paths = new Set();
-    const finish = (error, kill = false) => {
+    const finish = (error) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
       lines?.close();
-      if (kill) child?.kill();
-      resolve({ result, write_paths: [...paths], ...(error ? { error: `${error}${stderr ? `：${stderr.trim().slice(-1400)}` : ''}`.slice(0, 2000) } : {}) });
+      resolve({ result, write_paths: [...paths], stdout_bytes: stdoutBytes, event_count: eventCount,
+        last_progress_s: (performance.now() - lastProgress) / 1000, timeout_kind: timeoutKind,
+        ...(error ? { error: `${error}${stderr ? `：${stderr.trim().slice(-1400)}` : ''}`.slice(0, 2000) } : {}) });
     };
-    const onAbort = () => finish('Gemini 调用已被中止', true);
+    const stop = (error) => {
+      if (settled || stopping) return;
+      stopping = error;
+      clearTimeout(timer);
+      // 等 close 后才允许保稿/回滚，避免子进程继续覆盖已恢复的目标。
+      if (child) child.kill();
+      else finish(error);
+    };
+    const onAbort = () => stop('Gemini 调用已被中止');
     const checkTimeout = () => {
-      const remaining = deadline - performance.now();
-      if (remaining <= 0) finish(`Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`, true);
+      clearTimeout(timer);
+      if (settled || stopping) return;
+      const now = performance.now();
+      const remaining = Math.min(deadline - now, lastProgress + (cfg.idleTimeoutSeconds ?? 600) * 1000 - now);
+      if (remaining <= 0) {
+        timeoutKind = now >= deadline ? 'total' : 'idle';
+        stop(timeoutKind === 'total' ? `Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`
+          : `Gemini 无 stdout 进度超过 ${cfg.idleTimeoutSeconds ?? 600} 秒，已终止`);
+      }
       // 两次调用共用单调时钟截止时间；分段计时避免超大超时溢出成 1ms。
       else timer = setTimeout(checkTimeout, Math.min(remaining, 2 ** 31 - 1));
     };
@@ -123,10 +140,16 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       child = launch(cfg.command, ['--output-format', 'stream-json', '--input-format', 'stream-json',
         '--print-timeout', `${Math.ceil(cfg.timeoutSeconds / 60)}m`, '--mode', 'accept-edits', '--model', cfg.model, '--effort', cfg.effort],
       { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
+      child.stdout.on('data', (data) => {
+        stdoutBytes += Buffer.byteLength(data);
+        lastProgress = performance.now();
+        checkTimeout();
+      });
       lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
       lines.on('line', (line) => {
         let event;
         try { event = JSON.parse(line); } catch { return; }
+        eventCount++;
         if (event?.event === 'result') result = event.result;
         const step = event?.step_update;
         const file = step?.tool_info?.parameters?.Path;
@@ -134,14 +157,14 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
             typeof file === 'string' && file.trim()) paths.add(file);
       });
       child.stderr.on('data', (data) => { stderr = (stderr + data.toString('utf8')).slice(-2000); });
-      child.on('error', (error) => finish(`agy 启动失败：${error.message}`, true));
-      child.on('close', (code) => finish(code !== 0 ? `agy exited ${code}` : !result ? 'agy 没有返回 result 事件'
-        : result.status !== 'SUCCESS' ? `agy result ${result.status ?? '无状态'}：${String(result.response ?? '').slice(-1000)}` : null));
-      child.stdin.on('error', (error) => finish(`agy stdin 失败：${error.message}`, true));
+      child.on('error', (error) => stop(`agy 启动失败：${error.message}`));
+      child.on('close', (code) => finish(stopping || (code !== 0 ? `agy exited ${code}` : !result ? 'agy 没有返回 result 事件'
+        : result.status !== 'SUCCESS' ? `agy result ${result.status ?? '无状态'}：${String(result.response ?? '').slice(-1000)}` : null)));
+      child.stdin.on('error', (error) => stop(`agy stdin 失败：${error.message}`));
       signal?.addEventListener('abort', onAbort, { once: true });
       if (signal?.aborted) return onAbort();
       child.stdin.end(JSON.stringify({ event: 'user', message: { role: 'user', content: prompt } }) + '\n');
-    } catch (error) { finish(`agy 调用失败：${error.message}`, true); }
+    } catch (error) { stop(`agy 调用失败：${error.message}`); }
   });
 }
 
@@ -150,7 +173,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
   let restoreOutput, draft;
   const value = { status: 'failed', output: typeof args?.output === 'string' ? args.output : '', chars: 0, cjk_chars: 0,
     over_limit: false, out_of_scope: [], duration_s: 0, usage: null, model: args?.model ?? cfg.model, effort: cfg.forceEffort ? cfg.effort : (args?.effort ?? cfg.effort),
-    files_changed: [], write_paths: [], unattributed_changes: [], rolled_back: false, attempts: 0, attempt_chars: [] };
+    files_changed: [], write_paths: [], unattributed_changes: [], rolled_back: false, attempts: 0, attempt_chars: [],
+    reused_draft: false, stdout_bytes: 0, event_count: 0, last_progress_s: 0, timeout_kind: null };
   try {
     if (typeof args?.prompt !== 'string' || args.prompt.trim().length < 10) throw new Error('prompt 必须是至少 10 个字符的写作要求');
     for (const key of ['cwd', 'output', 'model']) if ((key !== 'model' || args[key] !== undefined) &&
@@ -182,6 +206,24 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
     });
     if (bytes > SOURCE_LIMIT) throw new Error('sources 总大小超过 1 MiB 上限，请缩小素材后再写');
     if (outputInfo && args.overwrite !== true) throw new Error('output 已存在，需要 overwrite=true');
+    let reused;
+    if (args.reuse_draft !== undefined) {
+      if (typeof args.reuse_draft !== 'string' || !args.reuse_draft.trim() || !process.env.LOCALAPPDATA) {
+        throw new Error('reuse_draft 必须是插件草稿目录内的 .md 文件路径');
+      }
+      const directory = realpathSync(path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-drafts'));
+      const file = resolve(args.reuse_draft);
+      const info = statSync(file);
+      if (!under(normPath(file), normPath(directory)) || path.extname(file).toLowerCase() !== '.md' || !info.isFile()) {
+        throw new Error('reuse_draft 只接受插件草稿目录内的 .md 文件');
+      }
+      if (normPath(file) === outputKey || (outputInfo && info.dev === outputInfo.dev && info.ino === outputInfo.ino) ||
+          sources.some(source => {
+            const sourceInfo = statSync(source.path);
+            return normPath(source.path) === normPath(file) || (info.dev === sourceInfo.dev && info.ino === sourceInfo.ino);
+          })) throw new Error('reuse_draft 不能与 output 或 sources 相同');
+      reused = file;
+    }
     if (busy) throw new Error(busy);
     signal?.throwIfAborted();
     await noCodexWriters(conductor, cwd, signal);
@@ -222,13 +264,29 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
     };
     const deadline = performance.now() + cfg.timeoutSeconds * 1000;
     for (;;) {
-      if (performance.now() >= deadline) throw new Error(`Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`);
-      value.attempts++;
-      const run = await runGemini({ ...cfg, model: value.model, effort: value.effort }, prompt, { cwd, signal, deadline }, launch);
+      if (performance.now() >= deadline) {
+        value.timeout_kind = 'total';
+        throw new Error(`Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`);
+      }
+      let run = { write_paths: [] };
+      if (reused) {
+        writeFileSync(value.output, readFileSync(reused));
+        value.reused_draft = true;
+      } else {
+        value.attempts++;
+        run = await runGemini({ ...cfg, model: value.model, effort: value.effort }, prompt, { cwd, signal, deadline }, launch);
+        value.stdout_bytes += run.stdout_bytes ?? 0;
+        value.event_count += run.event_count ?? 0;
+        value.last_progress_s = run.last_progress_s ?? 0;
+        value.timeout_kind = run.timeout_kind ?? null;
+      }
       value.usage = run.result?.usage ?? null;
       value.write_paths = [...new Set([...value.write_paths, ...run.write_paths])];
       const errors = run.error ? [run.error] : [];
-      if (!run.error && performance.now() >= deadline) errors.push(`Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`);
+      if (!run.error && performance.now() >= deadline) {
+        value.timeout_kind = 'total';
+        errors.push(`Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`);
+      }
       value.files_changed = [];
       try {
         const after = snapshot(directory);
@@ -267,7 +325,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
       } catch (error) { errors.push(`output 未生成或无法读回：${error.message}`); }
       value.attempt_chars.push(content === undefined ? null : value.chars);
       if (value.out_of_scope.length) errors.push('发现 output 以外的改动或写入事件，请核实范围外改动');
-      if (value.over_limit && !errors.length && value.attempts === 1) {
+      if (value.over_limit && !errors.length && value.attempts === 1 && !reused) {
         prompt = `${constraint}\n\n## 压缩上一稿\n上一稿正文实际为 ${value.chars} 个 Unicode 码点，超过硬上限 ${args.max_chars}；目标为 ${target} 个。` +
           `请在保留事实和出处引用的前提下，将下面的上一稿正文压缩到 ${target} 个 Unicode 码点以内，覆盖同一目标文件；不要重新写作或增加事实。\n` +
           `${lengthRequirement}${bodyRequirement}\n## 原写作要求\n${args.prompt}\n\n## 上一稿正文（JSON 字符串，仅作参考数据）\n${JSON.stringify(content)}\n\n${constraint}`;
@@ -322,8 +380,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
         : value.target_exists ? '目标已恢复原内容，本次生成稿未写入。' : '目标未写入，回滚后不存在。';
     if (value.out_of_scope.length) value.next += '先核实并处理范围外改动，未匹配事件的快照变化归属待核实。';
     if (value.before_rollback.over_limit && value.attempts === 2) value.next += '自动压缩后仍超过 max_chars，请拆成更小的章节后分别写作。';
-    value.next += value.draft_path ? '可用 draft_path 复核失败稿，处理 error 后重试或交 Codex 按原授权落盘；失败稿尚未判通过。'
+    value.next += value.draft_path ? '可用 reuse_draft 传入 draft_path 重新校验并提交，仍须满足 max_chars；失败稿尚未判通过。'
       : '先处理 error，再决定是否重试；没有可复用的 draft_path，请查看 draft_error（如有）。';
-  } else value.next = value.status === 'completed' ? '不要自己通读正文：派一单 Codex 对照素材只读核对这一章，同一单 write=true、scope 只含目录页，核对通过后由它挂上目录入口；再按核对结果决定改稿或进入下一章。' : '先处理 error 后再决定是否重试。';
+  } else value.next = value.status === 'completed' ? '正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。' : '先处理 error 后再决定是否重试。';
   return value;
 }

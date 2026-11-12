@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, PRODUCT_HINT, PRODUCT_DENY_HINT } from './guard.mjs';
+import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, PRODUCT_HINT, PRODUCT_DENY_HINT, GEMINI_READ_DENY } from './guard.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const call = (name, args, owner = 'S1') => ({
@@ -18,6 +18,68 @@ const deferred = () => {
   const promise = new Promise(done => { resolve = done; });
   return { promise, resolve };
 };
+
+test('Gemini prose denial precedes products and allowlists in both planner modes', async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-prose-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const body = path.join(root, 'chapter.md');
+  writeFileSync(body, '正文');
+  for (const plannerReads of ['open', 'products']) {
+    const scope = createProductReads({ plannerReads, plannerReadAllow: [root, body] }, completed);
+    scope.add('S1', [body]);
+    scope.addGemini('S1', [body]);
+    for (const [name, args] of [
+      ['read', { path: body }], ['read_file', { file_path: body }],
+      ['mcp__obsidian__obsidian_read', { path: body }], ['obsidian_frontmatter', { action: 'read', path: body }],
+      ['obsidian_search', { path: root, query: '正文' }], ['search_files', { path: root }],
+      ['ops_search_for_pattern', { path: body }],
+      ['wsl', { command: `cat '${body.replaceAll('\\', '/')}'` }],
+      ['wsl', { command: `rg 正文 '${root.replaceAll('\\', '/')}'` }],
+      ['obsidian_search', { query: '正文' }],
+    ]) {
+      assert.equal(scope.checkSync(call(name, args)), GEMINI_READ_DENY, `${plannerReads} ${name}`);
+      assert.equal(await scope.check(call(name, args)), GEMINI_READ_DENY);
+    }
+    for (const [name, args] of [['codex_run', { task: `读取 ${body}`, write: true, scope: [body] }],
+      ['obsidian_list', { path: root }], ['wsl', { command: `rg --files '${root.replaceAll('\\', '/')}'` }]]) {
+      assert.equal(scope.checkSync(call(name, args)), undefined, name);
+    }
+    assert.equal(scope.checkSync(call('read', { path: body }, 'S2')), undefined);
+  }
+});
+
+test('Gemini prose restores only correlated successful receipts and tracks appended log events', () => {
+  const scope = createProductReads({ plannerReads: 'open', plannerReadAllow: ['/repo'] }, completed);
+  const log = [];
+  const exec = call('read', { path: '/repo/chapter.md' });
+  exec.agent.session.log = log;
+  assert.equal(scope.checkSync(exec), undefined);
+  const addReceipt = (id, name, status, output, extra = {}) => {
+    log.push({ type: 'tool/call', data: { name, callId: id } });
+    log.push({ type: 'tool/result', data: { message: { role: 'tool', toolCallId: id,
+      content: [{ type: 'text', text: JSON.stringify({ status, output, ...extra }) }] } } });
+  };
+  addReceipt('failed', 'gemini_write', 'failed', '/repo/failed.md');
+  addReceipt('other', 'codex_run', 'completed', '/repo/codex.md');
+  addReceipt('success', 'gemini_write', 'completed', '/repo/chapter.md');
+  assert.equal(scope.checkSync(exec), GEMINI_READ_DENY);
+  for (const file of ['failed.md', 'codex.md']) {
+    assert.equal(scope.checkSync({ ...exec, arguments: { path: `/repo/${file}` } }), undefined);
+  }
+  addReceipt('reuse', 'gemini_write', 'completed', '/repo/reused.md', { reused_draft: true });
+  assert.equal(scope.checkSync({ ...exec, arguments: { path: '/repo/reused.md' } }), GEMINI_READ_DENY);
+  const reloaded = createProductReads({ plannerReads: 'open' }, completed);
+  assert.equal(reloaded.checkSync(exec), GEMINI_READ_DENY);
+  assert.equal(reloaded.checkSync({ ...exec, agent: { ...exec.agent, id: 'S2', session: { log: [] } } }), undefined);
+});
+
+test('Gemini receipt paths identify a vault for relative Obsidian reads without granting sources', () => {
+  const scope = createProductReads({ plannerReads: 'open' }, completed);
+  scope.addGemini('S1', ['E:/obsidian/study/course/chapter.md']);
+  assert.equal(scope.checkSync(call('obsidian_read', { path: 'course/chapter.md' })), GEMINI_READ_DENY);
+  assert.equal(scope.checkSync(call('obsidian_search', { path: 'course', query: '正文' })), GEMINI_READ_DENY);
+  assert.equal(scope.checkSync(call('obsidian_read', { path: 'course/notes.md' })), undefined);
+});
 
 test('rg file enumeration stays unrestricted with literal paths and glob options', async () => {
   const scope = createProductReads({}, completed);
