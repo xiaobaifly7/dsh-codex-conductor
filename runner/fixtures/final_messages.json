@@ -1,0 +1,48 @@
+[
+  {
+    "job_id": "20261108-002403-6c6b9e",
+    "fragment": "\\\"Name\\\": \\\"ops-99d2c4\\\\\",\\r\\n      \\\"State\\\": \\\"Running\\\"",
+    "expected": null,
+    "repairs": null
+  },
+  {
+    "job_id": "20261109-224124-3b323e",
+    "fragment": "输出路径含未解析的 F:\\01-安全研究\\逆向\\des\\，无法确定获准写入的 JSON 绝对路径。",
+    "expected": "输出路径含未解析的 F:\\01-安全研究\\逆向\\des\\，无法确定获准写入的 JSON 绝对路径。",
+    "repairs": [
+      "invalid_escape"
+    ]
+  },
+  {
+    "job_id": "20261109-235639-cc67e4",
+    "fragment": "目标目录仅显示为 F:\\01-安全研究\\逆向\\des\\_asa-des-audit-20261107，无法确定实际路径及允许写入范围。",
+    "expected": "目标目录仅显示为 F:\\01-安全研究\\逆向\\des\\_asa-des-audit-20261107，无法确定实际路径及允许写入范围。",
+    "repairs": [
+      "invalid_escape"
+    ]
+  },
+  {
+    "job_id": "20261109-235843-303709",
+    "fragment": "指定的新文件与“只允许改动这些路径：F:\\01-安全研究\\逆向\\des\\_asa-des-audit-20261107”之间无法确认一致；该白名单含未解析占位符。按执行约束，未执行写入。",
+    "expected": "指定的新文件与“只允许改动这些路径：F:\\01-安全研究\\逆向\\des\\_asa-des-audit-20261107”之间无法确认一致；该白名单含未解析占位符。按执行约束，未执行写入。",
+    "repairs": [
+      "invalid_escape"
+    ]
+  },
+  {
+    "job_id": "20261110-005205-81a15b",
+    "fragment": "，统计每块盘的出现次数，输出 SECTION-A。\n\n2. 对每个出现位置，向后截取到 b'----",
+    "expected": "，统计每块盘的出现次数，输出 SECTION-A。\n\n2. 对每个出现位置，向后截取到 b'----",
+    "repairs": [
+      "control_character"
+    ]
+  },
+  {
+    "job_id": "20261112-104001-1f49c7",
+    "fragment": "\\，内存中的三项指纹比较均为t",
+    "expected": "\\，内存中的三项指纹比较均为t",
+    "repairs": [
+      "invalid_escape"
+    ]
+  }
+]

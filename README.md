@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.87` Codex 的最终报告如果只是字符串里有原始控制字符，或者有非法的反斜杠转义（多见于证据里引用的 Windows 路径或正则），就修复后再解析，不再把整单判为 `schema_invalid`。修复后的报告仍要通过报告校验，修过的地方记在 `final_message_repaired`；JSON 结构本身损坏的仍判失败。
+
 `0.9.86` 新提交的复核如果所有验收项都是 `met`，又没有阻塞和偏差，就不能记成 `needs_changes`；被审正文的问题写进 notes。已经存下的旧复核不重新检查。
 
 `0.9.85` 复核没有覆盖全部验收时，报错会列出 `acceptance_count`、`out_of_range`、`duplicates`、`missing`，以及每条缺失验收的开头原文。`codex_continue` 碰上已有子任务、直接复用时，回执带 `submitted: false`，并写明这次的 answers/resolution 没有生效。`codex_review`、`codex_run`、`codex_summary` 的工具说明里加上了审计复核、一单一个可验收结果、先看汇总这三条规则。
@@ -440,6 +442,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.87` recovers Codex final reports that fail strict JSON parsing only because of raw control characters or invalid backslash escapes (often Windows paths or regexes quoted in evidence). The repaired report must still pass report validation; the repair is recorded in `final_message_repaired`. Broken structure still fails as `schema_invalid`.
 
 `0.9.86` rejects a new `needs_changes` review whose criteria are all `met` with no blockers and no deviations; defects in the audited content go in notes. Stored reviews are not re-checked.
 
