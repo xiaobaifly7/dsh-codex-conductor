@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
-const { normPath, under } = await import(new URL(`./guard.mjs${new URL(import.meta.url).search}`, import.meta.url));
+const { normPath, under, GEMINI_CHECK_HINT } = await import(new URL(`./guard.mjs${new URL(import.meta.url).search}`, import.meta.url));
 
 const SOURCE_LIMIT = 1024 * 1024;
 const SNAPSHOT_LIMIT = 1000;
@@ -99,6 +99,8 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
     let stderr = '';
     let settled = false, stopping = '', timeoutKind = null;
     let stdoutBytes = 0, eventCount = 0, lastProgress = performance.now();
+    let outputStarted = false, lastEventType = null;
+    const eventTypes = new Map();
     const paths = new Set();
     const finish = (error) => {
       if (settled) return;
@@ -107,6 +109,7 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       signal?.removeEventListener('abort', onAbort);
       lines?.close();
       resolve({ result, write_paths: [...paths], stdout_bytes: stdoutBytes, event_count: eventCount,
+        event_types: Object.fromEntries(eventTypes), last_event_type: lastEventType,
         last_progress_s: (performance.now() - lastProgress) / 1000, timeout_kind: timeoutKind,
         ...(error ? { error: `${error}${stderr ? `：${stderr.trim().slice(-1400)}` : ''}`.slice(0, 2000) } : {}) });
     };
@@ -123,7 +126,8 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       clearTimeout(timer);
       if (settled || stopping) return;
       const now = performance.now();
-      const remaining = Math.min(deadline - now, lastProgress + (cfg.idleTimeoutSeconds ?? 600) * 1000 - now);
+      const remaining = Math.min(deadline - now, outputStarted
+        ? lastProgress + (cfg.idleTimeoutSeconds ?? 600) * 1000 - now : Infinity);
       if (remaining <= 0) {
         timeoutKind = now >= deadline ? 'total' : 'idle';
         stop(timeoutKind === 'total' ? `Gemini 超过 ${cfg.timeoutSeconds} 秒未结束，已终止`
@@ -152,6 +156,16 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
         eventCount++;
         if (event?.event === 'result') result = event.result;
         const step = event?.step_update;
+        lastEventType = typeof event?.event === 'string' ? event.event : 'unknown';
+        if (event?.event === 'step_update' && typeof step?.step_type === 'string') lastEventType += `:${step.step_type}`;
+        eventTypes.set(lastEventType, (eventTypes.get(lastEventType) ?? 0) + 1);
+        // agy 的 PollPrintmode 先 StripThoughts；非空正文增量或 write_file 才开始 idle 计时。
+        if (event?.event === 'step_update' && ((step?.step_type === 'agent_response' &&
+            typeof step.text_delta === 'string' && step.text_delta.length > 0) ||
+            (step?.step_type === 'tool' && step.tool_name === 'write_file'))) {
+          outputStarted = true;
+          checkTimeout();
+        }
         const file = step?.tool_info?.parameters?.Path;
         if (event?.event === 'step_update' && step?.step_type === 'tool' && step.tool_name === 'write_file' &&
             typeof file === 'string' && file.trim()) paths.add(file);
@@ -174,7 +188,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
   const value = { status: 'failed', output: typeof args?.output === 'string' ? args.output : '', chars: 0, cjk_chars: 0,
     over_limit: false, out_of_scope: [], duration_s: 0, usage: null, model: args?.model ?? cfg.model, effort: cfg.forceEffort ? cfg.effort : (args?.effort ?? cfg.effort),
     files_changed: [], write_paths: [], unattributed_changes: [], rolled_back: false, attempts: 0, attempt_chars: [],
-    reused_draft: false, stdout_bytes: 0, event_count: 0, last_progress_s: 0, timeout_kind: null };
+    reused_draft: false, stdout_bytes: 0, event_count: 0, event_types: {}, last_event_type: null,
+    last_progress_s: 0, timeout_kind: null };
   try {
     if (typeof args?.prompt !== 'string' || args.prompt.trim().length < 10) throw new Error('prompt 必须是至少 10 个字符的写作要求');
     for (const key of ['cwd', 'output', 'model']) if ((key !== 'model' || args[key] !== undefined) &&
@@ -277,6 +292,10 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
         run = await runGemini({ ...cfg, model: value.model, effort: value.effort }, prompt, { cwd, signal, deadline }, launch);
         value.stdout_bytes += run.stdout_bytes ?? 0;
         value.event_count += run.event_count ?? 0;
+        for (const [type, count] of Object.entries(run.event_types ?? {})) {
+          value.event_types[type] = (Object.hasOwn(value.event_types, type) ? value.event_types[type] : 0) + count;
+        }
+        value.last_event_type = run.last_event_type ?? value.last_event_type;
         value.last_progress_s = run.last_progress_s ?? 0;
         value.timeout_kind = run.timeout_kind ?? null;
       }
@@ -382,6 +401,6 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
     if (value.before_rollback.over_limit && value.attempts === 2) value.next += '自动压缩后仍超过 max_chars，请拆成更小的章节后分别写作。';
     value.next += value.draft_path ? '可用 reuse_draft 传入 draft_path 重新校验并提交，仍须满足 max_chars；失败稿尚未判通过。'
       : '先处理 error，再决定是否重试；没有可复用的 draft_path，请查看 draft_error（如有）。';
-  } else value.next = value.status === 'completed' ? '正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。' : '先处理 error 后再决定是否重试。';
+  } else value.next = value.status === 'completed' ? GEMINI_CHECK_HINT : '先处理 error 后再决定是否重试。';
   return value;
 }

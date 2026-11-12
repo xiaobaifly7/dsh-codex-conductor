@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, PRODUCT_HINT, PRODUCT_DENY_HINT, GEMINI_READ_DENY } from './guard.mjs';
+import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, PRODUCT_HINT, PRODUCT_DENY_HINT, GEMINI_READ_DENY, GEMINI_CHECK_HINT } from './guard.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const call = (name, args, owner = 'S1') => ({
@@ -20,6 +20,8 @@ const deferred = () => {
 };
 
 test('Gemini prose denial precedes products and allowlists in both planner modes', async (t) => {
+  assert.equal(GEMINI_CHECK_HINT, '该正文由 gemini_write 写出，规划端不读取。下一步派一单 codex_run（write=true，scope 只含该正文文件），在同一单里核对事实与可读性、就地修正写法问题和句子级错误，报告问题位置和改动；不要另派只读核对或清理单，也不要换工具、搜索或命令绕读。');
+  assert.equal(GEMINI_READ_DENY, `[codex-conductor] ${GEMINI_CHECK_HINT}`);
   const root = mkdtempSync(path.join(tmpdir(), 'conductor-prose-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const body = path.join(root, 'chapter.md');

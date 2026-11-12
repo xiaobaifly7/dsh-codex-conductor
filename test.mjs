@@ -11,7 +11,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
 import { createPanelApi, PANEL_PATH } from './panel.mjs';
-import { wslPath } from './guard.mjs';
+import { wslPath, GEMINI_CHECK_HINT, GEMINI_READ_DENY } from './guard.mjs';
 import './panel.test.mjs';
 import './resume.test.mjs';
 import './planner.test.mjs';
@@ -1578,6 +1578,58 @@ test('codex_continue without answers returns the source and pending questions wi
   assert.equal(h.calls.filter((argv) => argv[0] === 'start').length, 0);
 });
 
+test('all continuation refusal receipts lead with the reason and keep the original state', async () => {
+  const answered = { answers: [{ id: 'format', answer: '保留旧格式' }] };
+  const rows = [
+    { args: {} }, { args: { answers: [{ id: 'I1', answer: '修正' }] } },
+    { args: { answers: [...answered.answers, ...answered.answers] } },
+    { args: { answers: [{ id: 'format', answer: '' }] } },
+    { args: { answers: 'invalid' } }, { args: { resolution: 42 } },
+    { source: { status: 'running' } }, { source: { status: 'cancelled' } }, { source: { status: 'unknown' } },
+    { source: { cwd: '' } },
+    { source: { structured: null }, args: { resolution: '已核对原报告' } },
+    { source: { task_options: 'invalid' }, args: answered, replied: true },
+    { kind: 'environment' },
+    { kind: 'implementation', source: { structured: { ...workflowSource('implementation').structured, blockers: undefined } } },
+    { source: { verification_status: 'verified', structured: { ...workflowSource().structured, blockers: [],
+      criteria: [{ criterion: 'CSV 解析测试通过', status: 'met', evidence: '测试通过' }] } } },
+    { source: { structured: { ...workflowSource().structured, blockers: [],
+      criteria: [{ criterion: 'CSV 解析测试通过', status: 'met', evidence: '测试通过' }] } } },
+    { args: answered },
+  ];
+  for (const row of rows) {
+    const source = { ...workflowSource(row.kind), ...row.source };
+    const h = harness();
+    h.finals.PARENT = source;
+    const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', ...row.args },
+      { agent: agentAt('/work/current', row.replied ? answeredParent : []) });
+    assert.equal(value.continuation_ready, false, JSON.stringify(row));
+    const text = h.tools.codex_continue.output.render({}, value)[0].text;
+    assert.equal(text.split('\n')[0], `续接未启动：${value.next.split('\n')[0]} · continuation_ready=false`);
+    assert.match(text.split('\n')[1], new RegExp(`^原任务状态：${value.status}`));
+    assert.ok(text.includes(value.next));
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
+  }
+});
+
+test('continuation errors before dispatch also say not started and never create a job', async () => {
+  for (const row of [
+    { args: { wait_seconds: -1 } }, { exec: {} },
+    { source: { context: { ...workflowSource().context, owner: 'other' } } },
+    { config: { listResult: { status: 'failed', error: 'history unavailable' } } },
+    { source: { sandbox: 'danger-full-access' } },
+  ]) {
+    const h = harness({ config: row.config });
+    h.finals.PARENT = { ...workflowSource('implementation'), ...row.source };
+    await assert.rejects(h.tools.codex_continue.execute({ job_id: 'PARENT', ...row.args },
+      row.exec ?? { agent: agentAt('/work/current') }), error => {
+      assert.match(error.message, /^续接未启动：.+\ncontinuation_ready=false$/);
+      return true;
+    });
+    assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
+  }
+});
+
 const answeredParent = [
   { type: 'job/registered', data: { kind: 'codex', owner: 'S1', jobId: 'bg1', label: 'Codex PARENT' } },
   { type: 'job/settled', data: { jobId: 'bg1' } },
@@ -1601,7 +1653,11 @@ test('both resume paths reject an older unanswered task on the same thread', asy
       ? { ...RUN, write: true, scope: ['src'], resume: parent.thread_id } : { job_id: 'CHILD', wait_seconds: 0 };
     const invoke = (log) => h.tools[tool].execute(args, { agent: agentAt('/work/current', log) });
     const log = [registered, settled, notice];
-    await assert.rejects(invoke(log), /PARENT.*用户回答.*未启动 Codex/);
+    await assert.rejects(invoke(log), error => {
+      assert.match(error.message, /PARENT.*用户回答.*未启动 Codex/);
+      if (tool === 'codex_continue') assert.match(error.message, /^续接未启动：.+\ncontinuation_ready=false$/);
+      return true;
+    });
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
     assert.equal((await invoke([...log, human])).job_id, 'NEXT');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
@@ -1942,11 +1998,11 @@ test('existing-job tools reject malformed runner IDs before invoking the runner'
       if (name === 'codex_review') Object.assign(args, { status: 'verified',
         criteria: [{ index: 1, status: 'met', evidence: 'checked' }], notes: 'checked', accepted_deviations: [] });
       await assert.rejects(h.tools[name].execute(args, exec), {
-        message: name === 'codex_continue' ? 'codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单' : `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
+        message: name === 'codex_continue' ? '续接未启动：codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单\ncontinuation_ready=false' : `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
       });
     }
     for (const args of [undefined, {}]) await assert.rejects(h.tools[name].execute(args, exec), {
-      message: name === 'codex_continue' ? 'codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单' : `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
+      message: name === 'codex_continue' ? '续接未启动：codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单\ncontinuation_ready=false' : `${name}: job_id 无效；请用 codex_jobs 找回 runner 任务编号`,
     });
   }
   assert.equal(h.calls.length, 0);
@@ -4371,7 +4427,9 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   assert.deepEqual(value.write_paths, [value.output]);
   assert.equal(Object.hasOwn(value, 'before_rollback'), false);
   assert.equal(Object.hasOwn(value, 'draft_path'), false);
-  assert.equal(value.next, '正文已写出；不要读取正文，下一步派一单 Codex 核对（write=true、scope 只含该正文），按核对结果处理。');
+  assert.equal(value.next, GEMINI_CHECK_HINT);
+  assert.deepEqual(value.event_types, { 'step_update:tool': 1, result: 1 });
+  assert.equal(value.last_event_type, 'result');
   assert.doesNotMatch(value.next, /codex_verify|原 Codex 素材任务/);
   assert.deepEqual(JSON.parse(h.tools.gemini_write.output.render({}, value)[0].text), value);
   const spawned = h.spawns[0];
@@ -4394,13 +4452,13 @@ test('products mode refuses this session\'s gemini output without granting its s
   const h = geminiFixture(t, { config: { plannerReads: 'products' } });
   const result = await h.execute();
   assert.equal(result.status, 'completed');
-  assert.match(hostGuardReason(h, { ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), /本会话 gemini_write/);
+  assert.equal(hostGuardReason(h, { ...call('read', { file_path: result.output }, h.cwd), agent: agentAt(h.cwd) }), GEMINI_READ_DENY);
   const denied = exec => hostExecute(h, exec, async () => assert.fail('Gemini source or another owner\'s product dispatched'));
   assert.match((await denied({ ...call('read', { file_path: path.join(h.cwd, 'notes.md') }, h.cwd), agent: agentAt(h.cwd) })).error.message, /原料/);
   const other = agentAt(h.cwd);
   other.id = 'S2';
   assert.match((await denied({ ...call('read', { file_path: result.output }, h.cwd), agent: other })).error.message, /原料/);
-  assert.match(result.next, /不要读取正文.*Codex 核对.*write=true、scope 只含该正文/);
+  assert.equal(result.next, GEMINI_CHECK_HINT);
   assert.doesNotMatch(result.next, /codex_verify|原 Codex 素材任务/);
 });
 
@@ -4542,6 +4600,8 @@ test('gemini_write automatically compresses the previous draft once within the h
   assert.equal(value.status, 'completed', value.error);
   assert.equal(value.attempts, 2);
   assert.deepEqual(value.attempt_chars, drafts.map((draft) => [...draft].length));
+  assert.deepEqual(value.event_types, { result: 2 });
+  assert.equal(value.last_event_type, 'result');
   assert.equal(value.chars, [...drafts[1]].length);
   assert.equal(value.over_limit, false);
   assert.equal(readFileSync(value.output, 'utf8'), drafts[1]);
@@ -4984,39 +5044,51 @@ test('gemini configuration warns and defaults invalid optional values without di
   assert.equal(h.spawns[0].argv[h.spawns[0].argv.indexOf('--print-timeout') + 1], '30m');
 });
 
-test('gemini stdout bytes including incomplete and thinking events renew idle time', async (t) => {
+test('gemini startup and silent thinking beyond 600 seconds wait for production before idle timing', async (t) => {
   let now = 0;
   t.mock.method(performance, 'now', () => now);
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const h = geminiFixture(t, { config: { gemini: { idleTimeoutSeconds: 1, timeoutSeconds: 5 } }, action() {} });
+  const h = geminiFixture(t, { action() {} });
   const pending = h.execute();
   await tick(); await tick();
   const { child } = h.spawns[0];
-  now = 900;
-  t.mock.timers.tick(900);
+  geminiEvent(child, { event: 'init' });
+  geminiEvent(child, { event: 'step_update', step_update: { step_type: 'user_input', text_delta: '写这一章' } });
+  geminiEvent(child, { event: 'step_update', step_update: { step_type: 'agent_response', text_delta: '' } });
+  now = 601_000;
+  t.mock.timers.tick(601_000);
+  assert.equal(child.killed, false);
   child.stdout.write('{"event":"step_update",');
-  now = 1800;
-  t.mock.timers.tick(900);
-  child.stdout.write('"step_update":{"step_type":"thinking"}}\n');
-  now = 2700;
-  t.mock.timers.tick(900);
+  child.stdout.write('"step_update":{"step_type":"agent_response","text_delta":"正文"}}\n');
+  now = 1_200_000;
+  t.mock.timers.tick(599_000);
+  assert.equal(child.killed, false);
+  child.stdout.write(' ');
+  now = 1_799_000;
+  t.mock.timers.tick(599_000);
   assert.equal(child.killed, false);
   writeFileSync(path.join(h.cwd, 'chapter.md'), '正文');
   geminiDone(child);
   const value = await pending;
   assert.equal(value.status, 'completed', value.error);
   assert.ok(value.stdout_bytes > 60);
-  assert.equal(value.event_count, 2);
+  assert.equal(value.event_count, 5);
+  assert.deepEqual(value.event_types, { init: 1, 'step_update:user_input': 1, 'step_update:agent_response': 2, result: 1 });
+  assert.equal(value.last_event_type, 'result');
   assert.equal(value.last_progress_s, 0);
   assert.equal(value.timeout_kind, null);
 });
 
-test('gemini idle timeout ignores stderr and waits for close before rollback', async (t) => {
+for (const step of [
+  { step_type: 'agent_response', text_delta: '正文增量' },
+  { step_type: 'tool', tool_name: 'write_file' },
+]) test(`gemini ${step.step_type} starts idle timing, ignores stderr and waits for close before rollback`, async (t) => {
   let now = 0, close;
   t.mock.method(performance, 'now', () => now);
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const h = geminiFixture(t, { config: { gemini: { idleTimeoutSeconds: 1, timeoutSeconds: 5 } }, action({ child, options }) {
     writeFileSync(path.join(options.cwd, 'chapter.md'), '尚在写入的稿');
+    geminiEvent(child, { event: 'step_update', step_update: step });
     child.kill = () => { child.killed = true; close = () => geminiDone(child, null, null); return true; };
   } });
   const output = path.join(h.cwd, 'chapter.md');
@@ -5037,8 +5109,10 @@ test('gemini idle timeout ignores stderr and waits for close before rollback', a
   close();
   const value = await pending;
   assert.equal(value.timeout_kind, 'idle');
-  assert.equal(value.stdout_bytes, 0);
-  assert.equal(value.event_count, 0);
+  assert.ok(value.stdout_bytes > 0);
+  assert.equal(value.event_count, 1);
+  assert.deepEqual(value.event_types, { [`step_update:${step.step_type}`]: 1 });
+  assert.equal(value.last_event_type, `step_update:${step.step_type}`);
   assert.equal(value.last_progress_s, 1);
   assert.match(value.error, /无 stdout 进度超过 1 秒/);
   assert.equal(readFileSync(value.draft_path, 'utf8'), '关闭前的最终稿');
@@ -5049,20 +5123,40 @@ test('gemini total deadline cannot be renewed by stdout progress', async (t) => 
   let now = 0;
   t.mock.method(performance, 'now', () => now);
   t.mock.timers.enable({ apis: ['setTimeout'] });
-  const h = geminiFixture(t, { config: { gemini: { idleTimeoutSeconds: 1, timeoutSeconds: 2 } }, action() {} });
+  const h = geminiFixture(t, { action() {} });
   const pending = h.execute();
   await tick(); await tick();
-  for (const time of [800, 1600]) {
+  for (const time of [500_000, 1_000_000, 1_500_000]) {
     now = time;
-    t.mock.timers.tick(800);
-    geminiEvent(h.spawns[0].child, { event: 'step_update', step_update: { step_type: 'thinking' } });
+    t.mock.timers.tick(500_000);
+    geminiEvent(h.spawns[0].child, { event: 'step_update', step_update: { step_type: 'agent_response', text_delta: '正文增量' } });
   }
-  now = 2000;
-  t.mock.timers.tick(400);
+  now = 1_800_000;
+  t.mock.timers.tick(300_000);
   const value = await pending;
   assert.equal(value.timeout_kind, 'total');
-  assert.equal(value.event_count, 2);
-  assert.equal(value.last_progress_s, 0.4);
+  assert.equal(value.event_count, 3);
+  assert.equal(value.last_progress_s, 300);
+  assert.equal(h.spawns[0].child.killed, true);
+});
+
+test('gemini silent thinking still reaches the 1800-second total deadline', async (t) => {
+  let now = 0;
+  t.mock.method(performance, 'now', () => now);
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = geminiFixture(t, { action() {} });
+  const pending = h.execute();
+  await tick(); await tick();
+  geminiEvent(h.spawns[0].child, { event: 'init' });
+  now = 1_799_000;
+  t.mock.timers.tick(1_799_000);
+  assert.equal(h.spawns[0].child.killed, false);
+  now = 1_800_000;
+  t.mock.timers.tick(1000);
+  const value = await pending;
+  assert.equal(value.timeout_kind, 'total');
+  assert.deepEqual(value.event_types, { init: 1 });
+  assert.equal(value.last_event_type, 'init');
   assert.equal(h.spawns[0].child.killed, true);
 });
 
@@ -5093,8 +5187,8 @@ test('reuse_draft shares Unicode/frontmatter checks, skips agy and registers pro
     ['search', { path: h.cwd, query: '正文' }], ['wsl', { command: `rg 正文 "${h.cwd.replaceAll('\\', '/')}"` }],
   ]) {
     const exec = { ...call(name, args, h.cwd), agent: agentAt(h.cwd) };
-    assert.match(hostGuardReason(h, exec), /本会话 gemini_write/);
-    assert.match((await hostExecute(h, exec, async () => assert.fail('正文读取已执行'))).error.message, /本会话 gemini_write/);
+    assert.equal(hostGuardReason(h, exec), GEMINI_READ_DENY);
+    assert.equal((await hostExecute(h, exec, async () => assert.fail('正文读取已执行'))).error.message, GEMINI_READ_DENY);
   }
   assert.equal(hostGuardReason(h, { ...call('read', { file_path: file }, h.cwd), agent: agentAt(h.cwd) }), undefined);
   const check = { ...RUN, task: `核对正文 ${value.output} 与 notes.md`, write: true, scope: ['chapter.md'] };
