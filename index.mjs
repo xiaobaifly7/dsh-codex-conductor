@@ -775,6 +775,11 @@ function settings(config, logger) {
         if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
         config.gemini[key] = valid ? value : fallback;
       }
+      // The configured effort wins over whatever the planner passes.
+      if (gemini.forceEffort !== undefined) {
+        if (typeof gemini.forceEffort === 'boolean') config.gemini.forceEffort = gemini.forceEffort;
+        else logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.forceEffort，必须是 true 或 false');
+      }
       // Applied when a call omits max_chars, so length stays capped even if the planner forgets it.
       if (gemini.defaultMaxChars !== undefined) {
         if (Number.isSafeInteger(gemini.defaultMaxChars) && gemini.defaultMaxChars > 0) config.gemini.defaultMaxChars = gemini.defaultMaxChars;
@@ -1675,7 +1680,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       output: { type: 'string', description: '唯一目标文件，绝对路径或相对任务目录；必须在任务目录内且不能与素材相同。' },
       cwd: { type: 'string', description: '任务目录，解析规则同 codex_run；Windows 路径或 /mnt/<盘符>/...。' },
       model: { type: 'string', description: `默认 ${cfg.gemini.model}。` },
-      effort: { type: 'string', enum: ['low', 'medium', 'high'], description: `默认 ${cfg.gemini.effort}。` },
+      effort: { type: 'string', enum: ['low', 'medium', 'high'], description: cfg.gemini.forceEffort ? `配置已固定为 ${cfg.gemini.effort}，传入值会被忽略。` : `默认 ${cfg.gemini.effort}。` },
       max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' +
         (cfg.gemini.defaultMaxChars ? `不传时默认 ${cfg.gemini.defaultMaxChars}。` : '') },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },

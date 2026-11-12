@@ -4377,6 +4377,16 @@ test('gemini.defaultMaxChars caps calls that omit max_chars and yields to an exp
   assert.doesNotMatch(uncapped.spawns[0].prompt, /正文硬上限/);
 });
 
+test('gemini.forceEffort makes the configured effort override the caller', async (t) => {
+  const forced = geminiFixture(t, { config: { gemini: { effort: 'high', forceEffort: true } } });
+  const value = await forced.execute({ effort: 'low' });
+  assert.equal(value.status, 'completed');
+  assert.equal(value.effort, 'high');
+  assert.equal(forced.spawns[0].argv[forced.spawns[0].argv.indexOf('--effort') + 1], 'high');
+  const free = geminiFixture(t, { config: { gemini: { effort: 'high' } } });
+  assert.equal((await free.execute({ effort: 'low' })).effort, 'low');
+});
+
 test('gemini_write automatically compresses the previous draft once within the hard limit', async (t) => {
   const drafts = ['第一稿：事实来自素材[1]。\n', '事实[1]。\n'];
   let attempt = 0;
