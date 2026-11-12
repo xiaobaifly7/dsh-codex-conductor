@@ -53,6 +53,8 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "literal_newline_report":
         finish('{"summary":"ok","criteria":[{"criterion":"checked","status":"met","evidence":"first\nsecond"}],'
                '"files_changed":[],"deviations":[],"unresolved":[]}')
+    elif mode == "fixture_report":
+        finish(Path(os.environ["FAKE_REPORT"]).read_text(encoding="utf-8"))
     elif mode == "nonzero_after_completed":
         finish()
         sys.exit(1)
@@ -217,6 +219,60 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["structured"]["criteria"],
                          [{"criterion": "checked", "status": "met", "evidence": "first\nsecond"}])
         self.assertIn('"evidence":"first\nsecond"', result["final_message"])
+        self.assertEqual(result["final_message_repaired"], ["control_character"])
+
+    def test_final_message_sample_regressions(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        schema = RUNNER.parents[1] / "report.v2.schema.json"
+        cases = json.loads((RUNNER.parent / "fixtures" / "final_messages.json").read_text(encoding="utf-8"))
+        report_file = Path(self.tmp.name) / "report.txt"
+        for case in cases:
+            with self.subTest(job_id=case["job_id"]):
+                report = self.sample_report(blockers=[], criteria=[{"criterion": "sample", "status": "blocked", "evidence": "FRAGMENT"}])
+                raw = json.dumps(report).replace("FRAGMENT", case["fragment"])
+                report_file.write_text(raw, encoding="utf-8")
+                result = self.invoke("--schema", str(schema), mode="fixture_report", env={"FAKE_REPORT": str(report_file)})
+                self.assertEqual(result["final_message"], raw)
+                self.assertEqual(result["attempts"], 1)
+                if case["repairs"] is None:
+                    self.assertEqual(result["error_kind"], "schema_invalid")
+                    self.assertFalse(result["retryable"])
+                    self.assertNotIn("structured", result)
+                    self.assertNotIn("final_message_repaired", result)
+                else:
+                    self.assertEqual(result["status"], "completed")
+                    self.assertEqual(result["final_message_repaired"], case["repairs"])
+                    self.assertTrue(codex_runner.valid_report(result["structured"]))
+                    self.assertEqual(result["structured"]["criteria"],
+                                     [{"criterion": "sample", "status": "blocked", "evidence": case["expected"]}])
+
+    def test_final_message_repairs_preserve_valid_escapes_and_reject_invalid_reports(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        evidence = 'quote " backslash \\ slash / backspace \b formfeed \f newline \n return \r tab \t unicode \u4e2d'
+        report = self.sample_report(criteria=[{"criterion": "checked", "status": "not_met", "evidence": evidence}],
+                                    blockers=[self.blocker()])
+        raw = json.dumps(report).replace("slash /", r"slash \/")
+        self.assertEqual(codex_runner.parse_final_message(raw), (report, []))
+        for fragment, expected, repairs in ((r"\d", r"\d", ["invalid_escape"]),
+                                            ("\n", "\n", ["control_character"]),
+                                            ("\\d\n", "\\d\n", ["control_character", "invalid_escape"])):
+            with self.subTest(fragment=fragment):
+                text = raw.replace('"evidence": "', '"evidence": "' + fragment)
+                parsed, actual_repairs = codex_runner.parse_final_message(text)
+                self.assertEqual(actual_repairs, repairs)
+                self.assertEqual(parsed, {**report, "criteria": [{**report["criteria"][0], "evidence": expected + evidence}]})
+        for fields in ({"summary": 7}, {"extra": True}, {"files_changed": [7]},
+                       {"criteria": [{**report["criteria"][0], "status": "done"}]},
+                       {"blockers": [{**self.blocker(), "kind": "unknown"}]}):
+            with self.subTest(fields=fields):
+                invalid = {**report, "deviations": [r"\d"], **fields}
+                invalid_raw = json.dumps(invalid).replace(r"\\d", r"\d")
+                with self.assertRaises(json.JSONDecodeError):
+                    codex_runner.parse_final_message(invalid_raw)
 
     def test_invalid_windows_path_report_preserves_the_original_and_reports_json_position(self):
         schema = RUNNER.parents[1] / "report.v2.schema.json"

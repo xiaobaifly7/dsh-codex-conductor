@@ -714,6 +714,34 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
             **({"ignore_warnings": warnings} if warnings else {})}
 
 
+def parse_final_message(final):
+    try:
+        return json.loads(final), []
+    except json.JSONDecodeError as original_error:
+        try:
+            report = json.loads(final, strict=False)
+            repaired = ["control_character"]
+        except json.JSONDecodeError:
+            # Match strings first so escaped quotes and paired backslashes keep their meaning.
+            escaped = re.sub(r'"(?:[^"\\]|\\.)*"', lambda string: re.sub(
+                r'\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4})|\\',
+                lambda escape: escape[0] if len(escape[0]) > 1 else "\\\\", string[0]), final, flags=re.S)
+            if escaped == final:
+                raise original_error
+            repaired = ["invalid_escape"]
+            try:
+                report = json.loads(escaped)
+            except json.JSONDecodeError:
+                try:
+                    report = json.loads(escaped, strict=False)
+                    repaired.insert(0, "control_character")
+                except json.JSONDecodeError:
+                    raise original_error
+        if not valid_report(report):
+            raise original_error
+        return report, repaired
+
+
 def execute(args, prompt, run_dir):
     run_dir.mkdir(parents=True, exist_ok=True)
     args.cwd = os.path.realpath(args.cwd)
@@ -822,8 +850,10 @@ def execute(args, prompt, run_dir):
             result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
         if args.schema:
             try:
-                # Codex can emit literal newlines inside evidence strings. Preserve them and the raw report.
-                result["structured"] = json.loads(final, strict=False)
+                report, repaired = parse_final_message(final)
+                result["structured"] = report
+                if repaired:
+                    result["final_message_repaired"] = repaired
             except ValueError as error:
                 detail = f": {error.msg} (line {error.lineno}, column {error.colno})" if isinstance(error, json.JSONDecodeError) else ""
                 result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON" + detail,
