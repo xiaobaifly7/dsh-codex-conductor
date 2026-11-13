@@ -4515,6 +4515,9 @@ test('gemini_write validates sources, output and overwrite before spawning', asy
     const value = await h.execute(args);
     assert.equal(value.status, 'failed');
     assert.match(value.error, reason);
+    const text = h.tools.gemini_write.output.render({}, value)[0].text;
+    assert.match(text.split('\n')[0], /^Gemini 写作失败（.+），目标未确认回滚。/);
+    assert.deepEqual(JSON.parse(text.slice(text.indexOf('\n') + 1)), value);
   }
   writeFileSync(path.join(h.cwd, 'big.md'), Buffer.alloc(1024 * 1024));
   assert.match((await h.execute({ sources: ['notes.md', 'big.md'] })).error, /总大小超过 1 MiB/);
@@ -4717,6 +4720,9 @@ test('gemini_write rolls back ERROR despite an already-written response and pres
     assert.match(value.next, /draft_path/);
     assert.match(value.next, /reuse_draft/);
     assert.doesNotMatch(value.next, /核对已有文件|本次 output 与本次 sources/);
+    const text = h.tools.gemini_write.output.render({}, value)[0].text;
+    assert.equal(text.split('\n')[0], `Gemini 写作失败（agy result ERROR：已写入），目标已回滚；草稿已保留在 ${value.draft_path}。下一步：gemini_write(reuse_draft=${JSON.stringify(value.draft_path)}, output=..., sources=..., 同样的写作要求) 复用这份草稿重新校验落盘；不要改用别的工具把草稿当普通文件搬运。`);
+    assert.deepEqual(JSON.parse(text.slice(text.indexOf('\n') + 1)), value);
     assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
   }
 });
@@ -4888,6 +4894,13 @@ test('gemini_write returns failed for CLI, protocol and missing or empty file er
     assert.match(value.error, reason, mode);
     assert.ok(value.error.length <= 2000);
     assert.equal(value.attempts, 1);
+    if (mode === 'missing') {
+      assert.deepEqual(value.write_paths, []);
+      assert.equal(value.draft_path, undefined);
+      const text = h.tools.gemini_write.output.render({}, value)[0].text;
+      assert.match(text.split('\n')[0], /^Gemini 写作失败（.+），目标已回滚；没有可复用草稿。下一步：.*重新 gemini_write。$/);
+      assert.deepEqual(JSON.parse(text.slice(text.indexOf('\n') + 1)), value);
+    }
     assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
   }
 });
@@ -4948,6 +4961,7 @@ test('gemini_write shares the timeout budget across both attempts and restores t
   assert.match(value.error, /超过 2 秒未结束/);
   assert.equal(value.attempts, 2);
   assert.deepEqual(value.attempt_chars, [21, 7]);
+  assert.match(h.tools.gemini_write.output.render({}, value)[0].text.split('\n')[0], /^Gemini 写作失败（total），目标已回滚；草稿已保留在 /);
   assert.equal(h.spawns[1].child.killed, true);
   assert.equal(readFileSync(output, 'utf8'), '调用前原文');
 });
