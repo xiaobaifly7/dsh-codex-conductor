@@ -1722,7 +1722,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             { type: 'array', items: { type: 'string', maxLength: 200 } }], description: '缺省 []，允许空数组。' },
         } },
     }, required: ['prompt', 'sources', 'output'] },
-    output: DATA_OUTPUT,
+    output: { schema: DATA_OUTPUT.schema, render: (_args, value) => {
+      let summary = '';
+      if (value.status === 'failed') {
+        const reason = String(value.timeout_kind || value.error || value.last_event_type || value.status)
+          .replace(/^gemini_write: /, '').replace(/\s+/g, ' ').slice(0, 160);
+        summary = `Gemini 写作失败（${reason}），` + (!value.rolled_back
+          ? `目标未确认回滚。下一步：${value.next}`
+          : value.draft_path
+            ? `目标已回滚；草稿已保留在 ${value.draft_path}。下一步：gemini_write(reuse_draft=${JSON.stringify(value.draft_path)}, output=..., sources=..., 同样的写作要求) 复用这份草稿重新校验落盘；不要改用别的工具把草稿当普通文件搬运。`
+            : '目标已回滚；没有可复用草稿。下一步：处理 error 后，按同样的写作要求重新 gemini_write。');
+      }
+      return [{ type: 'text', text: (summary ? `${summary}\n` : '') + JSON.stringify(value, null, 2) }];
+    } },
     async execute(args = {}, exec) {
       args ??= {};
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);

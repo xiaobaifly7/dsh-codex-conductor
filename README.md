@@ -4,6 +4,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
+`0.9.96` 为 Gemini 写作失败回执增加首行摘要，突出回滚状态与草稿路径，提示优先用 `reuse_draft` 重新校验落盘、无草稿时重新 `gemini_write`，并保留完整 JSON。
+
 `0.9.95` 统一 Gemini 正文的单次可写核对指引，续接拒绝回执首行明确未启动及原因，并增加事件类型统计，仅在正文增量或写文件事件后启用 Gemini 空闲超时，启动与思考阶段保留 1800 秒默认总上限。
 
 `0.9.94` 修复 Windows 后台任务启动时调用方与 worker 并发发布 PID 文件的竞态，并改进测试的条件等待、进程清理和失败诊断。
@@ -472,6 +474,8 @@ python3 runner/test_codex_runner.py
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
 ## English
+
+`0.9.96` adds a first-line summary to failed Gemini writing receipts, highlighting rollback status and the draft path, directing recovery through `reuse_draft` or a fresh `gemini_write` when no draft exists, and preserving the full JSON.
 
 `0.9.95` unifies Gemini prose guidance into one writable check, leads refused continuation receipts with the reason and explicit not-started status, and adds event-type counts while enabling Gemini idle timing only after prose deltas or file-write events, retaining the default 1800-second total deadline during startup and thinking.
 
