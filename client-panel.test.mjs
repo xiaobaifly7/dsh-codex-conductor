@@ -77,7 +77,7 @@ const click = async (host, label) => { const b = button(host, label); assert.ok(
 const field = (host, label) => {
   const container = nodes(host.tree).find((node) => node.type === 'label' && text(node).startsWith(label));
   assert.ok(container, label);
-  return nodes(container).find((node) => ['input', 'select', 'checkbox'].includes(node.type));
+  return nodes(container).find((node) => ['input', 'select', 'checkbox', 'textarea'].includes(node.type));
 };
 const change = async (host, label, value) => { field(host, label).props.onChange({ target: { value } }); await host.flush(); };
 
@@ -432,7 +432,9 @@ function panelService() {
     }
     if (path === '/status') return structuredClone(service.status);
     if (path === '/settings') return structuredClone(service.cfg);
-    if (path === '/prompt') return { text: '原提示词' };
+    if (path === '/prompt') return { text: '原提示词', injected: true };
+    if (path === '/prompt?kind=executor') return { text: '原固定要求' };
+    if (path === '/gemini') return { entries: [] };
     if (path === '/attention') return { total: 3 };
     if (path.startsWith('/jobs')) return { total: 524, jobs: [] };
     throw new Error(path);
@@ -633,4 +635,387 @@ test('reload without pending settings refreshes waiting and timed out states, th
   assert.ok(text(host.tree).includes('正在运行的 DeepSeek 会话回合： 0'));
   assert.ok(!text(host.tree).includes('剩余 600 秒'));
   assert.ok(!text(host.tree).includes('等 2 个会话'));
+});
+
+test('polling reads status every round and the other routes on load, after a change and every fourth round', async (t) => {
+  const service = panelService();
+  let jobs = [];
+  const host = clientHost((path, body) => path.startsWith('/jobs') ? { total: jobs.length, jobs } : service.handle(path, body));
+  t.after(() => host.dispose());
+  const counts = () => ['/status', '/settings', '/jobs', '/prompt', '/attention']
+    .map((route) => host.requests.filter((request) => !request.body &&
+      (route === '/jobs' ? request.path.startsWith(route) : request.path === route)).length);
+  const poll = async () => { host.poll(); await host.flush(); };
+  host.mount(host.exports.Panel); await host.flush();
+  assert.deepEqual(counts(), [1, 1, 1, 1, 1]);
+  assert.deepEqual([...host.timers.values()].map(({ ms }) => ms), [7000]);
+  for (let n = 0; n < 3; n++) await poll();
+  assert.deepEqual(counts(), [4, 1, 1, 1, 1], 'three rounds read only the status');
+  await poll();
+  assert.deepEqual(counts(), [5, 2, 2, 2, 2], 'the fourth round reads everything again');
+  jobs = [{ job_id: 'J', title: 'task', status: 'running', execution_status: 'running', started_at: 0 }];
+  await click(host, '待关注');
+  assert.deepEqual(counts(), [6, 3, 3, 3, 3], 'a filter change reads everything at once');
+  await poll();
+  assert.deepEqual(counts(), [7, 3, 4, 3, 3], 'a running task keeps the task list on every round');
+  jobs = [];
+  await poll();
+  assert.deepEqual(counts(), [8, 3, 5, 3, 3]);
+  await poll();
+  assert.deepEqual(counts(), [9, 3, 5, 3, 3], 'once nothing runs the task list returns to the slow cadence');
+  await change(host, 'Codex 模型', 'new-model');
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(counts(), [10, 4, 6, 4, 4], 'a save reads everything at once');
+});
+
+test('status polls carry applied settings into the form between full reads', async (t) => {
+  const service = panelService(), host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  service.status.settings.model = 'applied-model';
+  host.poll(); await host.flush();
+  assert.equal(host.requests.filter((request) => request.path === '/settings').length, 1);
+  assert.equal(field(host, 'Codex 模型').props.value, 'applied-model');
+});
+
+test('backend messages naming Harness, MiB or KiB reach the user; internal text still falls back', async (t) => {
+  const service = panelService();
+  const messages = { '/status': '请先登录 DeepSeek Harness 后重试。', '/prompt': '提交的内容超过 1 MiB，请缩短内容后再保存。',
+    '/jobs': '自检结果超过 64 KiB，请缩短后重试。', '/settings': '读取 profile_secret 失败，请重试。' };
+  const host = clientHost((path, body) => {
+    const error = messages[Object.keys(messages).find((route) => path.startsWith(route))];
+    return error ? { error } : service.handle(path, body);
+  });
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  for (const route of ['/status', '/prompt', '/jobs']) assert.ok(text(host.tree).includes(messages[route]), route);
+  assert.ok(!text(host.tree).includes('profile_secret'));
+});
+
+test('the Codex model and execution effort can be cleared to follow Codex; a Gemini model still needs a name', async (t) => {
+  const service = panelService(), host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  assert.ok(nodes(field(host, '执行时的思考程度')).some((node) => node.type === 'option' && node.props.value === '' && text(node) === '跟随 Codex 配置'));
+  await change(host, 'Codex 模型', '');
+  await change(host, '执行时的思考程度', '');
+  assert.ok(!nodes(host.tree).some((node) => node.props?.role === 'alert' && text(node)));
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(host.requests.find((request) => request.body), { path: '/settings', body: { model: '', effort: '' } });
+  const { settingsPatch } = host.exports;
+  assert.deepEqual(plain(settingsPatch({ model: '', effort: '' }, { model: '', effort: '' })), {});
+  assert.throws(() => settingsPatch(settings(), { 'gemini.model': '' }), /模型名请填/);
+  assert.throws(() => settingsPatch(settings(), { 'gemini.effort': '' }), /请从列表中选择思考程度/);
+  assert.throws(() => settingsPatch(settings(), { model: 'a b' }), /模型名请填/);
+});
+
+test('prompt sections count effective characters live, show the injected state and save the executor prompt with its kind', async (t) => {
+  const service = panelService(), host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = (title) => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === title);
+  assert.ok(text(section('规划提示词')).includes('已注入系统提示词'));
+  assert.ok(text(section('规划提示词')).includes('有效字数：4'));
+  assert.ok(text(section('给 Codex 的固定要求')).includes('Codex 每单都会看到；不增加权限'));
+  assert.ok(text(section('给 Codex 的固定要求')).includes('有效字数：5'));
+  assert.ok(!text(section('给 Codex 的固定要求')).includes('系统提示词'));
+  await change(host, '给 DeepSeek 的具体要求', '<!-- 注释\n不算 -->\n  全新的要求😀  \n<!-- 另一段 -->');
+  assert.ok(text(section('规划提示词')).includes('有效字数：6（'), 'comments and surrounding whitespace do not count; an emoji is one character');
+  assert.ok(!text(host.tree).includes('每个会话每一步都会带上'));
+  await change(host, '给 DeepSeek 的具体要求', '字'.repeat(4001));
+  assert.ok(text(section('规划提示词')).includes('有效字数：4001'));
+  assert.ok(text(section('规划提示词')).includes('这段内容每个会话每一步都会带上'));
+  assert.equal(host.requests.filter((request) => request.body).length, 0);
+  await change(host, '附在每一单任务书后面的内容', '只改任务点名的文件');
+  await click(host, '保存给 Codex 的固定要求');
+  assert.deepEqual(host.requests.find((request) => request.body), { path: '/prompt', body: { text: '只改任务点名的文件', kind: 'executor' } });
+  assert.ok(text(host.tree).includes('给 Codex 的固定要求已保存。'));
+  assert.equal(field(host, '给 DeepSeek 的具体要求').props.value, '字'.repeat(4001), 'the other draft is kept');
+  await click(host, '保存规划提示词');
+  assert.deepEqual(host.requests.filter((request) => request.body).at(-1), { path: '/prompt', body: { text: '字'.repeat(4001) } });
+
+  const missing = panelService();
+  const unavailable = clientHost((path, body) => path === '/prompt?kind=executor'
+    ? { error: '给 Codex 的固定要求在当前环境不可用，请在 DSH 中配置规划提示词的保存位置后重试。' }
+    : path === '/prompt' ? { text: '原提示词', injected: false } : missing.handle(path, body));
+  t.after(() => unavailable.dispose());
+  unavailable.mount(unavailable.exports.Panel); await unavailable.flush();
+  assert.ok(text(unavailable.tree).includes('给 Codex 的固定要求在当前环境不可用'));
+  assert.equal(field(unavailable, '附在每一单任务书后面的内容').props.disabled, true);
+  assert.ok(text(unavailable.tree).includes('未注入系统提示词'));
+});
+
+test('prompt backups expand on demand and load into the draft without saving', async (t) => {
+  const service = panelService();
+  const backups = [{ name: 'planner.md.2026-11-14T01-02-03-004Z.11111111-1111-4111-8111-111111111111.bak', savedAt: '2026-11-14T01:02:03.004Z', size: 12 }];
+  const host = clientHost((path, body) => path === '/prompt/backups?kind=planner' ? { backups }
+    : path.startsWith('/prompt/backup?') ? { text: '备份里的旧要求' } : path === '/prompt/backups?kind=executor' ? { backups: [] } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = (title) => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === title);
+  const press = async (title, label) => {
+    await nodes(section(title)).find((node) => node.type === 'button' && text(node) === label).props.onClick();
+    await host.flush();
+  };
+  assert.equal(host.requests.some((request) => request.path.startsWith('/prompt/backup')), false, 'backups are not polled');
+  await press('规划提示词', '查看历史备份');
+  assert.ok(text(section('规划提示词')).includes('12 字节'));
+  await press('规划提示词', '载入到编辑框');
+  assert.equal(host.requests.at(-1).path, `/prompt/backup?kind=planner&name=${encodeURIComponent(backups[0].name)}`);
+  assert.equal(field(host, '给 DeepSeek 的具体要求').props.value, '备份里的旧要求');
+  assert.ok(text(host.tree).includes('核对后点保存才会生效'));
+  assert.ok(text(host.tree).includes('有未保存的提示词。'));
+  assert.equal(host.requests.filter((request) => request.body).length, 0, 'loading a backup never writes');
+  await press('规划提示词', '收起历史备份');
+  assert.ok(!text(section('规划提示词')).includes('12 字节'));
+  await press('给 Codex 的固定要求', '查看历史备份');
+  assert.ok(text(section('给 Codex 的固定要求')).includes('还没有历史备份。'));
+});
+
+test('status shows guard scope, host access and unknown keys, and folds secondary rows without hiding their errors', () => {
+  const { Status } = clientHost().exports, service = panelService();
+  const view = (settings = {}, runtime = {}) => Status({ status: { settings: { ...service.status.settings, ...settings },
+    runtime: { ...service.status.runtime, ...runtime } } });
+  const folded = (tree) => nodes(tree).find((node) => node.type === 'details');
+  let tree = view({ roots: [], allowHostAccess: false, unknownConfig: [] });
+  for (const value of ['护栏工作区： 未启用护栏', '主机访问： 未开启']) assert.ok(text(tree).includes(value), value);
+  assert.ok(!text(tree).includes('不在沙箱内运行'));
+  assert.ok(!text(tree).includes('未识别的配置项'));
+  assert.equal(text(nodes(folded(tree))[1]), '更多运行信息');
+  for (const label of ['加载时间', '已保存的版本', '重新加载', '设置读取', '运行版本读取']) assert.ok(text(folded(tree)).includes(`${label}：`), label);
+  for (const label of ['正在运行的版本', '当前模型', '思考程度', '速度档']) {
+    assert.ok(text(tree).includes(`${label}：`) && !text(folded(tree)).includes(`${label}：`), `${label} stays outside the fold`);
+  }
+  tree = view({ roots: ['d:/work', '*'], allowHostAccess: true, defaultHostAccess: false, unknownConfig: ['timoutSeconds', 'modle'] });
+  for (const value of ['护栏工作区： 所有会话', '主机访问： 已开启，需逐单指定', 'Codex 不在沙箱内运行',
+    '未识别的配置项：timoutSeconds、modle。这些配置没有生效，请核对拼写。']) assert.ok(text(tree).includes(value), value);
+  assert.ok(nodes(tree).some((node) => node.props?.className === 'dcc-error' && text(node).includes('未识别的配置项')));
+  assert.ok(nodes(tree).some((node) => node.props?.className === 'dcc-warn' && text(node).includes('不在沙箱内运行')));
+  tree = view({ roots: ['d:/work', 'e:/docs'], allowHostAccess: true, defaultHostAccess: true });
+  for (const value of ['护栏工作区： d:/work、e:/docs', '主机访问： 已开启且默认使用', '当前每一单默认使用']) assert.ok(text(tree).includes(value), value);
+  tree = view({}, { profile_error: 'ENOENT secret-profile', loaded_error: 'invalid module record' });
+  const alerts = nodes(tree).filter((node) => node.props?.role === 'alert').map(text);
+  assert.ok(alerts.some((value) => value.includes('无法读取已保存的设置')) && alerts.some((value) => value.includes('无法读取当前运行版本')));
+  assert.equal(nodes(folded(tree)).some((node) => node.props?.role === 'alert'), false, 'the errors are shown outside the fold');
+  assert.ok(!text(tree).includes('secret-profile'));
+});
+
+test('the environment check runs only on click and shows a missing codex_auth as a hint', async (t) => {
+  const service = panelService();
+  const host = clientHost((path, body) => path === '/doctor' ? { ok: false, checks: [{ name: 'python', ok: true, detail: '3.12' },
+    { name: 'codex_auth', ok: false, detail: 'auth.json 不存在' }, { name: 'bash', ok: false, detail: '找不到 bash' }] } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  for (let n = 0; n < 5; n++) { host.poll(); await host.flush(); }
+  assert.equal(host.requests.some((request) => request.path === '/doctor'), false, 'never polled');
+  await click(host, '环境自检');
+  assert.equal(host.requests.filter((request) => request.path === '/doctor').length, 1);
+  const rows = nodes(host.tree).filter((node) => node.type === 'li' && /^(python|codex_auth|bash)：/.test(text(node)));
+  assert.deepEqual(rows.map((node) => [text(node).split(' ')[0], node.props.className]),
+    [['python：通过', 'dcc-muted'], ['codex_auth：提示', 'dcc-muted'], ['bash：未通过', 'dcc-error']]);
+  assert.ok(text(rows[1]).includes('用 API Key 或自定义提供方时属于正常'));
+  assert.ok(text(rows[2]).includes('找不到 bash'));
+
+  const selftest = clientHost(); t.after(() => selftest.dispose());
+  selftest.mount(selftest.exports.Panel, { selftest: { finish() {}, read: async (path) => service.handle(path) } }); await selftest.flush();
+  assert.equal(nodes(selftest.tree).some((node) => node.type === 'button' && text(node) === '环境自检'), false);
+});
+
+test('limits clear to null, retries accept zero, and automatic resume saves as a nested patch', async (t) => {
+  const service = panelService();
+  Object.assign(service.cfg, { timeoutSeconds: 900, idleTimeoutSeconds: null, retries: 2, maxRunningJobs: null, lockTimeoutSeconds: 30,
+    maxStorageMb: null, autoResume: { enabled: true } });
+  service.status.settings = structuredClone(service.cfg);
+  const host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  for (const label of ['每次尝试的总超时秒数', '空闲超时秒数', '自动重试次数', '同时运行的任务数上限', '等待其他任务的秒数', '任务记录占用空间上限']) {
+    assert.equal(field(host, label).props.type, 'number', label);
+    assert.match(text(nodes(host.tree).find((node) => node.type === 'label' && text(node).startsWith(label))), /留空表示(不限制|沿用默认)/);
+  }
+  assert.equal(field(host, '每次尝试的总超时秒数').props.value, '900');
+  assert.equal(field(host, '空闲超时秒数').props.value, '');
+  await change(host, '每次尝试的总超时秒数', '');
+  await change(host, '空闲超时秒数', '120');
+  await change(host, '自动重试次数', '0');
+  await change(host, '同时运行的任务数上限', '3');
+  await change(host, '等待其他任务的秒数', ' ');
+  const resume = () => nodes(host.tree).find((node) => node.type === 'checkbox' && node.props.label === '重启后自动续接');
+  assert.equal(resume().props.checked, true);
+  resume().props.onChange(false); await host.flush();
+  assert.equal(resume().props.checked, false);
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(host.requests.find((request) => request.body), { path: '/settings', body: { timeoutSeconds: null, idleTimeoutSeconds: 120,
+    retries: 0, maxRunningJobs: 3, lockTimeoutSeconds: null, autoResume: { enabled: false } } });
+  assert.equal(field(host, '每次尝试的总超时秒数').props.value, '', 'a pending cleared limit shows as empty');
+  assert.equal(resume().props.checked, false);
+
+  const { settingsPatch, pendingPatch } = host.exports, current = structuredClone(service.cfg);
+  assert.deepEqual(plain(settingsPatch(current, { idleTimeoutSeconds: '', maxRunningJobs: '', retries: '2', 'autoResume.enabled': true })), {});
+  assert.deepEqual(plain(pendingPatch(current, { changes: { timeoutSeconds: null, autoResume: { enabled: false } } }, { retries: '' })),
+    { timeoutSeconds: null, autoResume: { enabled: false }, retries: null });
+  for (const [edit, message] of [[{ timeoutSeconds: '0' }, /超时秒数/], [{ idleTimeoutSeconds: '-1' }, /超时秒数/], [{ retries: '-1' }, /重试次数/],
+    [{ retries: '1.5' }, /重试次数/], [{ maxRunningJobs: '0' }, /任务数上限/], [{ maxRunningJobs: '2.5' }, /任务数上限/],
+    [{ lockTimeoutSeconds: 'abc' }, /等待秒数/], [{ maxStorageMb: '0' }, /存储上限/]]) assert.throws(() => settingsPatch(current, edit), message);
+});
+
+test('recent tasks show what the runner recorded and search by task or session number', async (t) => {
+  const service = panelService();
+  const jobs = [
+    { job_id: '20261114-010203-abcdef', title: '完成的任务', status: 'completed', execution_status: 'completed', started_at: 0, owner: 'session-a',
+      cwd: '/mnt/d/work', duration_s: 148.4, criteria_counts: { met: 2, not_met: 1, blocked: 0 }, verification_status: 'needs_changes', updated_at: 5 },
+    { job_id: 'J2', title: '在跑的任务', status: 'running', execution_status: 'running', started_at: 0, phase: 'lock_wait', attempt: 2,
+      updated_at: 60, criteria_counts: { met: 0, not_met: 0, blocked: 0 } },
+    { job_id: 'J3', title: '失败的任务', status: 'failed', execution_status: 'failed', started_at: 0, error_kind: 'timeout' },
+    { job_id: 'J4', title: '旧记录', status: 'completed', execution_status: 'completed', started_at: 0 },
+  ];
+  const host = clientHost((path, body) => path.startsWith('/jobs') ? { total: jobs.length, jobs } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const row = (title) => text(nodes(host.tree).find((node) => node.type === 'li' && text(node).includes(title)));
+  for (const value of ['会话 session-a', '目录 /mnt/d/work', '耗时 148 秒', '验收 2 通过 / 1 未通过 / 0 受阻', '独立核验 待修正']) {
+    assert.ok(row('完成的任务').includes(value), value);
+  }
+  assert.ok(!row('完成的任务').includes('当前阶段') && !row('完成的任务').includes('最近活动'));
+  for (const value of ['当前阶段 排队等待目录写锁（第 2 轮）', '最近活动 ']) assert.ok(row('在跑的任务').includes(value), value);
+  assert.ok(!row('在跑的任务').includes('验收 '), 'a running task has no acceptance result yet');
+  assert.ok(row('失败的任务').includes('失败原因 timeout'));
+  for (const absent of ['会话 ', '目录 ', '耗时 ', '验收 ', '失败原因', '独立核验', '当前阶段', '最近活动']) assert.ok(!row('旧记录').includes(absent), absent);
+
+  const searchBox = () => nodes(host.tree).find((node) => node.type === 'input' && node.props['aria-label'] === '搜索任务');
+  searchBox().props.onChange({ target: { value: ' session-a ' } }); await host.flush();
+  await click(host, '搜索');
+  assert.equal(host.requests.at(-1 - host.requests.slice().reverse().findIndex((request) => request.path.startsWith('/jobs'))).path,
+    '/jobs?filter=all&offset=0&q=session-a');
+  await click(host, '待关注');
+  assert.ok(host.requests.some((request) => request.path === '/jobs?filter=attention&offset=0&q=session-a'), 'the search survives a filter change');
+  await click(host, '清除搜索');
+  assert.equal(searchBox().props.value, '');
+  assert.equal(host.requests.filter((request) => request.path.startsWith('/jobs')).at(-1).path, '/jobs?filter=attention&offset=0');
+});
+
+test('the report view switches to the task context, review history and error log as raw pages', async (t) => {
+  const requests = [];
+  const host = clientHost((path) => {
+    requests.push(path);
+    const artifact = /&artifact=(\w+)/.exec(path)?.[1] ?? 'report';
+    const offset = Number(/&offset=(\d+)/.exec(path)[1]);
+    return artifact === 'report' ? { text: JSON.stringify(sample()), next_offset: null, eof: true }
+      : { text: `${artifact} 第 ${offset} 段`, next_offset: offset === 0 ? 8000 : null, eof: offset !== 0 };
+  });
+  t.after(() => host.dispose());
+  host.mount(host.exports.Report, { jobId: 'J 1' }); await host.flush();
+  assert.match(text(host.tree), /概述.*逐条验收/s);
+  await click(host, '错误日志');
+  assert.deepEqual(requests.slice(1), ['/output?job_id=J%201&offset=0&limit=8000&artifact=stderr']);
+  assert.ok(nodes(host.tree).some((node) => node.type === 'pre' && text(node) === 'stderr 第 0 段'));
+  assert.ok(!text(host.tree).includes('不支持易读视图'));
+  await click(host, '下一页');
+  assert.equal(requests.at(-1), '/output?job_id=J%201&offset=8000&limit=8000&artifact=stderr');
+  assert.ok(nodes(host.tree).some((node) => node.type === 'pre' && text(node) === 'stderr 第 8000 段'));
+  for (const [label, artifact] of [['任务书与验收', 'context'], ['核验记录', 'review']]) {
+    await click(host, label);
+    assert.equal(requests.at(-1), `/output?job_id=J%201&offset=0&limit=8000&artifact=${artifact}`);
+    assert.ok(nodes(host.tree).some((node) => node.type === 'pre' && text(node) === `${artifact} 第 0 段`));
+  }
+  await click(host, '报告');
+  assert.equal(requests.at(-1), '/output?job_id=J%201&offset=0&limit=8000');
+  assert.match(text(host.tree), /概述.*逐条验收/s);
+});
+
+test('Gemini writing records appear only when Gemini is configured', async (t) => {
+  const service = panelService();
+  const entries = [{ at: '2026-11-14T01:02:03Z', output: 'D:\\docs\\第二章.md', status: 'failed', chars: 5200, error: 'output 超过 max_chars=4000',
+    draft_path: 'C:\\drafts\\a.md' }, { at: '2026-11-14T00:00:00Z', output: 'D:\\docs\\第一章.md', status: 'completed', chars: 2400, error: null, draft_path: null }];
+  const handler = (path, body) => path === '/gemini' ? { entries } : service.handle(path, body);
+  const host = clientHost(handler); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = (h) => nodes(h.tree).find((node) => node.type === 'section' && node.props['aria-label'] === 'Gemini 写作记录');
+  for (const value of ['D:\\docs\\第二章.md', '失败', '5200 字', '失败原因：output 超过 max_chars=4000', '草稿：C:\\drafts\\a.md',
+    'D:\\docs\\第一章.md', '成功', '2400 字']) assert.ok(text(section(host)).includes(value), value);
+  assert.ok(text(section(host)).indexOf('第二章') < text(section(host)).indexOf('第一章'), 'newest first as returned');
+  service.cfg.gemini = null; service.status.settings.gemini = null;
+  const plainHost = clientHost(handler); t.after(() => plainHost.dispose());
+  plainHost.mount(plainHost.exports.Panel); await plainHost.flush();
+  assert.equal(section(plainHost), undefined);
+});
+
+test('session operations confirm before acting as the user, post the request bodies and show recent results', async (t) => {
+  const service = panelService();
+  const results = { send: { completedAt: '2026-11-14T01:02:03.000Z', sessionId: 'session-a', status: 'sent', reason: 'message_submitted' },
+    resume: { completedAt: '2026-11-14T01:02:03.000Z', status: 'processed', sessions: [{ sessionId: 'session-b', status: 'skipped', reason: 'running' }] },
+    goal: null, autoresume: null };
+  const host = clientHost((path, body) => path === '/session/results' ? results : path.startsWith('/session/') ? { submitted: true } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话操作');
+  assert.equal(section.children[0].type, 'details', 'folded by default');
+  assert.equal(nodes(host.tree).filter((node) => node.type === 'section').at(-1), section, 'the last section');
+  const posts = () => host.requests.filter((request) => request.body);
+  await change(host, '发送到的会话编号', 'session-a');
+  await change(host, '要发送的消息', ' 接着做\n');
+  nodes(host.tree).find((node) => node.type === 'checkbox' && node.props.label === '会话正在运行时排到它的下一轮').props.onChange(true); await host.flush();
+  await click(host, '向会话发送消息');
+  assert.equal(posts().length, 0, 'nothing is sent before the confirmation');
+  assert.ok(text(host.tree).includes('这会以用户身份向该会话提交这条消息'));
+  await click(host, '先不发送');
+  assert.equal(posts().length, 0);
+  await click(host, '向会话发送消息');
+  await click(host, '确认发送');
+  assert.deepEqual(posts().at(-1), { path: '/session/send', body: { sessionId: 'session-a', message: ' 接着做\n', queue: true } });
+  assert.ok(text(host.tree).includes('请求已提交，稍后点“查看最近结果”确认处理情况。'));
+  await change(host, '要续接的会话编号', 'session-a, session-b，session-c  session-d');
+  await click(host, '续接被中断的会话');
+  assert.deepEqual(posts().at(-1), { path: '/session/resume', body: { sessions: ['session-a', 'session-b', 'session-c', 'session-d'] } });
+  await change(host, '续接时发送的话', '接着上次的做');
+  await click(host, '续接被中断的会话');
+  assert.deepEqual(posts().at(-1).body, { sessions: ['session-a', 'session-b', 'session-c', 'session-d'], message: '接着上次的做' });
+  await change(host, '要改 Goal 的会话编号', 'session-a');
+  assert.equal(button(host, '修改会话 Goal').props.disabled, true, 'a Goal change needs an objective or a round budget');
+  await change(host, '新的轮数上限', '20');
+  await click(host, '修改会话 Goal');
+  assert.equal(posts().length, 3);
+  assert.ok(text(host.tree).includes('这会以用户身份改写该会话当前 Goal'));
+  await click(host, '确认修改');
+  assert.deepEqual(posts().at(-1), { path: '/session/goal', body: { sessionId: 'session-a', maxGoalRounds: 20 } });
+  await change(host, '新的目标', '写完第三章');
+  await click(host, '修改会话 Goal'); await click(host, '确认修改');
+  assert.deepEqual(posts().at(-1).body, { sessionId: 'session-a', objective: '写完第三章', maxGoalRounds: 20 });
+  assert.equal(host.requests.some((request) => request.path === '/session/results'), false, 'results are read on request only');
+  await click(host, '查看最近结果');
+  const shown = text(nodes(host.tree).find((node) => node.type === 'pre' && node.props['aria-label'] === '最近的会话操作结果'));
+  for (const value of ['：sent / message_submitted', '会话 session-a', 'session-b：skipped / running', '修改 Goal：暂无结果', '重启后自动续接：暂无结果']) {
+    assert.ok(shown.includes(value), value);
+  }
+
+  const selftest = clientHost(); t.after(() => selftest.dispose());
+  selftest.mount(selftest.exports.Panel, { selftest: { finish() {}, read: async (path) => service.handle(path) } }); await selftest.flush();
+  for (const title of ['会话操作', '给 Codex 的固定要求']) {
+    assert.equal(nodes(selftest.tree).some((node) => node.type === 'section' && node.props['aria-label'] === title), false, title);
+  }
+  assert.equal(selftest.requests.length, 0);
+});
+
+test('a hidden page skips its reads but keeps the timer; the next visible round reads normally', async (t) => {
+  const service = panelService(), page = { hidden: true };
+  const host = clientHost(service.handle, { document: page }); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  assert.equal(host.requests.length, 0);
+  assert.deepEqual([...host.timers.values()].map(({ ms }) => ms), [7000]);
+  host.poll(); await host.flush();
+  assert.equal(host.requests.length, 0);
+  assert.equal(host.timers.size, 1);
+  page.hidden = false;
+  host.poll(); await host.flush();
+  assert.deepEqual(host.requests.map((request) => request.path).sort(),
+    ['/attention', '/gemini', '/jobs?filter=all&offset=0', '/prompt', '/prompt?kind=executor', '/settings', '/status'],
+    'the first visible round is a full read');
+  page.hidden = true;
+  host.poll(); await host.flush();
+  assert.equal(host.requests.length, 7);
+  page.hidden = false;
+  host.poll(); await host.flush();
+  assert.deepEqual(host.requests.slice(7).map((request) => request.path), ['/status']);
+
+  const reads = [];
+  const selftest = clientHost(undefined, { document: { hidden: true } }); t.after(() => selftest.dispose());
+  selftest.mount(selftest.exports.Panel, { selftest: { finish() {}, read: async (path) => { reads.push(path); return service.handle(path); } } });
+  await selftest.flush();
+  assert.equal(reads.length, 5, 'the offscreen selftest reads once even when the window is hidden');
 });

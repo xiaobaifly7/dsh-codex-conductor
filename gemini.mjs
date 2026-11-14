@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 const { normPath, under, GEMINI_CHECK_HINT } = await import(new URL(`./guard.mjs${new URL(import.meta.url).search}`, import.meta.url));
@@ -8,6 +8,10 @@ const { normPath, under, GEMINI_CHECK_HINT } = await import(new URL(`./guard.mjs
 const SOURCE_LIMIT = 1024 * 1024;
 const SNAPSHOT_LIMIT = 1000;
 const DRAFT_LIMIT = 20;
+const KILL_GRACE_MS = 5000;
+// 只有首块每行都是 YAML 键值或列表项才算模型自带的 frontmatter；以分隔线开头的正文原样保留。
+const YAML_KEY = /[A-Za-z_][\w.-]*[ \t]*:(?:[ \t][^\n]*)?\r?\n/.source;
+const MODEL_FRONTMATTER = new RegExp(String.raw`^\uFEFF?---[ \t]*\r?\n(?:${YAML_KEY}(?:${YAML_KEY}|[ \t]*-[ \t][^\n]*\n)*)?(?:---|\.\.\.)[ \t]*(?:\r?\n|$)`);
 const EFFORTS = ['low', 'medium', 'high'];
 const FRONTMATTER_FIELDS = ['created', 'updated', 'title', 'type', 'status', 'tags', 'aliases'];
 const NOTE_TYPES = ['daily-note', 'project', 'topic', 'moc', 'resource', 'inbox', 'archive'];
@@ -95,7 +99,7 @@ async function noCodexWriters(conductor, cwd, signal) {
 export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now() + cfg.timeoutSeconds * 1000 } = {}, launch = spawn) {
   if (signal?.aborted) return Promise.resolve({ error: 'Gemini 调用前已被中止', write_paths: [] });
   return new Promise((resolve) => {
-    let child, lines, timer, result;
+    let child, lines, timer, killTimer, result;
     let stderr = '';
     let settled = false, stopping = '', timeoutKind = null;
     let stdoutBytes = 0, eventCount = 0, lastProgress = performance.now();
@@ -106,6 +110,7 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      clearTimeout(killTimer);
       signal?.removeEventListener('abort', onAbort);
       lines?.close();
       resolve({ result, write_paths: [...paths], stdout_bytes: stdoutBytes, event_count: eventCount,
@@ -117,9 +122,15 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       if (settled || stopping) return;
       stopping = error;
       clearTimeout(timer);
-      // 等 close 后才允许保稿/回滚，避免子进程继续覆盖已恢复的目标。
-      if (child) child.kill();
-      else finish(error);
+      if (!child) return finish(error);
+      const kill = () => { try { child.kill(); } catch {} };
+      // child.kill() 只结束 agy 本身；Windows 先让 taskkill 结束整棵进程树，再补一次 kill。
+      if (process.platform === 'win32' && child.pid) {
+        spawn(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'taskkill.exe'), ['/T', '/F', '/PID', String(child.pid)],
+          { windowsHide: true, stdio: 'ignore' }).on('error', kill).on('close', kill);
+      } else kill();
+      // 等 close 后才允许保稿/回滚，避免子进程继续覆盖已恢复的目标；迟迟不关就强制收尾，不让调用和目录占用挂死。
+      killTimer = setTimeout(() => finish(`${error}；子进程 ${KILL_GRACE_MS / 1000} 秒内未关闭，已强制收尾`), KILL_GRACE_MS);
     };
     const onAbort = () => stop('Gemini 调用已被中止');
     const checkTimeout = () => {
@@ -182,7 +193,7 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
   });
 }
 
-export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = {}, launch = spawn) {
+export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sourceRoots } = {}, launch = spawn) {
   const started = performance.now();
   let restoreOutput, draft;
   const value = { status: 'failed', output: typeof args?.output === 'string' ? args.output : '', chars: 0, cjk_chars: 0,
@@ -220,6 +231,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
       return { path: source };
     });
     if (bytes > SOURCE_LIMIT) throw new Error('sources 总大小超过 1 MiB 上限，请缩小素材后再写');
+    const outside = sourceRoots ? sources.filter((source) => !sourceRoots.some((root) => under(normPath(source.path), root))) : [];
+    if (outside.length) throw new Error(`sources 超出本会话允许读取的范围：${outside.map((source) => source.path).join('、')}`);
     if (outputInfo && args.overwrite !== true) throw new Error('output 已存在，需要 overwrite=true');
     let reused;
     if (args.reuse_draft !== undefined) {
@@ -260,6 +273,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
     let prompt = `${constraint}\n\n## 写作要求\n${args.prompt}\n${lengthRequirement}${bodyRequirement}` +
       `\n## 内联素材\n${JSON.stringify(sources)}\n\n${constraint}`;
     const directory = path.dirname(value.output);
+    const made = [];
+    for (let folder = directory; !lstatSync(folder, { throwIfNoEntry: false }); folder = path.dirname(folder)) made.push(folder);
     mkdirSync(directory, { recursive: true });
     const before = snapshot(directory);
     const outputStamp = () => {
@@ -275,6 +290,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
       }
       if (original !== null) writeFileSync(value.output, original);
       else if (info) unlinkSync(value.output);
+      // 本次新建的父目录由深到浅删除；已有其他内容的目录保留。
+      for (const folder of made) try { rmdirSync(folder); } catch { break; }
       value.restored_to = original === null ? 'absent' : 'original_content';
     };
     const deadline = performance.now() + cfg.timeoutSeconds * 1000;
@@ -342,7 +359,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
           throw new Error('Gemini 没有改写 output，文件里仍是写作前的旧内容，不能当作本次草稿');
         }
         content = readFileSync(value.output, 'utf8');
-        if (header) content = content.replace(/^\uFEFF?---[ \t]*\r?\n(?:[^\n]*\n)*?(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/, '');
+        if (header) content = content.replace(MODEL_FRONTMATTER, '');
         draft = header + content;
         value.chars = [...content].length;
         value.cjk_chars = (content.match(/\p{Script=Han}/gu) ?? []).length;

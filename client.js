@@ -25,6 +25,9 @@ window.__ModuleLoader__.load({
       .dcc-actions { margin-top: 12px; }
       .dcc-error { color: var(--dsw-alias-state-error-primary); overflow-wrap: anywhere; }
       .dcc-status { margin-bottom: 10px; overflow-wrap: anywhere; }
+      .dcc-warn { color: var(--dsw-alias-state-error-primary); font-weight: 600; overflow-wrap: anywhere; }
+      .dcc-panel summary { cursor: pointer; margin: 8px 0; }
+      .dcc-panel textarea.dcc-short { min-height: 80px; }
       .dcc-jobs { padding: 0; list-style: none; margin: 12px 0; }
       .dcc-job { padding: 12px 0; border-bottom: 1px solid var(--dsw-alias-border-l2); overflow-wrap: anywhere; }
       .dcc-job strong { font-size: 13px; }
@@ -61,7 +64,7 @@ window.__ModuleLoader__.load({
     }
 
     function userError(value, fallback = '暂时无法完成操作，请刷新后重试；仍然失败请联系维护者。') {
-      if (typeof value !== 'string' || !/[\u3400-\u9fff]/.test(value) || /[A-Za-z_]/.test(value.replace(/\b(?:Codex|DSH|DeepSeek|Gemini)\b/g, ''))) return fallback;
+      if (typeof value !== 'string' || !/[\u3400-\u9fff]/.test(value) || /[A-Za-z_]/.test(value.replace(/\b(?:Codex|DSH|DeepSeek|Gemini|Harness|MiB|KiB)\b/g, ''))) return fallback;
       return /请|重试|重新|检查|联系/.test(value) ? value : `${value}。请刷新后重试；仍然失败请联系维护者。`;
     }
 
@@ -98,14 +101,18 @@ window.__ModuleLoader__.load({
       } catch (_) { return null; }
     }
 
-    const reportPath = (jobId, offset) => `/output?job_id=${encodeURIComponent(jobId)}&offset=${offset}&limit=8000`;
-    async function loadReport(jobId, signal, read = api) {
+    const ARTIFACTS = [['report', '报告'], ['context', '任务书与验收'], ['review', '核验记录'], ['stderr', '错误日志']];
+    const reportPath = (jobId, offset, artifact = 'report') =>
+      `/output?job_id=${encodeURIComponent(jobId)}&offset=${offset}&limit=8000${artifact === 'report' ? '' : `&artifact=${artifact}`}`;
+    async function loadReport(jobId, signal, read = api, artifact = 'report') {
       const pages = [];
       let offset = 0, length = 0;
       while (true) {
-        const page = await read(reportPath(jobId, offset), signal);
+        const page = await read(reportPath(jobId, offset, artifact), signal);
         if (page.status === 'pending' || page.error_kind === 'artifact_pending') return { pages: [], report: null, pending: true };
         pages.push({ ...page, offset });
+        // 其他产物只按原文分页看，后续页点“下一页”时再读。
+        if (artifact !== 'report') return { pages, report: null, tooLarge: false };
         // Python offsets count Unicode code points, not bytes or JavaScript UTF-16 units.
         length += Array.from(page.text || '').length;
         if (page.total_chars > REPORT_LIMIT || length > REPORT_LIMIT) return { pages, report: null, tooLarge: true };
@@ -144,9 +151,22 @@ window.__ModuleLoader__.load({
         list('还没解决的事（Codex 原话）', report.unresolved));
     }
 
-    const fieldValue = (settings, key) => key.startsWith('gemini.')
-      ? settings.gemini?.[key.slice(7)] : settings[key];
+    // 嵌套设置在表单里用“父.子”作键。
+    const NESTED = ['gemini', 'autoResume'];
+    const nestedKey = (key) => NESTED.includes(key.split('.')[0]) && key.includes('.') ? key.split('.') : null;
+    const fieldValue = (settings, key) => nestedKey(key)
+      ? settings[nestedKey(key)[0]]?.[nestedKey(key)[1]] : settings[key];
     const displayValue = (value) => value == null ? '' : String(value);
+    // 留空提交 null，表示恢复默认；check 之外的输入给出 message。
+    const NUMBERS = {
+      timeoutSeconds: [(v) => v > 0, '超时秒数请填大于 0 的数字，或留空。'],
+      idleTimeoutSeconds: [(v) => v > 0, '超时秒数请填大于 0 的数字，或留空。'],
+      retries: [(v) => Number.isInteger(v) && v >= 0, '自动重试次数请填 0 或正整数，或留空。'],
+      maxRunningJobs: [(v) => Number.isInteger(v) && v > 0, '同时运行的任务数上限请填正整数，或留空。'],
+      lockTimeoutSeconds: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
+      maxStorageMb: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
+    };
+    const effectiveLength = (text) => Array.from(text.replace(/<!--[\s\S]*?-->/g, '').trim()).length;
 
     function settingsPatch(settings, edits) {
       const patch = {};
@@ -155,35 +175,38 @@ window.__ModuleLoader__.load({
         if (displayValue(raw) === displayValue(old)) continue;
         let value = raw;
         if (key === 'model' || key === 'gemini.model') {
-          if (!/^[A-Za-z0-9._/:-]{1,80}$/.test(value)) throw new Error('模型名请填 1 到 80 个字母、数字或 . _ / : -。');
+          // 空的 Codex 模型表示沿用 Codex 配置。
+          if (!(key === 'model' && value === '') && !/^[A-Za-z0-9._/:-]{1,80}$/.test(value)) throw new Error('模型名请填 1 到 80 个字母、数字或 . _ / : -；Codex 模型可留空。');
         } else if (['effort', 'readOnlyEffort', 'gemini.effort'].includes(key)) {
-          const allowed = key === 'gemini.effort' ? ['low', 'medium', 'high']
-            : key === 'readOnlyEffort' ? ['', ...EFFORTS.map(([v]) => v)] : EFFORTS.map(([v]) => v);
+          const allowed = key === 'gemini.effort' ? ['low', 'medium', 'high'] : ['', ...EFFORTS.map(([v]) => v)];
           if (!allowed.includes(value)) throw new Error('请从列表中选择思考程度。');
         } else if (key === 'serviceTier') {
           if (!['', 'fast', 'ultrafast'].includes(value)) throw new Error('请从列表中选择服务速度。');
         } else if (key === 'plannerReads') {
           if (!['open', 'products'].includes(value)) throw new Error('请选择规划端的读取范围。');
-        } else if (key === 'lockTimeoutSeconds' || key === 'maxStorageMb') {
-          value = Number(raw);
-          if (String(raw).trim() === '' || !Number.isFinite(value) || value <= 0) throw new Error('等待秒数和存储上限请填大于 0 的有限数字。');
-          if (value === old) continue;
+        } else if (NUMBERS[key]) {
+          const [check, message] = NUMBERS[key];
+          value = raw == null || String(raw).trim() === '' ? null : Number(raw);
+          if (value !== null && !(Number.isFinite(value) && check(value))) throw new Error(message);
+          if (value === (old ?? null)) continue;
         }
-        if (key.startsWith('gemini.')) {
-          if (settings.gemini) (patch.gemini ||= {})[key.slice(7)] = value;
+        const nested = nestedKey(key);
+        if (nested) {
+          if (settings[nested[0]]) (patch[nested[0]] ||= {})[nested[1]] = value;
         } else patch[key] = value;
       }
       return patch;
     }
 
     function mergeSettings(settings, changes = {}) {
-      return { ...settings, ...changes, ...(changes.gemini ? { gemini: { ...settings?.gemini, ...changes.gemini } } : {}) };
+      return { ...settings, ...changes, ...Object.fromEntries(NESTED.filter((key) => changes[key])
+        .map((key) => [key, { ...settings?.[key], ...changes[key] }])) };
     }
 
     function pendingPatch(settings, pending, edits) {
       const changes = pending?.changes || {};
-      const values = Object.fromEntries(Object.entries(changes).filter(([key]) => key !== 'gemini'));
-      for (const [key, value] of Object.entries(changes.gemini || {})) values[`gemini.${key}`] = value;
+      const values = Object.fromEntries(Object.entries(changes).filter(([key]) => !NESTED.includes(key)));
+      for (const parent of NESTED) for (const [key, value] of Object.entries(changes[parent] || {})) values[`${parent}.${key}`] = value;
       return settingsPatch(settings, { ...values, ...edits });
     }
 
@@ -202,10 +225,14 @@ window.__ModuleLoader__.load({
       return `等${reasons.length ? ` ${reasons.join('，并等 ')}` : '待确认 Codex 任务和 DeepSeek 会话均空闲'}后${action}。最长等 10 分钟${countdown == null ? '' : `，剩余 ${countdown} 秒`}；超时停止自动重载，保留待生效设置。`;
     }
 
-    function Status({ status, attention, errors = {}, messages = {}, busy = '', onRefresh, onReload, onCancel }) {
+    function Status({ status, attention, errors = {}, messages = {}, busy = '', doctor, onRefresh, onReload, onCancel, onDoctor }) {
       const runtime = status?.runtime;
       const pending = runtime?.pending_settings;
       const activeSettings = status?.settings;
+      const roots = activeSettings?.roots || [];
+      const unknownConfig = activeSettings?.unknownConfig || [];
+      const profileError = runtime?.profile_error ? '无法读取已保存的设置，请联系维护者检查设置文件后刷新。' : '';
+      const loadedError = runtime?.loaded_error ? '无法读取当前运行版本，请刷新；仍然失败请联系维护者。' : '';
       function statusRow(label, value, hint) {
         return h('div', { className: 'dcc-status', key: label }, h('div', null, h('strong', null, `${label}：`), value), h('small', null, hint));
       }
@@ -217,15 +244,13 @@ window.__ModuleLoader__.load({
       return h('section', { 'aria-label': '运行状态' },
           h('div', { className: 'dcc-row' }, h('h3', null, '运行状态'),
             h(Button, { size: 'sm', disabled: !!busy, onClick: onRefresh }, '刷新状态')),
-          h('p', { className: 'dcc-muted' }, '每 7 秒自动查看状态和任务。未保存的输入会保留。'),
+          h('p', { className: 'dcc-muted' }, '每 7 秒自动查看运行状态；任务、关注数和提示词约每 28 秒刷新，有任务在跑时任务列表每 7 秒刷新。未保存的输入会保留。'),
           h(Message, { text: errors.status, error: true }),
           errors.status && status ? h('small', null, '下面保留的是上次成功读取的状态。') : null,
           !status ? h('p', null, errors.status ? '暂时读不到运行状态。' : '正在读取运行状态…') : null,
           status ? h('div', null,
             statusRow('生效情况', runtimeState[0], runtimeState[1]),
             statusRow('正在运行的版本', runtime?.loaded?.version || '未读到', '这是本次运行实际使用的插件版本。'),
-            statusRow('加载时间', runtime?.loaded?.loadedAt ? new Date(runtime.loaded.loadedAt).toLocaleString('zh-CN') : '未读到', '这是当前运行版本的加载时间。'),
-            statusRow('已保存的版本', runtime?.source?.version || '未读到', '这是磁盘上可供下一次加载的插件版本。'),
             statusRow('当前模型', activeSettings ? activeSettings.model || '跟随 Codex 配置' : '未读到', '这是当前正在使用的模型，不包含待生效或未保存的修改。'),
             statusRow('思考程度', activeSettings ? EFFORTS.find(([value]) => value === activeSettings.effort)?.[1] || activeSettings.effort || '跟随 Codex 配置' : '未读到', '控制 Codex 做任务时思考得多深入。'),
             statusRow('速度档', activeSettings ? activeSettings.serviceTier || '跟随 Codex 配置' : '未读到', '使用 Codex 配置或账号支持的 fast、ultrafast 档位。'),
@@ -233,13 +258,24 @@ window.__ModuleLoader__.load({
             statusRow('规划端读取范围', activeSettings ? activeSettings.plannerReads === 'products' ? '只读 Codex 的产物' : '不限制读取' : '未读到', '这是当前正在生效的读取范围。'),
             statusRow('额外允许读取的路径', activeSettings ? `${activeSettings.plannerReadAllowCount ?? 0} 条` : '未读到', '这里只显示数量，需要修改时请编辑插件配置。'),
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
+            statusRow('护栏工作区', !activeSettings ? '未读到' : roots.includes('*') ? '所有会话' : roots.length ? roots.join('、') : '未启用护栏',
+              '在这些目录里的会话，规划端不能直接改文件，改动交给 Codex。'),
+            statusRow('主机访问', !activeSettings ? '未读到' : !activeSettings.allowHostAccess ? '未开启'
+              : activeSettings.defaultHostAccess ? '已开启且默认使用' : '已开启，需逐单指定', '主机访问让 Codex 能启动 Windows 程序。'),
+            activeSettings?.allowHostAccess ? h('p', { className: 'dcc-warn', role: 'status' },
+              `使用主机访问的任务里，Codex 不在沙箱内运行，对整台机器有完全访问权限${activeSettings.defaultHostAccess ? '；当前每一单默认使用。' : '。'}`) : null,
+            unknownConfig.length ? h(Message, { error: true, text: `未识别的配置项：${unknownConfig.join('、')}。这些配置没有生效，请核对拼写。` }) : null,
             statusRow('正在执行的任务', runtime?.active_tasks ?? '未读到', 'Codex 活任务数量；等空闲会同时等待 DeepSeek 会话的当前回合结束。'),
             statusRow('正在运行的 DeepSeek 会话回合', runtime?.active_sessions ?? '未读到', '统计所有会话中正在进行的回合，包括等待模型回复的会话。'),
             statusRow('最近 24 小时内需要关注的任务', attention ?? (errors.attention ? '未读到' : '正在读取…'), '只统计最近 24 小时内开始、需要你查看的任务。'),
             h(Message, { text: errors.attention, error: true }),
-            statusRow('重新加载', runtime?.can_reload ? '现在可以操作' : '暂时不能操作', '只有服务确认可以加载时，下面的按钮才可用。'),
-            statusRow('设置读取', runtime?.profile_error ? '无法读取已保存的设置，请联系维护者检查设置文件后刷新。' : '未发现错误', '读取已保存设置遇到的问题会显示在这里。'),
-            statusRow('运行版本读取', runtime?.loaded_error ? '无法读取当前运行版本，请刷新；仍然失败请联系维护者。' : '未发现错误', '读取当前运行版本遇到的问题会显示在这里。'),
+            h(Message, { text: profileError, error: true }), h(Message, { text: loadedError, error: true }),
+            h('details', null, h('summary', null, '更多运行信息'),
+              statusRow('加载时间', runtime?.loaded?.loadedAt ? new Date(runtime.loaded.loadedAt).toLocaleString('zh-CN') : '未读到', '这是当前运行版本的加载时间。'),
+              statusRow('已保存的版本', runtime?.source?.version || '未读到', '这是磁盘上可供下一次加载的插件版本。'),
+              statusRow('重新加载', runtime?.can_reload ? '现在可以操作' : '暂时不能操作', '只有服务确认可以加载时，下面的按钮才可用。'),
+              statusRow('设置读取', profileError ? '有错误，见上方提示' : '未发现错误', '读取已保存设置遇到的问题会显示在折叠外。'),
+              statusRow('运行版本读取', loadedError ? '有错误，见上方提示' : '未发现错误', '读取当前运行版本遇到的问题会显示在折叠外。')),
             runtime?.active_error ? h(Message, { error: true, text: '无法确认正在执行的任务数量，请刷新后重试；仍然失败请联系维护者。' }) : null,
             runtime?.sessions_error ? h(Message, { error: true, text: '无法确认正在运行的 DeepSeek 会话回合，不能执行等空闲重载。请刷新后重试；仍然失败请联系维护者。' }) : null) : null,
           runtime?.idle_wait ? h(Message, { error: runtime.idle_wait.status === 'timed_out',
@@ -253,7 +289,18 @@ window.__ModuleLoader__.load({
           h(Button, { variant: 'outline', disabled: !!busy || !!errors.status || !runtime?.can_reload,
             onClick: onReload }, busy === 'reload' ? '正在重新加载…' : '重新加载插件（等任务结束）'),
           h('small', null, '等 Codex 活任务和所有 DeepSeek 会话的当前一轮结束后重载，最长等 10 分钟；超时不强制重载，请重新请求。'),
-          h(Message, { text: messages.reload }), h(Message, { text: errors.reload, error: true }));
+          h(Message, { text: messages.reload }), h(Message, { text: errors.reload, error: true }),
+          onDoctor ? h('div', { className: 'dcc-actions' },
+            h(Button, { size: 'sm', disabled: !!busy, onClick: onDoctor }, '环境自检'),
+            h('small', null, '只读检查 Codex 运行环境，不启动任务；点一次查一次。'),
+            h(Message, { text: messages.doctor }), h(Message, { text: errors.doctor, error: true }),
+            doctor ? h('ul', { className: 'dcc-jobs', 'aria-label': '环境自检结果' }, ...(doctor.checks || []).map((check) => {
+              // 用 API Key 或自定义提供方时没有 auth.json，属于正常情况。
+              const hint = !check.ok && check.name === 'codex_auth';
+              return h('li', { key: check.name, className: check.ok || hint ? 'dcc-muted' : 'dcc-error' },
+                `${check.name}：${check.ok ? '通过' : hint ? '提示' : '未通过'}${check.detail ? ` — ${check.detail}` : ''}`,
+                hint ? h('small', null, '没有检测到登录文件；用 API Key 或自定义提供方时属于正常。') : null);
+            })) : null) : null);
     }
 
     function Report({ jobId, refreshKey, onClose, selftest }) {
@@ -263,6 +310,7 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('');
       const [loading, setLoading] = useState(true);
       const [revision, setRevision] = useState(0);
+      const [artifact, setArtifact] = useState('report');
       const life = useRef(null);
       const page = document?.pages[pageIndex];
       useEffect(() => {
@@ -272,12 +320,12 @@ window.__ModuleLoader__.load({
         setError('');
         setDocument(null);
         setPageIndex(0);
-        loadReport(jobId, controller.signal, selftest?.read || api)
+        loadReport(jobId, controller.signal, selftest?.read || api, artifact)
           .then((value) => { if (!controller.signal.aborted) setDocument(value); })
           .catch((err) => { if (!controller.signal.aborted) setError(userError(err.message)); })
           .finally(() => { if (!controller.signal.aborted) setLoading(false); });
         return () => controller.abort();
-      }, [jobId, revision]);
+      }, [jobId, revision, artifact]);
       useEffect(() => {
         if (document?.pending && !selftest) setRevision((value) => value + 1);
       }, [refreshKey]);
@@ -288,7 +336,7 @@ window.__ModuleLoader__.load({
         setLoading(true);
         setError('');
         try {
-          const next = await api(reportPath(jobId, page.next_offset), controller.signal);
+          const next = await api(reportPath(jobId, page.next_offset, artifact), controller.signal);
           if (!controller.signal.aborted) {
             setDocument((old) => ({ ...old, pages: [...old.pages, { ...next, offset: page.next_offset }] }));
             setPageIndex(pageIndex + 1);
@@ -303,9 +351,12 @@ window.__ModuleLoader__.load({
           h('strong', null, readable || pending ? '任务报告' : `任务报告 · 第 ${pageIndex + 1} 页`),
           document?.report ? h(Button, { size: 'sm', onClick: () => setRaw((value) => !value) }, raw ? '查看易读报告' : '查看原文') : null,
           h(Button, { size: 'sm', onClick: onClose }, '收起报告')),
+        selftest ? null : h('div', { className: 'dcc-row', role: 'group', 'aria-label': '查看内容' },
+          ...ARTIFACTS.map(([value, label]) => h(Button, { key: value, size: 'sm', variant: artifact === value ? 'primary' : 'ghost',
+            'aria-pressed': artifact === value, onClick: () => setArtifact(value) }, label))),
         h('small', null, `任务编号：${jobId}。${pending ? '' : readable ? '已读完报告。' : '原文每页最多 8000 字符，可翻页查看。'}`),
         document?.tooLarge ? h('small', null, '报告超过 262144 字符，仅提供原文分页。') : null,
-        document && !pending && !document.report && !document.tooLarge ? h('small', null, '这份报告不支持易读视图，以下显示原文。') : null,
+        document && !pending && !document.report && !document.tooLarge && artifact === 'report' ? h('small', null, '这份报告不支持易读视图，以下显示原文。') : null,
         h(Message, { text: error, error: true }),
         loading ? h('p', { role: 'status' }, '正在读取报告…') : null,
         pending ? h('p', { role: 'status', 'data-dcc-report-pending': true }, '这个任务还在运行，报告会在任务结束后生成。') : null,
@@ -326,8 +377,18 @@ window.__ModuleLoader__.load({
       const [filter, setFilter] = useState('all');
       const [jobOffsets, setJobOffsets] = useState([0]);
       const jobOffset = jobOffsets[jobOffsets.length - 1];
-      const [prompt, setPrompt] = useState(null);
-      const [promptDraft, setPromptDraft] = useState(null);
+      // 两份提示词（planner / executor）共用一套状态：已保存的原文、未保存的草稿、展开的备份列表。
+      const [prompts, setPrompts] = useState({});
+      const [drafts, setDrafts] = useState({});
+      const [backups, setBackups] = useState({});
+      const [injected, setInjected] = useState(null);
+      const [search, setSearch] = useState('');
+      const [searchDraft, setSearchDraft] = useState('');
+      const [gemini, setGemini] = useState(null);
+      const [doctor, setDoctor] = useState(null);
+      const [session, setSession] = useState({});
+      const [confirmSession, setConfirmSession] = useState(null);
+      const [sessionResults, setSessionResults] = useState(null);
       const [errors, setErrors] = useState({});
       const [messages, setMessages] = useState({});
       const [busy, setBusy] = useState('');
@@ -347,9 +408,10 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         const controller = new AbortController();
-        let timer;
+        let timer, round = 0, running = false;
         async function refresh() {
-          if (!mutation.current) {
+          // 页面不可见时不读取，只排下一轮；自检在离屏节点里只读一次，不受此限制。
+          if (!mutation.current && (selftest || !globalThis.document?.hidden)) {
             const version = generation.current;
             // A poll started before a save must not replace the newly saved values.
             const fresh = () => !controller.signal.aborted && version === generation.current && !mutation.current;
@@ -363,12 +425,24 @@ window.__ModuleLoader__.load({
                 if (fresh()) setErrors((old) => ({ ...old, [key]: userError(error.message) }));
               }
             }
+            // /jobs 和 /attention 各启动一次 wsl.exe：只有状态每轮读，其余首轮读、之后每 4 轮读一次；有任务在跑时任务列表每轮读。
+            const full = round++ % 4 === 0;
             const reads = [
-              read('status', '/status', setStatus),
-              read('settings', '/settings', setSettings),
-              read('jobs', `/jobs?filter=${filter}&offset=${jobOffset}`, setJobs),
-              read('prompt', '/prompt', (value) => setPrompt(value.text)),
-              read('attention', '/attention', (value) => setAttention(value.total)),
+              // /status 自带当前设置，表单不必等下一次完整读取。
+              read('status', '/status', (value) => { setStatus(value); if (value.settings) setSettings(value.settings); }),
+              full && read('settings', '/settings', setSettings),
+              (full || running) && read('jobs', `/jobs?filter=${filter}&offset=${jobOffset}${search ? `&q=${encodeURIComponent(search)}` : ''}`, (value) => {
+                running = value.jobs.some((job) => (job.execution_status || job.status) === 'running');
+                setJobs(value);
+              }),
+              full && read('prompt', '/prompt', (value) => {
+                setPrompts((old) => ({ ...old, planner: value.text }));
+                setInjected(value.injected ?? null);
+              }),
+              full && read('attention', '/attention', (value) => setAttention(value.total)),
+              // 自检只读原有的五个接口。
+              full && !selftest && read('executor', '/prompt?kind=executor', (value) => setPrompts((old) => ({ ...old, executor: value.text }))),
+              full && !selftest && read('gemini', '/gemini', (value) => setGemini(value.entries || [])),
             ];
             await Promise.all(reads);
           }
@@ -376,7 +450,7 @@ window.__ModuleLoader__.load({
         }
         refresh();
         return () => { controller.abort(); clearTimeout(timer); };
-      }, [filter, revision, jobOffset]);
+      }, [filter, revision, jobOffset, search]);
 
       useEffect(() => {
         if (!selftest || !['status', 'settings', 'jobs', 'prompt', 'attention'].every((key) => Object.hasOwn(errors, key))) return;
@@ -405,7 +479,8 @@ window.__ModuleLoader__.load({
           if (!controller.signal.aborted) success(value);
         } catch (err) {
           if (!controller.signal.aborted) {
-            if (err.saved && key === 'promptSave') { setPrompt(body.text); setPromptDraft(null); }
+            const kind = { promptSave: 'planner', executorSave: 'executor' }[key];
+            if (err.saved && kind) { setPrompts((old) => ({ ...old, [kind]: body.text })); setDrafts((old) => ({ ...old, [kind]: null })); }
             setErrors((old) => ({ ...old, [key]: err.saved
               ? `内容已保存，但后续处理没有完成：${userError(err.message)} 请查看运行状态，草稿已保留。`
               : userError(err.message) }));
@@ -413,6 +488,22 @@ window.__ModuleLoader__.load({
         } finally {
           mutation.current = false;
           if (!controller.signal.aborted) { setBusy(''); setRevision((v) => v + 1); }
+        }
+      }
+
+      // 点击才读一次的只读请求（备份、环境自检、最近结果）；不进轮询，自检渲染里不发。
+      async function fetchOnce(key, path, apply) {
+        if (selftest || !life.current) return;
+        const controller = life.current;
+        setErrors((old) => ({ ...old, [key]: '' }));
+        setMessages((old) => ({ ...old, [key]: '正在读取…' }));
+        try {
+          const value = await api(path, controller.signal);
+          if (!controller.signal.aborted) apply(value);
+        } catch (err) {
+          if (!controller.signal.aborted) setErrors((old) => ({ ...old, [key]: userError(err.message) }));
+        } finally {
+          if (!controller.signal.aborted) setMessages((old) => ({ ...old, [key]: '' }));
         }
       }
 
@@ -470,19 +561,82 @@ window.__ModuleLoader__.load({
             !options.some(([v]) => v === displayValue(value)) ? h('option', { value: displayValue(value), disabled: true }, value ? '当前值不在列表中，请重新选择' : '请选择') : null,
             ...options.map(([v, label]) => h('option', { key: v, value: v }, label)))
           : h(Input, { value: displayValue(value), disabled: !!busy,
-            type: key === 'lockTimeoutSeconds' || key === 'maxStorageMb' ? 'number' : 'text',
-            ...(['lockTimeoutSeconds', 'maxStorageMb'].includes(key) ? { min: 0, step: 'any' } : { maxLength: 80, spellCheck: false }),
+            type: NUMBERS[key] ? 'number' : 'text',
+            ...(NUMBERS[key] ? { min: 0, step: 'any' } : { maxLength: 80, spellCheck: false }),
             onChange: (event) => edit(key, event.target.value) });
         return h('label', { className: 'dcc-field', key }, h('span', null, label), control, h('small', null, hint));
       }
       const executionText = { running: '运行中', completed: '已结束', failed: '执行失败', cancelled: '已取消', unknown: '状态待确认' };
       const pageJobs = jobs?.jobs ?? [];
-      const promptValue = promptDraft === null ? prompt ?? '' : promptDraft;
-      const promptDirty = prompt !== null && promptValue !== prompt;
+      const verificationText = { unreviewed: '未核验', verified: '已通过', needs_changes: '待修正', accepted_deviations: '已接受偏差', invalid: '记录异常' };
+      const phaseText = { lock_wait: '排队等待目录写锁', codex_running: 'Codex 执行中', codex_reconnecting: '正在重连' };
+      const when = (value) => new Date(value).toLocaleString('zh-CN');
+
+      // 规划提示词和给 Codex 的固定要求共用这一段界面；planner 沿用原有的请求体。
+      function promptSection(kind, title, intro, label, longHint) {
+        const readKey = kind === 'planner' ? 'prompt' : 'executor', saveKey = `${readKey}Save`, backupKey = `${readKey}Backups`;
+        const saved = prompts[kind] ?? null, draft = drafts[kind] ?? null;
+        const value = draft === null ? saved ?? '' : draft;
+        const dirty = saved !== null && value !== saved;
+        const count = effectiveLength(value);
+        const list = backups[kind];
+        const setDraft = (text) => setDrafts((old) => ({ ...old, [kind]: text }));
+        return h('section', { 'aria-label': title }, h('h3', null, title),
+          h('p', { className: 'dcc-muted' }, intro),
+          h(Message, { text: errors[readKey], error: true }),
+          kind === 'planner' && injected !== null ? h('small', null, injected ? '已注入系统提示词。'
+            : '未注入系统提示词：宿主没有提供系统提示词服务，这段内容当前不会生效。') : null,
+          h('label', { className: 'dcc-field' }, h('span', null, label),
+            h('textarea', { value, disabled: saved === null || !!busy,
+              placeholder: saved === null ? (errors[readKey] ? '暂时无法读取。' : '正在读取…') : '在这里填写，也可以留空。',
+              onChange: (event) => { setDraft(event.target.value); setMessages((old) => ({ ...old, [saveKey]: '' })); setErrors((old) => ({ ...old, [saveKey]: '' })); } })),
+          h('small', null, `有效字数：${count}（不含注释和首尾空白）`),
+          count > 4000 ? h(Message, { text: longHint }) : null,
+          h('div', { className: 'dcc-row dcc-actions' },
+            h(Button, { variant: 'primary', disabled: !!busy || !dirty,
+              onClick: () => mutate(saveKey, '/prompt', kind === 'planner' ? { text: value } : { text: value, kind }, () => {
+                setPrompts((old) => ({ ...old, [kind]: value })); setDraft(null);
+                setBackups((old) => ({ ...old, [kind]: null }));
+                setMessages((old) => ({ ...old, [saveKey]: `${title}已保存。` }));
+              }) }, busy === saveKey ? '正在保存…' : `保存${title}`),
+            h(Button, { disabled: !!busy || !dirty, onClick: () => { setDraft(null); setErrors((old) => ({ ...old, [saveKey]: '' })); } },
+              kind === 'planner' ? '放弃提示词更改' : '放弃固定要求的更改'),
+            dirty ? h('small', null, kind === 'planner' ? '有未保存的提示词。' : '有未保存的固定要求。') : null),
+          h(Message, { text: messages[saveKey] }), h(Message, { text: errors[saveKey], error: true }),
+          h('div', { className: 'dcc-actions' },
+            h(Button, { size: 'sm', disabled: saved === null, onClick: () => list ? setBackups((old) => ({ ...old, [kind]: null }))
+              : fetchOnce(backupKey, `/prompt/backups?kind=${kind}`, (result) => setBackups((old) => ({ ...old, [kind]: result.backups || [] }))) },
+            list ? '收起历史备份' : '查看历史备份'),
+            h('small', null, '每次保存前自动备份，保留最近 10 份。'),
+            h(Message, { text: messages[backupKey] }), h(Message, { text: errors[backupKey], error: true }),
+            list && !list.length ? h('p', null, '还没有历史备份。') : null,
+            list?.length ? h('ul', { className: 'dcc-jobs', 'aria-label': `${title}的历史备份` }, ...list.map((backup) =>
+              h('li', { key: backup.name, className: 'dcc-job' },
+                h('small', null, `${when(backup.savedAt)} · ${backup.size} 字节`),
+                h(Button, { size: 'sm', disabled: !!busy,
+                  onClick: () => fetchOnce(backupKey, `/prompt/backup?kind=${kind}&name=${encodeURIComponent(backup.name)}`, (result) => {
+                    setDraft(result.text);
+                    setMessages((old) => ({ ...old, [saveKey]: '已把备份内容放进编辑框，核对后点保存才会生效。' }));
+                  }) }, '载入到编辑框')))) : null));
+      }
+
+      const sessionField = (key, label, props = {}, control = Input) => h('label', { className: 'dcc-field' }, h('span', null, label),
+        h(control, { value: session[key] || '', disabled: !!busy, spellCheck: false, ...props,
+          onChange: (event) => { setConfirmSession(null); setSession((old) => ({ ...old, [key]: event.target.value })); } }));
+      const sessionSubmit = (key, path, body) => mutate(key, path, body, () => {
+        setConfirmSession(null);
+        setMessages((old) => ({ ...old, [key]: '请求已提交，稍后点“查看最近结果”确认处理情况。' }));
+      });
+      const sessionIds = (session.resumeIds || '').split(/[\s,，、]+/).filter(Boolean);
+      const resultLines = (label, value) => !value ? [`${label}：暂无结果`]
+        : [`${label}（${value.completedAt ? when(value.completedAt) : '时间未知'}）${value.status ? `：${value.status}${value.reason ? ` / ${value.reason}` : ''}` : ''}${value.error ? ` / ${value.error}` : ''}`,
+          ...(Array.isArray(value.sessions) ? value.sessions.map((entry) =>
+            `${entry.sessionId}：${entry.status} / ${entry.reason}${entry.error ? ` / ${entry.error}` : ''}`) : value.sessionId ? [`会话 ${value.sessionId}`] : [])];
 
       return h('div', { className: 'dcc-panel' },
         h('style', null, CSS),
-        h(Status, { status, attention, errors, messages, busy, onRefresh: () => setRevision((v) => v + 1),
+        h(Status, { status, attention, errors, messages, busy, doctor, onRefresh: () => setRevision((v) => v + 1),
+          onDoctor: selftest ? undefined : () => fetchOnce('doctor', '/doctor', setDoctor),
           onCancel: () => cancelPending(), onReload: () => mutate('reload', '/reload', {}, (value) => {
             setStatus((old) => ({ ...old, runtime: { ...old?.runtime, ...value } }));
             const text = { reloaded: '已重新加载，正在刷新运行状态。', already_current: '当前已经是已保存的版本。',
@@ -497,12 +651,16 @@ window.__ModuleLoader__.load({
           h(Message, { text: errors.settings, error: true }),
           settings ? h('div', null,
             h('div', { className: 'dcc-grid' },
-              field('model', 'Codex 模型', '填写要使用的模型名。'),
-              field('effort', '执行时的思考程度', '越高通常想得越久，也可能花更多时间。', EFFORTS),
+              field('model', 'Codex 模型', '填写要使用的模型名；留空则沿用 Codex 配置。'),
+              field('effort', '执行时的思考程度', '越高通常想得越久，也可能花更多时间。', [['', '跟随 Codex 配置'], ...EFFORTS]),
               field('readOnlyEffort', '只读任务的思考程度', '用于查看代码、分析和复核。', [['', '跟随执行设置'], ...EFFORTS]),
               field('serviceTier', '速度档', '跟随 Codex 配置，或使用账号支持的加速档位。', [['', '跟随 Codex 配置'], ['fast', 'fast'], ['ultrafast', 'ultrafast']]),
-              field('lockTimeoutSeconds', '等待其他任务的秒数', '要修改同一目录时，最多等其他任务多久；未设置时可留空。'),
-              field('maxStorageMb', '任务记录占用空间上限（MiB）', '超过上限时会清理最旧的已结束任务记录；未设置时可留空。'),
+              field('timeoutSeconds', '每次尝试的总超时秒数', 'Codex 的一次尝试最多跑多久；留空表示沿用默认。'),
+              field('idleTimeoutSeconds', '空闲超时秒数', 'Codex 多久没有动静就判定卡住；留空表示沿用默认。'),
+              field('retries', '自动重试次数', '连接出问题时最多自动重试几次，可填 0；留空表示沿用默认。'),
+              field('maxRunningJobs', '同时运行的任务数上限', '达到上限后不再启动新任务；留空表示不限制。'),
+              field('lockTimeoutSeconds', '等待其他任务的秒数', '要修改同一目录时，最多等其他任务多久；留空表示不限制，一直等。'),
+              field('maxStorageMb', '任务记录占用空间上限（MiB）', '超过上限时会清理最旧的已结束任务记录；留空表示不限制。'),
               settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,
               settings.gemini ? field('gemini.effort', 'Gemini 思考程度', 'Gemini 支持低、中、高三档。', EFFORTS.slice(0, 3)) : null),
             h('div', { className: 'dcc-actions' },
@@ -514,6 +672,11 @@ window.__ModuleLoader__.load({
                 checked: (Object.hasOwn(edits, 'plannerReads') ? edits.plannerReads : editingSettings.plannerReads) === 'products',
                 disabled: !!busy, onChange: (value) => edit('plannerReads', value ? 'products' : 'open') }),
               h('small', null, '打开后，源码和资料交给 Codex 去读，规划端只看产物；需要核对内容时也交给 Codex。')),
+            h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '重启后自动续接',
+                checked: (Object.hasOwn(edits, 'autoResume.enabled') ? edits['autoResume.enabled'] : editingSettings.autoResume?.enabled) !== false,
+                disabled: !!busy, onChange: (value) => edit('autoResume.enabled', value) }),
+              h('small', null, 'Harness 重启后，自动接着做上次被打断的会话。')),
             h(Message, { text: validation, error: true }),
             h('div', { className: 'dcc-row dcc-actions' },
               h(Button, { variant: 'primary', disabled: !!busy || (!dirty && !(pending?.error && !pending.awaiting_load)) || !!validation,
@@ -537,15 +700,31 @@ window.__ModuleLoader__.load({
               h(Button, { key: value, size: 'sm', variant: filter === value ? 'primary' : 'ghost', 'aria-pressed': filter === value,
                 onClick: () => { if (value !== filter) { setFilter(value); selectJobPage([0]); } } }, label)),
             h('small', null, '“待关注”包含历史任务')),
+          h('div', { className: 'dcc-row' },
+            h(Input, { value: searchDraft, placeholder: '任务编号或会话编号', 'aria-label': '搜索任务', maxLength: 100, spellCheck: false,
+              onChange: (event) => setSearchDraft(event.target.value) }),
+            h(Button, { size: 'sm', disabled: searchDraft.trim() === search,
+              onClick: () => { setSearch(searchDraft.trim()); selectJobPage([0]); } }, '搜索'),
+            search ? h(Button, { size: 'sm', onClick: () => { setSearch(''); setSearchDraft(''); selectJobPage([0]); } }, '清除搜索') : null),
           h('small', null, jobs ? `第 ${jobOffsets.length} 页，共 ${jobs.total} 项，本页 ${pageJobs.length} 项。` : errors.jobs ? '暂时读不到任务。' : '正在读取任务…'),
           h(Message, { text: errors.jobs, error: true }),
           jobs && !pageJobs.length ? h('p', null, '本页没有任务。') : null,
           h('ul', { className: 'dcc-jobs' }, ...pageJobs.map((job) => {
             const running = (job.execution_status || job.status) === 'running';
+            const counts = job.criteria_counts;
+            // 只显示任务记录里实际有的信息。
+            const facts = [job.owner && `会话 ${job.owner}`, job.cwd && `目录 ${job.cwd}`,
+              job.duration_s != null && `耗时 ${Math.round(job.duration_s)} 秒`,
+              !running && counts && `验收 ${counts.met} 通过 / ${counts.not_met} 未通过 / ${counts.blocked} 受阻`,
+              job.error_kind && `失败原因 ${job.error_kind}`,
+              job.verification_status && `独立核验 ${verificationText[job.verification_status] || job.verification_status}`,
+              running && job.phase && `当前阶段 ${phaseText[job.phase] || job.phase}${job.attempt ? `（第 ${job.attempt} 轮）` : ''}`,
+              running && job.updated_at && `最近活动 ${when(job.updated_at * 1000)}`].filter(Boolean);
             return h('li', { key: job.job_id, className: 'dcc-job' },
               h('strong', null, job.title || '未填写任务标题'),
               h('small', null, `${executionText[job.execution_status || job.status] || '状态待确认'}${job.needs_attention ? ' · 需要关注' : ''} · ${new Date(job.started_at * 1000).toLocaleString('zh-CN')}`),
               h('small', null, `任务编号：${job.job_id}`),
+              facts.length ? h('small', null, facts.join(' · ')) : null,
               h('div', { className: 'dcc-row' },
                 h(Button, { size: 'sm', onClick: () => setReportJob(job.job_id) }, '查看报告'),
                 running ? h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmJob(job.job_id) }, '取消任务') : null),
@@ -571,22 +750,68 @@ window.__ModuleLoader__.load({
           reportJob ? h(Report, { key: reportJob, jobId: reportJob, refreshKey: jobs,
             onClose: () => setReportJob(null), selftest }) : null),
 
-        h('section', { 'aria-label': '规划提示词' }, h('h3', null, '规划提示词'),
-          h('p', { className: 'dcc-muted' }, '填写给 DeepSeek 的要求，例如怎样安排任务、判断做完没有。自动刷新不会覆盖正在编辑的草稿。'),
-          h(Message, { text: errors.prompt, error: true }),
-          h('label', { className: 'dcc-field' }, h('span', null, '给 DeepSeek 的具体要求'),
-            h('textarea', { value: promptValue, disabled: prompt === null || !!busy,
-              placeholder: prompt === null ? '正在读取规划提示词…' : '在这里填写规划要求，也可以留空。',
-              onChange: (event) => { setPromptDraft(event.target.value); setMessages((old) => ({ ...old, promptSave: '' })); setErrors((old) => ({ ...old, promptSave: '' })); } })),
-          h('div', { className: 'dcc-row dcc-actions' },
-            h(Button, { variant: 'primary', disabled: !!busy || !promptDirty,
-              onClick: () => mutate('promptSave', '/prompt', { text: promptValue }, () => {
-                setPrompt(promptValue); setPromptDraft(null);
-                setMessages((old) => ({ ...old, promptSave: '规划提示词已保存。' }));
-              }) }, busy === 'promptSave' ? '正在保存提示词…' : '保存规划提示词'),
-            h(Button, { disabled: !!busy || !promptDirty, onClick: () => { setPromptDraft(null); setErrors((old) => ({ ...old, promptSave: '' })); } }, '放弃提示词更改'),
-            promptDirty ? h('small', null, '有未保存的提示词。') : null),
-          h(Message, { text: messages.promptSave }), h(Message, { text: errors.promptSave, error: true })));
+        settings?.gemini ? h('section', { 'aria-label': 'Gemini 写作记录' }, h('h3', null, 'Gemini 写作记录'),
+          h(Message, { text: errors.gemini, error: true }),
+          !gemini ? h('p', null, errors.gemini ? '暂时读不到写作记录。' : '正在读取写作记录…') : !gemini.length ? h('p', null, '还没有写作记录。')
+            : h('ul', { className: 'dcc-jobs' }, ...gemini.map((entry, i) => h('li', { key: i, className: 'dcc-job' },
+              h('strong', null, entry.output || '未记录目标文件'),
+              h('small', null, [entry.status === 'completed' ? '成功' : '失败', entry.at && when(entry.at),
+                entry.chars != null && `${entry.chars} 字`].filter(Boolean).join(' · ')),
+              entry.error ? h('p', { className: 'dcc-error' }, `失败原因：${entry.error}`) : null,
+              entry.draft_path ? h('small', null, `草稿：${entry.draft_path}`) : null)))) : null,
+
+        promptSection('planner', '规划提示词', '填写给 DeepSeek 的要求，例如怎样安排任务、判断做完没有。自动刷新不会覆盖正在编辑的草稿。',
+          '给 DeepSeek 的具体要求', '这段内容每个会话每一步都会带上，超过 4000 字会明显占用上下文，建议精简。'),
+        selftest ? null : promptSection('executor', '给 Codex 的固定要求', '这里的内容会附在每一单交给 Codex 的任务书后面，Codex 每单都会看到；不增加权限。',
+          '附在每一单任务书后面的内容', '这段内容每一单任务书都会带上，超过 4000 字建议精简。'),
+
+        selftest ? null : h('section', { 'aria-label': '会话操作' },
+          h('details', null, h('summary', null, h('h3', { style: { display: 'inline' } }, '会话操作')),
+            h('p', { className: 'dcc-muted' }, '通过本机请求文件交给插件处理；提交后不会立刻有结果，请用“查看最近结果”确认。'),
+            h('div', { className: 'dcc-grid' },
+              h('div', null,
+                sessionField('sendId', '发送到的会话编号', { maxLength: 100 }),
+                sessionField('sendMessage', '要发送的消息', { className: 'dcc-short', maxLength: 4000 }, 'textarea'),
+                h(Checkbox, { label: '会话正在运行时排到它的下一轮', checked: session.sendQueue === true, disabled: !!busy,
+                  onChange: (value) => { setConfirmSession(null); setSession((old) => ({ ...old, sendQueue: value })); } }),
+                h('div', { className: 'dcc-actions' }, h(Button, { size: 'sm', disabled: !!busy || !session.sendId || !(session.sendMessage || '').trim(),
+                  onClick: () => setConfirmSession('send') }, '向会话发送消息')),
+                confirmSession === 'send' ? h('div', { className: 'dcc-confirm' },
+                  h('p', null, '确定发送吗？这会以用户身份向该会话提交这条消息，会话会照这条消息继续工作。'),
+                  h('div', { className: 'dcc-row' },
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => sessionSubmit('sessionSend', '/session/send',
+                      { sessionId: session.sendId, message: session.sendMessage, ...(session.sendQueue ? { queue: true } : {}) }) }, '确认发送'),
+                    h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不发送'))) : null,
+                h(Message, { text: messages.sessionSend }), h(Message, { text: errors.sessionSend, error: true })),
+              h('div', null,
+                sessionField('resumeIds', '要续接的会话编号', { placeholder: '多个用空格或逗号分隔，最多 20 个' }),
+                sessionField('resumeMessage', '续接时发送的话', { placeholder: '留空用“继续”', maxLength: 2000 }),
+                h('div', { className: 'dcc-actions' }, h(Button, { size: 'sm', disabled: !!busy || !sessionIds.length,
+                  onClick: () => sessionSubmit('sessionResume', '/session/resume',
+                    { sessions: sessionIds, ...(session.resumeMessage ? { message: session.resumeMessage } : {}) }) }, '续接被中断的会话')),
+                h('small', null, '只处理被中断或被拒绝后停下的会话，正常结束的会话会跳过。'),
+                h(Message, { text: messages.sessionResume }), h(Message, { text: errors.sessionResume, error: true })),
+              h('div', null,
+                sessionField('goalId', '要改 Goal 的会话编号', { maxLength: 100 }),
+                sessionField('goalObjective', '新的目标', { className: 'dcc-short', placeholder: '留空表示不改目标' }, 'textarea'),
+                sessionField('goalRounds', '新的轮数上限', { type: 'number', min: 1, step: 1, placeholder: '留空表示不改' }),
+                h('div', { className: 'dcc-actions' }, h(Button, { size: 'sm',
+                  disabled: !!busy || !session.goalId || (!(session.goalObjective || '').trim() && !session.goalRounds),
+                  onClick: () => setConfirmSession('goal') }, '修改会话 Goal')),
+                confirmSession === 'goal' ? h('div', { className: 'dcc-confirm' },
+                  h('p', null, '确定修改吗？这会以用户身份改写该会话当前 Goal 的目标或轮数上限。'),
+                  h('div', { className: 'dcc-row' },
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => sessionSubmit('sessionGoal', '/session/goal',
+                      { sessionId: session.goalId, ...((session.goalObjective || '').trim() ? { objective: session.goalObjective } : {}),
+                        ...(session.goalRounds ? { maxGoalRounds: Number(session.goalRounds) } : {}) }) }, '确认修改'),
+                    h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不修改'))) : null,
+                h(Message, { text: messages.sessionGoal }), h(Message, { text: errors.sessionGoal, error: true }))),
+            h('div', { className: 'dcc-actions' },
+              h(Button, { size: 'sm', onClick: () => fetchOnce('sessionResults', '/session/results', setSessionResults) }, '查看最近结果'),
+              h(Message, { text: messages.sessionResults }), h(Message, { text: errors.sessionResults, error: true }),
+              sessionResults ? h('pre', { className: 'dcc-report', 'aria-label': '最近的会话操作结果' },
+                [['发送消息', 'send'], ['续接会话', 'resume'], ['修改 Goal', 'goal'], ['重启后自动续接', 'autoresume']]
+                  .flatMap(([label, key]) => resultLines(label, sessionResults[key])).join('\n')) : null))));
     }
 
     function collectSelftest(node, http, errors, timedOut) {

@@ -1115,8 +1115,9 @@ test('auto resume watcher: shutdown after successful submission preserves pendin
   assert.equal(f.messages.length, 1);
   assert.deepEqual(f.saved().sessions.map(({ basis, ...entry }) => entry),
     [row(agent.id, 'message_submitted', 'message')]);
-  assert.deepEqual(shutdownSnapshot, { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: [], pending: [agent.id] });
-  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')), shutdownSnapshot);
+  assert.deepEqual(shutdownSnapshot, { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: [], interrupted: true, pending: [agent.id] });
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')), { ...shutdownSnapshot, resumed: [agent.id] },
+    'the submitted session is recorded without dropping the shutdown list');
   assert.deepEqual(f.warnings, []);
 });
 
@@ -1320,6 +1321,68 @@ test('resume watcher: root shutdown aborts only automatic scanning; manual reque
   assert.equal(fs.existsSync(f.file('resume-request.json')), true);
 });
 
+test('auto resume: a scan cut short by a hot reload is finished by the next instance without resubmitting', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-done');
+  f.add('session-cut');
+  f.add('session-marked', [start(), interrupted()]);
+  fs.writeFileSync(f.file('autoresume-state.json'), JSON.stringify({ hostProcess: 'previous-host:1', resumed: [], pending: ['session-marked'] }));
+  const state = () => JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8'));
+  const hostProcess = `${process.pid}:${performance.timeOrigin}`;
+  const reasons = result => result.sessions.map(({ sessionId, reason }) => [sessionId, reason]);
+  const controller = new AbortController();
+  const resolve = f.services.sessionController.resolveAgent;
+  f.services.sessionController.resolveAgent = async (id) => {
+    if (id === 'session-cut') controller.abort(); // the reload lands in the middle of the scan
+    return resolve(id);
+  };
+  const first = await processAutoResume({ ...f, signal: controller.signal });
+  assert.equal(first.status, 'stopped');
+  assert.deepEqual(reasons(first), [['session-done', 'message_submitted'], ['session-cut', 'unloaded']]);
+  assert.deepEqual(state(), { hostProcess, resumed: ['session-done'], previousPending: ['session-marked'], interrupted: true },
+    'the shutdown list and the unfinished scan survive the reload');
+  f.services.sessionController.resolveAgent = resolve;
+  const second = await processAutoResume({ ...f, signal: new AbortController().signal });
+  assert.equal(second.status, 'processed');
+  assert.deepEqual(reasons(second),
+    [['session-done', 'already_resumed'], ['session-cut', 'message_submitted'], ['session-marked', 'message_submitted']]);
+  assert.deepEqual(f.messages.map(({ id }) => id), ['session-done', 'session-cut', 'session-marked'], 'each session is submitted once');
+  assert.deepEqual(state(), { hostProcess, resumed: ['session-done', 'session-cut', 'session-marked'] });
+  assert.equal(await processAutoResume({ ...f, signal: new AbortController().signal }), undefined, 'a finished scan is never repeated');
+  assert.equal(f.messages.length, 3);
+});
+
+test('auto resume watcher: an instance loaded while the old scan is still unwinding finishes it exactly once', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-reload');
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  const list = f.services.sessionQuery.listSessions;
+  let paused = false;
+  f.services.sessionQuery.listSessions = async () => {
+    const records = await list();
+    if (!paused) { paused = true; entered.resolve(); await release.promise; }
+    return records;
+  };
+  t.after(() => release.resolve());
+  const old = watchFixture(t, f);
+  f.ready();
+  await entered.promise;
+  old.dispose();
+  const reloaded = watchFixture(t, f);
+  f.ready();
+  await reloaded.check();
+  assert.equal(f.messages.length, 1, 'the reloaded instance finishes the interrupted scan');
+  release.resolve();
+  await old.check();
+  assert.equal(f.messages.length, 1, 'the unwinding old scan submits nothing');
+  assert.equal(f.saved().status, 'processed', 'and leaves the finished result in place');
+  assert.deepEqual(JSON.parse(fs.readFileSync(f.file('autoresume-state.json'), 'utf8')),
+    { hostProcess: `${process.pid}:${performance.timeOrigin}`, resumed: ['session-reload'] });
+  f.ready();
+  await reloaded.check();
+  assert.equal(f.calls.filter(([op]) => op === 'list').length, 2);
+});
+
 function autoWakeFixture(t, enabled = true) {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const bus = new EventEmitter();
@@ -1508,6 +1571,23 @@ test('auto wake: failed wake calls are contained and still consume the finite bu
   assert.equal(attempts, 2);
   assert.equal(f.warnings.filter(text => text.includes('自动唤醒失败')).length, 2);
   assert.equal(f.warnings.filter(text => text.includes('自动唤醒已用尽')).length, 1);
+});
+
+test('auto wake: a normal ending forgets only a consumed batch, so a still-queued notice is woken after a later blocked turn', async t => {
+  for (const consumed of [false, true]) await t.test(consumed ? 'consumed' : 'still queued', t => {
+    const f = autoWakeFixture(t);
+    const notice = f.notice({ target: 'nextTurn' });
+    if (consumed) f.inbox.nextTurn.splice(0, 1, { id: 'unrelated-input' });
+    f.endTurn('completed');
+    f.tick(60_000);
+    assert.equal(f.wakes.length, 0, 'a normal ending never wakes by itself');
+    f.agent.status = 'running';
+    f.event({ type: 'turn/start', data: {} });
+    f.endTurn();
+    f.tick(1000);
+    assert.deepEqual(f.wakes, consumed ? [] : [[notice]]);
+    assert.deepEqual(f.messages, []);
+  });
 });
 
 test('auto wake: configuration disables all automatic attempts', t => {

@@ -69,6 +69,11 @@ FAKE_CODEX = textwrap.dedent(r"""
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         time.sleep(300)
+    elif mode == "hang_with_detached_child":
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        (state / "child.pid").write_text(str(child.pid))
+        time.sleep(300)
     elif mode == "hang_after_completed":
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
@@ -108,6 +113,11 @@ FAKE_CODEX = textwrap.dedent(r"""
         finish()
     elif mode == "permanent":
         say(type="turn.failed", error={"message": "401 Unauthorized"})
+        sys.exit(1)
+    elif mode == "refused_turn":
+        say(type="thread.started", thread_id="THREAD-REFUSED")
+        say(type="turn.failed", error={"message": "This content was flagged for possible example risk. "
+                                                  "If this seems wrong, try rephrasing your request."})
         sys.exit(1)
     elif mode == "bad_request":
         say(type="thread.started", thread_id="THREAD-BAD")
@@ -743,6 +753,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["attempts"], 2)
         self.assertNotIn("resume", self.calls()[1]["argv"])
         self.assertNotIn("usage_scope", r)
+
+    def test_model_refusal_reported_as_a_failed_turn_is_model_refused(self):
+        r = self.invoke(mode="refused_turn")
+        self.assertEqual(r["error_kind"], "model_refused")
+        self.assertEqual(r["attempts"], 1)
+        self.assertFalse(r["retryable"])
 
     def test_upstream_bad_request_gets_its_own_kind_and_is_not_retried(self):
         r = self.invoke(mode="bad_request")
@@ -3655,6 +3671,119 @@ class RunnerTests(unittest.TestCase):
                 codex_runner.prune_old(subdir)
                 self.assertEqual(sorted(d.name for d in (codex_runner.HOME / subdir).iterdir()),
                                  ["orphan", "queued", "recent-log", "running"])
+
+    def test_unpaired_surrogates_neither_break_start_nor_lose_the_result(self):
+        schema = RUNNER.parents[1] / "report.v2.schema.json"
+        report = self.sample_report(blockers=[], criteria=[{"criterion": "Criterion one", "status": "met",
+                                                            "evidence": "half \ud83d emoji"}])
+        report_file = Path(self.tmp.name) / "report.txt"
+        report_file.write_text(json.dumps(report), encoding="utf-8")  # ASCII: the surrogate stays a \ud83d escape
+        envelope = json.dumps({"prompt": "do \ud83d it", "context": self.sample_context()})
+        job = self.invoke("--context-json", "--schema", str(schema), command="start", mode="fixture_report",
+                          prompt=envelope, env={"FAKE_REPORT": str(report_file)})
+        done = self.control("status", job["job_id"], "--wait", "30")
+        self.assertEqual(done["status"], "completed", done)
+        self.assertEqual(done["structured"], report)
+        self.assertEqual(self.calls()[-1]["prompt"], "do \ufffd it")
+
+    def test_worker_saves_a_result_when_finalization_fails(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        jd = self.stored_job("finalize", None, sandbox="workspace-write")
+        (jd / "prompt.txt").write_text("do it")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(sys, "argv", [str(RUNNER), "_worker", "finalize"]), \
+                mock.patch.object(codex_runner, "execute", return_value={"status": "completed", "thread_id": "thread-9"}), \
+                mock.patch.object(codex_runner, "review_summary", side_effect=RuntimeError("boom")):
+            codex_runner.main()
+        saved = json.loads((jd / "result.json").read_text("utf-8"))
+        self.assertEqual((saved["status"], saved["error_kind"], saved["retryable"]), ("failed", "runner_error", False))
+        self.assertEqual(saved["thread_id"], "thread-9")
+        self.assertIn("'completed'", saved["error"])
+        self.assertIn("boom", saved["error"])
+
+    def test_unreadable_overlapping_record_keeps_the_writer_waiting(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        child = self.cwd / "child"
+        child.mkdir()
+        self.stored_job("owner", None, sandbox="workspace-write")
+        waiter = self.stored_job("waiter", None, cwd=str(child), sandbox="workspace-write")
+        roots = codex_runner.write_lock_roots(str(child), "workspace-write", None)
+        # A record vanishing mid-read may belong to a live writer; a corrupt one never becomes readable.
+        for error, waits in ((FileNotFoundError("codex.pid"), True), (ValueError("corrupt pid"), False)):
+            with self.subTest(error=error), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(codex_runner, "recorded_pid", side_effect=error):
+                self.assertEqual(codex_runner.earlier_writer_waiting(waiter, roots), waits)
+
+    def test_storage_limit_keeps_the_jobs_the_new_task_refers_to(self):
+        for name in ("target", "parent", "other"):
+            d = self.stored_job(name, {"status": "completed"})
+            (d / "events.jsonl").write_bytes(b"x" * 8192)
+        context = {**self.sample_context(), "verification_of": "target",
+                   "continuation": {"parent_job_id": "parent", "answers": [], "resolution": "go on"}}
+        result = self.invoke("--context-json", "--max-storage-mb", "0.001",
+                             prompt=json.dumps({"prompt": "do it", "context": context}))
+        self.assertEqual(result["status"], "completed", result)
+        jobs = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs"
+        self.assertEqual(sorted(d.name for d in jobs.iterdir()), ["parent", "target"])
+
+    def test_status_and_list_report_a_repaired_final_message(self):
+        self.stored_job("repaired", {"status": "completed", "structured": self.sample_report(),
+                                     "final_message_repaired": ["invalid_escape"]})
+        self.stored_job("plain", {"status": "completed", "structured": self.sample_report()})
+        self.assertEqual(self.control("status", "repaired")["final_message_repaired"], ["invalid_escape"])
+        jobs = {j["job_id"]: j for j in self.control("list")["jobs"]}
+        self.assertEqual(jobs["repaired"]["final_message_repaired"], ["invalid_escape"])
+        self.assertNotIn("final_message_repaired", jobs["plain"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "walks the Linux /proc parent chain")
+    def test_timeout_kills_descendants_that_left_the_process_group(self):
+        bystander = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True)
+        try:
+            r = self.invoke("--idle-timeout", "3", "--retries", "0", mode="hang_with_detached_child")
+            self.assertEqual(r["error_kind"], "idle_timeout")
+            child = int((self.state / "child.pid").read_text())
+            self.wait_for(lambda: not alive(child))
+            self.assertIsNone(bystander.poll(), "killed a process that is not a Codex descendant")
+        finally:
+            bystander.kill()
+            bystander.wait()
+
+    def test_doctor_reports_every_check_without_writing_or_exposing_credentials(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        auth = Path(self.env["CODEX_HOME"]) / "auth.json"
+        auth.write_text("SECRET-TOKEN")
+        names = ["python", "codex", "codex_version", "codex_home", "codex_auth", "runner_home", "router", "bash"]
+        tool = SimpleNamespace(returncode=0, stdout="tool 1.2.3\nsecond line\n", stderr="")
+        with mock.patch.object(codex_runner, "HOME", home), \
+                mock.patch.object(codex_runner.subprocess, "run", return_value=tool):
+            report = codex_runner.doctor()
+        self.assertEqual([c["name"] for c in report["checks"]], names)
+        self.assertEqual((report["status"], report["ok"]), ("completed", True), report)
+        self.assertEqual(report["checks"][-1], {"name": "bash", "ok": True, "detail": "tool 1.2.3"})
+        self.assertNotIn("SECRET-TOKEN", json.dumps(report))
+        auth.unlink()
+        with mock.patch.object(codex_runner, "HOME", home), \
+                mock.patch.dict(os.environ, {"CODEX_RUNNER_ROUTER_URL": "http://user:hunter2@127.0.0.1:1"}), \
+                mock.patch.object(codex_runner.subprocess, "run", side_effect=OSError("no such tool")):
+            report = codex_runner.doctor()
+        self.assertEqual({c["name"] for c in report["checks"] if not c["ok"]}, {"codex_version", "codex_auth", "router", "bash"})
+        self.assertEqual((report["status"], report["ok"]), ("completed", False))
+        self.assertNotIn("hunter2", json.dumps(report))
+        # The real command prints one JSON object and creates nothing, not even the runner home.
+        self.assertEqual([c["name"] for c in self.control("doctor")["checks"]], names)
+        self.assertFalse(home.exists())
+        with mock.patch.object(codex_runner, "tomllib", None), mock.patch.object(codex_runner, "emit") as emit, \
+                mock.patch.object(sys, "argv", [str(RUNNER), "list"]), self.assertRaises(SystemExit):
+            codex_runner.main()
+        self.assertIn("3.11", emit.call_args.args[0]["error"])
 
 
 if __name__ == "__main__":

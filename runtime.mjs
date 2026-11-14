@@ -79,6 +79,15 @@ export function loadedRecord(loadedFile) {
   }
 }
 
+// A recycled PID keeps a dead instance's record alive; its real holder cannot have started after the record was written.
+export function pidReused(pid, loadedAt) {
+  if (process.platform !== 'win32') return false;
+  const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    `(Get-Process -Id ${Number(pid)}).StartTime.ToUniversalTime().ToString('o')`], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+  const started = Date.parse(String(result.stdout ?? '').trim());
+  return Number.isFinite(started) && started > Date.parse(loadedAt);
+}
+
 function decodeProfile(bytes) {
   let encoding = 'utf8';
   let bom = Buffer.alloc(0);
@@ -212,8 +221,7 @@ function profileRecord(profileFile, moduleUrl, readRelocated = false) {
 }
 
 // The caller supplies the deduplicated in-flight runner count and owns idle/now scheduling.
-export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, profileFile, activeTasks = null }) {
-  const source = runtimeIdentity(moduleUrl);
+export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, profileFile, activeTasks = null, source = runtimeIdentity(moduleUrl) }) {
   const { record: loaded, error: loaded_error } = loadedRecord(loadedFile);
   let profile_module = null;
   let profile_error = null;
@@ -246,7 +254,12 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
 
 const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
-  maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置' };
+  maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置',
+  timeoutSeconds: '每次尝试的总超时秒数', idleTimeoutSeconds: '空闲超时秒数', retries: '自动重试次数',
+  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接' };
+// null clears a limit and restores the runner default.
+const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) => v > 0, timeoutSeconds: (v) => v > 0,
+  idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: (v) => Number.isInteger(v) && v > 0 };
 
 export function validatePanelSettings(value, geminiConfigured = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
@@ -256,14 +269,17 @@ export function validatePanelSettings(value, geminiConfigured = false) {
   const model = (v) => typeof v === 'string' && /^[A-Za-z0-9._/:-]{1,80}$/.test(v);
   for (const [key, v] of Object.entries(value)) {
     let valid = false;
-    if (key === 'model') valid = model(v);
-    else if (key === 'effort') valid = efforts.includes(v);
+    // '' clears the override and falls back to Codex's own configuration.
+    if (key === 'model') valid = v === '' || model(v);
+    else if (key === 'effort') valid = v === '' || efforts.includes(v);
     else if (key === 'readOnlyEffort') valid = v === '' || efforts.includes(v);
     else if (key === 'serviceTier') valid = ['', 'fast', 'ultrafast'].includes(v);
     else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
     else if (key === 'plannerReads') valid = ['open', 'products'].includes(v);
-    else if (['lockTimeoutSeconds', 'maxStorageMb'].includes(key)) valid = typeof v === 'number' && Number.isFinite(v) && v > 0;
-    else if (key === 'gemini') {
+    else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
+    else if (key === 'autoResume') {
+      valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.enabled === 'boolean';
+    } else if (key === 'gemini') {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
         Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
     }
@@ -296,11 +312,14 @@ function settingsEdits(profile, changes) {
     edits.push([{ ...field, render: () => rendered }, value]);
   };
   const insert = (at, text) => edits.push([{ start: at, length: 0, render: () => text }, null]);
+  // A new key; nested settings (autoResume) become a block of their own.
+  const fresh = (key, value, indentation) => newline + indentation + key + ':' + (value !== null && typeof value === 'object'
+    ? Object.entries(value).map(([k, item]) => fresh(k, item, indentation + '  ')).join('') : ' ' + yamlSetting(value));
   if (!configs.length) {
     validatePanelSettings(changes, false);
     const last = lines.at(-1);
     insert(endOfLine(last), newline + pad + 'config:' + Object.entries(changes)
-      .map(([key, value]) => newline + pad + '  ' + key + ': ' + yamlSetting(value)).join(''));
+      .map(([key, value]) => fresh(key, value, pad + '  ')).join(''));
     return edits;
   }
   const config = configs[0];
@@ -316,8 +335,12 @@ function settingsEdits(profile, changes) {
   validatePanelSettings(changes, gemini.length === 1 && new RegExp('^' + fieldPad + 'gemini:[ \\t]*(?:#.*)?$').test(gemini[0].text));
   let additions = '';
   for (const [key, value] of Object.entries(changes)) {
-    if (key === 'gemini') {
-      const parent = gemini[0];
+    if (key === 'gemini' || key === 'autoResume') {
+      const parents = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
+      if (parents.length > 1) throw new Error(`${key} 配置重复，未保存`);
+      if (!parents.length) { additions += fresh(key, value, fieldPad); continue; }
+      const parent = parents[0];
+      if (!new RegExp('^' + fieldPad + key + ':[ \\t]*(?:#.*)?$').test(parent.text)) throw new Error(`${key} 必须使用分行 YAML，未保存`);
       const nested = [];
       for (const line of children.slice(children.indexOf(parent) + 1)) {
         if (line.text.search(/\S/) <= fieldPad.length) break;
@@ -327,7 +350,7 @@ function settingsEdits(profile, changes) {
       let added = '';
       for (const [k, item] of Object.entries(value)) {
         const hits = nested.filter((line) => line.text.startsWith(nestedPad + k + ':'));
-        if (hits.length > 1) throw new Error(`gemini.${k} 配置重复，未保存`);
+        if (hits.length > 1) throw new Error(`${key}.${k} 配置重复，未保存`);
         if (hits.length) replace(hits[0], k, nestedPad, item);
         else added += newline + nestedPad + k + ': ' + yamlSetting(item);
       }
@@ -337,7 +360,7 @@ function settingsEdits(profile, changes) {
     const hits = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
     if (hits.length > 1) throw new Error(`${key} 配置重复，未保存`);
     if (hits.length) replace(hits[0], key, fieldPad, value);
-    else additions += newline + fieldPad + key + ': ' + yamlSetting(value);
+    else additions += fresh(key, value, fieldPad);
   }
   if (additions) insert(endOfLine(config), additions);
   return edits;
@@ -458,7 +481,11 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       ...(value.expected_module ? { awaiting_load: true } : {}) };
   }
   const label = 'Codex runtime · 等待空闲后重载';
-  function snapshot(activeTasks, active_error = null) {
+  let sourceSeen = null;
+  // cached: the panel polls every 7 s and each fresh identity runs git twice, synchronously, on the host's main thread.
+  function snapshot(activeTasks, active_error = null, cached = false) {
+    const source = cached && sourceSeen && Date.now() - sourceSeen.at < 20_000 ? sourceSeen.value : runtimeIdentity(moduleUrl);
+    if (source !== sourceSeen?.value) sourceSeen = { at: Date.now(), value: source };
     let active_sessions = null;
     let sessions_error = null;
     try {
@@ -471,7 +498,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       }
       active_sessions = sessions.filter((agent) => agent.status === 'running').length;
     } catch (error) { sessions_error = `无法确认 DeepSeek 会话回合状态：${error.message}，请刷新后重试。`; }
-    return { ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks }), active_error,
+    return { ...runtimeStatus({ moduleUrl, loadedIdentity, profileFile, loadedFile, activeTasks, source }), active_error,
       active_sessions, sessions_error, pending_settings: pendingView(),
       idle_wait: idleWait && { status: idleWait.status, deadline_at: new Date(idleWait.deadline).toISOString(),
         remaining_seconds: Math.max(0, Math.ceil((idleWait.deadline - Date.now()) / 1000)) } };
@@ -608,10 +635,11 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     description: '查看磁盘源码、实际加载版本、服务档位、网关、默认权限、在途 Codex 任务数及进行中的 DeepSeek 会话回合数。' +
       'reload 默认 when=idle，同时等 Codex 任务结束且所有会话 status 不为 running，最多等 10 分钟；超时不重载，需重新请求。' +
       'when=now 立即重载，可能中止正在进行的 DeepSeek 回合；Codex 后台任务继续运行，重载后按登记记录接回。' +
-      '已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。',
+      '已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。' +
+      'action=doctor 只读自检 WSL 里的 Python、Codex、登录文件、路由和 bash，不启动任务。',
     presentCall: (args) => ({ card: 'generic', kind: args?.action === 'reload' ? 'write' : 'read', title: 'Codex runtime' }),
     parameters: { type: 'object', properties: {
-      action: { type: 'string', enum: ['status', 'reload'], default: 'status' },
+      action: { type: 'string', enum: ['status', 'reload', 'doctor'], default: 'status' },
       when: { type: 'string', enum: ['idle', 'now'], default: 'idle' },
     } },
     output: { schema: { type: 'object', additionalProperties: true },
@@ -628,9 +656,10 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
     async execute(args = {}, exec, changes) {
       if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('codex_runtime: arguments must be an object');
       const { action = 'status', when = 'idle' } = args;
-      if (!['status', 'reload'].includes(action)) throw new Error('codex_runtime: invalid action');
+      if (!['status', 'reload', 'doctor'].includes(action)) throw new Error('codex_runtime: invalid action');
       if (!['idle', 'now'].includes(when)) throw new Error('codex_runtime: invalid when');
       let current = null;
+      if (action === 'doctor') return conductor.doctor(exec?.signal);
       if (action === 'reload' && !profileFile) {
         return { ...snapshot(null), status: 'failed', error_kind: 'profile_not_configured', error_status: 409,
           error: 'runtimeProfileFile 未配置，无法请求重载。' };
@@ -663,7 +692,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
           count = null;
           active_error = String(error?.message ?? error);
         }
-        current = snapshot(count, active_error);
+        current = snapshot(count, active_error, action === 'status' && exec?.panel === true);
         if (action === 'status') return { ...current, status: 'status' };
         if (when === 'idle' && current.sessions_error && !pendingReload(current) && (changes || current.state !== 'synchronized')) {
           return { ...current, status: 'failed', error_kind: 'session_status_unavailable', error_status: 503, error: current.sessions_error };

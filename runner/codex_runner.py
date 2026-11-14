@@ -4,6 +4,7 @@
     python codex_runner.py start  --cwd DIR [--sandbox workspace-write] [--scope PATH ...] < prompt.txt
     python codex_runner.py status JOB_ID [--wait SECONDS]
     python codex_runner.py cancel JOB_ID
+    python codex_runner.py doctor
 
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
 """
@@ -26,10 +27,14 @@ import subprocess
 import sys
 import threading
 import time
-import tomllib
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11: `doctor` reports it, every other command refuses to run.
+    tomllib = None
 
 IS_WIN = os.name == "nt"
 if IS_WIN:
@@ -55,7 +60,8 @@ PERMANENT = re.compile(
     r"|model.{0,40}(not found|not supported|does not exist)|invalid.{0,20}(config|schema)|unrecognized", re.I)
 # The model refusing the request arrives inside "Reconnecting... n/5" notices; the same prompt is refused again,
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
-REFUSED = re.compile(r"refused this request|safety filter", re.I)
+# The same refusal also arrives as a failed turn with no reconnect notice ("This content was flagged for ...").
+REFUSED = re.compile(r"refused this request|safety filter|content was flagged for", re.I)
 # The model service answering 400 "Bad Request" to one request of a thread: seven jobs in one evening, and both a
 # retry inside the job and a later resume of the same thread were rejected again, while a new thread worked.
 REJECTED = re.compile(r"bad request|invalid_request_error", re.I)
@@ -101,12 +107,35 @@ def launcher():
     return [find_codex() or "codex"], env
 
 
+def descendants(pid):
+    """Linux: (pid, start time) of every process whose parent chain reaches pid, including those that left its
+    process group or session. A process whose parent already exited was reparented and is not found."""
+    children = {}
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat.read_text(errors="replace").rsplit(")", 1)[1].split()
+            children.setdefault(int(fields[1]), []).append((int(stat.parent.name), fields[19]))
+        except (OSError, IndexError, ValueError):
+            continue
+    found, pending = [], [pid]
+    while pending:
+        for child in children.get(pending.pop(), []):
+            found.append(child)
+            pending.append(child[0])
+    return found
+
+
 def kill_tree(pid):
     if not IS_WIN:
+        found = descendants(pid)  # before the group dies: orphans are reparented and lose the chain
         try:
             os.killpg(pid, signal.SIGKILL)  # children start in their own session, so the group id is the pid
         except ProcessLookupError:
             pass
+        for child, started in found:
+            with suppress(OSError):
+                if process_start(child) == started:  # the pid still names the process that was a descendant
+                    os.kill(child, signal.SIGKILL)
         return
     subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW)
 
@@ -271,7 +300,10 @@ def earlier_writer_waiting(run_dir, roots):
             other_paths = [Path(tree_key(p)) for p in other_roots.values()]
             overlapping_roots = [root for root, path in zip(other_roots.values(), other_paths)
                                  if any(path.is_relative_to(p) or p.is_relative_to(path) for p in paths)]
-        except (OSError, ValueError, TypeError):
+        except OSError:
+            # A record read while its owner replaces or removes it may belong to an overlapping writer: look again.
+            return True
+        except (ValueError, TypeError):
             continue
         if not overlapping_roots:
             continue
@@ -549,6 +581,8 @@ def classify(state, run_dir):
         except OSError:
             text = ""
         state["error"] = text.strip()[-500:] or "Codex exited without turn.completed"
+    if REFUSED.search(text):
+        return "model_refused", False
     if PERMANENT.search(text):
         return "permanent", False
     if REJECTED.search(text):
@@ -927,7 +961,13 @@ def read_prompt(strict=False):
 
 def write_result(job_dir, result):
     tmp = job_dir / "result.json.tmp"
-    tmp.write_text(json.dumps({**result, **runner_activity(job_dir / "events.jsonl")}, ensure_ascii=False), "utf-8")
+    value = {**result, **runner_activity(job_dir / "events.jsonl")}
+    try:
+        data = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    except UnicodeEncodeError:
+        # A report can carry an unpaired surrogate escape (\ud83d); keep it escaped instead of losing the result.
+        data = json.dumps(value).encode("ascii")
+    tmp.write_bytes(data)
     os.replace(tmp, job_dir / "result.json")
 
 
@@ -1026,7 +1066,8 @@ def read_task_input(args, parser):
             if not isinstance(envelope["prompt"], str) or not envelope["prompt"].strip():
                 raise ValueError("prompt must be a nonempty string")
             args.context = task_context(envelope["context"])
-            prompt = envelope["prompt"]
+            # JSON can carry an unpaired surrogate that UTF-8 cannot: neither prompt.txt nor Codex's stdin takes it.
+            prompt = re.sub("[\ud800-\udfff]", "\ufffd", envelope["prompt"])
         except (ValueError, argparse.ArgumentTypeError) as e:
             parser.error("Invalid context envelope: " + str(e))
     return prompt
@@ -1549,6 +1590,7 @@ def list_jobs(args):
                          **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
                          **({"verification_of": j["context"]["verification_of"]} if "verification_of" in j["context"] else {})}
              if j.get("context") else None,
+             **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
@@ -1811,7 +1853,8 @@ def storage_size(root):
     return sum(p.stat().st_size for p in root.rglob("*") if p.is_file())
 
 
-def prune_storage(max_storage_mb):
+def prune_storage(max_storage_mb, keep=()):
+    """keep: job ids the task being started still refers to (its verification target and continuation parent)."""
     total, finished = 0, []
     for root in (HOME / "jobs", HOME / "runs"):
         try:
@@ -1822,7 +1865,7 @@ def prune_storage(max_storage_mb):
         for d in directories:
             try:
                 result = d / "result.json"
-                if not d.is_dir() or d.is_symlink() or not result.is_file():
+                if not d.is_dir() or d.is_symlink() or not result.is_file() or (root.name == "jobs" and d.name in keep):
                     continue
                 value = json.loads(result.read_text("utf-8"))
                 if not isinstance(value, dict) or value.get("status") not in ("completed", "failed", "cancelled"):
@@ -1843,9 +1886,61 @@ def prune_storage(max_storage_mb):
             pass
 
 
+def doctor():
+    """Read-only environment checks: starts no task, calls no model and writes nothing."""
+    checks = []
+
+    def check(name, probe):
+        try:
+            ok, detail = probe()
+        except Exception as e:
+            ok, detail = False, repr(e)[:300]
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    def first_line(argv):
+        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                           timeout=10, creationflags=NO_WINDOW)
+        return p.returncode == 0, ((p.stdout or p.stderr).strip().splitlines() or [f"exit {p.returncode}"])[0][:200]
+
+    def codex_path():
+        prefix = launcher()[0]
+        path = shutil.which(prefix[0]) if os.environ.get("CODEX_RUNNER_CMD") else find_codex()
+        return bool(path), path or f"{prefix[0]} not found"
+
+    def runner_home():
+        existing = next(p for p in (HOME, *HOME.parents) if p.exists())
+        return os.access(existing, os.W_OK | os.X_OK), str(HOME) if existing == HOME else f"{HOME} (not created yet)"
+
+    def router():
+        target = os.environ.get("CODEX_RUNNER_ROUTER_URL") or os.environ.get("CODEX_RUNNER_ROUTE_URL")
+        if not target:
+            return True, "not configured"
+        url = urlparse(target)  # Only host and port: a route URL may embed credentials.
+        reachable = router_reachable()
+        port = url.port or (80 if url.scheme == "http" else 443)
+        return reachable, f"{url.hostname}:{port} {'reachable' if reachable else 'unreachable'}"
+
+    def codex_auth():  # Existence only: the file is never opened.
+        present = (codex_home / "auth.json").is_file()
+        return present, "auth.json exists" if present else "auth.json missing (expected with an API key or a custom provider)"
+
+    codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    check("python", lambda: (sys.version_info >= (3, 11), sys.version.split()[0]))
+    check("codex", codex_path)
+    check("codex_version", lambda: first_line([*launcher()[0], "--version"]))
+    check("codex_home", lambda: (codex_home.is_dir(), str(codex_home)))
+    check("codex_auth", codex_auth)
+    check("runner_home", runner_home)
+    check("router", router)
+    check("bash", lambda: first_line(["bash", "--version"]))
+    # codex_auth is advisory: API-key and custom-provider setups have no auth.json.
+    return {"status": "completed", "ok": all(c["ok"] for c in checks if c["name"] != "codex_auth"), "checks": checks}
+
+
 def main():
     parser = Parser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
+    sub.add_parser("doctor")
     add_task_arguments(sub.add_parser("run"))
     add_task_arguments(sub.add_parser("start"))
     status = sub.add_parser("status")
@@ -1883,6 +1978,11 @@ def main():
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
     args = parser.parse_args()
+    if args.command == "doctor":
+        emit(doctor())
+        return
+    if tomllib is None:
+        parser.error("Python 3.11 or newer is required")
     if args.command == "products":
         if not args.owner.strip() or not 1 <= args.limit <= 10000:
             parser.error("owner must be nonempty and limit between 1 and 10000")
@@ -1934,7 +2034,9 @@ def main():
             prune_old("jobs")
             prune_old("runs")
         if args.max_storage_mb is not None:
-            prune_storage(args.max_storage_mb)
+            context = getattr(args, "context", None) or {}
+            prune_storage(args.max_storage_mb, {context.get("verification_of"),
+                                                (context.get("continuation") or {}).get("parent_job_id")})
 
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -1983,9 +2085,16 @@ def main():
             result = execute(task, (job_dir / "prompt.txt").read_text("utf-8"), job_dir)
         except Exception as e:
             result = {"status": "failed", "error_kind": "runner_error", "error": repr(e), "retryable": False}
-        result = {**job_metadata(job_dir, thread_id=result.get("thread_id")), **result}
-        result.update(review_summary(result))
-        write_result(job_dir, result)
+        try:
+            result = {**job_metadata(job_dir, thread_id=result.get("thread_id")), **result}
+            result.update(review_summary(result))
+            write_result(job_dir, result)
+        except Exception as e:
+            # Codex may have finished and changed files: a missing result would read as a dead worker to retry.
+            write_result(job_dir, {
+                "status": "failed", "error_kind": "runner_error", "retryable": False, "log_dir": str(job_dir),
+                "error": f"Saving the result failed after execution ended as {result.get('status')!r}: {repr(e)[:500]}",
+                **({"thread_id": result["thread_id"]} if result.get("thread_id") else {})})
         return
 
     if args.command == "status":

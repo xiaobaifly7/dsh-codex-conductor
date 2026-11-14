@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -14,6 +14,9 @@ const routes = [
   ['POST', '/cancel', { job_id: 'job-1', confirm: true }],
   ['GET', '/prompt'], ['POST', '/prompt', { text: 'updated' }], ['POST', '/reload', {}],
   ['GET', '/selftest/request'], ['POST', '/selftest/result', {}],
+  ['GET', '/prompt/backups'], ['GET', '/prompt/backup?name=planner.md.bak'], ['GET', '/doctor'], ['GET', '/gemini'],
+  ['POST', '/session/send', { sessionId: 'session-a', message: 'hello' }], ['POST', '/session/resume', { sessions: ['session-a'] }],
+  ['POST', '/session/goal', { sessionId: 'session-a', maxGoalRounds: 3 }], ['GET', '/session/results'],
 ];
 
 // Model Cordis injection ownership: only changed dependencies restart a child callback.
@@ -64,6 +67,7 @@ function fixture(t, options = {}) {
     list: t.mock.fn(async () => ({ total: jobs.length, jobs, next_offset: null })),
     output: t.mock.fn(async () => ({ text: '报告🙂', next_offset: 4, eof: true })),
     cancel: t.mock.fn(async (job_id) => ({ job_id, status: 'cancelled' })),
+    doctor: t.mock.fn(async () => ({ status: 'completed', ok: true, checks: [{ name: 'python', ok: true, detail: '3.12' }] })),
   };
   const connection = { requestRejection: t.mock.fn(() => undefined) };
   const web = { register: t.mock.fn((route) => { handler = route.handler; return unregister; }) };
@@ -87,8 +91,8 @@ function fixture(t, options = {}) {
     assert.equal(headers['Cache-Control'], 'no-store');
     return { status: res.statusCode, body: res.body };
   }
-  const calls = () => [runtime.execute, conductor.list, conductor.output, conductor.cancel]
-    .map((fn) => fn.mock.callCount());
+  const calls = () => { assert.equal(conductor.doctor.mock.callCount(), 0); return [runtime.execute, conductor.list, conductor.output, conductor.cancel]
+    .map((fn) => fn.mock.callCount()); };
   return { root, plannerFile, cfg, state, jobs, runtime, conductor, connection, web, ctx, services,
     unregister, registration, request, calls, api: createPanelApi(apiOptions) };
 }
@@ -228,8 +232,15 @@ test('panel settings expose editable fields and read scope counts while redactin
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, token: 'secret', runner: 'secret',
     gemini: { model: 'gemini', effort: 'low', command: 'secret' } };
   const expected = { model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
-    lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' } };
+    lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' },
+    timeoutSeconds: null, idleTimeoutSeconds: null, retries: null, maxRunningJobs: null, autoResume: { enabled: true },
+    roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [] };
   assert.deepEqual(panelSettings(cfg), expected);
+  assert.deepEqual(panelSettings({ ...cfg, timeoutSeconds: 900, idleTimeoutSeconds: 60, retries: 0, maxRunningJobs: 2,
+    autoResume: { enabled: false, message: 'private-message', exclude: ['private-session'] }, roots: ['*'], allowHostAccess: true,
+    defaultHostAccess: true, unknownConfig: ['timoutSeconds'] }),
+  { ...expected, timeoutSeconds: 900, idleTimeoutSeconds: 60, retries: 0, maxRunningJobs: 2, autoResume: { enabled: false },
+    roots: ['*'], allowHostAccess: true, defaultHostAccess: true, unknownConfig: ['timoutSeconds'] });
   assert.deepEqual(cfg.gemini, { ...expected.gemini, command: 'secret' });
   assert.equal(panelSettings({ ...cfg, gemini: undefined }).gemini, null);
   assert.deepEqual(panelSettings({ ...cfg, plannerReads: 'products', plannerReadAllow: ['C:\\private', '/mnt/e/allowed'] }),
@@ -340,6 +351,7 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   const status = await f.request('GET', '/status');
   assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments[0], { action: 'status' });
+  assert.equal(f.runtime.execute.mock.calls[0].arguments[1].panel, true, 'status polls are marked as panel reads');
   assert.ok(f.runtime.execute.mock.calls[0].arguments[1].signal instanceof AbortSignal);
   assert.equal(f.conductor.list.mock.callCount(), 0);
   t.mock.method(Date, 'now', () => 1800000000000);
@@ -358,7 +370,8 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
     ['?filter=attention', { needs_attention: true }]]) {
     const response = await f.request('GET', '/jobs' + query);
     assert.deepEqual(response, { status: 200, body: { total: 1, next_offset: null, jobs: [{ job_id: 'job-1', started_at: 123,
-      status: 'running', execution_status: 'running', title: '🙂'.repeat(60), needs_attention: true }] } });
+      status: 'running', execution_status: 'running', title: '🙂'.repeat(60), needs_attention: true,
+      cwd: 'private-directory', verification_status: 'needs_changes' }] } });
     assert.deepEqual(f.conductor.list.mock.calls.at(-1).arguments.slice(0, 1), [{ limit: 20, offset: 0, ...expected }]);
   }
   assert.deepEqual(await f.request('GET', '/output?job_id=job-1'),
@@ -370,7 +383,7 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(await f.request('POST', '/cancel', { job_id: 'job-1', confirm: true }),
     { status: 200, body: { job_id: 'job-1', status: 'cancelled' } });
   assert.deepEqual(f.conductor.cancel.mock.calls[0].arguments, ['job-1']);
-  assert.deepEqual(await f.request('GET', '/prompt'), { status: 200, body: { text: '原有规划要求🙂\n' } });
+  assert.deepEqual(await f.request('GET', '/prompt'), { status: 200, body: { text: '原有规划要求🙂\n', injected: false } });
   assert.deepEqual(await f.request('POST', '/prompt', { text: '新规划🙂\n' }), { status: 200, body: { saved: true } });
   assert.equal(readFileSync(f.plannerFile, 'utf8'), '新规划🙂\n');
   const backups = readdirSync(f.root).filter((name) => name.endsWith('.bak'));
@@ -378,6 +391,17 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.equal(readFileSync(path.join(f.root, backups[0]), 'utf8'), '原有规划要求🙂\n');
   assert.equal((await f.request('POST', '/prompt', { text: '' })).status, 200);
   assert.equal(readFileSync(f.plannerFile, 'utf8'), '');
+  const unrelated = ['planner.md.bak', 'planner.md.2026-01-01T00-00-00-000Z.not-a-uuid.bak', 'other.md.2026-01-01T00-00-00-000Z.00000000-0000-4000-8000-000000000000.bak'];
+  for (const name of unrelated) writeFileSync(path.join(f.root, name), 'keep');
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  for (let n = 0; n < 12; n++) {
+    t.mock.timers.tick(1); // backup names sort by their millisecond timestamp
+    assert.equal((await f.request('POST', '/prompt', { text: `第 ${n} 版` })).status, 200);
+  }
+  const kept = readdirSync(f.root).filter((name) => name.endsWith('.bak') && !unrelated.includes(name)).sort();
+  assert.equal(kept.length, 10, 'only the ten newest prompt backups remain');
+  assert.deepEqual(kept.map((name) => readFileSync(path.join(f.root, name), 'utf8')), Array.from({ length: 10 }, (_, n) => `第 ${n + 1} 版`));
+  for (const name of unrelated) assert.equal(readFileSync(path.join(f.root, name), 'utf8'), 'keep');
   assert.deepEqual(await f.request('POST', '/reload', {}), { status: 200, body: { status: 'reloaded', saved: true } });
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, undefined]);
 });
@@ -462,7 +486,7 @@ test('panel report reads full Unicode context internally and exposes only accept
   ]);
   assert.deepEqual(await f.request('GET', '/output?job_id=job-1&offset=4'), { status: 200, body: report });
   assert.equal(f.conductor.output.mock.callCount(), 4);
-  rejected(await f.request('GET', '/output?job_id=job-1&artifact=context'), 400);
+  rejected(await f.request('GET', '/output?job_id=job-1&artifact=events'), 400);
   assert.equal(f.conductor.output.mock.callCount(), 4);
 });
 
@@ -640,12 +664,16 @@ test('panel HTTP rejects traversal job IDs and malformed output pagination befor
 test('panel HTTP settings accept all supported enums, model characters and positive finite numbers', async (t) => {
   const f = fixture(t);
   const patches = [
-    ...['low', 'medium', 'high', 'xhigh', 'max'].map((effort) => ({ effort })),
+    ...['', 'low', 'medium', 'high', 'xhigh', 'max'].map((effort) => ({ effort })),
     ...['', 'low', 'medium', 'high', 'xhigh', 'max'].map((readOnlyEffort) => ({ readOnlyEffort })),
     ...['', 'fast', 'ultrafast'].map((serviceTier) => ({ serviceTier })),
     ...['low', 'medium', 'high'].map((effort) => ({ gemini: { effort } })),
-    { model: 'A0._/:-' }, { model: 'm'.repeat(80) }, { gemini: { model: 'google/gemini-4:latest' } },
+    { model: '' }, { model: 'A0._/:-' }, { model: 'm'.repeat(80) }, { gemini: { model: 'google/gemini-4:latest' } },
     { plannerAnswers: false }, { plannerAnswers: true }, { lockTimeoutSeconds: 0.5, maxStorageMb: 1.25 },
+    // null clears a limit and restores the default.
+    ...['lockTimeoutSeconds', 'maxStorageMb', 'timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'maxRunningJobs'].map((key) => ({ [key]: null })),
+    { timeoutSeconds: 900, idleTimeoutSeconds: 0.5 }, { retries: 0 }, { retries: 3 }, { maxRunningJobs: 1 },
+    { autoResume: { enabled: false } }, { autoResume: { enabled: true } },
   ];
   for (const patch of patches) {
     assert.equal((await f.request('POST', '/settings', patch)).status, 200, JSON.stringify(patch));
@@ -656,18 +684,22 @@ test('panel HTTP settings accept all supported enums, model characters and posit
 test('panel HTTP settings reject invalid enums/models/numbers, unknown fields and newly created Gemini', async (t) => {
   const f = fixture(t);
   const patches = [null, [], {}, true, 'settings', { unknown: 1 }, { model: 'valid', runner: 'evil' },
-    { effort: '' }, { effort: 'ultra' }, { effort: 1 }, { readOnlyEffort: 'ultra' },
+    { effort: 'ultra' }, { effort: 1 }, { readOnlyEffort: 'ultra' },
     { readOnlyEffort: null }, { serviceTier: 'priority' }, { serviceTier: false }, { plannerAnswers: 'true' },
     { plannerAnswers: 1 }, { gemini: null }, { gemini: [] }, { gemini: {} },
     { gemini: { effort: 'max' } }, { gemini: { effort: 'xhigh' } }, { gemini: { command: 'evil' } },
     { gemini: { model: 'ok', unknown: true } }];
   for (const model of ['', 'a b', ' a', 'a\nfield: injected', 'a\t', '模型', 'a\\b', 'a#b', 'a"b', 'a'.repeat(81), null, 42]) {
-    patches.push({ model }, { gemini: { model } });
+    // An empty Codex model clears the override; Gemini still needs a model name.
+    patches.push(...(model === '' ? [] : [{ model }]), { gemini: { model } });
   }
   for (const key of ['lockTimeoutSeconds', 'maxStorageMb']) {
-    for (const value of [0, -1, null, '1', true]) patches.push({ [key]: value });
+    for (const value of [0, -1, '1', true]) patches.push({ [key]: value });
     for (const value of [NaN, Infinity, -Infinity]) await assert.rejects(f.api('POST', PANEL_PATH + '/settings', {}, { [key]: value }), /无效/);
   }
+  patches.push({ timeoutSeconds: 0 }, { idleTimeoutSeconds: '60' }, { retries: -1 }, { retries: 1.5 }, { maxRunningJobs: 0 },
+    { maxRunningJobs: 2.5 }, { autoResume: {} }, { autoResume: true }, { autoResume: { enabled: 'no' } },
+    { autoResume: { enabled: true, message: 'x' } });
   for (const patch of patches) rejected(await f.request('POST', '/settings', patch), 400, /无效|设置/);
   const absent = fixture(t, { api: { cfg: { model: 'existing' } } });
   rejected(await absent.request('POST', '/settings', { gemini: { model: 'new', effort: 'low' } }), 400, /Gemini/);
@@ -840,4 +872,188 @@ test('panel client applies fast status before history and always reads the separ
       finish(history);
     }
   }
+});
+
+test('panel prompts share one implementation for planner and executor, with injected state, backups and pruning', async (t) => {
+  const executorFile = path.join(mkdtempSync(path.join(tmpdir(), 'conductor-panel-executor-')), 'executor-prompt.md');
+  t.after(() => rmSync(path.dirname(executorFile), { recursive: true, force: true }));
+  writeFileSync(executorFile, '原固定要求\n');
+  const f = fixture(t, { api: { plannerInjected: true, executorFile } });
+  assert.deepEqual(await f.request('GET', '/prompt'), { status: 200, body: { text: '原有规划要求🙂\n', injected: true } });
+  assert.deepEqual(await f.request('GET', '/prompt?kind=planner'), { status: 200, body: { text: '原有规划要求🙂\n', injected: true } });
+  assert.deepEqual(await f.request('GET', '/prompt?kind=executor'), { status: 200, body: { text: '原固定要求\n' } });
+  assert.deepEqual(await f.request('GET', '/prompt/backups?kind=executor'), { status: 200, body: { backups: [] } });
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 10, 14, 1, 2, 3, 4) });
+  for (let n = 0; n < 12; n++) {
+    t.mock.timers.tick(1000);
+    assert.deepEqual(await f.request('POST', '/prompt', { text: `固定要求 ${n}`, kind: 'executor' }), { status: 200, body: { saved: true } });
+  }
+  assert.equal(readFileSync(executorFile, 'utf8'), '固定要求 11');
+  assert.equal(readFileSync(f.plannerFile, 'utf8'), '原有规划要求🙂\n', 'the planner prompt is untouched');
+  assert.deepEqual(readdirSync(f.root), ['planner.md'], 'executor backups stay beside the executor file');
+  const { body: { backups } } = await f.request('GET', '/prompt/backups?kind=executor');
+  assert.equal(backups.length, 10);
+  assert.equal(backups[0].savedAt, '2026-11-14T01:02:15.004Z', 'newest first, time read from the backup name');
+  assert.equal(backups.at(-1).savedAt, '2026-11-14T01:02:06.004Z');
+  assert.equal(backups[0].size, Buffer.byteLength('固定要求 10'));
+  assert.deepEqual(backups.map(({ name }) => name).sort().reverse(), backups.map(({ name }) => name));
+  assert.deepEqual(await f.request('GET', `/prompt/backup?kind=executor&name=${encodeURIComponent(backups[0].name)}`),
+    { status: 200, body: { text: '固定要求 10' } });
+  assert.deepEqual((await f.request('GET', '/prompt/backups')).body, { backups: [] }, 'planner and executor backups are listed separately');
+  rejected(await f.request('GET', `/prompt/backup?name=${encodeURIComponent(backups[0].name)}`), 404);
+  for (const name of ['', 'executor-prompt.md', '../planner.md', '..\\planner.md', f.plannerFile, backups[0].name + '/../executor-prompt.md',
+    'executor-prompt.md.2026-11-14T01-02-15-004Z.00000000-0000-4000-8000-000000000000.bak']) {
+    rejected(await f.request('GET', `/prompt/backup?kind=executor&name=${encodeURIComponent(name)}`), 404);
+  }
+  rejected(await f.request('GET', '/prompt/backup?kind=executor'), 404);
+  for (const route of ['/prompt?kind=other', '/prompt/backups?kind=other', '/prompt/backup?kind=..&name=x']) rejected(await f.request('GET', route), 400);
+  rejected(await f.request('POST', '/prompt', { text: 'x', kind: 'other' }), 400);
+  rejected(await f.request('POST', '/prompt?kind=executor', { text: 'x' }), 400);
+  assert.equal(readFileSync(executorFile, 'utf8'), '固定要求 11');
+
+  const unavailable = fixture(t, { api: { executorFile: '' } });
+  for (const response of [await unavailable.request('GET', '/prompt?kind=executor'), await unavailable.request('GET', '/prompt/backups?kind=executor'),
+    await unavailable.request('POST', '/prompt', { text: 'x', kind: 'executor' })]) rejected(response, 409, /当前环境不可用/);
+  assert.equal((await unavailable.request('GET', '/prompt')).status, 200);
+});
+
+test('panel status settings report guard workspaces, host access, unknown keys and the editable limits', async (t) => {
+  const f = fixture(t);
+  Object.assign(f.cfg, { roots: ['d:/work', '*'], allowHostAccess: true, defaultHostAccess: false, unknownConfig: ['timoutSeconds'],
+    timeoutSeconds: 900, idleTimeoutSeconds: null, retries: 0, maxRunningJobs: 2, autoResume: { enabled: false, message: 'private-message' } });
+  const { body: { settings } } = await f.request('GET', '/status');
+  assert.deepEqual({ roots: settings.roots, allowHostAccess: settings.allowHostAccess, defaultHostAccess: settings.defaultHostAccess,
+    unknownConfig: settings.unknownConfig, timeoutSeconds: settings.timeoutSeconds, idleTimeoutSeconds: settings.idleTimeoutSeconds,
+    retries: settings.retries, maxRunningJobs: settings.maxRunningJobs, autoResume: settings.autoResume },
+  { roots: ['d:/work', '*'], allowHostAccess: true, defaultHostAccess: false, unknownConfig: ['timoutSeconds'], timeoutSeconds: 900,
+    idleTimeoutSeconds: null, retries: 0, maxRunningJobs: 2, autoResume: { enabled: false } });
+  assert.ok(!JSON.stringify(settings).includes('private-'));
+});
+
+test('panel doctor runs only on request and maps runner checks; a dead bridge is a 502', async (t) => {
+  const f = fixture(t);
+  f.conductor.doctor.mock.mockImplementation(async () => ({ status: 'completed', ok: false, secret: 'private',
+    checks: [{ name: 'python', ok: true, detail: '3.12', secret: 'private' }, { name: 'codex_auth', ok: false, detail: null }, { name: 'bash', ok: 'yes' }] }));
+  assert.deepEqual(await f.request('GET', '/doctor'), { status: 200, body: { ok: false, checks: [
+    { name: 'python', ok: true, detail: '3.12' }, { name: 'codex_auth', ok: false, detail: '' }, { name: 'bash', ok: false, detail: '' }] } });
+  assert.equal(f.conductor.doctor.mock.callCount(), 1);
+  f.conductor.doctor.mock.mockImplementation(async () => ({ status: 'failed', error_kind: 'bridge_error', error: 'WSL offline' }));
+  rejected(await f.request('GET', '/doctor'), 502, /请/);
+  rejected(await f.request('POST', '/doctor', {}), 405);
+});
+
+test('panel jobs pass through only the fields the runner returned and search by job id or session id', async (t) => {
+  const f = fixture(t);
+  const full = { job_id: '20261114-010203-abcdef', started_at: 1, status: 'completed', execution_status: 'completed',
+    context: { owner: 'session-a', task: 'task' }, cwd: '/mnt/d/work', duration_s: 148.4, error_kind: null,
+    criteria_counts: { met: 2, not_met: 1, blocked: 0, secret: 'private' }, verification_status: 'verified', review_status: 'needs_verification',
+    phase: null, attempt: 1, updated_at: 9, scope: ['private-scope'], blocking: { secret: 'private' } };
+  const running = { job_id: 'J2', started_at: 2, status: 'running', execution_status: 'running', context: null,
+    phase: 'lock_wait', attempt: 2, updated_at: 12, error_kind: 'timeout' };
+  f.conductor.list.mock.mockImplementation(async () => ({ total: 2, next_offset: null, jobs: [full, running] }));
+  assert.deepEqual((await f.request('GET', '/jobs')).body.jobs, [
+    { job_id: full.job_id, started_at: 1, status: 'completed', execution_status: 'completed', title: 'task', needs_attention: false,
+      owner: 'session-a', cwd: '/mnt/d/work', duration_s: 148.4, verification_status: 'verified', attempt: 1, updated_at: 9,
+      criteria_counts: { met: 2, not_met: 1, blocked: 0 } },
+    { job_id: 'J2', started_at: 2, status: 'running', execution_status: 'running', title: '', needs_attention: false,
+      error_kind: 'timeout', phase: 'lock_wait', attempt: 2, updated_at: 12 }]);
+  for (const [q, expected] of [['20261114-010203-abcdef', { job_ids: ['20261114-010203-abcdef'] }], ['session-a', { owner: 'session-a' }],
+    ['20261114-010203-ABCDEF', { owner: '20261114-010203-ABCDEF' }], ['a'.repeat(100), { owner: 'a'.repeat(100) }]]) {
+    assert.equal((await f.request('GET', `/jobs?filter=running&offset=20&q=${q}`)).status, 200);
+    assert.deepEqual(f.conductor.list.mock.calls.at(-1).arguments[0], { limit: 20, offset: 20, status: 'running', ...expected });
+  }
+  const calls = f.conductor.list.mock.callCount();
+  for (const q of ['', ' ', 'a b', '../x', 'a'.repeat(101), '会话', 'a,b', '--job-id', '-a']) {
+    rejected(await f.request('GET', `/jobs?q=${encodeURIComponent(q)}`), 400, /任务编号或会话编号/);
+  }
+  assert.equal(f.conductor.list.mock.callCount(), calls, 'rejected searches never reach the runner');
+});
+
+test('panel output serves the other artifacts as raw pages and rejects unknown ones', async (t) => {
+  const f = fixture(t);
+  for (const artifact of ['context', 'review', 'stderr', 'result']) {
+    assert.deepEqual(await f.request('GET', `/output?job_id=job-1&artifact=${artifact}&offset=3&limit=10`),
+      { status: 200, body: { text: '报告🙂', next_offset: 4, eof: true } });
+    assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments.slice(0, 2), ['job-1', { artifact, offset: 3, limit: 10 }]);
+  }
+  f.conductor.output.mock.resetCalls();
+  assert.equal((await f.request('GET', '/output?job_id=job-1&artifact=context')).body.acceptance, undefined);
+  assert.equal(f.conductor.output.mock.callCount(), 1, 'only the report view reads the acceptance context');
+  assert.equal((await f.request('GET', '/output?job_id=job-1&artifact=report')).status, 200);
+  assert.equal(f.conductor.output.mock.callCount(), 3);
+  for (const artifact of ['events', '', 'Report', '../result', 'report,stderr']) {
+    rejected(await f.request('GET', `/output?job_id=job-1&artifact=${encodeURIComponent(artifact)}`), 400);
+  }
+  assert.equal(f.conductor.output.mock.callCount(), 3);
+});
+
+test('panel gemini history returns the newest twenty records and tolerates a missing file or bad lines', async (t) => {
+  const missing = fixture(t, { api: { geminiHistoryFile: '' } });
+  assert.deepEqual(await missing.request('GET', '/gemini'), { status: 200, body: { entries: [] } });
+  const f = fixture(t, { api: { geminiHistoryFile: path.join(tmpdir(), `conductor-gemini-history-${process.pid}-${Date.now()}.jsonl`) } });
+  const file = path.join(f.root, 'gemini-history.jsonl');
+  const g = fixture(t, { api: { geminiHistoryFile: file } });
+  assert.deepEqual(await f.request('GET', '/gemini'), { status: 200, body: { entries: [] } }, 'a file that does not exist yet');
+  const record = (n) => ({ at: `2026-11-14T00:00:${String(n).padStart(2, '0')}Z`, session: 'session-a', output: `D:\\docs\\${n}.md`,
+    status: n % 2 ? 'failed' : 'completed', chars: n, attempts: 1, error: n % 2 ? '超限' : null, draft_path: n % 2 ? `D:\\drafts\\${n}.md` : null,
+    duration_s: 1.5, secret: 'private' });
+  writeFileSync(file, [...Array.from({ length: 25 }, (_, n) => JSON.stringify(record(n))), '{bad json', '[]', 'null', '"text"', ''].join('\n'));
+  const { status, body } = await g.request('GET', '/gemini');
+  assert.equal(status, 200);
+  assert.equal(body.entries.length, 20);
+  const { secret, ...newest } = record(24);
+  assert.deepEqual(body.entries[0], newest);
+  assert.deepEqual(body.entries.map(({ chars }) => chars), Array.from({ length: 20 }, (_, n) => 24 - n));
+  writeFileSync(file, JSON.stringify({ at: 'x' }) + '\n');
+  assert.deepEqual((await g.request('GET', '/gemini')).body.entries, [{ at: 'x', session: null, output: null, status: null, chars: null,
+    attempts: null, error: null, draft_path: null, duration_s: null }]);
+});
+
+test('panel session operations publish the existing local request files atomically and never overwrite a pending one', async (t) => {
+  const f = fixture(t);
+  const request = (kind) => JSON.parse(readFileSync(path.join(f.root, `${kind}-request.json`), 'utf8'));
+  assert.deepEqual(await f.request('GET', '/session/results'), { status: 200, body: { send: null, resume: null, goal: null, autoresume: null } });
+  assert.deepEqual(await f.request('POST', '/session/send', { sessionId: 'session-a', message: ' 继续做\n' }), { status: 200, body: { submitted: true } });
+  assert.deepEqual(request('send'), { sessionId: 'session-a', message: ' 继续做\n' });
+  rejected(await f.request('POST', '/session/send', { sessionId: 'session-b', message: 'second' }), 409, /还没有处理完/);
+  assert.deepEqual(request('send'), { sessionId: 'session-a', message: ' 继续做\n' }, 'the pending request is not replaced');
+  rmSync(path.join(f.root, 'send-request.json'));
+  assert.equal((await f.request('POST', '/session/send', { sessionId: 'session-a', message: 'm', queue: true })).status, 200);
+  assert.deepEqual(request('send'), { sessionId: 'session-a', message: 'm', whenRunning: 'queue' });
+  rmSync(path.join(f.root, 'send-request.json'));
+  assert.equal((await f.request('POST', '/session/send', { sessionId: 'session-a', message: 'm', queue: false })).status, 200);
+  assert.deepEqual(request('send'), { sessionId: 'session-a', message: 'm' });
+  assert.equal((await f.request('POST', '/session/resume', { sessions: ['session-a', 'session-b', 'session-a'] })).status, 200);
+  assert.deepEqual(request('resume'), { sessions: ['session-a', 'session-b'], message: '继续' });
+  rmSync(path.join(f.root, 'resume-request.json'));
+  assert.equal((await f.request('POST', '/session/resume', { sessions: ['session-a'], message: '接着做' })).status, 200);
+  assert.deepEqual(request('resume'), { sessions: ['session-a'], message: '接着做' });
+  assert.equal((await f.request('POST', '/session/goal', { sessionId: 'session-a', objective: '新目标', maxGoalRounds: 20 })).status, 200);
+  assert.deepEqual(request('goal'), { sessionId: 'session-a', objective: '新目标', maxGoalRounds: 20 });
+  assert.deepEqual(readdirSync(f.root).sort(), ['goal-request.json', 'planner.md', 'resume-request.json', 'send-request.json'], 'no temporary files remain');
+
+  const g = fixture(t);
+  const invalid = [
+    ['/session/send', [{}, { sessionId: 'a' }, { message: 'm' }, { sessionId: '../a', message: 'm' }, { sessionId: 'a', message: '  ' },
+      { sessionId: 'a', message: 'm'.repeat(4001) }, { sessionId: 'a', message: 'm', queue: 'queue' }, { sessionId: 'a', message: 'm', whenRunning: 'queue' },
+      { sessionId: 'a', message: 'm', sessions: [] }, { sessionId: ['a'], message: 'm' }]],
+    ['/session/resume', [{}, { sessions: [] }, { sessions: 'a' }, { sessions: ['a b'] }, { sessions: ['a\n'] }, { sessions: Array(21).fill('a') },
+      { sessions: ['a'], message: 1 }, { sessions: ['a'], message: 'm'.repeat(2001) }, { sessions: ['a'], path: 'x' }]],
+    ['/session/goal', [{}, { sessionId: 'a' }, { sessionId: 'a', objective: ' ' }, { sessionId: 'a', maxGoalRounds: 0 }, { sessionId: 'a', maxGoalRounds: 1.5 },
+      { sessionId: 'a', maxGoalRounds: '3' }, { sessionId: 'a/b', objective: 'x' }, { sessionId: 'a', objective: 'x', phase: 'complete' }]],
+  ];
+  for (const [route, bodies] of invalid) for (const body of bodies) rejected(await g.request('POST', route, body), 400);
+  for (const route of ['/session/send', '/session/resume', '/session/goal']) rejected(await g.request('GET', route), 405);
+  assert.deepEqual(readdirSync(g.root), ['planner.md'], 'rejected requests write nothing');
+
+  for (const [name, value] of [['send', { status: 'sent', reason: 'message_submitted' }], ['resume', { status: 'processed', sessions: [] }],
+    ['goal', { status: 'edited' }], ['autoresume', { status: 'processed' }]]) writeFileSync(path.join(g.root, `${name}-result.json`), JSON.stringify(value));
+  writeFileSync(path.join(g.root, 'goal-result.json'), '{half');
+  assert.deepEqual((await g.request('GET', '/session/results')).body, { send: { status: 'sent', reason: 'message_submitted' },
+    resume: { status: 'processed', sessions: [] }, goal: null, autoresume: { status: 'processed' } });
+
+  const none = fixture(t, { api: { selftestDirectory: null } });
+  rejected(await none.request('POST', '/session/send', { sessionId: 'a', message: 'm' }), 409);
+  assert.deepEqual((await none.request('GET', '/session/results')).body, { send: null, resume: null, goal: null, autoresume: null });
+  assert.equal(existsSync(path.join(none.root, 'send-request.json')), false);
 });

@@ -96,11 +96,13 @@ test('planner read scope saves both modes and preserves the uneditable whitelist
 test('panel settings reject invalid values and unsupported YAML without changing the file', (t) => {
   const f = fixture(t);
   const text = `plugins:\n  - id: ${oldId}\n    name: ${f.moduleUrl}\n    config:\n      model: old\n`;
-  for (const changes of [null, [], {}, { unknown: 1 }, { model: '' }, { model: 'a b' }, { model: 'a'.repeat(81) },
-    { model: 'a\nother: injected' }, { effort: '' }, { effort: 'ultra' }, { readOnlyEffort: 'ultra' },
+  for (const changes of [null, [], {}, { unknown: 1 }, { model: 'a b' }, { model: 'a'.repeat(81) },
+    { model: 'a\nother: injected' }, { effort: 'ultra' }, { readOnlyEffort: 'ultra' },
     { plannerAnswers: 'true' }, { plannerReads: true }, { plannerReads: 'all' }, { plannerReads: null },
     { plannerReadAllow: [] }, { plannerReadAllowCount: 0 }, { serviceTier: 'priority' }, { lockTimeoutSeconds: 0 }, { lockTimeoutSeconds: -1 },
-    { lockTimeoutSeconds: NaN }, { maxStorageMb: Infinity }, { maxStorageMb: null }, { maxStorageMb: '1' },
+    { lockTimeoutSeconds: NaN }, { maxStorageMb: Infinity }, { maxStorageMb: '1' },
+    { retries: -1 }, { retries: 1.5 }, { maxRunningJobs: 0 }, { maxRunningJobs: 1.5 }, { timeoutSeconds: 0 },
+    { autoResume: {} }, { autoResume: { enabled: 'true' } }, { autoResume: { enabled: true, message: 'x' } },
     { gemini: { model: 'new' } }]) {
     writeFileSync(f.profileFile, text);
     assert.throws(() => saveRuntimeSettings({ ...f, changes }));
