@@ -118,6 +118,13 @@ FAKE_CODEX = textwrap.dedent(r"""
         while True:
             say(type="error", message="Reconnecting... waiting for network")
             time.sleep(0.5)
+    elif mode == "reconnect_refused":
+        child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
+        (state / "child.pid").write_text(str(child.pid))
+        while True:
+            say(type="error", message="Reconnecting... 1/5 (stream disconnected before completion: "
+                "the model refused this request (safety filter: example_policy))")
+            time.sleep(0.5)
     elif mode == "scoped_write":
         Path("keep/a.txt").write_text("changed by a shell command")
         say(type="item.completed", item={"type": "file_change",
@@ -369,6 +376,17 @@ class RunnerTests(unittest.TestCase):
         r = self.invoke("--reconnect-timeout", "2", "--idle-timeout", "60", "--retries", "0", mode="reconnect_forever")
         self.assertEqual(r["error_kind"], "reconnect_timeout")
         self.assertTrue(r["retryable"])
+        self.assertLess(time.time() - start, 20)
+        time.sleep(1)
+        self.assertFalse(alive(int((self.state / "child.pid").read_text())))
+
+    def test_model_refusal_in_a_reconnect_notice_fails_at_once_without_retry(self):
+        start = time.time()
+        r = self.invoke("--reconnect-timeout", "60", "--idle-timeout", "60", "--retries", "2", mode="reconnect_refused")
+        self.assertEqual(r["error_kind"], "model_refused")
+        self.assertFalse(r["retryable"])
+        self.assertEqual(r["attempts"], 1)
+        self.assertIn("refused this request", r["error"])
         self.assertLess(time.time() - start, 20)
         time.sleep(1)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))

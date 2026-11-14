@@ -579,6 +579,10 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   // 只读任务用 --ephemeral 运行；只有它续跑的写任务线程还能续。
   const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
+    if (value.error_kind === 'model_refused') {
+      return '执行模型拒绝了这单任务（模型侧安全策略，不是连接或插件故障），原样重派会再次被拒，不要重派同一份任务书。' +
+        '先用大白话告诉用户哪一单被模型拒绝、影响到哪一步；是否改写任务范围后再派由用户决定，不要改为自己动手。';
+    }
     if (!value.retryable) return '这次失败不可重试：先用大白话说明哪一步没做成和实际影响，必要时附原始错误，不要改为自己动手。';
     if (value.error_kind === 'lock_timeout') {
       return '等待写锁超时，尚未启动 Codex。先用 codex_jobs 查询同目录正在运行的任务，再决定等待还是用 codex_cancel 取消持锁任务；不要直接重派。';
