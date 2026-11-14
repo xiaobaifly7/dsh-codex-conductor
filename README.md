@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.97` 识别执行模型的安全策略拒绝：拒绝信息夹在重连提示里时立即结束任务并标记为 `model_refused`（不可重试），不再重连到超时、重试三轮；回执明确说明这是模型拒绝而不是连接故障。
+`0.9.98` 模型服务以 400 Bad Request 拒收某一轮请求时，任务标记为 `upstream_rejected`；回执说明同一线程续跑会再次被拒，不要 `resume`，核对已有改动后新开一单只补未完成部分。`0.9.97` 起模型安全策略拒绝会立即结束并标记为 `model_refused`。
 
 `0.9.95` 统一 Gemini 正文的单次可写核对指引，续接拒绝回执首行明确未启动及原因，并增加事件类型统计，仅在正文增量或写文件事件后启用 Gemini 空闲超时，启动与思考阶段保留 1800 秒默认总上限。
 
@@ -475,7 +475,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.97` recognises a safety refusal from the execution model: when the refusal arrives inside a reconnect notice the job ends at once as `model_refused` (not retryable) instead of reconnecting until the timeout across three attempts, and the receipt says it is a model refusal rather than a connection failure.
+`0.9.98` marks a job as `upstream_rejected` when the model service answers one request with 400 Bad Request; the receipt says the same thread is rejected again, so do not `resume` it: check existing changes and dispatch a new job for the unfinished part. Since `0.9.97` a model safety refusal ends the job at once as `model_refused`.
 
 `0.9.95` unifies Gemini prose guidance into one writable check, leads refused continuation receipts with the reason and explicit not-started status, and adds event-type counts while enabling Gemini idle timing only after prose deltas or file-write events, retaining the default 1800-second total deadline during startup and thinking.
 

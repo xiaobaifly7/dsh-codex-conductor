@@ -583,6 +583,11 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       return '执行模型拒绝了这单任务（模型侧安全策略，不是连接或插件故障），原样重派会再次被拒，不要重派同一份任务书。' +
         '先用大白话告诉用户哪一单被模型拒绝、影响到哪一步；是否改写任务范围后再派由用户决定，不要改为自己动手。';
     }
+    if (value.error_kind === 'upstream_rejected') {
+      return '模型服务拒收了这一轮请求（400 Bad Request，不是连接或插件故障）。同一线程续跑会再次被拒，不要用 resume 续这条线程。' +
+        (readOnly ? '' : '这单退出前可能已改了部分文件：先用 git status 或对比文件核对已有改动。') +
+        '用 codex_run 新开一单（不填 resume），沿用原任务和授权，并在任务书里写明已经做完的部分，只补没做完的。';
+    }
     if (!value.retryable) return '这次失败不可重试：先用大白话说明哪一步没做成和实际影响，必要时附原始错误，不要改为自己动手。';
     if (value.error_kind === 'lock_timeout') {
       return '等待写锁超时，尚未启动 Codex。先用 codex_jobs 查询同目录正在运行的任务，再决定等待还是用 codex_cancel 取消持锁任务；不要直接重派。';
