@@ -254,7 +254,12 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
 
 const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
-  maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置' };
+  maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置',
+  timeoutSeconds: '每次尝试的总超时秒数', idleTimeoutSeconds: '空闲超时秒数', retries: '自动重试次数',
+  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接' };
+// null clears a limit and restores the runner default.
+const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) => v > 0, timeoutSeconds: (v) => v > 0,
+  idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: (v) => Number.isInteger(v) && v > 0 };
 
 export function validatePanelSettings(value, geminiConfigured = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
@@ -271,8 +276,10 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'serviceTier') valid = ['', 'fast', 'ultrafast'].includes(v);
     else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
     else if (key === 'plannerReads') valid = ['open', 'products'].includes(v);
-    else if (['lockTimeoutSeconds', 'maxStorageMb'].includes(key)) valid = typeof v === 'number' && Number.isFinite(v) && v > 0;
-    else if (key === 'gemini') {
+    else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
+    else if (key === 'autoResume') {
+      valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.enabled === 'boolean';
+    } else if (key === 'gemini') {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
         Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
     }
@@ -305,11 +312,14 @@ function settingsEdits(profile, changes) {
     edits.push([{ ...field, render: () => rendered }, value]);
   };
   const insert = (at, text) => edits.push([{ start: at, length: 0, render: () => text }, null]);
+  // A new key; nested settings (autoResume) become a block of their own.
+  const fresh = (key, value, indentation) => newline + indentation + key + ':' + (value !== null && typeof value === 'object'
+    ? Object.entries(value).map(([k, item]) => fresh(k, item, indentation + '  ')).join('') : ' ' + yamlSetting(value));
   if (!configs.length) {
     validatePanelSettings(changes, false);
     const last = lines.at(-1);
     insert(endOfLine(last), newline + pad + 'config:' + Object.entries(changes)
-      .map(([key, value]) => newline + pad + '  ' + key + ': ' + yamlSetting(value)).join(''));
+      .map(([key, value]) => fresh(key, value, pad + '  ')).join(''));
     return edits;
   }
   const config = configs[0];
@@ -325,8 +335,12 @@ function settingsEdits(profile, changes) {
   validatePanelSettings(changes, gemini.length === 1 && new RegExp('^' + fieldPad + 'gemini:[ \\t]*(?:#.*)?$').test(gemini[0].text));
   let additions = '';
   for (const [key, value] of Object.entries(changes)) {
-    if (key === 'gemini') {
-      const parent = gemini[0];
+    if (key === 'gemini' || key === 'autoResume') {
+      const parents = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
+      if (parents.length > 1) throw new Error(`${key} 配置重复，未保存`);
+      if (!parents.length) { additions += fresh(key, value, fieldPad); continue; }
+      const parent = parents[0];
+      if (!new RegExp('^' + fieldPad + key + ':[ \\t]*(?:#.*)?$').test(parent.text)) throw new Error(`${key} 必须使用分行 YAML，未保存`);
       const nested = [];
       for (const line of children.slice(children.indexOf(parent) + 1)) {
         if (line.text.search(/\S/) <= fieldPad.length) break;
@@ -336,7 +350,7 @@ function settingsEdits(profile, changes) {
       let added = '';
       for (const [k, item] of Object.entries(value)) {
         const hits = nested.filter((line) => line.text.startsWith(nestedPad + k + ':'));
-        if (hits.length > 1) throw new Error(`gemini.${k} 配置重复，未保存`);
+        if (hits.length > 1) throw new Error(`${key}.${k} 配置重复，未保存`);
         if (hits.length) replace(hits[0], k, nestedPad, item);
         else added += newline + nestedPad + k + ': ' + yamlSetting(item);
       }
@@ -346,7 +360,7 @@ function settingsEdits(profile, changes) {
     const hits = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
     if (hits.length > 1) throw new Error(`${key} 配置重复，未保存`);
     if (hits.length) replace(hits[0], key, fieldPad, value);
-    else additions += newline + fieldPad + key + ': ' + yamlSetting(value);
+    else additions += fresh(key, value, fieldPad);
   }
   if (additions) insert(endOfLine(config), additions);
   return edits;

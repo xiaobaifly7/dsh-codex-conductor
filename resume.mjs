@@ -10,7 +10,7 @@ function validSessionId(id) {
   return typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
 }
 
-function validateRequest(request) {
+export function validateRequest(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) ||
       !Array.isArray(request.sessions) || request.sessions.length > 20) {
     throw new Error('sessions must be an array of at most 20 session IDs');
@@ -25,7 +25,7 @@ function validateRequest(request) {
   return { sessions: [...new Set(request.sessions)], message };
 }
 
-function validateSendRequest(request) {
+export function validateSendRequest(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) ||
       Object.hasOwn(request, 'sessions') || !validSessionId(request.sessionId) ||
       typeof request.message !== 'string' || !request.message.trim() || [...request.message].length > 4000 ||
@@ -35,7 +35,7 @@ function validateSendRequest(request) {
   return { sessionId: request.sessionId, message: request.message, queue: request.whenRunning === 'queue' };
 }
 
-function validateGoalRequest(request) {
+export function validateGoalRequest(request) {
   if (!request || typeof request !== 'object' || Array.isArray(request) || !validSessionId(request.sessionId) ||
       (request.objective === undefined && request.maxGoalRounds === undefined) ||
       (Object.hasOwn(request, 'objective') && (typeof request.objective !== 'string' || !request.objective.trim())) ||

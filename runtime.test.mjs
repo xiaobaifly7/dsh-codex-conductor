@@ -100,7 +100,9 @@ test('panel settings reject invalid values and unsupported YAML without changing
     { model: 'a\nother: injected' }, { effort: 'ultra' }, { readOnlyEffort: 'ultra' },
     { plannerAnswers: 'true' }, { plannerReads: true }, { plannerReads: 'all' }, { plannerReads: null },
     { plannerReadAllow: [] }, { plannerReadAllowCount: 0 }, { serviceTier: 'priority' }, { lockTimeoutSeconds: 0 }, { lockTimeoutSeconds: -1 },
-    { lockTimeoutSeconds: NaN }, { maxStorageMb: Infinity }, { maxStorageMb: null }, { maxStorageMb: '1' },
+    { lockTimeoutSeconds: NaN }, { maxStorageMb: Infinity }, { maxStorageMb: '1' },
+    { retries: -1 }, { retries: 1.5 }, { maxRunningJobs: 0 }, { maxRunningJobs: 1.5 }, { timeoutSeconds: 0 },
+    { autoResume: {} }, { autoResume: { enabled: 'true' } }, { autoResume: { enabled: true, message: 'x' } },
     { gemini: { model: 'new' } }]) {
     writeFileSync(f.profileFile, text);
     assert.throws(() => saveRuntimeSettings({ ...f, changes }));

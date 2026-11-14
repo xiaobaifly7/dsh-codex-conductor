@@ -77,9 +77,20 @@ const DEFAULTS = {
   reportSchema: here('./report.v2.schema.json'),
   // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
   plannerPromptFile: '',
+  // 附在每一单任务书后面、给 Codex 的固定要求（Markdown）；留空用规划要求文件同目录的 executor-prompt.md
+  executorPromptFile: '',
   runtimeProfileFile: '',
   gemini: null,
 };
+
+const EXECUTOR_TEMPLATE = `<!--
+每一单交给 Codex 的固定要求（dsh-codex-conductor）。
+
+写在这段注释下面的内容，会附在每一单任务书的执行约束后面，Codex 每单都会看到；
+它不增加权限，也不改变任务范围和验收标准。保存后下一单就生效，不用重载插件。
+只留这段注释（或清空文件）就不附加任何内容。
+-->
+`;
 
 const PLANNER_TEMPLATE = `<!--
 DeepSeek 派活给 Codex 前的规划要求（dsh-codex-conductor）。
@@ -299,7 +310,7 @@ export function createConductor(cfg, run = runRunner) {
     // runner 在截取前 300 条改动之前就过滤，改动数和超出 scope 的检查才准
     for (const pattern of cfg.ignoreChanges ?? []) argv.push('--ignore', pattern);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
-      ignore: cfg.ignoreChanges ?? [] });
+      ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '' });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -347,7 +358,7 @@ export function createConductor(cfg, run = runRunner) {
   return { start, waitJob, cancel, list, output, review, summary, products, doctor };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '' } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     '\n\n## 执行约束\n' +
@@ -363,6 +374,8 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '- 任务与现状不符、验收标准之间互相冲突，或者按计划做不到时，不要自行改方案或取舍：做完能做的部分，' +
     '在 deviations 里写清冲突和原因，并把对应验收标准标为 blocked。\n' +
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
+    (fixed ? '\n## 用户的固定要求\n以下要求适用于每一单，不增加权限，也不扩大范围；与上面的任务、验收标准或执行约束冲突时，' +
+      `以上面的为准，并在 deviations 里说明。\n${fixed}\n` : '') +
     '\n## 最后汇报\n最终答复只输出符合给定 JSON 格式的对象：summary 概述结果；criteria 按上面的顺序逐条给出 ' +
     'status（met / not_met / blocked）和 evidence（具体证据：命令与输出、文件与行号）；files_changed 列出改动的文件；' +
     'deviations 列出与计划不一致的地方及原因（没有就空数组）；unresolved 列出没解决的问题。\n' +
@@ -918,6 +931,26 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     mkdirSync(path.dirname(plannerFile), { recursive: true });
     writeFileSync(plannerFile, PLANNER_TEMPLATE);
   } catch {}
+  // 给 Codex 的固定要求：每次派单时现读，改完下一单就生效
+  cfg.executorPromptFile ||= plannerFile ? path.join(path.dirname(plannerFile), 'executor-prompt.md') : '';
+  if (cfg.executorPromptFile && !existsSync(cfg.executorPromptFile)) try {
+    mkdirSync(path.dirname(cfg.executorPromptFile), { recursive: true });
+    writeFileSync(cfg.executorPromptFile, EXECUTOR_TEMPLATE);
+  } catch {}
+  // 面板里的 Gemini 写作记录：gemini_write 没有 runner 任务，单独留最近 200 条
+  const geminiHistoryFile = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-history.jsonl') : '';
+  const recordGemini = (value, session) => {
+    if (!geminiHistoryFile) return;
+    try {
+      const lines = existsSync(geminiHistoryFile) ? readFileSync(geminiHistoryFile, 'utf8').split('\n').filter(Boolean) : [];
+      lines.push(JSON.stringify({ at: new Date().toISOString(), session: session ?? null, output: value.output ?? null, status: value.status,
+        chars: value.chars ?? value.before_rollback?.chars ?? null, attempts: value.attempts ?? null,
+        error: typeof value.error === 'string' ? value.error.slice(0, 300) : null,
+        draft_path: value.draft_path ?? null, duration_s: value.duration_s ?? null }));
+      mkdirSync(path.dirname(geminiHistoryFile), { recursive: true });
+      writeFileSync(geminiHistoryFile, `${lines.slice(-200).join('\n')}\n`);
+    } catch {}
+  };
   // 经 ctx.get 取服务（没列进 inject 时 ctx.systemPrompt 取不到），登记随插件卸载自动撤销。
   // 同名段已登记（新旧实例同时在）会抛错，这时只放弃注入，不连累其余功能；
   // 组装出错会让所有请求失败，所以 text 里不抛错（plannerPrompt 读不了就返回空）
@@ -1718,7 +1751,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     profileFile: cfg.runtimeProfileFile,
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
-  registerPanel({ ctx, cfg, conductor, runtime, plannerFile });
+  registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile });
 
   if (cfg.gemini) ctx.tools.register({
     name: 'gemini_write',
@@ -1787,6 +1820,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (value.status === 'completed') {
           productReads.addGemini(exec?.agent?.id, [value.output]);
         }
+        recordGemini(value, exec?.agent?.id);
         return value;
       }
       finally { if (!busy) geminiWrites.delete(key); }
@@ -1882,7 +1916,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
-        plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected }, null, 1));
+        plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}
   const resumeDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
   if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {

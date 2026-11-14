@@ -10,15 +10,15 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-safeguards-'));
 process.env.LOCALAPPDATA = localAppData;
 test.after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-const { apply, hasUserReply } = await import('./index.mjs');
-const { pidReused, validatePanelSettings } = await import('./runtime.mjs');
+const { apply, composePrompt, hasUserReply } = await import('./index.mjs');
+const { pidReused, saveRuntimeSettings, validatePanelSettings } = await import('./runtime.mjs');
 
 const exec = (id = 'S1', cwd = '/repo', log = []) => ({ agent: { id, session: { header: { cwd }, log } } });
 function load(config, run) {
-  const tools = {}, warnings = [], calls = [];
+  const tools = {}, warnings = [], calls = [], inputs = [];
   apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {}, logger: { warn: text => warnings.push(text) } },
-    config, async (_cfg, argv) => { calls.push(argv); return run(argv); });
-  return { tools, warnings, calls };
+    config, async (_cfg, argv, options) => { calls.push(argv); inputs.push(options?.stdin); return run(argv); });
+  return { tools, warnings, calls, inputs };
 }
 
 test('the automatic restart notice is not a user reply', () => {
@@ -109,4 +109,55 @@ test('a load marker held by a recycled PID is replaced', { skip: process.platfor
   writeFileSync(marker, JSON.stringify({ module: 'file:///C:/old/index.mjs', loadedAt: new Date(Date.now() - 3_600_000).toISOString(), pid: child.pid }));
   load({}, () => ({ jobs: [], total: 0 }));
   assert.equal(JSON.parse(readFileSync(marker, 'utf8')).pid, process.pid);
+});
+
+test('the fixed executor requirements ride along with every handoff', async () => {
+  assert.doesNotMatch(composePrompt('Inspect the layout.', ['Reported']), /用户的固定要求/);
+  const file = path.join(localAppData, 'dsh-codex-conductor', 'executor-prompt.md');
+  const { tools, inputs } = load({}, argv => argv[0] === 'list' ? { jobs: [], total: 0 } : { job_id: 'J1', status: 'completed', cwd: '/repo' });
+  assert.match(readFileSync(file, 'utf8'), /^<!--/);
+  const args = { task: 'Inspect the repository layout.', acceptance: ['Layout is reported'], write: false };
+  await tools.codex_run.execute(args, exec());
+  assert.doesNotMatch(JSON.parse(inputs.at(-1)).prompt, /用户的固定要求/);
+  writeFileSync(file, '<!-- note -->\n提交信息用英文。\n');
+  await tools.codex_run.execute(args, exec());
+  const prompt = JSON.parse(inputs.at(-1)).prompt;
+  assert.match(prompt, /## 用户的固定要求\n[^\n]*不增加权限[^\n]*\n提交信息用英文。\n\n## 最后汇报/);
+  assert.doesNotMatch(prompt, /note/);
+  writeFileSync(file, '');
+});
+
+test('gemini_write leaves one history line per call for the panel', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-history-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(path.join(root, 'notes.md'), '素材');
+  const tools = {};
+  apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {} }, { gemini: { command: 'C:\\agy\\agy.exe' } },
+    async () => ({ jobs: [], total: 0 }), () => { throw new Error('spawn unavailable'); });
+  const value = await tools.gemini_write.execute({ prompt: '根据素材写第一章入门说明。', sources: ['notes.md'], output: 'chapter.md' }, exec('S1', root));
+  assert.equal(value.status, 'failed');
+  const lines = readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'gemini-history.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  const last = lines.at(-1);
+  assert.deepEqual([last.session, last.status, last.output], ['S1', 'failed', value.output]);
+  assert.match(last.error, /spawn unavailable/);
+});
+
+test('the panel can clear limits and switch auto resume in the profile', t => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conductor-profile-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const moduleUrl = 'file:///C:/plugins/conductor/index.mjs';
+  const profileFile = path.join(dir, 'cordis.patch.yml');
+  const save = (config, changes) => {
+    writeFileSync(profileFile, `plugins:\n  - id: codex-conductor\n    name: ${moduleUrl}\n${config}`);
+    saveRuntimeSettings({ moduleUrl, profileFile, changes });
+    return readFileSync(profileFile, 'utf8').split('\n').slice(3).join('\n');
+  };
+  assert.equal(save('    config:\n      maxStorageMb: 500\n', { maxStorageMb: null, retries: 0, maxRunningJobs: 3 }),
+    '    config:\n      retries: 0\n      maxRunningJobs: 3\n      maxStorageMb: null\n');
+  assert.equal(save('    config:\n      model: m\n', { autoResume: { enabled: false } }),
+    '    config:\n      autoResume:\n        enabled: false\n      model: m\n');
+  assert.equal(save('    config:\n      autoResume:\n        maxAgeHours: 6\n        enabled: true\n', { autoResume: { enabled: false } }),
+    '    config:\n      autoResume:\n        maxAgeHours: 6\n        enabled: false\n');
+  assert.equal(save('', { autoResume: { enabled: false } }), '    config:\n      autoResume:\n        enabled: false\n');
+  assert.throws(() => save('    config:\n      autoResume: { enabled: true }\n', { autoResume: { enabled: false } }), /分行 YAML/);
 });

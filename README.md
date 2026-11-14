@@ -240,6 +240,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 防虚报：回合结束时 agent 声称“已派 Codex”或“Codex 正在做”，但这一轮没有调用 `codex_*`，也没有由本插件后台监控确认仍在运行的任务，插件会提醒它一次，让它补上调用或更正说法。没有 jobs 服务时不跨轮缓存轮询状态；取消失败时继续保留后台任务的执行状态。判断按当前会话的 DSH 任务表进行，插件重载后也沿用已有任务，不受其他会话运行任务的影响。
 - `0.9.98` 起：词首 `#` 按 bash 注释处理，`$(...)` 内不放行注释；未引用的 `$'…'`、`$"…"` 和 `${ cmd; }` 不放行。测试运行器只接受固定开关和字面路径：pytest 接受 `-q -v -x -s -l -k/-m <表达式> --maxfail=N --tb=… --lf --ff --collect-only` 等，`python -m unittest` 的操作数只接受 `discover`、`tests…`、`test_*…` 或 `.py` 路径，`node --test` 接受文件和 `--test-name-pattern=…`，npm/pnpm/yarn 的 `test` 后只接受 `--`、`-s`、`--silent` 和字面操作数，`make` 只接受单独的 `make test` / `make check`；需要其他参数时写进 `allowCommands`，或把这次检查交给 Codex。工具名不区分大小写，`apply_patch`、`multi_edit`、`ops_write`、`ops_edit` 以及 camelCase、连字符形式的 MCP 写入和执行动作同样拒绝；shell 工具不接受 `env`、`stdin` 等会改变执行的参数。超过 32 KB 的命令直接拒绝。`workspaces: ["*"]` 也覆盖没有工作目录的会话。
 
+### 0.9.98：面板新增内容
+
+“Codex 指挥”面板新增：“给 Codex 的固定要求”编辑框（保存前备份，保留最近 10 份，上限 1 MiB）；两份提示词的有效字数、历史备份查看与载入，规划提示词是否已注入；运行状态里的护栏工作区、主机访问状态和未识别的配置项，以及点一次查一次的“环境自检”；常用设置里的总超时、空闲超时、重试次数、同时运行任务数上限和重启后自动续接，数字项留空表示恢复默认或不限制；最近任务的会话、目录、耗时、验收条数、失败原因、核验状态和运行阶段，按任务编号或会话编号搜索，报告区切换查看任务书与验收、核验记录、错误日志；配置了 Gemini 时的最近 20 条写作记录；默认折叠的“会话操作”，可提交发送、续接、改 Goal 请求，走上文的本机请求文件，发送和改 Goal 需二次确认，上一份未处理时拒绝新提交。面板的运行状态每 7 秒读取，其余约每 28 秒，页面不可见时暂停；面板自检仍只读原有五个接口，不渲染会话操作。
+
 ## 要求
 
 - Windows + WSL2，DSH 运行在 Windows 上（插件通过 `wsl.exe` 调用）。
@@ -304,6 +308,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `defaultHostAccess` | `false` | 与 `allowHostAccess=true` 一起使用，省略 `host_access` 的新任务和 `resume` 默认以 `danger-full-access` 运行；显式传 `host_access=false` 可为单次任务恢复沙箱 |
 | `plannerAnswers` | `false` | 为 `true` 时允许规划端按用户原始目标和已有事实回答阻塞问题、自行登记 `accepted_deviations`（含 `kind: 'scope'`），不再做待答范围冲突的写入范围预检；最新任务仍为 `ask_user` 时须用 `codex_continue`，答案仍须覆盖全部问题 id。在给用户的汇报里说明代做的决定；拿不准、涉及删除数据或改动用户没提过的目录时仍先问用户 |
 | `plannerPromptFile` | `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` | 规划要求文件（Markdown，HTML 注释不算内容），注入 agent 的系统提示词（见上文） |
+| `executorPromptFile` | 规划要求文件同目录的 `executor-prompt.md` | 给 Codex 的固定要求（Markdown，HTML 注释不算内容）：附在每一单任务书的执行约束后面，Codex 每单都会看到；不增加权限，与任务、验收或执行约束冲突时以后者为准。保存后下一单生效，也可在设置的“Codex 指挥”面板里编辑 |
 | `runtimeProfileFile` | 空 | 当前 Harness 实例实际使用的 `cordis.patch.yml` 完整 Windows 路径；用于版本匹配与明确请求的热重载，留空时不能自动重载 |
 | `allowCommands` | `[]` | 额外放行的命令，JavaScript 正则逐段匹配（按 `\|`、`&&`、`;` 切开后的每一段），建议写成锚定正则；非法正则会警告并跳过，护栏和其余条目照常生效 |
 | `ignoreChanges` | `[]` | 改动清单里忽略的文件，Python `re` 正则匹配相对任务目录的路径（`/` 分隔），用于其他进程定期写的日志等；runner 在截取改动清单之前过滤，匹配的文件不计入改动数和超出 `scope` 的检查，交接提示里会告诉 Codex 它们可能被其他进程改动。无效模式由 runner 跳过，并在任务结果的 `ignore_warnings` 和展示文字中警告 |
@@ -628,6 +633,8 @@ A read-only subshell can omit the space after its opening parenthesis, for examp
 `env -u TAR_OPTIONS tar -tzvf ./archive.tar.gz` lists one literal local gzip archive. Extraction, remote archives, and extra options remain refused.
 
 Since `0.9.98` a word-initial `#` is a bash comment (refused inside `$(...)`), and unquoted `$'…'`, `$"…"` and `${ cmd; }` are refused. Test runners accept only fixed switches and literal paths: pytest takes `-q -v -x -s -l -k/-m <expr> --maxfail=N --tb=… --lf --ff --collect-only` and similar, `python -m unittest` operands must be `discover`, `tests…`, `test_*…` or a `.py` path, `node --test` takes files and `--test-name-pattern=…`, npm/pnpm/yarn `test` accepts only `--`, `-s`, `--silent` and literal operands, and `make` only a lone `make test` / `make check`; put other arguments in `allowCommands` or hand that check to Codex. Tool names are case-insensitive; `apply_patch`, `multi_edit`, `ops_write`, `ops_edit` and camelCase or hyphenated MCP write and execute actions are refused too, and shell tools refuse `env`, `stdin` and similar arguments. Commands above 32 KB are refused. `workspaces: ["*"]` also covers sessions without a working directory.
+
+`executorPromptFile` (default `executor-prompt.md` next to the planner prompt) holds fixed requirements for Codex: its content, minus HTML comments, is appended after the execution constraints of every handoff, grants no permission and yields to the task, acceptance criteria and constraints on conflict. The control panel edits it, shows prompt lengths and backups, guarded workspaces, host access, unknown configuration keys and an environment check, adds timeout, retry, running-job and auto-resume settings, richer job rows with search and extra report artifacts, a Gemini write history, and session operations that go through the local request files.
 
 Requires Windows/WSL2, Codex CLI, Python 3.11+ in WSL, and DSH `>=0.2.1-rc.2 <0.3.0`. Install `github:xiaobaifly7/dsh-codex-conductor`; see [installation](#安装). Tests: `node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs` and `python3 runner/test_codex_runner.py`; mocks need no DSH/real Codex. Platform/tool-specific cases skip when unavailable. CI runs both on Ubuntu/Windows with Node 22/Python 3.12.
 
