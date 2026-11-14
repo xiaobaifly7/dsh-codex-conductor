@@ -55,7 +55,8 @@ PERMANENT = re.compile(
     r"|model.{0,40}(not found|not supported|does not exist)|invalid.{0,20}(config|schema)|unrecognized", re.I)
 # The model refusing the request arrives inside "Reconnecting... n/5" notices; the same prompt is refused again,
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
-REFUSED = re.compile(r"refused this request|safety filter", re.I)
+# The same refusal also arrives as a failed turn with no reconnect notice ("This content was flagged for ...").
+REFUSED = re.compile(r"refused this request|safety filter|content was flagged for", re.I)
 # The model service answering 400 "Bad Request" to one request of a thread: seven jobs in one evening, and both a
 # retry inside the job and a later resume of the same thread were rejected again, while a new thread worked.
 REJECTED = re.compile(r"bad request|invalid_request_error", re.I)
@@ -549,6 +550,8 @@ def classify(state, run_dir):
         except OSError:
             text = ""
         state["error"] = text.strip()[-500:] or "Codex exited without turn.completed"
+    if REFUSED.search(text):
+        return "model_refused", False
     if PERMANENT.search(text):
         return "permanent", False
     if REJECTED.search(text):
