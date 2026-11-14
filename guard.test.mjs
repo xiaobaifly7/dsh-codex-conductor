@@ -489,7 +489,10 @@ test('tool names match case-insensitively and MCP actions in snake, camel or keb
   }
   for (const name of ['read', 'codex_run', 'codex_status', 'gemini_write', 'todo_write', 'mcp__fs__read_file',
     'mcp__gh__getFileContents', 'mcp__fs__list_directory', 'mcp__fs__search_files', 'mcp__git__git_status', 'mcp__git__git_diff',
-    'mcp__git__git_log', 'mcp__git__git_show', 'mcp__graph__query_graph', 'mcp__serena__find_symbol', 'mcp__x__seep_r2_info']) {
+    'mcp__git__git_log', 'mcp__git__git_show', 'mcp__graph__query_graph', 'mcp__serena__find_symbol', 'mcp__x__seep_r2_info',
+    // Not file writes: these keep the verdict they had before the action list grew.
+    'mcp__magpie-memory__memory_save', 'mcp__hindsight-codex__save', 'mcp__paseo__update_agent', 'mcp__x__push_notification',
+    'mcp__x__copy_text', 'mcp__x__reset_view', 'mcp__x__checkout_status']) {
     assert.equal(decide(call(name, {}), cfg), undefined, name);
   }
   assert.equal(decide(call('WSL', { command: 'git status' }), cfg), undefined);

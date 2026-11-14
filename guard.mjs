@@ -15,8 +15,10 @@ const DENY_TOOLS = new Set(['write', 'edit', 'wsl-write', 'wsl-edit', 'wsl-term'
 // MCP 工具按动作名拦（Serena 的 replace_content / insert_after_symbol / execute_shell_command 等）
 // Seep 的任意 r2 命令入口也可调用 Shell 或写文件，不能当读取工具放行。
 // 动作名先归一成小写 snake_case（writeFile、write-file 与 write_file 同等对待）再匹配。
-const MCP_WRITE = new RegExp('(^|_)(write|edit|replace|insert|delete|remove|rename|move|create|patch|apply|execute|exec|' +
-  'append|save|update|copy|mkdir|commit|reset|checkout|push)(_|$)|' +
+// save / update / copy 这类通用动词只在对象是文件时才拦：memory_save、update_agent 不是写文件，照常放行。
+const MCP_WRITE = new RegExp('(^|_)(write|edit|replace|insert|delete|remove|rename|move|create|patch|apply|execute|exec|mkdir)(_|$)|' +
+  '(^|_)(append|save|update|copy)_(to_)?files?(_|$)|' +
+  '(^|_)git_(commit|reset|checkout|push|pull|add|merge|rebase|stash|clean|revert|restore|rm|mv|cherry_pick)(_|$)|' +
   '(^|_)(run|start|spawn)_(command|cmd|script|code|process|shell|terminal)(_|$)|(^|_)send_(terminal_)?keys(_|$)|' +
   '^(shell|bash|sh|pwsh|powershell|cmd|terminal|seep_r2_cmd)$');
 const mcpAction = (tool) => tool.slice(tool.lastIndexOf('__') + 2)
