@@ -51,7 +51,6 @@ function fixture(t, action) {
 
 test('an existing target that agy leaves untouched is neither completed nor saved as a draft', async (t) => {
   for (const [name, action] of [['success without writing', ({ child }) => done(child)],
-    ['identical bytes rewritten', ({ child, output }) => { writeFileSync(output, readFileSync(output)); writeEvent(child, output); done(child); }],
     ['CLI failure before writing', ({ child }) => { child.stderr.write('auth failed'); done(child, 1, null); }]]) {
     for (const frontmatter of [undefined, { title: '新标题', tags: ['课程'] }]) await t.test(`${name}${frontmatter ? ' with frontmatter' : ''}`, async (t) => {
       const h = fixture(t, action);
@@ -59,7 +58,7 @@ test('an existing target that agy leaves untouched is neither completed nor save
       writeFileSync(h.output, original);
       const value = await h.execute({ overwrite: true, frontmatter });
       assert.equal(value.status, 'failed');
-      assert.match(value.error, /output 未被改写/);
+      assert.match(value.error, /没有改写 output/);
       assert.equal(Object.hasOwn(value, 'draft_path'), false, 'the old file must not be offered as a failed draft');
       assert.doesNotMatch(value.next, /可用 reuse_draft/);
       assert.equal(value.rolled_back, true);

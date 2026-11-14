@@ -2915,6 +2915,19 @@ test('a model refusal is reported as a refusal instead of a connection failure',
   assert.doesNotMatch(refused.next, /重连超时|恢复前不要重派/);
 });
 
+test('an upstream bad request tells the planner to start a new thread instead of resuming', async () => {
+  const { tools, finals } = harness();
+  finals.REJECTED = { job_id: 'REJECTED', status: 'failed', error_kind: 'upstream_rejected', retryable: false,
+    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', error: 'Codex: Bad Request' };
+  const rejected = await tools.codex_status.execute({ job_id: 'REJECTED', wait_seconds: 0 });
+  assert.match(rejected.next, /拒收了这一轮请求[\s\S]*不要用 resume[\s\S]*核对已有改动[\s\S]*新开一单/);
+
+  finals.REJECTED_RO = { ...finals.REJECTED, job_id: 'REJECTED_RO', sandbox: 'read-only', thread_id: null };
+  const readOnly = await tools.codex_status.execute({ job_id: 'REJECTED_RO', wait_seconds: 0 });
+  assert.match(readOnly.next, /不要用 resume[\s\S]*新开一单/);
+  assert.doesNotMatch(readOnly.next, /核对已有改动/);
+});
+
 test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {
   for (const cancelResult of [
     { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' },
@@ -4736,6 +4749,19 @@ test('gemini_write rolls back ERROR despite an already-written response and pres
     assert.deepEqual(JSON.parse(text.slice(text.indexOf('\n') + 1)), value);
     assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
   }
+});
+
+test('gemini_write does not keep an untouched existing output as a Gemini draft', async (t) => {
+  const h = geminiFixture(t, { action: ({ child }) => geminiDone(child, 3, { status: 'ERROR', response: 'service disabled' }) });
+  const output = path.join(h.cwd, 'chapter.md');
+  writeFileSync(output, '写作前的旧正文');
+  const value = await h.execute({ overwrite: true });
+  assert.equal(value.status, 'failed');
+  assert.match(value.error, /没有改写 output/);
+  assert.equal(Object.hasOwn(value, 'draft_path'), false);
+  assert.deepEqual(value.attempt_chars, [null]);
+  assert.doesNotMatch(h.tools.gemini_write.output.render({}, value)[0].text.split('\n')[0], /reuse_draft=/);
+  assert.equal(readFileSync(output, 'utf8'), '写作前的旧正文');
 });
 
 test('gemini_write retains only twenty drafts including the newest failed draft', async (t) => {

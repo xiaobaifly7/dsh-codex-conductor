@@ -351,17 +351,20 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
       value.over_limit = false;
       try {
         if (normPath(realPath(value.output)) !== outputKey || !statSync(value.output).isFile()) throw new Error('output 已被替换成其他路径或不是文件');
-        const written = readFileSync(value.output);
-        // 覆盖已有文件时，读回仍是原字节说明 agy 没有改写：不算完成，也不把旧内容存成失败稿。
-        const unchanged = !reused && original !== null && written.equals(original);
-        content = written.toString('utf8');
+        // With overwrite=true the old file is still there when Gemini fails before writing. One run saved that old
+        // text as its draft, and reuse_draft then reported the unchanged chapter as freshly written by Gemini.
+        if (!reused && original !== null && !eventKeys.has(outputKey) &&
+            !value.files_changed.some((file) => normPath(file.path) === outputKey) &&
+            readFileSync(value.output).equals(original)) {
+          throw new Error('Gemini 没有改写 output，文件里仍是写作前的旧内容，不能当作本次草稿');
+        }
+        content = readFileSync(value.output, 'utf8');
         if (header) content = content.replace(MODEL_FRONTMATTER, '');
-        if (!unchanged) draft = header + content;
+        draft = header + content;
         value.chars = [...content].length;
         value.cjk_chars = (content.match(/\p{Script=Han}/gu) ?? []).length;
         value.over_limit = args.max_chars !== undefined && value.chars > args.max_chars;
-        if (unchanged) errors.push('output 未被改写，仍是原内容');
-        else if (!content.trim()) errors.push('output 为空');
+        if (!content.trim()) errors.push('output 为空');
       } catch (error) { errors.push(`output 未生成或无法读回：${error.message}`); }
       value.attempt_chars.push(content === undefined ? null : value.chars);
       if (value.out_of_scope.length) errors.push('发现 output 以外的改动或写入事件，请核实范围外改动');
