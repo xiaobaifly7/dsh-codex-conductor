@@ -2353,7 +2353,7 @@ test("workspaces '*' guards every session workspace", () => {
   apply({ tools: { register: () => {}, guard: (g) => guards.push(g) }, on: () => {} }, { workspaces: ['*'] });
   assert.match(guards[0](call('write', {}, 'D:\\other')), /已拒绝/);
   assert.match(guards[0](call('write', {}, '/mnt/e/x')), /已拒绝/);
-  assert.equal(guards[0](call('write', {}, '')), undefined);
+  assert.match(guards[0](call('write', {}, '')), /已拒绝/);
 });
 
 test('read-only tasks use readOnlyEffort, writer tasks use effort; scope entries reach the runner', async () => {
@@ -4534,6 +4534,8 @@ test('gemini_write validates sources, output and overwrite before spawning', asy
   assert.equal(readFileSync(path.join(h.cwd, 'existing.md'), 'utf8'), '保留原文');
   const good = await h.execute({ sources: [path.join(h.cwd, 'notes.md')], output: 'chapter.md', overwrite: true });
   assert.equal(good.status, 'completed', good.error);
+  // The fake agy always writes the same bytes; an overwrite must actually change the target.
+  writeFileSync(path.join(h.cwd, 'chapter.md'), '旧稿\n');
   assert.equal((await h.execute({ overwrite: true })).status, 'completed');
 });
 
@@ -4883,10 +4885,11 @@ test('gemini_write keeps and counts model frontmatter when the parameter is omit
   assert.equal(value.chars, [...original].length);
   assert.equal(readFileSync(value.output, 'utf8'), original);
   assert.doesNotMatch(h.spawns[0].prompt, /元数据由插件生成/);
+  writeFileSync(value.output, '旧稿\n');
   const failed = await h.execute({ overwrite: true, max_chars: [...original].length - 1 });
   assert.equal(failed.status, 'failed');
   assert.deepEqual(failed.attempt_chars, [[...original].length, [...original].length]);
-  assert.equal(readFileSync(value.output, 'utf8'), original);
+  assert.equal(readFileSync(value.output, 'utf8'), '旧稿\n');
 });
 
 test('gemini_write returns failed for CLI, protocol and missing or empty file errors', async (t) => {

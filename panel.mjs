@@ -1,4 +1,4 @@
-import { readFileSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
+import { readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 const { validatePanelSettings, writeBackedUpFile, queryWithTimeout } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
@@ -8,6 +8,7 @@ export const PANEL_PATH = '/dsh-codex-conductor';
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const bad = (message, status = 400) => Object.assign(new Error(message), { status });
 const SELFTEST_LIMIT = 64 * 1024;
+const PROMPT_BACKUPS = 10;
 
 function selftestResult(body) {
   object(body, ['id', 'claim', 'result']);
@@ -138,7 +139,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
       return { saved: true };
     }
     if (route === '/status') {
-      return { runtime: await runtime.execute({ action: 'status' }, { signal }), settings: panelSettings(cfg) };
+      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg) };
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;
@@ -215,6 +216,13 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile,
     if (method === 'GET') return { text: readFileSync(plannerFile, 'utf8') };
     if (typeof body.text !== 'string') throw bad('规划提示词必须是文字，请重新填写后保存。');
     writeBackedUpFile(plannerFile, Buffer.from(body.text, 'utf8'));
+    // 只清理本功能按 writeBackedUpFile 命名生成的备份，保留最近几份；清理失败不影响已完成的保存。
+    try {
+      const prefix = path.basename(plannerFile) + '.';
+      const backups = readdirSync(path.dirname(plannerFile)).filter((name) => name.startsWith(prefix) &&
+        /^\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z\.[0-9a-f-]{36}\.bak$/.test(name.slice(prefix.length))).sort();
+      for (const name of backups.slice(0, -PROMPT_BACKUPS)) unlinkSync(path.join(path.dirname(plannerFile), name));
+    } catch {}
     return { saved: true };
   }
   return (method, pathname, query, body) => method === 'GET' &&

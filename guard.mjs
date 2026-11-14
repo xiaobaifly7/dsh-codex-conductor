@@ -10,23 +10,33 @@ export function wslPath(p) {
 // 范围内一律拒绝：直接写文件、交互终端、Windows shell、可跑任意命令的 Actions、PTC 代码执行
 // subagent_codex 走的是 Windows 版 Codex，绕开了 WSL runner
 const DENY_TOOLS = new Set(['write', 'edit', 'wsl-write', 'wsl-edit', 'wsl-term', 'wsl-bootstrap',
-  'pwsh', 'actions_run', 'actions_configure', 'run_code', 'subagent_codex']);
+  'pwsh', 'actions_run', 'actions_configure', 'run_code', 'subagent_codex',
+  'apply_patch', 'multi_edit', 'ops_write', 'ops_edit']);
 // MCP 工具按动作名拦（Serena 的 replace_content / insert_after_symbol / execute_shell_command 等）
 // Seep 的任意 r2 命令入口也可调用 Shell 或写文件，不能当读取工具放行。
-const MCP_WRITE = /(^|_)(write|edit|replace|insert|delete|remove|rename|move|create|patch|apply|execute|exec)(_|$)|^seep_r2_cmd$/i;
+// 动作名先归一成小写 snake_case（writeFile、write-file 与 write_file 同等对待）再匹配。
+const MCP_WRITE = new RegExp('(^|_)(write|edit|replace|insert|delete|remove|rename|move|create|patch|apply|execute|exec|' +
+  'append|save|update|copy|mkdir|commit|reset|checkout|push)(_|$)|' +
+  '(^|_)(run|start|spawn)_(command|cmd|script|code|process|shell|terminal)(_|$)|(^|_)send_(terminal_)?keys(_|$)|' +
+  '^(shell|bash|sh|pwsh|powershell|cmd|terminal|seep_r2_cmd)$');
+const mcpAction = (tool) => tool.slice(tool.lastIndexOf('__') + 2)
+  .replace(/([a-z0-9])([A-Z])/g, '$1_$2').replace(/-/g, '_').toLowerCase();
 // shell 类工具只放行只读命令；这些参数一出现就拒绝
-const SHELL_TOOLS = { wsl: ['env', 'stdin', 'asRoot', 'allowDangerous'], bash: ['env', 'stdin'], ops_bash: ['script_path'] };
+const SHELL_ARGS = ['env', 'stdin', 'asRoot', 'allowDangerous', 'script_path'];
+const SHELL_TOOLS = { wsl: SHELL_ARGS, bash: SHELL_ARGS, ops_bash: SHELL_ARGS };
+const MAX_COMMAND = 32_768; // 同步护栏不解析更长的命令
 
 const READERS = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'stat',
   'file', 'du', 'df', 'diff', 'cmp', 'sha256sum', 'sha1sum', 'md5sum', 'nl', 'cut', 'tr', 'column', 'jq',
   'basename', 'dirname', 'realpath', 'readlink', 'which', 'echo', 'printf', 'date', 'hexdump', 'od',
-  'strings', 'readelf', 'objdump', 'nm', 'true', 'test', '[', '[[', 'read', 'exit', 'pytest', 'ps', 'pgrep',
+  'strings', 'readelf', 'objdump', 'nm', 'true', 'test', '[', '[[', 'read', 'exit', 'ps', 'pgrep',
   'uname', 'whoami', 'id', 'paste', 'tasklist', 'netstat']);
 // 流程控制关键字本身不执行任何东西，剥掉后检查它带的命令
 const LEAD_KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', '(', 'time']);
 const CLOSE_KEYWORDS = new Set(['fi', 'done', '}', ')']);
 const GIT_READ = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'ls-tree', 'blame',
-  'grep', 'describe', 'shortlog', 'cat-file', 'whatchanged', 'rev-list', 'diff-tree', 'check-ignore']);
+  'grep', 'describe', 'shortlog', 'cat-file', 'whatchanged', 'rev-list', 'diff-tree', 'check-ignore',
+  'merge-base', 'show-ref']);
 const GIT_BRANCH_READ = new Set(['-a', '-r', '-v', '-vv', '--list', '--all', '--show-current', '--no-color']);
 // 项目自带的验证脚本视同 pytest：只放行 -File 指向 tests 目录下的 .ps1，不放行 -Command
 // 只认字面的 pwsh 路径：$PWSH 之类的变量可以先被单独赋值成任意命令，展开后按空白切开执行
@@ -41,9 +51,10 @@ const SED_ADDRESS = String.raw`(?:\d+(?:,\d+)?|/[^/\\$]*/(?:,/[^/\\$]*/)?)`;
 const SED_PRINT = new RegExp(String.raw`^\s*${SED_ADDRESS}p(?:\s*;\s*${SED_ADDRESS}p)*\s*;?\s*$`);
 const SED_START = new RegExp(String.raw`^\s*(?:${SED_ADDRESS})?([sp])`);
 // These names change command lookup, startup code or tool execution options rather than hold task data.
-const EXEC_ENV = /^(?:PATH|HOME|XDG_CONFIG_HOME|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|CDPATH|GLOBIGNORE|BASH_XTRACEFD|PS4|PROMPT_COMMAND|LD_.*|DYLD_.*|GCONV_PATH|GIT_.*|TAR_OPTIONS|NODE_.*|PYTHON.*|AWKPATH|AWKLIBPATH)$/;
+const EXEC_ENV = /^(?:PATH|HOME|XDG_CONFIG_HOME|IFS|ENV|BASH_ENV|BASHOPTS|SHELLOPTS|CDPATH|GLOBIGNORE|BASH_XTRACEFD|PS4|PROMPT_COMMAND|LD_.*|DYLD_.*|GCONV_PATH|GIT_.*|TAR_OPTIONS|NODE_.*|PYTHON.*|AWKPATH|AWKLIBPATH|RIPGREP_CONFIG_PATH|MAKEFILES|MAKEFLAGS|MFLAGS|RUSTC|RUSTC_WRAPPER|RUSTC_WORKSPACE_WRAPPER|RUSTFLAGS|RUSTDOCFLAGS|CARGO_.*|GOFLAGS|PYTEST_.*)$/;
+// npm 读取 npm_config_* 时不区分大小写。
 const assignmentAllowed = (w) => /^[A-Za-z_][A-Za-z0-9_]*=(?![-(])\S*$/.test(w) &&
-  !w.includes('$(') && !EXEC_ENV.test(w.slice(0, w.indexOf('=')));
+  !w.includes('$(') && !EXEC_ENV.test(w.slice(0, w.indexOf('='))) && !/^npm_config_/i.test(w);
 
 const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex_run 交给 Codex；你只做只读核验：read / glob / grep 等读工具，' +
   '或 wsl 里的只读命令（git status/diff/log/show、ls、cat、head、tail、grep、find、wc、sha256sum、gzip -t、pytest、npm test 等，' +
@@ -55,7 +66,8 @@ const HINT = '改文件、跑会产生改动的命令、做调查，都用 codex
 
 export function normPath(p) {
   if (typeof p !== 'string' || !p.trim()) return '';
-  let s = p.trim().replace(/\\/g, '/');
+  // \\wsl.localhost\<distro>\... 与 \\wsl$\<distro>\... 是同一个 WSL 路径的 Windows 写法。
+  let s = p.trim().replace(/\\/g, '/').replace(/^\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(?=\/|$)/i, '') || '/';
   const windows = /^[A-Za-z]:/.test(s) || s.startsWith('//');
   // Resolve .. in WSL before converting a mount to its Windows drive.
   s = path.posix.normalize(s);
@@ -69,17 +81,22 @@ export const under = (p, r) => p === r || p.startsWith(r === '/' ? r : `${r}/`);
 
 export function inWorkspace(cwd, roots) {
   const c = normPath(cwd);
-  // '*' 匹配任何会话工作区
-  return c !== '' && roots.some((r) => r === '*' || under(c, r));
+  // '*' 匹配任何会话，包括没有工作目录的会话
+  return roots.some((r) => r === '*' || (c !== '' && under(c, r)));
 }
 
 // `$(` 之后找到配对的 `)`，跳过引号内的括号；找不到返回 -1。
 function closingParen(s, start) {
   let depth = 1;
   let quote = null;
+  let wordStart = true;
   for (let j = start; j < s.length; j++) {
     const c = s[j];
     if (quote) { if (c === quote) quote = null; else if (c === '\\' && quote === '"') j++; continue; }
+    // 注释和 $'…' / $"…" 里的引号、括号不按这里的规则配对，保守拒绝。
+    if ((c === '#' && wordStart) || (c === '$' && (s[j + 1] === "'" || s[j + 1] === '"'))) return -1;
+    if (c === '\\' && s[j + 1] === '\n') { j++; continue; }
+    wordStart = ' \t\n;&|()<>'.includes(c);
     if (c === "'" || c === '"') quote = c;
     else if (c === '\\') j++;
     else if (c === '(') depth++;
@@ -176,6 +193,12 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
       else { word += ch; parameterWord += ch === '$' ? 'X' : ch; }
       continue;
     }
+    // 词首的 # 开始注释：到行尾为止，其中的引号和反斜杠续行都不生效。
+    if (ch === '#' && !quote && !started) {
+      const end = command.indexOf('\n', i);
+      i = (end < 0 ? command.length : end) - 1;
+      continue;
+    }
     if (ch === '`') return null;
     if (ch === '$') {
       if (/^[({A-Za-z0-9_@*#?!-]/.test(next ?? '')) dynamic = true;
@@ -191,6 +214,8 @@ export function splitCommand(command, inner = () => false, braceSegments = new S
     }
     const expansion = ch === '$' ? skipLineContinuations(command, i + 1) : -1;
     if (command[expansion] === '[') return null;
+    // $'…' 里的 \' 不结束引号，$"…" 是本地化引号；都不能按普通引号解析。
+    if (!quote && (command[expansion] === "'" || command[expansion] === '"')) return null;
     if (command[expansion] === '(') {
       // $((...)) 是算术：会把变量值当表达式递归求值，值里的 a[$(...)] 就能执行命令
       const start = expansion + 1;
@@ -292,7 +317,9 @@ function gitAllowed(args) {
   // -ePATTERN/-fFILE 等会吞掉后面的字母，其中的 O 不是 pager 开关。
   if (sub === 'grep' && rest.some((a) => /^-[^-efmCBA]*O/.test(a) || (a.startsWith('--') && a !== '--' &&
     '--open-files-in-pager'.startsWith(a.split('=')[0])))) return false;
-  if (sub === 'branch') return rest.every((a) => GIT_BRANCH_READ.has(a));
+  if (sub === 'branch') return rest.every((a) => GIT_BRANCH_READ.has(a) || (rest.includes('--list') && !a.startsWith('-')));
+  // reflog 只放行默认的 show 形式；expire / delete 会改引用日志。
+  if (sub === 'reflog') return rest[0] === undefined || rest[0] === 'show' || rest[0].startsWith('-');
   if (sub === 'config') return (rest.length === 1 && ['-l', '--list'].includes(rest[0])) ||
     (rest[0] === '--get' && rest.length > 1 && rest.slice(1).every((a) => !a.startsWith('-')));
   if (sub === 'remote') return rest.every((a) => ['-v', '--verbose'].includes(a));
@@ -308,7 +335,9 @@ function pwshTestAllowed(args) {
   // 语法检查脚本后面只能跟待检查的文件，不放行任何开关
   const helper = normPath(script) === normPath(PS_SYNTAX) &&
     args.length > file + 2 && args.slice(file + 2).every((a) => !a.startsWith('-'));
-  if (file < 0 || script.includes('$') || !(helper || TEST_SCRIPT.test(script))) return false;
+  // 测试脚本的命名参数由脚本自己定义（如 -Configuration Release），照常放行；只拒绝无法确定展开结果的 $。
+  const plain = args.slice(file + 2).every((a) => !a.includes('$'));
+  if (file < 0 || script.includes('$') || !(helper || (TEST_SCRIPT.test(script) && plain))) return false;
   for (let i = 0; i < file; i++) {
     if (/^-ExecutionPolicy$/i.test(args[i])) i++;
     else if (!PWSH_FLAGS.has(args[i].toLowerCase())) return false;
@@ -403,7 +432,8 @@ function awkIssue(args, patterns = []) {
   if (patterns[i]) return '程序不能由未引用的 glob 展开生成';
   if (/\bsystem\s*\(/.test(script)) return 'system(...) 可以启动进程';
   if (script.replaceAll('||', '').includes('|')) return '管道 | 可以启动进程';
-  if (/>(?!=)/.test(script)) return '重定向 > 可以写文件';
+  // > 只在 print / printf 语句里是重定向；没有 print 的程序里只能是比较运算符。
+  if (/>(?!=)/.test(script) && script.includes('print')) return '重定向 > 可以写文件';
   if (/\bgetline\b/.test(script)) return 'getline 可以读取外部文件或管道';
   if (script.includes('@')) return '@include/@load/间接调用可以加载或执行代码';
   if (args.slice(i + 1).some((a) => a.startsWith('-') && a !== '-')) return '程序后的选项可能加载其他程序或扩展';
@@ -460,7 +490,8 @@ function testAllowed(args) {
     if (a === undefined) return false;
     if (TEST_BINARY.has(op)) {
       i += 3;
-      return b !== undefined && (!ARITH_OP.has(op) || (intOperand(a) && intOperand(b)));
+      // [ / test 只把操作数当整数解析，不做算术求值（[[ 才会）：整词的 "$(...)" 可以放行，未引用的仍被 fieldSplit 拦下。
+      return b !== undefined && (!ARITH_OP.has(op) || [a, b].every((v) => intOperand(v) || v === '$X'));
     }
     if (TEST_UNARY.has(a)) {
       i += 2;
@@ -497,7 +528,8 @@ function braceBodySafe(body) {
   if (body[0] === '!') return false;
   let s = body[0] === '#' ? body.slice(1) : body;
   const name = /^([A-Za-z_][A-Za-z0-9_]*|[-@*#?$!0-9]+)/.exec(s);
-  if (!name) return true;
+  // 没有变量名的 ${ cmd; } / ${|cmd;} 是 Bash 5.3 的命令替换，只有 ${#} 是合法的无名形式。
+  if (!name) return body === '#';
   s = s.slice(name[0].length);
   if (s[0] === '[') {
     const close = s.indexOf(']');
@@ -528,23 +560,42 @@ function braceExpansionsSafe(word) {
   return true;
 }
 
+// 测试运行器的其余参数可以写文件或加载代码：只接受列出的开关、带值开关，以及不以 - / @ 开头的操作数。
+function runnerArgs(args, flags = /^$/, valued = [], operand = () => true) {
+  for (let i = 0; i < args.length; i++) {
+    const option = valued.includes(args[i]);
+    const a = option ? args[++i] : args[i];
+    if (a === undefined) return false;
+    if (/^[-@]/.test(a)) { if (option || !flags.test(a)) return false; }
+    else if (!option && !operand(a)) return false;
+  }
+  return true;
+}
+const PYTEST_FLAGS = /^(?:-[qvxsl]+|-r[A-Za-z]+|--(?:lf|ff|last-failed|failed-first|collect-only|co|no-header|no-summary|disable-warnings|showlocals|exitfirst|quiet|verbose|version)|--(?:maxfail|durations)=\d+|--tb=(?:auto|long|short|line|native|no)|--color=(?:yes|no|auto))$/;
+const pytestArgs = (args) => runnerArgs(args, PYTEST_FLAGS, ['-k', '-m']);
+// unittest 会调用任意点分名指向的可调用对象（code.interact、pdb.set_trace…），操作数只接受测试模块名或 .py 路径。
+const unittestArgs = (args) => runnerArgs(args, /^(?:-[vqfbc]+|--(?:verbose|quiet|failfast|buffer|catch|locals))$/, ['-k', '-s', '-p', '-t'],
+  (a) => a === 'discover' || /\.py$/.test(a) || /^(?:tests|test_\w*)(?:\.|$)/.test(a));
+const GO_FLAGS = /^--?(?:v|short|race|failfast|cover|json|(?:count|p|parallel)=\d+|timeout=\w+|run=[^=]*)$/;
+const CARGO_FLAGS = /^(?:--|-[qv]+|--(?:release|workspace|all|all-targets|all-features|no-default-features|lib|bins|tests|doc|quiet|verbose|locked|offline|frozen|no-fail-fast|nocapture|exact|ignored|include-ignored|show-output)|--test-threads=\d+)$/;
+
 function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
   const { words, kind, start, assignments } = core(raw, expansion.kinds);
-  if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   // 只检查实际展开；单引号和转义保护的字面文本不参与。
   if (expansion.unsafeParameter) return false;
   if (!assignments.every(assignmentAllowed)) return false;
+  if (extra.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) return true;
   if (!words.length) return true;
   // 循环列表里的词会代入后面的命令，不能借它塞进参数（for f in -delete; do find . $f）
   if (words[0] === 'for') return kind === 'literal' && (words.length <= 2 || words[2] === 'in') &&
     words.slice(3).every((w) => !w.startsWith('-'));
   if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[0])) return false;
-  if (PWSH.test(words[0])) return pwshTestAllowed(words.slice(1));
+  if (PWSH.test(words[0])) return !braceExpansion && !(expansion.glob && expansion.fieldSplit) && pwshTestAllowed(words.slice(1));
   const [cmd, ...args] = words;
   const parameters = expansion.parameters?.slice(start + 1) ?? args;
   const patterns = expansion.patterns?.slice(start + 1);
   // 展开后的词可能变成被过滤的开关，不能把它当成普通文件参数。
-  if (/^(git|iconv|icacls|find|sed|awk|dd|base64|ssh-keygen|rg|sort|uniq|tree|file|date|npm|pnpm|yarn|node|go|cargo|make)$/.test(cmd) &&
+  if (/^(git|iconv|icacls|find|sed|awk|dd|base64|ssh-keygen|rg|sort|uniq|tree|file|date|npm|pnpm|yarn|node|go|cargo|make|pytest|python|python3)$/.test(cmd) &&
       (braceExpansion || parameters.some((a) => a.includes('$')) || (expansion.glob && expansion.fieldSplit))) return false;
   switch (cmd) {
     // 只放行直接、无参数的内建控制；timeout 后的同名外部程序仍拒绝。
@@ -588,7 +639,7 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       return true;
     }
     case 'find': return !findIssue(args, extra, braceExpansion, { ...expansion, parameters, patterns });
-    case 'rg': return !args.some((a) => a.startsWith('--pre'));
+    case 'rg': return !args.some((a) => a.startsWith('--pre') || a.startsWith('--hostname-bin'));
     case 'sort': return !args.some((a) => /^-[^-]*o/.test(a) || (a.startsWith('--') && a !== '--' &&
       ['--output', '--compress-program', '--random-source'].some((flag) => flag.startsWith(a.split('=')[0]))));
     case 'uniq': {
@@ -603,7 +654,8 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
         !expansion.dynamicWords?.[start + i + 1] && !patterns?.[i] && !parameters[i]?.includes('$')) &&
         !/%[-+ #0']*(?:\d+|\*)?(?:\.(?:\d+|\*)?)?[hlLjzt]*n/.test((args[format] ?? '').replace(/%%/g, ''));
     }
-    case 'tree': return !args.some((a) => /^-[^-]*o/.test(a));
+    // -R 配 -H 会在各子目录写 00Tree.html。
+    case 'tree': return !args.some((a) => /^-[^-]*[oR]/.test(a));
     case 'sed': return !sedIssue(args, patterns);
     case 'awk': return !awkIssue(args, patterns);
     case 'dd': return !ddIssue(args);
@@ -611,11 +663,22 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
       args.every((a) => !a.startsWith('-') || ['-', '-d', '--decode', '-i', '--ignore-garbage'].includes(a)) : false;
     case 'ssh-keygen': return (args.length === 3 && args[0] === '-l' && args[1] === '-f') ||
       (args.length === 2 && args[0] === '-lf');
-    case 'python': case 'python3': return args[0] === '-m' && ['pytest', 'unittest'].includes(args[1]);
-    case 'npm': case 'pnpm': case 'yarn': return args[0] === 'test' || (args[0] === 'run' && /^test/.test(args[1] ?? ''));
-    case 'node': return args[0] === '--test' || args[0] === '--check';
-    case 'go': return ['test', 'vet'].includes(args[0]) && !args.some((a) => /^--?(exec|toolexec|vettool)(=|$)/.test(a));
-    case 'cargo': case 'make': return ['test', 'check'].includes(args[0]);
+    case 'pytest': return pytestArgs(args);
+    case 'python': case 'python3':
+      if (args.length === 1 && ['--version', '-V'].includes(args[0])) return true;
+      return args[0] === '-m' && (args[1] === 'pytest' ? pytestArgs(args.slice(2)) : args[1] === 'unittest' && unittestArgs(args.slice(2)));
+    case 'npm': case 'pnpm': case 'yarn': {
+      const rest = args[0] === 'test' ? args.slice(1) : args[0] === 'run' && /^test/.test(args[1] ?? '') ? args.slice(2) : null;
+      return rest !== null && runnerArgs(rest, /^(?:--|-s|--silent)$/);
+    }
+    case 'node': return (args.length === 1 && ['--version', '-v'].includes(args[0])) ||
+      (args[0] === '--check' && runnerArgs(args.slice(1))) ||
+      (args[0] === '--test' && runnerArgs(args.slice(1), /^--test-(?:only|name-pattern=.*)$/));
+    case 'go': return ['test', 'vet'].includes(args[0]) && runnerArgs(args.slice(1), GO_FLAGS, ['-run', '-count', '-timeout']);
+    case 'cargo': return ['test', 'check'].includes(args[0]) &&
+      runnerArgs(args.slice(1), CARGO_FLAGS, ['-p', '--package', '--features', '--test', '--bin']);
+    // make 的额外目标、VAR=值、--eval / -f 都能执行任意配方，只接受单个目标。
+    case 'make': return args.length === 1 && ['test', 'check'].includes(args[0]);
     // 算术比较（-eq 等）两侧必须是字面整数：否则操作数的运行时值（文件内容、变量、命令输出）会被当算术表达式求值并执行其中的 $(...)。
     // 只有 -v / -R 的操作数会对 name[下标] 做算术求值；=~、== 的模式和文件测试里的 name[..] 不求值，照常放行（真有 $(...) 由 splitCommand 拦）
     case 'test': case '[':
@@ -631,7 +694,7 @@ function segmentAllowed(raw, extra, braceExpansion = false, expansion = {}) {
 }
 
 export function readOnlyCommand(command, extra = [], variables = new Map()) {
-  if (typeof command !== 'string' || !command.trim()) return false;
+  if (typeof command !== 'string' || !command.trim() || command.length > MAX_COMMAND) return false;
   const braceSegments = new Set();
   const expansions = new Map();
   const segments = splitCommand(command, (sub, vars) => readOnlyCommand(sub, extra, vars), braceSegments, expansions, variables);
@@ -640,11 +703,12 @@ export function readOnlyCommand(command, extra = [], variables = new Map()) {
 
 // 拒绝原因：整条命令截断后看不到真正卡住的地方，所以指出不放行的结构或第一段不放行的命令
 function refusedPart(command, extra) {
+  if (typeof command === 'string' && command.length > MAX_COMMAND) return '命令超过 32 KB，请拆成几条短命令';
   const braceSegments = new Set();
   const expansions = new Map();
   const segments = typeof command === 'string' ? splitCommand(command, (sub, vars) => readOnlyCommand(sub, extra, vars), braceSegments, expansions) : [];
   if (segments === null) {
-    return '含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、$[...] 算术、进程替换、$(...) 里的非只读命令或未闭合引号';
+    return "含不放行的结构：写到 /dev/null 以外的重定向、反引号、heredoc、$((...)) 算术、$[...] 算术、进程替换、$'...' / $\"...\" 引号、$(...) 里的非只读命令或注释、未闭合引号";
   }
   const bad = segments.find((w) => !segmentAllowed(w, extra, braceSegments.has(w), expansions.get(w)));
   if (!bad) return '命令为空';
@@ -674,6 +738,9 @@ export const PRODUCT_DENY_HINT = '已拒绝。调查交给 codex_run；核对产
 export const PRODUCT_HINT = `这是原料，规划端不直接读。${PRODUCT_DENY_HINT}`;
 export const GEMINI_CHECK_HINT = '该正文由 gemini_write 写出，规划端不读取。下一步派一单 codex_run（write=true，scope 只含该正文文件），在同一单里核对事实与可读性、就地修正写法问题和句子级错误，报告问题位置和改动；不要另派只读核对或清理单，也不要换工具、搜索或命令绕读。';
 export const GEMINI_READ_DENY = `[codex-conductor] ${GEMINI_CHECK_HINT}`;
+export const GEMINI_UNKNOWN_DENY = '[codex-conductor] 本会话有 gemini_write 写出的正文，规划端不读取。这条命令的读取目标无法确定' +
+  '（cd、变量、通配符、循环，或 git diff/log/show、测试运行器等），不能确认它不读该正文，已拒绝。' +
+  '只读核验请逐个写明具体文件的绝对路径（如 cat /abs/path/a.py）；其余核对派 codex_run。';
 
 // Use the same mount/case normalization as scopes; resolve local links before comparing.
 export function readPath(file, cwd = '') {
@@ -745,6 +812,7 @@ function rgFilesOnly(args) {
 
 export function shellReadTargets(command, cwd) {
   const expansions = new Map(), braces = new Set(), targets = [];
+  if (typeof command !== 'string' || command.length > MAX_COMMAND) return null;
   let unknown = false;
   const segments = splitCommand(command, (sub) => {
     const reads = shellReadTargets(sub, cwd);
@@ -875,7 +943,7 @@ function obsidianVaultRoot(allow) {
 }
 
 export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd, plannerReadAllow = []) {
-  const name = String(exec?.name ?? '').split('__').at(-1);
+  const name = String(exec?.name ?? '').split('__').at(-1).toLowerCase();
   const args = exec.arguments ?? {};
   if (name === 'obsidian_list') return [];
   if (['obsidian_read', 'obsidian_search', 'obsidian_frontmatter'].includes(name)) {
@@ -903,10 +971,16 @@ export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd
   const search = /^(?:ops_)?(?:grep|search|search_files|search_for_pattern|find_symbol|get_symbols_overview)$/.test(operation);
   const reader = /^(?:ops_)?(?:read|read_file|read_files|read_many_files|read_multiple_files|read_image|view_image|read_text_file|read_media_file|inspect_local_file|read_pdf|read_docx|read_table|diff)$/.test(operation);
   if (!search && !reader) return [];
-  const input = args.paths ?? args.files ?? args.file_path ?? args.filePath ?? args.relative_path ?? args.path ?? (search ? cwd : undefined);
-  const paths = Array.isArray(input) ? input : [input];
-  if (!paths.length) return null;
-  const targets = paths.map(p => readPath(typeof p === 'object' && p ? p.path ?? p.file_path ?? p.filePath : p, cwd));
+  // 没有宿主 schema：出现的每个路径别名都检查，不猜工具实际读哪一个。
+  const given = (source, keys) => keys.map(key => source[key]).filter(value => value !== undefined && value !== null);
+  const values = given(args, ['paths', 'files', 'file_path', 'filePath', 'relative_path', 'path']);
+  if (values.some(value => Array.isArray(value) && !value.length)) return null;
+  const paths = (values.length ? values.flat() : [search ? cwd : undefined]).flatMap(p => {
+    if (typeof p !== 'object' || !p) return [p];
+    const inner = given(p, ['path', 'file_path', 'filePath']);
+    return inner.length ? inner : [undefined];
+  });
+  const targets = paths.map(p => readPath(p, cwd));
   return targets.every(Boolean) ? targets : null;
 }
 
@@ -978,7 +1052,12 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     if (state) recoverGemini(state, exec);
     const targets = plannerReadTargets(exec, cwd, [...cfg.plannerReadAllow ?? [], ...state?.gemini ?? []]);
     if (targets?.length === 0) return undefined;
-    if (state?.gemini.size && (!targets || targets.some(file => [...state.gemini].some(body => under(body, file))))) return GEMINI_READ_DENY;
+    if (state?.gemini.size && targets?.some(file => [...state.gemini].some(body => under(body, file)))) return GEMINI_READ_DENY;
+    if (state?.gemini.size && !targets) {
+      // 读取目标不明的命令不放行，但原因不是“在读正文”；products 模式交给下面的产物边界说明。
+      if (!SHELL_TOOLS[String(exec?.name ?? '').split('__').at(-1).toLowerCase()]) return GEMINI_READ_DENY;
+      if (cfg.plannerReads === 'open') return GEMINI_UNKNOWN_DENY;
+    }
     if (cfg.plannerReads === 'open') return undefined;
     if (targets && targets.every(file => allowed(file, state, directories))) return undefined;
     if (targets && state && !state.pending && now() - state.refreshed >= 25_000) {
@@ -1020,12 +1099,16 @@ export function decide(exec, cfg) {
   const deny = (reason) => cfg.plannerReads === 'products' ? `[codex-conductor] ${PRODUCT_DENY_HINT}` :
     `[codex-conductor] 本工作区按「你规划 → Codex 执行 → 你验收」运行，${reason}。${HINT}` +
     (cfg.gemini ? '教程/文档正文可用 gemini_write，一章一章做。' : '');
-  if (DENY_TOOLS.has(tool) || cfg.denyTools.has(tool)) return deny(`${tool} 会直接改动文件或执行任意代码，已拒绝`);
+  // 工具名不区分大小写：Write / WSL 与 write / wsl 是同一个入口。
+  const lower = tool.toLowerCase();
+  if (DENY_TOOLS.has(lower) || [...cfg.denyTools].some((name) => String(name).toLowerCase() === lower)) {
+    return deny(`${tool} 会直接改动文件或执行任意代码，已拒绝`);
+  }
   if (frontmatterWrite(exec)) return deny(`${tool} 请求修改 frontmatter，已拒绝`);
-  if (tool.startsWith('mcp__') && MCP_WRITE.test(tool.slice(tool.lastIndexOf('__') + 2))) {
+  if (lower.startsWith('mcp__') && MCP_WRITE.test(mcpAction(tool))) {
     return deny(`${tool} 会改动文件或执行命令，已拒绝`);
   }
-  const blocked = SHELL_TOOLS[tool];
+  const blocked = SHELL_TOOLS[lower];
   if (!blocked) return undefined;
   const args = exec.arguments ?? {};
   const used = blocked.filter((k) => present(args[k]));

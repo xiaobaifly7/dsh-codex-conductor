@@ -340,6 +340,7 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   const status = await f.request('GET', '/status');
   assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments[0], { action: 'status' });
+  assert.equal(f.runtime.execute.mock.calls[0].arguments[1].panel, true, 'status polls are marked as panel reads');
   assert.ok(f.runtime.execute.mock.calls[0].arguments[1].signal instanceof AbortSignal);
   assert.equal(f.conductor.list.mock.callCount(), 0);
   t.mock.method(Date, 'now', () => 1800000000000);
@@ -378,6 +379,17 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.equal(readFileSync(path.join(f.root, backups[0]), 'utf8'), '原有规划要求🙂\n');
   assert.equal((await f.request('POST', '/prompt', { text: '' })).status, 200);
   assert.equal(readFileSync(f.plannerFile, 'utf8'), '');
+  const unrelated = ['planner.md.bak', 'planner.md.2026-01-01T00-00-00-000Z.not-a-uuid.bak', 'other.md.2026-01-01T00-00-00-000Z.00000000-0000-4000-8000-000000000000.bak'];
+  for (const name of unrelated) writeFileSync(path.join(f.root, name), 'keep');
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  for (let n = 0; n < 12; n++) {
+    t.mock.timers.tick(1); // backup names sort by their millisecond timestamp
+    assert.equal((await f.request('POST', '/prompt', { text: `第 ${n} 版` })).status, 200);
+  }
+  const kept = readdirSync(f.root).filter((name) => name.endsWith('.bak') && !unrelated.includes(name)).sort();
+  assert.equal(kept.length, 10, 'only the ten newest prompt backups remain');
+  assert.deepEqual(kept.map((name) => readFileSync(path.join(f.root, name), 'utf8')), Array.from({ length: 10 }, (_, n) => `第 ${n + 1} 版`));
+  for (const name of unrelated) assert.equal(readFileSync(path.join(f.root, name), 'utf8'), 'keep');
   assert.deepEqual(await f.request('POST', '/reload', {}), { status: 200, body: { status: 'reloaded', saved: true } });
   assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments, [{ action: 'reload', when: 'idle' }, { panel: true }, undefined]);
 });
@@ -640,11 +652,11 @@ test('panel HTTP rejects traversal job IDs and malformed output pagination befor
 test('panel HTTP settings accept all supported enums, model characters and positive finite numbers', async (t) => {
   const f = fixture(t);
   const patches = [
-    ...['low', 'medium', 'high', 'xhigh', 'max'].map((effort) => ({ effort })),
+    ...['', 'low', 'medium', 'high', 'xhigh', 'max'].map((effort) => ({ effort })),
     ...['', 'low', 'medium', 'high', 'xhigh', 'max'].map((readOnlyEffort) => ({ readOnlyEffort })),
     ...['', 'fast', 'ultrafast'].map((serviceTier) => ({ serviceTier })),
     ...['low', 'medium', 'high'].map((effort) => ({ gemini: { effort } })),
-    { model: 'A0._/:-' }, { model: 'm'.repeat(80) }, { gemini: { model: 'google/gemini-4:latest' } },
+    { model: '' }, { model: 'A0._/:-' }, { model: 'm'.repeat(80) }, { gemini: { model: 'google/gemini-4:latest' } },
     { plannerAnswers: false }, { plannerAnswers: true }, { lockTimeoutSeconds: 0.5, maxStorageMb: 1.25 },
   ];
   for (const patch of patches) {
@@ -656,13 +668,14 @@ test('panel HTTP settings accept all supported enums, model characters and posit
 test('panel HTTP settings reject invalid enums/models/numbers, unknown fields and newly created Gemini', async (t) => {
   const f = fixture(t);
   const patches = [null, [], {}, true, 'settings', { unknown: 1 }, { model: 'valid', runner: 'evil' },
-    { effort: '' }, { effort: 'ultra' }, { effort: 1 }, { readOnlyEffort: 'ultra' },
+    { effort: 'ultra' }, { effort: 1 }, { readOnlyEffort: 'ultra' },
     { readOnlyEffort: null }, { serviceTier: 'priority' }, { serviceTier: false }, { plannerAnswers: 'true' },
     { plannerAnswers: 1 }, { gemini: null }, { gemini: [] }, { gemini: {} },
     { gemini: { effort: 'max' } }, { gemini: { effort: 'xhigh' } }, { gemini: { command: 'evil' } },
     { gemini: { model: 'ok', unknown: true } }];
   for (const model of ['', 'a b', ' a', 'a\nfield: injected', 'a\t', '模型', 'a\\b', 'a#b', 'a"b', 'a'.repeat(81), null, 42]) {
-    patches.push({ model }, { gemini: { model } });
+    // An empty Codex model clears the override; Gemini still needs a model name.
+    patches.push(...(model === '' ? [] : [{ model }]), { gemini: { model } });
   }
   for (const key of ['lockTimeoutSeconds', 'maxStorageMb']) {
     for (const value of [0, -1, null, '1', true]) patches.push({ [key]: value });

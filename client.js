@@ -61,7 +61,7 @@ window.__ModuleLoader__.load({
     }
 
     function userError(value, fallback = '暂时无法完成操作，请刷新后重试；仍然失败请联系维护者。') {
-      if (typeof value !== 'string' || !/[\u3400-\u9fff]/.test(value) || /[A-Za-z_]/.test(value.replace(/\b(?:Codex|DSH|DeepSeek|Gemini)\b/g, ''))) return fallback;
+      if (typeof value !== 'string' || !/[\u3400-\u9fff]/.test(value) || /[A-Za-z_]/.test(value.replace(/\b(?:Codex|DSH|DeepSeek|Gemini|Harness|MiB|KiB)\b/g, ''))) return fallback;
       return /请|重试|重新|检查|联系/.test(value) ? value : `${value}。请刷新后重试；仍然失败请联系维护者。`;
     }
 
@@ -155,10 +155,10 @@ window.__ModuleLoader__.load({
         if (displayValue(raw) === displayValue(old)) continue;
         let value = raw;
         if (key === 'model' || key === 'gemini.model') {
-          if (!/^[A-Za-z0-9._/:-]{1,80}$/.test(value)) throw new Error('模型名请填 1 到 80 个字母、数字或 . _ / : -。');
+          // 空的 Codex 模型表示沿用 Codex 配置。
+          if (!(key === 'model' && value === '') && !/^[A-Za-z0-9._/:-]{1,80}$/.test(value)) throw new Error('模型名请填 1 到 80 个字母、数字或 . _ / : -；Codex 模型可留空。');
         } else if (['effort', 'readOnlyEffort', 'gemini.effort'].includes(key)) {
-          const allowed = key === 'gemini.effort' ? ['low', 'medium', 'high']
-            : key === 'readOnlyEffort' ? ['', ...EFFORTS.map(([v]) => v)] : EFFORTS.map(([v]) => v);
+          const allowed = key === 'gemini.effort' ? ['low', 'medium', 'high'] : ['', ...EFFORTS.map(([v]) => v)];
           if (!allowed.includes(value)) throw new Error('请从列表中选择思考程度。');
         } else if (key === 'serviceTier') {
           if (!['', 'fast', 'ultrafast'].includes(value)) throw new Error('请从列表中选择服务速度。');
@@ -217,7 +217,7 @@ window.__ModuleLoader__.load({
       return h('section', { 'aria-label': '运行状态' },
           h('div', { className: 'dcc-row' }, h('h3', null, '运行状态'),
             h(Button, { size: 'sm', disabled: !!busy, onClick: onRefresh }, '刷新状态')),
-          h('p', { className: 'dcc-muted' }, '每 7 秒自动查看状态和任务。未保存的输入会保留。'),
+          h('p', { className: 'dcc-muted' }, '每 7 秒自动查看运行状态；任务、关注数和提示词约每 28 秒刷新，有任务在跑时任务列表每 7 秒刷新。未保存的输入会保留。'),
           h(Message, { text: errors.status, error: true }),
           errors.status && status ? h('small', null, '下面保留的是上次成功读取的状态。') : null,
           !status ? h('p', null, errors.status ? '暂时读不到运行状态。' : '正在读取运行状态…') : null,
@@ -347,7 +347,7 @@ window.__ModuleLoader__.load({
 
       useEffect(() => {
         const controller = new AbortController();
-        let timer;
+        let timer, round = 0, running = false;
         async function refresh() {
           if (!mutation.current) {
             const version = generation.current;
@@ -363,12 +363,18 @@ window.__ModuleLoader__.load({
                 if (fresh()) setErrors((old) => ({ ...old, [key]: userError(error.message) }));
               }
             }
+            // /jobs 和 /attention 各启动一次 wsl.exe：只有状态每轮读，其余首轮读、之后每 4 轮读一次；有任务在跑时任务列表每轮读。
+            const full = round++ % 4 === 0;
             const reads = [
-              read('status', '/status', setStatus),
-              read('settings', '/settings', setSettings),
-              read('jobs', `/jobs?filter=${filter}&offset=${jobOffset}`, setJobs),
-              read('prompt', '/prompt', (value) => setPrompt(value.text)),
-              read('attention', '/attention', (value) => setAttention(value.total)),
+              // /status 自带当前设置，表单不必等下一次完整读取。
+              read('status', '/status', (value) => { setStatus(value); if (value.settings) setSettings(value.settings); }),
+              full && read('settings', '/settings', setSettings),
+              (full || running) && read('jobs', `/jobs?filter=${filter}&offset=${jobOffset}`, (value) => {
+                running = value.jobs.some((job) => (job.execution_status || job.status) === 'running');
+                setJobs(value);
+              }),
+              full && read('prompt', '/prompt', (value) => setPrompt(value.text)),
+              full && read('attention', '/attention', (value) => setAttention(value.total)),
             ];
             await Promise.all(reads);
           }
@@ -497,8 +503,8 @@ window.__ModuleLoader__.load({
           h(Message, { text: errors.settings, error: true }),
           settings ? h('div', null,
             h('div', { className: 'dcc-grid' },
-              field('model', 'Codex 模型', '填写要使用的模型名。'),
-              field('effort', '执行时的思考程度', '越高通常想得越久，也可能花更多时间。', EFFORTS),
+              field('model', 'Codex 模型', '填写要使用的模型名；留空则沿用 Codex 配置。'),
+              field('effort', '执行时的思考程度', '越高通常想得越久，也可能花更多时间。', [['', '跟随 Codex 配置'], ...EFFORTS]),
               field('readOnlyEffort', '只读任务的思考程度', '用于查看代码、分析和复核。', [['', '跟随执行设置'], ...EFFORTS]),
               field('serviceTier', '速度档', '跟随 Codex 配置，或使用账号支持的加速档位。', [['', '跟随 Codex 配置'], ['fast', 'fast'], ['ultrafast', 'ultrafast']]),
               field('lockTimeoutSeconds', '等待其他任务的秒数', '要修改同一目录时，最多等其他任务多久；未设置时可留空。'),

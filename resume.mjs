@@ -215,13 +215,33 @@ export function processGoalRequest(options) {
 export async function processAutoResume({ ctx, directory, autoResume, signal }) {
   if (!autoResume.enabled || signal?.aborted) return;
   const stateFile = path.join(directory, 'autoresume-state.json');
-  let previous;
-  try { previous = JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
-  catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (previous?.hostProcess === HOST_PROCESS) return;
-  const state = { hostProcess: HOST_PROCESS, resumed: [] };
+  const readState = () => {
+    try { return JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  };
+  const previous = readState();
+  const continuing = previous?.hostProcess === HOST_PROCESS;
+  // A scan cut short by a hot reload is finished by the next plugin instance in the same process.
+  if (continuing && !previous.interrupted) return;
+  const state = { hostProcess: HOST_PROCESS, resumed: continuing ? previous.resumed : [] };
+  // The previous process's shutdown list must outlive an interrupted scan; root shutdown reuses `pending`.
+  const shutdownPending = continuing ? previous.previousPending : previous?.pending;
+  if (shutdownPending) state.previousPending = shutdownPending;
   // Reserve the process before awaiting anything, including across overlapping hot reloads.
   writeJson(directory, 'autoresume-state', state);
+  // The root shutdown snapshot writes the same file: re-read it and change only this scan's fields.
+  const update = (change) => {
+    const current = readState();
+    if (current?.hostProcess !== HOST_PROCESS) return;
+    change(current);
+    writeJson(directory, 'autoresume-state', current);
+  };
+  // Marked synchronously on abort, so the instance loaded right after a reload already sees it.
+  const interrupt = () => {
+    try { update(current => { current.interrupted = true; }); }
+    catch (error) { ctx.logger?.warn?.(`[codex-conductor] local request: ${error?.message ?? error}`); }
+  };
+  signal?.addEventListener('abort', interrupt, { once: true });
   const requestedAt = new Date().toISOString();
   const result = { requestedAt, status: 'processed', sessions: [] };
   const cutoff = Date.now() - autoResume.maxAgeHours * 3600_000;
@@ -235,7 +255,8 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
       const skipped = (reason, basis) => ({ sessionId, status: 'skipped', reason, method: null, basis });
       let entry;
       try {
-        if (autoResume.exclude.includes(sessionId)) entry = skipped('excluded', { excluded: true });
+        if (state.resumed.includes(sessionId)) entry = skipped('already_resumed', { resumed: true });
+        else if (autoResume.exclude.includes(sessionId)) entry = skipped('excluded', { excluded: true });
         else if (!sessionId.startsWith('session-')) entry = skipped('fork', { mainSession: false });
         else if (ctx.get('agents').get(sessionId)?.status === 'running') entry = skipped('running', { agentStatus: 'running' });
         else {
@@ -251,7 +272,7 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
             const lastTurn = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
             const automatic = { lastTurn: lastTurn?.type === 'turn/start' ? 'unterminated' : lastTurn?.data?.reason?.kind ?? 'none',
               cancelCause: lastTurn?.data?.reason?.reason?.kind ?? null,
-              shutdownPending: previous?.pending?.includes(sessionId) ?? false };
+              shutdownPending: shutdownPending?.includes(sessionId) ?? false };
             entry = await resumeSession(ctx, sessionId, autoResume.message, { automatic, signal });
           }
           entry.basis = { updatedAt, ...entry.basis };
@@ -260,15 +281,17 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
         entry = { ...skipped('error', {}), error: String(error?.message ?? error) };
       }
       result.sessions.push(entry);
-      if (entry.status === 'resumed' && !signal?.aborted) {
-        state.resumed.push(sessionId);
-        writeJson(directory, 'autoresume-state', state);
-      }
+      // Recorded even after an abort, so the instance that finishes this scan never submits it again.
+      if (entry.status === 'resumed') update(current => { current.resumed.push(sessionId); });
     }
+    if (shutdownPending && !signal?.aborted) update(current => { delete current.previousPending; });
   } catch (error) {
     result.status = 'error';
     result.error = String(error?.message ?? error);
   }
+  signal?.removeEventListener('abort', interrupt);
+  // An aborted scan that is still unwinding must not overwrite the result of the instance that took over.
+  if (signal?.aborted && !readState()?.interrupted) return result;
   result.completedAt = new Date().toISOString();
   writeJson(directory, 'autoresume-result', result);
   return result;
@@ -393,7 +416,8 @@ export function registerAutoWake({ ctx, enabled = true }) {
     batch.timer = undefined;
     batch.blocked = event.type === 'turn/end' && event.data?.reason?.kind === 'blocked';
     if (batch.blocked) schedule(batch.agent, batch);
-    else if (event.type === 'turn/end') forget(session.id);
+    // A normal ending with the notice still queued may be followed by a rejected turn; keep the batch for it.
+    else if (event.type === 'turn/end' && !pendingNotices(batch.agent, batch)) forget(session.id);
   });
   // turn/end is appended while still running; kick() publishes idle only after releasing the driver.
   listen('agent/status', ({ agent, status }) => {

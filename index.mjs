@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
-const { runtimeIdentity, loadedRecord, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
+const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
@@ -60,6 +60,8 @@ const DEFAULTS = {
   retries: null,
   lockTimeoutSeconds: null,
   maxStorageMb: null,
+  // 同时运行（含排队等写锁）的 Codex 任务数上限；留空不限制
+  maxRunningJobs: null,
   workspaces: [],
   denyTools: [],
   allowCommands: [],
@@ -341,7 +343,8 @@ export function createConductor(cfg, run = runRunner) {
   }
 
   const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
-  return { start, waitJob, cancel, list, output, review, summary, products };
+  const doctor = (signal) => run(cfg, ['doctor'], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  return { start, waitJob, cancel, list, output, review, summary, products, doctor };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [] } = {}) {
@@ -416,8 +419,11 @@ function widensOverlappingScope(previousCwd, original, cwd, requested) {
     after.some(p => !before.some(r => under(p, r)));
 }
 
-function hasUserReply(log, job, owner) {
-  const user = log.findLastIndex(e => e.type === 'user/message' && e.data?.source?.kind === 'user');
+export function hasUserReply(log, job, owner, autoMessage) {
+  const text = (e) => (Array.isArray(e.data?.content) ? e.data.content : []).filter(c => c?.type === 'text').map(c => c.text).join('\n');
+  // autoResume submits its restart notice with the user source; nobody answered anything.
+  const user = log.findLastIndex(e => e.type === 'user/message' && e.data?.source?.kind === 'user' &&
+    !(autoMessage && text(e) === autoMessage));
   if (user < 0) return false;
   const replyAt = log[user].at ?? log[user].time;
   const review = job.verification;
@@ -665,6 +671,8 @@ function details(rest) {
     ...(rest.verification?.criteria ?? []).map((c) => `核验第 ${c.index} 条 ${c.status}：${c.evidence}`),
     rest.usage && `用量（${rest.usage_scope ?? '统计范围未知'}，不是费用）：${JSON.stringify(rest.usage)}`,
     ...(rest.ignore_warnings ?? []),
+    rest.final_message_repaired?.length && `报告的 JSON 经转义修复（${[rest.final_message_repaired].flat().join('、')}）后才解析成功：` +
+      `证据里带反斜杠的路径或正则可能与原文不同，以 ${rest.log_dir ? `${rest.log_dir}/last_message.txt` : 'last_message.txt'} 原文为准。`,
     rest.report_note].filter(Boolean);
 }
 
@@ -759,12 +767,16 @@ export function taskCwd(args, session, workspaces) {
 }
 
 function settings(config, logger) {
+  // A misspelt key (workspace for workspaces) would otherwise switch the guard off without a trace.
+  const unknownConfig = Object.keys(config).filter(key => !Object.hasOwn(DEFAULTS, key));
+  if (unknownConfig.length) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.join(', ')} 已忽略，请核对拼写`);
   config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
     const value = config[key];
-    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb'].includes(key);
+    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb', 'maxRunningJobs'].includes(key);
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
-      ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0 : value > 0))
+      ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0
+        : key === 'maxRunningJobs' ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
       : key === 'autoResume' ? value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -831,6 +843,7 @@ function settings(config, logger) {
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),
     allowCommands: patterns('allowCommands'),
     ignoreChanges: Array.isArray(config.ignoreChanges) ? config.ignoreChanges.map(String) : [],
+    unknownConfig,
   };
 }
 
@@ -842,7 +855,7 @@ const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 
 export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const cfg = settings(config, ctx.logger);
-  const canAnswer = (log, job, owner) => cfg.plannerAnswers === true || hasUserReply(log, job, owner);
+  const canAnswer = (log, job, owner) => cfg.plannerAnswers === true || hasUserReply(log, job, owner, cfg.autoResume.message);
   const conductor = createConductor(cfg, run);
   let dispatching = 0;
   let dispatchGeneration = 0;
@@ -1154,6 +1167,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           offset = history.next_offset ?? null;
         }
       }
+      if (cfg.maxRunningJobs != null) {
+        const running = await conductor.list({ status: 'running', limit: 1 }, exec?.signal);
+        exec?.signal?.throwIfAborted();
+        if (!Number.isSafeInteger(running.total)) throw preflightUnavailable('无法核对正在运行的任务数', running);
+        // 本进程里其他尚未拿到 job_id 的派单也计入。
+        if (running.total + dispatching - 1 >= cfg.maxRunningJobs) {
+          throw reject(`${tool}: 已有 ${running.total} 个 Codex 任务在运行或排队，达到 maxRunningJobs=${cfg.maxRunningJobs} 的上限，未启动 Codex。` +
+            '用 codex_jobs（status="running"）查看，等其中一个结束后再派同一单，不要改为自己动手。');
+        }
+      }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
@@ -1338,6 +1361,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_cancel: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       await ensureOwnJob(args.job_id, exec, 'codex_cancel');
       const bg = liveBackground(args.job_id, exec);
+      // open 模式也不取消别的会话的任务；本会话登记着的后台任务不用再查，归属未知的旧任务仍可取消。
+      if (!bg && !restrictedReads(exec) && exec?.agent?.id) {
+        const owner = (await conductor.waitJob(args.job_id, 0, exec.signal)).context?.owner;
+        if (owner && owner !== exec.agent.id) {
+          throw new Error(`codex_cancel: 任务 ${args.job_id} 属于另一个会话，未取消。确需取消时在该会话里操作，或由用户在设置的“Codex 指挥”面板取消。`);
+        }
+      }
       // 取消前先挂上等待：后台循环随后看到任务结束并结算，算作已被等到，DSH 不再另发一条结束通知。
       // 取消未确认时撤掉等待，免得吞掉任务之后真正结束时的通知。
       const stop = new AbortController();
@@ -1749,7 +1779,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!busy) geminiWrites.add(key);
       try {
         const value = await geminiWrite(cfg.gemini, { ...args, cwd,
-          ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor, { signal: exec?.signal, busy }, launchGemini);
+          ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
+          { signal: exec?.signal, busy,
+            // products 模式下规划端不能读原料，也就不能把工作区外的文件当素材发给 Gemini。
+            ...(restrictedReads(exec) && !cfg.roots.includes('*')
+              ? { sourceRoots: [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] } : {}) }, launchGemini);
         if (value.status === 'completed') {
           productReads.addGemini(exec?.agent?.id, [value.output]);
         }
@@ -1837,8 +1871,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     mkdirSync(dir, { recursive: true });
     const loadedFile = path.join(dir, 'loaded.json');
     const { record } = loadedRecord(loadedFile);
-    if (!record || record.pid === process.pid) writeFileSync(loadedFile,
+    if (!record || record.pid === process.pid || pidReused(record.pid, record.loadedAt)) writeFileSync(loadedFile,
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
+        ...(cfg.unknownConfig.length ? { unknownConfig: cfg.unknownConfig } : {}),
         tools: ['codex_run', 'codex_verify', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
           ...(cfg.gemini ? ['gemini_write'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,

@@ -634,3 +634,72 @@ test('reload without pending settings refreshes waiting and timed out states, th
   assert.ok(!text(host.tree).includes('剩余 600 秒'));
   assert.ok(!text(host.tree).includes('等 2 个会话'));
 });
+
+test('polling reads status every round and the other routes on load, after a change and every fourth round', async (t) => {
+  const service = panelService();
+  let jobs = [];
+  const host = clientHost((path, body) => path.startsWith('/jobs') ? { total: jobs.length, jobs } : service.handle(path, body));
+  t.after(() => host.dispose());
+  const counts = () => ['/status', '/settings', '/jobs', '/prompt', '/attention']
+    .map((route) => host.requests.filter((request) => !request.body && request.path.startsWith(route)).length);
+  const poll = async () => { host.poll(); await host.flush(); };
+  host.mount(host.exports.Panel); await host.flush();
+  assert.deepEqual(counts(), [1, 1, 1, 1, 1]);
+  assert.deepEqual([...host.timers.values()].map(({ ms }) => ms), [7000]);
+  for (let n = 0; n < 3; n++) await poll();
+  assert.deepEqual(counts(), [4, 1, 1, 1, 1], 'three rounds read only the status');
+  await poll();
+  assert.deepEqual(counts(), [5, 2, 2, 2, 2], 'the fourth round reads everything again');
+  jobs = [{ job_id: 'J', title: 'task', status: 'running', execution_status: 'running', started_at: 0 }];
+  await click(host, '待关注');
+  assert.deepEqual(counts(), [6, 3, 3, 3, 3], 'a filter change reads everything at once');
+  await poll();
+  assert.deepEqual(counts(), [7, 3, 4, 3, 3], 'a running task keeps the task list on every round');
+  jobs = [];
+  await poll();
+  assert.deepEqual(counts(), [8, 3, 5, 3, 3]);
+  await poll();
+  assert.deepEqual(counts(), [9, 3, 5, 3, 3], 'once nothing runs the task list returns to the slow cadence');
+  await change(host, 'Codex 模型', 'new-model');
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(counts(), [10, 4, 6, 4, 4], 'a save reads everything at once');
+});
+
+test('status polls carry applied settings into the form between full reads', async (t) => {
+  const service = panelService(), host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  service.status.settings.model = 'applied-model';
+  host.poll(); await host.flush();
+  assert.equal(host.requests.filter((request) => request.path === '/settings').length, 1);
+  assert.equal(field(host, 'Codex 模型').props.value, 'applied-model');
+});
+
+test('backend messages naming Harness, MiB or KiB reach the user; internal text still falls back', async (t) => {
+  const service = panelService();
+  const messages = { '/status': '请先登录 DeepSeek Harness 后重试。', '/prompt': '提交的内容超过 1 MiB，请缩短内容后再保存。',
+    '/jobs': '自检结果超过 64 KiB，请缩短后重试。', '/settings': '读取 profile_secret 失败，请重试。' };
+  const host = clientHost((path, body) => {
+    const error = messages[Object.keys(messages).find((route) => path.startsWith(route))];
+    return error ? { error } : service.handle(path, body);
+  });
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  for (const route of ['/status', '/prompt', '/jobs']) assert.ok(text(host.tree).includes(messages[route]), route);
+  assert.ok(!text(host.tree).includes('profile_secret'));
+});
+
+test('the Codex model and execution effort can be cleared to follow Codex; a Gemini model still needs a name', async (t) => {
+  const service = panelService(), host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  assert.ok(nodes(field(host, '执行时的思考程度')).some((node) => node.type === 'option' && node.props.value === '' && text(node) === '跟随 Codex 配置'));
+  await change(host, 'Codex 模型', '');
+  await change(host, '执行时的思考程度', '');
+  assert.ok(!nodes(host.tree).some((node) => node.props?.role === 'alert' && text(node)));
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(host.requests.find((request) => request.body), { path: '/settings', body: { model: '', effort: '' } });
+  const { settingsPatch } = host.exports;
+  assert.deepEqual(plain(settingsPatch({ model: '', effort: '' }, { model: '', effort: '' })), {});
+  assert.throws(() => settingsPatch(settings(), { 'gemini.model': '' }), /模型名请填/);
+  assert.throws(() => settingsPatch(settings(), { 'gemini.effort': '' }), /请从列表中选择思考程度/);
+  assert.throws(() => settingsPatch(settings(), { model: 'a b' }), /模型名请填/);
+});

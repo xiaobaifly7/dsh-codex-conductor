@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, shellReadTargets, wslPath } from './guard.mjs';
 import { apply, nextStep } from './index.mjs';
-import './guard.test.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
