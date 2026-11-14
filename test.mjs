@@ -2906,6 +2906,15 @@ test('terminal connection failures tell the planner to wait for recovery before 
   assert.doesNotMatch(router.next, /resume/);
 });
 
+test('a model refusal is reported as a refusal instead of a connection failure', async () => {
+  const { tools, finals } = harness();
+  finals.REFUSED = { job_id: 'REFUSED', status: 'failed', error_kind: 'model_refused', retryable: false,
+    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', error: 'Reconnecting... 1/5 (refused this request)' };
+  const refused = await tools.codex_status.execute({ job_id: 'REFUSED', wait_seconds: 0 });
+  assert.match(refused.next, /模型拒绝了这单任务[\s\S]*不是连接或插件故障[\s\S]*不要重派同一份任务书/);
+  assert.doesNotMatch(refused.next, /重连超时|恢复前不要重派/);
+});
+
 test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {
   for (const cancelResult of [
     { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' },

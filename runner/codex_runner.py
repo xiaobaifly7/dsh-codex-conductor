@@ -53,6 +53,9 @@ CREATE_NEW_PROCESS_GROUP = 0x00000200
 PERMANENT = re.compile(
     r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|quota|insufficient"
     r"|model.{0,40}(not found|not supported|does not exist)|invalid.{0,20}(config|schema)|unrecognized", re.I)
+# The model refusing the request arrives inside "Reconnecting... n/5" notices; the same prompt is refused again,
+# and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
+REFUSED = re.compile(r"refused this request|safety filter", re.I)
 TRANSIENT = re.compile(
     r"stream disconnected|stream error|timed? ?out|connection|reset by peer|\b429\b|rate.?limit"
     r"|\b50[0234]\b|overloaded|server_error|temporarily|try again", re.I)
@@ -467,6 +470,10 @@ def run_attempt(args, prompt, run_dir, thread_id):
                         active_commands.discard(item.get("id"))
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
                 if kind == "error":
+                    if REFUSED.search(str(ev.get("message") or "")):
+                        state.update(end_reason="model_refused", error=str(ev["message"])[:500])
+                        kill_tree(proc.pid)
+                        break
                     reconnecting_since = reconnecting_since or time.monotonic()
                 else:
                     reconnecting_since = None
@@ -528,6 +535,8 @@ def classify(state, run_dir):
         return state["end_reason"], True
     if state["end_reason"] == "spawn_failed":
         return "spawn_failed", False
+    if state["end_reason"] == "model_refused":
+        return "model_refused", False
     text = state["error"] or ""
     if not state["failed"] and not text:
         try:

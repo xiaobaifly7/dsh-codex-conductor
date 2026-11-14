@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.96` 为 Gemini 写作失败回执增加首行摘要，突出回滚状态与草稿路径，提示优先用 `reuse_draft` 重新校验落盘、无草稿时重新 `gemini_write`，并保留完整 JSON。
+`0.9.97` 识别执行模型的安全策略拒绝：拒绝信息夹在重连提示里时立即结束任务并标记为 `model_refused`（不可重试），不再重连到超时、重试三轮；回执明确说明这是模型拒绝而不是连接故障。
 
 `0.9.95` 统一 Gemini 正文的单次可写核对指引，续接拒绝回执首行明确未启动及原因，并增加事件类型统计，仅在正文增量或写文件事件后启用 Gemini 空闲超时，启动与思考阶段保留 1800 秒默认总上限。
 
@@ -475,7 +475,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.96` adds a first-line summary to failed Gemini writing receipts, highlighting rollback status and the draft path, directing recovery through `reuse_draft` or a fresh `gemini_write` when no draft exists, and preserving the full JSON.
+`0.9.97` recognises a safety refusal from the execution model: when the refusal arrives inside a reconnect notice the job ends at once as `model_refused` (not retryable) instead of reconnecting until the timeout across three attempts, and the receipt says it is a model refusal rather than a connection failure.
 
 `0.9.95` unifies Gemini prose guidance into one writable check, leads refused continuation receipts with the reason and explicit not-started status, and adds event-type counts while enabling Gemini idle timing only after prose deltas or file-write events, retaining the default 1800-second total deadline during startup and thinking.
 
