@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-`0.9.98` 模型服务以 400 Bad Request 拒收某一轮请求时，任务标记为 `upstream_rejected`；回执说明同一线程续跑会再次被拒，不要 `resume`，核对已有改动后新开一单只补未完成部分。`0.9.97` 起模型安全策略拒绝会立即结束并标记为 `model_refused`。
+`0.9.99` `gemini_write` 在 `overwrite=true` 且 Gemini 没写出任何内容就失败时，不再把目标文件里的旧正文存成“草稿”；此前 `reuse_draft` 会把这份旧正文当作 Gemini 新写的内容报告成功。`0.9.98` 起模型服务 400 拒收标记为 `upstream_rejected`。
 
 `0.9.95` 统一 Gemini 正文的单次可写核对指引，续接拒绝回执首行明确未启动及原因，并增加事件类型统计，仅在正文增量或写文件事件后启用 Gemini 空闲超时，启动与思考阶段保留 1800 秒默认总上限。
 
@@ -475,7 +475,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`0.9.98` marks a job as `upstream_rejected` when the model service answers one request with 400 Bad Request; the receipt says the same thread is rejected again, so do not `resume` it: check existing changes and dispatch a new job for the unfinished part. Since `0.9.97` a model safety refusal ends the job at once as `model_refused`.
+`0.9.99` `gemini_write` no longer saves the old text of an existing target as a draft when Gemini fails before writing anything under `overwrite=true`; `reuse_draft` used to report that unchanged text as newly written by Gemini. Since `0.9.98` an upstream 400 is reported as `upstream_rejected`.
 
 `0.9.95` unifies Gemini prose guidance into one writable check, leads refused continuation receipts with the reason and explicit not-started status, and adds event-type counts while enabling Gemini idle timing only after prose deltas or file-write events, retaining the default 1800-second total deadline during startup and thinking.
 

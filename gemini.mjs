@@ -334,6 +334,13 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '' } = 
       value.over_limit = false;
       try {
         if (normPath(realPath(value.output)) !== outputKey || !statSync(value.output).isFile()) throw new Error('output 已被替换成其他路径或不是文件');
+        // With overwrite=true the old file is still there when Gemini fails before writing. One run saved that old
+        // text as its draft, and reuse_draft then reported the unchanged chapter as freshly written by Gemini.
+        if (!reused && original !== null && !eventKeys.has(outputKey) &&
+            !value.files_changed.some((file) => normPath(file.path) === outputKey) &&
+            readFileSync(value.output).equals(original)) {
+          throw new Error('Gemini 没有改写 output，文件里仍是写作前的旧内容，不能当作本次草稿');
+        }
         content = readFileSync(value.output, 'utf8');
         if (header) content = content.replace(/^\uFEFF?---[ \t]*\r?\n(?:[^\n]*\n)*?(?:---|\.\.\.)[ \t]*(?:\r?\n|$)/, '');
         draft = header + content;

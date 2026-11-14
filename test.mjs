@@ -4749,6 +4749,19 @@ test('gemini_write rolls back ERROR despite an already-written response and pres
   }
 });
 
+test('gemini_write does not keep an untouched existing output as a Gemini draft', async (t) => {
+  const h = geminiFixture(t, { action: ({ child }) => geminiDone(child, 3, { status: 'ERROR', response: 'service disabled' }) });
+  const output = path.join(h.cwd, 'chapter.md');
+  writeFileSync(output, '写作前的旧正文');
+  const value = await h.execute({ overwrite: true });
+  assert.equal(value.status, 'failed');
+  assert.match(value.error, /没有改写 output/);
+  assert.equal(Object.hasOwn(value, 'draft_path'), false);
+  assert.deepEqual(value.attempt_chars, [null]);
+  assert.doesNotMatch(h.tools.gemini_write.output.render({}, value)[0].text.split('\n')[0], /reuse_draft=/);
+  assert.equal(readFileSync(output, 'utf8'), '写作前的旧正文');
+});
+
 test('gemini_write retains only twenty drafts including the newest failed draft', async (t) => {
   const h = geminiFixture(t, { action: ({ child, options }) => {
     writeFileSync(path.join(options.cwd, 'chapter.md'), '最新失败稿😀\n');
