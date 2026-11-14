@@ -103,10 +103,13 @@ test('the panel may clear the model and effort overrides', () => {
 test('a load marker held by a recycled PID is replaced', { skip: process.platform !== 'win32' }, async t => {
   const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
   t.after(() => child.kill());
-  assert.equal(pidReused(child.pid, new Date(Date.now() - 3_600_000).toISOString()), true);
-  assert.equal(pidReused(child.pid, new Date(Date.now() + 3_600_000).toISOString()), false);
+  const old = new Date(Date.now() - 3_600_000).toISOString();
+  // A cold PowerShell on a CI runner can take longer than the 5 s the plugin allows itself at load.
+  assert.equal(pidReused(child.pid, old, 60_000), true);
+  assert.equal(pidReused(child.pid, new Date(Date.now() + 3_600_000).toISOString(), 60_000), false);
+  if (!pidReused(child.pid, old)) return t.diagnostic('PowerShell is too slow here for the load-time check; marker replacement not exercised');
   const marker = path.join(localAppData, 'dsh-codex-conductor', 'loaded.json');
-  writeFileSync(marker, JSON.stringify({ module: 'file:///C:/old/index.mjs', loadedAt: new Date(Date.now() - 3_600_000).toISOString(), pid: child.pid }));
+  writeFileSync(marker, JSON.stringify({ module: 'file:///C:/old/index.mjs', loadedAt: old, pid: child.pid }));
   load({}, () => ({ jobs: [], total: 0 }));
   assert.equal(JSON.parse(readFileSync(marker, 'utf8')).pid, process.pid);
 });

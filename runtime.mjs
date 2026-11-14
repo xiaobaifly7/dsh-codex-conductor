@@ -80,10 +80,11 @@ export function loadedRecord(loadedFile) {
 }
 
 // A recycled PID keeps a dead instance's record alive; its real holder cannot have started after the record was written.
-export function pidReused(pid, loadedAt) {
+// shortcut: a PowerShell start slower than the timeout answers false and keeps the old record, as before this check existed.
+export function pidReused(pid, loadedAt, timeout = 5000) {
   if (process.platform !== 'win32') return false;
   const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-    `(Get-Process -Id ${Number(pid)}).StartTime.ToUniversalTime().ToString('o')`], { encoding: 'utf8', timeout: 5000, windowsHide: true });
+    `(Get-Process -Id ${Number(pid)}).StartTime.ToUniversalTime().ToString('o')`], { encoding: 'utf8', timeout, windowsHide: true });
   const started = Date.parse(String(result.stdout ?? '').trim());
   return Number.isFinite(started) && started > Date.parse(loadedAt);
 }
