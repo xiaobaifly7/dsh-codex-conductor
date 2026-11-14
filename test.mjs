@@ -2915,6 +2915,19 @@ test('a model refusal is reported as a refusal instead of a connection failure',
   assert.doesNotMatch(refused.next, /重连超时|恢复前不要重派/);
 });
 
+test('an upstream bad request tells the planner to start a new thread instead of resuming', async () => {
+  const { tools, finals } = harness();
+  finals.REJECTED = { job_id: 'REJECTED', status: 'failed', error_kind: 'upstream_rejected', retryable: false,
+    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', error: 'Codex: Bad Request' };
+  const rejected = await tools.codex_status.execute({ job_id: 'REJECTED', wait_seconds: 0 });
+  assert.match(rejected.next, /拒收了这一轮请求[\s\S]*不要用 resume[\s\S]*核对已有改动[\s\S]*新开一单/);
+
+  finals.REJECTED_RO = { ...finals.REJECTED, job_id: 'REJECTED_RO', sandbox: 'read-only', thread_id: null };
+  const readOnly = await tools.codex_status.execute({ job_id: 'REJECTED_RO', wait_seconds: 0 });
+  assert.match(readOnly.next, /不要用 resume[\s\S]*新开一单/);
+  assert.doesNotMatch(readOnly.next, /核对已有改动/);
+});
+
 test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {
   for (const cancelResult of [
     { status: 'failed', error_kind: 'bridge_error', error: 'WSL unavailable' },

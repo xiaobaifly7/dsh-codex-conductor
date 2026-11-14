@@ -109,6 +109,11 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "permanent":
         say(type="turn.failed", error={"message": "401 Unauthorized"})
         sys.exit(1)
+    elif mode == "bad_request":
+        say(type="thread.started", thread_id="THREAD-BAD")
+        say(type="turn.failed", error={"message": '{"error":{"code":null,"message":"Codex: Bad Request",'
+                                                  '"param":null,"type":"invalid_request_error"}}'})
+        sys.exit(1)
     elif mode == "retry_notice_then_ok":
         say(type="error", message="Reconnecting... 1/5")
         finish()
@@ -738,6 +743,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["attempts"], 2)
         self.assertNotIn("resume", self.calls()[1]["argv"])
         self.assertNotIn("usage_scope", r)
+
+    def test_upstream_bad_request_gets_its_own_kind_and_is_not_retried(self):
+        r = self.invoke(mode="bad_request")
+        self.assertEqual(r["error_kind"], "upstream_rejected")
+        self.assertEqual(r["attempts"], 1)
+        self.assertFalse(r["retryable"])
 
     def test_permanent_failure_is_not_retried(self):
         r = self.invoke(mode="permanent")
