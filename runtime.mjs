@@ -257,10 +257,17 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
   maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置',
   timeoutSeconds: '每次尝试的总超时秒数', idleTimeoutSeconds: '空闲超时秒数', retries: '自动重试次数',
-  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接' };
+  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接', maxSessionJobs: '每个会话的任务数上限',
+  maxSessionTokens: '每个会话的用量上限', jobDiff: '记录每单的改动', toolPolicy: '工具放行方式', allowTools: '白名单工具',
+  plannerReadAllow: '额外允许读取的路径' };
 // null clears a limit and restores the runner default.
+const count = (v) => Number.isInteger(v) && v > 0;
 const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) => v > 0, timeoutSeconds: (v) => v > 0,
-  idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: (v) => Number.isInteger(v) && v > 0 };
+  idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: count,
+  maxSessionJobs: count, maxSessionTokens: count };
+// Lists are replaced as a whole; an entry is one line of plain text.
+const listSettings = { allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v)],
+  plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\/|\\\\)[^\r\n]*$/.test(v)] };
 
 export function validatePanelSettings(value, geminiConfigured = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
@@ -277,7 +284,11 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'serviceTier') valid = ['', 'fast', 'ultrafast'].includes(v);
     else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
     else if (key === 'plannerReads') valid = ['open', 'products'].includes(v);
-    else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
+    else if (key === 'toolPolicy') valid = ['denylist', 'allowlist'].includes(v);
+    else if (key === 'jobDiff') valid = typeof v === 'boolean';
+    else if (Object.hasOwn(listSettings, key)) {
+      valid = Array.isArray(v) && v.length <= listSettings[key][0] && v.every((item) => typeof item === 'string' && listSettings[key][1](item));
+    } else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
     else if (key === 'autoResume') {
       valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.enabled === 'boolean';
     } else if (key === 'gemini') {
@@ -314,8 +325,10 @@ function settingsEdits(profile, changes) {
   };
   const insert = (at, text) => edits.push([{ start: at, length: 0, render: () => text }, null]);
   // A new key; nested settings (autoResume) become a block of their own.
-  const fresh = (key, value, indentation) => newline + indentation + key + ':' + (value !== null && typeof value === 'object'
-    ? Object.entries(value).map(([k, item]) => fresh(k, item, indentation + '  ')).join('') : ' ' + yamlSetting(value));
+  const fresh = (key, value, indentation) => newline + indentation + key + ':' + (Array.isArray(value)
+    ? value.map((item) => newline + indentation + "  - '" + item.replace(/'/g, "''") + "'").join('') || ' []'
+    : value !== null && typeof value === 'object'
+      ? Object.entries(value).map(([k, item]) => fresh(k, item, indentation + '  ')).join('') : ' ' + yamlSetting(value));
   if (!configs.length) {
     validatePanelSettings(changes, false);
     const last = lines.at(-1);
@@ -360,7 +373,21 @@ function settingsEdits(profile, changes) {
     }
     const hits = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
     if (hits.length > 1) throw new Error(`${key} 配置重复，未保存`);
-    if (hits.length) replace(hits[0], key, fieldPad, value);
+    if (hits.length && Array.isArray(value)) {
+      // shortcut: the whole list is rewritten, so comments inside it are dropped; a flow list must fit on its own line.
+      const parent = hits[0];
+      const rest = parent.text.slice((fieldPad + key + ':').length);
+      const items = [];
+      if (/^[ \t]*(?:#.*)?$/.test(rest)) {
+        for (const line of children.slice(children.indexOf(parent) + 1)) {
+          const depth = line.text.search(/\S/);
+          if (depth < fieldPad.length || (depth === fieldPad.length && !/^-(?:[ \t]|$)/.test(line.text.slice(depth)))) break;
+          items.push(line);
+        }
+      } else if (!/^[ \t]*\[[^\]]*\][ \t]*(?:#.*)?$/.test(rest)) throw new Error(`不支持 ${key} 的 YAML 写法，未保存`);
+      const end = endOfLine(items.at(-1) ?? parent);
+      edits.push([{ start: parent.start, length: end - parent.start, render: () => fresh(key, value, fieldPad).slice(newline.length) }, null]);
+    } else if (hits.length) replace(hits[0], key, fieldPad, value);
     else additions += fresh(key, value, fieldPad);
   }
   if (additions) insert(endOfLine(config), additions);

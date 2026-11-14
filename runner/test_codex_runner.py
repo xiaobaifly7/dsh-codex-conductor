@@ -3,6 +3,7 @@ import errno
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -69,6 +70,16 @@ FAKE_CODEX = textwrap.dedent(r"""
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         time.sleep(300)
+    elif mode in ("repo_edit", "repo_edit_hang"):
+        Path("a.txt").write_bytes(b"changed\n")
+        Path("new.txt").write_bytes(b"new\n")
+        Path("gone.txt").unlink()
+        Path("ignored.log").write_bytes(b"noise\n")
+        Path("../outside.txt").write_bytes(b"outside the task directory\n")
+        if mode == "repo_edit_hang":
+            (state / "edited").touch()
+            time.sleep(300)
+        finish()
     elif mode == "hang_with_detached_child":
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -3784,6 +3795,268 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(sys, "argv", [str(RUNNER), "list"]), self.assertRaises(SystemExit):
             codex_runner.main()
         self.assertIn("3.11", emit.call_args.args[0]["error"])
+
+    def git_repo(self, name, commit=True):
+        """A repository whose sub/ is the task directory; the fake's repo_edit changes three files there."""
+        root = Path(self.tmp.name) / name
+        sub = root / "sub"
+        sub.mkdir(parents=True)
+        (sub / "a.txt").write_bytes(b"original\n")
+        (sub / "gone.txt").write_bytes(b"to delete\n")
+        (root / ".gitignore").write_bytes(b"*.log\n")
+        git = lambda *argv: subprocess.run(
+            ["git", "-C", str(root), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+             "-c", "commit.gpgsign=false", *argv], check=True, capture_output=True, text=True).stdout
+        git("init", "-q")
+        git("config", "core.autocrlf", "false")
+        if commit:
+            git("add", "-A")
+            git("commit", "-q", "-m", "base")
+        return root, sub, git
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_writer_changes_become_a_patch_without_touching_the_repository(self):
+        names = ["sub/a.txt", "sub/gone.txt", "sub/new.txt"]
+        for commit in (True, False):
+            with self.subTest(commit=commit):
+                root, sub, git = self.git_repo(f"repo-{commit}", commit)
+                git("status", "--porcelain")  # refreshes the index before it is compared
+                index = root / ".git" / "index"
+                before = (index.read_bytes() if index.exists() else None, git("count-objects", "-v"))
+                result = self.invoke("--sandbox", "workspace-write", "--cwd", str(sub), mode="repo_edit")
+                self.assertEqual((result["status"], result["diff_status"], result["diff_files"]), ("completed", "captured", 3), result)
+                self.assertEqual((index.read_bytes() if index.exists() else None, git("count-objects", "-v")), before)
+                self.assertTrue(os.path.samefile(result["diff_repo"], root))
+                log_dir = Path(result["log_dir"])
+                patch = (log_dir / "diff.patch").read_bytes()
+                self.assertEqual(result["diff_bytes"], len(patch))
+                self.assertEqual([line.split()[2][2:] for line in patch.decode().splitlines() if line.startswith("diff --git ")], names)
+                self.assertFalse({"diff.index", "diff-objects", "diff-base.json"} & {p.name for p in log_dir.iterdir()})
+                if commit:
+                    self.assertEqual(sorted(git("status", "--porcelain").splitlines()),
+                                     [" D sub/gone.txt", " M sub/a.txt", "?? outside.txt", "?? sub/new.txt"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_diff_status_says_why_there_is_no_patch(self):
+        root, sub, _ = self.git_repo("repo")
+        for extra, status in ((("--sandbox", "workspace-write", "--cwd", str(sub)), "empty"),
+                              (("--sandbox", "workspace-write", "--cwd", str(sub), "--no-diff"), "skipped"),
+                              (("--sandbox", "danger-full-access"), "not_git"), ((), None)):
+            with self.subTest(status=status):
+                result = self.invoke(*extra)
+                self.assertEqual((result["status"], result.get("diff_status")), ("completed", status), result)
+                self.assertFalse((Path(result["log_dir"]) / "diff.patch").exists())
+        self.assertIn("--no-diff", self.invoke("--sandbox", "workspace-write", "--no-diff")["diff_reason"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_rollback_checks_then_reverses_the_patch_once(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root, sub, git = self.git_repo("repo")
+        job_id = self.invoke("--sandbox", "workspace-write", "--cwd", str(sub), command="start", mode="repo_edit")["job_id"]
+        self.assertEqual(self.control("status", job_id, "--wait", "30")["diff_status"], "captured")
+        page = self.control("output", job_id, "--artifact", "diff")
+        self.assertEqual((page["status"], page["diff_status"]), ("completed", "captured"))
+        self.assertIn("diff --git a/sub/a.txt b/sub/a.txt", page["text"])
+        done = {"status": "completed", "job_id": job_id, "checked": True, "files": 3}
+        self.assertEqual(self.control("rollback", job_id, "--check"), {**done, "rolled_back": False})
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                codex_runner.acquire_write_lock(str(sub)):
+            self.assertEqual(self.control("rollback", job_id)["error_kind"], "lock_busy")
+        (sub / "a.txt").write_bytes(b"edited after the task\n")
+        conflict = self.control("rollback", job_id)
+        self.assertEqual((conflict["error_kind"], conflict["rolled_back"]), ("rollback_conflict", False))
+        self.assertIn("sub/a.txt", conflict["error"])
+        self.assertTrue((sub / "new.txt").exists(), "a refused rollback changed the tree")
+        (sub / "a.txt").write_bytes(b"changed\n")
+        self.assertEqual(self.control("rollback", job_id), {**done, "rolled_back": True})
+        self.assertEqual(((sub / "a.txt").read_bytes(), (sub / "gone.txt").read_bytes(), (sub / "new.txt").exists()),
+                         (b"original\n", b"to delete\n", False))
+        self.assertEqual(git("status", "--porcelain").splitlines(), ["?? outside.txt"])
+        self.assertIsInstance(self.control("status", job_id)["rolled_back_at"], float)
+        listed = self.control("list")["jobs"][0]
+        self.assertEqual((listed["diff_status"], listed["diff_files"], type(listed["rolled_back_at"])), ("captured", 3, float))
+        self.assertEqual(self.control("rollback", job_id)["error_kind"], "already_rolled_back")
+
+    def test_rollback_and_diff_output_refuse_jobs_without_a_patch(self):
+        self.stored_job("running", None, sandbox="workspace-write")
+        self.stored_job("plain", {"status": "completed"}, sandbox="workspace-write")
+        for job_id, kind in (("running", "still_running"), ("plain", "no_diff"), ("missing", "unknown_job")):
+            with self.subTest(job_id=job_id):
+                result = self.control("rollback", job_id)
+                self.assertEqual((result["status"], result["error_kind"], result["rolled_back"]), ("failed", kind, False))
+        page = self.control("output", "plain", "--artifact", "diff")
+        self.assertEqual((page["error_kind"], page["diff_status"]), ("artifact_missing", None))
+        self.assertIn("No patch for this job", page["error"])
+        self.assertEqual(self.control("output", "running", "--artifact", "diff")["error_kind"], "artifact_pending")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_cancelled_and_dead_writers_still_get_a_patch(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root, sub, _ = self.git_repo("repo")
+        job_id = self.invoke("--sandbox", "workspace-write", "--cwd", str(sub), command="start", mode="repo_edit_hang")["job_id"]
+        self.wait_for(lambda: (self.state / "edited").exists())
+        cancelled = self.control("cancel", job_id)
+        self.assertEqual((cancelled["status"], cancelled["diff_status"], cancelled["diff_files"]), ("cancelled", "captured", 3))
+        self.assertNotIn("diff_note", cancelled)
+        self.assertEqual(self.control("rollback", job_id)["rolled_back"], True)
+
+        dead = self.stored_job("dead", None, cwd=str(sub), sandbox="workspace-write")
+        (dead / "worker.pid").write_text("123")
+        (dead / "worker.start").write_text("dead-worker")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            codex_runner.diff_begin(dead, str(sub))
+        (sub / "a.txt").write_bytes(b"left by the dead worker\n")
+        for _ in range(2):  # recorded once, then read back
+            status = self.control("status", "dead")
+            self.assertEqual((status["error_kind"], status["diff_status"], status["diff_files"]), ("worker_died", "captured", 1))
+            self.assertIn("after the worker died", status["diff_note"])
+        self.assertFalse((dead / "diff-base.json").exists())
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_oversized_patch_keeps_only_the_stat_and_slow_trees_are_remembered(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root, sub, _ = self.git_repo("repo")
+        big = self.stored_job("big", {"status": "completed"}, cwd=str(sub), sandbox="workspace-write")
+        slow = self.stored_job("slow", {"status": "completed"}, cwd=str(sub), sandbox="workspace-write")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            with mock.patch.object(codex_runner, "DIFF_MAX_BYTES", 10):
+                codex_runner.diff_begin(big, str(sub))
+                (sub / "a.txt").write_bytes(b"changed\n")
+                info = codex_runner.diff_end(big)
+            self.assertEqual((info["diff_status"], info["diff_files"]), ("too_large", 1))
+            self.assertGreater(info["diff_bytes"], 10)
+            self.assertIn("sub/a.txt |", (big / "diff.patch").read_text())
+            self.assertEqual(self.control("rollback", "big")["error_kind"], "no_diff")
+            with mock.patch.object(codex_runner, "git", side_effect=subprocess.TimeoutExpired("git", 20)) as git:
+                codex_runner.diff_begin(slow, str(sub))
+                codex_runner.diff_begin(slow, str(sub))  # the tree is remembered: no second wait
+            self.assertEqual(git.call_count, 1)
+            self.assertEqual(codex_runner.diff_fields(slow)["diff_status"], "skipped")
+            self.assertIsNotNone(codex_runner.snapshot_before(str(sub), None)[0])  # the file snapshot still walks it
+            self.assertTrue(codex_runner.forget_too_big(str(sub)))
+            self.assertFalse(codex_runner.forget_too_big(str(sub)))
+
+    def record_diff(self, sub, name, edit):
+        """Run one writer's diff around edit(); returns its fields, its patch and the indexes it tried to start from."""
+        import codex_runner
+
+        job = self.stored_job(name, {"status": "completed"}, cwd=str(sub), sandbox="workspace-write")
+        with mock.patch.object(codex_runner.shutil, "copy2", wraps=shutil.copy2) as copy:
+            codex_runner.diff_begin(job, str(sub))
+        edit()
+        info = codex_runner.diff_end(job)
+        return (info, (job / "diff.patch").read_bytes() if info["diff_status"] == "captured" else None,
+                [Path(call.args[0]) for call in copy.call_args_list])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_next_writer_starts_from_the_cached_index_and_gets_the_same_patch(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root, sub, git = self.git_repo("repo")
+        record = lambda name, edit: self.record_diff(sub, name, edit)
+
+        def second_edit():
+            (sub / "a.txt").write_bytes(b"two\n")  # same size, same second: only the index's own mtime gives it away
+            (sub / "new.txt").write_bytes(b"new\n")
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            cache = codex_runner.diff_index_cache(str(sub))
+            first, _, tried = record("first", lambda: (sub / "a.txt").write_bytes(b"one\n"))
+            self.assertEqual((first["diff_status"], len(tried), cache.exists()), ("captured", 2, True))  # no cache yet
+            git("add", "-A")
+            git("commit", "-q", "-m", "the user commits between two tasks")
+            second, cached_patch, tried = record("second", second_edit)
+            self.assertEqual((second["diff_files"], tried), (2, [cache / "index"]))
+            self.assertIn(b"-one\n+two\n", cached_patch)
+            self.assertNotIn(b"original", cached_patch)
+            (sub / "a.txt").write_bytes(b"one\n")
+            (sub / "new.txt").unlink()
+            self.assertTrue(codex_runner.forget_too_big(str(sub)))
+            self.assertFalse(cache.exists())
+            _, plain_patch, tried = record("uncached", second_edit)
+            self.assertEqual((plain_patch, len(tried)), (cached_patch, 2))
+            (cache / "index").write_bytes(b"not an index")
+            self.assertEqual(record("damaged", lambda: None)[0]["diff_status"], "empty")
+            self.assertFalse(cache.exists(), "a cache that failed was kept")
+            self.assertEqual(record("rebuilt", lambda: None)[0]["diff_status"], "empty")
+            codex_runner.prune_diff_index()
+            self.assertTrue(cache.exists(), "a fresh cached index was pruned")
+            with mock.patch.object(codex_runner.time, "time", return_value=time.time() + codex_runner.PRUNE_TTL + 86400):
+                codex_runner.prune_diff_index()
+            self.assertFalse(cache.exists())
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_cached_index_keeps_the_objects_only_the_work_tree_has(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root, sub, git = self.git_repo("repo")
+        (sub / "a.txt").write_bytes(b"edited by the user, never committed\n")  # a blob the repository does not have
+        (sub / "untracked.txt").write_bytes(b"untracked\n")
+        objects = git("count-objects", "-v")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            cache = codex_runner.diff_index_cache(str(sub))
+            self.assertEqual(self.record_diff(sub, "first", lambda: None)[0]["diff_status"], "empty")
+            info, patch, tried = self.record_diff(
+                sub, "second", lambda: (sub / "gone.txt").write_bytes(b"changed by the task\n"))
+            self.assertEqual((info["diff_files"], tried), (1, [cache / "index"]))  # no fall back to the user's index
+            self.assertIn(b"-to delete\n+changed by the task\n", patch)
+            self.assertNotIn(b"never committed", patch)
+            self.assertEqual(git("count-objects", "-v"), objects)
+            with mock.patch.object(codex_runner, "DIFF_CACHE_MAX_BYTES", 0):
+                self.assertEqual(self.record_diff(sub, "full", lambda: None)[0]["diff_status"], "empty")
+            self.assertFalse(cache.exists(), "a cache over its limit was kept")
+            info, _, tried = self.record_diff(sub, "rebuilt", lambda: None)
+            self.assertEqual((info["diff_status"], len(tried), (cache / "index").exists()), ("empty", 2, True))
+
+    def test_blocking_summary_agrees_with_the_shared_cases(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        data = json.loads((RUNNER.parent / "fixtures" / "blocking_cases.json").read_text("utf-8"))
+        differences = []
+        for case in data["cases"]:
+            value = {"status": case["status"], "context": {"acceptance": ["one"] * case["acceptance"]},
+                     **({"error_kind": case["error_kind"]} if case["error_kind"] else {}),
+                     **({"verification_status": case["verification_status"]} if case["verification_status"] else {}),
+                     **({"structured": data["reports"][case["report"]]} if case["report"] else {}),
+                     **({"verification": {"blockers": data["review_blockers"][case["review_blockers"]]}}
+                        if case["review_blockers"] else {})}
+            actual = codex_runner.blocking_summary(value)
+            got = {"state": actual["state"], "next_action": actual["next_action"],
+                   "blockers": [b["id"] for b in actual["blockers"]], "questions": [q["id"] for q in actual["questions"]]}
+            if got != case["expected"]:
+                differences.append({**case, "got": got})
+        self.assertEqual(differences[:5], [], f"{len(differences)} of {len(data['cases'])} cases differ")
+
+    def test_list_shows_the_last_activity_of_running_jobs_only(self):
+        running = self.stored_job("running", None)
+        (running / "events.jsonl").write_text(json.dumps(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "plan"}}), "utf-8")
+        self.stored_job("finished", {"status": "completed", "last_activity": "message: stale"})
+        jobs = {j["job_id"]: j for j in self.control("list")["jobs"]}
+        self.assertEqual(jobs["running"]["last_activity"], "message: plan")
+        self.assertNotIn("last_activity", jobs["finished"])
+
+    def test_summary_totals_usage_over_every_group_once(self):
+        usage = lambda **tokens: {"status": "completed", "usage": tokens}
+        self.stored_job("thread-1", {**usage(input_tokens=10), "thread_id": "t", "usage_scope": "thread_total"})
+        self.stored_job("thread-2", {**usage(input_tokens=25), "thread_id": "t", "usage_scope": "thread_total"})
+        self.stored_job("single", usage(input_tokens=5, output_tokens=1))
+        self.stored_job("unknown", {"status": "failed"})
+        os.utime(Path(self.tmp.name) / "home" / "jobs" / "thread-1" / "args.json", (1, 1))  # the older round
+        for extra in ((), ("--limit", "1"), ("--limit", "1", "--offset", "2")):
+            with self.subTest(extra=extra):
+                summary = self.control("summary", *extra)
+                self.assertEqual((summary["usage_total"], summary["usage_unknown_groups"]),
+                                 ({"input_tokens": 30, "output_tokens": 1}, 1), summary)
 
 
 if __name__ == "__main__":

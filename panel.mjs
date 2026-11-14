@@ -10,7 +10,15 @@ const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
 const bad = (message, status = 400) => Object.assign(new Error(message), { status });
 const SELFTEST_LIMIT = 64 * 1024;
 const PROMPT_BACKUPS = 10;
-const ARTIFACTS = ['report', 'context', 'review', 'stderr', 'result'];
+const ARTIFACTS = ['report', 'context', 'review', 'stderr', 'result', 'diff'];
+// runner 拒绝回滚的原因：前者是当前状态不允许（409），其余按任务服务不可用处理（502）。文案不含英文，前端原样显示。
+const ROLLBACK_REFUSED = {
+  rollback_conflict: '这些文件在任务之后又被改过，不能自动回滚，没有改动任何文件。请查看改动记录后手动处理。',
+  lock_busy: '这个任务目录正有其他任务在写，暂时不能回滚，没有改动任何文件。请等它结束后重试。',
+  still_running: '任务还在运行，不能回滚。请等它结束或先取消，再重试。',
+  no_diff: '这一单没有记录可回滚的改动，请刷新任务列表后查看。',
+  already_rolled_back: '这一单的改动已经回滚过，请刷新任务列表后查看。',
+};
 const RUNNER_JOB_ID = /^\d{8}-\d{6}-[0-9a-f]{6}$/;
 // 搜索词会作为 --owner 的值传给 runner，不接受以 - 开头的写法。
 const SESSION_ID = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,99}$/;
@@ -102,7 +110,12 @@ export function panelSettings(cfg) {
       ...['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'maxRunningJobs'].map((key) => [key, cfg[key] ?? null]),
       ['autoResume', { enabled: cfg.autoResume?.enabled !== false }],
       ['roots', cfg.roots ?? []], ['allowHostAccess', cfg.allowHostAccess === true],
-      ['defaultHostAccess', cfg.defaultHostAccess === true], ['unknownConfig', cfg.unknownConfig ?? []]]));
+      ['defaultHostAccess', cfg.defaultHostAccess === true], ['unknownConfig', cfg.unknownConfig ?? []],
+      ['toolPolicy', cfg.toolPolicy ?? 'denylist'], ['allowTools', [...(cfg.allowTools ?? [])]],
+      ['plannerReadAllow', [...(cfg.plannerReadAllow ?? [])]],
+      ...['maxSessionJobs', 'maxSessionTokens'].map((key) => [key, cfg[key] ?? null]), ['jobDiff', cfg.jobDiff === true],
+      // 受护栏会话里出现过、白名单模式下不会放行的工具名；只读，不是设置项。
+      ['seenTools', [...(cfg.seenTools ?? [])].sort()]]));
 }
 
 // No runner commands come from HTTP input; file names from HTTP are only matched against fixed directory listings.
@@ -122,7 +135,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
     const route = pathname.slice(PANEL_PATH.length);
     const known = { '/status': ['GET'], '/attention': ['GET'], '/settings': ['GET', 'POST'],
       '/settings/apply': ['POST'], '/settings/cancel': ['POST'], '/jobs': ['GET'], '/output': ['GET'],
-      '/cancel': ['POST'], '/prompt': ['GET', 'POST'], '/prompt/backups': ['GET'], '/prompt/backup': ['GET'], '/reload': ['POST'],
+      '/cancel': ['POST'], '/rollback': ['POST'], '/prompt': ['GET', 'POST'], '/prompt/backups': ['GET'], '/prompt/backup': ['GET'], '/reload': ['POST'],
       '/doctor': ['GET'], '/gemini': ['GET'], '/session/send': ['POST'], '/session/resume': ['POST'], '/session/goal': ['POST'],
       '/session/results': ['GET'], '/selftest/request': ['GET'], '/selftest/result': ['POST'] };
     if (!pathname.startsWith(PANEL_PATH + '/') || !known[route]) throw bad('找不到这个功能，请刷新面板后重试。', 404);
@@ -131,7 +144,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       '/prompt': method === 'GET' ? ['kind'] : [], '/prompt/backups': ['kind'], '/prompt/backup': ['kind', 'name'] }[route] ?? [];
     object(query, allowedQuery);
     if (method === 'POST' && route !== '/settings' && route !== '/selftest/result') object(body, { '/prompt': ['text', 'kind'],
-      '/cancel': ['job_id', 'confirm'], '/settings/apply': ['changes', 'confirm'], '/session/send': ['sessionId', 'message', 'queue'],
+      '/cancel': ['job_id', 'confirm'], '/rollback': ['job_id', 'confirm', 'check'], '/settings/apply': ['changes', 'confirm'], '/session/send': ['sessionId', 'message', 'queue'],
       '/session/resume': ['sessions', 'message'], '/session/goal': ['sessionId', 'objective', 'maxGoalRounds'] }[route] ?? []);
     if (route === '/selftest/request') {
       if (!selftestDirectory) return { request: null };
@@ -212,7 +225,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
             (job.verification_status === 'unreviewed' && job.review_status === 'needs_attention'),
           // 只转交 runner 实际给出的字段。
           ...(job.context?.owner != null ? { owner: job.context.owner } : {}),
-          ...Object.fromEntries(['cwd', 'duration_s', 'error_kind', 'verification_status', 'phase', 'attempt', 'updated_at']
+          ...Object.fromEntries(['cwd', 'duration_s', 'error_kind', 'verification_status', 'phase', 'attempt', 'updated_at',
+            'diff_status', 'diff_files', 'rolled_back_at', 'last_activity']
             .filter((key) => job[key] != null).map((key) => [key, job[key]])),
           ...(counts && typeof counts === 'object' ? { criteria_counts: { met: counts.met, not_met: counts.not_met, blocked: counts.blocked } } : {}) };
       }) };
@@ -253,6 +267,17 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       }
       return result;
     }
+    if (route === '/rollback') {
+      const id = jobId(body.job_id);
+      if (body.confirm !== true) throw bad('请先确认回滚这一单的改动');
+      if (body.check !== undefined && typeof body.check !== 'boolean') throw bad('提交的内容不正确，请刷新页面后重新操作。');
+      const result = await conductor.rollback(id, { check: body.check === true });
+      if (result?.status !== 'completed' || result.error_kind) {
+        const refused = ROLLBACK_REFUSED[result?.error_kind];
+        throw bad(refused ?? '暂时无法确认回滚结果，请检查任务服务是否可用，刷新任务列表确认后再试。', refused ? 409 : 502);
+      }
+      return { job_id: id, rolled_back: result.rolled_back === true, checked: result.checked === true, files: result.files ?? null };
+    }
     if (route === '/doctor') {
       const value = runnerResult(await conductor.doctor(signal));
       return { ok: value?.ok === true, checks: (Array.isArray(value?.checks) ? value.checks : []).map((check) => ({
@@ -268,8 +293,10 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
         let entry;
         try { entry = JSON.parse(line); } catch { continue; }
         if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
-        entries.push(Object.fromEntries(['at', 'session', 'output', 'status', 'chars', 'attempts', 'error', 'draft_path', 'duration_s']
-          .map((key) => [key, entry[key] ?? null])));
+        entries.push({ ...Object.fromEntries(['at', 'session', 'output', 'status', 'chars', 'attempts', 'error', 'draft_path', 'duration_s']
+          .map((key) => [key, entry[key] ?? null])),
+        // 较新的记录才有这两项。
+        ...(entry.id != null ? { id: entry.id } : {}), ...(typeof entry.background === 'boolean' ? { background: entry.background } : {}) });
       }
       return { entries };
     }

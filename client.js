@@ -101,7 +101,7 @@ window.__ModuleLoader__.load({
       } catch (_) { return null; }
     }
 
-    const ARTIFACTS = [['report', '报告'], ['context', '任务书与验收'], ['review', '核验记录'], ['stderr', '错误日志']];
+    const ARTIFACTS = [['report', '报告'], ['context', '任务书与验收'], ['review', '核验记录'], ['stderr', '错误日志'], ['diff', '改动 diff']];
     const reportPath = (jobId, offset, artifact = 'report') =>
       `/output?job_id=${encodeURIComponent(jobId)}&offset=${offset}&limit=8000${artifact === 'report' ? '' : `&artifact=${artifact}`}`;
     async function loadReport(jobId, signal, read = api, artifact = 'report') {
@@ -165,13 +165,28 @@ window.__ModuleLoader__.load({
       maxRunningJobs: [(v) => Number.isInteger(v) && v > 0, '同时运行的任务数上限请填正整数，或留空。'],
       lockTimeoutSeconds: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
       maxStorageMb: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
+      maxSessionJobs: [(v) => Number.isInteger(v) && v > 0, '每个会话最多派几单请填正整数，或留空。'],
+      maxSessionTokens: [(v) => Number.isInteger(v) && v > 0, '每个会话的用量上限请填正整数，或留空。'],
     };
+    // 多行文本框一行一个，空行忽略；提交时整体替换数组。[最多几项, 单项检查, 提示]
+    const LISTS = {
+      allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v), '白名单工具请一行填一个，只用字母、数字和 _ . : * -，最多 200 个。'],
+      plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(v), '额外允许读取的路径请一行填一个完整路径，最多 50 个。'],
+    };
+    const listLines = (value) => Array.isArray(value) ? value
+      : String(value ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
     const effectiveLength = (text) => Array.from(text.replace(/<!--[\s\S]*?-->/g, '').trim()).length;
 
     function settingsPatch(settings, edits) {
       const patch = {};
       for (const [key, raw] of Object.entries(edits)) {
         const old = fieldValue(settings, key);
+        if (LISTS[key]) {
+          const [most, check, message] = LISTS[key], list = listLines(raw);
+          if (list.length > most || !list.every(check)) throw new Error(message);
+          if (JSON.stringify(list) !== JSON.stringify(old ?? [])) patch[key] = list;
+          continue;
+        }
         if (displayValue(raw) === displayValue(old)) continue;
         let value = raw;
         if (key === 'model' || key === 'gemini.model') {
@@ -184,6 +199,8 @@ window.__ModuleLoader__.load({
           if (!['', 'fast', 'ultrafast'].includes(value)) throw new Error('请从列表中选择服务速度。');
         } else if (key === 'plannerReads') {
           if (!['open', 'products'].includes(value)) throw new Error('请选择规划端的读取范围。');
+        } else if (key === 'toolPolicy') {
+          if (!['denylist', 'allowlist'].includes(value)) throw new Error('请从列表中选择工具放行方式。');
         } else if (NUMBERS[key]) {
           const [check, message] = NUMBERS[key];
           value = raw == null || String(raw).trim() === '' ? null : Number(raw);
@@ -388,6 +405,8 @@ window.__ModuleLoader__.load({
       const [doctor, setDoctor] = useState(null);
       const [session, setSession] = useState({});
       const [confirmSession, setConfirmSession] = useState(null);
+      // 正在走回滚流程的任务：先检查（checked 之前只有 id），通过后再确认。
+      const [rollback, setRollback] = useState(null);
       const [sessionResults, setSessionResults] = useState(null);
       const [errors, setErrors] = useState({});
       const [messages, setMessages] = useState({});
@@ -566,6 +585,15 @@ window.__ModuleLoader__.load({
             onChange: (event) => edit(key, event.target.value) });
         return h('label', { className: 'dcc-field', key }, h('span', null, label), control, h('small', null, hint));
       }
+      const listDraft = (key) => Object.hasOwn(edits, key) ? edits[key] : (fieldValue(editingSettings, key) || []).join('\n');
+      function listField(key, label, hint) {
+        return h('label', { className: 'dcc-field', key }, h('span', null, label),
+          h('textarea', { className: 'dcc-short', value: listDraft(key), disabled: !!busy, spellCheck: false,
+            onChange: (event) => edit(key, event.target.value) }), h('small', null, hint));
+      }
+      const allowDraft = settings ? listLines(listDraft('allowTools')) : [];
+      const diffText = { empty: '没有文件改动', skipped: '这一单没有记录改动 diff', not_git: '任务目录不是 git 仓库，没有记录改动 diff',
+        too_large: '改动太大，没有记录 diff' };
       const executionText = { running: '运行中', completed: '已结束', failed: '执行失败', cancelled: '已取消', unknown: '状态待确认' };
       const pageJobs = jobs?.jobs ?? [];
       const verificationText = { unreviewed: '未核验', verified: '已通过', needs_changes: '待修正', accepted_deviations: '已接受偏差', invalid: '记录异常' };
@@ -661,6 +689,10 @@ window.__ModuleLoader__.load({
               field('maxRunningJobs', '同时运行的任务数上限', '达到上限后不再启动新任务；留空表示不限制。'),
               field('lockTimeoutSeconds', '等待其他任务的秒数', '要修改同一目录时，最多等其他任务多久；留空表示不限制，一直等。'),
               field('maxStorageMb', '任务记录占用空间上限（MiB）', '超过上限时会清理最旧的已结束任务记录；留空表示不限制。'),
+              field('maxSessionJobs', '每个会话最多派几单', '一个会话累计派出的任务数上限；留空表示不限制。'),
+              field('maxSessionTokens', '每个会话的用量上限（token）', '一个会话里 Codex 任务累计用量的上限；留空表示不限制。'),
+              field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
+                [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
               settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,
               settings.gemini ? field('gemini.effort', 'Gemini 思考程度', 'Gemini 支持低、中、高三档。', EFFORTS.slice(0, 3)) : null),
             h('div', { className: 'dcc-actions' },
@@ -677,6 +709,22 @@ window.__ModuleLoader__.load({
                 checked: (Object.hasOwn(edits, 'autoResume.enabled') ? edits['autoResume.enabled'] : editingSettings.autoResume?.enabled) !== false,
                 disabled: !!busy, onChange: (value) => edit('autoResume.enabled', value) }),
               h('small', null, 'Harness 重启后，自动接着做上次被打断的会话。')),
+            h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '记录每单的改动 diff', checked: (Object.hasOwn(edits, 'jobDiff') ? edits.jobDiff : editingSettings.jobDiff) === true,
+                disabled: !!busy, onChange: (value) => edit('jobDiff', value) }),
+              h('small', null, '记录后可以在任务报告里查看这一单改了什么，也可以回滚这一单的改动。')),
+            (Object.hasOwn(edits, 'toolPolicy') ? edits.toolPolicy : editingSettings.toolPolicy) === 'allowlist' ? h('p', { className: 'dcc-warn', role: 'status' },
+              '白名单模式下，未列入白名单的工具在受护栏会话里会被拒绝。') : null,
+            h('div', { className: 'dcc-grid dcc-actions' },
+              listField('allowTools', '白名单工具', '一行一个工具名；以 * 结尾表示放行这个前缀开头的所有工具。只在白名单模式下生效。'),
+              listField('plannerReadAllow', '额外允许读取的路径', '一行一个完整路径，可以是文件或目录；“规划端只读 Codex 的产物”打开时，这些路径仍可直接读取。')),
+            settings.seenTools?.length ? h('div', { className: 'dcc-actions' },
+              h('small', null, '这些工具在受护栏会话里出现过，白名单模式下会被拒绝：'),
+              h('ul', { className: 'dcc-jobs', 'aria-label': '出现过但不在白名单里的工具' }, ...settings.seenTools.map((tool) =>
+                h('li', { key: tool, className: 'dcc-row' }, h('span', null, tool),
+                  h(Button, { size: 'sm', disabled: !!busy || allowDraft.includes(tool),
+                    onClick: () => edit('allowTools', [...allowDraft, tool].join('\n')) },
+                  allowDraft.includes(tool) ? '已在白名单草稿里' : '加入白名单'))))) : null,
             h(Message, { text: validation, error: true }),
             h('div', { className: 'dcc-row dcc-actions' },
               h(Button, { variant: 'primary', disabled: !!busy || (!dirty && !(pending?.error && !pending.awaiting_load)) || !!validation,
@@ -712,6 +760,8 @@ window.__ModuleLoader__.load({
           h('ul', { className: 'dcc-jobs' }, ...pageJobs.map((job) => {
             const running = (job.execution_status || job.status) === 'running';
             const counts = job.criteria_counts;
+            const canRollback = ['completed', 'failed', 'cancelled'].includes(job.execution_status || job.status) &&
+              job.diff_status === 'captured' && !job.rolled_back_at;
             // 只显示任务记录里实际有的信息。
             const facts = [job.owner && `会话 ${job.owner}`, job.cwd && `目录 ${job.cwd}`,
               job.duration_s != null && `耗时 ${Math.round(job.duration_s)} 秒`,
@@ -719,7 +769,9 @@ window.__ModuleLoader__.load({
               job.error_kind && `失败原因 ${job.error_kind}`,
               job.verification_status && `独立核验 ${verificationText[job.verification_status] || job.verification_status}`,
               running && job.phase && `当前阶段 ${phaseText[job.phase] || job.phase}${job.attempt ? `（第 ${job.attempt} 轮）` : ''}`,
-              running && job.updated_at && `最近活动 ${when(job.updated_at * 1000)}`].filter(Boolean);
+              running && (job.last_activity ? `最近活动 ${job.last_activity}` : job.updated_at && `最近活动 ${when(job.updated_at * 1000)}`),
+              job.diff_status === 'captured' ? `改动 diff ${job.diff_files != null ? `${job.diff_files} 个文件` : '已记录'}` : diffText[job.diff_status],
+              job.rolled_back_at && `已回滚 ${when(typeof job.rolled_back_at === 'number' ? job.rolled_back_at * 1000 : job.rolled_back_at)}`].filter(Boolean);
             return h('li', { key: job.job_id, className: 'dcc-job' },
               h('strong', null, job.title || '未填写任务标题'),
               h('small', null, `${executionText[job.execution_status || job.status] || '状态待确认'}${job.needs_attention ? ' · 需要关注' : ''} · ${new Date(job.started_at * 1000).toLocaleString('zh-CN')}`),
@@ -727,7 +779,27 @@ window.__ModuleLoader__.load({
               facts.length ? h('small', null, facts.join(' · ')) : null,
               h('div', { className: 'dcc-row' },
                 h(Button, { size: 'sm', onClick: () => setReportJob(job.job_id) }, '查看报告'),
-                running ? h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmJob(job.job_id) }, '取消任务') : null),
+                running ? h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmJob(job.job_id) }, '取消任务') : null,
+                canRollback ? h(Button, { size: 'sm', disabled: !!busy, onClick: () => {
+                  setRollback({ id: job.job_id });
+                  setMessages((old) => ({ ...old, rollback: '' })); setErrors((old) => ({ ...old, rollback: '' }));
+                } }, '回滚这单的改动') : null),
+              canRollback && rollback?.id === job.job_id ? h('div', { className: 'dcc-confirm' },
+                h('p', null, '只撤销这一单在任务目录里的文件改动，不动提交记录。这些文件在任务之后又被改过时不会回滚，也不会改动任何文件。'),
+                rollback.checked ? h('p', null, `检查通过${rollback.files != null ? `，可以回滚 ${rollback.files} 个文件` : ''}。确定现在回滚吗？`) : null,
+                h('div', { className: 'dcc-row' },
+                  rollback.checked
+                    ? h(Button, { size: 'sm', variant: 'outline', disabled: !!busy,
+                      onClick: () => mutate('rollback', '/rollback', { job_id: job.job_id, confirm: true }, (value) => {
+                        setRollback(null);
+                        setMessages((old) => ({ ...old, rollback: value.rolled_back ? '已回滚这一单的改动，正在刷新列表。'
+                          : '回滚请求已返回，但没有确认已回滚，请查看刷新后的任务列表。' }));
+                      }) }, busy === 'rollback' ? '正在回滚…' : '确认回滚')
+                    : h(Button, { size: 'sm', variant: 'outline', disabled: !!busy,
+                      onClick: () => mutate('rollback', '/rollback', { job_id: job.job_id, confirm: true, check: true },
+                        (value) => setRollback({ id: job.job_id, checked: true, files: value.files })) },
+                    busy === 'rollback' ? '正在检查…' : '检查能否回滚'),
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => setRollback(null) }, '先不回滚'))) : null,
               confirmJob === job.job_id && running ? h('div', { className: 'dcc-confirm' },
                 h('p', null, '确定停止这个任务吗？已经产生的文件改动会保留。'),
                 h('div', { className: 'dcc-row' },
@@ -747,6 +819,7 @@ window.__ModuleLoader__.load({
             h(Button, { size: 'sm', disabled: !!busy || !(jobs?.next_offset > jobOffset),
               onClick: () => selectJobPage([...jobOffsets, jobs.next_offset]) }, '下一页')),
           h(Message, { text: messages.cancel }), h(Message, { text: errors.cancel, error: true }),
+          h(Message, { text: messages.rollback }), h(Message, { text: errors.rollback, error: true }),
           reportJob ? h(Report, { key: reportJob, jobId: reportJob, refreshKey: jobs,
             onClose: () => setReportJob(null), selftest }) : null),
 
@@ -756,7 +829,7 @@ window.__ModuleLoader__.load({
             : h('ul', { className: 'dcc-jobs' }, ...gemini.map((entry, i) => h('li', { key: i, className: 'dcc-job' },
               h('strong', null, entry.output || '未记录目标文件'),
               h('small', null, [entry.status === 'completed' ? '成功' : '失败', entry.at && when(entry.at),
-                entry.chars != null && `${entry.chars} 字`].filter(Boolean).join(' · ')),
+                entry.chars != null && `${entry.chars} 字`, entry.background && '后台'].filter(Boolean).join(' · ')),
               entry.error ? h('p', { className: 'dcc-error' }, `失败原因：${entry.error}`) : null,
               entry.draft_path ? h('small', null, `草稿：${entry.draft_path}`) : null)))) : null,
 
@@ -787,8 +860,13 @@ window.__ModuleLoader__.load({
                 sessionField('resumeIds', '要续接的会话编号', { placeholder: '多个用空格或逗号分隔，最多 20 个' }),
                 sessionField('resumeMessage', '续接时发送的话', { placeholder: '留空用“继续”', maxLength: 2000 }),
                 h('div', { className: 'dcc-actions' }, h(Button, { size: 'sm', disabled: !!busy || !sessionIds.length,
-                  onClick: () => sessionSubmit('sessionResume', '/session/resume',
-                    { sessions: sessionIds, ...(session.resumeMessage ? { message: session.resumeMessage } : {}) }) }, '续接被中断的会话')),
+                  onClick: () => setConfirmSession('resume') }, '续接被中断的会话')),
+                confirmSession === 'resume' ? h('div', { className: 'dcc-confirm' },
+                  h('p', null, '确定续接吗？这会以用户身份让这些会话接着做，被中断的会话会收到上面这句话。'),
+                  h('div', { className: 'dcc-row' },
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => sessionSubmit('sessionResume', '/session/resume',
+                      { sessions: sessionIds, ...(session.resumeMessage ? { message: session.resumeMessage } : {}) }) }, '确认续接'),
+                    h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不续接'))) : null,
                 h('small', null, '只处理被中断或被拒绝后停下的会话，正常结束的会话会跳过。'),
                 h(Message, { text: messages.sessionResume }), h(Message, { text: errors.sessionResume, error: true })),
               h('div', null,

@@ -240,6 +240,14 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 防虚报：回合结束时 agent 声称“已派 Codex”或“Codex 正在做”，但这一轮没有调用 `codex_*`，也没有由本插件后台监控确认仍在运行的任务，插件会提醒它一次，让它补上调用或更正说法。没有 jobs 服务时不跨轮缓存轮询状态；取消失败时继续保留后台任务的执行状态。判断按当前会话的 DSH 任务表进行，插件重载后也沿用已有任务，不受其他会话运行任务的影响。
 - `0.9.100` 起：词首 `#` 按 bash 注释处理，`$(...)` 内不放行注释；未引用的 `$'…'`、`$"…"` 和 `${ cmd; }` 不放行。测试运行器只接受固定开关和字面路径：pytest 接受 `-q -v -x -s -l -k/-m <表达式> --maxfail=N --tb=… --lf --ff --collect-only` 等，`python -m unittest` 的操作数只接受 `discover`、`tests…`、`test_*…` 或 `.py` 路径，`node --test` 接受文件和 `--test-name-pattern=…`，npm/pnpm/yarn 的 `test` 后只接受 `--`、`-s`、`--silent` 和字面操作数，`make` 只接受单独的 `make test` / `make check`；需要其他参数时写进 `allowCommands`，或把这次检查交给 Codex。工具名不区分大小写，`apply_patch`、`multi_edit`、`ops_write`、`ops_edit` 以及 camelCase、连字符形式的 MCP 写入和执行动作同样拒绝；shell 工具不接受 `env`、`stdin` 等会改变执行的参数。超过 32 KB 的命令直接拒绝。`workspaces: ["*"]` 也覆盖没有工作目录的会话。
 
+### 0.9.102：每单 diff、回滚与白名单模式
+
+可写任务的任务目录在 git 工作树内时，结果里的 `diff_status` 为 `captured` 表示本单的改动已记成 patch：用 `codex_output` 的 `artifact="diff"` 分页查看，或在面板的任务报告里切到“改动 diff”。记录只含任务目录子树、遵守 .gitignore，不含被忽略的文件、任务目录之外和 `writable_roots` 里的改动，也不含子模块内部的改动；patch 超过 5 MiB 记 `too_large`，只留统计信息且不可回滚；不是 git 仓库记 `not_git`，超时或 git 出错记 `skipped`，都不影响任务本身。被取消的任务同样有 patch；worker 中断的任务在下次查询时补记，并用 `diff_note` 注明可能含之后的改动。为了不让每单都重新哈希整个目录，runner 在 `runnerHome/diff-index/<目录键>/` 下为每个任务目录缓存一份刷新过的 index 和记录用的对象（上限 256 MiB，超过后整体重建；`forget-too-big` 和 30 天清理会一并清掉）：每个目录的第一单要完整哈希一遍，之后只处理变化的文件。
+
+回滚只能由用户在面板里发起：先“检查能否回滚”，通过后二次确认。它按 patch 反向应用，只撤销这一单在任务目录里的文件改动，不动提交记录和暂存区；相关文件之后又被改过、与 patch 对不上时拒绝并且不改任何文件；同目录有写任务在运行或排队时返回忙，稍后再试；每单只能回滚一次。规划端没有回滚工具。
+
+白名单模式（`toolPolicy: allowlist`）用来堵住“护栏不认识的工具默认放行”这个口子：切换前先看面板里列出的“白名单模式下会被拒绝的工具”，把需要的加进 `allowTools` 再保存。默认的 `denylist` 模式行为不变。
+
 ### 0.9.100：面板新增内容
 
 “Codex 指挥”面板新增：“给 Codex 的固定要求”编辑框（保存前备份，保留最近 10 份，上限 1 MiB）；两份提示词的有效字数、历史备份查看与载入，规划提示词是否已注入；运行状态里的护栏工作区、主机访问状态和未识别的配置项，以及点一次查一次的“环境自检”；常用设置里的总超时、空闲超时、重试次数、同时运行任务数上限和重启后自动续接，数字项留空表示恢复默认或不限制；最近任务的会话、目录、耗时、验收条数、失败原因、核验状态和运行阶段，按任务编号或会话编号搜索，报告区切换查看任务书与验收、核验记录、错误日志；配置了 Gemini 时的最近 20 条写作记录；默认折叠的“会话操作”，可提交发送、续接、改 Goal 请求，走上文的本机请求文件，发送和改 Goal 需二次确认，上一份未处理时拒绝新提交。面板的运行状态每 7 秒读取，其余约每 28 秒，页面不可见时暂停；面板自检仍只读原有五个接口，不渲染会话操作。
@@ -290,6 +298,11 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `codexHome` | Codex 默认 | 传给 Codex 的 `CODEX_HOME` |
 | `runnerHome` | `~/.local/state/codex-runner` | 任务记录和日志目录 |
 | `maxStorageMb` | 留空（不限制） | `jobs` 与 `runs` 合计大小上限（MiB），须为正有限数字，可含小数；启动时尽力清理最旧的已结束任务，保留活任务和本次任务 |
+| `maxSessionJobs` | 留空（不限制） | 每个会话累计可派的 Codex 任务数上限，须为正整数；达到后不启动 Codex 并说明原因 |
+| `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
+| `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
+| `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools`，已有的拒绝规则仍然优先 |
+| `allowTools` | `[]` | 白名单模式下额外放行的工具名，不区分大小写，`*` 结尾表示前缀匹配；不能放行 `write`、`run_code` 等已被拒绝的工具 |
 | `maxRunningJobs` | 留空（不限制） | 同时运行或排队等写锁的 Codex 任务数上限，须为正整数；达到上限时 `codex_run` / `codex_continue` / `codex_verify` 不启动 Codex 并说明原因，等其中一个结束后再派 |
 | `routerCheckUrl` | 空 | Codex 使用固定本机模型网关时，可填其 HTTP(S) 地址。runner 在 WSL 内先探测该主机和端口；不可达时报 `router_down`，不会先启动 Codex。仅探测，不修改模型配置。 |
 | `codexRoute` | 空 | `{ provider, baseUrl }`，只给插件启动的 Codex 指定已有的自定义提供方与 HTTP(S) 地址，不改 Codex 配置文件。未设置 `routerCheckUrl` 时，启动前向该地址的主机请求 `HEAD /`，确认网关有响应。环回地址只在该 Codex 进程中绕过代理。 |
@@ -368,6 +381,7 @@ python3 runner/codex_runner.py review JOB_ID --reviewer SESSION_ID < review.json
 python3 runner/codex_runner.py summary [--cwd DIR] [--owner SESSION_ID] [--thread-id THREAD_ID] [--round-limit 20]
 python3 runner/codex_runner.py forget-too-big --cwd DIR
 python3 runner/codex_runner.py doctor
+python3 runner/codex_runner.py rollback JOB_ID [--check]
 ```
 
 `run` / `start` 可选 `--context-json`，此时 stdin 为 `{"prompt":"完整交接提示","context":{"owner":"会话 ID","task":"原任务","acceptance":["原验收"],"write":true}}`；不传时沿用纯文本提示。`list` 默认最近 20 条、每页最多 100 条；`--status` 按执行状态筛选。`output` 偏移和长度按 Unicode 字符计算，不切断中文或 emoji，可重复读取。CLI 同样保留主机访问权限选项，新增查询不会启动 Codex。
@@ -542,6 +556,11 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | --- | --- | --- |
 | `plannerAnswers` | `false` | Allows planner answers and `accepted_deviations` (including `kind: 'scope'`) based on the user's original goal and known facts, and skips pending-conflict write-scope preflight. The latest `ask_user` task still requires `codex_continue`, with answers covering every question ID. Report decisions made for the user; ask first when uncertain or when answers entail data deletion or changes to directories the user did not mention. |
 | `lockTimeoutSeconds` | Empty (unlimited) | Positive finite seconds waiting for directory write locks; expiry returns retryable `lock_timeout` before Codex starts. Null, empty or omitted passes no flag. |
+| `maxSessionJobs` | Empty (unlimited) | Positive integer limit on the Codex jobs one session may dispatch in total |
+| `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |
+| `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
+| `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
+| `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |
 | `maxRunningJobs` | Empty (unlimited) | Positive integer limit on Codex jobs that are running or queued for a write lock; at the limit a dispatch is refused with the reason instead of starting Codex |
 | `maxStorageMb` | Empty (unlimited) | Positive finite combined `jobs`/`runs` limit in MiB, including fractions; startup best-effort cleanup removes the oldest finished records, preserving active and current tasks. Null, empty or omitted passes no flag. |
 

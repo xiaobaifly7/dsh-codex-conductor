@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, normPath, inWorkspace,
-  PRODUCT_HINT, PRODUCT_DENY_HINT, GEMINI_READ_DENY, GEMINI_UNKNOWN_DENY, GEMINI_CHECK_HINT } from './guard.mjs';
+import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, normPath, inWorkspace, knownTool,
+  PRODUCT_HINT, PRODUCT_DENY_HINT, GEMINI_READ_DENY, GEMINI_UNKNOWN_DENY, GEMINI_CHECK_HINT, RUN_CODE_DENY } from './guard.mjs';
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const call = (name, args, owner = 'S1') => ({
@@ -575,4 +575,105 @@ test("'*' also guards sessions without a cwd, and WSL UNC paths match their moun
   assert.equal(inWorkspace('\\\\wsl.localhost\\Ubuntu\\mnt\\d\\proj\\sub', ['d:/proj']), true);
   assert.equal(inWorkspace('\\\\wsl$\\Ubuntu\\home\\u\\p', ['/home/u/p']), true);
   assert.equal(inWorkspace('\\\\wsl$\\Ubuntu\\home\\u\\other', ['/home/u/p']), false);
+});
+
+test('toolPolicy allowlist refuses tools the guard does not know unless allowTools names them', () => {
+  const base = { ...config('open'), gemini: true };
+  const cfg = { ...base, toolPolicy: 'allowlist', allowTools: ['todo_write', 'MCP__Docs__*'] };
+  for (const name of ['codex_run', 'codex_status', 'gemini_write', 'tool_call', 'read', 'grep', 'glob', 'ops_glob', 'ops_read_files',
+    'wsl-read', 'wsl-grep', 'mcp__fs__read_file', 'mcp__serena__find_symbol', 'mcp__serena__find_referencing_symbols',
+    'mcp__notes__obsidian_read', 'obsidian_list', 'mcp__seep-reverse-lab__seep_r2_info', 'mcp__seep_reverse_lab__seep_status',
+    'todo_write', 'Todo_Write', 'mcp__docs__query']) {
+    assert.equal(knownTool(name, cfg), true, name);
+    assert.equal(decide(call(name, {}), cfg), undefined, name);
+  }
+  assert.equal(decide(call('wsl', { command: 'git status' }), cfg), undefined);
+  assert.match(decide(call('wsl', { command: 'rm x' }), cfg), /不放行的是「rm x」/);
+  for (const name of ['web_search', 'ls', 'todo_writer', 'mcp__git__git_status', 'mcp__doc__query', 'mcp__x__seep_r2_strings']) {
+    assert.equal(knownTool(name, cfg), false, name);
+    const denied = decide(call(name, {}), cfg);
+    assert.match(denied, /白名单模式下未放行，确需使用请把工具名加入插件配置 allowTools/, name);
+    assert.ok(denied.includes(name), name);
+    assert.match(decide(call(name, {}), { ...cfg, plannerReads: 'products' }), /allowTools/, name);
+    // 默认的 denylist 行为不变
+    assert.equal(decide(call(name, {}), base), undefined, name);
+    assert.equal(decide(call(name, {}), { ...base, toolPolicy: 'denylist', allowTools: [] }), undefined, name);
+  }
+  // 已有的拒绝规则在前，allowTools 不能把它们放出来
+  assert.match(decide(call('write', {}), { ...cfg, allowTools: ['write'] }), /会直接改动文件或执行任意代码/);
+  assert.match(decide(call('mcp__docs__write_file', {}), cfg), /会改动文件或执行命令/);
+  assert.equal(knownTool('gemini_write', { ...cfg, gemini: false }), false);
+  assert.equal(knownTool('anything', { allowTools: ['*'] }), true);
+  assert.equal(knownTool('anything'), false);
+});
+
+test('tools the read boundary does not know stay unchecked in the default policy, with or without path arguments', () => {
+  // 线上有带 path 参数的未知工具（Seep 结构化查询读工作区二进制、接口类工具的 path: '/v1/x'）；收紧走白名单模式。
+  const calls = [['mcp__seep__seep_r2_strings', { path: '/repo/bin/app' }], ['mcp__api__request', { path: '/v1/x' }],
+    ['view', { path: '/repo/secret.js' }], ['glob', { path: '/repo', pattern: '**' }], ['mcp__cbm__get_code_snippet', { qualified_name: 'x' }]];
+  for (const plannerReads of ['open', 'products']) {
+    const scope = createProductReads(config(plannerReads), completed);
+    scope.addGemini('S1', ['/repo/docs/ch1.md']);
+    for (const [name, args] of calls) {
+      assert.deepEqual(plannerReadTargets(call(name, args), '/repo'), [], name);
+      assert.equal(scope.checkSync(call(name, args)), undefined, `${plannerReads} ${name}`);
+      assert.equal(decide(call(name, args), config(plannerReads)), undefined, `${plannerReads} ${name}`);
+    }
+  }
+});
+
+test('run_code that tries to reach codex_* or gemini_write gets the preset explanation in both read modes', () => {
+  for (const plannerReads of ['open', 'products']) {
+    const cfg = { ...config(plannerReads), gemini: true };
+    for (const args of [{ code: 'await tools.codex_run({ task: "x" })' }, { source: 'tools["codex_status"]({})' },
+      { code: 'tools.gemini_write({ output: "a.md" })' }, 'return tools.codex_jobs()']) {
+      const denied = decide(call('run_code', args), cfg);
+      assert.equal(denied, RUN_CODE_DENY, JSON.stringify(args));
+      assert.match(denied, /不执行规划端代码.*ops-ptc.*切回 standard.*直接调用 codex_run.*不要换别的代码或工具入口重试/);
+    }
+    // 其他 run_code 调用的拒绝文案不变，也仍然不放行
+    for (const args of [{}, { code: 'print(1)' }, { code: 'subagent_codex()' }, { code: 'my_codex_run()' }]) {
+      const denied = decide(call('run_code', args), cfg);
+      assert.notEqual(denied, RUN_CODE_DENY, JSON.stringify(args));
+      assert.equal(denied, plannerReads === 'products' ? shortDenial : denied);
+      assert.match(denied, plannerReads === 'products' ? /已拒绝/ : /run_code 会直接改动文件或执行任意代码，已拒绝/);
+    }
+  }
+});
+
+test('awk regex literals and strings may contain | while pipes stay refused', () => {
+  allowed(["awk '/foo|bar/ {print $1}' f", "awk '$1 ~ /a|b/ {print}' f", "awk '!/a|b/' f", "awk '/a|b/ || /c|d/' f",
+    "awk 'BEGIN{n=0} /a|b/ {n++} END{print n}' f", "awk '{print $1 \"|\" $2}' f", "awk '{ if ($0 ~ /x|y/) print $2 }' f",
+    "awk '/a\\/b|c/ {print}' f",
+    // 只有 || 没有管道的程序原来就放行，带除法也不能因为新的扫描变成拒绝
+    "awk '$1 > 0 || $2 / 2 == 1' f", "awk '/a/ || $2/2 == 1 {print $1}' f"]);
+  refused(["awk '{print | \"sh\"}' f", "awk '{print $1 | \"sort\"}' f", "awk '/a|b/ {print | \"sh\"}' f",
+    "awk '{ \"date\" | getline d; print d }' f", "awk '{print |& \"sh\"}' f", "awk '{print \"a|b\" | \"sh\"}' f",
+    // print 后的 /"/ 是正则：不能把其中的引号当字符串开头，吞掉后面的管道
+    "awk '{ print /\"/ ; print | \"sh\" ; print /\"/ }' f", "awk '{ print /a/ | \"sh\" }' f",
+    // 除号不是正则的开头：两个 / 之间的管道不能被当成正则吞掉
+    "awk '{ print a / 2 | \"sh\"; y = b / 2 }' f", "awk '{ print (a) / 2 | \"sh\"; y = 1 / 2 }' f",
+    // gawk 允许 [ ] 里出现 /；拿不准正则在哪里结束时按有管道处理
+    "awk '/[/]a,/ { print | \"sh\" } /b/' f", "awk '/[a|b]/' f", "awk '/a|b' f", "awk '{print \"a|b}' f",
+    "awk '{ x = 1\n/ 2 | \"sh\" / 1 }' f"]);
+});
+
+test('pwsh test scripts with absolute or parent paths must stay inside the session directory', () => {
+  const inside = (c, cwd) => readOnlyCommand(c, [], undefined, cwd);
+  for (const c of ['pwsh -NoProfile -File tests/a.ps1', "pwsh -NoProfile -File 'D:\\x\\proj\\tests\\a.ps1'",
+    'pwsh -NoProfile -File /mnt/d/x/proj/sub/tests/a.ps1 -Configuration Release', 'pwsh -NoProfile -File sub/../tests/a.ps1']) {
+    assert.equal(inside(c, '/mnt/d/x/proj'), true, c);
+  }
+  assert.equal(readOnlyCommand('pwsh -NoProfile -File tests/a.ps1'), true);
+  for (const c of ['pwsh -NoProfile -File /tmp/evil/tests/a.ps1', "pwsh -NoProfile -File 'D:\\x\\other\\tests\\a.ps1'",
+    "pwsh -NoProfile -File 'D:\\x\\proj-old\\tests\\a.ps1'", 'pwsh -NoProfile -File ../other/tests/a.ps1',
+    'pwsh -NoProfile -File /mnt/d/x/proj/../other/tests/a.ps1', 'pwsh -NoProfile -File ~/tests/a.ps1',
+    "pwsh -NoProfile -File 'C:tests\\a.ps1'", "pwsh -NoProfile -File '\\\\server\\share\\tests\\a.ps1'"]) {
+    assert.equal(inside(c, '/mnt/d/x/proj'), false, c);
+  }
+  for (const c of ['pwsh -NoProfile -File /mnt/d/x/proj/tests/a.ps1', 'pwsh -NoProfile -File ../tests/a.ps1']) {
+    assert.equal(readOnlyCommand(c), false, c);
+  }
+  assert.equal(decide(call('wsl', { command: 'pwsh -NoProfile -File /repo/tests/a.ps1' }), config('open')), undefined);
+  assert.match(decide(call('wsl', { command: 'pwsh -NoProfile -File /other/tests/a.ps1' }), config('open')), /不放行的是「pwsh/);
 });

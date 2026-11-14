@@ -340,3 +340,22 @@ test('new report schema retains original fields and requires strict five-field b
   assert.deepEqual(item.properties.kind.enum, ['user_input', 'task_conflict', 'environment', 'implementation']);
   assert.ok(Object.values(item.properties).every((field) => field.type === 'string'));
 });
+
+// The runner (blocking_summary) and this module classify the same record; these cases keep the two from drifting apart.
+test('blockingState agrees with the runner on every shared case', () => {
+  const { reports, review_blockers: reviews, cases } = JSON.parse(readFileSync(new URL('./runner/fixtures/blocking_cases.json', import.meta.url), 'utf8'));
+  const differences = [];
+  for (const item of cases) {
+    const value = { status: item.status, context: { acceptance: Array(item.acceptance).fill('one') },
+      ...(item.error_kind ? { error_kind: item.error_kind } : {}),
+      ...(item.verification_status ? { verification_status: item.verification_status } : {}),
+      ...(item.report ? { structured: reports[item.report] } : {}),
+      ...(item.review_blockers ? { verification: { blockers: reviews[item.review_blockers] } } : {}) };
+    const actual = blockingState(value);
+    const got = { state: actual.state, next_action: actual.next_action,
+      blockers: actual.blockers.map((b) => b.id), questions: actual.questions.map((q) => q.id) };
+    try { assert.deepEqual(got, item.expected); }
+    catch { differences.push({ ...item, expected: undefined, want: item.expected, got }); }
+  }
+  assert.deepEqual(differences.slice(0, 5), [], `${differences.length} of ${cases.length} cases differ`);
+});

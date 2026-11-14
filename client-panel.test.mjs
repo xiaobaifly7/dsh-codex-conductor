@@ -962,9 +962,14 @@ test('session operations confirm before acting as the user, post the request bod
   assert.ok(text(host.tree).includes('请求已提交，稍后点“查看最近结果”确认处理情况。'));
   await change(host, '要续接的会话编号', 'session-a, session-b，session-c  session-d');
   await click(host, '续接被中断的会话');
+  assert.equal(posts().length, 1, 'resuming also waits for the confirmation');
+  assert.ok(text(host.tree).includes('这会以用户身份让这些会话接着做'));
+  await click(host, '先不续接');
+  assert.equal(posts().length, 1);
+  await click(host, '续接被中断的会话'); await click(host, '确认续接');
   assert.deepEqual(posts().at(-1), { path: '/session/resume', body: { sessions: ['session-a', 'session-b', 'session-c', 'session-d'] } });
   await change(host, '续接时发送的话', '接着上次的做');
-  await click(host, '续接被中断的会话');
+  await click(host, '续接被中断的会话'); await click(host, '确认续接');
   assert.deepEqual(posts().at(-1).body, { sessions: ['session-a', 'session-b', 'session-c', 'session-d'], message: '接着上次的做' });
   await change(host, '要改 Goal 的会话编号', 'session-a');
   assert.equal(button(host, '修改会话 Goal').props.disabled, true, 'a Goal change needs an objective or a round budget');
@@ -1018,4 +1023,148 @@ test('a hidden page skips its reads but keeps the timer; the next visible round 
   selftest.mount(selftest.exports.Panel, { selftest: { finish() {}, read: async (path) => { reads.push(path); return service.handle(path); } } });
   await selftest.flush();
   assert.equal(reads.length, 5, 'the offscreen selftest reads once even when the window is hidden');
+});
+
+test('task rows describe the recorded diff, a rollback and the runner activity text; the report can show the diff', async (t) => {
+  const service = panelService();
+  const done = { status: 'completed', execution_status: 'completed', started_at: 0 };
+  const jobs = [{ ...done, job_id: 'J1', title: '有改动', diff_status: 'captured', diff_files: 4 },
+    { ...done, job_id: 'J2', title: '已回滚', diff_status: 'captured', diff_files: 2, rolled_back_at: 1800000000 },
+    { ...done, job_id: 'J3', title: '没改动', diff_status: 'empty' }, { ...done, job_id: 'J4', title: '没记录', diff_status: 'skipped' },
+    { ...done, job_id: 'J5', title: '不是仓库', diff_status: 'not_git' }, { ...done, job_id: 'J6', title: '太大', diff_status: 'too_large' },
+    { ...done, job_id: 'J7', title: '旧任务' },
+    { job_id: 'J8', title: '在跑有文字', status: 'running', execution_status: 'running', started_at: 0, updated_at: 60, last_activity: '正在运行 npm test' },
+    { job_id: 'J9', title: '在跑没文字', status: 'running', execution_status: 'running', started_at: 0, updated_at: 60, diff_status: 'captured' }];
+  const host = clientHost((path, body) => path.startsWith('/jobs') ? { total: jobs.length, jobs } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const item = (title) => nodes(host.tree).find((node) => node.type === 'li' && text(node).includes(title));
+  const hasRollback = (title) => nodes(item(title)).some((node) => node.type === 'button' && text(node) === '回滚这单的改动');
+  for (const [title, value] of [['有改动', '改动 diff 4 个文件'], ['已回滚', '已回滚 '], ['没改动', '没有文件改动'], ['没记录', '这一单没有记录改动 diff'],
+    ['不是仓库', '任务目录不是 git 仓库，没有记录改动 diff'], ['太大', '改动太大，没有记录 diff'], ['在跑有文字', '最近活动 正在运行 npm test']]) {
+    assert.ok(text(item(title)).includes(value), `${title}: ${value}`);
+  }
+  assert.ok(text(item('已回滚')).includes(new Date(1800000000000).toLocaleString('zh-CN')));
+  assert.ok(!/diff|回滚/.test(text(item('旧任务'))));
+  assert.match(text(item('在跑没文字')), /最近活动 \d/, 'falls back to the last update time');
+  assert.deepEqual(['有改动', '已回滚', '没改动', '没记录', '不是仓库', '太大', '旧任务', '在跑有文字', '在跑没文字'].filter(hasRollback), ['有改动'],
+    'only a finished task with a recorded diff that was not rolled back can be rolled back');
+
+  const requests = [];
+  const report = clientHost((path) => { requests.push(path); return { text: 'diff --git a/x b/x', next_offset: null, eof: true }; });
+  t.after(() => report.dispose());
+  report.mount(report.exports.Report, { jobId: 'J1' }); await report.flush();
+  await click(report, '改动 diff');
+  assert.equal(requests.at(-1), '/output?job_id=J1&offset=0&limit=8000&artifact=diff');
+  assert.ok(nodes(report.tree).some((node) => node.type === 'pre' && text(node) === 'diff --git a/x b/x'));
+});
+
+test('rollback checks first, then asks again before undoing the task, and shows a refusal as returned', async (t) => {
+  const service = panelService();
+  const job = { job_id: 'J1', title: '有改动', status: 'completed', execution_status: 'completed', started_at: 0, diff_status: 'captured', diff_files: 4 };
+  let refuse = null;
+  const host = clientHost((path, body) => path.startsWith('/jobs') ? { total: 1, jobs: [{ ...job }] }
+    : path === '/rollback' ? refuse ? { error: refuse } : { job_id: 'J1', rolled_back: !body.check, checked: true, files: 4 } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const posts = () => host.requests.filter((request) => request.body);
+  const has = (label) => nodes(host.tree).some((node) => node.type === 'button' && text(node) === label);
+  await click(host, '回滚这单的改动');
+  assert.equal(posts().length, 0);
+  assert.ok(text(host.tree).includes('只撤销这一单在任务目录里的文件改动，不动提交记录'));
+  assert.equal(has('确认回滚'), false, 'the real rollback is offered only after a passed check');
+  await click(host, '先不回滚');
+  assert.equal(has('检查能否回滚'), false);
+  await click(host, '回滚这单的改动');
+  refuse = '这些文件在任务之后又被改过，不能自动回滚，没有改动任何文件。请查看改动记录后手动处理。';
+  await click(host, '检查能否回滚');
+  assert.deepEqual(posts(), [{ path: '/rollback', body: { job_id: 'J1', confirm: true, check: true } }]);
+  assert.ok(text(host.tree).includes(refuse));
+  assert.equal(has('确认回滚'), false);
+  refuse = null;
+  await click(host, '检查能否回滚');
+  assert.ok(text(host.tree).includes('检查通过，可以回滚 4 个文件。确定现在回滚吗？'));
+  assert.equal(posts().length, 2);
+  await click(host, '确认回滚');
+  assert.deepEqual(posts().at(-1), { path: '/rollback', body: { job_id: 'J1', confirm: true } });
+  assert.ok(text(host.tree).includes('已回滚这一单的改动，正在刷新列表。'));
+  assert.equal(has('确认回滚'), false);
+
+  const selftest = clientHost(); t.after(() => selftest.dispose());
+  selftest.mount(selftest.exports.Panel, { selftest: { finish() {},
+    read: async (path) => path.startsWith('/jobs') ? { total: 1, jobs: [{ ...job }] } : service.handle(path) } });
+  await selftest.flush();
+  const rollback = nodes(selftest.tree).find((node) => node.type === 'button' && text(node) === '回滚这单的改动');
+  await rollback.props.onClick(); await selftest.flush();
+  await nodes(selftest.tree).find((node) => node.type === 'button' && text(node) === '检查能否回滚').props.onClick(); await selftest.flush();
+  assert.equal(selftest.requests.length, 0, 'the selftest never posts a rollback');
+});
+
+test('tool policy, allowlist, readable paths, session limits and diff recording save through the settings patch', async (t) => {
+  const service = panelService();
+  Object.assign(service.cfg, { toolPolicy: 'denylist', allowTools: ['codex_run'], plannerReadAllow: ['E:\\project\\RULES.md'], plannerReadAllowCount: 1,
+    maxSessionJobs: null, maxSessionTokens: 2000000, jobDiff: false, seenTools: ['mcp__notes__search', 'web_fetch'] });
+  service.status.settings = structuredClone(service.cfg);
+  const host = clientHost(service.handle); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  assert.ok(text(host.tree).includes('额外允许读取的路径： 1 条'), 'the status row with the count stays');
+  assert.equal(field(host, '白名单工具').props.value, 'codex_run');
+  assert.equal(field(host, '额外允许读取的路径').type, 'textarea');
+  assert.equal(field(host, '额外允许读取的路径').props.value, 'E:\\project\\RULES.md');
+  assert.deepEqual(nodes(field(host, '工具放行方式')).filter((node) => node.type === 'option').map((node) => [node.props.value, text(node)]),
+    [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]);
+  const warning = () => nodes(host.tree).some((node) => node.props?.className === 'dcc-warn' && text(node).includes('未列入白名单的工具在受护栏会话里会被拒绝'));
+  assert.equal(warning(), false);
+  await change(host, '工具放行方式', 'allowlist');
+  assert.equal(warning(), true);
+  const seen = (tool) => nodes(host.tree).find((node) => node.type === 'li' && nodes(node).some((child) => child.type === 'span' && text(child) === tool));
+  assert.ok(text(host.tree).includes('这些工具在受护栏会话里出现过，白名单模式下会被拒绝'));
+  await nodes(seen('web_fetch')).find((node) => node.type === 'button').props.onClick(); await host.flush();
+  assert.equal(field(host, '白名单工具').props.value, 'codex_run\nweb_fetch', 'adding only changes the draft');
+  assert.equal(host.requests.filter((request) => request.body).length, 0);
+  assert.equal(nodes(seen('web_fetch')).find((node) => node.type === 'button').props.disabled, true);
+  await change(host, '白名单工具', ' codex_run \n\nweb_fetch\r\n mcp__docs__* \n');
+  await change(host, '额外允许读取的路径', 'E:\\project\\RULES.md\n\n /mnt/e/project/review-inputs \n\\\\server\\share\\notes');
+  await change(host, '每个会话最多派几单', '20');
+  await change(host, '每个会话的用量上限（token）', '');
+  const diff = () => nodes(host.tree).find((node) => node.type === 'checkbox' && node.props.label === '记录每单的改动 diff');
+  assert.equal(diff().props.checked, false);
+  diff().props.onChange(true); await host.flush();
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(host.requests.find((request) => request.body), { path: '/settings', body: { toolPolicy: 'allowlist',
+    allowTools: ['codex_run', 'web_fetch', 'mcp__docs__*'],
+    plannerReadAllow: ['E:\\project\\RULES.md', '/mnt/e/project/review-inputs', '\\\\server\\share\\notes'],
+    maxSessionJobs: 20, maxSessionTokens: null, jobDiff: true } });
+  assert.equal(field(host, '白名单工具').props.value, 'codex_run\nweb_fetch\nmcp__docs__*', 'pending lists show one entry per line');
+
+  const { settingsPatch, pendingPatch } = host.exports, current = structuredClone(service.cfg);
+  assert.deepEqual(plain(settingsPatch(current, { allowTools: 'codex_run\n', plannerReadAllow: ' E:\\project\\RULES.md ', maxSessionJobs: '' })), {});
+  assert.deepEqual(plain(settingsPatch(current, { allowTools: '', plannerReadAllow: '' })), { allowTools: [], plannerReadAllow: [] });
+  assert.deepEqual(plain(settingsPatch(current, { plannerReadAllow: 'C:\\a,b\nD:\\c' })), { plannerReadAllow: ['C:\\a,b', 'D:\\c'] });
+  assert.deepEqual(plain(pendingPatch(current, { changes: { allowTools: ['a', 'b'], toolPolicy: 'allowlist' } }, { allowTools: 'a\nb\nc' })),
+    { allowTools: ['a', 'b', 'c'], toolPolicy: 'allowlist' });
+  for (const [edit, message] of [[{ allowTools: 'has space' }, /白名单工具/], [{ allowTools: 'a'.repeat(121) }, /白名单工具/],
+    [{ allowTools: Array.from({ length: 201 }, (_, n) => `t${n}`).join('\n') }, /白名单工具/], [{ plannerReadAllow: 'relative\\path' }, /路径/],
+    [{ plannerReadAllow: `C:\\${'a'.repeat(500)}` }, /路径/], [{ plannerReadAllow: Array.from({ length: 51 }, (_, n) => `C:\\p${n}`).join('\n') }, /路径/],
+    [{ toolPolicy: 'open' }, /工具放行方式/], [{ maxSessionJobs: '0' }, /最多派几单/], [{ maxSessionJobs: '1.5' }, /最多派几单/],
+    [{ maxSessionTokens: '-1' }, /用量上限/]]) assert.throws(() => settingsPatch(current, edit), message);
+
+  const selftest = clientHost(); t.after(() => selftest.dispose());
+  const reads = [];
+  selftest.mount(selftest.exports.Panel, { selftest: { finish() {}, read: async (path) => { reads.push(path); return service.handle(path); } } });
+  await selftest.flush();
+  assert.ok(text(selftest.tree).includes('白名单工具'), 'the new settings render in the selftest');
+  assert.deepEqual(reads.sort(), ['/attention', '/jobs?filter=all&offset=0', '/prompt', '/settings', '/status'], 'without any new read');
+  assert.equal(selftest.requests.length, 0);
+});
+
+test('a background Gemini record is labelled', async (t) => {
+  const service = panelService();
+  const entries = [{ id: 'G2', at: '2026-11-14T01:02:03Z', output: 'D:\\docs\\后台.md', status: 'completed', chars: 10, background: true },
+    { id: 'G1', at: '2026-11-14T00:00:00Z', output: 'D:\\docs\\前台.md', status: 'completed', chars: 10, background: false }];
+  const host = clientHost((path, body) => path === '/gemini' ? { entries } : service.handle(path, body)); t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const row = (name) => text(nodes(host.tree).find((node) => node.type === 'li' && text(node).includes(name)));
+  assert.ok(row('后台.md').includes(' · 后台'));
+  assert.ok(!row('前台.md').includes(' · 后台'));
 });

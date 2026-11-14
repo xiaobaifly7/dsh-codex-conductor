@@ -17,6 +17,7 @@ const routes = [
   ['GET', '/prompt/backups'], ['GET', '/prompt/backup?name=planner.md.bak'], ['GET', '/doctor'], ['GET', '/gemini'],
   ['POST', '/session/send', { sessionId: 'session-a', message: 'hello' }], ['POST', '/session/resume', { sessions: ['session-a'] }],
   ['POST', '/session/goal', { sessionId: 'session-a', maxGoalRounds: 3 }], ['GET', '/session/results'],
+  ['POST', '/rollback', { job_id: 'job-1', confirm: true }],
 ];
 
 // Model Cordis injection ownership: only changed dependencies restart a child callback.
@@ -68,6 +69,7 @@ function fixture(t, options = {}) {
     output: t.mock.fn(async () => ({ text: '报告🙂', next_offset: 4, eof: true })),
     cancel: t.mock.fn(async (job_id) => ({ job_id, status: 'cancelled' })),
     doctor: t.mock.fn(async () => ({ status: 'completed', ok: true, checks: [{ name: 'python', ok: true, detail: '3.12' }] })),
+    rollback: t.mock.fn(async (job_id, { check }) => ({ status: 'completed', job_id, rolled_back: !check, checked: true, files: 3 })),
   };
   const connection = { requestRejection: t.mock.fn(() => undefined) };
   const web = { register: t.mock.fn((route) => { handler = route.handler; return unregister; }) };
@@ -91,7 +93,7 @@ function fixture(t, options = {}) {
     assert.equal(headers['Cache-Control'], 'no-store');
     return { status: res.statusCode, body: res.body };
   }
-  const calls = () => { assert.equal(conductor.doctor.mock.callCount(), 0); return [runtime.execute, conductor.list, conductor.output, conductor.cancel]
+  const calls = () => { assert.equal(conductor.doctor.mock.callCount() + conductor.rollback.mock.callCount(), 0); return [runtime.execute, conductor.list, conductor.output, conductor.cancel]
     .map((fn) => fn.mock.callCount()); };
   return { root, plannerFile, cfg, state, jobs, runtime, conductor, connection, web, ctx, services,
     unregister, registration, request, calls, api: createPanelApi(apiOptions) };
@@ -234,8 +236,14 @@ test('panel settings expose editable fields and read scope counts while redactin
   const expected = { model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' },
     timeoutSeconds: null, idleTimeoutSeconds: null, retries: null, maxRunningJobs: null, autoResume: { enabled: true },
-    roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [] };
+    roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [],
+    toolPolicy: 'denylist', allowTools: [], plannerReadAllow: [], maxSessionJobs: null, maxSessionTokens: null, jobDiff: false, seenTools: [] };
   assert.deepEqual(panelSettings(cfg), expected);
+  const tools = { toolPolicy: 'allowlist', allowTools: ['codex_run', 'mcp__docs__*'], maxSessionJobs: 20, maxSessionTokens: 5000000,
+    jobDiff: true, seenTools: new Set(['zeta_tool', 'alpha_tool']) };
+  const shown = panelSettings({ ...cfg, ...tools });
+  assert.deepEqual(shown, { ...expected, ...tools, seenTools: ['alpha_tool', 'zeta_tool'] });
+  assert.notEqual(shown.allowTools, tools.allowTools, 'arrays are copied, not shared with the live configuration');
   assert.deepEqual(panelSettings({ ...cfg, timeoutSeconds: 900, idleTimeoutSeconds: 60, retries: 0, maxRunningJobs: 2,
     autoResume: { enabled: false, message: 'private-message', exclude: ['private-session'] }, roots: ['*'], allowHostAccess: true,
     defaultHostAccess: true, unknownConfig: ['timoutSeconds'] }),
@@ -244,17 +252,17 @@ test('panel settings expose editable fields and read scope counts while redactin
   assert.deepEqual(cfg.gemini, { ...expected.gemini, command: 'secret' });
   assert.equal(panelSettings({ ...cfg, gemini: undefined }).gemini, null);
   assert.deepEqual(panelSettings({ ...cfg, plannerReads: 'products', plannerReadAllow: ['C:\\private', '/mnt/e/allowed'] }),
-    { ...expected, plannerReads: 'products', plannerReadAllowCount: 2 });
+    { ...expected, plannerReads: 'products', plannerReadAllowCount: 2, plannerReadAllow: ['C:\\private', '/mnt/e/allowed'] });
 });
 
-test('panel read scope switch uses existing save and confirmed apply routes without allowing whitelist edits', async (t) => {
+test('panel read scope switch uses existing save and confirmed apply routes and reports the extra readable paths', async (t) => {
   const f = fixture(t);
   f.cfg.plannerReads = 'products';
   f.cfg.plannerReadAllow = ['C:\\private'];
   const status = await f.request('GET', '/status');
   assert.equal(status.body.settings.plannerReads, 'products');
   assert.equal(status.body.settings.plannerReadAllowCount, 1);
-  assert.equal(Object.hasOwn(status.body.settings, 'plannerReadAllow'), false);
+  assert.deepEqual(status.body.settings.plannerReadAllow, ['C:\\private']);
   for (const plannerReads of ['open', 'products']) {
     assert.equal((await f.request('POST', '/settings', { plannerReads })).status, 200);
     assert.deepEqual(f.runtime.execute.mock.calls.at(-1).arguments,
@@ -264,7 +272,7 @@ test('panel read scope switch uses existing save and confirmed apply routes with
       [{ action: 'reload', when: 'now' }, { panel: true }, { plannerReads }]);
   }
   const calls = f.runtime.execute.mock.callCount();
-  for (const changes of [{ plannerReads: true }, { plannerReads: 'all' }, { plannerReadAllow: [] }, { plannerReadAllowCount: 0 }]) {
+  for (const changes of [{ plannerReads: true }, { plannerReads: 'all' }, { plannerReadAllowCount: 0 }, { seenTools: [] }]) {
     assert.equal((await f.request('POST', '/settings', changes)).status, 400);
   }
   assert.equal((await f.request('POST', '/settings/apply', { changes: { plannerReads: 'open' } })).status, 400);
@@ -971,7 +979,7 @@ test('panel jobs pass through only the fields the runner returned and search by 
 
 test('panel output serves the other artifacts as raw pages and rejects unknown ones', async (t) => {
   const f = fixture(t);
-  for (const artifact of ['context', 'review', 'stderr', 'result']) {
+  for (const artifact of ['context', 'review', 'stderr', 'result', 'diff']) {
     assert.deepEqual(await f.request('GET', `/output?job_id=job-1&artifact=${artifact}&offset=3&limit=10`),
       { status: 200, body: { text: '报告🙂', next_offset: 4, eof: true } });
     assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments.slice(0, 2), ['job-1', { artifact, offset: 3, limit: 10 }]);
@@ -1056,4 +1064,64 @@ test('panel session operations publish the existing local request files atomical
   rejected(await none.request('POST', '/session/send', { sessionId: 'a', message: 'm' }), 409);
   assert.deepEqual((await none.request('GET', '/session/results')).body, { send: null, resume: null, goal: null, autoresume: null });
   assert.equal(existsSync(path.join(none.root, 'send-request.json')), false);
+});
+
+test('panel jobs pass through diff, rollback and activity fields only when the runner returned them', async (t) => {
+  const f = fixture(t);
+  const base = { started_at: 1, status: 'completed', execution_status: 'completed', context: null };
+  f.conductor.list.mock.mockImplementation(async () => ({ total: 3, next_offset: null, jobs: [
+    { ...base, job_id: 'J1', diff_status: 'captured', diff_files: 4, rolled_back_at: 1800000000, diff_path: 'private-path' },
+    { ...base, job_id: 'J2', status: 'running', execution_status: 'running', last_activity: '正在运行测试', diff_status: null },
+    { ...base, job_id: 'J3' }] }));
+  const row = { started_at: 1, status: 'completed', execution_status: 'completed', title: '', needs_attention: false };
+  assert.deepEqual((await f.request('GET', '/jobs')).body.jobs, [
+    { ...row, job_id: 'J1', diff_status: 'captured', diff_files: 4, rolled_back_at: 1800000000 },
+    { ...row, job_id: 'J2', status: 'running', execution_status: 'running', last_activity: '正在运行测试' },
+    { ...row, job_id: 'J3' }]);
+});
+
+test('panel rollback needs a literal confirmation, passes the check flag and maps runner refusals to readable 409/502', async (t) => {
+  const f = fixture(t);
+  assert.deepEqual(await f.request('POST', '/rollback', { job_id: 'job-1', confirm: true, check: true }),
+    { status: 200, body: { job_id: 'job-1', rolled_back: false, checked: true, files: 3 } });
+  assert.deepEqual(f.conductor.rollback.mock.calls.at(-1).arguments, ['job-1', { check: true }]);
+  for (const body of [{ job_id: 'job-1', confirm: true }, { job_id: 'job-1', confirm: true, check: false }]) {
+    assert.deepEqual(await f.request('POST', '/rollback', body), { status: 200, body: { job_id: 'job-1', rolled_back: true, checked: true, files: 3 } });
+    assert.deepEqual(f.conductor.rollback.mock.calls.at(-1).arguments, ['job-1', { check: false }]);
+  }
+  const calls = f.conductor.rollback.mock.callCount();
+  for (const confirm of [undefined, false, 'true', 1, null]) rejected(await f.request('POST', '/rollback', { job_id: 'job-1', confirm }), 400, /确认/);
+  for (const body of [{ confirm: true }, { job_id: '../job', confirm: true }, { job_id: 'job-1', confirm: true, check: 'true' },
+    { job_id: 'job-1', confirm: true, check: 1 }, { job_id: 'job-1', confirm: true, force: true }, null, []]) {
+    rejected(await f.request('POST', '/rollback', body), 400);
+  }
+  rejected(await f.request('GET', '/rollback'), 405);
+  assert.equal(f.conductor.rollback.mock.callCount(), calls, 'rejected requests never reach the runner');
+  for (const [error_kind, status, message] of [['rollback_conflict', 409, /在任务之后又被改过，不能自动回滚，没有改动任何文件/],
+    ['lock_busy', 409, /其他任务在写/], ['still_running', 409, /还在运行/], ['no_diff', 409, /没有记录可回滚的改动/],
+    ['already_rolled_back', 409, /已经回滚过/], ['bridge_error', 502, /暂时无法确认回滚结果/], ['unexpected_kind', 502, /暂时无法确认回滚结果/]]) {
+    f.conductor.rollback.mock.mockImplementation(async () => ({ status: 'failed', error_kind, error: 'private runner text C:\\secret' }));
+    const response = await f.request('POST', '/rollback', { job_id: 'job-1', confirm: true });
+    rejected(response, status, message);
+    assert.doesNotMatch(response.body.error, /[A-Za-z]/, 'the client shows these messages verbatim only without Latin letters');
+  }
+  for (const result of [undefined, {}, { status: 'running' }, { status: 'completed', error_kind: 'bridge_error' }]) {
+    f.conductor.rollback.mock.mockImplementation(async () => result);
+    rejected(await f.request('POST', '/rollback', { job_id: 'job-1', confirm: true }), 502);
+  }
+  f.conductor.rollback.mock.resetCalls();
+});
+
+test('panel gemini history keeps the record id and background flag when a record has them', async (t) => {
+  const f = fixture(t);
+  const file = path.join(f.root, 'gemini-history.jsonl');
+  const g = fixture(t, { api: { geminiHistoryFile: file } });
+  writeFileSync(file, [{ at: 'a', output: 'old.md' }, { at: 'b', output: 'new.md', id: 'G2', background: true },
+    { at: 'c', output: 'front.md', id: 'G3', background: false, secret: 'private' }].map((entry) => JSON.stringify(entry)).join('\n'));
+  const entries = (await g.request('GET', '/gemini')).body.entries;
+  assert.deepEqual(entries.map(({ output, id, background }) => ({ output, id, background })), [
+    { output: 'front.md', id: 'G3', background: false }, { output: 'new.md', id: 'G2', background: true },
+    { output: 'old.md', id: undefined, background: undefined }]);
+  assert.equal(Object.hasOwn(entries[2], 'background'), false);
+  assert.equal(Object.hasOwn(entries[0], 'secret'), false);
 });
