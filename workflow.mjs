@@ -40,13 +40,14 @@ export function blockingState(value) {
   let blockers = valid ? report.blockers ?? [] : [];
   const reviewBlockers = object(verification) && Object.hasOwn(verification, 'blockers');
   if (['verified', 'accepted_deviations', 'needs_changes'].includes(status)) blockers = [];
-  if (reviewBlockers && validBlockers(verification.blockers)) blockers = verification.blockers;
+  // Kept identical to the runner's blocking_summary; runner/fixtures/blocking_cases.json checks both.
+  if (reviewBlockers && validBlockers(verification.blockers) && !['verified', 'accepted_deviations'].includes(status)) blockers = verification.blockers;
   const active = activeBlockers(blockers, status);
   const result = (state, next_action) => ({ state, blockers,
     questions: active.filter(questionKind).map(({ id, question }) => ({ id, question })), next_action });
   if (executionOf(value) === 'running') return result('running', 'wait');
   if (!['completed', 'failed', 'cancelled'].includes(executionOf(value)) ||
-      status === 'invalid' || (reviewBlockers && !validBlockers(verification.blockers))) {
+      ['unknown', 'invalid'].includes(status) || (reviewBlockers && !validBlockers(verification.blockers))) {
     return result('unclassified', 'inspect_report');
   }
   if (['verified', 'accepted_deviations'].includes(status)) return result('clear', 'done');

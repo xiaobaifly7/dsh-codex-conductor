@@ -163,4 +163,84 @@ test('the panel can clear limits and switch auto resume in the profile', t => {
     '    config:\n      autoResume:\n        maxAgeHours: 6\n        enabled: false\n');
   assert.equal(save('', { autoResume: { enabled: false } }), '    config:\n      autoResume:\n        enabled: false\n');
   assert.throws(() => save('    config:\n      autoResume: { enabled: true }\n', { autoResume: { enabled: false } }), /分行 YAML/);
+
+  // Lists are rewritten whole, in block style, whatever shape they had.
+  const paths = ['E:\\project\\RULES.md', "/mnt/e/it's here"];
+  const block = "      plannerReadAllow:\n        - 'E:\\project\\RULES.md'\n        - '/mnt/e/it''s here'\n";
+  assert.equal(save('    config:\n      model: m\n', { plannerReadAllow: paths }), `    config:\n${block}      model: m\n`);
+  assert.equal(save("    config:\n      plannerReadAllow:\n        - 'D:\\old'   # stale\n        - /old/two\n      model: m\n", { plannerReadAllow: paths }),
+    `    config:\n${block}      model: m\n`);
+  assert.equal(save("    config:\n      plannerReadAllow:\n      - 'D:\\old'\n      model: m\n", { plannerReadAllow: paths }), `    config:\n${block}      model: m\n`);
+  assert.equal(save('    config:\n      plannerReadAllow: []\n      model: m\n', { plannerReadAllow: paths }), `    config:\n${block}      model: m\n`);
+  assert.equal(save(`    config:\n${block}      model: m\n`, { plannerReadAllow: [] }), '    config:\n      plannerReadAllow: []\n      model: m\n');
+  assert.equal(save('    config:\n      model: m\n', { toolPolicy: 'allowlist', allowTools: ['todo_read', 'mcp__docs__*'], jobDiff: false, maxSessionJobs: 40 }),
+    "    config:\n      toolPolicy: allowlist\n      allowTools:\n        - 'todo_read'\n        - 'mcp__docs__*'\n      jobDiff: false\n      maxSessionJobs: 40\n      model: m\n");
+  assert.throws(() => save('    config:\n      plannerReadAllow: [a,\n        b]\n', { plannerReadAllow: paths }), /YAML 写法/);
+  for (const bad of [{ plannerReadAllow: ['relative/path'] }, { plannerReadAllow: ['D:\\a\nb'] }, { allowTools: ['has space'] },
+    { allowTools: 'todo_read' }, { toolPolicy: 'open' }, { jobDiff: 'no' }, { maxSessionJobs: 0 }, { maxSessionTokens: 1.5 }]) {
+    assert.throws(() => validatePanelSettings(bad), /无效/, JSON.stringify(bad));
+  }
+});
+
+test('per-session job and token limits stop a dispatch before Codex starts', async () => {
+  const args = { task: 'Inspect the repository layout.', acceptance: ['Layout is reported'], write: false };
+  const run = (usage) => (argv) => argv[0] === 'list' ? { jobs: [], total: argv.includes('--owner') ? 3 : 0 }
+    : argv[0] === 'summary' ? { groups: [], total: 0, usage_total: usage } : { job_id: 'J1', status: 'completed', cwd: '/repo' };
+  const jobs = load({ maxSessionJobs: 3 }, run());
+  await assert.rejects(jobs.tools.codex_run.execute(args, exec()), /本会话已派 3 单.*maxSessionJobs=3.*未启动 Codex/);
+  assert.equal((await load({ maxSessionJobs: 4 }, run()).tools.codex_run.execute(args, exec())).job_id, 'J1');
+  const tokens = load({ maxSessionTokens: 1000 }, run({ input_tokens: 600, output_tokens: 500 }));
+  await assert.rejects(tokens.tools.codex_run.execute(args, exec()), /约 1100 token.*maxSessionTokens=1000/);
+  assert.ok(!tokens.calls.some(argv => argv[0] === 'start'));
+  for (const usage of [{ total_tokens: 900, input_tokens: 5000 }, undefined]) {
+    assert.equal((await load({ maxSessionTokens: 1000 }, run(usage)).tools.codex_run.execute(args, exec())).job_id, 'J1');
+  }
+});
+
+test('the runner bridge carries rollback, the diff artifact and the diff switch', async () => {
+  const off = load({ jobDiff: false }, argv => argv[0] === 'list' ? { jobs: [], total: 0 } : { job_id: 'J1', status: 'completed', cwd: '/repo' });
+  await off.tools.codex_run.execute({ task: 'Fix the parser in place.', acceptance: ['Parser test passes'], write: true }, exec());
+  assert.ok(off.calls.find(argv => argv[0] === 'start').includes('--no-diff'));
+  const on = load({}, argv => argv[0] === 'list' ? { jobs: [], total: 0 } : { job_id: 'J1', status: 'completed', cwd: '/repo', text: 'diff --git', eof: true });
+  await on.tools.codex_run.execute({ task: 'Fix the parser in place.', acceptance: ['Parser test passes'], write: true }, exec());
+  assert.ok(!on.calls.find(argv => argv[0] === 'start').includes('--no-diff'));
+  await on.tools.codex_output.execute({ job_id: 'J1', artifact: 'diff' }, exec());
+  assert.deepEqual(on.calls.at(-1).slice(0, 4), ['output', 'J1', '--artifact', 'diff']);
+});
+
+test('gemini_write can run as a background job and still leaves its receipt and history', async t => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-background-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  writeFileSync(path.join(root, 'notes.md'), '素材');
+  const started = [];
+  const jobs = { list: () => [], start(spec) { started.push({ spec, ...spec.run({ append() {}, updateProgress() {} }) }); return 'BG7'; } };
+  const tools = {};
+  apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {}, get: name => name === 'jobs' ? jobs : undefined },
+    { gemini: { command: 'C:\\agy\\agy.exe' } }, async () => ({ jobs: [], total: 0 }), () => { throw new Error('spawn unavailable'); });
+  const call = { prompt: '根据素材写第一章入门说明。', sources: ['notes.md'], output: 'chapter.md' };
+  const value = await tools.gemini_write.execute({ ...call, background: true }, exec('S1', root));
+  assert.deepEqual([value.status, value.background_job_id], ['running', 'BG7']);
+  assert.match(started[0].spec.label, new RegExp(`^Gemini ${value.write_id} · chapter\\.md$`));
+  const settled = await started[0].done;
+  assert.equal(settled.status, 'failed');
+  assert.match(settled.result, /spawn unavailable/);
+  const last = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'gemini-history.jsonl'), 'utf8').trim().split('\n').at(-1));
+  assert.deepEqual([last.id, last.background, last.status], [value.write_id, true, 'failed']);
+  // Without the flag, and without a jobs service, the call stays in the foreground.
+  assert.equal((await tools.gemini_write.execute(call, exec('S1', root))).status, 'failed');
+  assert.equal(started.length, 1);
+});
+
+test('allowlist mode refuses unlisted tools only when it is switched on', () => {
+  const guard = config => {
+    let installed;
+    apply({ tools: { register() {}, guard: value => { installed = value; } }, on() {} }, { workspaces: ['/repo'], ...config }, async () => ({ jobs: [], total: 0 }));
+    return name => installed({ name, arguments: {}, agent: exec().agent });
+  };
+  const open = guard({});
+  for (const name of ['mystery_tool', 'mcp__magpie-memory__memory_save', 'codex_status']) assert.equal(open(name), undefined, name);
+  const strict = guard({ toolPolicy: 'allowlist', allowTools: ['mystery_*'] });
+  assert.match(strict('other_tool'), /白名单模式下未放行.*allowTools/);
+  for (const name of ['mystery_tool', 'codex_status']) assert.equal(strict(name), undefined, name);
+  assert.match(strict('write'), /已拒绝/);
 });

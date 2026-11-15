@@ -230,10 +230,13 @@ test('read-only commands pass', () => {
       '  else\n    printf \'%-60s ABSENT\\n\' "$f"\n  fi\ndone\nls -la /home/x/jobs/1/ 2>&1 | head -20\nexit 0',
     'while read -r l; do echo "$l"; done < list.txt',
     // 项目验证脚本、timeout 前缀、语法检查
-    "timeout 180 /mnt/c/tools/pwsh.exe -NoProfile -File 'D:\\x\\proj\\tests\\Verify-Build.ps1' 2>&1 | tail -20",
     '/mnt/c/tools/pwsh.exe -NoProfile -ExecutionPolicy Bypass -File tests/Run-AllVerifications.ps1 -Verbose',
     'timeout 30 git status', 'timeout -k 5 60s pytest -q', 'bash -n build.sh', 'sh -n a.sh b.sh',
   ]) assert.equal(readOnlyCommand(c), true, c);
+  // 绝对路径的验证脚本必须落在会话工作目录内（第四个参数）；不知道会话目录时不放行
+  const absolute = "timeout 180 /mnt/c/tools/pwsh.exe -NoProfile -File 'D:\\x\\proj\\tests\\Verify-Build.ps1' 2>&1 | tail -20";
+  assert.equal(readOnlyCommand(absolute, [], undefined, '/mnt/d/x/proj'), true);
+  assert.equal(readOnlyCommand(absolute), false);
 });
 
 test('bare no-op and continue keep the read-only boundary', () => {

@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, createProductReads, PRODUCT_DENY_HINT } =
+const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
@@ -62,6 +62,14 @@ const DEFAULTS = {
   maxStorageMb: null,
   // 同时运行（含排队等写锁）的 Codex 任务数上限；留空不限制
   maxRunningJobs: null,
+  // 每个会话累计可派的任务数、累计用量（token）上限；留空不限制
+  maxSessionJobs: null,
+  maxSessionTokens: null,
+  // 可写任务在 git 仓库里记录本单改动的 diff（可回滚）；false 关闭
+  jobDiff: true,
+  // 受护栏会话的工具放行方式：denylist 只拒绝已知的写入/执行工具；allowlist 只放行已知只读工具和 allowTools
+  toolPolicy: 'denylist',
+  allowTools: [],
   workspaces: [],
   denyTools: [],
   allowCommands: [],
@@ -299,6 +307,7 @@ export function createConductor(cfg, run = runRunner) {
       ['lockTimeoutSeconds', '--lock-timeout'], ['maxStorageMb', '--max-storage-mb']]) {
       if (cfg[key] != null) argv.push(flag, String(cfg[key]));
     }
+    if (cfg.jobDiff === false) argv.push('--no-diff');
     // host_access 不管 write 都在沙箱外运行，write=false 的只读只靠提示约束
     if (hostAccess === true) argv.push('--sandbox', 'danger-full-access');
     else if (args.write === true) argv.push('--sandbox', 'workspace-write');
@@ -355,7 +364,9 @@ export function createConductor(cfg, run = runRunner) {
 
   const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
   const doctor = (signal) => run(cfg, ['doctor'], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
-  return { start, waitJob, cancel, list, output, review, summary, products, doctor };
+  const rollback = (jobId, { check = false } = {}, signal) =>
+    run(cfg, ['rollback', jobId, ...(check ? ['--check'] : [])], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '' } = {}) {
@@ -790,12 +801,15 @@ function settings(config, logger) {
   if (unknownConfig.length) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.join(', ')} 已忽略，请核对拼写`);
   config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
     const value = config[key];
-    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb', 'maxRunningJobs'].includes(key);
+    const counts = ['maxRunningJobs', 'maxSessionJobs', 'maxSessionTokens'];
+    const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb', ...counts].includes(key);
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0
-        : key === 'maxRunningJobs' ? Number.isInteger(value) && value > 0 : value > 0))
+        : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
+      : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
+      : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
       : key === 'autoResume' ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
@@ -861,6 +875,8 @@ function settings(config, logger) {
     denyTools: new Set(Array.isArray(config.denyTools) ? config.denyTools : []),
     allowCommands: patterns('allowCommands'),
     ignoreChanges: Array.isArray(config.ignoreChanges) ? config.ignoreChanges.map(String) : [],
+    allowTools: config.allowTools.map(name => name.trim()),
+    seenTools: new Set(),
     unknownConfig,
   };
 }
@@ -949,6 +965,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try {
       const lines = existsSync(geminiHistoryFile) ? readFileSync(geminiHistoryFile, 'utf8').split('\n').filter(Boolean) : [];
       lines.push(JSON.stringify({ at: new Date().toISOString(), session: session ?? null, output: value.output ?? null, status: value.status,
+        ...(value.background ? { id: value.id, background: true } : {}),
         chars: value.chars ?? value.before_rollback?.chars ?? null, attempts: value.attempts ?? null,
         error: typeof value.error === 'string' ? value.error.slice(0, 300) : null,
         draft_path: value.draft_path ?? null, duration_s: value.duration_s ?? null }));
@@ -1203,6 +1220,27 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             }
           }
           offset = history.next_offset ?? null;
+        }
+      }
+      if (cfg.maxSessionJobs != null && owner) {
+        const mine = await conductor.list({ owner, limit: 1 }, exec?.signal);
+        exec?.signal?.throwIfAborted();
+        if (!Number.isSafeInteger(mine.total)) throw preflightUnavailable('无法核对本会话已派的任务数', mine);
+        if (mine.total >= cfg.maxSessionJobs) {
+          throw reject(`${tool}: 本会话已派 ${mine.total} 单，达到 maxSessionJobs=${cfg.maxSessionJobs} 的上限，未启动 Codex。` +
+            '先向用户说明进度和还差什么，由用户决定是否调高上限；不要改为自己动手。');
+        }
+      }
+      if (cfg.maxSessionTokens != null && owner) {
+        const spent = await conductor.summary({ owner, limit: 1 }, exec?.signal);
+        exec?.signal?.throwIfAborted();
+        if (!Array.isArray(spent.groups)) throw preflightUnavailable('无法核对本会话已用的用量', spent);
+        // 用量口径取 runner 汇总的 total_tokens，没有时用输入加输出；用量未知的任务不计入。
+        const usage = spent.usage_total ?? {};
+        const used = Number.isFinite(usage.total_tokens) ? usage.total_tokens : (usage.input_tokens ?? 0) + (usage.output_tokens ?? 0);
+        if (used >= cfg.maxSessionTokens) {
+          throw reject(`${tool}: 本会话的 Codex 用量约 ${used} token，达到 maxSessionTokens=${cfg.maxSessionTokens} 的上限，未启动 Codex。` +
+            '先向用户说明进度和还差什么，由用户决定是否调高上限；不要改为自己动手。');
         }
       }
       if (cfg.maxRunningJobs != null) {
@@ -1540,7 +1578,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: 'runner job_id；可用 codex_jobs 找回，不是 Harness 的 background_job_id。' },
-        artifact: { type: 'string', enum: ['report', 'result', 'context', 'review', 'stderr', 'events'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准；review 独立核验历史；stderr 标准错误日志；events JSONL 事件日志。默认 report。' },
+        artifact: { type: 'string', enum: ['report', 'result', 'context', 'review', 'stderr', 'events', 'diff'], description: 'report 原始全文；result 执行结果；context 原任务和验收标准；review 独立核验历史；stderr 标准错误日志；events JSONL 事件日志；diff 本单在 git 仓库里的改动（可写任务，结果里 diff_status 为 captured 时有）。默认 report。' },
         offset: { type: 'integer', minimum: 0, description: 'Unicode 字符起点，默认 0。' },
         limit: { type: 'integer', minimum: 1, maximum: 8000, description: '每段最多字符数，默认 4000。' },
       },
@@ -1549,7 +1587,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     output: DATA_OUTPUT,
     async execute(args, exec) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_output: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
-      if (args.artifact !== undefined && !['report', 'result', 'context', 'review', 'stderr', 'events'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
+      if (args.artifact !== undefined && !['report', 'result', 'context', 'review', 'stderr', 'events', 'diff'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
       await ensureOwnJob(args.job_id, exec, 'codex_output');
@@ -1758,6 +1796,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
   registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile });
 
+  const geminiText = (value) => {
+    let summary = '';
+    if (value.status === 'failed') {
+      const reason = String(value.timeout_kind || value.error || value.last_event_type || value.status)
+        .replace(/^gemini_write: /, '').replace(/\s+/g, ' ').slice(0, 160);
+      summary = `Gemini 写作失败（${reason}），` + (!value.rolled_back
+        ? `目标未确认回滚。下一步：${value.next}`
+        : value.draft_path
+          ? `目标已回滚；草稿已保留在 ${value.draft_path}。下一步：gemini_write(reuse_draft=${JSON.stringify(value.draft_path)}, output=..., sources=..., 同样的写作要求) 复用这份草稿重新校验落盘；不要改用别的工具把草稿当普通文件搬运。`
+          : '目标已回滚；没有可复用草稿。下一步：处理 error 后，按同样的写作要求重新 gemini_write。');
+    }
+    return (summary ? `${summary}\n` : '') + JSON.stringify(value, null, 2);
+  };
   if (cfg.gemini) ctx.tools.register({
     name: 'gemini_write',
     description: '把教程、文档正文交给本机官方 agy 的 Gemini 写入单个文件，一章一章做；源码改动和素材笔记用 codex_run。' +
@@ -1779,6 +1830,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' +
         (cfg.gemini.defaultMaxChars ? `不传时默认 ${cfg.gemini.defaultMaxChars}。` : '') },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },
+      background: { type: 'boolean', description: '默认 false：前台等到写完再返回回执。true：登记为 Harness 后台任务后立即返回 background_job_id，写完由完成通知或 job_output 送回同样的回执；没有后台任务服务时仍按前台执行。' },
       reuse_draft: { type: 'string', description: '失败回执的 draft_path：只接受插件 gemini-drafts 目录内 .md，与 output/sources 分开；跳过 agy，按本次参数重新校验、落盘，超 max_chars 直接拒绝，不自动压缩。' },
       frontmatter: { type: 'object', additionalProperties: false, required: ['title', 'tags'],
         description: '启用后由插件生成七字段 YAML；title 和至少一个非空 tags 必填，单值最多 200 个 Unicode 字符且禁止换行和控制字符；仅 tags/aliases 可用字符串数组，aliases 允许空数组；不传则保留原有正文处理。',
@@ -1794,41 +1846,54 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             { type: 'array', items: { type: 'string', maxLength: 200 } }], description: '缺省 []，允许空数组。' },
         } },
     }, required: ['prompt', 'sources', 'output'] },
-    output: { schema: DATA_OUTPUT.schema, render: (_args, value) => {
-      let summary = '';
-      if (value.status === 'failed') {
-        const reason = String(value.timeout_kind || value.error || value.last_event_type || value.status)
-          .replace(/^gemini_write: /, '').replace(/\s+/g, ' ').slice(0, 160);
-        summary = `Gemini 写作失败（${reason}），` + (!value.rolled_back
-          ? `目标未确认回滚。下一步：${value.next}`
-          : value.draft_path
-            ? `目标已回滚；草稿已保留在 ${value.draft_path}。下一步：gemini_write(reuse_draft=${JSON.stringify(value.draft_path)}, output=..., sources=..., 同样的写作要求) 复用这份草稿重新校验落盘；不要改用别的工具把草稿当普通文件搬运。`
-            : '目标已回滚；没有可复用草稿。下一步：处理 error 后，按同样的写作要求重新 gemini_write。');
-      }
-      return [{ type: 'text', text: (summary ? `${summary}\n` : '') + JSON.stringify(value, null, 2) }];
-    } },
-    async execute(args = {}, exec) {
-      args ??= {};
+    output: { schema: DATA_OUTPUT.schema, render: (_args, value) => [{ type: 'text', text: geminiText(value) }] },
+    async execute(input, exec) {
+      const { background, ...args } = input ?? {};
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
       const key = normPath(cwd);
       const busy = geminiWrites.has(key) ? '同一任务目录的 gemini_write 尚未结束，请先等它结束'
         : [...startingWrites].some((writer) => writer.cwd === key) ? '同一任务目录的可写 Codex 任务正在启动，请先等它结束' : '';
       // 查询与启动之间也占住本实例的入口，避免规划端同时派入另一种写任务。
       if (!busy) geminiWrites.add(key);
+      const owner = exec?.agent?.id;
+      const write = (signal, extra = {}) => geminiWrite(cfg.gemini, { ...args, cwd,
+        ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
+        { signal, busy,
+          // products 模式下规划端不能读原料，也就不能把工作区外的文件当素材发给 Gemini。
+          ...(restrictedReads(exec) && !cfg.roots.includes('*')
+            ? { sourceRoots: [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] } : {}) }, launchGemini)
+        .then((value) => {
+          if (value.status === 'completed') productReads.addGemini(owner, [value.output]);
+          recordGemini({ ...value, ...extra }, owner);
+          return value;
+        }).finally(() => { if (!busy) geminiWrites.delete(key); });
+      // 后台模式：登记 DSH 后台任务后立即返回，写完由完成通知送回同样的回执；没有 jobs 服务或目录正忙时照常前台执行。
+      const jobs = background === true && !busy && owner ? ctx.get?.('jobs') : undefined;
+      if (!jobs) return write(exec?.signal);
+      const id = randomUUID().slice(0, 8);
+      const stop = new AbortController();
+      let backgroundId;
+      let launched = false;
       try {
-        const value = await geminiWrite(cfg.gemini, { ...args, cwd,
-          ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
-          { signal: exec?.signal, busy,
-            // products 模式下规划端不能读原料，也就不能把工作区外的文件当素材发给 Gemini。
-            ...(restrictedReads(exec) && !cfg.roots.includes('*')
-              ? { sourceRoots: [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] } : {}) }, launchGemini);
-        if (value.status === 'completed') {
-          productReads.addGemini(exec?.agent?.id, [value.output]);
-        }
-        recordGemini(value, exec?.agent?.id);
-        return value;
+        backgroundId = jobs.start({ owner, kind: 'gemini', label: `Gemini ${id} · ${path.basename(String(args.output ?? ''))}`, outputLimitBytes: 65536,
+          run: (handle) => ({
+            done: (launched = true, write(stop.signal, { id, background: true })).then((value) => {
+              const text = geminiText(value);
+              handle.append(`${text}\n`, { channel: 'log' });
+              return { status: value.status === 'completed' ? 'completed' : stop.signal.aborted ? 'killed' : 'failed',
+                detail: `${value.status} · ${value.chars ?? '?'} 字 · ${Math.round(value.duration_s ?? 0)} s`, result: text };
+            }, (error) => ({ status: 'failed', detail: 'gemini_write 出错', result: String(error?.message ?? error) })),
+            cancel: () => stop.abort(),
+          }) });
+      } catch (error) {
+        // 写作已经开始就不能再起一份；还没开始（run 没被调用）才退回前台执行。
+        if (launched) throw error;
+        ctx.logger?.warn?.(`[codex-conductor] gemini_write 后台登记失败，改为前台执行：${error?.message ?? error}`);
+        return write(exec?.signal);
       }
-      finally { if (!busy) geminiWrites.delete(key); }
+      return { status: 'running', write_id: id, background_job_id: backgroundId, output: args.output,
+        next: `已登记为后台任务 ${backgroundId}，Gemini 正在写作。留在本轮可用 job_output(${JSON.stringify({ job_id: backgroundId, wait: true })}) 等回执；` +
+          '会话空闲时完成通知会唤醒会话。写完前不要对同一任务目录派可写的 codex_run 或再次 gemini_write；回执到手后按其中的 next 处理。' };
     },
   });
 
@@ -1895,6 +1960,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       try {
         const denied = decide(exec, cfg);
         if (denied || !inWorkspace(sessionCwd(exec), cfg.roots)) return denied;
+        // 记下白名单模式下不会放行的工具名，面板据此提示切换前要补进 allowTools 的名字。
+        if (cfg.seenTools.size < 200 && typeof exec?.name === 'string' && !knownTool(exec.name, cfg)) cfg.seenTools.add(exec.name);
         // null 是内部延后判定；上面的中间件必须判定通过后才调用 next()。
         return productReads.checkSync(exec, ...productReadLocation(exec)) ?? undefined;
       } catch (error) {
@@ -1920,6 +1987,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
+        toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}

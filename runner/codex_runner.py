@@ -4,6 +4,7 @@
     python codex_runner.py start  --cwd DIR [--sandbox workspace-write] [--scope PATH ...] < prompt.txt
     python codex_runner.py status JOB_ID [--wait SECONDS]
     python codex_runner.py cancel JOB_ID
+    python codex_runner.py rollback JOB_ID [--check]
     python codex_runner.py doctor
 
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
@@ -598,6 +599,16 @@ SNAPSHOT_BUDGET = 20
 # Trees that blew the budget are remembered, so later writers skip the doomed 20s walk.
 TOO_BIG_FILE = "snapshot-too-big.json"
 TOO_BIG_TTL = 7 * 86400
+# Hashing a tree for a diff can exceed its budget where the stat-only snapshot does not, so it has its own entry.
+DIFF_TOO_BIG = "diff:"
+DIFF_BUDGET = 20
+LATE_DIFF_BUDGET = 4  # per step, twice per late diff: a status query must stay quick
+DIFF_MAX_BYTES = 5 * 1024 ** 2
+DIFF_CACHE_MAX_BYTES = 256 * 1024 ** 2  # one directory's cached index and objects
+# The user's diff settings must not change the patch format that `git apply` reads back.
+GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false",
+            "-c", "diff.srcPrefix=a/", "-c", "diff.dstPrefix=b/",
+            "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--submodule=short")
 
 
 def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
@@ -648,10 +659,10 @@ def tree_key(cwd, *, resolve=None):
     return normalized_path((resolve or os.path.realpath)(local_path(cwd)))
 
 
-def remember_too_big(cwd):
+def remember_too_big(cwd, prefix=""):
     # Only an optimisation: losing a concurrent update or failing to write must never fail the task.
     try:
-        data = {**too_big_trees(), tree_key(cwd): time.time()}
+        data = {**too_big_trees(), prefix + tree_key(cwd): time.time()}
         HOME.mkdir(parents=True, exist_ok=True)
         tmp = HOME / f"{TOO_BIG_FILE}.{os.getpid()}.tmp"
         tmp.write_text(json.dumps(data), "utf-8")
@@ -660,17 +671,35 @@ def remember_too_big(cwd):
         pass
 
 
+def diff_index_cache(cwd):
+    """One refreshed index per task directory, with the objects it refers to: a repository kept by Windows git has
+    stat data that never matches inside WSL, so starting from the user's index re-hashes every tracked file under
+    cwd for each task. The objects stay because that index names blobs and trees the repository does not have."""
+    return HOME / "diff-index" / write_lock_key(cwd)
+
+
+def remove_tree(path):
+    if IS_WIN and path.is_dir():
+        for entry in path.rglob("*"):
+            os.chmod(entry, 0o700)  # git writes objects read-only, which Windows refuses to delete
+    shutil.rmtree(path, ignore_errors=True)
+
+
 def forget_too_big(cwd):
+    cached = diff_index_cache(cwd)
+    had_index = cached.exists()
+    remove_tree(cached)
     try:
         data = json.loads((HOME / TOO_BIG_FILE).read_text("utf-8"))
     except FileNotFoundError:
-        return False
+        return had_index
     if not isinstance(data, dict):
         raise ValueError("Snapshot size cache must be a JSON object")
-    key = tree_key(cwd)
-    if key not in data:
-        return False
-    del data[key]
+    keys = [k for k in (tree_key(cwd), DIFF_TOO_BIG + tree_key(cwd)) if k in data]
+    if not keys:
+        return had_index
+    for key in keys:
+        del data[key]
     tmp = HOME / f"{TOO_BIG_FILE}.{os.getpid()}.tmp"
     tmp.write_text(json.dumps(data), "utf-8")
     os.replace(tmp, HOME / TOO_BIG_FILE)
@@ -762,6 +791,158 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
             **({"ignore_warnings": warnings} if warnings else {})}
 
 
+def git(cwd, *argv, deadline, env=None):
+    p = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=max(0.1, deadline - time.monotonic()),
+                       creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
+    if p.returncode:
+        raise ValueError(p.stderr.decode("utf-8", "replace").strip() or f"git exited {p.returncode}")
+    return p.stdout
+
+
+def diff_fields(job_dir):
+    """The saved diff_* fields of a writer and when it was rolled back."""
+    info = {}
+    for name in ("diff.json", "rollback.json"):
+        try:
+            info.update(json.loads((job_dir / name).read_text("utf-8")))
+        except (OSError, ValueError, TypeError):
+            pass
+    return info
+
+
+def diff_save(job_dir, info):
+    tmp = job_dir / "diff.json.tmp"
+    tmp.write_text(json.dumps(info), "utf-8")
+    os.replace(tmp, job_dir / "diff.json")
+    # The patch is self-contained, so the task's own index and objects are only needed until it exists.
+    for name in ("diff.index", "diff.index.lock", "diff-base.json"):
+        (job_dir / name).unlink(missing_ok=True)
+    remove_tree(job_dir / "diff-objects")
+    return info
+
+
+def diff_skipped(job_dir, reason, info=None):
+    return diff_save(job_dir, {**(info or {}), "diff_status": "skipped",
+                               "diff_reason": (reason.strip().splitlines() or ["git failed"])[0][:300]})
+
+
+def diff_tree(job_dir, base, budget):
+    """Write the tree of the starting index plus everything under cwd that .gitignore lets through. The index and
+    the new objects live under the runner home, so the repository's own index, HEAD and object store stay as they are."""
+    deadline = time.monotonic() + budget
+    env = {"GIT_INDEX_FILE": str(job_dir / "diff.index"), "GIT_OBJECT_DIRECTORY": base["object_dir"],
+           "GIT_ALTERNATE_OBJECT_DIRECTORIES": base["objects"]}
+    (job_dir / "diff.index.lock").unlink(missing_ok=True)  # left by a git that was stopped at its deadline
+    git(base["cwd"], "add", "-A", "--", ".", deadline=deadline, env=env)
+    return git(base["cwd"], "write-tree", deadline=deadline, env=env).decode("ascii").strip(), env
+
+
+def diff_begin(job_dir, cwd, enabled=True):
+    """Record the tree a writer starts from. Nothing here may fail the task: every problem becomes diff.json."""
+    if not enabled:
+        return diff_skipped(job_dir, "disabled by --no-diff")
+    if {tree_key(cwd), DIFF_TOO_BIG + tree_key(cwd)} & too_big_trees().keys():
+        return diff_skipped(job_dir, "the tree is recorded as too big")
+    try:
+        try:
+            paths = git(cwd, "rev-parse", "--show-toplevel", "--git-path", "objects", "--git-path", "index",
+                        deadline=time.monotonic() + DIFF_BUDGET).decode("utf-8").splitlines()
+        except ValueError as e:
+            if "not a git repository" not in str(e):
+                raise
+            return diff_save(job_dir, {"diff_status": "not_git"})
+        repo, objects, index = (os.path.normpath(os.path.join(cwd, p)) for p in paths)
+        base = {"cwd": cwd, "repo": repo, "objects": objects}
+        deadline = time.monotonic() + DIFF_BUDGET
+        cache = diff_index_cache(cwd)
+
+        def user_index():
+            (job_dir / "diff.index").unlink(missing_ok=True)
+            with suppress(FileNotFoundError):  # a repository without an index yet (no HEAD) starts from the empty tree
+                shutil.copy2(index, job_dir / "diff.index")
+
+        # Either index is only a starting point: `git add -A` makes the entries under cwd equal the work tree, and
+        # the entries elsewhere are the same in both trees. copy2 keeps the mtime git's racy-entry check relies on.
+        try:
+            (cache / "objects").mkdir(parents=True, exist_ok=True)
+            base.update(object_dir=str(cache / "objects"), cached=True)
+            try:
+                shutil.copy2(cache / "index", job_dir / "diff.index")
+            except FileNotFoundError:
+                user_index()  # the first writer here: its objects stay, and the index it leaves joins them
+            base["tree"] = diff_tree(job_dir, base, DIFF_BUDGET)[0]
+        except (OSError, ValueError):
+            # The cache cannot be used (or no longer fits this repository): drop it and work in the task directory.
+            remove_tree(cache)
+            (job_dir / "diff-objects").mkdir(exist_ok=True)
+            base.update(object_dir=str(job_dir / "diff-objects"), cached=False)
+            user_index()
+            base["tree"] = diff_tree(job_dir, base, max(0.1, deadline - time.monotonic()))[0]
+        (job_dir / "diff-base.json").write_text(json.dumps(base), "utf-8")
+    except subprocess.TimeoutExpired:
+        remember_too_big(cwd, DIFF_TOO_BIG)
+        diff_skipped(job_dir, f"recording the starting tree exceeded {DIFF_BUDGET}s")
+    except (OSError, ValueError) as e:
+        diff_skipped(job_dir, str(e) or type(e).__name__)
+
+
+def diff_end(job_dir, budget=DIFF_BUDGET, note=None):
+    """Record the tree a writer left and save the difference as diff.patch. Returns the diff_* result fields."""
+    try:
+        base = json.loads((job_dir / "diff-base.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return diff_fields(job_dir)  # no starting tree: diff.json already says why, or the task took none
+    patch = job_dir / "diff.patch"
+    info = {"diff_note": note} if note else {}
+    try:
+        info["diff_repo"] = base["repo"]
+        tree, env = diff_tree(job_dir, base, budget)
+        cache = diff_index_cache(base["cwd"]) if base["cached"] else None
+        with suppress(OSError):  # losing the cached index only costs the next writer here its re-hash
+            if cache is not None:
+                tmp = cache / f"index.{os.getpid()}.tmp"
+                shutil.copy2(job_dir / "diff.index", tmp)
+                os.replace(tmp, cache / "index")
+        deadline = time.monotonic() + budget
+        compare = lambda *options: git(base["cwd"], *GIT_DIFF, *options, base["tree"], tree, "--", ".",
+                                       deadline=deadline, env=env)
+        files = compare("--name-only", "-z").count(b"\0")
+        size = 0
+        if files:
+            compare("--binary", f"--output={patch}")
+            size = patch.stat().st_size
+            if size > DIFF_MAX_BYTES:
+                patch.write_bytes(compare("--stat=200"))  # too big to keep or to roll back: only the file list remains
+        info.update(diff_status="empty" if not files else "too_large" if size > DIFF_MAX_BYTES else "captured",
+                    diff_bytes=size, diff_files=files)
+        with suppress(OSError):
+            # Objects are never collected, so past the limit the cache starts over with the next writer. A late diff
+            # holds no write lock and leaves it to the task that may be using it.
+            if cache is not None and not note and storage_size(cache) > DIFF_CACHE_MAX_BYTES:
+                remove_tree(cache)
+        return diff_save(job_dir, info)
+    except subprocess.TimeoutExpired:
+        if budget >= DIFF_BUDGET:
+            remember_too_big(base["cwd"], DIFF_TOO_BIG)
+        reason = f"recording the final tree exceeded {budget}s"
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        reason = str(e) or type(e).__name__
+    patch.unlink(missing_ok=True)
+    return diff_skipped(job_dir, reason, info)
+
+
+def late_diff(job_dir):
+    """A worker that died left a starting tree but no patch: record the final tree now, once nothing is running."""
+    if not (job_dir / "diff-base.json").exists() or \
+            any(recorded_pid(job_dir / name) is not None for name in ("worker.pid", "codex.pid")):
+        return
+    lock = acquire_file_lock(job_dir / "process.lock")  # a cancel in progress records the tree itself
+    if lock is not None:
+        with lock:
+            diff_end(job_dir, LATE_DIFF_BUDGET, "Recorded after the worker died: may include later changes to the tree.")
+
+
 def parse_final_message(final):
     try:
         return json.loads(final), []
@@ -844,10 +1025,18 @@ def execute(args, prompt, run_dir):
                         "retryable": False, "attempts": 0, "duration_s": round(time.time() - started, 1)}
             # Jobs queued before --scope existed have no scope in args.json.
             before, scope = snapshot_before(args.cwd, scope_args)
+            with suppress(OSError):  # not even a full disk may fail the task over its diff
+                diff_begin(run_dir, args.cwd, not getattr(args, "no_diff", False))
 
         def changes():
             return files_changed(args.cwd, before, event_changes, scope, ignore) \
                 if args.sandbox != "read-only" else {}
+
+        def diff():
+            try:
+                return diff_end(run_dir) if args.sandbox != "read-only" else {}
+            except OSError as error:
+                return {"diff_status": "skipped", "diff_reason": str(error)[:300]}
 
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
@@ -876,7 +1065,7 @@ def execute(args, prompt, run_dir):
                 runner_event(run_dir, attempt, "finalizing", kind)
                 return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
                         "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
-                        **changes()}
+                        **changes(), **diff()}
             delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
             time.sleep(delay)
@@ -893,7 +1082,7 @@ def execute(args, prompt, run_dir):
         result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
                   "final_message": final[:8000],
                   "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
-                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes()}
+                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes(), **diff()}
         if resumed:
             result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
         if args.schema:
@@ -936,6 +1125,7 @@ def add_task_arguments(p):
     p.add_argument("--ignore", action="append",
                    help="Regex for cwd-relative paths other processes write; such changes are left out; repeatable")
     p.add_argument("--use-user-config", action="store_true", help="Inherit ~/.codex/config.toml, MCP servers and hooks")
+    p.add_argument("--no-diff", action="store_true", help="Do not record a writer's changes as diff.patch")
     p.add_argument("--timeout", type=float, default=3600)
     p.add_argument("--lock-timeout", type=positive_float, help="Maximum seconds waiting for write locks; omitted waits indefinitely")
     p.add_argument("--max-storage-mb", type=positive_float, help="Best-effort jobs/runs storage limit in MiB; omitted is unlimited")
@@ -1401,7 +1591,7 @@ def enriched_status(job_id, job_dir, value, record=None):
     finished = (job_dir / "result.json").stat().st_mtime if (job_dir / "result.json").exists() else None
     metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
                                                                          thread_id=value.get("thread_id"))
-    result = {**metadata, **value, "job_id": job_id}
+    result = {**metadata, **diff_fields(job_dir), **value, "job_id": job_id}
     for key in ("model", "service_tier"):
         if key in metadata["task_options"]:
             result["task_options"] = {**result["task_options"], key: metadata["task_options"][key]}
@@ -1591,6 +1781,8 @@ def list_jobs(args):
                          **({"verification_of": j["context"]["verification_of"]} if "verification_of" in j["context"] else {})}
              if j.get("context") else None,
              **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
+             **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
+             **{k: j[k] for k in ("diff_status", "diff_files", "rolled_back_at") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
@@ -1732,8 +1924,15 @@ def summarize_jobs(args):
                        "verification": verification, "open_items": open_items, "files_changed": files,
                        "finished_duration_s": round(sum(durations), 1) if all(type(d) in (int, float) for d in durations) else None,
                        "usage": summary_usage(rounds), "usage_scope": "thread_total" if kind == "thread" else "job"})
+    usage_total, usage_unknown = {}, 0
+    for jobs in groups.values():  # every matching group, whatever page is shown
+        usage = summary_usage(list(reversed(jobs)))
+        usage_unknown += usage is None
+        for key, amount in (usage or {}).items():
+            usage_total[key] = usage_total.get(key, 0) + amount
     next_offset = args.offset + len(result)
     return {"status": "completed", "groups": result, "total": len(groups),
+            "usage_total": usage_total, "usage_unknown_groups": usage_unknown,
             "total_jobs": sum(map(len, groups.values())), "error_kinds": error_kinds, "offset": args.offset, "limit": args.limit,
             "next_offset": next_offset if next_offset < len(groups) else None}
 
@@ -1744,15 +1943,27 @@ def job_output(args):
         value = {"job_id": args.job_id, "status": "failed", "error_kind": "unknown_job", "retryable": False}
         return {**value, **review_summary(value)}
     source = job_dir / {"report": "last_message.txt", "result": "result.json", "context": "args.json",
-                        "review": "reviews.json", "stderr": "stderr.log", "events": "events.jsonl"}[args.artifact]
+                        "review": "reviews.json", "stderr": "stderr.log", "events": "events.jsonl",
+                        "diff": "diff.patch"}[args.artifact]
+    if args.artifact == "diff":
+        late_diff(job_dir)
     value = job_status(args.job_id)
     base = {"job_id": args.job_id, "artifact": args.artifact, "execution_status": value.get("execution_status", value["status"]),
             "source_path": str(source), "offset": args.offset, "limit": args.limit}
+    if args.artifact == "diff":
+        base["diff_status"] = value.get("diff_status")  # too_large: the text is the --stat list, not a patch
     if not source.resolve().is_relative_to(job_dir.resolve()):
         return {**base, "status": "failed", "error_kind": "invalid_artifact", "retryable": False}
-    if args.artifact in ("report", "result") and value["status"] == "running":
+    if args.artifact in ("report", "result", "diff") and value["status"] == "running":
         return {**base, "status": "pending", "error_kind": "artifact_pending", "retryable": True}
     if not source.exists():
+        if args.artifact == "diff":
+            reason = {"empty": "the task left no changes under its directory",
+                      "not_git": "the task directory is not inside a git work tree",
+                      "skipped": value.get("diff_reason")}.get(value.get("diff_status")) or \
+                "none was recorded (a read-only task, or a job from before diffs were recorded)"
+            return {**base, "status": "failed", "error_kind": "artifact_missing", "retryable": False,
+                    "error": "No patch for this job: " + reason}
         return {**base, "status": "failed", "error_kind": "legacy_context_missing" if args.artifact == "context" else "artifact_missing", "retryable": False}
     try:
         if args.artifact == "context":
@@ -1767,7 +1978,8 @@ def job_output(args):
             total_chars = 0
             has_content = False
             text = ""
-            with open(source, "r", encoding="utf-8", newline="") as f:
+            # A patch quotes the files' own bytes, which need not be UTF-8.
+            with open(source, "r", encoding="utf-8", newline="", **({"errors": "replace"} if args.artifact == "diff" else {})) as f:
                 while chunk := f.read(65536):
                     start = max(0, args.offset - total_chars)
                     stop = min(len(chunk), args.offset + args.limit - total_chars)
@@ -1785,6 +1997,62 @@ def job_output(args):
     end = args.offset + len(text)
     return {**base, "status": "completed", "text": text, "total_chars": total_chars,
             "next_offset": end if end < total_chars else None, "eof": end >= total_chars}
+
+
+def rollback_job(args):
+    """Reverse a finished writer's diff.patch in the working tree; the user's index and commits are not touched."""
+    fail = lambda kind, error, **extra: {"status": "failed", "job_id": args.job_id, "error_kind": kind, "error": error,
+                                          "retryable": kind == "lock_busy", "rolled_back": False, **extra}
+    job_dir = job_directory(args.job_id)
+    if job_dir.exists():
+        late_diff(job_dir)
+    value = job_status(args.job_id)
+    if value.get("error_kind") in ("unknown_job", "invalid_record"):
+        return fail(value["error_kind"], value.get("error") or "No such job.")
+    if value["status"] == "running" or value.get("residual_codex_pid"):
+        return fail("still_running", "The job or its Codex process is still running; wait for it or cancel it first.")
+    if value.get("rolled_back_at"):
+        return fail("already_rolled_back", "This job was already rolled back.", rolled_back_at=value["rolled_back_at"])
+    patch = job_dir / "diff.patch"
+    if value.get("diff_status") != "captured" or not patch.is_file() or patch.is_symlink():
+        return fail("no_diff", f"No patch to roll back: diff_status is {value.get('diff_status')!r}.",
+                    diff_status=value.get("diff_status"))
+    roots = write_lock_roots(value["cwd"], value.get("sandbox"), value["task_options"].get("writable_roots"))
+    apply = lambda *options, seconds: git(value["diff_repo"], "apply", "-R", "--binary", "--whitespace=nowarn", *options,
+                                         str(patch), deadline=time.monotonic() + seconds)
+    reason = lambda error: "git apply timed out" if isinstance(error, subprocess.TimeoutExpired) else \
+        "\n".join(str(error).splitlines()[:10])
+    (HOME / "locks").mkdir(parents=True, exist_ok=True)
+    locks = []
+    try:
+        # Admission stays held, so no writer on this or an overlapping directory starts while files are restored.
+        with acquire_file_lock(HOME / "locks" / "admission.lock", blocking=True):
+            busy = earlier_writer_waiting(job_dir, roots)
+            for key in sorted(roots) if not busy else []:
+                lock = acquire_write_lock(roots[key])
+                if lock is None:
+                    busy = True
+                    break
+                locks.append(lock)
+            if busy:
+                return fail("lock_busy", "Another writer holds or waits for this directory; try again once it has finished.")
+            try:
+                apply("--check", seconds=60)
+            except (subprocess.TimeoutExpired, OSError, ValueError) as error:
+                return fail("rollback_conflict", reason(error))
+            if not args.check:
+                try:
+                    apply(seconds=300)
+                except (subprocess.TimeoutExpired, OSError, ValueError) as error:
+                    return fail("rollback_failed", reason(error))
+                tmp = job_dir / "rollback.json.tmp"
+                tmp.write_text(json.dumps({"rolled_back_at": time.time()}), "utf-8")
+                os.replace(tmp, job_dir / "rollback.json")
+    finally:
+        for lock in locks:
+            lock.close()
+    return {"status": "completed", "job_id": args.job_id, "rolled_back": not args.check, "checked": True,
+            "files": value.get("diff_files")}
 
 
 def worker_died(job_id, job_dir, task=None):
@@ -1847,6 +2115,14 @@ def prune_old(subdir):
                 shutil.rmtree(d, ignore_errors=True)
         except (OSError, ValueError):
             pass
+
+
+def prune_diff_index():
+    for cached in (HOME / "diff-index").glob("*"):
+        with suppress(OSError):
+            # Every writer replaces the index inside, which is what moves the directory's mtime.
+            if cached.stat().st_mtime < time.time() - PRUNE_TTL:
+                remove_tree(cached)
 
 
 def storage_size(root):
@@ -1974,9 +2250,13 @@ def main():
     review.add_argument("--reviewer", required=True)
     output = sub.add_parser("output")
     output.add_argument("job_id", type=job_identifier)
-    output.add_argument("--artifact", choices=["report", "result", "context", "review", "stderr", "events"], default="report")
+    output.add_argument("--artifact", choices=["report", "result", "context", "review", "stderr", "events", "diff"],
+                        default="report")
     output.add_argument("--limit", type=int, default=4000)
     output.add_argument("--offset", type=int, default=0)
+    rollback = sub.add_parser("rollback")
+    rollback.add_argument("job_id", type=job_identifier)
+    rollback.add_argument("--check", action="store_true", help="Only test whether the patch still reverses cleanly")
     args = parser.parse_args()
     if args.command == "doctor":
         emit(doctor())
@@ -2008,6 +2288,13 @@ def main():
         except (OSError, ValueError, argparse.ArgumentTypeError) as e:
             parser.error("Invalid review: " + str(e))
         return
+    if args.command == "rollback":
+        try:
+            emit(rollback_job(args))
+        except (OSError, ValueError, KeyError) as e:
+            emit({"status": "failed", "job_id": args.job_id, "error_kind": "invalid_record", "error": str(e),
+                  "retryable": False, "rolled_back": False})
+        return
     if args.command in ("list", "summary", "output"):
         maximum = 8000 if args.command == "output" else 100
         if args.offset < 0 or not 1 <= args.limit <= maximum:
@@ -2033,6 +2320,7 @@ def main():
         if args.command == "start" or args.max_storage_mb is not None:
             prune_old("jobs")
             prune_old("runs")
+            prune_diff_index()
         if args.max_storage_mb is not None:
             context = getattr(args, "context", None) or {}
             prune_storage(args.max_storage_mb, {context.get("verification_of"),
@@ -2101,6 +2389,8 @@ def main():
         interval = max(1, args.wait) if args.follow else args.wait
         deadline = time.monotonic() + interval
         while True:
+            with suppress(OSError, ValueError):
+                late_diff(job_directory(args.job_id))
             current = job_status(args.job_id)
             now = time.monotonic()
             if current["status"] != "running" or now >= deadline:
@@ -2121,24 +2411,35 @@ def main():
             if (job_dir / "result.json").exists():
                 emit(job_status(args.job_id))
                 return
-            codex_pid = job_dir / "codex.pid"
-            pid = recorded_pid(codex_pid)
-            if pid is not None:
-                # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
-                kill_tree(pid)
-            # Stop Codex before its worker: orphaning an exited leader can reap its recorded identity.
-            worker_pid = recorded_pid(pid_file)
-            if worker_pid is not None:
-                kill_tree(worker_pid)
-            if worker_pid is None:
-                emit(job_status(args.job_id))
-                return
-            # The worker may have published its result after the initial check, before it was killed.
-            if not (job_dir / "result.json").exists():
-                result = {**job_metadata(job_dir, finished_at=time.time()), "status": "cancelled",
-                          "retryable": False, "log_dir": str(job_dir)}
-                result.update(review_summary(result))
-                write_result(job_dir, result)
+            # With a diff to finish, hold admission: the killed worker frees its write locks, and a queued writer
+            # must not change the tree before the final tree is recorded.
+            (HOME / "locks").mkdir(parents=True, exist_ok=True)
+            admission = acquire_file_lock(HOME / "locks" / "admission.lock", blocking=True) \
+                if (job_dir / "diff-base.json").exists() else None
+            try:
+                codex_pid = job_dir / "codex.pid"
+                pid = recorded_pid(codex_pid)
+                if pid is not None:
+                    # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
+                    kill_tree(pid)
+                # Stop Codex before its worker: orphaning an exited leader can reap its recorded identity.
+                worker_pid = recorded_pid(pid_file)
+                if worker_pid is not None:
+                    kill_tree(worker_pid)
+                if worker_pid is None:
+                    emit(job_status(args.job_id))
+                    return
+                # The worker may have published its result after the initial check, before it was killed.
+                if not (job_dir / "result.json").exists():
+                    result = {**job_metadata(job_dir, finished_at=time.time()), "status": "cancelled",
+                              "retryable": False, "log_dir": str(job_dir)}
+                    with suppress(OSError):
+                        result.update(diff_end(job_dir))
+                    result.update(review_summary(result))
+                    write_result(job_dir, result)
+            finally:
+                if admission is not None:
+                    admission.close()
         emit(job_status(args.job_id))
 
 
