@@ -1284,7 +1284,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     logger: { warn: (text) => warnings.push(text) },
     ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
   // 收尾护栏会多一次 list 调用；只有专门测它的用例才打开。
-  apply(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, ...pluginConfig }, run, launchGemini);
+  apply(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, continueFreshAboveTokens: 0, ...pluginConfig }, run, launchGemini);
   const answer = async (job, value) => {
     for (let i = 0; !waiters[job]?.length; i++) {
       if (i === 1000) {
@@ -1326,7 +1326,7 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
       assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
         const args = { ...RUN, write, ...access, scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
-          cwd: '/work/original', resume: 'THREAD', use_user_config: true, effort: 'low', wait_seconds: 1 };
+          cwd: '/work/original', resume: 'THREAD', fresh: false, use_user_config: true, effort: 'low', wait_seconds: 1 };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
         assert.equal((await h.tools.codex_run.execute(args, exec)).job_id, 'J');
         const context = JSON.parse(h.requests.at(-1).stdin).context;
@@ -5605,7 +5605,7 @@ test('codex_continue opens a fresh thread for a large thread unless answers are 
   const run = async ({ size, args = {}, kind = 'implementation', config = {}, log = [] } = {}) => {
     const source = workflowSource(kind);
     source.structured.files_changed = ['src/csv.js'];
-    const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' },
+    const h = harness({ config: { continueFreshAboveTokens: 100000, startResult: { job_id: 'CHILD', status: 'completed' },
       threadSizeResult: size === 'throw' ? () => Promise.reject(new Error('wsl down')) : { status: 'completed', last_input_tokens: size }, ...config } });
     h.finals.PARENT = source;
     const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', wait_seconds: 0, ...args }, { agent: agentAt('/work/current', log) });
@@ -5630,10 +5630,15 @@ test('codex_continue opens a fresh thread for a large thread unless answers are 
   assert.ok(!forced.h.calls.some((argv) => argv[0] === 'thread-size'));
   // 回答阻塞问题是对话：始终沿用原线程。
   const [registered, settled, human] = answeredParent;
-  const answered = await run({ size: 900000, kind: 'user_input', args: { fresh: true, answers: [{ id: 'format', answer: '保留旧格式' }] },
-    log: [human, registered, settled, { ...human, time: 13_000 }] });
+  const answers = [{ id: 'format', answer: '保留旧格式' }];
+  const answered = await run({ size: 900000, kind: 'user_input', args: { answers }, log: [human, registered, settled, { ...human, time: 13_000 }] });
   assert.equal(start(answered.h)[start(answered.h).indexOf('--resume') + 1], 'THREAD');
   assert.equal(answered.value.continuation_thread.reason, 'answers');
+  // 明确 fresh:true 时回答也可以开新线程，回答写进交接内容。
+  const freshAnswers = await run({ size: 900000, kind: 'user_input', args: { answers, fresh: true }, log: [human, registered, settled, { ...human, time: 13_000 }] });
+  assert.ok(!start(freshAnswers.h).includes('--resume'));
+  assert.match(payload(freshAnswers.h).prompt, /规划端回答（仅补充信息）[\s\S]*保留旧格式/);
+  assert.match(freshAnswers.value.next, /新任务 CHILD/);
   await assert.rejects(run({ args: { fresh: 'yes' } }), /fresh 必须是布尔值/);
 });
 
@@ -5683,4 +5688,55 @@ test('the pre-step hook forwards a Codex job notice of a handed-over session to 
   // 没有交接的会话照常进入这一步。
   assert.deepEqual(await h.handlers['agent/pre-step']({ agent: { id: 'session-wire-other' }, messages: [notice] }, async () => ({ kind: 'enter' })), { kind: 'enter' });
   writeFileSync(file, JSON.stringify({ links }));
+});
+
+test('codex_run with resume starts a fresh thread for a large thread, keeps the planner task, links the parent and follows superseded threads', async () => {
+  const parent = { ...workflowSource('implementation'), verification_status: 'needs_changes',
+    verification: { status: 'needs_changes', notes: '解析仍漏空列', criteria: [{ index: 1, status: 'not_met', evidence: '空列用例失败' }] } };
+  parent.structured.files_changed = ['src/csv.js'];
+  const pending = { job_id: 'FLAG', execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: Date.now() / 1000 + 60, started_at: Date.now() / 1000 };
+  const lists = { THREAD: [{ job_id: 'PARENT', thread_id: 'THREAD' }], OLD: [{ job_id: 'P1', thread_id: 'OLD' }], NEW: [{ job_id: 'C2', thread_id: 'NEW' }] };
+  const children = { P1: [{ job_id: 'C1', thread_id: 'NEW' }] };
+  const listResult = (argv) => {
+    const at = (flag) => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined;
+    if (argv.includes('--started-between')) return { jobs: [pending], total: 1 };
+    if (at('--thread-id')) return { jobs: lists[at('--thread-id')] ?? [], total: 1 };
+    if (at('--parent-job')) return { jobs: children[at('--parent-job')] ?? [], total: 1 };
+    return { jobs: [], total: 0 };
+  };
+  const run = async (args, size, extra = {}) => {
+    const h = harness({ config: { continueFreshAboveTokens: 100000, closeoutGuard: true, plannerAnswers: true, listResult,
+      threadSizeResult: { status: 'completed', last_input_tokens: size }, startResult: { job_id: 'J9', status: 'completed' }, ...extra } });
+    h.finals.PARENT = parent;
+    const value = await h.tools.codex_run.execute({ ...RUN, write: true, scope: ['src'], task: '把空列也解析成空字符串并补测试', ...args },
+      { agent: agentAt('/work/current') });
+    const start = h.calls.find((argv) => argv[0] === 'start');
+    const payload = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin);
+    return { h, value, start, payload };
+  };
+  // 原线程很大：开新线程；任务原文完整保留在交接内容之后；父任务链接为该线程最新的任务；收尾护栏仍按返工放行。
+  const big = await run({ resume: 'THREAD' }, 250000);
+  assert.ok(!big.start.includes('--resume'));
+  assert.equal(big.payload.context.task, '把空列也解析成空字符串并补测试');
+  assert.deepEqual(big.payload.context.continuation, { parent_job_id: 'PARENT', answers: [], resolution: 'codex_run 以新线程接续线程 THREAD' });
+  assert.match(big.payload.prompt, /上一轮交接（任务 PARENT，原线程 THREAD[\s\S]*修复 CSV 解析[\s\S]*1\. CSV 解析测试通过[\s\S]*上一轮改动文件：src\/csv\.js[\s\S]*最新验收结论：needs_changes[\s\S]*解析仍漏空列[\s\S]*## 本轮任务（规划端原文）\n把空列也解析成空字符串并补测试/);
+  assert.equal(big.value.continuation_thread.mode, 'fresh');
+  assert.match(big.value.next, /已开新线程（原线程 THREAD，上一轮任务 PARENT，原线程上次请求约 250000 输入 token），新任务 J9[\s\S]*对新任务 J9 调 codex_continue，不要再 resume 原线程/);
+  assert.ok(!big.h.calls.some((argv) => argv.includes('--started-between')), 'rework is not checked by the close-out guard');
+  // 小线程、读不到大小、fresh:false：照旧 resume；fresh:true 强制开新线程。
+  for (const [args, size] of [[{ resume: 'THREAD' }, 50000], [{ resume: 'THREAD' }, null], [{ resume: 'THREAD', fresh: false }, 900000]]) {
+    const { start, payload } = await run(args, size);
+    assert.equal(start[start.indexOf('--resume') + 1], 'THREAD', JSON.stringify([args, size]));
+    assert.equal(payload.context.continuation, undefined);
+  }
+  assert.ok(!(await run({ resume: 'THREAD', fresh: true }, 10)).start.includes('--resume'));
+  // 原线程已被开新线程的续接接替：改接最新线程上的最新任务，并说明。
+  const redirected = await run({ resume: 'OLD' }, 50000);
+  assert.equal(redirected.start[redirected.start.indexOf('--resume') + 1], 'NEW');
+  assert.match(redirected.value.next, /线程 OLD 已由新线程接续，本次改为接续线程 NEW（任务 C2）/);
+  // 没有 resume 的新任务不查线程。
+  const plain = await run({}, 900000, { closeoutGuard: false });
+  assert.ok(!plain.h.calls.some((argv) => argv[0] === 'thread-size' || argv.includes('--thread-id')));
+  await assert.rejects(run({ resume: 'THREAD', fresh: 'yes' }, 1), /fresh 必须是布尔值/);
 });

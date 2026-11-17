@@ -20,7 +20,7 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
-const { validReport, blockingState, prepareContinuation } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+const { validReport, blockingState, prepareContinuation, previousRoundBrief } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
@@ -1292,7 +1292,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function continuationThread(plan, args, signal) {
     const thread = plan.args.resume;
     if (!thread) return null;
-    if (plan.continuation.answers.length) return { mode: 'resume', reason: 'answers', parent_thread_id: thread };
+    // 回答阻塞问题默认沿用原线程（是对话）；规划端明确 fresh:true 时开新线程，回答写在交接内容里。
+    if (plan.continuation.answers.length && args.fresh !== true) return { mode: 'resume', reason: 'answers', parent_thread_id: thread };
     if (args.fresh === false) return { mode: 'resume', reason: 'requested', parent_thread_id: thread };
     if (args.fresh === true) return { mode: 'fresh', reason: 'requested', parent_thread_id: thread };
     const limit = cfg.continueFreshAboveTokens ?? 0;
@@ -1301,6 +1302,38 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try { size = (await conductor.threadSize(thread, signal))?.last_input_tokens; } catch { signal?.throwIfAborted(); }
     if (!Number.isSafeInteger(size)) return { mode: 'resume', reason: 'size_unknown', parent_thread_id: thread };
     return { mode: size > limit ? 'fresh' : 'resume', reason: 'size', parent_thread_id: thread, parent_last_input_tokens: size, threshold: limit };
+  }
+
+  // resume 指向的线程上本会话（含交接前任）最新的任务；这个任务若已被开新线程的续接接替，沿接替链走到最新的线程。
+  async function threadHead(owner, thread, signal) {
+    const also_owners = aliases.predecessors(owner);
+    const latestOn = async (id) => (await conductor.list({ owner, also_owners, thread_id: id, limit: 1 }, signal))?.jobs?.[0];
+    let job = await latestOn(thread);
+    const superseded = [];
+    for (let hop = 0; job && hop < 10; hop++) {
+      const child = (await conductor.list({ owner, also_owners, parent_job: job.job_id, limit: 1 }, signal))?.jobs?.[0];
+      if (!child?.thread_id || child.thread_id === job.thread_id) break;
+      superseded.push(job.thread_id);
+      job = (await latestOn(child.thread_id)) ?? child;
+    }
+    return { job, superseded };
+  }
+
+  // codex_run 带 resume：与 codex_continue 同一阈值决定是否开新线程；线程不认识、读不到大小或很小时照旧沿用。
+  async function runThread(args, exec) {
+    const owner = exec?.agent?.id;
+    if (!args.resume || !owner) return null;
+    const { job, superseded } = await threadHead(owner, args.resume, exec?.signal);
+    if (!job?.job_id) return null;
+    const base = { parent_thread_id: job.thread_id ?? args.resume, parent_job_id: job.job_id, ...(superseded.length ? { superseded_threads: superseded } : {}) };
+    if (args.fresh === false) return { mode: 'resume', reason: 'requested', ...base };
+    if (args.fresh === true) return { mode: 'fresh', reason: 'requested', ...base };
+    const limit = cfg.continueFreshAboveTokens ?? 0;
+    if (!limit) return { mode: 'resume', reason: 'disabled', ...base };
+    let size;
+    try { size = (await conductor.threadSize(base.parent_thread_id, exec?.signal))?.last_input_tokens; } catch { exec?.signal?.throwIfAborted(); }
+    if (!Number.isSafeInteger(size)) return { mode: 'resume', reason: 'size_unknown', ...base };
+    return { mode: size > limit ? 'fresh' : 'resume', reason: 'size', ...base, parent_last_input_tokens: size, threshold: limit };
   }
 
   // 本会话（含交接前任）在收尾截止时间之后开始的全部任务；runner 每页最多 100 条，逐页取全。
@@ -1327,7 +1360,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
   }
 
-  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf) {
+  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
@@ -1439,10 +1472,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         exec?.signal?.throwIfAborted();
         if (refusal) throw new Error(refusal);
       }
+      // 预检（待答问题、收尾护栏）按原线程做完后才换成新线程：规划端任务原文完整保留，前面附上一轮交接内容。
+      if (fresh) {
+        const { resume: _resumed, ...rest } = args;
+        args = { ...rest, task: `${fresh.brief}\n\n## 本轮任务（规划端原文）\n${args.task}` };
+      }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
-        ...(continuation ? { continuation } : {}),
+        ...(continuation ?? fresh?.continuation ? { continuation: continuation ?? fresh.continuation } : {}),
         ...(verificationOf ? { verification_of: verificationOf } : {}),
       });
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
@@ -1512,6 +1550,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           '不传时：会话工作区属于配置里带 cwd 的 workspaces 条目，就用那个 cwd，否则用当前会话工作区。' +
           '只在 task 里写目标目录不会切换任务目录，要处理哪个目录就传哪个 cwd。' },
         resume: { type: 'string', description: '仅在继续已有 Codex 会话时填写工具真实返回的 thread_id；新任务省略，不要生成编号或填写 DSH 会话号、job_id。原任务补答阻塞问题时用 codex_continue(job_id)。' },
+        fresh: { type: 'boolean', description: '只配合 resume：不传时原线程很大就开新线程（你的任务原文前附上一轮交接内容），否则沿用原线程；true 强制开新线程，false 强制沿用。' },
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
           `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
@@ -1526,9 +1565,29 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       const unknown = Object.keys(args ?? {}).filter(key => !Object.hasOwn(runTool.parameters.properties, key));
       if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
-      const value = await dispatch(args, exec);
-      const hints = [acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
-      return hints ? { ...value, next: value.next ? `${value.next}\n${hints}` : hints } : value;
+      if (args.fresh !== undefined && typeof args.fresh !== 'boolean') throw new Error('codex_run: fresh 必须是布尔值');
+      // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
+      let thread = null;
+      // 没有 resume，或阈值为 0 且没指定 fresh 时不查询，调用时序与以前一样。
+      if (args.resume && (args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0)) {
+        try { thread = await runThread(args, exec); } catch { exec?.signal?.throwIfAborted(); }
+      }
+      if (thread && thread.parent_thread_id !== args.resume) args = { ...args, resume: thread.parent_thread_id };
+      let fresh;
+      if (thread?.mode === 'fresh') {
+        const parent = withReport(await conductor.waitJob(thread.parent_job_id, 0, exec?.signal));
+        if (unknownState(parent) || !owns(exec?.agent?.id, parent.context?.owner)) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
+        else fresh = { brief: previousRoundBrief(parent),
+          continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: `codex_run 以新线程接续线程 ${thread.parent_thread_id}` } };
+      }
+      const value = await dispatch(args, exec, undefined, args.task, undefined, fresh);
+      const threadLine = !thread ? '' : thread.mode === 'fresh'
+        ? `已开新线程（原线程 ${thread.parent_thread_id}，上一轮任务 ${thread.parent_job_id}${thread.parent_last_input_tokens ? `，原线程上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），` +
+          `新任务 ${value.job_id ?? '（见上）'}；任务里附了上一轮交接内容。之后的返工请对新任务 ${value.job_id ?? ''} 调 codex_continue，不要再 resume 原线程。`
+        : thread.superseded_threads ? `线程 ${thread.superseded_threads[0]} 已由新线程接续，本次改为接续线程 ${thread.parent_thread_id}（任务 ${thread.parent_job_id}）。` : '';
+      const hints = [threadLine, acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
+      const shown = thread ? { ...value, continuation_thread: thread } : value;
+      return hints ? { ...shown, next: shown.next ? `${shown.next}\n${hints}` : hints } : shown;
     },
   };
   ctx.tools.register(runTool);
@@ -1852,7 +1911,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           exec, plan.continuation, plan.task);
         if (!thread) return value;
         const line = thread.mode === 'fresh'
-          ? `已开新线程续接（原线程 ${thread.parent_thread_id}${thread.parent_last_input_tokens ? ` 上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），任务里附了上轮交接内容；之后的返工对这个新任务的 job_id 调 codex_continue。`
+          ? `已开新线程续接（原线程 ${thread.parent_thread_id}${thread.parent_last_input_tokens ? ` 上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），新任务 ${value.job_id ?? '（见上）'}，任务里附了上轮交接内容；之后的返工对新任务 ${value.job_id ?? ''} 调 codex_continue，不要再 resume 原线程。`
           : '';
         return { ...value, continuation_thread: thread, ...(line ? { next: value.next ? `${line}\n${value.next}` : line } : {}) };
       })();

@@ -148,3 +148,27 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   return { ready: true, args, task, continuation, blocking,
     next: value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
 }
+
+// codex_run 带 resume 改开新线程时，放在规划端任务前面的上轮交接内容：只用原任务记录、结构化报告和最新验收，不带旧线程对话。
+export function previousRoundBrief(value) {
+  value = object(value) ? value : {};
+  const context = object(value.context) ? value.context : {};
+  const report = reportOf(value);
+  const lines = [`## 上一轮交接（任务 ${value.job_id ?? '?'}，原线程 ${value.thread_id ?? '?'}；本轮在新线程里执行，看不到旧线程的对话）`];
+  if (nonempty(context.task)) lines.push(`上一轮的任务书：\n${context.task.trim()}`);
+  if (Array.isArray(context.acceptance) && context.acceptance.length) {
+    lines.push(`上一轮的验收标准：\n${context.acceptance.map((item, index) => `${index + 1}. ${item}`).join('\n')}`);
+  }
+  if (validReport(report)) {
+    if (nonempty(report.summary)) lines.push(`上一轮报告摘要：${report.summary}`);
+    lines.push(`上一轮逐条自报：\n${report.criteria.map((c, index) => `${index + 1}. [${c.status}] ${c.criterion} —— ${c.evidence}`).join('\n')}`);
+    for (const [label, items] of [['偏差', report.deviations], ['未决', report.unresolved]]) if (items.length) lines.push(`${label}：${items.join('；')}`);
+    for (const blocker of report.blockers ?? []) lines.push(`阻塞 ${blocker.id}（${blocker.kind}）：${blocker.message}`);
+    if (report.files_changed.length) lines.push(`上一轮改动文件：${report.files_changed.slice(0, 50).join('、')}${report.files_changed.length > 50 ? ` 等 ${report.files_changed.length} 个` : ''}`);
+  } else lines.push('上一轮没有有效的结构化报告。');
+  const review = object(value.verification) ? value.verification : null;
+  if (verificationOf(value) && verificationOf(value) !== 'unreviewed') lines.push(`最新验收结论：${verificationOf(value)}`);
+  if (nonempty(review?.notes)) lines.push(`验收意见：${review.notes}`);
+  for (const item of review?.criteria ?? []) if (item.status !== 'met') lines.push(`验收第 ${item.index} 条（${item.status}）：${item.evidence}`);
+  return lines.join('\n');
+}
