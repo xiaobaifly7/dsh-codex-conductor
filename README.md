@@ -66,6 +66,20 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.106：把长会话交接给新会话
+
+会话历史越长，每一步越慢（整段历史每步都要重发）。交接把目标和 Codex 任务一起转到一个新会话，原会话只读保留。插件状态目录是 DSH 进程的 `%LOCALAPPDATA%\dsh-codex-conductor`（便携版 DSH 一般是 `<DSH 数据目录>\local\dsh-codex-conductor`，即 `loaded.json` 所在目录）。步骤：
+
+1. 等原会话停下来：没有正在进行的回合，也没有运行中的 Codex 任务（否则会被拒绝，见第 5 步）。
+2. 在状态目录写 `handover-request.json`，建议先写临时文件再改名：`{"sessionId":"session-原会话","note":"可选，给新会话的一句话"}`。
+3. 读 `handover-result.json`：`status` 为 `handed_over` 时，`to` 是新会话 ID，`briefPath` 是交接单文件；`steps` 逐项写明做了什么：`session`（created / adopted）、`alias`（linked）、`predecessorGoal`（paused / unchanged_* / none / failed: …）、`delivered`（prompted / prompt_pending / failed）、`successorGoal`（created / exists / none / failed: …）；`pending` 列出待收尾的任务。`refused` 时看 `reason`：`turn_running`、`jobs_running`（`running` 列出任务）、`already_handed_over`、`jobs_unreadable`、`session_not_found` 等；`rejected` 表示请求格式不对。
+4. 在界面打开新会话：首条消息是交接单。确认它能看到原会话的任务：让它调 `codex_jobs`（session_id="current"）或 `codex_summary`，列表里应有原会话的 job_id。原会话此后不能再派活、验收、续接、核验或取消（会提示已交接给新会话），只能查看。
+5. 确需在有运行中任务时交接，加 `"force": true`；这些任务的结束通知仍发到原会话，新会话用 `codex_status` 查询结果。
+6. 插件建不了会话时（例如宿主接口不可用），先在界面里同一工作目录新建会话，再写 `{"adopt":{"from":"session-原会话","to":"session-新会话"}}`，其余步骤相同。
+7. 撤回：写 `{"revert":{"from":"session-原会话","to":"session-新会话"}}`。插件删掉这次交接记录，暂停新会话的目标、恢复原会话被暂停的目标；新会话在交接后派出的任务仍归新会话。
+
+交接单只用插件和 runner 已有的记录机械生成：目标、轮次、收尾截止时间之后的任务（状态、结论、是否有标记、线程、目录、diff、任务首行）和待收尾清单；不调用模型。交接记录存在状态目录的 `handover.json`（原子写入，可成链 A→B→C，每个会话只能交给一个后继，不能成环）；只有本机请求文件能写它，模型不能。新会话在收尾护栏里也要对原会话已结束的任务收尾，截止时间规则不变；会话的 `maxSessionJobs` / `maxSessionTokens` 仍按各自会话计算。新会话沿用原会话的工作目录和预设，模型用宿主的默认选择，需要时在界面里切换。
+
 ### 0.9.92：从本机修改会话 Goal
 
 向同目录的 `goal-request.json` 写入 `{"sessionId":"session-example","objective":"新的目标","maxGoalRounds":20}`，建议先写临时文件再改名发布。`objective` 和 `maxGoalRounds` 至少提供一个：目标须为非空字符串，轮数须为正安全整数。插件加载指定会话，读取当前未完成 Goal（包括 paused / blocked），用其最新 `id` / `revision` 调用宿主 `goals.edit`，保留原 phase 和激活状态；修改会记录在该会话的持久日志中。这个入口与 send / resume 共用目录监视、串行处理、原子认领及 tmp + rename 结果发布；发布成功后消费请求，不自动重放已认领文件。`goal-result.json` 包含 `requestedAt`、`completedAt`、`sessionId`、`status`、`reason`；`reason` 区分 `edited`、`no_active_goal`（无 Goal 或已完成）、`session_not_found`、`invalid_request`、`error`。仅供本机操作者使用。
@@ -475,6 +489,20 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 `send-result.json` contains claim time `requestedAt`, completion time `completedAt`, `sessionId`, `status`, `reason`, and `error` on failures. Success is `sent / message_submitted`. Skips are `skipped / running` (busy), `skipped / session_changed` (agent replaced or removed during the read), `skipped / error` (unavailable agent, missing host interface or failed submission), and `skipped / invalid_request` (invalid JSON, fields or length; no submission). `sessionId` is `null` when no valid ID can be obtained. Results and plugin logs omit the message body, including any body quoted by host errors.
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
+
+### 0.9.106: Hand a long session over to a fresh one
+
+Every step of a session gets slower as its history grows, because the whole history is resent each step. A hand-over moves the goal and the Codex jobs to a new session and keeps the old one read-only. The plugin's state directory is `%LOCALAPPDATA%\dsh-codex-conductor` of the DSH process (for a portable DSH usually `<DSH data>\local\dsh-codex-conductor`, the directory that holds `loaded.json`). Steps:
+
+1. Let the old session stop: no turn in progress and no running Codex job (otherwise the request is refused, see step 5).
+2. Write `handover-request.json` in the state directory, preferably by renaming a temporary file: `{"sessionId":"session-old","note":"optional line for the new session"}`.
+3. Read `handover-result.json`. With `status` `handed_over`, `to` is the new session id and `briefPath` the brief file. `steps` lists what was done: `session` (created / adopted), `alias` (linked), `predecessorGoal` (paused / unchanged_* / none / failed: …), `delivered` (prompted / prompt_pending / failed) and `successorGoal` (created / exists / none / failed: …). `pending` lists the jobs awaiting close-out. With `refused`, `reason` says why: `turn_running`, `jobs_running` (with `running`), `already_handed_over`, `jobs_unreadable`, `session_not_found` and so on. `rejected` means the request was malformed.
+4. Open the new session in the UI; its first message is the brief. To confirm it sees the old jobs, have it call `codex_jobs` (session_id="current") or `codex_summary`; the old session's job ids must be listed. From now on the old session cannot dispatch, review, continue, verify or cancel (it is told the session was handed over) and can only read.
+5. To hand over while jobs are still running, add `"force": true`; their completion notices still go to the old session, and the new session reads their results with `codex_status`.
+6. If the plugin cannot create the session (for example because the host interface is unavailable), create one in the UI in the same working directory, then write `{"adopt":{"from":"session-old","to":"session-new"}}`; the rest is the same.
+7. Roll back with `{"revert":{"from":"session-old","to":"session-new"}}`. The plugin removes the hand-over record, pauses the new session's goal and resumes the old session's paused goal; jobs the new session dispatched after the hand-over stay with the new session.
+
+The brief is built mechanically from the plugin's and the runner's records, with no model call: goal, rounds, the jobs started after the close-out cut-off (status, verdict, flagged or not, thread, directory, diff, first task line) and the close-out list. Hand-overs are stored in `handover.json` in the state directory (written atomically; chains A→B→C are allowed, each session has at most one successor, no cycles); only local request files write it, never the model. The close-out guard makes the new session close out the old session's finished jobs too, with the same cut-off rule; `maxSessionJobs` / `maxSessionTokens` still count per session. The new session keeps the old session's working directory and preset and starts on the host's default model; switch it in the UI if needed.
 
 ### 0.9.92: Edit a session's goal from a local file
 
