@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -70,6 +70,8 @@ const DEFAULTS = {
   maxSessionJobs: null,
   // 会话消息数超过这个值时标记“建议交接”；0 关闭（自动交接的提醒、询问也随之关闭）
   handoverSuggestMessages: 5000,
+  // 新派活的验收标准超过这么多条时，在派活回执里提醒一句（不拦截）；0 关闭
+  acceptanceWarnAbove: 8,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
   autoHandover: AUTO_HANDOVER_DEFAULTS,
   maxSessionTokens: null,
@@ -822,7 +824,7 @@ function settings(config, logger) {
         : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
-      : key === 'handoverSuggestMessages' ? Number.isInteger(value) && value >= 0
+      : ['handoverSuggestMessages', 'acceptanceWarnAbove'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
@@ -973,6 +975,25 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!Number.isSafeInteger(page?.total)) throw new Error(page?.error ?? page?.error_kind ?? '任务列表不可用');
       return page.total;
     } });
+  // 新派活的验收标准条数：超过 acceptanceWarnAbove 时提醒一句（不拦截），并累计到 acceptance-stats.json 供日后对比。
+  const acceptanceStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'acceptance-stats.json');
+  const acceptanceHint = (args) => {
+    if (args?.resume || !Array.isArray(args?.acceptance)) return '';
+    const items = args.acceptance.length;
+    const limit = cfg.acceptanceWarnAbove ?? 0;
+    const over = limit > 0 && items > limit;
+    if (acceptanceStatsFile) try {
+      let stats;
+      try { stats = JSON.parse(readFileSync(acceptanceStatsFile, 'utf8')); } catch {}
+      if (!stats || typeof stats !== 'object') stats = { since: new Date().toISOString(), dispatches: 0, items: 0, over: 0 };
+      Object.assign(stats, { dispatches: stats.dispatches + 1, items: stats.items + items, over: stats.over + (over ? 1 : 0),
+        threshold: limit, updatedAt: new Date().toISOString() });
+      mkdirSync(path.dirname(acceptanceStatsFile), { recursive: true });
+      writeJsonAtomic(acceptanceStatsFile, stats);
+    } catch {}
+    return over ? `[验收条数] 这单带了 ${items} 条验收标准（提醒阈值 ${limit}）。验收标准只放交付必须满足、能拿证据判断的条目；` +
+      '偏好、顺手的改进和“尽量”类要求写进 task 正文，下次派活时精简。' : '';
+  };
   // 超过阈值时给规划端一行提示，每个回合最多一次；规划端自己不发起交接。
   const hintedTurns = new Map();
   const handoverHint = (agent) => {
@@ -1464,8 +1485,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const unknown = Object.keys(args ?? {}).filter(key => !Object.hasOwn(runTool.parameters.properties, key));
       if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
       const value = await dispatch(args, exec);
-      const hint = handoverHint(exec?.agent);
-      return hint ? { ...value, next: value.next ? `${value.next}\n${hint}` : hint } : value;
+      const hints = [acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
+      return hints ? { ...value, next: value.next ? `${value.next}\n${hints}` : hints } : value;
     },
   };
   ctx.tools.register(runTool);
@@ -2136,9 +2157,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const result = await next();
       const value = history.observe(exec.agent);
       if (result.isError || !value) return result;
+      let acceptance;
+      try { acceptance = acceptanceStatsFile && JSON.parse(readFileSync(acceptanceStatsFile, 'utf8')); } catch {}
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
-        (value.suggest ? '：建议由操作员交接到新会话。' : '');
-      return { ...result, ...(result.value && typeof result.value === 'object' ? { value: { ...result.value, session_history: value } } : {}),
+        (value.suggest ? '：建议由操作员交接到新会话。' : '') +
+        (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
+          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '');
+      return { ...result, ...(result.value && typeof result.value === 'object'
+        ? { value: { ...result.value, session_history: value, ...(acceptance ? { acceptance_stats: acceptance } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。

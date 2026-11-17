@@ -5574,3 +5574,20 @@ test('a handed-over session gets one notice before the first step of each user m
   const refused = await h.handlers['tools/execute']({ name: 'codex_run', arguments: {}, agent: as('S1') }, async () => ({ value: 'ran' }));
   assert.match(refused.error.message, /已交接给 S2[\s\S]*请告诉用户到会话 S2 继续/);
 });
+
+test('a new-work codex_run with too many acceptance items gets one soft line and is counted', async () => {
+  const statsFile = path.join(localAppData, 'dsh-codex-conductor', 'acceptance-stats.json');
+  const before = (() => { try { return JSON.parse(readFileSync(statsFile, 'utf8')); } catch { return { dispatches: 0, over: 0, items: 0 }; } })();
+  const h = harness({ config: { acceptanceWarnAbove: 2, startResult: { job_id: 'J', status: 'completed' } } });
+  const exec = { agent: agentAt('/work/current') };
+  const many = { ...RUN, acceptance: ['测试一通过', '测试二通过', '测试三通过'] };
+  assert.match((await h.tools.codex_run.execute(many, exec)).next, /\[验收条数\] 这单带了 3 条验收标准（提醒阈值 2）[\s\S]*写进 task 正文/);
+  assert.doesNotMatch((await h.tools.codex_run.execute({ ...RUN, acceptance: ['测试一通过', '测试二通过'] }, exec)).next ?? '', /验收条数/);
+  const after = JSON.parse(readFileSync(statsFile, 'utf8'));
+  assert.deepEqual([after.dispatches - before.dispatches, after.over - before.over, after.items - before.items], [2, 1, 5]);
+  const off = harness({ config: { acceptanceWarnAbove: 0, startResult: { job_id: 'J', status: 'completed' } } });
+  assert.doesNotMatch((await off.tools.codex_run.execute(many, exec)).next ?? '', /验收条数/);
+  const runtime = await h.handlers['tools/execute']({ name: 'codex_runtime', arguments: {}, agent: exec.agent },
+    async () => ({ value: {}, content: [{ type: 'text', text: 'ok' }] }));
+  assert.match(runtime.content.at(-1).text, /新派活验收标准：\d+ 单，平均/);
+});
