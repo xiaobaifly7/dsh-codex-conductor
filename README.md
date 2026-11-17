@@ -78,6 +78,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 6. 插件建不了会话时（例如宿主接口不可用），先在界面里同一工作目录新建会话，再写 `{"adopt":{"from":"session-原会话","to":"session-新会话"}}`，其余步骤相同。
 7. 撤回：写 `{"revert":{"from":"session-原会话","to":"session-新会话"}}`。插件删掉这次交接记录，暂停新会话的目标、恢复原会话被暂停的目标；新会话在交接后派出的任务仍归新会话。
 
+何时交接：会话消息数（用户、助手消息和工具结果）超过 `handoverSuggestMessages`（默认 5000，0 关闭）时，`codex_runtime` 和面板的“建议交接的会话”会提示；规划端在 `codex_run` / `codex_jobs` 的结果里每个回合最多看到一行提示，会转告用户，但不会自己发起交接。插件还把各会话的消息数写进状态目录的 `history-status.json`（只有会话 ID、消息数、是否建议、阈值和时间），供外部看门狗读取。交接单里的任务号（job_id）用于各工具的 job_id 参数，线程号只为需要返工的任务列出、只用于 `codex_run` 的 resume；`codex_status` 和 `codex_output` 误收到本会话的线程号时会解析为该线程上最新的任务并注明。
+
 交接单只用插件和 runner 已有的记录机械生成：目标、轮次、收尾截止时间之后的任务（状态、结论、是否有标记、线程、目录、diff、任务首行）和待收尾清单；不调用模型。交接记录存在状态目录的 `handover.json`（原子写入，可成链 A→B→C，每个会话只能交给一个后继，不能成环）；只有本机请求文件能写它，模型不能。新会话在收尾护栏里也要对原会话已结束的任务收尾，截止时间规则不变；会话的 `maxSessionJobs` / `maxSessionTokens` 仍按各自会话计算。新会话沿用原会话的工作目录和预设，模型用宿主的默认选择，需要时在界面里切换。
 
 ### 0.9.92：从本机修改会话 Goal
@@ -317,6 +319,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
 | `closeoutGuard` | `true` | 本会话有已结束、报告标出问题却没有 `codex_review` 的任务，或记了 `needs_changes` 却没有后续轮次的任务时，拒绝开新工作的 `codex_run` 和规划端的 `update_goal(action=complete)`（续接、返工、核验和查询照常；用户在界面上完成目标不受影响）；第一次加载 0.9.103 之前开始的任务不计入，记录读不到时放行并记警告；设为 `false` 关闭。已知限制：带任意 `resume` 的 `codex_run` 视为返工、不受检查，规划端可借本会话的旧线程开新工作；`needs_changes` 任务一旦有后续轮次（哪怕随即 `codex_cancel`）就不再拦 |
+| `handoverSuggestMessages` | `5000` | 会话消息数超过此值时提示“建议交接”（只提示，不自动交接）；0 关闭 |
 | `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools`，已有的拒绝规则仍然优先 |
 | `allowTools` | `[]` | 白名单模式下额外放行的工具名，不区分大小写，`*` 结尾表示前缀匹配；不能放行 `write`、`run_code` 等已被拒绝的工具 |
 | `maxRunningJobs` | 留空（不限制） | 同时运行或排队等写锁的 Codex 任务数上限，须为正整数；达到上限时 `codex_run` / `codex_continue` / `codex_verify` 不启动 Codex 并说明原因，等其中一个结束后再派 |
@@ -502,6 +505,8 @@ Every step of a session gets slower as its history grows, because the whole hist
 6. If the plugin cannot create the session (for example because the host interface is unavailable), create one in the UI in the same working directory, then write `{"adopt":{"from":"session-old","to":"session-new"}}`; the rest is the same.
 7. Roll back with `{"revert":{"from":"session-old","to":"session-new"}}`. The plugin removes the hand-over record, pauses the new session's goal and resumes the old session's paused goal; jobs the new session dispatched after the hand-over stay with the new session.
 
+When to hand over: once a session's message count (user and assistant messages plus tool results) exceeds `handoverSuggestMessages` (default 5000, 0 = off), `codex_runtime` and the panel's "建议交接的会话" row say so; the planner sees one line per turn at most on `codex_run` / `codex_jobs` results and is told to pass it on to the user, never to start a hand-over itself. The plugin also writes each session's count to `history-status.json` in the state directory (session ids, counts, whether a hand-over is suggested, threshold and time only) for an external watchdog. In the brief, job ids are what the tools' job_id parameter takes; thread ids are listed only for jobs that need rework and only for `resume` on `codex_run`. If `codex_status` or `codex_output` receives one of the session's thread ids, it resolves it to the latest job on that thread and says so.
+
 The brief is built mechanically from the plugin's and the runner's records, with no model call: goal, rounds, the jobs started after the close-out cut-off (status, verdict, flagged or not, thread, directory, diff, first task line) and the close-out list. Hand-overs are stored in `handover.json` in the state directory (written atomically; chains A→B→C are allowed, each session has at most one successor, no cycles); only local request files write it, never the model. The close-out guard makes the new session close out the old session's finished jobs too, with the same cut-off rule; `maxSessionJobs` / `maxSessionTokens` still count per session. The new session keeps the old session's working directory and preset and starts on the host's default model; switch it in the UI if needed.
 
 ### 0.9.92: Edit a session's goal from a local file
@@ -590,6 +595,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
 | `closeoutGuard` | `true` | Refuse a new-work `codex_run` and the planner's `update_goal(action=complete)` while the session owns finished jobs whose report flags something and that have no `codex_review`, or a `needs_changes` job with no follow-up round (continue, resume, verify and queries stay allowed); jobs started before 0.9.103 was first loaded never count, and unreadable records fail open with a warning; `false` switches it off. Known limits: a `codex_run` with any `resume` counts as rework and is not checked, so the planner can start new work on one of the session's old threads; a `needs_changes` job stops blocking once any follow-up round exists, even one cancelled straight away |
+| `handoverSuggestMessages` | `5000` | Suggest a hand-over once a session has more messages than this (a hint only, never automatic); 0 switches it off |
 | `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`: empty keeps the one in `CODEX_HOME`, `none` leaves it out, an absolute path uses that file instead (symlinks under `runnerHome/codex-home`, needs WSL) |
 | `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |
