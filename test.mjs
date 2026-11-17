@@ -5343,4 +5343,13 @@ test('close-out guard refuses new-work codex_run until finished jobs are reviewe
   assert.equal((await goal(off, { action: 'complete' })).value, 'done');
   const clear = harness({ config: { closeoutGuard: true, listResult: { jobs: [{ ...flagged, verification_status: 'verified' }], total: 1 } } });
   assert.equal((await goal(clear, { action: 'complete' })).value, 'done');
+  // 没用过 conductor 的会话不查（不调 runner）；会话记录里有派单调用时照查。
+  const goalWith = (h, log) => h.handlers['tools/execute']({ name: 'update_goal', arguments: { action: 'complete' },
+    agent: agentAt('/work/original', log) }, async () => ({ value: 'done' }));
+  const fresh = () => harness({ config: { closeoutGuard: true, listResult: { jobs: [flagged], total: 1 } } });
+  const unused = fresh();
+  assert.equal((await goalWith(unused, [{ type: 'tool/call', data: { name: 'read' } }])).value, 'done');
+  assert.ok(!unused.calls.some(argv => argv[0] === 'list'));
+  assert.equal((await goalWith(fresh(), [{ type: 'tool/call', data: { name: 'codex_run' } }])).isError, true);
+  assert.equal((await goalWith(fresh(), [{ type: 'tool/call', data: { name: 'tool_call', arguments: '{"name":"codex_verify"}' } }])).isError, true);
 });

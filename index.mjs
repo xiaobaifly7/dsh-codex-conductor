@@ -1160,6 +1160,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         '等待期间不要自己动手补做。' };
   }
 
+  // 只有用过 conductor 的会话才查收尾：本实例加载后派过单，或会话记录里有派单调用；记录读不到时照查。
+  const dispatchedSessions = new Set();
+  const DISPATCH_TOOLS = /\b(?:codex_run|codex_continue|codex_verify)\b/;
+  const usedConductor = (agent) => {
+    const log = agent?.session?.log;
+    return dispatchedSessions.has(agent?.id) || !Array.isArray(log) || log.some((e) => e?.type === 'tool/call' &&
+      (DISPATCH_TOOLS.test(e.data?.name ?? '') || (e.data?.name === 'tool_call' && DISPATCH_TOOLS.test(String(e.data.arguments)))));
+  };
   const goalAction = (value) => {
     try { return (typeof value === 'string' ? JSON.parse(value) : value)?.action; } catch { return undefined; }
   };
@@ -1210,6 +1218,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (writer) startingWrites.add(writer);
     try {
       const owner = exec?.agent?.id;
+      if (owner) dispatchedSessions.add(owner);
       const log = exec?.agent?.session?.log ?? [];
       const tool = continuation ? 'codex_continue' : 'codex_run';
       const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
@@ -1969,7 +1978,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
     // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
-    if (exec.name === 'update_goal' && goalAction(exec.arguments) === 'complete') {
+    if (exec.name === 'update_goal' && goalAction(exec.arguments) === 'complete' && usedConductor(exec.agent)) {
       const refusal = await closeoutCheck(exec.agent?.id, 'update_goal', exec.signal);
       if (refusal) return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
     }
