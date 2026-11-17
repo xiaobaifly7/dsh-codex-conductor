@@ -25,6 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -1681,13 +1682,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const source = await conductor.waitJob(args.job_id, 0);
       if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
-      const { job_id, notes = '', accepted_deviations = [], ...review } = args;
+      const { job_id } = args;
+      const prepared = prepareReview(args, source);
+      if (prepared.problems.length) throw new Error(reviewRejection(job_id, source, prepared));
+      const { review } = prepared;
       // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
-      if (Array.isArray(accepted_deviations) && accepted_deviations.length > 0 &&
+      if (review.accepted_deviations.length > 0 &&
           !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
-      const result = await conductor.review(job_id, { ...review, notes, accepted_deviations }, owner, exec?.signal);
+      const result = await conductor.review(job_id, review, owner, exec?.signal);
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
         throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +

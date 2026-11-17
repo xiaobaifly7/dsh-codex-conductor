@@ -44,6 +44,8 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
         `globalThis[${JSON.stringify(traceKey)}].push('gemini-${version}');\nexport const geminiWrite = () => ({});\n`);
       writeFileSync(path.join(dir, 'panel.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('panel-${version}');\nexport const registerPanel = () => {};\n`);
+      writeFileSync(path.join(dir, 'closeout.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('closeout-${version}');\nexport const prepareReview = () => ({}), reviewRejection = () => '';\n`);
       writeFileSync(path.join(dir, 'guard.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
         readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));
@@ -51,7 +53,7 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['closeout-new', 'closeout-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
