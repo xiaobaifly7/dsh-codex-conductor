@@ -41,3 +41,17 @@ test('review repair lists every remaining problem in one message', () => {
   assert.equal(wrong.review.accepted_deviations.length, 1);
   assert.ok(wrong.problems.some((p) => p.includes('reported#2 不存在')));
 });
+
+test('verified must address every item the report flagged', () => {
+  const flagged = source({}, { criteria: [{ criterion: '第一条', status: 'met', evidence: 'e' }, { criterion: '第二条', status: 'blocked', evidence: '没跑测试' }],
+    unresolved: ['数据未刷新'], blockers: [{ id: 'B1', kind: 'environment', message: '网络断开', question: '', resolution: '' }] });
+  const copied = prepareReview({ status: 'verified', criteria: [met(1), { index: 2, status: 'met', evidence: '没跑测试' }] }, flagged);
+  assert.ok(copied.problems.some((p) => p.includes('第 2 条为 blocked')));
+  assert.ok(copied.problems.some((p) => p.includes('unresolved#1')));
+  assert.ok(copied.problems.some((p) => p.includes('blocker:B1')));
+  const addressed = prepareReview({ status: 'verified', criteria: [met(1), met(2)],
+    notes: 'unresolved#1: 已手动刷新并核对\nblocker:B1: 网络已恢复，测试已重跑' }, flagged);
+  assert.deepEqual(addressed.problems, []);
+  // needs_changes 不受此约束。
+  assert.deepEqual(prepareReview({ status: 'needs_changes', criteria: [met(1), { index: 2, status: 'not_met', evidence: 'x' }] }, flagged).problems, []);
+});

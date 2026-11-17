@@ -1951,6 +1951,7 @@ test('codex_review sends every criterion in stdin and returns verification witho
 
 test('codex_review accepts a complete review without empty optional fields', async () => {
   const source = workflowSource('implementation');
+  source.structured.blockers = [];
   const review = { status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '只读测试确认已通过' }] };
   const record = { ...review, notes: '', accepted_deviations: [] };
   const h = harness({ config: { reviewResult: { ...source, verification_status: 'verified', verification: record } } });

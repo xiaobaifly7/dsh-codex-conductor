@@ -1657,6 +1657,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         : 'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。') +
       '不能把 Codex 自报 met 当作独立核验。审计/核对类任务逐项判断是否完成核对：已完成记 met；被审正文的缺陷写入 notes/结论，不因此记 needs_changes。' +
       '全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes。' +
+      'verified 不能与原报告矛盾：报告自标 not_met/blocked 的条目要写你自己的核验证据；报告的未决项和阻塞须在 notes 逐项写「unresolved#N: 依据」「blocker:<id>: 依据」。' +
       'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
@@ -1684,13 +1685,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
       const prepared = prepareReview(args, source);
-      if (prepared.problems.length) throw new Error(reviewRejection(job_id, source, prepared));
       const { review } = prepared;
       // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
-      if (review.accepted_deviations.length > 0 &&
+      if (Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0 &&
           !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
+      if (prepared.problems.length) throw new Error(reviewRejection(job_id, source, prepared));
       const result = await conductor.review(job_id, review, owner, exec?.signal);
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {

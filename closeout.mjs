@@ -124,11 +124,38 @@ export function prepareReview(args, source) {
     if (open.length) problems.push(`${review.status} 要求每条验收都 met；${open.map((c) => `${c.index}=${c.status}`).join('、')} 未通过，改记 needs_changes，或核实后给出 met 的证据`);
     if (Array.isArray(review.blockers) && review.blockers.length) problems.push(`${review.status} 不能带活动 blockers；有阻塞请记 needs_changes`);
   }
+  if (review.status === 'verified') problems.push(...unaddressed(review, source, acceptance));
   if (review.status === 'needs_changes' && !deviations.length && Array.isArray(review.criteria) && review.criteria.length &&
       review.criteria.every((c) => c?.status === 'met') && !(review.blockers ?? []).length) {
     problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met 或加 blocker');
   }
   return { review, fixed, problems };
+}
+
+// verified 不能与原报告矛盾：报告自标未满足/阻塞的验收项要有规划端自己的核验证据（不能照抄 Codex 的 evidence），
+// 报告的 unresolved 与 blockers 没有专门的条目结构，须在 notes 里逐项用标记说明（偏差与范围外改动已由 accepted_deviations 覆盖）。
+function unaddressed(review, source, acceptance) {
+  const report = source?.structured;
+  if (!report || typeof report !== 'object' || !Array.isArray(review.criteria)) return [];
+  const problems = [];
+  (Array.isArray(report.criteria) ? report.criteria : []).forEach((c, i) => {
+    if (!c || !['not_met', 'blocked'].includes(c.status)) return;
+    const hit = acceptance?.findIndex((a) => nonempty(c.criterion) && label(a).trim() === c.criterion.trim());
+    const index = hit >= 0 ? hit + 1 : i + 1;
+    const entry = review.criteria.find((r) => r?.index === index);
+    // 缺项或未 met 已由上面的覆盖与通过检查报告，这里只拦照抄报告证据的 met。
+    if (entry?.status !== 'met' || !nonempty(entry.evidence) || entry.evidence.trim() !== String(c.evidence ?? '').trim()) return;
+    problems.push(`Codex 报告第 ${index} 条为 ${c.status}；verified 需要你在 criteria index ${index} 写出自己核实已满足的证据，不能照抄报告原文，否则记 needs_changes`);
+  });
+  const notes = typeof review.notes === 'string' ? review.notes : '';
+  (Array.isArray(report.unresolved) ? report.unresolved : []).forEach((u, i) => {
+    if (!notes.includes(`unresolved#${i + 1}`)) problems.push(`报告未决项 unresolved#${i + 1}「${clip(u, 80)}」未处理；verified 需在 notes 写「unresolved#${i + 1}: 已解决或不影响验收的依据」，否则记 needs_changes`);
+  });
+  (Array.isArray(report.blockers) ? report.blockers : []).forEach((b) => {
+    const id = b?.id ?? '?';
+    if (!notes.includes(`blocker:${id}`)) problems.push(`报告阻塞 blocker:${id}「${clip(b?.message, 80)}」未处理；verified 需在 notes 写「blocker:${id}: 已解除的依据」，否则记 needs_changes`);
+  });
+  return problems;
 }
 
 export function reviewRejection(jobId, source, { fixed, problems }) {
