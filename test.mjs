@@ -5644,3 +5644,16 @@ test('a hand-over successor can continue the job of its predecessor', async (t) 
   const payload = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin);
   assert.deepEqual([payload.context.owner, payload.context.continuation.parent_job_id], ['S2', 'PARENT']);
 });
+
+test('handover-pending lists sessions with an auto hand-over pending or a hand-over request waiting or in progress', async (t) => {
+  const { handoverPendingSessions } = await import('./index.mjs');
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-pending-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  assert.deepEqual(handoverPendingSessions(root), []);
+  writeFileSync(path.join(root, 'auto-handover.json'), JSON.stringify({ sessions: { 'session-A': { pending: { requestedAt: 'x' } }, 'session-B': {} } }));
+  writeFileSync(path.join(root, 'handover-request.json'), JSON.stringify({ sessionId: 'session-C' }));
+  writeFileSync(path.join(root, 'handover-request.0f1e2d3c-aaaa-bbbb-cccc-1234567890ab.processing.json'), JSON.stringify({ adopt: { from: 'session-D', to: 'session-E' } }));
+  writeFileSync(path.join(root, 'handover-result.json'), JSON.stringify({ from: 'session-F' }));
+  assert.deepEqual(handoverPendingSessions(root), ['session-A', 'session-C', 'session-D', 'session-E']);
+  assert.deepEqual(handoverPendingSessions(path.join(root, 'missing')), []);
+});

@@ -14,7 +14,7 @@
 
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -124,6 +124,27 @@ DeepSeek 派活给 Codex 前的规划要求（dsh-codex-conductor）。
 `;
 
 // 规划要求文件的有效内容：去掉 HTML 注释；文件不存在或读不了就当没有
+// 给外部看门狗：哪些会话正有交接排队或进行中（自动交接的 pending，或还没处理完的交接请求文件）。只含会话 ID。
+export function handoverPendingSessions(directory) {
+  const ids = new Set();
+  try {
+    const sessions = JSON.parse(readFileSync(path.join(directory, 'auto-handover.json'), 'utf8')).sessions ?? {};
+    for (const [id, record] of Object.entries(sessions)) if (record?.pending) ids.add(id);
+  } catch {}
+  let names = [];
+  try { names = readdirSync(directory); } catch {}
+  for (const name of names) {
+    if (!/^handover-request(\.[0-9a-f-]+\.processing)?\.json$/.test(name)) continue;
+    try {
+      const request = JSON.parse(readFileSync(path.join(directory, name), 'utf8').replace(/^﻿/, ''));
+      for (const id of [request.sessionId, request.adopt?.from, request.adopt?.to, request.revert?.from, request.revert?.to]) {
+        if (typeof id === 'string' && id) ids.add(id);
+      }
+    } catch {}
+  }
+  return [...ids].sort();
+}
+
 export function plannerPrompt(file) {
   try {
     return readFileSync(file, 'utf8').replace(/<!--[\s\S]*?-->/g, '').trim();
@@ -2253,6 +2274,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}
   const resumeDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  // 每 2 秒把排队或进行中的交接写进 handover-pending.json（只在变化时写），看门狗据此不去打扰这些会话。
+  if (resumeDirectory) ctx.effect?.(() => {
+    let last;
+    const timer = setInterval(() => {
+      try {
+        const sessions = handoverPendingSessions(resumeDirectory);
+        const key = sessions.join(',');
+        if (key === last) return;
+        mkdirSync(resumeDirectory, { recursive: true });
+        writeJsonAtomic(path.join(resumeDirectory, 'handover-pending.json'), { updatedAt: new Date().toISOString(), sessions });
+        last = key;
+      } catch {}
+    }, 2_000);
+    timer.unref?.();
+    return () => clearInterval(timer);
+  });
   if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
     registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume });
     registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,
