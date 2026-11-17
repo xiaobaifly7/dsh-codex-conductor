@@ -1834,7 +1834,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' +
         (cfg.gemini.defaultMaxChars ? `不传时默认 ${cfg.gemini.defaultMaxChars}。` : '') },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },
-      background: { type: 'boolean', description: '默认 false：前台等到写完再返回回执。true：登记为 Harness 后台任务后立即返回 background_job_id，写完由完成通知或 job_output 送回同样的回执；没有后台任务服务时仍按前台执行。' },
+      background: { type: 'boolean', description: '默认后台：登记为 Harness 后台任务后立即返回 background_job_id，写完由完成通知或 job_output 送回同样的回执，期间可以继续规划。传 false 才前台等到写完再返回；没有后台任务服务或同目录正忙时也按前台执行。' },
       reuse_draft: { type: 'string', description: '失败回执的 draft_path：只接受插件 gemini-drafts 目录内 .md，与 output/sources 分开；跳过 agy，按本次参数重新校验、落盘，超 max_chars 直接拒绝，不自动压缩。' },
       frontmatter: { type: 'object', additionalProperties: false, required: ['title', 'tags'],
         description: '启用后由插件生成七字段 YAML；title 和至少一个非空 tags 必填，单值最多 200 个 Unicode 字符且禁止换行和控制字符；仅 tags/aliases 可用字符串数组，aliases 允许空数组；不传则保留原有正文处理。',
@@ -1871,8 +1871,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           recordGemini({ ...value, ...extra }, owner);
           return value;
         }).finally(() => { if (!busy) geminiWrites.delete(key); });
-      // 后台模式：登记 DSH 后台任务后立即返回，写完由完成通知送回同样的回执；没有 jobs 服务或目录正忙时照常前台执行。
-      const jobs = background === true && !busy && owner ? ctx.get?.('jobs') : undefined;
+      // 默认后台：登记 DSH 后台任务后立即返回，写完由完成通知送回同样的回执；没有 jobs 服务或目录正忙时照常前台执行。
+      const jobs = background !== false && !busy && owner ? ctx.get?.('jobs') : undefined;
       if (!jobs) return write(exec?.signal);
       const id = randomUUID().slice(0, 8);
       const stop = new AbortController();

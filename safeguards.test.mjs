@@ -218,7 +218,8 @@ test('gemini_write can run as a background job and still leaves its receipt and 
   apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {}, get: name => name === 'jobs' ? jobs : undefined },
     { gemini: { command: 'C:\\agy\\agy.exe' } }, async () => ({ jobs: [], total: 0 }), () => { throw new Error('spawn unavailable'); });
   const call = { prompt: '根据素材写第一章入门说明。', sources: ['notes.md'], output: 'chapter.md' };
-  const value = await tools.gemini_write.execute({ ...call, background: true }, exec('S1', root));
+  // 不传 background 即后台。
+  const value = await tools.gemini_write.execute(call, exec('S1', root));
   assert.deepEqual([value.status, value.background_job_id], ['running', 'BG7']);
   assert.match(started[0].spec.label, new RegExp(`^Gemini ${value.write_id} · chapter\\.md$`));
   const settled = await started[0].done;
@@ -226,9 +227,14 @@ test('gemini_write can run as a background job and still leaves its receipt and 
   assert.match(settled.result, /spawn unavailable/);
   const last = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'gemini-history.jsonl'), 'utf8').trim().split('\n').at(-1));
   assert.deepEqual([last.id, last.background, last.status], [value.write_id, true, 'failed']);
-  // Without the flag, and without a jobs service, the call stays in the foreground.
-  assert.equal((await tools.gemini_write.execute(call, exec('S1', root))).status, 'failed');
+  // background:false still forces the foreground.
+  assert.equal((await tools.gemini_write.execute({ ...call, overwrite: true, background: false }, exec('S1', root))).status, 'failed');
   assert.equal(started.length, 1);
+  // Without a jobs service the default stays in the foreground.
+  const bare = {};
+  apply({ tools: { register: tool => bare[tool.name] = tool, guard() {} }, on() {}, get: () => undefined },
+    { gemini: { command: 'C:\\agy\\agy.exe' } }, async () => ({ jobs: [], total: 0 }), () => { throw new Error('spawn unavailable'); });
+  assert.equal((await bare.gemini_write.execute({ ...call, overwrite: true }, exec('S1', root))).status, 'failed');
 });
 
 test('allowlist mode refuses unlisted tools only when it is switched on', () => {
