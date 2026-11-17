@@ -1154,6 +1154,35 @@ class RunnerTests(unittest.TestCase):
             router.assert_not_called()
             attempt.assert_not_called()
 
+    def test_full_access_read_only_job_takes_no_write_lock_or_snapshot(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        context = {"owner": "a", "task": "t", "acceptance": ["x"], "write": False}
+        self.assertEqual(codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None, context), {})
+        self.assertTrue(codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None, {**context, "write": True}))
+        self.assertTrue(codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None))
+        self.assertTrue(codex_runner.write_lock_roots(str(self.cwd), "workspace-write", None, context))
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        for write, expect_lock in ((False, False), (True, True)):
+            args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "danger-full-access", "--lock-timeout", "1"])
+            args.context = {**context, "write": write}
+            elapsed = [0]
+            def advance(delay):
+                elapsed[0] += delay
+            with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])),                     codex_runner.acquire_write_lock(str(self.cwd)),                     mock.patch.object(codex_runner, "time", wraps=time) as clock,                     mock.patch.object(codex_runner, "snapshot_before", return_value=(None, None)) as snapshot,                     mock.patch.object(codex_runner, "diff_begin") as diff,                     mock.patch.object(codex_runner, "router_reachable", side_effect=RuntimeError("stop")):
+                clock.monotonic.side_effect = lambda: elapsed[0]
+                clock.sleep.side_effect = advance
+                try:
+                    result = codex_runner.execute(args, "look", Path(self.tmp.name) / f"run-{write}")
+                except RuntimeError:
+                    result = {}
+                # A writer still waits for the held lock; a read-only full-access job goes straight to Codex.
+                self.assertEqual(result.get("error_kind") == "lock_timeout", expect_lock)
+                self.assertEqual(snapshot.called, False)
+                self.assertEqual(diff.called, False)
+
     def test_lock_timeout_does_not_acquire_a_lock_released_after_the_deadline(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -2912,7 +2941,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(exact["total"], 1)
         self.assertEqual([j["job_id"] for j in exact["jobs"]], ["legacy"])
         owned = next(j for j in result["jobs"] if j["job_id"] == "owned")
-        self.assertEqual(owned["context"], {"owner": "owner-a", "task": "Task title"})
+        self.assertEqual(owned["context"], {"owner": "owner-a", "write": True, "task": "Task title"})
         self.assertEqual(owned["scope"], ["src"])
         self.assertEqual(owned["scope_paths"], [os.path.realpath(self.cwd / "src")])
         self.assertEqual(owned["criteria_counts"], {"met": 1, "not_met": 0, "blocked": 0})

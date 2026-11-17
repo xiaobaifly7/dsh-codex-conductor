@@ -4496,6 +4496,7 @@ test('gemini_write rejects running and queued Codex writers and unavailable hist
     { status: 'running', sandbox: 'workspace-write', phase: 'codex_running' },
     { status: 'running', sandbox: 'workspace-write', phase: 'lock_wait' },
     { status: 'running', sandbox: 'danger-full-access' },
+    { status: 'running', sandbox: 'danger-full-access', context: { write: true } },
     { status: 'running' },
   ]) {
     const h = geminiFixture(t, { config: { listResult: { jobs: [{ job_id: 'ACTIVE', ...row }], total: 1 } } });
@@ -4522,6 +4523,10 @@ test('gemini_write rejects running and queued Codex writers and unavailable hist
   assert.equal(h.spawns.length, 0);
   const reader = geminiFixture(t, { config: { listResult: { jobs: [{ job_id: 'READ', status: 'running', sandbox: 'read-only' }], total: 1 } } });
   assert.equal((await reader.execute()).status, 'completed');
+  // 主机模式的只读任务（write=false）不加写锁，不挡 gemini_write。
+  const hostReader = geminiFixture(t, { config: { listResult: { jobs: [{ job_id: 'HOSTREAD', status: 'running',
+    sandbox: 'danger-full-access', context: { write: false } }], total: 1 } } });
+  assert.equal((await hostReader.execute()).status, 'completed');
 });
 
 test('gemini_write validates sources, output and overwrite before spawning', async (t) => {

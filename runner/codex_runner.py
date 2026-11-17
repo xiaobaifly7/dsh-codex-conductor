@@ -269,8 +269,15 @@ def acquire_write_lock(cwd):
     return acquire_file_lock(locks / f"{write_lock_key(cwd)}.lock")
 
 
-def write_lock_roots(cwd, sandbox, writable_roots):
-    if sandbox == "read-only":
+def writer(sandbox, context=None):
+    # A full-access job dispatched with write=false keeps its sandbox (it may launch Windows programs)
+    # but is trusted not to write: no directory write lock, snapshot or diff.
+    return sandbox != "read-only" and not (
+        sandbox == "danger-full-access" and isinstance(context, dict) and context.get("write") is False)
+
+
+def write_lock_roots(cwd, sandbox, writable_roots, context=None):
+    if not writer(sandbox, context):
         return {}
     roots = [cwd]
     if sandbox == "workspace-write":
@@ -297,7 +304,7 @@ def earlier_writer_waiting(run_dir, roots):
             task = task_record(job_dir)
             if not task.get("cwd"):
                 continue
-            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"))
+            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"), task.get("context"))
             other_paths = [Path(tree_key(p)) for p in other_roots.values()]
             overlapping_roots = [root for root, path in zip(other_roots.values(), other_paths)
                                  if any(path.is_relative_to(p) or p.is_relative_to(path) for p in paths)]
@@ -987,10 +994,12 @@ def execute(args, prompt, run_dir):
     locks = []
     before = scope = None
     event_changes = []
+    writes = writer(args.sandbox, getattr(args, "context", None))
     try:
-        if args.sandbox != "read-only":
+        if writes:
             try:
-                roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None))
+                roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None),
+                                         getattr(args, "context", None))
                 lock_timeout = getattr(args, "lock_timeout", None)
                 deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
@@ -1029,12 +1038,12 @@ def execute(args, prompt, run_dir):
                 diff_begin(run_dir, args.cwd, not getattr(args, "no_diff", False))
 
         def changes():
-            return files_changed(args.cwd, before, event_changes, scope, ignore) \
-                if args.sandbox != "read-only" else {}
+            # Without a snapshot (read-only full-access jobs) this still reports Codex's own patch events.
+            return files_changed(args.cwd, before, event_changes, scope, ignore) if args.sandbox != "read-only" else {}
 
         def diff():
             try:
-                return diff_end(run_dir) if args.sandbox != "read-only" else {}
+                return diff_end(run_dir) if writes else {}
             except OSError as error:
                 return {"diff_status": "skipped", "diff_reason": str(error)[:300]}
 
@@ -1776,6 +1785,7 @@ def list_jobs(args):
               "last_error_kind", "retry_at")
     page = [{**{k: j.get(k) for k in fields},
              "context": {"owner": j["context"].get("owner"),
+                         **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
                          "task": j["context"]["task"].strip().splitlines()[0][:160],
                          **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
                          **({"verification_of": j["context"]["verification_of"]} if "verification_of" in j["context"] else {})}

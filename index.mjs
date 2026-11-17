@@ -1165,7 +1165,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
     if (!cwd) throw reject('codex_run: 当前会话没有工作区，请传 cwd');
-    const writer = cfg.gemini && (args.write || (args.host_access ?? cfg.defaultHostAccess)) ? { cwd: normPath(cwd) } : null;
+    // 只有 write=true 的任务加目录写锁；主机模式的只读任务不挡同目录的 gemini_write。
+    const writer = cfg.gemini && args.write ? { cwd: normPath(cwd) } : null;
     if (writer && geminiWrites.has(writer.cwd)) throw reject('codex_run: 同一任务目录的 gemini_write 尚未结束，请先等它结束');
     const finish = (result) => {
       const outside = result.scope_paths ? result.out_of_scope : outOfScope(result, cwd, args.scope);

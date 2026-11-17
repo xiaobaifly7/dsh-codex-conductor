@@ -89,7 +89,8 @@ async function noCodexWriters(conductor, cwd, signal) {
           !['read-only', 'workspace-write', 'danger-full-access'].includes(job.sandbox)) {
         throw new Error(`无法确认 Codex 任务 ${job.job_id ?? ''} 的写入状态`);
       }
-      if (job.sandbox !== 'read-only') throw new Error(`同一任务目录的可写 Codex 任务 ${job.job_id} 正在运行或排队，请先等它结束`);
+      // 主机模式的只读任务（write=false）不加写锁，也不挡 gemini_write。
+      if (job.sandbox !== 'read-only' && !(job.sandbox === 'danger-full-access' && job.context?.write === false)) throw new Error(`同一任务目录的可写 Codex 任务 ${job.job_id} 正在运行或排队，请先等它结束`);
     }
     offset += page.jobs.length;
     if (offset === total) return;
