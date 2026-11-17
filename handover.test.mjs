@@ -149,7 +149,7 @@ test('history tracker counts messages incrementally, flags sessions over the thr
 });
 
 // 交接用的最小宿主：会话、目标、sessionController；log 里放 turn/start 模拟回合。
-function host(t) {
+function host(t, hooks = {}) {
   const root = dir(t);
   const agents = new Map();
   const goalsByAgent = new Map();
@@ -164,12 +164,12 @@ function host(t) {
     get: (x) => goalsByAgent.get(x),
     pause: (x) => goalsByAgent.set(x, { ...goalsByAgent.get(x), phase: 'paused' }),
     resume: (x) => goalsByAgent.set(x, { ...goalsByAgent.get(x), phase: 'active' }),
-    create: (x, request) => goalsByAgent.set(x, { id: 'G', revision: 1, phase: 'active', ...request }),
+    create: (x, request) => { hooks.goalCreate?.(x, request); goalsByAgent.set(x, { id: 'G', revision: 1, phase: 'active', ...request, ...hooks.goalPatch }); },
   };
   const ctx = { get: (name) => ({ goals, sessionController: {
     resolveAgent: async (id) => (agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found', message: 'no' } }),
     create: async () => { const id = `session-N${++next}`; agent(id); return { sessionId: id }; },
-    prompt: async (request) => { prompts.push(request); },
+    prompt: async (request) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId)); },
   } })[name] };
   const aliases = createAliases(root);
   const deps = { aliases, since: 0, deliverWaitMs: 50, sessionJobs: async () => [], pendingOf: () => ({ unreviewed: [], needsChanges: [] }) };
@@ -238,34 +238,203 @@ test('a revert is refused once the successor has new turns beyond the brief, and
   assert.match(forced.sessions[1].note, /请决定保留哪一个会话/);
 });
 
-test('the auto-continue of the old session is turned off through an interface when one exists, otherwise reported as manual, and restored on revert', async (t) => {
-  const { setAutoContinue } = await import('./handover.mjs');
-  // 插件不在：什么都不做。
-  assert.deepEqual(await setAutoContinue(undefined, 'session-A', 'off'), { autoContinue: 'not_installed' });
-  assert.deepEqual(await setAutoContinue(() => undefined, 'session-A', 'off'), { autoContinue: 'not_installed' });
-  assert.deepEqual(await setAutoContinue(() => { throw new Error('boom'); }, 'session-A', 'off'), { autoContinue: 'failed:boom' });
+// 宿主设置服务的替身：describe 给出 auto-continue 的当前值，mutate 按 set / unset 改 sessionModes。
+function settingsService(modes, { installed = true, writable = true, fail } = {}) {
+  const calls = [];
+  return { calls, writable,
+    describe: () => (installed ? [{ ns: 'other', value: {} }, { ns: 'auto-continue', value: { sessionModes: { ...modes } } }] : [{ ns: 'other', value: {} }]),
+    async mutate(ns, ops) {
+      calls.push([ns, ops]);
+      if (fail) throw new Error(fail);
+      for (const op of ops) {
+        if (op.op === 'set') modes[op.path[1]] = op.value;
+        else delete modes[op.path[1]];
+      }
+    } };
+}
+
+test('a hand-over turns the old session auto-continue off through the host settings and a revert restores the previous value', async (t) => {
+  const { autoContinueFromSettings, disableAutoContinue, AUTO_CONTINUE_ENTRY } = await import('./handover.mjs');
+  assert.equal(AUTO_CONTINUE_ENTRY, 'auto-continue', 'the profile entry id dsh-client-auto-continue registers and mutates');
   const h = host(t);
+  // 原来没有这个键：设为 off，撤回时删掉键。
+  const modes = { 'session-X': 'loop' };
+  const settings = settingsService(modes);
+  const probe = autoContinueFromSettings(settings);
   h.agent('session-A');
-  // 有接口：关掉并记下原模式，撤回时恢复。
-  const modes = { 'session-A': 'loop' };
-  const api = (id) => ({ mode: modes[id] ?? 'default', setMode: async (mode) => { modes[id] = mode; } });
-  const handed = await h.request({ sessionId: 'session-A' }, { autoContinue: api });
-  assert.deepEqual([handed.steps.autoContinue, modes['session-A']], ['disabled', 'off']);
-  assert.deepEqual([h.aliases.links()[handed.to].autoContinue, h.aliases.links()[handed.to].autoContinuePrevious], ['disabled', 'loop']);
-  const reverted = await h.request({ revert: { from: 'session-A', to: handed.to } }, { autoContinue: api });
-  assert.deepEqual([reverted.steps.autoContinue, modes['session-A']], ['restored', 'loop']);
-  // 接口失败不影响交接。
-  const failing = await h.request({ sessionId: 'session-A' }, { autoContinue: () => ({ mode: 'recover', setMode: async () => { throw new Error('busy'); } }) });
-  assert.deepEqual([failing.status, failing.steps.autoContinue], ['handed_over', 'failed:busy']);
-  // 只读得到模式、没有接口：要求手动关，交接单写明。
+  const handed = await h.request({ sessionId: 'session-A' }, { autoContinue: probe });
+  assert.deepEqual([handed.steps.autoContinue, modes], ['disabled', { 'session-X': 'loop', 'session-A': 'off' }]);
+  assert.deepEqual(settings.calls[0], ['auto-continue', [{ op: 'set', path: ['sessionModes', 'session-A'], value: 'off' }]]);
+  assert.deepEqual([h.aliases.links()[handed.to].autoContinue, h.aliases.links()[handed.to].autoContinuePrevious], ['disabled', null]);
+  assert.equal(handed.checks.predecessorFrozen, 'ok');
+  const reverted = await h.request({ revert: { from: 'session-A', to: handed.to } }, { autoContinue: probe });
+  assert.deepEqual([reverted.steps.autoContinue, modes], ['restored', { 'session-X': 'loop' }]);
+  assert.deepEqual(settings.calls.at(-1), ['auto-continue', [{ op: 'unset', path: ['sessionModes', 'session-A'] }]]);
+  // 原来是 loop：撤回时写回 loop；其他会话的键不动。
+  modes['session-A'] = 'loop';
+  const again = await h.request({ sessionId: 'session-A' }, { autoContinue: probe });
+  assert.equal(h.aliases.links()[again.to].autoContinuePrevious, 'loop');
+  await h.request({ revert: { from: 'session-A', to: again.to } }, { autoContinue: probe });
+  assert.deepEqual(modes, { 'session-X': 'loop', 'session-A': 'loop' });
+  // 已经是 off、插件没装、设置服务不可写、写入失败。
+  modes['session-A'] = 'off';
+  assert.deepEqual(await disableAutoContinue(probe, 'session-A'), { autoContinue: 'already_off' });
+  assert.deepEqual(await disableAutoContinue(autoContinueFromSettings(settingsService({}, { installed: false })), 'session-A'), { autoContinue: 'not_installed' });
+  assert.deepEqual(await disableAutoContinue(autoContinueFromSettings(undefined), 'session-A'), { autoContinue: 'not_installed' });
+  assert.deepEqual(await disableAutoContinue(autoContinueFromSettings(settingsService({}, { writable: false })), 'session-A'), { autoContinue: 'manual_required' });
+  h.agent('session-F');
+  const failing = await h.request({ sessionId: 'session-F' }, { autoContinue: autoContinueFromSettings(settingsService({}, { fail: 'busy' })) });
+  assert.deepEqual([failing.steps.autoContinue, failing.status, failing.checks.predecessorFrozen],
+    ['failed:busy', 'handed_over_with_issues', 'failed:autoContinue_failed:busy']);
+  // 手动关闭时交接单写明。
   h.agent('session-M');
-  const manual = await h.request({ sessionId: 'session-M' }, { autoContinue: () => ({ mode: 'default' }) });
-  assert.deepEqual([manual.status, manual.steps.autoContinue], ['handed_over', 'manual_required']);
+  const manual = await h.request({ sessionId: 'session-M' }, { autoContinue: autoContinueFromSettings(settingsService({}, { writable: false })) });
+  assert.equal(manual.steps.autoContinue, 'manual_required');
   assert.match(readFileSync(manual.briefPath, 'utf8'), /把原会话 session-M 的“自动继续”开关关掉/);
-  // 关闭这一步可以按配置跳过。
+  // disableAutoContinue: false 时完全不碰。
   h.agent('session-S');
-  const skipped = await h.request({ sessionId: 'session-S' }, { autoContinue: api, disableAutoContinue: false });
-  assert.equal(skipped.steps.autoContinue, undefined);
+  const before = settings.calls.length;
+  const skipped = await h.request({ sessionId: 'session-S' }, { autoContinue: probe, disableAutoContinue: false });
+  assert.deepEqual([skipped.steps.autoContinue, settings.calls.length], [undefined, before]);
+});
+
+test('the brief extracts human instructions and the last completed turn mechanically, filtering automated sources', async () => {
+  const { sessionContext } = await import('./handover.mjs');
+  const user = (text, source = { kind: 'user' }, time = 1_000) => ({ type: 'user/message', time, data: { content: [{ type: 'text', text }], ...(source ? { source } : {}) } });
+  const log = [
+    user('最早的要求：用中文写', null, 1),
+    user('第一条要求：保留旧接口', { kind: 'user' }, 2),
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: '早先的小结' }] } } },
+    { type: 'turn/end', time: 3, data: { turn: 1, reason: { kind: 'completed' } } },
+    user('目标续轮', { kind: 'goal', round: 3 }),
+    user('插件通知', { kind: 'plugin:dsh-client-auto-continue' }),
+    user('任务通知', { kind: 'tool-jobs', form: 'notice' }),
+    user('继续'), user('继续。宿主在你上一轮运行期间重启了; 从中断处继续'), user('(上一步工具「x」已完成, 不要重复执行)'),
+    user('[codex-conductor 交接] 本会话接手……'), user('Harness 已重启，接着上次中断的地方继续。'),
+    user('继续做第三章，注意术语表', { kind: 'user' }, 5),
+    user('长'.repeat(700), { kind: 'user' }, 6),
+    { type: 'turn/start', data: { turn: 2 } },
+    { type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: '阶段小结：' + '进'.repeat(2000) }] } } },
+    { type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'thinking', text: '不可见' }] } } },
+    { type: 'turn/end', time: Date.parse('2026-11-17T10:00:00Z'), data: { turn: 2, reason: { kind: 'completed' } } },
+    { type: 'turn/start', data: { turn: 3 } },
+    { type: 'assistant/message', data: { turn: 3, message: { content: [{ type: 'text', text: '出错前的半句' }] } } },
+    { type: 'turn/end', time: Date.parse('2026-11-17T11:00:00Z'), data: { turn: 3, reason: { kind: 'error' } } },
+  ];
+  const context = sessionContext(log, { autoMessage: 'Harness 已重启，接着上次中断的地方继续。' });
+  assert.deepEqual(context.instructions.map((m) => m.text.slice(0, 12)), ['长'.repeat(12), '继续做第三章，注意术语表', '第一条要求：保留旧接口']);
+  assert.equal(context.instructions[0].text.length, 601, '600 characters plus an ellipsis');
+  assert.deepEqual(context.lastTurn, { reason: 'error', at: '2026-11-17T11:00:00.000Z' });
+  assert.ok(context.progress.text.startsWith('阶段小结：'));
+  assert.equal(context.progress.text.length, 1501);
+  // 最多 8 条，最近的在前。
+  const many = Array.from({ length: 12 }, (_, i) => user(`要求 ${i}`, { kind: 'user' }, i));
+  assert.deepEqual(sessionContext(many).instructions.map((m) => m.text), ['要求 11', '要求 10', '要求 9', '要求 8', '要求 7', '要求 6', '要求 5', '要求 4']);
+  // 超过时限：放弃这两节。
+  let clock = 0;
+  assert.deepEqual(sessionContext(Array.from({ length: 2000 }, () => ({ type: 'tool/call' })), { now: () => (clock += 6_000) }), { timedOut: true });
+  assert.deepEqual(sessionContext(undefined), { instructions: [], lastTurn: undefined, progress: undefined });
+});
+
+const briefJobs = (n) => Array.from({ length: n }, (_, i) => ({ job_id: `J${String(n - i).padStart(3, '0')}`, execution_status: i === 30 ? 'running' : 'completed',
+  verification_status: 'verified', cwd: '/work/project', context: { task: `第 ${n - i} 单：${'整理'.repeat(40)}` } }));
+
+test('the brief has every section in order, caps each section and drops whole sections by priority beyond the total limit', async () => {
+  const { buildBrief, sessionContext, BRIEF_LIMIT } = await import('./handover.mjs');
+  const log = [
+    ...Array.from({ length: 10 }, (_, i) => ({ type: 'user/message', time: Date.parse('2026-11-17T08:00:00Z') + i, data: { source: { kind: 'user' }, content: [{ type: 'text', text: `第 ${i} 条用户要求：${'细节'.repeat(150)}` }] } })),
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: `阶段小结：${'完成'.repeat(900)}` }] } } },
+    { type: 'turn/end', time: Date.parse('2026-11-17T09:00:00Z'), data: { turn: 1, reason: { kind: 'completed' } } },
+  ];
+  const base = { from: 'session-A', to: 'session-B', at: '2026-11-17T09:30:00.000Z', cwd: '/work/project', since: 0,
+    goal: { phase: 'active', objective: `把迁移做完。${'约束'.repeat(300)}`, roundsStarted: 4, maxGoalRounds: 10 },
+    jobs: briefJobs(80), pending: { unreviewed: ['J080', 'J079'], needsChanges: ['J078'] }, context: sessionContext(log), sessionRead: true };
+  const brief = buildBrief({ ...base, note: '先把 J058 返工，再派第四章' });
+  const titles = brief.match(/^## .*/gm);
+  assert.deepEqual(titles.map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 目标', '## 最近的用户指令', '## 旧会话最后的进展', '## 待收尾', '## 任务', '## 如何回看旧会话', '## 接手须知']);
+  assert.ok(brief.length <= BRIEF_LIMIT, String(brief.length));
+  assert.match(brief, /## 下一步\n先把 J058 返工，再派第四章/);
+  assert.match(brief, /目标已在本会话逐字重建，上限 6 轮（原会话状态 active，已用 4 \/ 10 轮）；以 get_goal 返回的为准/);
+  assert.ok(!brief.includes('约束'.repeat(120)), 'only the first 200 characters of the goal');
+  assert.equal((brief.match(/^- 2026-11-17T08:00:00\.00\dZ：第 \d 条用户要求/gm) ?? []).length, 8);
+  assert.match(brief, /最后一个回合：结束原因 completed，2026-11-17T09:00:00\.000Z/);
+  assert.match(brief, /session_read\(sessionId="session-A", mode="summary"\)/);
+  assert.match(brief, /有“下一步”时直接按它推进，不要为确认方向而向用户提问/);
+  // 任务表超过本节上限时只放最近的几单，并写明截断。
+  assert.match(brief, /（已截断，共 80 条，显示最近 \d+ 条）/);
+  // 没有下一步、没有回看工具、读取日志超时。
+  const plain = buildBrief({ ...base, note: '', sessionRead: false, context: { timedOut: true }, jobs: briefJobs(3), pending: { unreviewed: [], needsChanges: [] } });
+  assert.match(plain, /## 下一步\n未指定；按目标继续，先完成“待收尾”。/);
+  assert.match(plain, /读取旧会话日志超时，省略了“最近的用户指令”和“旧会话最后的进展”/);
+  assert.ok(!plain.includes('## 最近的用户指令') && !plain.includes('session_read'));
+  assert.match(plain, /codex_summary（session_id="current"）看总览/);
+  // 总长度紧张：任务表先缩成未结束、待处理和最近 10 单，再从优先级最低的节开始整节省略；下一步从不省略。
+  const tight = buildBrief({ ...base, note: '下一步', limit: 6000 });
+  assert.ok(tight.length <= 6000 || tight.match(/^## /gm).length === 1, String(tight.length));
+  assert.match(tight, /本单超过 6000 字符，省略了：接手须知、如何回看旧会话/);
+  assert.ok(tight.includes('## 下一步'));
+  const compact = buildBrief({ ...base, note: '', limit: 12_500 });
+  const rows = compact.match(/^\| J\d+ /gm) ?? [];
+  assert.ok(rows.length <= 13 && rows.some((r) => r.includes('J050')), rows.join(''));
+  const smallest = buildBrief({ ...base, note: 'x', limit: 100 });
+  assert.deepEqual(smallest.match(/^## .*/gm), ['## 下一步']);
+});
+
+test('after a hand-over the plugin checks goal, settings, jobs, delivery and the frozen predecessor, and reports issues without rolling back', async (t) => {
+  const h = host(t);
+  const a = h.agent('session-A');
+  h.goalsByAgent.set(a, { id: 'G1', revision: 1, phase: 'active', objective: '完成迁移'.repeat(1000), roundsStarted: 4, maxGoalRounds: 10 });
+  const jobsA = [{ job_id: 'J1', execution_status: 'completed', review_status: 'needs_attention' }, { job_id: 'J2', execution_status: 'completed' }];
+  const deps = { sessionJobs: async (owner) => (owner === 'session-A' || h.aliases.predecessors(owner).includes('session-A') ? jobsA : []),
+    pendingOf: () => ({ unreviewed: ['J1'], needsChanges: [] }) };
+  const ok = await h.request({ sessionId: 'session-A' }, deps);
+  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', predecessorFrozen: 'ok' }]);
+  // 目标没有逐字接上、轮数不对、模型路由不同、新会话查不到待验收任务：如实报告，不回滚。
+  const g = host(t, { goalPatch: { objective: '完成迁移', maxGoalRounds: 3 } });
+  const b = g.agent('session-B');
+  g.goalsByAgent.set(b, { id: 'G1', revision: 1, phase: 'active', objective: '完成迁移'.repeat(1000), roundsStarted: 4, maxGoalRounds: 10 });
+  b.session.log.push({ type: 'model/selection', time: 1, data: { route: { provider: 'p', model: 'secret-model' } } });
+  const issues = await g.request({ sessionId: 'session-B' }, { ...deps, sessionJobs: async (owner) => (owner === 'session-B' ? jobsA : []) });
+  assert.equal(issues.status, 'handed_over_with_issues');
+  assert.equal(issues.checks.goal, 'failed:objective_differs');
+  assert.equal(issues.checks.settings, 'failed:differs:model');
+  assert.ok(!JSON.stringify(issues.checks).includes('secret-model'), 'only the names of differing settings');
+  assert.equal(issues.checks.jobs, 'failed:missing:J1');
+  assert.equal(g.aliases.successor('session-B'), issues.to, 'issues alone never roll back');
+  const r = host(t, { goalPatch: { maxGoalRounds: 3 } });
+  const c = r.agent('session-C');
+  r.goalsByAgent.set(c, { id: 'G1', revision: 1, phase: 'active', objective: '目标', roundsStarted: 4, maxGoalRounds: 10 });
+  assert.equal((await r.request({ sessionId: 'session-C' })).checks.goal, 'failed:rounds_3_expected_6');
+  // 原会话没有目标：goal 跳过；没有待处理任务：jobs 跳过。
+  h.agent('session-D');
+  const none = await h.request({ sessionId: 'session-D' });
+  assert.deepEqual([none.checks.goal, none.checks.jobs], ['skipped:no_goal', 'skipped:no_open_jobs']);
+});
+
+test('a hand-over whose brief was not delivered or whose successor goal failed rolls back once; a failed rollback is reported', async (t) => {
+  const undelivered = host(t, { prompt: async () => { throw new Error('offline'); } });
+  const a = undelivered.agent('session-A');
+  undelivered.goalsByAgent.set(a, { id: 'G1', revision: 1, phase: 'active', objective: '目标', roundsStarted: 1, maxGoalRounds: 5 });
+  const rolled = await undelivered.request({ sessionId: 'session-A' });
+  assert.deepEqual([rolled.status, rolled.rollback.reason, rolled.rollback.status], ['rolled_back', 'delivery_failed', 'reverted']);
+  assert.equal(undelivered.aliases.successor('session-A'), undefined);
+  assert.equal(undelivered.goalsByAgent.get(a).phase, 'active', 'the old goal is resumed');
+  assert.deepEqual(readFileSync(path.join(undelivered.root, 'handover-history.jsonl'), 'utf8').trim().split('\n').map((l) => JSON.parse(l).status), ['rolled_back']);
+  // 目标建不起来：交接单那一回合还在跑也照样撤回。
+  const goalless = host(t, { goalCreate: () => { throw new Error('goal service down'); }, prompt: async (_request, agent) => { agent.status = 'running'; } });
+  const b = goalless.agent('session-B');
+  goalless.goalsByAgent.set(b, { id: 'G1', revision: 1, phase: 'active', objective: '目标' });
+  const back = await goalless.request({ sessionId: 'session-B' });
+  assert.deepEqual([back.status, back.rollback.reason], ['rolled_back', 'successor_goal_failed']);
+  // 回滚自身被拒（继任会话已经多跑了回合）：如实记录，不重试，保留交接。
+  const stuck = host(t, { prompt: async (_request, agent) => { agent.session.log.push({ type: 'turn/start' }, { type: 'turn/start' }); throw new Error('lost'); } });
+  stuck.agent('session-C');
+  const failed = await stuck.request({ sessionId: 'session-C' });
+  assert.deepEqual([failed.status, failed.rollback.status, failed.rollback.refused], ['handed_over_with_issues', 'rejected', 'successor_active']);
+  assert.equal(failed.checks.delivered, 'failed:lost');
+  assert.equal(stuck.aliases.successor('session-C'), failed.to);
 });
 
 test('auto hand-over decisions honour mode, idleness, links, cooldown, the startup delay and one automatic hand-over a day', async () => {

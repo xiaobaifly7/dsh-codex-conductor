@@ -1212,3 +1212,27 @@ test('the hand-over section submits from suggestions, prompts and links, and exp
   host.poll(); await host.flush();
   assert.ok(shown().includes('已交接：session-big → session-n2，来自询问后同意。请在界面把旧会话 session-big 的“自动继续”开关关掉。'));
 });
+
+test('the hand-over section warns about queued input and shows self-check problems and automatic rollbacks prominently', async (t) => {
+  const service = panelService();
+  service.status.handover = { mode: 'confirm', suggestions: [{ sessionId: 'session-big', messages: 6200, suggest: true }],
+    prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }], links: [], recent: [],
+    result: { status: 'handed_over_with_issues', from: 'session-big', to: 'session-n', origin: 'panel', steps: {},
+      checks: { goal: 'ok', settings: 'failed:differs:model', jobs: 'skipped:no_open_jobs', delivered: 'ok', predecessorFrozen: 'ok' } } };
+  const host = clientHost((path, body) => service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = () => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接');
+  const hint = '旧会话输入框里还有排队未发的消息的话，请先发出或清空——它们不会跟到新会话。';
+  assert.equal(text(section()).split(hint).length - 1, 1, 'the question carries the hint');
+  await click(host, '交接到新会话');
+  assert.equal(text(section()).split(hint).length - 1, 2, 'the confirmation carries it too');
+  const checks = nodes(section()).find((node) => node.type === 'ul' && node.props['aria-label'] === '交接自检');
+  assert.ok(text(checks).includes('预设、模型、权限和工作目录一致：有问题（differs:model）'));
+  assert.ok(text(checks).includes('新会话能查到待处理的任务：跳过（no_open_jobs）'));
+  assert.ok(nodes(section()).some((node) => node.props?.className === 'dcc-warn' && text(node).includes('交接后自检有问题')));
+  service.status.handover = { ...service.status.handover, result: { status: 'rolled_back', from: 'session-big', to: 'session-n', origin: 'auto',
+    rollback: { reason: 'delivery_failed', status: 'reverted' } } };
+  host.poll(); await host.flush();
+  assert.ok(text(section()).includes('交接已自动撤回：交接单没能送到新会话，session-big 恢复原状，session-n 不再作为继任会话，来自自动交接。'));
+});

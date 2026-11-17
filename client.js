@@ -244,6 +244,9 @@ window.__ModuleLoader__.load({
     }
 
     const HANDOVER_MODES = { off: '关闭（只标记建议交接）', notify: '只提醒', confirm: '空闲时询问，同意后交接', auto: '空闲时自动交接' };
+    const QUEUED_HINT = '旧会话输入框里还有排队未发的消息的话，请先发出或清空——它们不会跟到新会话。';
+    const CHECK_TEXT = { goal: '目标逐字接上', settings: '预设、模型、权限和工作目录一致', jobs: '新会话能查到待处理的任务', delivered: '交接单已送达',
+      predecessorFrozen: '旧会话已冻结' };
     const ORIGIN_TEXT = { panel: '面板', auto: '自动交接', confirm: '询问后同意', tool: '工具', file: '请求文件' };
     // 交接被拒或撤回被拦时，把结果里的原因说成人话。
     function handoverReason(result) {
@@ -262,9 +265,13 @@ window.__ModuleLoader__.load({
     function handoverResultText(result) {
       if (!result) return '还没有交接记录。';
       const from = ORIGIN_TEXT[result.origin] ? `，来自${ORIGIN_TEXT[result.origin]}` : '';
-      if (result.status === 'handed_over') {
-        return `已交接：${result.from} → ${result.to}${from}。` + (result.steps?.autoContinue === 'manual_required'
-          ? `请在界面把旧会话 ${result.from} 的“自动继续”开关关掉。` : '');
+      if (result.status === 'handed_over' || result.status === 'handed_over_with_issues') {
+        return `已交接：${result.from} → ${result.to}${from}。` + (result.status === 'handed_over_with_issues' ? '交接后自检有问题，见下方各项。' : '') +
+          (result.steps?.autoContinue === 'manual_required' ? `请在界面把旧会话 ${result.from} 的“自动继续”开关关掉。` : '');
+      }
+      if (result.status === 'rolled_back') {
+        return `交接已自动撤回：${{ delivery_failed: '交接单没能送到新会话', successor_goal_failed: '新会话的目标没能建立' }[result.rollback?.reason] || '交接没有完成'}，` +
+          `${result.from} 恢复原状，${result.to} 不再作为继任会话${from}。`;
       }
       if (result.status === 'reverted') {
         return `已撤回：${result.from} 恢复派活，${result.to} 的目标已暂停${from}。` +
@@ -890,6 +897,7 @@ window.__ModuleLoader__.load({
               handover.prompts.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '需要处理的交接提醒' }, ...handover.prompts.map((prompt) =>
                 h('li', { key: prompt.sessionId, className: 'dcc-job' },
                   h('strong', null, `会话 ${prompt.sessionId} 已有 ${prompt.messages} 条消息，${prompt.kind === 'ask' ? '建议现在交接到新会话' : '可以交接到新会话'}`),
+                  h('small', null, QUEUED_HINT),
                   h('div', { className: 'dcc-row' },
                     h(Button, { size: 'sm', disabled: !!busy, onClick: () => answer(prompt.sessionId, true) }, prompt.kind === 'ask' ? '同意交接' : '现在交接'),
                     h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => answer(prompt.sessionId, false) }, prompt.kind === 'ask' ? '暂不交接' : '知道了'))))) : null,
@@ -903,6 +911,7 @@ window.__ModuleLoader__.load({
                       h(Input, { value: session.handoverNote || '', disabled: !!busy, maxLength: 4000,
                         onChange: (event) => setSession((old) => ({ ...old, handoverNote: event.target.value })) })),
                     h('p', null, '确定交接吗？插件会新建会话、发去交接单，并暂停这个会话的目标；之后这个会话只能查看。'),
+                    h('p', null, QUEUED_HINT),
                     h('div', { className: 'dcc-row' },
                       h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => mutate('handover', '/handover/request',
                         { sessionId: item.sessionId, ...((session.handoverNote || '').trim() ? { note: session.handoverNote } : {}) }, submitted) }, '确认交接'),
@@ -925,7 +934,13 @@ window.__ModuleLoader__.load({
                     h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => revert(true) }, '仍然撤回（两个会话会并行）')) : null);
               })) : h('p', null, '暂无。'),
               h(Message, { text: messages.handover }), h(Message, { text: errors.handover, error: true }),
-              h('p', null, h('strong', null, '最近结果：'), handoverResultText(result)),
+              h('p', { className: ['handed_over_with_issues', 'rolled_back'].includes(result?.status) ? 'dcc-warn' : undefined },
+                h('strong', null, '最近结果：'), handoverResultText(result)),
+              result?.checks ? h('ul', { className: 'dcc-jobs', 'aria-label': '交接自检' }, ...Object.entries(result.checks).map(([key, value]) =>
+                h('li', { key, className: value.startsWith('failed') ? 'dcc-warn' : 'dcc-muted' },
+                  `${CHECK_TEXT[key] || key}：${value === 'ok' ? '通过' : value.startsWith('skipped') ? `跳过（${value.slice(8)}）` : `有问题（${value.slice(7)}）`}`))) : null,
+              result?.rollback && result.status !== 'rolled_back' ? h('p', { className: 'dcc-warn' },
+                `自动撤回没有成功（${result.rollback.refused || result.rollback.status}），请在“当前交接”里手动处理。`) : null,
               handover.recent.length ? h('details', null, h('summary', null, '最近的交接记录'),
                 h('ul', { className: 'dcc-jobs', 'aria-label': '最近的交接记录' }, ...handover.recent.slice().reverse().map((entry, index) =>
                   h('li', { key: `${entry.at}-${index}` }, `${entry.at ? when(entry.at) : '时间未知'} · ${{ handover: '交接', adopt: '认领', revert: '撤回' }[entry.action] || entry.action}` +

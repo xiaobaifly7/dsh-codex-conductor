@@ -5523,3 +5523,32 @@ test('auto hand-over settings default to confirm, warn and default invalid field
     assert.deepEqual(loaded.autoHandover, expected);
   }
 });
+
+test('a session turning idle runs the auto hand-over check: confirm asks once, off and running jobs do not', async () => {
+  const state = () => {
+    try { return JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'auto-handover.json'), 'utf8')).sessions; } catch { return {}; }
+  };
+  const settle = async () => { for (let i = 0; i < 20; i++) await tick(); };
+  const big = (id) => ({ id, status: 'idle', session: { header: { cwd: '/work/w' },
+    log: [{ type: 'user/message' }, { type: 'assistant/message' }, { type: 'tool/result' }] } });
+  const idle = async (h, agent) => { agent.status = 'idle'; h.handlers['agent/status']({ agent, status: 'idle' }); await settle(); };
+  const confirm = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm' } } });
+  const asked = big('session-wire-confirm');
+  // 回合进行中的状态变化不触发。
+  confirm.handlers['agent/status']({ agent: { ...asked, status: 'running' }, status: 'running' });
+  await settle();
+  assert.equal(state()['session-wire-confirm'], undefined);
+  await idle(confirm, asked);
+  const record = state()['session-wire-confirm'];
+  assert.deepEqual([record.open, record.askedMessages], ['ask', 3]);
+  assert.ok(confirm.calls.some((argv) => argv[0] === 'list' && argv.includes('running')), 'running jobs are checked through the runner');
+  // 冷却期内再次空闲不重复询问。
+  await idle(confirm, asked);
+  assert.equal(state()['session-wire-confirm'].askedAt, record.askedAt);
+  const off = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'off' } } });
+  await idle(off, big('session-wire-off'));
+  assert.equal(state()['session-wire-off'], undefined);
+  const busy = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm' }, listResult: { jobs: [{ job_id: 'J1', status: 'running' }], total: 1 } } });
+  await idle(busy, big('session-wire-busy'));
+  assert.equal(state()['session-wire-busy'].open, 'remind', 'a running Codex job only leaves a reminder, never a question');
+});
