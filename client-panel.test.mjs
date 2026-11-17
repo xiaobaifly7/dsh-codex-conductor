@@ -1236,3 +1236,23 @@ test('the hand-over section warns about queued input and shows self-check proble
   host.poll(); await host.flush();
   assert.ok(text(section()).includes('交接已自动撤回：交接单没能送到新会话，session-big 恢复原状，session-n 不再作为继任会话，来自自动交接。'));
 });
+
+test('the hand-over section names the workspace of each successor and explains an approved hand-over waits for the next turn boundary', async (t) => {
+  const service = panelService();
+  service.status.handover = { mode: 'confirm', suggestions: [], scheduled: [],
+    prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }],
+    links: [{ from: 'session-old', to: 'session-new', at: '2026-11-17T02:00:00.000Z', origin: 'auto', workspace: 'Seep-Reverse-Lab' },
+      { from: 'session-x', to: 'session-y', at: '2026-11-17T02:00:00.000Z', origin: 'panel' }],
+    recent: [{ at: '2026-11-17T03:00:00.000Z', action: 'repair', from: 'session-old', to: 'session-new', origin: 'startup', status: 'repaired', workspace: 'Seep-Reverse-Lab' }],
+    result: { status: 'handed_over', from: 'session-old', to: 'session-new', steps: {}, checks: { workspace: 'ok' } } };
+  const host = clientHost((path, body) => path === '/handover/answer' ? { scheduled: true } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = () => text(nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接'));
+  assert.ok(section().includes('自动交接 · 分组 Seep-Reverse-Lab'));
+  assert.ok(!section().includes('面板 · 分组'), 'no workspace name when it is unknown');
+  assert.ok(section().includes('启动修复 · repaired · 分组 Seep-Reverse-Lab'));
+  assert.ok(section().includes('新会话在原会话的分组里：通过'));
+  await click(host, '同意交接');
+  assert.ok(section().includes('已同意：会话停在两个回合之间时自动交接'));
+});

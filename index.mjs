@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -964,7 +964,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
   const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  // 工作区（侧栏分组）、目标和会话都是可选的宿主服务，取不到时相应步骤降级。
+  const workspaces = () => ctx.get?.('workspaceRegistry');
   const autoHandover = createAutoHandover({ directory: stateDirectory, settings: () => cfg.autoHandover, aliases, logger: ctx.logger,
+    goals: () => ctx.get?.('goals'), agentOf: (id) => ctx.get?.('agents')?.get?.(id), workspaces,
     runningJobs: async (owner) => {
       const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), status: 'running', limit: 1 });
       if (!Number.isSafeInteger(page?.total)) throw new Error(page?.error ?? page?.error_kind ?? '任务列表不可用');
@@ -1936,7 +1939,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
   registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
     history: () => history.snapshot(), handover: () => autoHandover.snapshot(history.snapshot().sessions),
-    answerHandover: (id, accept) => autoHandover.answer(id, accept) });
+    answerHandover: async (id, accept) => {
+      const value = autoHandover.answer(id, accept);
+      // 会话此刻正停着（没有回合在跑）就不等下一个回合边界，马上按自动交接的流程走。
+      const agent = accept ? ctx.get?.('agents')?.get?.(id) : undefined;
+      if (agent?.status === 'idle') await autoHandover.observe(agent, history.observe(agent));
+      return value;
+    } });
 
   const geminiText = (value) => {
     let summary = '';
@@ -2173,6 +2182,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 交接时通过宿主设置服务关掉旧会话在 dsh-client-auto-continue 里的自动继续；没装该插件时什么都不做。
       autoContinue: (id) => autoContinueFromSettings(ctx.get?.('settings'))(id),
       // 交接单里“最近的用户指令”排除重启续接的固定话术；有 session_read 工具时写上回看旧会话的用法。
-      autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')) });
+      autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')),
+      workspaces, onResult: (result) => autoHandover.settled(result) });
+  });
+  // 旧版本交接出的继任会话落在“未分组”、标题是固定的交接标题：工作区服务可用后对每条现存链接修复一次。
+  if (resumeDirectory) ctx.inject?.(['workspaceRegistry', 'sessionController'], (repairCtx) => {
+    void repairLinks({ registry: repairCtx.get('workspaceRegistry'), controller: repairCtx.get('sessionController'), aliases,
+      directory: resumeDirectory, logger: ctx.logger }).catch((error) => ctx.logger?.warn?.(`[codex-conductor] 旧交接修复失败：${error?.message ?? error}`));
   });
 }

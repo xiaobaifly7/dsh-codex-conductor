@@ -77,7 +77,7 @@ test('apply waits for session services and processes a pending local resume requ
   try {
     apply({ tools: { register() {} }, on() {}, inject(names, callback) {
       // The panel also waits for its own services through inject; only the session one matters here.
-      if (names.includes('sessionController')) {
+      if (names.includes('appReady')) {
         assert.deepEqual(names, ['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady']);
         activate = callback;
       }
@@ -113,7 +113,7 @@ test('apply auto resume: injected services wait for appReady and receive merged 
       process.env.LOCALAPPDATA = root;
       try {
         apply({ tools: { register() {} }, on() {}, inject(names, callback) {
-          if (names.includes('sessionController')) {
+          if (names.includes('appReady')) {
             assert.deepEqual(names, ['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady']);
             activate = callback;
           }

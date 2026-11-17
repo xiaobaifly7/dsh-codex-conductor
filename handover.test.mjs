@@ -89,7 +89,7 @@ test('hand-over request creates the successor, links it, pauses the old goal, de
   assert.equal(result.status, 'handed_over');
   assert.equal(result.to, 'session-B');
   assert.deepEqual(created, [{ cwd: '/work/project', agentPreset: 'planner' }]);
-  assert.deepEqual(result.steps, { session: 'created', alias: 'linked', autoContinue: 'not_installed', predecessorGoal: 'paused', delivered: 'prompted', successorGoal: 'created' });
+  assert.deepEqual(result.steps, { session: 'created', alias: 'linked', workspace: 'unavailable', title: 'unavailable', autoContinue: 'not_installed', predecessorGoal: 'paused', delivered: 'prompted', successorGoal: 'created' });
   assert.deepEqual(result.pending, { unreviewed: ['J1'], needsChanges: [] });
   assert.deepEqual(aliases.owners('session-B'), ['session-B', 'session-A']);
   assert.equal(goalsByAgent.get(a).phase, 'paused');
@@ -150,6 +150,7 @@ test('history tracker counts messages incrementally, flags sessions over the thr
 
 // 交接用的最小宿主：会话、目标、sessionController；log 里放 turn/start 模拟回合。
 function host(t, hooks = {}) {
+  const renames = [];
   const root = dir(t);
   const agents = new Map();
   const goalsByAgent = new Map();
@@ -170,6 +171,7 @@ function host(t, hooks = {}) {
     resolveAgent: async (id) => (agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found', message: 'no' } }),
     create: async () => { const id = `session-N${++next}`; agent(id); return { sessionId: id }; },
     prompt: async (request) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId)); },
+    rename: async (request) => { renames.push(request); if (hooks.renameError) throw new Error(hooks.renameError); },
   } })[name] };
   const aliases = createAliases(root);
   const deps = { aliases, since: 0, deliverWaitMs: 50, sessionJobs: async () => [], pendingOf: () => ({ unreviewed: [], needsChanges: [] }) };
@@ -178,7 +180,7 @@ function host(t, hooks = {}) {
     writeFileSync(path.join(root, 'handover-request.json'), JSON.stringify(body));
     return processHandoverRequest({ ctx, directory: root, ...deps, ...extra });
   };
-  return { root, agent, agents, goalsByAgent, aliases, request, prompts };
+  return { root, agent, agents, goalsByAgent, aliases, request, prompts, renames };
 }
 
 test('every hand-over, adoption and revert records its origin and request time in the result, the link, the brief and the history', async (t) => {
@@ -328,9 +330,9 @@ test('the brief extracts human instructions and the last completed turn mechanic
   assert.deepEqual(context.lastTurn, { reason: 'error', at: '2026-11-17T11:00:00.000Z' });
   assert.ok(context.progress.text.startsWith('阶段小结：'));
   assert.equal(context.progress.text.length, 1501);
-  // 最多 8 条，最近的在前。
-  const many = Array.from({ length: 12 }, (_, i) => user(`要求 ${i}`, { kind: 'user' }, i));
-  assert.deepEqual(sessionContext(many).instructions.map((m) => m.text), ['要求 11', '要求 10', '要求 9', '要求 8', '要求 7', '要求 6', '要求 5', '要求 4']);
+  // 最多 12 条，最近的在前。
+  const many = Array.from({ length: 15 }, (_, i) => user(`要求 ${i}`, { kind: 'user' }, i));
+  assert.deepEqual(sessionContext(many).instructions.map((m) => m.text), Array.from({ length: 12 }, (_, i) => `要求 ${14 - i}`));
   // 超过时限：放弃这两节。
   let clock = 0;
   assert.deepEqual(sessionContext(Array.from({ length: 2000 }, () => ({ type: 'tool/call' })), { now: () => (clock += 6_000) }), { timedOut: true });
@@ -358,7 +360,8 @@ test('the brief has every section in order, caps each section and drops whole se
   assert.match(brief, /## 下一步\n先把 J058 返工，再派第四章/);
   assert.match(brief, /目标已在本会话逐字重建，上限 6 轮（原会话状态 active，已用 4 \/ 10 轮）；以 get_goal 返回的为准/);
   assert.ok(!brief.includes('约束'.repeat(120)), 'only the first 200 characters of the goal');
-  assert.equal((brief.match(/^- 2026-11-17T08:00:00\.00\dZ：第 \d 条用户要求/gm) ?? []).length, 8);
+  assert.equal((brief.match(/^- 2026-11-17T08:00:00\.00\dZ：第 \d 条用户要求/gm) ?? []).length, 10);
+  assert.match(brief, /## 最近的用户指令[^\n]*\n以下是用户亲手输入的要求，仍然有效，除非与“下一步”或更新的指令冲突。/);
   assert.match(brief, /最后一个回合：结束原因 completed，2026-11-17T09:00:00\.000Z/);
   assert.match(brief, /session_read\(sessionId="session-A", mode="summary"\)/);
   assert.match(brief, /有“下一步”时直接按它推进，不要为确认方向而向用户提问/);
@@ -403,7 +406,7 @@ test('after a hand-over the plugin checks goal, settings, jobs, delivery and the
   const deps = { sessionJobs: async (owner) => (owner === 'session-A' || h.aliases.predecessors(owner).includes('session-A') ? jobsA : []),
     pendingOf: () => ({ unreviewed: ['J1'], needsChanges: [] }) };
   const ok = await h.request({ sessionId: 'session-A' }, deps);
-  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', predecessorFrozen: 'ok' }]);
+  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', predecessorFrozen: 'ok', workspace: 'skipped:unavailable' }]);
   // 目标没有逐字接上、轮数不对、模型路由不同、新会话查不到待验收任务：如实报告，不回滚。
   const g = host(t, { goalPatch: { objective: '完成迁移', maxGoalRounds: 3 } });
   const b = g.agent('session-B');
@@ -460,7 +463,7 @@ test('auto hand-over decisions honour mode, idleness, links, cooldown, the start
   assert.deepEqual(step(), { remind: true, act: 'ask' });
   assert.deepEqual(step({}, { mode: 'off' }), { remind: false, act: null });
   assert.deepEqual(step({}, { mode: 'notify' }), { remind: true, act: null });
-  assert.deepEqual(step({}, { mode: 'auto' }), { remind: true, act: 'auto' });
+  assert.deepEqual(step({}, { mode: 'auto' }), { remind: true, act: 'auto', origin: 'auto' });
   // 任一条件不满足就不问也不交接。
   assert.deepEqual(step({ suggest: false }), { remind: false, act: null });
   assert.deepEqual(step({ retired: true }), { remind: false, act: null });
@@ -506,10 +509,12 @@ test('auto hand-over asks in the panel or submits a request only when the sessio
   agent.status = 'idle';
   await auto.observe(agent, big);
   assert.deepEqual(auto.snapshot().prompts.map((p) => p.kind), ['ask']);
-  // 同意：写交接请求，来源 confirm；提醒随之关闭。
-  assert.deepEqual(auto.answer('session-A', true), { submitted: true });
+  // 同意：记下同意，下一个回合边界按自动交接的流程提交，来源 confirm；提醒随之关闭。
+  assert.deepEqual(auto.answer('session-A', true), { scheduled: true });
+  assert.deepEqual([submitted, auto.snapshot().prompts, auto.snapshot().scheduled], [[], [], ['session-A']]);
+  await auto.observe(agent, big);
   assert.deepEqual(submitted, [{ sessionId: 'session-A', origin: 'confirm', requestedAt: new Date(clock).toISOString() }]);
-  assert.deepEqual(auto.snapshot().prompts, []);
+  assert.deepEqual(auto.snapshot().scheduled, []);
   assert.throws(() => auto.answer('session-A', true), (error) => error.code === 'none');
   // 拒绝：冷却期内不再问；没人理的询问过了冷却期也算过期，可以再问。
   const b = { id: 'session-B', status: 'idle' };
@@ -546,4 +551,170 @@ test('panel and automatic hand-over requests share the pending-request rule', as
   submitHandoverRequest(root, { sessionId: 'session-A', origin: 'auto' });
   assert.throws(() => submitHandoverRequest(root, { sessionId: 'session-B' }), (error) => error.code === 'pending');
   assert.deepEqual(JSON.parse(readFileSync(path.join(root, 'handover-request.json'), 'utf8')), { sessionId: 'session-A', origin: 'auto' });
+});
+
+// workspaceRegistry 的替身：方法名与宿主 dsh-workspace 一致（list / attachSession / insertSessionBefore / detachSession /
+// pinnedSessionIds / pinSession / unpinSession）。
+function workspaceRegistry(entries, pinned = [], { pin = true, attachError } = {}) {
+  const list = entries.map(({ id, title, sessionIds }) => ({ id, title, sessionIds: [...sessionIds],
+    async attachSession(sid) { if (attachError) throw new Error(attachError); if (!this.sessionIds.includes(sid)) this.sessionIds = [sid, ...this.sessionIds]; },
+    async insertSessionBefore(sid, before) { const rest = this.sessionIds.filter((x) => x !== sid); rest.splice(rest.indexOf(before), 0, sid); this.sessionIds = rest; },
+    async detachSession(sid) { this.sessionIds = this.sessionIds.filter((x) => x !== sid); } }));
+  return { list: () => list, pinnedSessionIds: pinned,
+    ...(pin ? { async pinSession(sid) { pinned.unshift(sid); }, async unpinSession(sid) { pinned.splice(pinned.indexOf(sid), 1); } } : {}) };
+}
+const titled = (agent, title) => agent.session.log.push({ type: 'session/title', data: { title } });
+
+test('a successor joins the workspace of its predecessor right above it, follows its pin, and leaves on revert only from that workspace', async (t) => {
+  const h = host(t);
+  const registry = workspaceRegistry([{ id: 'W1', title: 'Seep-Reverse-Lab', sessionIds: ['session-X', 'session-A'] }, { id: 'W2', title: '别的', sessionIds: [] }], ['session-A']);
+  const workspaces = () => registry;
+  titled(h.agent('session-A'), '继续 AI 编程助手对话');
+  const handed = await h.request({ sessionId: 'session-A' }, { workspaces });
+  assert.deepEqual([handed.status, handed.steps.workspace, handed.steps.workspaceId, handed.steps.pin, handed.checks.workspace],
+    ['handed_over', 'attached', 'W1', 'pinned', 'ok']);
+  assert.deepEqual(registry.list()[0].sessionIds, ['session-X', handed.to, 'session-A']);
+  assert.deepEqual(registry.pinnedSessionIds, [handed.to, 'session-A']);
+  assert.deepEqual([h.aliases.links()[handed.to].workspaceId, h.aliases.links()[handed.to].pinned], ['W1', true]);
+  assert.deepEqual(h.renames, [{ sessionId: handed.to, title: '[交接←A] 继续 AI 编程助手对话' }]);
+  assert.equal(handed.steps.title, 'set');
+  // 撤回：移出交接放进去的工作区，撤销交接加的置顶；原会话的置顶不动。
+  const reverted = await h.request({ revert: { from: 'session-A', to: handed.to } }, { workspaces });
+  assert.deepEqual([reverted.steps.workspace, reverted.steps.pin], ['detached', 'unpinned']);
+  assert.deepEqual([registry.list()[0].sessionIds, registry.pinnedSessionIds], [['session-X', 'session-A'], ['session-A']]);
+  // 用户后来把继任挪到别的工作区：撤回时不动它。
+  const again = await h.request({ sessionId: 'session-A' }, { workspaces });
+  await registry.list()[0].detachSession(again.to);
+  await registry.list()[1].attachSession(again.to);
+  const moved = await h.request({ revert: { from: 'session-A', to: again.to } }, { workspaces });
+  assert.deepEqual([moved.steps.workspace, registry.list()[1].sessionIds], ['unchanged', [again.to]]);
+  // 认领已有会话同样进原会话的分组，但不改它的标题。
+  h.agent('session-C');
+  const renamed = h.renames.length;
+  const adopted = await h.request({ adopt: { from: 'session-A', to: 'session-C' } }, { workspaces });
+  assert.deepEqual([adopted.steps.workspace, adopted.steps.title, h.renames.length], ['attached', undefined, renamed]);
+  assert.deepEqual(registry.list()[0].sessionIds, ['session-X', 'session-C', 'session-A']);
+});
+
+test('workspace placement degrades to none, unavailable, failed or a skipped pin without failing the hand-over', async (t) => {
+  const { placeInWorkspace } = await import('./handover.mjs');
+  assert.deepEqual(await placeInWorkspace(undefined, 'session-A', 'session-B'), { workspace: 'unavailable' });
+  assert.deepEqual(await placeInWorkspace(workspaceRegistry([{ id: 'W1', title: 'w', sessionIds: ['session-X'] }]), 'session-A', 'session-B'), { workspace: 'none' });
+  assert.deepEqual(await placeInWorkspace(workspaceRegistry([{ id: 'W1', title: 'w', sessionIds: ['session-A'] }], ['session-A'], { pin: false }), 'session-A', 'session-B'),
+    { workspace: 'attached', workspaceId: 'W1', pin: 'skipped' });
+  const h = host(t);
+  h.agent('session-A');
+  const failing = workspaceRegistry([{ id: 'W1', title: 'w', sessionIds: ['session-A'] }], [], { attachError: 'cwd mismatch' });
+  const result = await h.request({ sessionId: 'session-A' }, { workspaces: () => failing });
+  assert.deepEqual([result.steps.workspace, result.checks.workspace, result.status], ['failed:cwd mismatch', 'failed:not_in_workspace', 'handed_over_with_issues']);
+  assert.equal(h.aliases.successor('session-A'), result.to, 'a workspace problem never rolls back');
+  h.agent('session-U');
+  const ungrouped = await h.request({ sessionId: 'session-U' }, { workspaces: () => workspaceRegistry([]) });
+  assert.deepEqual([ungrouped.steps.workspace, ungrouped.checks.workspace, ungrouped.status], ['none', 'skipped:ungrouped', 'handed_over']);
+});
+
+test('successor titles name the predecessor without nesting hand-over prefixes', async () => {
+  const { successorTitle } = await import('./handover.mjs');
+  assert.equal(successorTitle('session-0200eab4-1111-2222', '继续 AI 编程助手对话'), '[交接←0200eab4] 继续 AI 编程助手对话');
+  assert.equal(successorTitle('session-0200eab4-1111-2222', undefined), '[交接←0200eab4]');
+  assert.equal(successorTitle('session-897a5c8a-3333', '[交接←0200eab4] 继续 AI 编程助手对话'), '[交接←897a5c8a] 继续 AI 编程助手对话');
+  assert.equal(successorTitle('session-897a5c8a-3333', '[codex-conductor 交接] 本会话接手会话'), '[交接←897a5c8a]');
+  assert.equal(successorTitle('session-1234567890', '长'.repeat(60)), `[交接←12345678] ${'长'.repeat(40)}`);
+});
+
+test('startup repair puts an old ungrouped successor into the predecessor workspace and retitles it once', async (t) => {
+  const { repairLinks, readHandoverHistory } = await import('./handover.mjs');
+  const root = dir(t);
+  const aliases = createAliases(root);
+  aliases.link('session-0200eab4-aaaa', 'session-897a5c8a-bbbb');
+  aliases.link('session-old-other', 'session-moved');
+  const sessions = { 'session-0200eab4-aaaa': '继续 AI 编程助手对话', 'session-897a5c8a-bbbb': '[codex-conductor 交接]',
+    'session-old-other': '另一件事', 'session-moved': '[codex-conductor 交接]' };
+  const renames = [];
+  const controller = { resolveAgent: async (id) => ({ agent: { id, session: { log: [{ type: 'session/title', data: { title: sessions[id] } }] } } }),
+    rename: async (request) => { renames.push(request); sessions[request.sessionId] = request.title; } };
+  const registry = workspaceRegistry([{ id: 'W1', title: 'Seep-Reverse-Lab', sessionIds: ['session-0200eab4-aaaa', 'session-old-other'] },
+    { id: 'W2', title: '用户挪过去的', sessionIds: ['session-moved'] }]);
+  await repairLinks({ registry, controller, aliases, directory: root });
+  assert.deepEqual(registry.list()[0].sessionIds, ['session-897a5c8a-bbbb', 'session-0200eab4-aaaa', 'session-old-other']);
+  assert.deepEqual(registry.list()[1].sessionIds, ['session-moved'], 'a successor already in another workspace stays there');
+  assert.equal(aliases.links()['session-897a5c8a-bbbb'].workspaceId, 'W1');
+  assert.deepEqual(renames.map((r) => [r.sessionId, r.title]), [['session-897a5c8a-bbbb', '[交接←0200eab4] 继续 AI 编程助手对话'],
+    ['session-moved', '[交接←old-othe] 另一件事']]);
+  assert.ok(Object.values(aliases.links()).every((link) => link.repaired));
+  assert.deepEqual(readHandoverHistory(root).map((e) => [e.action, e.origin, e.to, e.status]),
+    [['repair', 'startup', 'session-897a5c8a-bbbb', 'repaired'], ['repair', 'startup', 'session-moved', 'repaired']]);
+  // 第二次加载什么都不做。
+  await registry.list()[0].detachSession('session-897a5c8a-bbbb');
+  await repairLinks({ registry, controller, aliases, directory: root });
+  assert.deepEqual([registry.list()[0].sessionIds.includes('session-897a5c8a-bbbb'), renames.length, readHandoverHistory(root).length], [false, 2, 2]);
+});
+
+// 目标循环的替身：pause / resume 与宿主 GoalService 一样改 phase、activation 和 revision。
+function goalLoop() {
+  const byAgent = new Map();
+  const calls = [];
+  return { byAgent, calls,
+    get: (agent) => byAgent.get(agent),
+    pause(agent, ref) { calls.push(['pause', agent.id]); const g = byAgent.get(agent); assert.equal(ref.revision, g.revision);
+      const next = { ...g, phase: 'paused', activation: 'disarmed', revision: g.revision + 1 }; byAgent.set(agent, next); return next; },
+    resume(agent, ref) { calls.push(['resume', agent.id]); const g = byAgent.get(agent); assert.equal(ref.revision, g.revision);
+      const next = { ...g, phase: 'active', activation: 'armed', revision: g.revision + 1 }; byAgent.set(agent, next); return next; } };
+}
+
+test('in a goal loop auto hand-over pauses the goal at the idle edge, hands over, and restores the goal with a retry cooldown when it does not', async (t) => {
+  const { createAutoHandover, AUTO_HANDOVER_DEFAULTS, RETRY_COOLDOWN_MS } = await import('./handover.mjs');
+  const root = dir(t);
+  const aliases = createAliases(root);
+  const goals = goalLoop();
+  const agents = new Map();
+  let clock = Date.parse('2026-11-17T12:00:00Z');
+  let running = 0;
+  let settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' };
+  const submitted = [];
+  const auto = createAutoHandover({ directory: root, settings: () => settings, aliases, now: () => clock, uptime: () => 3_600_000,
+    runningJobs: async () => running, submit: (request) => submitted.push(request), goals: () => goals, agentOf: (id) => agents.get(id) });
+  const session = (id, phase = 'active') => {
+    const agent = { id, status: 'idle' };
+    agents.set(id, agent);
+    goals.byAgent.set(agent, { id: `G-${id}`, revision: 1, phase, activation: phase === 'active' ? 'armed' : 'disarmed', objective: '目标', maxGoalRounds: 10 });
+    return agent;
+  };
+  const big = { messages: 6000, threshold: 5000, suggest: true };
+  // 1. 满足条件：空闲事件里同步暂停目标（在 goal 排下一轮之前），再提交交接；交接成功后目标保持暂停。
+  const a = session('session-A');
+  const observing = auto.observe(a, big);
+  assert.equal(goals.byAgent.get(a).phase, 'paused', 'paused before the first await');
+  await observing;
+  assert.deepEqual(submitted.map((r) => [r.sessionId, r.origin]), [['session-A', 'auto']]);
+  auto.settled({ from: 'session-A', requestedAt: submitted[0].requestedAt, status: 'handed_over' });
+  assert.deepEqual([goals.byAgent.get(a).phase, goals.calls], ['paused', [['pause', 'session-A']]]);
+  // 2. 空闲后发现有任务在跑：恢复目标（重新武装），30 分钟内不再试。
+  const b = session('session-B');
+  running = 1;
+  await auto.observe(b, big);
+  assert.deepEqual([goals.byAgent.get(b).phase, goals.byAgent.get(b).activation], ['active', 'armed']);
+  running = 0;
+  await auto.observe(b, big);
+  assert.equal(submitted.length, 1, 'retry cooldown');
+  clock += RETRY_COOLDOWN_MS + 1;
+  await auto.observe(b, big);
+  assert.equal(submitted.at(-1).sessionId, 'session-B');
+  // 交接被拒（例如用户恰好开了新回合）：恢复提前暂停的目标，进入重试冷却。
+  auto.settled({ from: 'session-B', requestedAt: submitted.at(-1).requestedAt, status: 'refused', reason: 'turn_running' });
+  assert.equal(goals.byAgent.get(b).phase, 'active');
+  // 3. 用户手动暂停的目标：不暂停也不恢复，照原来的空闲触发提交。
+  const c = session('session-C', 'paused');
+  const before = goals.calls.length;
+  await auto.observe(c, big);
+  auto.settled({ from: 'session-C', requestedAt: submitted.at(-1).requestedAt, status: 'refused', reason: 'jobs_running' });
+  assert.deepEqual([submitted.at(-1).sessionId, goals.calls.length, goals.byAgent.get(c).phase], ['session-C', before, 'paused']);
+  // 4. confirm 模式询问时不碰目标；同意后在下一个空闲边界按同一流程暂停并交接，来源 confirm。
+  settings = { ...settings, mode: 'confirm' };
+  const d = session('session-D');
+  await auto.observe(d, big);
+  assert.deepEqual([auto.snapshot().prompts.find((p) => p.sessionId === 'session-D').kind, goals.byAgent.get(d).phase], ['ask', 'active']);
+  auto.answer('session-D', true);
+  await auto.observe(d, big);
+  assert.deepEqual([submitted.at(-1).sessionId, submitted.at(-1).origin, goals.byAgent.get(d).phase], ['session-D', 'confirm', 'paused']);
 });

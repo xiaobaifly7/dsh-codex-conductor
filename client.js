@@ -246,8 +246,8 @@ window.__ModuleLoader__.load({
     const HANDOVER_MODES = { off: '关闭（只标记建议交接）', notify: '只提醒', confirm: '空闲时询问，同意后交接', auto: '空闲时自动交接' };
     const QUEUED_HINT = '旧会话输入框里还有排队未发的消息的话，请先发出或清空——它们不会跟到新会话。';
     const CHECK_TEXT = { goal: '目标逐字接上', settings: '预设、模型、权限和工作目录一致', jobs: '新会话能查到待处理的任务', delivered: '交接单已送达',
-      predecessorFrozen: '旧会话已冻结' };
-    const ORIGIN_TEXT = { panel: '面板', auto: '自动交接', confirm: '询问后同意', tool: '工具', file: '请求文件' };
+      predecessorFrozen: '旧会话已冻结', workspace: '新会话在原会话的分组里' };
+    const ORIGIN_TEXT = { panel: '面板', auto: '自动交接', confirm: '询问后同意', tool: '工具', file: '请求文件', startup: '启动修复' };
     // 交接被拒或撤回被拦时，把结果里的原因说成人话。
     function handoverReason(result) {
       const reason = result?.reason;
@@ -887,8 +887,8 @@ window.__ModuleLoader__.load({
         selftest ? null : (() => {
           const handover = status?.handover;
           const submitted = () => { setConfirmSession(null); setMessages((old) => ({ ...old, handover: '交接请求已提交，几秒后在下面的“最近结果”查看。' })); };
-          const answer = (sessionId, accept) => mutate('handover', '/handover/answer', { sessionId, accept }, (value) => value.submitted ? submitted()
-            : setMessages((old) => ({ ...old, handover: '已记下，冷却期内不再询问。' })));
+          const answer = (sessionId, accept) => mutate('handover', '/handover/answer', { sessionId, accept }, (value) => setMessages((old) => ({ ...old, handover: value.declined
+            ? '已记下，冷却期内不再询问。' : '已同意：会话停在两个回合之间时自动交接（目标循环会先暂停，交接没成会恢复）。' })));
           const result = handover?.result;
           return h('section', { 'aria-label': '会话交接' }, h('h3', null, '会话交接'),
             h('p', { className: 'dcc-muted' }, '交接把目标和 Codex 任务转到一个新会话，原会话只读保留。提交后由插件在几秒内处理；有回合或 Codex 任务在跑时会被拒绝。'),
@@ -922,7 +922,7 @@ window.__ModuleLoader__.load({
                 const revert = (force) => mutate('handover', '/handover/request', { revert: { from: link.from, to: link.to }, ...(force ? { force: true } : {}) }, submitted);
                 return h('li', { key: link.to, className: 'dcc-job' },
                   h('strong', null, `${link.from} → ${link.to}`),
-                  h('small', null, `${link.at ? when(link.at) : '时间未知'} · ${ORIGIN_TEXT[link.origin] || '来源未记录'}`),
+                  h('small', null, `${link.at ? when(link.at) : '时间未知'} · ${ORIGIN_TEXT[link.origin] || '来源未记录'}${link.workspace ? ` · 分组 ${link.workspace}` : ''}`),
                   h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(`revert:${link.to}`) }, '撤回'),
                   confirmSession === `revert:${link.to}` ? h('div', { className: 'dcc-confirm' },
                     h('p', null, '确定撤回吗？原会话恢复派活和目标，继任会话的目标暂停。继任会话已经开工时插件会拒绝，并在这里说明。'),
@@ -944,7 +944,7 @@ window.__ModuleLoader__.load({
               handover.recent.length ? h('details', null, h('summary', null, '最近的交接记录'),
                 h('ul', { className: 'dcc-jobs', 'aria-label': '最近的交接记录' }, ...handover.recent.slice().reverse().map((entry, index) =>
                   h('li', { key: `${entry.at}-${index}` }, `${entry.at ? when(entry.at) : '时间未知'} · ${{ handover: '交接', adopt: '认领', revert: '撤回' }[entry.action] || entry.action}` +
-                    ` · ${entry.from || '?'} → ${entry.to || '?'} · ${ORIGIN_TEXT[entry.origin] || entry.origin} · ${entry.status}${entry.reason ? ` / ${entry.reason}` : ''}`)))) : null));
+                    ` · ${entry.from || '?'} → ${entry.to || '?'} · ${ORIGIN_TEXT[entry.origin] || entry.origin} · ${entry.status}${entry.reason ? ` / ${entry.reason}` : ''}${entry.workspace ? ` · 分组 ${entry.workspace}` : ''}`)))) : null));
         })(),
 
         selftest ? null : h('section', { 'aria-label': '会话操作' },
