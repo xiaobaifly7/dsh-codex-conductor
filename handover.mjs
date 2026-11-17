@@ -81,9 +81,11 @@ const firstLine = (value, size = 80) => String(value ?? '').split('\n')[0].trim(
 // 交接单只用插件和 runner 已有的记录机械生成，不经模型。
 export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note }) {
   const running = jobs.filter((j) => (j.execution_status ?? j.status) === 'running');
+  // 表里只放任务号（job_id）：续接、核验、验收都靠它。线程号只列给需要带 resume 返工的任务，免得被当成任务号。
   const rows = jobs.slice(0, 50).map((j) => `| ${j.job_id} | ${j.execution_status ?? j.status ?? '?'} | ${j.verification_status ?? '?'} | ` +
-    `${j.review_status === 'needs_attention' ? '有标记' : '-'} | ${j.thread_id ?? '-'} | ${j.parent_job_id ?? '-'} | ${j.cwd ?? '-'} | ` +
+    `${j.review_status === 'needs_attention' ? '有标记' : '-'} | ${j.parent_job_id ?? '-'} | ${j.cwd ?? '-'} | ` +
     `${j.diff_status ?? '-'} | ${firstLine(j.context?.task).replace(/\|/g, '/')} |`);
+  const threads = jobs.filter((j) => pending.needsChanges.includes(j.job_id) && j.thread_id);
   return [
     `# Codex 指挥交接单：${from} → ${to}`, '',
     `- 生成时间：${at}`, `- 工作目录：${cwd ?? '（未知）'}`,
@@ -94,14 +96,18 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
     `- 记了 needs_changes、还没有后续轮次：${pending.needsChanges.join('、') || '无'}`,
     `- 仍在运行：${running.map((j) => j.job_id).join('、') || '无'}（结束通知会发到原会话；用 codex_status 查询）`, '',
     `## 任务（收尾截止时间 ${new Date(since * 1000).toISOString()} 之后开始，共 ${jobs.length} 单${jobs.length > 50 ? '，只列最近 50 单' : ''}）`, '',
-    '| job_id | 执行 | 验收 | 报告 | 线程 | 续接自 | 目录 | diff | 任务首行 |', '|---|---|---|---|---|---|---|---|---|',
+    '任务号（job_id）用于 codex_status、codex_output、codex_review、codex_verify、codex_continue 的 job_id 参数。', '',
+    '| 任务号 job_id | 执行 | 验收 | 报告 | 续接自（任务号） | 目录 | diff | 任务首行 |', '|---|---|---|---|---|---|---|---|',
     ...rows, '',
+    ...(threads.length ? ['## 返工用的线程号', '线程号（thread_id）不是任务号，只用于 codex_run 的 resume 参数；不要传给其他工具的 job_id。', '',
+      ...threads.map((j) => `- 任务 ${j.job_id} 的线程号：${j.thread_id}`), ''] : []),
   ].join('\n');
 }
 
 const handoverMessage = (from, briefPath, brief) => `[codex-conductor 交接] 本会话接手会话 ${from} 的工作；原会话的目标已暂停，` +
   '它不能再派活或验收。下面是插件按记录生成的交接单' + (briefPath ? `（文件：${briefPath}）` : '') + '。\n' +
   '先调 codex_summary（session_id="current"）和 codex_jobs 看详情：本会话现在可以查看、验收、续接、核验和取消原会话的任务。' +
+  '工具的 job_id 参数只填交接单里的任务号；线程号只用于 codex_run 的 resume。' +
   '收尾规则照旧：先给列出的待收尾任务做 codex_review 或返工，再派新任务。本会话若还没有目标，按交接单里的目标创建后继续推进。\n\n' + brief;
 
 // 首条消息走 sessionController.prompt（与界面发送相同的路径）；它可能等到整轮结束才返回，8 秒内没回执就当作已投递。

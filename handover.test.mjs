@@ -96,9 +96,14 @@ test('hand-over request creates the successor, links it, pauses the old goal, de
   const goalB = goalsByAgent.get(agents.get('session-B'));
   assert.deepEqual([goalB.objective, goalB.maxGoalRounds], ['完成迁移', 6]);
   const brief = readFileSync(result.briefPath, 'utf8');
-  for (const part of ['session-A → session-B', '完成迁移', '已用 4 / 10 轮', '先收尾 J1', '尚未 codex_review：J1', '| J1 | completed | unreviewed | 有标记 | T1 |', '第一单'])
+  for (const part of ['session-A → session-B', '完成迁移', '已用 4 / 10 轮', '先收尾 J1', '尚未 codex_review：J1', '| J1 | completed | unreviewed | 有标记 | - | /work/project |', '任务号（job_id）用于 codex_status', '第一单'])
     assert.ok(brief.includes(part), part);
   assert.ok(!brief.includes('细节'));
+  // 没有待返工任务时不列线程号。
+  assert.ok(!brief.includes('的线程号：'));
+  const rework = (await import('./handover.mjs')).buildBrief({ from: 'A', to: 'B', at: 'now', cwd: '/w', goal: null, since: 0, note: '',
+    jobs: [{ job_id: 'J9', thread_id: 'TH9', verification_status: 'needs_changes' }], pending: { unreviewed: [], needsChanges: ['J9'] } });
+  assert.match(rework, /只用于 codex_run 的 resume[\s\S]*任务 J9 的线程号：TH9/);
   assert.equal(prompts.length, 1);
   assert.equal(prompts[0].sessionId, 'session-B');
   assert.match(prompts[0].content[0].text, /codex_summary[\s\S]*尚未 codex_review：J1/);
