@@ -66,6 +66,14 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.110：续接开新线程、已交接会话的开场说明、写任务起步更快
+
+- 续接开新线程：`codex_continue` 不带 `answers`、且原线程上一次请求超过 `continueFreshAboveTokens`（默认 100000 输入 token，0 表示总是沿用原线程）时，改开新的 Codex 线程，只带上轮交接内容（原任务、验收标准、上轮未满足项和证据、偏差与未决项、独立核验意见、阻塞、上轮改动文件），不再每个请求重发旧线程的整段历史。线程大小由 runner 的只读命令 `thread-size` 从该线程的 rollout 读取；读不到时沿用原线程。`fresh: true` / `false` 可逐次指定；带 `answers` 的续接（回答阻塞问题）始终沿用原线程。新任务仍以 `parent_job_id` 挂在原任务下：收尾护栏、交接自检、`codex_jobs` 的 `parent_job` 和 `codex_summary` 的分组都照旧（summary 把续接放进父任务所在的组，用量按线程分别累加）。`codex_run` 带 `resume` 仍沿用原线程。
+- 已交接的会话收到用户消息时，第一步之前插一条说明：本会话已于何时交接给哪个会话、这里的 Codex 工具已停用、请告诉用户到新会话继续；同一条消息只说明一次。被拒的工具调用也写明新会话 ID 和这句说明。
+- 写任务起步：在 `/mnt/...` 这类很大的任务目录里，scope 中单独一项遍历超过 5 秒、或用光 20 秒快照预算时，记为太大（与任务目录同样保留 7 天），之后的任务跳过这一项快照、只靠 Codex 的改文件事件；其他 scope 项照常快照。`forget-too-big` 会一并清掉任务目录下的这些记录。
+- 验收标准条数：新派活的验收标准超过 `acceptanceWarnAbove`（默认 8，0 关闭）条时，派活回执里提醒一句把偏好写进 task 正文；只提醒不拦截，条数累计在状态目录的 `acceptance-stats.json`，`codex_runtime` 会显示。
+- 状态目录新增 `handover-pending.json`（每 2 秒刷新，只含会话 ID）：列出有自动交接排队、或交接请求还没处理完的会话，外部看门狗可据此暂不向这些会话发消息。
+
 ### 0.9.109：继任会话留在原分组、带来源的标题、目标循环里的自动交接
 
 - **分组**：交接（含认领）建好继任会话后，插件通过宿主的工作区服务（`workspaceRegistry`）把它加进原会话所在的工作区、排在原会话正上方；原会话置顶时继任也置顶（原会话的置顶不动）。原会话未分组时不动。结果记 `steps.workspace`：`attached`（附 `workspaceId`）/ `none` / `unavailable`（宿主没有工作区服务）/ `failed:<原因>`，置顶记 `steps.pin`；工作区 id 和是否由交接置顶记在链接里。撤回时只把继任会话移出交接放进去的那个工作区（用户后来挪到别处的不动），并撤销交接加上的置顶。都不影响交接成败。
@@ -349,6 +357,8 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
 | `closeoutGuard` | `true` | 本会话有已结束、报告标出问题却没有 `codex_review` 的任务，或记了 `needs_changes` 却没有后续轮次的任务时，拒绝开新工作的 `codex_run` 和规划端的 `update_goal(action=complete)`（续接、返工、核验和查询照常；用户在界面上完成目标不受影响）；第一次加载 0.9.103 之前开始的任务不计入，记录读不到时放行并记警告；设为 `false` 关闭。已知限制：带任意 `resume` 的 `codex_run` 视为返工、不受检查，规划端可借本会话的旧线程开新工作；`needs_changes` 任务一旦有后续轮次（哪怕随即 `codex_cancel`）就不再拦 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
+| `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
+| `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
 | `autoHandover` | 见下 | 标记建议交接之后怎么办，对象，各键可单独省略；无效值告警并回落默认值，未知子键写进 `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` 只标记并保留面板按钮；`notify` 另加面板提醒；`confirm` 会话空闲且没有运行中的 Codex 任务时在面板询问，同意才交接；`auto` 同样条件下直接交接 |
 | `autoHandover.cooldownHours` | `12` | 拒绝、点“知道了”或询问没人理之后多少小时内不再询问或自动交接，非负数 |
@@ -528,6 +538,14 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
 
+### 0.9.110: Fresh-thread continuations, a notice in handed-over sessions, faster write-job startup
+
+- Fresh continuations: when `codex_continue` carries no `answers` and the parent thread's last request exceeded `continueFreshAboveTokens` (default 100000 input tokens, 0 = always resume), the job starts a new Codex thread with the previous round's brief only (original task, acceptance list, unmet criteria with evidence, deviations and unresolved items, the independent review, blockers, files changed) instead of re-sending the old thread on every request. The runner's read-only `thread-size` reads the size from the thread's rollout; when it is unknown the thread is resumed. `fresh: true` / `false` overrides per call; continuations with `answers` (answering blocking questions) always resume. The new job is still linked by `parent_job_id`, so the close-out guard, the hand-over self-check, `codex_jobs parent_job` and `codex_summary` grouping are unchanged (summary keeps the continuation in its parent's group and sums usage per thread). `codex_run` with `resume` still resumes.
+- A handed-over session that receives a user message gets one notice before its first step: when and to which session it was handed over, that Codex tools are disabled there, and that the user should continue in the new session. Refused tool calls name the successor too.
+- Write-job startup: in large task directories such as `/mnt/...`, a scope entry whose walk alone takes over 5 s, or that exhausts the 20 s snapshot budget, is remembered as too big (7 days, like the task directory) and skipped by later jobs, which then rely on Codex's file events for it; other scope entries are still snapshotted. `forget-too-big` clears these entries under the task directory.
+- Acceptance lists: a new-work dispatch with more than `acceptanceWarnAbove` (default 8, 0 = off) items gets one line suggesting preferences go into the task text; it never blocks, and counts accumulate in `acceptance-stats.json` in the state directory, shown by `codex_runtime`.
+- New `handover-pending.json` in the state directory (refreshed every 2 s, session ids only): sessions with an auto hand-over pending or an unprocessed hand-over request, so an external watchdog can leave them alone.
+
 ### 0.9.109: Successors stay in the predecessor's group, carry a telling title, and auto hand-over works inside goal loops
 
 - **Group**: after creating (or adopting) the successor, the plugin adds it through the host workspace service (`workspaceRegistry`) to the predecessor's workspace, right above the predecessor, and pins it when the predecessor is pinned (the predecessor's pin is untouched). Nothing happens when the predecessor is ungrouped. `steps.workspace` records `attached` (with `workspaceId`) / `none` / `unavailable` / `failed:<reason>`, `steps.pin` the pin; the workspace id and the pin are kept on the link. A revert removes the successor only from that workspace (not if the user moved it elsewhere) and undoes the pin the hand-over added. None of this fails a hand-over.
@@ -660,6 +678,8 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
 | `closeoutGuard` | `true` | Refuse a new-work `codex_run` and the planner's `update_goal(action=complete)` while the session owns finished jobs whose report flags something and that have no `codex_review`, or a `needs_changes` job with no follow-up round (continue, resume, verify and queries stay allowed); jobs started before 0.9.103 was first loaded never count, and unreadable records fail open with a warning; `false` switches it off. Known limits: a `codex_run` with any `resume` counts as rework and is not checked, so the planner can start new work on one of the session's old threads; a `needs_changes` job stops blocking once any follow-up round exists, even one cancelled straight away |
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
+| `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |
+| `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |
 | `autoHandover` | see below | What happens once a session is flagged; an object whose keys may be omitted one by one. Invalid values warn and fall back to the default; unknown sub-keys go to `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` flags only and keeps the panel button; `notify` adds a panel reminder; `confirm` asks in the panel once the session is idle with no running Codex job and hands over on agreement; `auto` hands over directly under the same conditions |
 | `autoHandover.cooldownHours` | `12` | Hours without questions or automatic hand-overs after a decline, a dismissed reminder or an unanswered question; non-negative |
