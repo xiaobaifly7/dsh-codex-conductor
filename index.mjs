@@ -2086,6 +2086,28 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const location = ctx.get?.('sessionPersistence')?.locate?.(exec.agent.session.header);
     return [cwd, location?.kind === 'jsonl' && typeof location.path === 'string' ? [path.dirname(location.path)] : []];
   };
+  // 已交接出去的会话收到用户消息时，在第一步之前附一条说明，免得规划端照常干活、到调用工具才被拒。
+  // 每条用户消息只附一次；任何异常都放行原决定。
+  const retiredNotified = new Set();
+  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+    const decision = await next();
+    try {
+      if (decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
+      const fresh = (messages ?? []).filter((m) => m?.source?.kind === 'user' && !retiredNotified.has(m.id));
+      if (!fresh.length) return decision;
+      const successor = aliases.successor(agent?.id);
+      if (!successor) return decision;
+      if (retiredNotified.size > 1000) retiredNotified.clear();
+      for (const m of fresh) retiredNotified.add(m.id);
+      const at = aliases.links()[successor]?.at;
+      const text = `[codex-conductor] 本会话已于 ${at ?? '（时间未知）'} 交接给会话 ${successor}。这里的 Codex 派活、续接、核验、验收和取消工具都已停用，只能查看记录。` +
+        `请直接告诉用户：到会话 ${successor} 继续这项工作，然后结束本回合，不要在这里继续推进。`;
+      return { ...decision, messages: [...decision.messages, { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: `plugin:${name}` } }] };
+    } catch {
+      return decision;
+    }
+  });
+
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
     // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
@@ -2093,7 +2115,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (['codex_run', 'codex_continue', 'codex_verify', 'codex_review', 'codex_cancel', 'gemini_write'].includes(exec.name)) {
       const successor = aliases.successor(exec.agent?.id);
       if (successor) {
-        const message = `${exec.name}: 本会话已交接给 ${successor}，任务改由新会话处理；这里只能查看记录。`;
+        const message = `${exec.name}: 本会话已交接给 ${successor}，任务改由新会话处理；这里只能查看记录。` +
+          `请告诉用户到会话 ${successor} 继续，本会话不要再派活或验收。`;
         return { isError: true, error: { message }, content: [{ type: 'text', text: `Error: ${message}` }] };
       }
     }

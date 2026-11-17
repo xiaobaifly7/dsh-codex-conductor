@@ -5552,3 +5552,25 @@ test('a session turning idle runs the auto hand-over check: confirm asks once, o
   await idle(busy, big('session-wire-busy'));
   assert.equal(state()['session-wire-busy'].open, 'remind', 'a running Codex job only leaves a reminder, never a question');
 });
+
+test('a handed-over session gets one notice before the first step of each user message, and the refusal names the successor', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link('S1', 'S2');
+  t.after(() => aliases.unlink('S1', 'S2'));
+  const h = harness();
+  const as = (id) => ({ ...agentAt('/work/current'), id });
+  const user = { id: 'u1', role: 'user', content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } };
+  const step = (agent, messages) => h.handlers['agent/pre-step']({ agent, messages, step: 1, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [...messages] }));
+  const first = await step(as('S1'), [user]);
+  assert.equal(first.messages.length, 2);
+  assert.match(first.messages[1].content[0].text, /已于 .+ 交接给会话 S2[\s\S]*到会话 S2 继续/);
+  assert.equal((await step(as('S1'), [user])).messages.length, 1, 'once per user message');
+  assert.equal((await step(as('S1'), [{ ...user, id: 'n1', source: { kind: 'tool-jobs' } }])).messages.length, 1);
+  assert.equal((await step(as('S3'), [{ ...user, id: 'u3' }])).messages.length, 1, 'sessions without a successor are untouched');
+  const rejected = await h.handlers['agent/pre-step']({ agent: as('S1'), messages: [{ ...user, id: 'u4' }] }, async () => ({ kind: 'reject' }));
+  assert.deepEqual(rejected, { kind: 'reject' });
+  const refused = await h.handlers['tools/execute']({ name: 'codex_run', arguments: {}, agent: as('S1') }, async () => ({ value: 'ran' }));
+  assert.match(refused.error.message, /已交接给 S2[\s\S]*请告诉用户到会话 S2 继续/);
+});
