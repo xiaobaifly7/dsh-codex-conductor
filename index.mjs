@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -68,6 +68,8 @@ const DEFAULTS = {
   maxSessionTokens: null,
   // 可写任务在 git 仓库里记录本单改动的 diff（可回滚）；false 关闭
   jobDiff: true,
+  // 本会话有已结束、报告有标记却未 codex_review 或 needs_changes 未跟进的任务时，拒绝开新工作的 codex_run；false 关闭
+  closeoutGuard: true,
   // 受护栏会话的工具放行方式：denylist 只拒绝已知的写入/执行工具；allowlist 只放行已知只读工具和 allowTools
   toolPolicy: 'denylist',
   allowTools: [],
@@ -896,6 +898,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   let dispatchGeneration = 0;
   const geminiWrites = new Set();
   const startingWrites = new Set();
+  const closeoutFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
   const statusQueries = new Map();
   function dampenStatus(value, exec, tool, seconds = 0) {
     const owner = exec?.agent?.id;
@@ -1188,6 +1191,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const tool = continuation ? 'codex_continue' : 'codex_run';
       const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
         (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
+      // 收尾护栏只拦开新工作的 codex_run；续接、返工（resume）和核验照常放行。读不到记录或判定出错时放行并记警告。
+      if (cfg.closeoutGuard !== false && !continuation && !args.resume && !verificationOf && owner) {
+        let refusal = '';
+        try {
+          // shortcut: 只看截止时间后开始的前 1000 单；单会话超过时漏判只会放行，届时再翻页。
+          const mine = await conductor.list({ owner, started_between: [closeoutFrom, Date.now() / 1000 + 86_400], limit: 1000 }, exec?.signal);
+          if (!Array.isArray(mine.jobs)) throw new Error(mine.error ?? mine.error_kind ?? '任务列表不可用');
+          refusal = closeoutRefusal(tool, pendingCloseout(mine.jobs, closeoutFrom));
+        } catch (error) {
+          exec?.signal?.throwIfAborted();
+          ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
+        }
+        if (refusal) throw new Error(refusal);
+      }
       if (args.resume && owner) {
         // 新一轮的结果不能替代同线程更早问题的用户回复。
         for (let offset = 0; offset !== null;) {
@@ -1296,7 +1313,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。' +
       (cfg.plannerReads === 'products' ? 'completed 后先机械核对产物、出处和数字，内容是否属实用 codex_verify，' : 'completed 后你要逐条只读核验，') +
       (cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
-      '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
+      (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
       (cfg.allowHostAccess === true
@@ -1992,7 +2010,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
-        toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false,
+        toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}

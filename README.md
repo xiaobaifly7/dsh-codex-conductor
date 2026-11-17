@@ -301,6 +301,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `maxSessionJobs` | 留空（不限制） | 每个会话累计可派的 Codex 任务数上限，须为正整数；达到后不启动 Codex 并说明原因 |
 | `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
+| `closeoutGuard` | `true` | 本会话有已结束、报告标出问题却没有 `codex_review` 的任务，或记了 `needs_changes` 却没有后续轮次的任务时，拒绝开新工作的 `codex_run`（续接、返工、核验和查询照常）；第一次加载 0.9.103 之前开始的任务不计入，记录读不到时放行并记警告；设为 `false` 关闭 |
 | `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools`，已有的拒绝规则仍然优先 |
 | `allowTools` | `[]` | 白名单模式下额外放行的工具名，不区分大小写，`*` 结尾表示前缀匹配；不能放行 `write`、`run_code` 等已被拒绝的工具 |
 | `maxRunningJobs` | 留空（不限制） | 同时运行或排队等写锁的 Codex 任务数上限，须为正整数；达到上限时 `codex_run` / `codex_continue` / `codex_verify` 不启动 Codex 并说明原因，等其中一个结束后再派 |
@@ -559,6 +560,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `maxSessionJobs` | Empty (unlimited) | Positive integer limit on the Codex jobs one session may dispatch in total |
 | `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
+| `closeoutGuard` | `true` | Refuse a new-work `codex_run` while the session owns finished jobs whose report flags something and that have no `codex_review`, or a `needs_changes` job with no follow-up round (continue, resume, verify and queries stay allowed); jobs started before 0.9.103 was first loaded never count, and unreadable records fail open with a warning; `false` switches it off |
 | `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |
 | `maxRunningJobs` | Empty (unlimited) | Positive integer limit on Codex jobs that are running or queued for a write lock; at the limit a dispatch is refused with the reason instead of starting Codex |

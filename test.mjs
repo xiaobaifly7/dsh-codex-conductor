@@ -1263,7 +1263,8 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   const ctx = { tools: { register: (t) => { tools[t.name] = t; }, guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; },
     logger: { warn: (text) => warnings.push(text) },
     ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
-  apply(ctx, { workspaces: ['F:\\work\\项目'], ...pluginConfig }, run, launchGemini);
+  // 收尾护栏会多一次 list 调用；只有专门测它的用例才打开。
+  apply(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, ...pluginConfig }, run, launchGemini);
   const answer = async (job, value) => {
     for (let i = 0; !waiters[job]?.length; i++) {
       if (i === 1000) {
@@ -5297,4 +5298,19 @@ test('reuse_draft rejects external files, non-md, aliases and linked escapes bef
   const outputAlias = path.join(path.dirname(good), `${path.basename(h.cwd)}-alias.md`);
   linkSync(output, outputAlias);
   assert.match((await h.execute({ reuse_draft: outputAlias, overwrite: true })).error, /不能与 output 或 sources 相同/);
+});
+
+test('close-out guard refuses new-work codex_run until finished jobs are reviewed, and fails open', async () => {
+  const flagged = { job_id: 'FLAG', execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: Date.now() / 1000 + 60, started_at: Date.now() / 1000 };
+  const on = harness({ config: { closeoutGuard: true, listResult: { jobs: [flagged], total: 1 } } });
+  await assert.rejects(on.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') }), /未收尾.*codex_review 记录：FLAG/);
+  assert.ok(on.calls.find(argv => argv[0] === 'list').includes('--started-between'));
+  assert.ok(!on.calls.some(argv => argv[0] === 'start'));
+  const broken = harness({ config: { closeoutGuard: true, listResult: { status: 'failed', error_kind: 'bridge_error' }, startResult: { job_id: 'J', status: 'completed' } } });
+  assert.equal((await broken.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') })).job_id, 'J');
+  assert.match(broken.warnings.join('\n'), /收尾检查失败，已放行/);
+  const off = harness({ config: { listResult: { jobs: [flagged], total: 1 }, startResult: { job_id: 'J', status: 'completed' } } });
+  assert.equal((await off.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') })).job_id, 'J');
+  assert.ok(!off.calls.some(argv => argv[0] === 'list'));
 });

@@ -1,3 +1,6 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+
 // codex_review 提交前的机械修补与一次性问题清单：只改无歧义的形状，不替规划端判定结论、补证据或接受偏差。
 const STATUSES = ['verified', 'needs_changes', 'accepted_deviations'];
 const MARKS = ['met', 'not_met', 'blocked'];
@@ -168,4 +171,43 @@ export function reviewRejection(jobId, source, { fixed, problems }) {
     problems.map((p, i) => `${i + 1}. ${p}`).join('\n') +
     (fixed.length ? `\n（以下已自动修正，无需再改：${fixed.join('；')}）` : '') +
     `\n应提交的形状：${shape}\n结论和证据由你核验后填写，插件不会代填。`;
+}
+
+// 收尾护栏：本会话已结束、报告有标记却没有 codex_review 的任务，以及 needs_changes 后既无后续轮次也无新核验的任务。
+// 核验任务（verification_of）的验收记在原任务上；取消、无有效报告的失败和截止时间之前结束的任务都不拦。
+export function pendingCloseout(jobs, since) {
+  const unreviewed = [];
+  const needsChanges = [];
+  for (const job of jobs) {
+    if (!job || job.context?.verification_of || !(job.finished_at >= since)) continue;
+    if (job.verification_status === 'unreviewed' && job.review_status === 'needs_attention' &&
+        ['completed', 'failed'].includes(job.execution_status) && job.report_status === 'valid') unreviewed.push(job.job_id);
+    else if (job.verification_status === 'needs_changes' && !jobs.some((other) => other && other.job_id !== job.job_id &&
+        (other.parent_job_id === job.job_id || (job.thread_id && other.thread_id === job.thread_id && other.started_at > job.started_at)))) {
+      needsChanges.push(job.job_id);
+    }
+  }
+  return { unreviewed, needsChanges };
+}
+
+export function closeoutRefusal(tool, { unreviewed, needsChanges }) {
+  if (!unreviewed.length && !needsChanges.length) return '';
+  return `${tool}: 本会话还有已结束但未收尾的 Codex 任务，未启动新任务。` +
+    (unreviewed.length ? `报告标出问题却没有验收记录，先用 codex_review 记录：${unreviewed.join('、')}。` : '') +
+    (needsChanges.length ? `已记 needs_changes 但没有后续轮次：${needsChanges.join('、')}；用 codex_continue 或带 resume 的 codex_run 返工，` +
+      '或核实后用 codex_review 记 accepted_deviations（写明理由）或 verified。' : '') +
+    'codex_continue、codex_verify、codex_review、codex_status、codex_output、codex_cancel 仍可使用。';
+}
+
+// 截止时间：本机第一次加载带收尾护栏的版本时记下（秒，与 runner 的 finished_at 同单位），之后保持不变；
+// 在此之前结束的任务一律不拦。没有目录（测试或非 Windows）时取本次加载时间。
+export function closeoutSince(directory, now = Date.now() / 1000) {
+  if (!directory) return now;
+  const file = path.join(directory, 'closeout-since.json');
+  try {
+    const since = JSON.parse(readFileSync(file, 'utf8')).since;
+    if (Number.isFinite(since)) return since;
+  } catch {}
+  try { mkdirSync(directory, { recursive: true }); writeFileSync(file, JSON.stringify({ since: now })); } catch {}
+  return now;
 }

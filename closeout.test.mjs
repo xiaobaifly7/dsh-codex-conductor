@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { prepareReview, reviewRejection } from './closeout.mjs';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } from './closeout.mjs';
 
 const acceptance = ['第一条', '第二条'];
 const report = (extra = {}) => ({ summary: 's', criteria: acceptance.map((criterion) => ({ criterion, status: 'met', evidence: 'e' })),
@@ -54,4 +57,29 @@ test('verified must address every item the report flagged', () => {
   assert.deepEqual(addressed.problems, []);
   // needs_changes 不受此约束。
   assert.deepEqual(prepareReview({ status: 'needs_changes', criteria: [met(1), { index: 2, status: 'not_met', evidence: 'x' }] }, flagged).problems, []);
+});
+
+test('close-out guard picks unreviewed flagged jobs and needs_changes without follow-up', () => {
+  const done = (job_id, extra = {}) => ({ job_id, execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: 200, started_at: 100, thread_id: `T-${job_id}`, parent_job_id: null, ...extra });
+  const jobs = [done('A'), done('OLD', { finished_at: 50 }), done('CANCELLED', { execution_status: 'cancelled', report_status: 'missing' }),
+    done('NOREPORT', { execution_status: 'failed', report_status: 'missing' }), done('CLEAN', { review_status: 'needs_verification' }),
+    done('VERIFY', { context: { verification_of: 'A' } }), done('NC', { verification_status: 'needs_changes' }),
+    done('NC2', { verification_status: 'needs_changes' }), done('CHILD', { parent_job_id: 'NC2', review_status: 'needs_verification' }),
+    done('NC3', { verification_status: 'needs_changes' }), done('RESUMED', { thread_id: 'T-NC3', started_at: 300, review_status: 'needs_verification' }),
+    done('OK', { verification_status: 'verified' }), done('RUNNING', { execution_status: 'running', finished_at: null })];
+  const pending = pendingCloseout(jobs, 100);
+  assert.deepEqual(pending, { unreviewed: ['A'], needsChanges: ['NC'] });
+  const message = closeoutRefusal('codex_run', pending);
+  assert.match(message, /codex_review 记录：A。/);
+  assert.match(message, /needs_changes 但没有后续轮次：NC；/);
+  assert.equal(closeoutRefusal('codex_run', { unreviewed: [], needsChanges: [] }), '');
+});
+
+test('close-out cut-off is written once and then kept', (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conductor-closeout-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(closeoutSince(path.join(dir, 'state'), 1000), 1000);
+  assert.equal(closeoutSince(path.join(dir, 'state'), 2000), 1000);
+  assert.equal(closeoutSince(undefined, 3000), 3000);
 });
