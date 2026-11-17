@@ -342,6 +342,7 @@ export function createConductor(cfg, run = runRunner) {
   async function list(filters = {}, signal) {
     const argv = ['list', '--limit', String(filters.limit ?? 20), '--offset', String(filters.offset ?? 0)];
     for (const key of ['cwd', 'owner', 'status']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
+    for (const id of filters.owner !== undefined ? filters.also_owners ?? [] : []) argv.push('--also-owner', id);
     for (const [key, flag] of [['thread_id', '--thread-id'], ['parent_job', '--parent-job']]) if (filters[key] !== undefined) argv.push(flag, filters[key]);
     if (filters.needs_attention) argv.push('--needs-attention');
     if (filters.scope_conflicts) argv.push('--scope-conflicts');
@@ -362,6 +363,7 @@ export function createConductor(cfg, run = runRunner) {
   async function summary(filters = {}, signal) {
     const argv = ['summary'];
     for (const key of ['cwd', 'owner']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
+    for (const id of filters.owner !== undefined ? filters.also_owners ?? [] : []) argv.push('--also-owner', id);
     if (filters.thread_id !== undefined) argv.push('--thread-id', filters.thread_id);
     for (const key of ['limit', 'offset']) if (filters[key] !== undefined) argv.push(`--${key}`, String(filters[key]));
     for (const id of filters.job_ids ?? []) argv.push('--job-id', id);

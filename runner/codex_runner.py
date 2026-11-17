@@ -1728,7 +1728,9 @@ def matching_jobs(args, *, page_dates=None):
 
     def matches_metadata(value, job_id):
         context = value.get("context")
-        if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
+        # --also-owner adds predecessor sessions handed over to --owner; it never applies without --owner.
+        owners = {args.owner, *(getattr(args, "also_owner", None) or [])}
+        if args.owner and not ((isinstance(context, dict) and context.get("owner") in owners) or
                                job_id in (args.job_id or [])):
             return False
         return not args.cwd or bool(value.get("cwd") and
@@ -2274,6 +2276,7 @@ def main():
     for command in (listing, summary):
         command.add_argument("--cwd")
         command.add_argument("--owner")
+        command.add_argument("--also-owner", action="append")
         command.add_argument("--status", choices=["running", "completed", "failed", "cancelled", "unknown"])
         command.add_argument("--needs-attention", action="store_true")
         command.add_argument("--job-id", action="append", type=job_identifier)

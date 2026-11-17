@@ -2997,6 +2997,17 @@ class RunnerTests(unittest.TestCase):
         for extra in (("--limit", "101"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
+    def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
+        for job_id, owner in (("mine", "owner-b"), ("predecessor", "owner-a"), ("unrelated", "owner-c")):
+            self.stored_job(job_id, {"status": "completed", "structured": self.sample_report()}, context=self.sample_context(owner))
+        listed = self.control("list", "--owner", "owner-b", "--also-owner", "owner-a")
+        self.assertEqual({j["job_id"] for j in listed["jobs"]}, {"mine", "predecessor"})
+        self.assertEqual({j["job_id"] for j in self.control("list", "--owner", "owner-b")["jobs"]}, {"mine"})
+        # Without --owner it is not a filter at all.
+        self.assertEqual(self.control("list", "--also-owner", "owner-a")["total"], 3)
+        summary = self.control("summary", "--owner", "owner-b", "--also-owner", "owner-a")
+        self.assertEqual(summary["total_jobs"], 2)
+
     def test_list_filters_metadata_before_reading_job_events(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
