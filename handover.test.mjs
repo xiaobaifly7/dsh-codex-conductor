@@ -370,16 +370,29 @@ test('the brief has every section in order, caps each section and drops whole se
   assert.match(plain, /读取旧会话日志超时，省略了“最近的用户指令”和“旧会话最后的进展”/);
   assert.ok(!plain.includes('## 最近的用户指令') && !plain.includes('session_read'));
   assert.match(plain, /codex_summary（session_id="current"）看总览/);
-  // 总长度紧张：任务表先缩成未结束、待处理和最近 10 单，再从优先级最低的节开始整节省略；下一步从不省略。
+  // 总长度紧张：任务表先缩成未结束、待处理和最近 10 单，再从优先级最低的节开始整节省略；下一步、待收尾从不省略。
   const tight = buildBrief({ ...base, note: '下一步', limit: 6000 });
-  assert.ok(tight.length <= 6000 || tight.match(/^## /gm).length === 1, String(tight.length));
+  assert.ok(tight.length <= 6000 || tight.match(/^## /gm).length === 2, String(tight.length));
   assert.match(tight, /本单超过 6000 字符，省略了：接手须知、如何回看旧会话/);
   assert.ok(tight.includes('## 下一步'));
   const compact = buildBrief({ ...base, note: '', limit: 12_500 });
   const rows = compact.match(/^\| J\d+ /gm) ?? [];
   assert.ok(rows.length <= 13 && rows.some((r) => r.includes('J050')), rows.join(''));
   const smallest = buildBrief({ ...base, note: 'x', limit: 100 });
-  assert.deepEqual(smallest.match(/^## .*/gm), ['## 下一步']);
+  assert.deepEqual(smallest.match(/^## .*/gm), ['## 下一步', '## 待收尾']);
+  assert.match(smallest, /本单超过 100 字符，省略了：接手须知、如何回看旧会话、任务、旧会话最后的进展、最近的用户指令、目标。/);
+});
+
+test('in an extremely long brief the next step and the pending close-out still survive', async () => {
+  const { buildBrief, sessionContext } = await import('./handover.mjs');
+  const log = Array.from({ length: 50 }, (_, i) => ({ type: 'user/message', time: i, data: { source: { kind: 'user' }, content: [{ type: 'text', text: `要求 ${i}：${'很长'.repeat(5000)}` }] } }));
+  const brief = buildBrief({ from: 'session-A', to: 'session-B', at: '2026-11-17T09:30:00.000Z', cwd: '/w', since: 0,
+    goal: { phase: 'active', objective: '目标'.repeat(50_000), roundsStarted: 1, maxGoalRounds: 3 }, jobs: briefJobs(2000),
+    pending: { unreviewed: ['J2000', 'J1999'], needsChanges: ['J1998'] }, context: sessionContext(log), note: `先返工 J1998。${'说明'.repeat(8000)}` });
+  assert.deepEqual(brief.match(/^## .*/gm).map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 待收尾']);
+  assert.match(brief, /## 下一步\n先返工 J1998/);
+  assert.match(brief, /尚未 codex_review：J2000、J1999/);
+  assert.match(brief, /还没有后续轮次：J1998/);
 });
 
 test('after a hand-over the plugin checks goal, settings, jobs, delivery and the frozen predecessor, and reports issues without rolling back', async (t) => {

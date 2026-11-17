@@ -135,7 +135,7 @@ const clip = (value, size) => { const text = String(value ?? '').trim(); return 
 const textOf = (content) => (Array.isArray(content) ? content : []).filter((c) => c?.type === 'text').map((c) => c.text).join('\n');
 const timeOf = (event) => { const t = event?.time ?? event?.at; return Number.isFinite(t) ? new Date(t).toISOString() : typeof t === 'string' ? t : '时间未知'; };
 
-// 整张交接单的字符上限；超出时先把任务表缩成要紧的几单，再按优先级从低到高整节省略。
+// 整张交接单的字符上限；超出时先把任务表缩成要紧的几单，再按优先级从低到高整节省略（下一步、待收尾永不省略）。
 export const BRIEF_LIMIT = 16_000;
 // 宿主、自动续接和本插件以“用户”身份发出的固定话术：不是人工输入。
 const AUTOMATED_USER_TEXT = /^\s*(?:\[codex-conductor|(?:继续|continue|продолжай)(?:[\s。.!！,，;；:：]|$)|[（(](?:上一步工具|检测到你可能陷入循环))/i;
@@ -217,7 +217,8 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
         ...(context.lastTurn ? [`- 最后一个回合：结束原因 ${context.lastTurn.reason}，${context.lastTurn.at}`] : []),
         ...(context.progress ? [`- 最后一个正常结束回合的助手回复（${context.progress.at}，前 1500 字符）：`, '', context.progress.text] : [])] }] : []),
     ] : []),
-    { priority: 5, title: '待收尾', lines: ['## 待收尾',
+    // 待收尾很短却是接手时最要紧的，与“下一步”同为 1，永不省略。
+    { priority: 1, title: '待收尾', lines: ['## 待收尾',
       `- 报告有标记、尚未 codex_review：${fit(pending.unreviewed, 1000).join('、') || '无'}`,
       `- 记了 needs_changes、还没有后续轮次：${fit(pending.needsChanges, 1000).join('、') || '无'}`,
       `- 仍在运行：${running.map((j) => j.job_id).join('、') || '无'}（结束通知会发到原会话；用 codex_status 查询）`] },
