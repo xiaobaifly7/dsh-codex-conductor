@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { createAliases, registerHandoverRequests, createHistoryTracker } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -68,8 +68,10 @@ const DEFAULTS = {
   maxRunningJobs: null,
   // 每个会话累计可派的任务数、累计用量（token）上限；留空不限制
   maxSessionJobs: null,
-  // 会话消息数超过这个值时提示“建议交接”（只提示，不自动交接）；0 关闭
+  // 会话消息数超过这个值时标记“建议交接”；0 关闭（自动交接的提醒、询问也随之关闭）
   handoverSuggestMessages: 5000,
+  // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
+  autoHandover: AUTO_HANDOVER_DEFAULTS,
   maxSessionTokens: null,
   // 可写任务在 git 仓库里记录本单改动的 diff（可回滚）；false 关闭
   jobDiff: true,
@@ -824,7 +826,7 @@ function settings(config, logger) {
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
-      : key === 'autoResume' ? value !== null && typeof value === 'object' && !Array.isArray(value)
+      : ['autoResume', 'autoHandover'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
@@ -841,6 +843,18 @@ function settings(config, logger) {
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoResume.${key}，使用默认值`);
     return [key, valid ? value : fallback];
   }));
+  const autoHandover = config.autoHandover;
+  for (const key of Object.keys(autoHandover)) if (!Object.hasOwn(DEFAULTS.autoHandover, key)) unknownConfig.push(`autoHandover.${key}`);
+  config.autoHandover = Object.fromEntries(Object.entries(DEFAULTS.autoHandover).map(([key, fallback]) => {
+    const value = autoHandover[key];
+    const valid = key === 'mode' ? ['off', 'notify', 'confirm', 'auto'].includes(value)
+      : key === 'remindStepMessages' ? Number.isSafeInteger(value) && value > 0
+      : key === 'disableAutoContinue' ? typeof value === 'boolean'
+      : Number.isFinite(value) && value >= 0;
+    if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoHandover.${key}，使用默认值`);
+    return [key, valid ? value : fallback];
+  }));
+  if (unknownConfig.some((key) => key.startsWith('autoHandover.'))) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.filter((key) => key.startsWith('autoHandover.')).join(', ')} 已忽略，请核对拼写`);
   if (config.gemini) {
     const gemini = config.gemini;
     if (typeof gemini.command !== 'string' || !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)/.test(gemini.command.trim())) {
@@ -949,7 +963,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const owns = (id, owner) => Boolean(id && owner) && aliases.owners(id).includes(owner);
   const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
-  // 超过阈值时给规划端一行提示，每个回合最多一次；交接只能由操作员发起。
+  const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  const autoHandover = createAutoHandover({ directory: stateDirectory, settings: () => cfg.autoHandover, aliases, logger: ctx.logger,
+    runningJobs: async (owner) => {
+      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), status: 'running', limit: 1 });
+      if (!Number.isSafeInteger(page?.total)) throw new Error(page?.error ?? page?.error_kind ?? '任务列表不可用');
+      return page.total;
+    } });
+  // 超过阈值时给规划端一行提示，每个回合最多一次；规划端自己不发起交接。
   const hintedTurns = new Map();
   const handoverHint = (agent) => {
     const value = history.observe(agent);
@@ -1914,7 +1935,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
   registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
-    history: () => history.snapshot() });
+    history: () => history.snapshot(), handover: () => autoHandover.snapshot(history.snapshot().sessions),
+    answerHandover: (id, accept) => autoHandover.answer(id, accept) });
 
   const geminiText = (value) => {
     let summary = '';
@@ -2025,6 +2047,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   for (const agent of ctx.get?.('agents')?.list?.() ?? []) recoverAgent(agent);
   // 已交接出去的会话不再被任务通知唤醒，由后继会话查询这些任务。
   registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox, retired: (id) => Boolean(aliases.successor(id)) });
+  // 会话回到空闲时按 autoHandover 判定是否提醒、询问或自动交接；从不在回合进行中动手。
+  ctx.on('agent/status', ({ agent, status }) => {
+    if (status !== 'idle') return;
+    try { void autoHandover.observe(agent, history.observe(agent)).catch(() => {}); } catch {}
+  });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
@@ -2131,15 +2158,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         plannerAnswers: cfg.plannerAnswers === true,
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length },
+        autoHandover: cfg.autoHandover,
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}
   const resumeDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  // dsh-client-auto-continue 只给自己的网页提供设置接口，没有给其他插件调用的服务：这里只读它在宿主设置里的会话模式，
+  // 交接结果记 manual_required，由操作员在界面关掉旧会话的自动继续。没装这个插件时返回 undefined。
+  const autoContinueMode = (sessionId) => {
+    const entry = ctx.get?.('settings')?.describe?.().find((form) => form.ns === 'auto-continue');
+    return entry && { mode: entry.value?.sessionModes?.[sessionId] ?? 'default' };
+  };
   if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
     registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume });
     registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,
-      sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom) });
+      sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom),
+      disableAutoContinue: cfg.autoHandover.disableAutoContinue, autoContinue: autoContinueMode });
   });
 }

@@ -66,6 +66,19 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.108：面板一键交接、到阈值询问或自动交接
+
+不必再手写请求文件。设置里“Codex 指挥”新增“会话交接”一节：
+
+- **建议交接的会话**：列出消息数超过 `handoverSuggestMessages` 的会话（会话编号、工作目录、消息数），每个旁边有“交接到新会话”；点开可以填一句给新会话的“下一步”（可空），确认后提交。走的仍是 `handover-request.json`，上一份没处理完时拒绝新提交。会话有回合或 Codex 任务在跑时照样能点，插件会拒绝并在“最近结果”里说明，例如“当前有 2 个 Codex 任务在运行，结束后再交接”。
+- **需要处理的交接提醒**：按 `autoHandover.mode` 出现。`notify` 起，会话首次被标记时出现一条提醒（“现在交接 / 知道了”），之后消息数每再涨 `remindStepMessages` 条才再提醒一次。`confirm`（默认）在会话空闲、名下没有运行中的 Codex 任务、本身没有交接出去、不在冷却期时改为询问（“同意交接 / 暂不交接”）；同意即提交来源为 `confirm` 的交接，拒绝或放着不理都进入 `cooldownHours` 冷却。`auto` 满足同样条件时直接提交来源为 `auto` 的交接，另加：同一会话 24 小时内最多自动交接 1 次、宿主进程启动后 `startupDelayMinutes` 分钟内不触发；继任会话要从交接时起再涨满一个阈值才会再次触发。插件从不在回合或任务进行中询问或交接，也从不自动带 `force`。宿主没有给插件的通知或提问通道，提醒和询问只出现在这一节，并写一行插件日志；不会占用会话的模型回合。
+- **当前交接**：列出每条交接（原会话 → 继任会话、时间、来源），可“撤回”。继任会话在交接后已有新回合（交接单那一回合不算）或正在运行时，撤回默认被拒（`status: rejected`、`reason: successor_active`，说明“继任会话已有 N 个新回合，撤回会造成两个会话并行”）；面板这时显示原因和“仍然撤回（两个会话会并行）”，再点一次才带 `force` 提交，结果标 `warning: parallel_sessions`。撤回结果的 `sessions` 写明两个会话各自的状态：原会话恢复派活和目标，继任会话目标暂停、它在交接后派出的任务仍归它。
+- **最近结果与最近记录**：最近一次交接结果，以及最近 10 条交接、认领、撤回记录。
+
+来源与记录：请求可带 `origin`（`panel` / `auto` / `confirm` / `tool` / `file`，没带时记 `file`）和 `requestedAt`；面板提交自动带 `panel` 和提交时刻。`handover-result.json`、`handover.json` 的链接记录和交接单头部都写入来源和请求时间；状态目录另有只追加的 `handover-history.jsonl`（每次交接、认领、撤回一行：时间、动作、from、to、来源、状态、被拒原因，不含交接单正文），保留最近 200 行。链接记录还记下交接时继任会话的消息数和回合数（`toMessages` / `toTurns`），用于撤回保护和再次触发的判断。目前没有给模型的交接工具，`tool` 只是预留的来源值。
+
+旧会话的自动继续：同机装了 `dsh-client-auto-continue` 时，它的“自动继续”不归本插件管，旧会话仍可能被它推着跑。该插件只给自己的网页提供设置接口，没有可供其他插件调用的服务，所以交接时插件只读它在宿主设置里的会话模式：已经是“关闭”记 `steps.autoContinue: disabled`，否则记 `manual_required`，交接单和面板提示“请把旧会话的自动继续开关关掉”。没装该插件记 `not_installed`；读取出错记 `failed:<原因>`；都不影响交接。若将来有可调用的接口，插件会改为直接关闭并把原模式记在链接里，撤回时恢复。`autoHandover.disableAutoContinue: false` 跳过这一步。
+
 ### 0.9.106：把长会话交接给新会话
 
 会话历史越长，每一步越慢（整段历史每步都要重发）。交接把目标和 Codex 任务一起转到一个新会话，原会话只读保留。插件状态目录是 DSH 进程的 `%LOCALAPPDATA%\dsh-codex-conductor`（便携版 DSH 一般是 `<DSH 数据目录>\local\dsh-codex-conductor`，即 `loaded.json` 所在目录）。步骤：
@@ -319,7 +332,13 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
 | `closeoutGuard` | `true` | 本会话有已结束、报告标出问题却没有 `codex_review` 的任务，或记了 `needs_changes` 却没有后续轮次的任务时，拒绝开新工作的 `codex_run` 和规划端的 `update_goal(action=complete)`（续接、返工、核验和查询照常；用户在界面上完成目标不受影响）；第一次加载 0.9.103 之前开始的任务不计入，记录读不到时放行并记警告；设为 `false` 关闭。已知限制：带任意 `resume` 的 `codex_run` 视为返工、不受检查，规划端可借本会话的旧线程开新工作；`needs_changes` 任务一旦有后续轮次（哪怕随即 `codex_cancel`）就不再拦 |
-| `handoverSuggestMessages` | `5000` | 会话消息数超过此值时提示“建议交接”（只提示，不自动交接）；0 关闭 |
+| `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
+| `autoHandover` | 见下 | 标记建议交接之后怎么办，对象，各键可单独省略；无效值告警并回落默认值，未知子键写进 `unknownConfig` |
+| `autoHandover.mode` | `confirm` | `off` 只标记并保留面板按钮；`notify` 另加面板提醒；`confirm` 会话空闲且没有运行中的 Codex 任务时在面板询问，同意才交接；`auto` 同样条件下直接交接 |
+| `autoHandover.cooldownHours` | `12` | 拒绝、点“知道了”或询问没人理之后多少小时内不再询问或自动交接，非负数 |
+| `autoHandover.remindStepMessages` | `2000` | 同一会话再次提醒需要再涨的消息数，正整数 |
+| `autoHandover.startupDelayMinutes` | `10` | 宿主进程启动后多少分钟内不自动交接（只约束 `auto`），非负数 |
+| `autoHandover.disableAutoContinue` | `true` | 交接后处理旧会话在 `dsh-client-auto-continue` 里的自动继续（目前只能提示手动关闭，见上文） |
 | `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools`，已有的拒绝规则仍然优先 |
 | `allowTools` | `[]` | 白名单模式下额外放行的工具名，不区分大小写，`*` 结尾表示前缀匹配；不能放行 `write`、`run_code` 等已被拒绝的工具 |
 | `maxRunningJobs` | 留空（不限制） | 同时运行或排队等写锁的 Codex 任务数上限，须为正整数；达到上限时 `codex_run` / `codex_continue` / `codex_verify` 不启动 Codex 并说明原因，等其中一个结束后再派 |
@@ -493,6 +512,19 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
 
+### 0.9.108: One-click hand-over in the panel, asking at the threshold, or automatic
+
+No more hand-written request files. The "Codex 指挥" settings page has a new "会话交接" (hand-over) section:
+
+- **Suggested sessions**: every session over `handoverSuggestMessages` (id, working directory, message count) with a "交接到新会话" button; it opens an optional one-line "next step" for the new session and submits after a confirmation. It still goes through `handover-request.json` and is refused while the previous request is pending. The button works while a turn or Codex job is running; the plugin refuses and the latest result says why in plain words (for example "2 Codex jobs are running, hand over once they end").
+- **Prompts**: driven by `autoHandover.mode`. From `notify` on, a session gets one reminder when it is first flagged and another only after `remindStepMessages` more messages. `confirm` (default) asks instead once the session is idle, has no running Codex job, has not been handed over and is out of its cooldown; agreeing submits a hand-over with origin `confirm`, declining or ignoring it starts a `cooldownHours` cooldown. `auto` submits a hand-over with origin `auto` under the same conditions, at most once per session per 24 hours and never within `startupDelayMinutes` of the host process starting; a successor triggers again only after it has grown by a full threshold since the hand-over. The plugin never asks or hands over while a turn or job runs and never sets `force` itself. The host offers plugins no notification or question channel, so reminders and questions appear only in this section (plus one log line) and never take a model turn.
+- **Current links**: every link (from → to, time, origin) with a revert button. If the successor has had new turns since the hand-over (the brief's own turn does not count) or is running, a revert is refused by default (`status: rejected`, `reason: successor_active`, "the successor has N new turns; reverting would leave two sessions working in parallel"). The panel then shows the reason and a second button that resubmits with `force`; the result carries `warning: parallel_sessions`. A revert's `sessions` field states what each session now is: the predecessor can dispatch again with its goal resumed; the successor's goal is paused and the jobs it started stay its own.
+- **Latest result and recent records**: the last result and the last 10 hand-over, adoption and revert records.
+
+Origin and records: a request may carry `origin` (`panel` / `auto` / `confirm` / `tool` / `file`; `file` when absent) and `requestedAt`; the panel always sends `panel` and the submission time. Both are written to `handover-result.json`, the link in `handover.json` and the brief's header, and `handover-history.jsonl` in the state directory gets one line per hand-over, adoption or revert (time, action, from, to, origin, status, refusal reason; never the brief), keeping the last 200. Links also record the successor's message and turn counts at hand-over time (`toMessages` / `toTurns`) for revert protection and re-triggering. There is no hand-over tool for the model yet; `tool` is a reserved origin.
+
+Auto-continue of the old session: `dsh-client-auto-continue`, when installed, is outside this plugin and could keep pushing the old session. It exposes its settings only to its own web page and offers no service other plugins can call, so the plugin only reads the session's mode from the host settings: already off records `steps.autoContinue: disabled`, otherwise `manual_required`, and the brief and the panel ask the operator to switch the old session's auto-continue off. Not installed records `not_installed`; a read error records `failed:<reason>`; none of these fail the hand-over. Should a callable interface appear, the plugin would switch it off directly, keep the previous mode on the link and restore it on revert. `autoHandover.disableAutoContinue: false` skips this step.
+
 ### 0.9.106: Hand a long session over to a fresh one
 
 Every step of a session gets slower as its history grows, because the whole history is resent each step. A hand-over moves the goal and the Codex jobs to a new session and keeps the old one read-only. The plugin's state directory is `%LOCALAPPDATA%\dsh-codex-conductor` of the DSH process (for a portable DSH usually `<DSH data>\local\dsh-codex-conductor`, the directory that holds `loaded.json`). Steps:
@@ -595,7 +627,13 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
 | `closeoutGuard` | `true` | Refuse a new-work `codex_run` and the planner's `update_goal(action=complete)` while the session owns finished jobs whose report flags something and that have no `codex_review`, or a `needs_changes` job with no follow-up round (continue, resume, verify and queries stay allowed); jobs started before 0.9.103 was first loaded never count, and unreadable records fail open with a warning; `false` switches it off. Known limits: a `codex_run` with any `resume` counts as rework and is not checked, so the planner can start new work on one of the session's old threads; a `needs_changes` job stops blocking once any follow-up round exists, even one cancelled straight away |
-| `handoverSuggestMessages` | `5000` | Suggest a hand-over once a session has more messages than this (a hint only, never automatic); 0 switches it off |
+| `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
+| `autoHandover` | see below | What happens once a session is flagged; an object whose keys may be omitted one by one. Invalid values warn and fall back to the default; unknown sub-keys go to `unknownConfig` |
+| `autoHandover.mode` | `confirm` | `off` flags only and keeps the panel button; `notify` adds a panel reminder; `confirm` asks in the panel once the session is idle with no running Codex job and hands over on agreement; `auto` hands over directly under the same conditions |
+| `autoHandover.cooldownHours` | `12` | Hours without questions or automatic hand-overs after a decline, a dismissed reminder or an unanswered question; non-negative |
+| `autoHandover.remindStepMessages` | `2000` | Further messages before the same session is reminded again; positive integer |
+| `autoHandover.startupDelayMinutes` | `10` | Minutes after the host process starts during which `auto` does not hand over; non-negative |
+| `autoHandover.disableAutoContinue` | `true` | Deal with the old session's `dsh-client-auto-continue` after a hand-over (currently a manual-switch reminder, see above) |
 | `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`: empty keeps the one in `CODEX_HOME`, `none` leaves it out, an absolute path uses that file instead (symlinks under `runnerHome/codex-home`, needs WSL) |
 | `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |

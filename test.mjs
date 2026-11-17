@@ -5490,3 +5490,36 @@ test('a long session gets one hand-over suggestion per turn on codex_run and cod
   const off = harness({ config: { handoverSuggestMessages: 0, startResult: { job_id: 'J', status: 'completed' } } });
   assert.doesNotMatch((await off.tools.codex_run.execute(RUN, { agent })).next ?? '', /建议交接/);
 });
+
+test('auto hand-over settings default to confirm, warn and default invalid fields one by one and list unknown sub-keys', async () => {
+  const defaults = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true };
+  const cases = [
+    { value: undefined, expected: defaults, warn: null },
+    { value: { mode: 'auto', cooldownHours: 0.5, startupDelayMinutes: 0, disableAutoContinue: false }, warn: null,
+      expected: { ...defaults, mode: 'auto', cooldownHours: 0.5, startupDelayMinutes: 0, disableAutoContinue: false } },
+    ...[null, 'auto', []].map((value) => ({ value, expected: defaults, warn: 'autoHandover' })),
+    { value: { mode: 'always' }, expected: defaults, warn: 'autoHandover.mode' },
+    { value: { mode: 'off', cooldownHours: -1 }, expected: { ...defaults, mode: 'off' }, warn: 'autoHandover.cooldownHours' },
+    { value: { remindStepMessages: 0 }, expected: defaults, warn: 'autoHandover.remindStepMessages' },
+    { value: { startupDelayMinutes: '10' }, expected: defaults, warn: 'autoHandover.startupDelayMinutes' },
+    { value: { disableAutoContinue: 'no' }, expected: defaults, warn: 'autoHandover.disableAutoContinue' },
+    { value: { mode: 'notify', messages: 3000 }, expected: { ...defaults, mode: 'notify' }, warn: 'autoHandover.messages' },
+  ];
+  for (const { value, expected, warn } of cases) {
+    const tools = {}, warnings = [];
+    let actual;
+    apply({ tools: { register: tool => { tools[tool.name] = tool; } }, on() {},
+      logger: { warn: text => warnings.push(text) } }, { autoHandover: value }, async cfg => {
+      actual = cfg;
+      return { job_id: 'J', status: 'completed' };
+    });
+    await tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
+    assert.deepEqual(actual.autoHandover, expected, warn ?? 'valid');
+    assert.equal(warnings.length, warn ? 1 : 0, warnings.join('\n'));
+    if (warn) assert.ok(warnings[0].includes(warn), warnings[0]);
+    // 未知子键与未知顶层键一样写进 unknownConfig；阈值沿用 handoverSuggestMessages，不另设 messages。
+    assert.deepEqual(actual.unknownConfig, warn === 'autoHandover.messages' ? ['autoHandover.messages'] : []);
+    const loaded = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
+    assert.deepEqual(loaded.autoHandover, expected);
+  }
+});

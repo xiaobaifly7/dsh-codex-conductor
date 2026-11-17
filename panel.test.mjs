@@ -18,6 +18,7 @@ const routes = [
   ['POST', '/session/send', { sessionId: 'session-a', message: 'hello' }], ['POST', '/session/resume', { sessions: ['session-a'] }],
   ['POST', '/session/goal', { sessionId: 'session-a', maxGoalRounds: 3 }], ['GET', '/session/results'],
   ['POST', '/rollback', { job_id: 'job-1', confirm: true }],
+  ['POST', '/handover/request', { sessionId: 'session-a' }], ['POST', '/handover/answer', { sessionId: 'session-a', accept: false }],
 ];
 
 // Model Cordis injection ownership: only changed dependencies restart a child callback.
@@ -357,7 +358,7 @@ test('panel reads the current connection on every request as authentication appe
 test('panel HTTP implements every valid route using only stub runtime/conductor', async (t) => {
   const f = fixture(t);
   const status = await f.request('GET', '/status');
-  assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg), history: null } });
+  assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg), history: null, handover: null } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments[0], { action: 'status' });
   assert.equal(f.runtime.execute.mock.calls[0].arguments[1].panel, true, 'status polls are marked as panel reads');
   assert.ok(f.runtime.execute.mock.calls[0].arguments[1].signal instanceof AbortSignal);
@@ -1124,4 +1125,36 @@ test('panel gemini history keeps the record id and background flag when a record
     { output: 'old.md', id: undefined, background: undefined }]);
   assert.equal(Object.hasOwn(entries[2], 'background'), false);
   assert.equal(Object.hasOwn(entries[0], 'secret'), false);
+});
+
+test('panel hand-over posts a request file with origin panel, refuses while one is pending and forwards answers to the auto hand-over', async (t) => {
+  const answers = [];
+  const f = fixture(t, { api: { handover: () => ({ mode: 'confirm' }), answerHandover: (id, accept) => { answers.push([id, accept]); return { declined: true }; } } });
+  const file = path.join(f.root, 'handover-request.json');
+  assert.deepEqual((await f.request('GET', '/status')).body.handover, { mode: 'confirm' });
+  assert.deepEqual(await f.request('POST', '/handover/request', { sessionId: 'session-a', note: '先收尾' }), { status: 200, body: { submitted: true } });
+  const first = JSON.parse(readFileSync(file, 'utf8'));
+  assert.deepEqual({ ...first, requestedAt: typeof first.requestedAt }, { sessionId: 'session-a', note: '先收尾', origin: 'panel', requestedAt: 'string' });
+  rejected(await f.request('POST', '/handover/request', { sessionId: 'session-b' }), 409, /上一份交接请求还没有处理完/);
+  rmSync(file);
+  // 面板只在撤回时带 force；交接请求里的 force 被丢掉。
+  assert.equal((await f.request('POST', '/handover/request', { sessionId: 'session-a', force: true })).status, 200);
+  assert.equal(JSON.parse(readFileSync(file, 'utf8')).force, undefined);
+  rmSync(file);
+  assert.equal((await f.request('POST', '/handover/request', { revert: { from: 'session-a', to: 'session-b' }, force: true })).status, 200);
+  const revert = JSON.parse(readFileSync(file, 'utf8'));
+  assert.deepEqual([revert.revert, revert.force, revert.origin], [{ from: 'session-a', to: 'session-b' }, true, 'panel']);
+  rmSync(file);
+  for (const body of [{}, { sessionId: '../a' }, { sessionId: 'a', revert: { from: 'a', to: 'b' } }, { revert: { from: 'a', to: 'a' } }, { sessionId: 'a', note: 1 },
+    { sessionId: 'a', origin: 'auto' }]) rejected(await f.request('POST', '/handover/request', body), 400);
+  assert.equal(existsSync(file), false, 'rejected requests write nothing');
+  assert.deepEqual(await f.request('POST', '/handover/answer', { sessionId: 'session-a', accept: false }), { status: 200, body: { declined: true } });
+  assert.deepEqual(answers, [['session-a', false]]);
+  for (const body of [{ sessionId: 'session-a' }, { sessionId: 'session-a', accept: 'yes' }, { sessionId: '-a', accept: true }]) {
+    rejected(await f.request('POST', '/handover/answer', body), 400);
+  }
+  const g = fixture(t, { api: { answerHandover: () => { throw Object.assign(new Error('x'), { code: 'none' }); } } });
+  rejected(await g.request('POST', '/handover/answer', { sessionId: 'session-a', accept: true }), 409, /已经处理过或已过期/);
+  const none = fixture(t, { api: { selftestDirectory: null } });
+  rejected(await none.request('POST', '/handover/request', { sessionId: 'session-a' }), 409);
 });

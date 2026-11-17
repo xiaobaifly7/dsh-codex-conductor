@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 const { validatePanelSettings, writeBackedUpFile, queryWithTimeout } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { validateRequest, validateSendRequest, validateGoalRequest } = await import(new URL(`./resume.mjs${new URL(import.meta.url).search}`, import.meta.url));
+const { validateHandoverRequest, submitHandoverRequest } = await import(new URL(`./handover.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export const PANEL_PATH = '/dsh-codex-conductor';
@@ -122,7 +123,7 @@ export function panelSettings(cfg) {
 
 // No runner commands come from HTTP input; file names from HTTP are only matched against fixed directory listings.
 export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerInjected = false, executorFile, geminiHistoryFile,
-  history = () => null, selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
+  history = () => null, handover = () => null, answerHandover, selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
   let saving = false;
   const selftests = new Map();
   const promptFile = (kind = 'planner') => {
@@ -139,7 +140,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       '/settings/apply': ['POST'], '/settings/cancel': ['POST'], '/jobs': ['GET'], '/output': ['GET'],
       '/cancel': ['POST'], '/rollback': ['POST'], '/prompt': ['GET', 'POST'], '/prompt/backups': ['GET'], '/prompt/backup': ['GET'], '/reload': ['POST'],
       '/doctor': ['GET'], '/gemini': ['GET'], '/session/send': ['POST'], '/session/resume': ['POST'], '/session/goal': ['POST'],
-      '/session/results': ['GET'], '/selftest/request': ['GET'], '/selftest/result': ['POST'] };
+      '/session/results': ['GET'], '/selftest/request': ['GET'], '/selftest/result': ['POST'],
+      '/handover/request': ['POST'], '/handover/answer': ['POST'] };
     if (!pathname.startsWith(PANEL_PATH + '/') || !known[route]) throw bad('找不到这个功能，请刷新面板后重试。', 404);
     if (!known[route].includes(method)) throw bad('打开方式不正确，请使用面板上的按钮重试。', 405);
     const allowedQuery = { '/jobs': ['filter', 'offset', 'q'], '/output': ['job_id', 'offset', 'limit', 'artifact'],
@@ -147,7 +149,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
     object(query, allowedQuery);
     if (method === 'POST' && route !== '/settings' && route !== '/selftest/result') object(body, { '/prompt': ['text', 'kind'],
       '/cancel': ['job_id', 'confirm'], '/rollback': ['job_id', 'confirm', 'check'], '/settings/apply': ['changes', 'confirm'], '/session/send': ['sessionId', 'message', 'queue'],
-      '/session/resume': ['sessions', 'message'], '/session/goal': ['sessionId', 'objective', 'maxGoalRounds'] }[route] ?? []);
+      '/session/resume': ['sessions', 'message'], '/session/goal': ['sessionId', 'objective', 'maxGoalRounds'],
+      '/handover/request': ['sessionId', 'note', 'revert', 'force'], '/handover/answer': ['sessionId', 'accept'] }[route] ?? []);
     if (route === '/selftest/request') {
       if (!selftestDirectory) return { request: null };
       const claim = randomUUID();
@@ -181,7 +184,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       return { saved: true };
     }
     if (route === '/status') {
-      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg), history: history() };
+      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg), history: history(), handover: handover() };
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;
@@ -307,6 +310,28 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
         try { return JSON.parse(readFileSync(path.join(selftestDirectory, `${name}-result.json`), 'utf8')); } catch { return null; }
       };
       return Object.fromEntries(['send', 'resume', 'goal', 'autoresume'].map((name) => [name, selftestDirectory ? read(name) : null]));
+    }
+    if (route === '/handover/request' || route === '/handover/answer') {
+      if (!selftestDirectory) throw bad('当前环境没有本机请求目录，无法提交交接，请检查 DSH 的本地数据目录后重试。', 409);
+      try {
+        if (route === '/handover/answer') {
+          if (!SESSION_ID.test(body.sessionId ?? '') || typeof body.accept !== 'boolean') throw bad('会话编号或选择不正确，请刷新面板后重试。');
+          if (!answerHandover) throw bad('当前环境不能处理交接询问，请刷新面板后重试。', 409);
+          return answerHandover(body.sessionId, body.accept);
+        }
+        // 面板发起的请求总是带来源和提交时刻；仍走 handover-request.json，由 handover.mjs 的目录监听认领执行。
+        let request;
+        try { request = validateHandoverRequest({ ...body, origin: 'panel', requestedAt: new Date().toISOString() }); }
+        catch { throw bad('会话编号或备注填写不正确，请检查后重新提交。'); }
+        const { revert, from, note, force, origin, requestedAt } = request;
+        submitHandoverRequest(selftestDirectory, revert ? { revert, ...(force ? { force } : {}), origin, requestedAt }
+          : { sessionId: from, ...(note ? { note } : {}), origin, requestedAt }); // 面板只在撤回时提供 force
+        return { submitted: true };
+      } catch (error) {
+        if (error.code === 'pending') throw bad('上一份交接请求还没有处理完，请稍后查看交接结果，再重新提交。', 409);
+        if (error.code === 'none') throw bad('这条交接提醒已经处理过或已过期，请刷新面板。', 409);
+        throw error;
+      }
     }
     if (SESSION_REQUESTS[route]) {
       // 只发布现有的本机请求文件，由 resume.mjs 的目录监听认领和执行；面板自身不直接操作会话。

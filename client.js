@@ -243,6 +243,36 @@ window.__ModuleLoader__.load({
       return `等${reasons.length ? ` ${reasons.join('，并等 ')}` : '待确认 Codex 任务和 DeepSeek 会话均空闲'}后${action}。最长等 10 分钟${countdown == null ? '' : `，剩余 ${countdown} 秒`}；超时停止自动重载，保留待生效设置。`;
     }
 
+    const HANDOVER_MODES = { off: '关闭（只标记建议交接）', notify: '只提醒', confirm: '空闲时询问，同意后交接', auto: '空闲时自动交接' };
+    const ORIGIN_TEXT = { panel: '面板', auto: '自动交接', confirm: '询问后同意', tool: '工具', file: '请求文件' };
+    // 交接被拒或撤回被拦时，把结果里的原因说成人话。
+    function handoverReason(result) {
+      const reason = result?.reason;
+      return {
+        turn_running: '当前有回合在运行，结束后再交接。',
+        jobs_running: `当前有 ${result?.running?.length ?? '若干'} 个 Codex 任务在运行，结束后再交接。`,
+        successor_active: `继任会话已有 ${result?.newTurns ?? '若干'} 个新回合${result?.successorRunning ? '且正在运行' : ''}，撤回会造成两个会话并行。`,
+        successor_turn_running: '要接手的会话正在运行，结束后再交接。',
+        already_handed_over: `这个会话已经交接给 ${result?.successor ?? '其他会话'}。`,
+        session_not_found: '找不到这个会话。', session_unavailable: '暂时打不开这个会话。',
+        jobs_unreadable: '暂时读不到这个会话的 Codex 任务，没有交接。', successor_unavailable: '没能建立或打开新会话，没有交接。',
+        alias_failed: '没能记下交接关系，没有交接。', not_linked: '这两个会话之间没有交接记录。', invalid_request: '请求格式不正确。',
+      }[reason] || (reason ? `没有执行（${reason}）。` : '');
+    }
+    function handoverResultText(result) {
+      if (!result) return '还没有交接记录。';
+      const from = ORIGIN_TEXT[result.origin] ? `，来自${ORIGIN_TEXT[result.origin]}` : '';
+      if (result.status === 'handed_over') {
+        return `已交接：${result.from} → ${result.to}${from}。` + (result.steps?.autoContinue === 'manual_required'
+          ? `请在界面把旧会话 ${result.from} 的“自动继续”开关关掉。` : '');
+      }
+      if (result.status === 'reverted') {
+        return `已撤回：${result.from} 恢复派活，${result.to} 的目标已暂停${from}。` +
+          (result.warning === 'parallel_sessions' ? '两个会话都已开工，请决定保留哪一个，另一个停下。' : '');
+      }
+      return `${result.from || '会话'}${result.to ? ` → ${result.to}` : ''} 没有执行：${handoverReason(result)}`;
+    }
+
     function Status({ status, attention, errors = {}, messages = {}, busy = '', doctor, onRefresh, onReload, onCancel, onDoctor }) {
       const runtime = status?.runtime;
       const pending = runtime?.pending_settings;
@@ -278,7 +308,7 @@ window.__ModuleLoader__.load({
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
             statusRow('建议交接的会话', !status.history ? '未读到' : !status.history.threshold ? '提示已关闭'
               : status.history.sessions.filter((s) => s.suggest).map((s) => `${s.sessionId}（${s.messages} 条消息）`).join('、') || '暂无',
-              `消息数超过 ${status.history?.threshold || '设定值'} 条的会话每一步都会变慢，可以按 README 的步骤交接到新会话；这里只提示，不会自动交接。`),
+              `消息数超过 ${status.history?.threshold || '设定值'} 条的会话每一步都会变慢，可以在下方“会话交接”里交接到新会话。`),
             statusRow('护栏工作区', !activeSettings ? '未读到' : roots.includes('*') ? '所有会话' : roots.length ? roots.join('、') : '未启用护栏',
               '在这些目录里的会话，规划端不能直接改文件，改动交给 Codex。'),
             statusRow('主机访问', !activeSettings ? '未读到' : !activeSettings.allowHostAccess ? '未开启'
@@ -846,6 +876,61 @@ window.__ModuleLoader__.load({
           '给 DeepSeek 的具体要求', '这段内容每个会话每一步都会带上，超过 4000 字会明显占用上下文，建议精简。'),
         selftest ? null : promptSection('executor', '给 Codex 的固定要求', '这里的内容会附在每一单交给 Codex 的任务书后面，Codex 每单都会看到；不增加权限。',
           '附在每一单任务书后面的内容', '这段内容每一单任务书都会带上，超过 4000 字建议精简。'),
+
+        selftest ? null : (() => {
+          const handover = status?.handover;
+          const submitted = () => { setConfirmSession(null); setMessages((old) => ({ ...old, handover: '交接请求已提交，几秒后在下面的“最近结果”查看。' })); };
+          const answer = (sessionId, accept) => mutate('handover', '/handover/answer', { sessionId, accept }, (value) => value.submitted ? submitted()
+            : setMessages((old) => ({ ...old, handover: '已记下，冷却期内不再询问。' })));
+          const result = handover?.result;
+          return h('section', { 'aria-label': '会话交接' }, h('h3', null, '会话交接'),
+            h('p', { className: 'dcc-muted' }, '交接把目标和 Codex 任务转到一个新会话，原会话只读保留。提交后由插件在几秒内处理；有回合或 Codex 任务在跑时会被拒绝。'),
+            !handover ? h('p', null, errors.status ? '暂时读不到交接状态。' : '正在读取交接状态…') : h('div', null,
+              h('small', null, `自动交接：${HANDOVER_MODES[handover.mode] || handover.mode}`),
+              handover.prompts.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '需要处理的交接提醒' }, ...handover.prompts.map((prompt) =>
+                h('li', { key: prompt.sessionId, className: 'dcc-job' },
+                  h('strong', null, `会话 ${prompt.sessionId} 已有 ${prompt.messages} 条消息，${prompt.kind === 'ask' ? '建议现在交接到新会话' : '可以交接到新会话'}`),
+                  h('div', { className: 'dcc-row' },
+                    h(Button, { size: 'sm', disabled: !!busy, onClick: () => answer(prompt.sessionId, true) }, prompt.kind === 'ask' ? '同意交接' : '现在交接'),
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => answer(prompt.sessionId, false) }, prompt.kind === 'ask' ? '暂不交接' : '知道了'))))) : null,
+              h('h4', null, '建议交接的会话'),
+              handover.suggestions.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '建议交接的会话' }, ...handover.suggestions.map((item) =>
+                h('li', { key: item.sessionId, className: 'dcc-job' },
+                  h('strong', null, item.sessionId), h('small', null, `${item.cwd || '工作目录未知'} · ${item.messages} 条消息`),
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(`handover:${item.sessionId}`) }, '交接到新会话'),
+                  confirmSession === `handover:${item.sessionId}` ? h('div', { className: 'dcc-confirm' },
+                    h('label', { className: 'dcc-field' }, h('span', null, '给新会话的下一步（可空）'),
+                      h(Input, { value: session.handoverNote || '', disabled: !!busy, maxLength: 4000,
+                        onChange: (event) => setSession((old) => ({ ...old, handoverNote: event.target.value })) })),
+                    h('p', null, '确定交接吗？插件会新建会话、发去交接单，并暂停这个会话的目标；之后这个会话只能查看。'),
+                    h('div', { className: 'dcc-row' },
+                      h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => mutate('handover', '/handover/request',
+                        { sessionId: item.sessionId, ...((session.handoverNote || '').trim() ? { note: session.handoverNote } : {}) }, submitted) }, '确认交接'),
+                      h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不交接'))) : null))) : h('p', null, '暂无。'),
+              h('h4', null, '当前交接'),
+              handover.links.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '当前交接' }, ...handover.links.map((link) => {
+                const blocked = result?.reason === 'successor_active' && result.from === link.from && result.to === link.to;
+                const revert = (force) => mutate('handover', '/handover/request', { revert: { from: link.from, to: link.to }, ...(force ? { force: true } : {}) }, submitted);
+                return h('li', { key: link.to, className: 'dcc-job' },
+                  h('strong', null, `${link.from} → ${link.to}`),
+                  h('small', null, `${link.at ? when(link.at) : '时间未知'} · ${ORIGIN_TEXT[link.origin] || '来源未记录'}`),
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(`revert:${link.to}`) }, '撤回'),
+                  confirmSession === `revert:${link.to}` ? h('div', { className: 'dcc-confirm' },
+                    h('p', null, '确定撤回吗？原会话恢复派活和目标，继任会话的目标暂停。继任会话已经开工时插件会拒绝，并在这里说明。'),
+                    h('div', { className: 'dcc-row' },
+                      h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => revert(false) }, '确认撤回'),
+                      h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不撤回'))) : null,
+                  blocked ? h('div', { className: 'dcc-confirm' },
+                    h('p', { className: 'dcc-warn' }, `${handoverReason(result)}仍要撤回的话，请确认之后只保留一个会话继续工作。`),
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => revert(true) }, '仍然撤回（两个会话会并行）')) : null);
+              })) : h('p', null, '暂无。'),
+              h(Message, { text: messages.handover }), h(Message, { text: errors.handover, error: true }),
+              h('p', null, h('strong', null, '最近结果：'), handoverResultText(result)),
+              handover.recent.length ? h('details', null, h('summary', null, '最近的交接记录'),
+                h('ul', { className: 'dcc-jobs', 'aria-label': '最近的交接记录' }, ...handover.recent.slice().reverse().map((entry, index) =>
+                  h('li', { key: `${entry.at}-${index}` }, `${entry.at ? when(entry.at) : '时间未知'} · ${{ handover: '交接', adopt: '认领', revert: '撤回' }[entry.action] || entry.action}` +
+                    ` · ${entry.from || '?'} → ${entry.to || '?'} · ${ORIGIN_TEXT[entry.origin] || entry.origin} · ${entry.status}${entry.reason ? ` / ${entry.reason}` : ''}`)))) : null));
+        })(),
 
         selftest ? null : h('section', { 'aria-label': '会话操作' },
           h('details', null, h('summary', null, h('h3', { style: { display: 'inline' } }, '会话操作')),

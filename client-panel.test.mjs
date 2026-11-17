@@ -1168,3 +1168,47 @@ test('a background Gemini record is labelled', async (t) => {
   assert.ok(row('后台.md').includes(' · 后台'));
   assert.ok(!row('前台.md').includes(' · 后台'));
 });
+
+test('the hand-over section submits from suggestions, prompts and links, and explains refusals in plain words', async (t) => {
+  const service = panelService();
+  service.status.handover = { mode: 'confirm',
+    suggestions: [{ sessionId: 'session-big', cwd: 'D:\\work', messages: 6200, suggest: true }],
+    prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }],
+    links: [{ from: 'session-old', to: 'session-new', at: '2026-11-17T02:00:00.000Z', origin: 'auto', autoContinue: 'manual_required' }],
+    result: { status: 'refused', reason: 'jobs_running', from: 'session-big', running: ['J1', 'J2'], origin: 'panel' },
+    recent: [{ at: '2026-11-17T02:00:00.000Z', action: 'handover', from: 'session-old', to: 'session-new', origin: 'auto', status: 'handed_over' }] };
+  const host = clientHost((path, body) => path.startsWith('/handover/') ? (body.accept === false ? { declined: true } : { submitted: true }) : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = () => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接');
+  const shown = () => text(section());
+  for (const value of ['空闲时询问，同意后交接', 'session-big', 'D:\\work · 6200 条消息', 'session-old → session-new', '自动交接',
+    '当前有 2 个 Codex 任务在运行，结束后再交接。', '最近的交接记录']) assert.ok(shown().includes(value), value);
+  const posts = () => host.requests.filter((request) => request.body);
+  // 建议列表：点开填一句下一步，确认后才提交。
+  await click(host, '交接到新会话');
+  assert.equal(posts().length, 0, 'nothing is sent before the confirmation');
+  await change(host, '给新会话的下一步（可空）', '先收尾 J1');
+  await click(host, '确认交接');
+  assert.deepEqual(posts().at(-1), { path: '/handover/request', body: { sessionId: 'session-big', note: '先收尾 J1' } });
+  assert.ok(shown().includes('交接请求已提交'));
+  // 询问：同意 / 暂不交接。
+  await click(host, '同意交接');
+  assert.deepEqual(posts().at(-1), { path: '/handover/answer', body: { sessionId: 'session-big', accept: true } });
+  await click(host, '暂不交接');
+  assert.deepEqual(posts().at(-1), { path: '/handover/answer', body: { sessionId: 'session-big', accept: false } });
+  assert.ok(shown().includes('冷却期内不再询问'));
+  // 撤回先确认；被继任会话已开工拦下后，显示原因并给出带 force 的二次确认。
+  await click(host, '撤回');
+  await click(host, '确认撤回');
+  assert.deepEqual(posts().at(-1), { path: '/handover/request', body: { revert: { from: 'session-old', to: 'session-new' } } });
+  assert.equal(nodes(section()).some((node) => node.type === 'button' && text(node) === '仍然撤回（两个会话会并行）'), false);
+  service.status.handover = { ...service.status.handover, result: { status: 'rejected', reason: 'successor_active', from: 'session-old', to: 'session-new', newTurns: 3 } };
+  host.poll(); await host.flush();
+  assert.ok(shown().includes('继任会话已有 3 个新回合，撤回会造成两个会话并行。'));
+  await click(host, '仍然撤回（两个会话会并行）');
+  assert.deepEqual(posts().at(-1), { path: '/handover/request', body: { revert: { from: 'session-old', to: 'session-new' }, force: true } });
+  service.status.handover = { ...service.status.handover, result: { status: 'handed_over', from: 'session-big', to: 'session-n2', origin: 'confirm', steps: { autoContinue: 'manual_required' } } };
+  host.poll(); await host.flush();
+  assert.ok(shown().includes('已交接：session-big → session-n2，来自询问后同意。请在界面把旧会话 session-big 的“自动继续”开关关掉。'));
+});
