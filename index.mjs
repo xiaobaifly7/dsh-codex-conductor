@@ -1160,6 +1160,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         '等待期间不要自己动手补做。' };
   }
 
+  const goalAction = (value) => {
+    try { return (typeof value === 'string' ? JSON.parse(value) : value)?.action; } catch { return undefined; }
+  };
+  // 收尾护栏：本会话有未收尾的已结束任务时返回拒绝说明，否则返回空串；读不到记录或判定出错时放行并记警告。
+  async function closeoutCheck(owner, tool, signal) {
+    if (cfg.closeoutGuard === false || !owner) return '';
+    try {
+      // shortcut: 只看截止时间后开始的前 1000 单；单会话超过时漏判只会放行，届时再翻页。
+      const mine = await conductor.list({ owner, started_between: [closeoutFrom, Date.now() / 1000 + 86_400], limit: 1000 }, signal);
+      if (!Array.isArray(mine.jobs)) throw new Error(mine.error ?? mine.error_kind ?? '任务列表不可用');
+      return closeoutRefusal(tool, pendingCloseout(mine.jobs, closeoutFrom));
+    } catch (error) {
+      signal?.throwIfAborted();
+      ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
+      return '';
+    }
+  }
+
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
@@ -1197,17 +1215,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
         (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
       // 收尾护栏只拦开新工作的 codex_run；续接、返工（resume）和核验照常放行。读不到记录或判定出错时放行并记警告。
-      if (cfg.closeoutGuard !== false && !continuation && !args.resume && !verificationOf && owner) {
-        let refusal = '';
-        try {
-          // shortcut: 只看截止时间后开始的前 1000 单；单会话超过时漏判只会放行，届时再翻页。
-          const mine = await conductor.list({ owner, started_between: [closeoutFrom, Date.now() / 1000 + 86_400], limit: 1000 }, exec?.signal);
-          if (!Array.isArray(mine.jobs)) throw new Error(mine.error ?? mine.error_kind ?? '任务列表不可用');
-          refusal = closeoutRefusal(tool, pendingCloseout(mine.jobs, closeoutFrom));
-        } catch (error) {
-          exec?.signal?.throwIfAborted();
-          ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
-        }
+      if (!continuation && !args.resume && !verificationOf) {
+        const refusal = await closeoutCheck(owner, tool, exec?.signal);
         if (refusal) throw new Error(refusal);
       }
       if (args.resume && owner) {
@@ -1959,6 +1968,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
+    // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
+    if (exec.name === 'update_goal' && goalAction(exec.arguments) === 'complete') {
+      const refusal = await closeoutCheck(exec.agent?.id, 'update_goal', exec.signal);
+      if (refusal) return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
+    }
     if (inWorkspace(sessionCwd(exec), cfg.roots)) {
       let denied;
       try { denied = await productReads.check(exec, ...productReadLocation(exec)); }

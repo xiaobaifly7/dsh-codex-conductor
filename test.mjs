@@ -5332,4 +5332,15 @@ test('close-out guard refuses new-work codex_run until finished jobs are reviewe
   const off = harness({ config: { listResult: { jobs: [flagged], total: 1 }, startResult: { job_id: 'J', status: 'completed' } } });
   assert.equal((await off.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') })).job_id, 'J');
   assert.ok(!off.calls.some(argv => argv[0] === 'list'));
+  // 规划端完成会话目标走 update_goal(action=complete)，同样受收尾护栏约束。
+  const goal = (h, args) => h.handlers['tools/execute']({ name: 'update_goal', arguments: args, agent: agentAt('/work/original') },
+    async () => ({ value: 'done' }));
+  const refused = await goal(on, { action: 'complete' });
+  assert.equal(refused.isError, true);
+  assert.match(refused.error.message, /会话目标暂不能标记完成.*FLAG/);
+  assert.equal((await goal(on, JSON.stringify({ action: 'complete' }))).isError, true);
+  assert.equal((await goal(on, { action: 'blocked' })).value, 'done');
+  assert.equal((await goal(off, { action: 'complete' })).value, 'done');
+  const clear = harness({ config: { closeoutGuard: true, listResult: { jobs: [{ ...flagged, verification_status: 'verified' }], total: 1 } } });
+  assert.equal((await goal(clear, { action: 'complete' })).value, 'done');
 });
