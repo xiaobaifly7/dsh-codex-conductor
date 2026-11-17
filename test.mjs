@@ -1321,15 +1321,20 @@ test('codex_run rejects unknown top-level keys before invoking the runner', asyn
 test('codex_run accepts minimal calls and every declared parameter with host access on or off', async () => {
   for (const allowHostAccess of [false, true]) {
     const h = harness({ config: { allowHostAccess, startResult: { job_id: 'J', status: 'completed' } } });
+    h.finals.PREV = { job_id: 'PREV', status: 'completed', cwd: '/work/elsewhere', scope_paths: ['/work/elsewhere/docs'],
+      context: { owner: 'S1', task: '整理另一个目录的文档', acceptance: ['文档已整理'], write: true } };
     const exec = { agent: agentAt('/work/current') };
     for (const write of [false, true]) {
       assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
         const args = { ...RUN, write, ...access, scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
-          cwd: '/work/original', resume: 'THREAD', fresh: false, use_user_config: true, effort: 'low', wait_seconds: 1 };
+          cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, effort: 'low', wait_seconds: 1 };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
-        assert.equal((await h.tools.codex_run.execute(args, exec)).job_id, 'J');
-        const context = JSON.parse(h.requests.at(-1).stdin).context;
+        const ran = await h.tools.codex_run.execute(args, exec);
+        assert.equal(ran.job_id, 'J');
+        assert.ok(ran.verify_previous, 'verify_previous reported');
+        const context = h.requests.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin).context)
+          .findLast((item) => !item.verification_of);
         assert.equal(context.task, RUN.task);
         assert.deepEqual(context.acceptance, RUN.acceptance);
         assert.equal(context.write, write);
@@ -5739,4 +5744,24 @@ test('codex_run with resume starts a fresh thread for a large thread, keeps the 
   const plain = await run({}, 900000, { closeoutGuard: false });
   assert.ok(!plain.h.calls.some((argv) => argv[0] === 'thread-size' || argv.includes('--thread-id')));
   await assert.rejects(run({ resume: 'THREAD', fresh: 'yes' }, 1), /fresh 必须是布尔值/);
+});
+
+test('codex_continue with verify_previous refuses an overlapping verification before continuing and runs both otherwise', async () => {
+  const prev = (scope) => ({ job_id: 'PREV', status: 'completed', cwd: '/work/original', scope: [scope], scope_paths: [`/work/original/${scope}`],
+    files_changed: [], context: { owner: 'S1', task: '整理另一处的文档和索引', acceptance: ['索引已更新'], write: true } });
+  for (const [scope, allowed] of [['src/csv', false], ['docs', true]]) {
+    const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
+    h.finals.PARENT = workflowSource('implementation');
+    h.finals.PREV = prev(scope);
+    const call = h.tools.codex_continue.execute({ job_id: 'PARENT', wait_seconds: 0, verify_previous: 'PREV' }, { agent: agentAt('/work/current') });
+    if (!allowed) {
+      await assert.rejects(call, /与任务 PREV 的产物或 scope 重叠/);
+      assert.ok(!h.calls.some((argv) => argv[0] === 'start'));
+    } else {
+      const value = await call;
+      assert.equal(value.job_id, 'CHILD');
+      assert.ok(value.verify_previous);
+      assert.ok(h.calls.filter((argv) => argv[0] === 'start').length >= 1);
+    }
+  }
 });

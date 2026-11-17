@@ -1319,6 +1319,40 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return { job, superseded };
   }
 
+  // verify_previous：派这一单的同时核验一个已结束的任务。核验只读、不加锁；新单只读，或写入范围与被核验任务的产物和 scope
+  // 互不包含时才允许，否则核验可能读到新单改到一半的文件。路径按 normPath 比较（/mnt 下不分大小写），任一方向包含即算重叠。
+  async function verifyPreviousCheck(jobId, args, exec, tool) {
+    if (jobId === undefined) return null;
+    if (typeof jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(jobId)) throw new Error(`${tool}: verify_previous 必须是 runner job_id`);
+    const source = withReport(await conductor.waitJob(jobId, 0, exec?.signal));
+    if (unknownState(source) || !owns(exec?.agent?.id, source.context?.owner)) {
+      throw new Error(`${tool}: verify_previous 的任务 ${jobId} 归属未知或不属于当前会话，未派出这一单。`);
+    }
+    if (args.write !== true) return { source, overlap: [] };
+    const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces) ?? '';
+    const mine = [...(args.scope?.length ? args.scope : ['.']), ...(args.writable_roots ?? [])].map((p) => taskScopePath(cwd, p));
+    const scoped = source.scope_paths ?? source.scope;
+    const theirs = [...(Array.isArray(scoped) && scoped.length ? scoped : ['.']), ...[...source.files_changed ?? [], ...source.write_paths ?? []]
+      .map((file) => typeof file === 'string' ? file : file?.path).filter((file) => typeof file === 'string' && file.trim())]
+      .map((p) => taskScopePath(source.cwd ?? '', p));
+    const overlap = mine.filter((a) => theirs.some((b) => under(a, b) || under(b, a)));
+    if (overlap.length) {
+      throw new Error(`${tool}: 这一单的写入范围（${overlap.slice(0, 3).join('、')}）与任务 ${jobId} 的产物或 scope 重叠，不能边改边核验，未派出这一单。` +
+        `请先 codex_verify ${jobId} 并等它结束、记完 codex_review，再派这一单；或去掉 verify_previous。`);
+    }
+    return { source, overlap };
+  }
+  async function startVerifyPrevious(jobId, exec) {
+    try {
+      const value = await verifyTool.execute({ job_id: jobId, wait_seconds: 0 }, exec);
+      return { job_id: value.job_id, ...(value.background_job_id ? { background_job_id: value.background_job_id } : {}), status: value.status,
+        line: `已同时派出对 ${jobId} 的只读核验（任务 ${value.job_id}），结果由完成通知送达；拿到后按原验收用 codex_review 记录 ${jobId}。` +
+          '核验若判 needs_changes，用 codex_continue 返工原任务（续接不受收尾护栏限制）。' };
+    } catch (error) {
+      return { error: String(error?.message ?? error), line: `对 ${jobId} 的核验没有派出：${error?.message ?? error}。这一单已经派出；之后再用 codex_verify ${jobId}。` };
+    }
+  }
+
   // codex_run 带 resume：与 codex_continue 同一阈值决定是否开新线程；线程不认识、读不到大小或很小时照旧沿用。
   async function runThread(args, exec) {
     const owner = exec?.agent?.id;
@@ -1522,6 +1556,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
       (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
+      'verify_previous 可在派这一单的同时只读核验上一单（写入范围重叠时拒绝）。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
       (cfg.allowHostAccess === true
         ? (cfg.defaultHostAccess === true
@@ -1551,6 +1586,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           '只在 task 里写目标目录不会切换任务目录，要处理哪个目录就传哪个 cwd。' },
         resume: { type: 'string', description: '仅在继续已有 Codex 会话时填写工具真实返回的 thread_id；新任务省略，不要生成编号或填写 DSH 会话号、job_id。原任务补答阻塞问题时用 codex_continue(job_id)。' },
         fresh: { type: 'boolean', description: '只配合 resume：不传时原线程很大就开新线程（你的任务原文前附上一轮交接内容），否则沿用原线程；true 强制开新线程，false 强制沿用。' },
+        verify_previous: { type: 'string', description: '可选：一个已结束任务的 job_id，派这一单的同时只读核验它；这一单可写且写入范围与它的产物或 scope 重叠时拒绝。' },
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
           `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
@@ -1566,6 +1602,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const unknown = Object.keys(args ?? {}).filter(key => !Object.hasOwn(runTool.parameters.properties, key));
       if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
       if (args.fresh !== undefined && typeof args.fresh !== 'boolean') throw new Error('codex_run: fresh 必须是布尔值');
+      const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, args, exec, 'codex_run');
       // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
       let thread = null;
       // 没有 resume，或阈值为 0 且没指定 fresh 时不查询，调用时序与以前一样。
@@ -1585,14 +1622,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ? `已开新线程（原线程 ${thread.parent_thread_id}，上一轮任务 ${thread.parent_job_id}${thread.parent_last_input_tokens ? `，原线程上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），` +
           `新任务 ${value.job_id ?? '（见上）'}；任务里附了上一轮交接内容。之后的返工请对新任务 ${value.job_id ?? ''} 调 codex_continue，不要再 resume 原线程。`
         : thread.superseded_threads ? `线程 ${thread.superseded_threads[0]} 已由新线程接续，本次改为接续线程 ${thread.parent_thread_id}（任务 ${thread.parent_job_id}）。` : '';
-      const hints = [threadLine, acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
-      const shown = thread ? { ...value, continuation_thread: thread } : value;
+      const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
+      const hints = [threadLine, verify?.line, acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
+      const { line: _verifyLine, ...verifyResult } = verify ?? {};
+      const shown = { ...value, ...(thread ? { continuation_thread: thread } : {}), ...(verify ? { verify_previous: verifyResult } : {}) };
       return hints ? { ...shown, next: shown.next ? `${shown.next}\n${hints}` : hints } : shown;
     },
   };
   ctx.tools.register(runTool);
 
-  ctx.tools.register({
+  const verifyTool = {
     name: 'codex_verify',
     description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录、主机访问和模型设置，回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `独立核验 Codex ${a?.job_id ?? ''}` }),
@@ -1634,7 +1673,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
       }, exec, undefined, undefined, source.job_id);
     },
-  });
+  };
+  ctx.tools.register(verifyTool);
 
   ctx.tools.register({
     ...PRESENT.codex_status,
@@ -1865,7 +1905,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
       (cfg.plannerAnswers ? 'answers 用阻塞问题的 id，可由规划端回答；' + PLANNER_ANSWERS : 'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；') +
       '缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
-      '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。' + WAIT_GUIDANCE,
+      '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。verify_previous 可在续接的同时只读核验另一单。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string' },
@@ -1873,7 +1913,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
       resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
       fresh: { type: 'boolean', description: '不传时由插件决定：不带 answers 且原线程很大时开新线程（附上轮交接内容），否则沿用原线程。' +
-        'true 强制开新线程，false 强制沿用原线程；带 answers 的续接始终沿用原线程。' },
+        'true 强制开新线程，false 强制沿用原线程；带 answers 的续接默认沿用原线程。' },
+      verify_previous: { type: 'string', description: '可选：另一个已结束任务的 job_id，续接的同时只读核验它；续接可写且写入范围与它的产物或 scope 重叠时拒绝。' },
       wait_seconds: { type: 'integer', minimum: 0, description: waitSecondsDescription },
     }, required: ['job_id'] },
     output: OUTPUT,
@@ -1905,10 +1946,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           remaining_questions: needsReply ? plan.blocking.questions : plan.remaining_questions,
           next: cfg.plannerAnswers && plan.blocking.questions.length ? plan.next + PLANNER_ANSWERS : needsReply
             ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
+        const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, plan.args, exec, 'codex_continue');
         const thread = await continuationThread(plan, args, exec?.signal);
         if (thread?.mode === 'fresh') delete plan.args.resume;
         const value = await dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
           exec, plan.continuation, plan.task);
+        const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
+        if (verify) {
+          const { line: verifyLine, ...verifyResult } = verify;
+          Object.assign(value, { verify_previous: verifyResult, next: value.next ? `${value.next}\n${verifyLine}` : verifyLine });
+        }
         if (!thread) return value;
         const line = thread.mode === 'fresh'
           ? `已开新线程续接（原线程 ${thread.parent_thread_id}${thread.parent_last_input_tokens ? ` 上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），新任务 ${value.job_id ?? '（见上）'}，任务里附了上轮交接内容；之后的返工对新任务 ${value.job_id ?? ''} 调 codex_continue，不要再 resume 原线程。`

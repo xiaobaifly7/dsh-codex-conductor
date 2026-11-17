@@ -468,3 +468,54 @@ test('a successor session may verify its predecessor\'s job; an unrelated sessio
   assert.equal(h.payload().context.verification_of, 'SOURCE-1');
   await assert.rejects(harness().verify({}, caller('stranger-session')), /不属于当前会话/);
 });
+
+test('verify_previous starts the verification with the new unit, only when their files cannot overlap', async () => {
+  const unit = { task: '在另一个子目录整理测试夹具并补说明', acceptance: ['夹具说明已补全'], wait_seconds: 0 };
+  const starts = (h) => h.calls.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin).context);
+  // 只读新单：总是允许；核验任务与 codex_verify 派出的一样（原任务、归属、只读）。
+  const readOnly = harness();
+  const value = await readOnly.tools.codex_run.execute({ ...unit, write: false, verify_previous: 'SOURCE-1' }, exec);
+  const [main, verification] = starts(readOnly);
+  assert.equal(main.verification_of, undefined);
+  assert.deepEqual([verification.verification_of, verification.owner, verification.write], ['SOURCE-1', exec.agent.id, false]);
+  assert.equal(value.verify_previous.job_id, 'VERIFY-1');
+  assert.match(value.next, /已同时派出对 SOURCE-1 的只读核验[\s\S]*codex_continue 返工原任务/);
+  // 可写新单与被核验任务的 scope 或产物重叠（任一方向包含）：拒绝，什么都不派。
+  for (const args of [{ cwd: '/work/original', scope: ['docs/sub'] }, { cwd: '/work/original' }, { cwd: '/work', scope: ['original'] }]) {
+    const h = harness();
+    await assert.rejects(h.tools.codex_run.execute({ ...unit, write: true, ...args, verify_previous: 'SOURCE-1' }, exec),
+      /与任务 SOURCE-1 的产物或 scope 重叠，不能边改边核验[\s\S]*先 codex_verify SOURCE-1/, JSON.stringify(args));
+    assert.equal(starts(h).length, 0);
+  }
+  // /mnt 下不分大小写。
+  const mnt = { ...sourceJob(), cwd: '/mnt/E/Work', scope: ['docs'], scope_paths: ['/mnt/E/Work/docs'], files_changed: [], write_paths: [] };
+  await assert.rejects(harness({ source: mnt }).tools.codex_run.execute({ ...unit, write: true, cwd: '/mnt/e/work', scope: ['DOCS/a.md'], verify_previous: 'SOURCE-1' }, exec),
+    /重叠/);
+  // 不重叠的可写新单：两单都派出。
+  const apart = harness();
+  await apart.tools.codex_run.execute({ ...unit, write: true, cwd: '/work/original', scope: ['fixtures'], verify_previous: 'SOURCE-1' }, exec);
+  assert.equal(starts(apart).length, 2);
+  // 不属于本会话的任务：拒绝。
+  await assert.rejects(harness().tools.codex_run.execute({ ...unit, write: false, verify_previous: 'SOURCE-1' },
+    { agent: { ...exec.agent, id: 'stranger-session' } }), /归属未知或不属于当前会话/);
+});
+
+test('verify_previous reports a verification that could not start without undoing the new unit', async () => {
+  // 运行数上限只够一单：新单派出，核验被上限挡住，结果里说明，规划端之后再 codex_verify。
+  const h = harness({ config: { maxRunningJobs: 1 } });
+  const value = await h.tools.codex_run.execute({ task: '在另一个子目录整理测试夹具并补说明', acceptance: ['夹具说明已补全'], write: false,
+    wait_seconds: 0, verify_previous: 'SOURCE-1' }, exec);
+  assert.ok(value.job_id);
+  assert.match(value.verify_previous.error, /maxRunningJobs/);
+  assert.match(value.next, /对 SOURCE-1 的核验没有派出[\s\S]*之后再用 codex_verify SOURCE-1/);
+});
+
+test('two verifications can be in flight: verify_previous on two units starts one verification each', async () => {
+  const h = harness();
+  for (const task of ['在另一个子目录整理测试夹具并补说明', '再核对一遍发布说明的链接与版本号']) {
+    await h.tools.codex_run.execute({ task, acceptance: ['结果已写清楚'], write: false, wait_seconds: 0, verify_previous: 'SOURCE-1' }, exec);
+  }
+  const contexts = h.calls.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin).context);
+  assert.equal(contexts.filter((context) => context.verification_of === 'SOURCE-1').length, 2);
+  assert.equal(contexts.filter((context) => !context.verification_of).length, 2);
+});
