@@ -66,6 +66,13 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.112：codex_run 续接也开新线程、派活时同时核验上一单
+
+- `codex_run` 带 `resume`：原线程上次请求超过 `continueFreshAboveTokens`（默认 100000）时改开新线程，规划端写的任务原文完整保留，前面附上一轮交接内容（上一轮的任务书和验收标准、逐条自报的状态和证据、偏差、未决、阻塞、改动文件、最新验收结论和意见）。“上一轮”是该线程上本会话（含交接前任）最新的任务，新任务以 `parent_job_id` 挂在它下面，所以工作单元、`codex_summary` 分组、收尾护栏的“后续轮次”、交接自检和别名都把它当作这条线程的后续。`fresh: true` / `false` 可逐次指定；线程小、读不到大小时照旧沿用原线程。结果写明开了新线程、原线程、上一轮任务和新任务号，并提示以后对新任务返工、不要再 resume 原线程；之后若仍 resume 已被接替的旧线程，插件自动改接接替它的线程上最新的任务并说明。
+- `codex_continue` 带 `answers`（回答阻塞问题）默认仍沿用原线程；传 `fresh: true` 时开新线程，回答写在交接内容里。实测这类续接的原线程多数也超过阈值（11-17 改动后 11 单里 10 单，中位约 15.4 万 token），把默认改成开新线程大约能让续接的输入 token 再省一倍；是否改由所有者决定。
+- `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
+- 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
+
 ### 0.9.111：带着运行中的任务交接、重启后的兜底续接、自动生成的交接标题也改名
 
 - **带任务交接**（`autoHandover.withRunningJobs`，默认 `true`）：自动交接、询问后同意的交接和面板按钮发起的交接，在会话没有回合在跑、但名下有运行中的 Codex 任务时照常进行（`turn_running` 仍一律拒绝）；面板询问也不再等任务结束。交接单“待收尾”逐条列出运行中任务的编号、标题和已运行时长，并写明“这些任务随交接转给本会话：用 `codex_status` 等待并验收，不要重派”；自检 `jobs` 覆盖这些任务。宿主的后台任务机制会把任务结束通知发给任务属主（交接前派出的任务属主仍是前任），属主空闲时直接开一个新回合；现在插件在前任这一回合的第一步之前拦下 Codex 任务的结束通知，转给链路末端的继任会话（A→B→C 时转给 C；继任空闲就开新回合，正忙就放进它的下一步），前任这一回合以 `blocked` 结束、不调用模型。撤回后前任不再有继任，通知照常留给它。`false` 时保持旧行为（有任务就放弃，稍后重试）。
@@ -546,6 +553,13 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 `send-result.json` contains claim time `requestedAt`, completion time `completedAt`, `sessionId`, `status`, `reason`, and `error` on failures. Success is `sent / message_submitted`. Skips are `skipped / running` (busy), `skipped / session_changed` (agent replaced or removed during the read), `skipped / error` (unavailable agent, missing host interface or failed submission), and `skipped / invalid_request` (invalid JSON, fields or length; no submission). `sessionId` is `null` when no valid ID can be obtained. Results and plugin logs omit the message body, including any body quoted by host errors.
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
+
+### 0.9.112: Fresh threads for codex_run resumes, and verifying the previous job alongside the next one
+
+- `codex_run` with `resume` starts a new thread when the resumed thread's last request exceeded `continueFreshAboveTokens` (default 100000). The planner's task text is kept in full after a brief of the previous round (its task and acceptance list, the per-criterion self-report with evidence, deviations, unresolved items, blockers, changed files, and the latest review verdict and notes). The previous round is the latest job on that thread owned by the session or its hand-over predecessors; the new job links to it through `parent_job_id`, so units of work, `codex_summary` grouping, the close-out guard's follow-up rule, the hand-over self-check and aliases all treat it as that thread's follow-up. `fresh: true` / `false` overrides per call; small or unknown-size threads still resume. The result names the new thread decision, the old thread, the previous job and the new job and says to continue from the new job; a later resume of a superseded thread is redirected to the superseding thread's latest job and says so.
+- `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
+- `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
+- Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
 
 ### 0.9.111: Hand over with running jobs, fallback resume after a restart, and retitle auto-generated hand-over titles
 
