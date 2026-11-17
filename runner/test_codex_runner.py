@@ -1885,6 +1885,26 @@ class RunnerTests(unittest.TestCase):
         before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
         self.assertEqual(list(before), ["single.txt"])
 
+    def test_scoped_walk_over_the_slow_limit_in_total_remembers_its_slowest_entry(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        (root / "more").mkdir()
+        (root / "more" / "b.txt").write_text("b")
+        real_walk = codex_runner.os.walk
+
+        def walk(top, *args, **kwargs):
+            for entry in real_walk(top, *args, **kwargs):
+                time.sleep(0.15 if str(top).endswith("keep") else 0.05)
+                yield entry
+
+        # Neither entry alone exceeds the limit, the two together do: the slower one is skipped from now on.
+        with mock.patch.object(codex_runner, "SCOPE_SLOW_S", 0.18), mock.patch.object(codex_runner.os, "walk", side_effect=walk):
+            before, _ = codex_runner.snapshot_before(str(root), ["keep", "more"])
+        self.assertEqual(sorted(before), ["keep/a.txt", "more/b.txt"])
+        known = codex_runner.too_big_trees()
+        self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), known)
+        self.assertNotIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "more")), known)
+
     def test_forget_too_big_removes_only_the_normalized_key_and_is_idempotent(self):
         codex_runner, root = self.big_tree()
         codex_runner.remember_too_big(str(root))

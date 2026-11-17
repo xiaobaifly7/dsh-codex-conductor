@@ -657,7 +657,10 @@ GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c"
 def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
     None when the walk exceeds the budget. With scope, entries that took over SCOPE_SLOW_S to walk, or that were being
-    walked when the budget ran out, are appended to slow."""
+    walked when the budget ran out, are appended to slow; when only the whole scoped walk took over SCOPE_SLOW_S, its
+    slowest entry is."""
+    began = time.monotonic()
+    durations = {}
     deadline = time.monotonic() + budget
     files = {}
 
@@ -691,8 +694,11 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
                         slow.append(top)
                     return None
                 add(os.path.join(dirpath, name))
-        if slow is not None and scope and time.monotonic() - started > SCOPE_SLOW_S:
+        durations[top] = time.monotonic() - started
+        if slow is not None and scope and durations[top] > SCOPE_SLOW_S:
             slow.append(top)
+    if slow is not None and scope and not slow and durations and time.monotonic() - began > SCOPE_SLOW_S:
+        slow.append(max(durations, key=durations.get))
     return files if time.monotonic() <= deadline else None
 
 
