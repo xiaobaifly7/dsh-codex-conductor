@@ -16,6 +16,7 @@ import errno
 from functools import cache
 import hashlib
 import http.client
+import glob
 import json
 from math import isfinite
 import os
@@ -641,6 +642,7 @@ TOO_BIG_FILE = "snapshot-too-big.json"
 TOO_BIG_TTL = 7 * 86400
 # Hashing a tree for a diff can exceed its budget where the stat-only snapshot does not, so it has its own entry.
 DIFF_TOO_BIG = "diff:"
+SCOPE_TOO_BIG = "scope:"
 DIFF_BUDGET = 20
 LATE_DIFF_BUDGET = 4  # per step, twice per late diff: a status query must stay quick
 DIFF_MAX_BYTES = 5 * 1024 ** 2
@@ -651,9 +653,9 @@ GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c"
             "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--submodule=short")
 
 
-def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
+def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
-    None when the walk exceeds the budget."""
+    None when the walk exceeds the budget. The scope entry being walked when the budget ran out is appended to slow."""
     deadline = time.monotonic() + budget
     files = {}
 
@@ -676,10 +678,14 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
             continue
         for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
             if time.monotonic() > deadline:
+                if slow is not None and scope:
+                    slow.append(top)
                 return None
             dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
             for name in filenames:
                 if time.monotonic() > deadline:
+                    if slow is not None and scope:
+                        slow.append(top)
                     return None
                 add(os.path.join(dirpath, name))
     return files if time.monotonic() <= deadline else None
@@ -735,7 +741,9 @@ def forget_too_big(cwd):
         return had_index
     if not isinstance(data, dict):
         raise ValueError("Snapshot size cache must be a JSON object")
-    keys = [k for k in (tree_key(cwd), DIFF_TOO_BIG + tree_key(cwd)) if k in data]
+    root = tree_key(cwd)
+    keys = [k for k in data if k in (root, DIFF_TOO_BIG + root) or
+            (k.startswith(SCOPE_TOO_BIG) and (k[len(SCOPE_TOO_BIG):] == root or k[len(SCOPE_TOO_BIG):].startswith(root.rstrip(os.sep) + os.sep)))]
     if not keys:
         return had_index
     for key in keys:
@@ -744,6 +752,23 @@ def forget_too_big(cwd):
     tmp.write_text(json.dumps(data), "utf-8")
     os.replace(tmp, HOME / TOO_BIG_FILE)
     return True
+
+
+def thread_last_input_tokens(thread_id, tail=512 * 1024):
+    """Input tokens of the thread's last model request, from its rollout's last token count; None if unknown.
+    Read-only: a continuation decides from this whether resuming would re-send a large history."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    files = sorted(glob.glob(str(home / "sessions" / "*" / "*" / "*" / f"rollout-*-{glob.escape(thread_id)}.jsonl")))
+    if not files:
+        return None
+    try:
+        with open(files[-1], "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - tail))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = re.findall(r'"last_token_usage":\s*\{[^}]*"input_tokens":\s*(\d+)', text)
+    return int(found[-1]) if found else None
 
 
 def scope_path(cwd, scope, *, resolve=None):
@@ -774,11 +799,18 @@ def snapshot_before(cwd, scope_args):
         if before is not None:
             return before, None
         remember_too_big(cwd)
-    scope = [scope_path(cwd, s) for s in scope_args or []]
+    # A scope directory that once ran the walk out of budget is skipped for the too-big TTL; the other scope entries
+    # are still snapshotted, and changes inside the skipped directory come from Codex's events, as when the walk fails.
+    known = too_big_trees()
+    scope = [p for p in (scope_path(cwd, s) for s in scope_args or []) if SCOPE_TOO_BIG + tree_key(p) not in known]
+    slow = []
     try:
-        return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
+        before = snapshot(cwd, scope=scope, slow=slow) if scope else None
     except OSError:
         return None, scope
+    if before is None and slow:
+        remember_too_big(slow[0], SCOPE_TOO_BIG)
+    return (before, scope) if scope else (None, None)
 
 
 def ignore_patterns(ignore):
@@ -1910,23 +1942,39 @@ def products(args):
 
 
 def summary_usage(rounds):
-    if not rounds or (len(rounds) > 1 and rounds[-1].get("usage_scope") != "thread_total"):
-        return None
-    usage = rounds[-1].get("usage")
-    return usage if isinstance(usage, dict) and usage and all(type(v) in (int, float) for v in usage.values()) else None
+    """Each thread's latest thread_total, summed: a group can span threads when a continuation started a fresh one."""
+    threads = {}
+    for job in rounds:
+        threads.setdefault(job.get("thread_id") or job.get("job_id"), []).append(job)
+    total = {}
+    for part in threads.values():
+        usage = part[-1].get("usage")
+        if (len(part) > 1 and part[-1].get("usage_scope") != "thread_total") or not (
+                isinstance(usage, dict) and usage and all(type(v) in (int, float) for v in usage.values())):
+            return None
+        for key, amount in usage.items():
+            total[key] = total.get(key, 0) + amount
+    return total or None
 
 
 def summarize_jobs(args):
     groups = {}
     error_kinds = {}
+    listed = []
     for job in matching_jobs(args):
         if job["_record"] is None or job["_record"]["result"] is None:
             job = job_details(job)
         if job.get("error_kind"):
             kind = job["error_kind"]
             error_kinds[kind] = error_kinds.get(kind, 0) + 1
-        key = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
-        groups.setdefault(key, []).append(job)
+        listed.append(job)
+    # A continuation that started a fresh thread stays in its parent's unit of work.
+    key_of = {}
+    for job in reversed(listed):
+        own = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
+        key_of[job["job_id"]] = key_of.get(job.get("parent_job_id"), own)
+    for job in listed:
+        groups.setdefault(key_of[job["job_id"]], []).append(job)
     result = []
     page = list(groups.items())[args.offset:args.offset + args.limit]
     for (kind, identifier), jobs in page:
@@ -2271,6 +2319,7 @@ def main():
     sub.add_parser("cancel").add_argument("job_id", type=job_identifier)
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
+    sub.add_parser("thread-size").add_argument("thread_id")
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
     for command in (listing, summary):
@@ -2321,6 +2370,12 @@ def main():
         start, end = args.started_between
         if not (isfinite(start) and isfinite(end) and start <= end):
             parser.error("--started-between requires finite epoch seconds in order")
+    if args.command == "thread-size":
+        if not re.fullmatch(r"[0-9A-Za-z-]{8,80}", args.thread_id):
+            emit({"status": "failed", "error_kind": "bad_arguments", "error": "thread_id is invalid", "retryable": False})
+        else:
+            emit({"status": "completed", "thread_id": args.thread_id, "last_input_tokens": thread_last_input_tokens(args.thread_id)})
+        return
     if args.command == "forget-too-big":
         try:
             emit({"status": "completed", "removed": forget_too_big(args.cwd)})

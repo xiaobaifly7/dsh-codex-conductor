@@ -1845,6 +1845,29 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered tree")):
             self.assertEqual(codex_runner.snapshot_before(str(root), None), (None, None))
 
+    def test_scope_entry_that_runs_out_of_budget_is_remembered_and_skipped(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        real_snapshot, real_walk = codex_runner.snapshot, codex_runner.os.walk
+
+        def slow_walk(top, *args, **kwargs):
+            for entry in real_walk(top, *args, **kwargs):
+                time.sleep(0.2)
+                yield entry
+
+        with mock.patch.object(codex_runner, "snapshot", side_effect=lambda *a, **k: real_snapshot(*a, **{**k, "budget": 0.1})),                 mock.patch.object(codex_runner.os, "walk", side_effect=slow_walk):
+            self.assertEqual(codex_runner.snapshot_before(str(root), ["keep", "single.txt"]), (None, None))
+        self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), codex_runner.too_big_trees())
+        # The slow directory is skipped from now on; the other scope entries are still snapshotted.
+        with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered scope entry")):
+            before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
+        self.assertEqual(scope, [os.path.realpath(root / "single.txt")])
+        self.assertEqual(list(before), ["single.txt"])
+        # Only that scope entry is skipped, and forget-too-big on the task directory clears it too.
+        self.assertEqual(codex_runner.snapshot_before(str(root), ["other.txt"])[1], [os.path.realpath(root / "other.txt")])
+        self.assertEqual(self.control("forget-too-big", "--cwd", str(root)), {"status": "completed", "removed": True})
+        self.assertEqual(codex_runner.too_big_trees(), {})
+
     def test_forget_too_big_removes_only_the_normalized_key_and_is_idempotent(self):
         codex_runner, root = self.big_tree()
         codex_runner.remember_too_big(str(root))
@@ -2713,6 +2736,36 @@ class RunnerTests(unittest.TestCase):
         os.utime(latest / "args.json", (1004, 1004))
         self.assertIsNone(self.control("summary", "--thread-id", "shared-thread")["groups"][0]["usage"])
         self.assertEqual(self.control("summary", "--job-id", "round-4")["groups"][0]["usage"], {"input_tokens": 50})
+
+    def test_summary_keeps_a_fresh_thread_continuation_in_its_parent_unit_and_sums_usage_per_thread(self):
+        parent = self.stored_job("parent", {"status": "completed", "thread_id": "old-thread", "usage": {"input_tokens": 100},
+                                            "structured": self.sample_report()}, context=self.sample_context())
+        os.utime(parent / "args.json", (1001, 1001))
+        child_context = {**self.sample_context(), "continuation": {"parent_job_id": "parent", "answers": [], "resolution": ""}}
+        child = self.stored_job("child", {"status": "completed", "thread_id": "fresh-thread", "usage": {"input_tokens": 30},
+                                          "structured": self.sample_report()}, context=child_context)
+        os.utime(child / "args.json", (1002, 1002))
+        self.stored_job("other", {"status": "completed", "thread_id": "other-thread", "usage": {"input_tokens": 5},
+                                  "structured": self.sample_report()}, context=self.sample_context())
+        groups = self.control("summary")["groups"]
+        unit = next(g for g in groups if "parent" in g["job_ids"])
+        self.assertEqual((unit["group_id"], unit["job_ids"], unit["latest_job_id"]), ("thread:old-thread", ["parent", "child"], "child"))
+        self.assertEqual(unit["usage"], {"input_tokens": 130})
+        self.assertEqual(len(groups), 2)
+
+    def test_thread_size_reads_the_last_token_count_of_the_rollout(self):
+        home = Path(self.tmp.name) / "codex-home"
+        day = home / "sessions" / "2026" / "11" / "18"
+        day.mkdir(parents=True)
+        lines = [json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": n}}}})
+                 for n in (1000, 207000)]
+        (day / "rollout-2026-11-18T01-33-04-01a1ea91-c621-7612-8d92-e5414f0ad6ea.jsonl").write_text("".join(line + chr(10) for line in lines))
+        env = {**self.env, "CODEX_HOME": str(home)}
+        run = lambda thread: json.loads(subprocess.run([sys.executable, "-B", str(RUNNER), "thread-size", thread], env=env,
+                                                       capture_output=True, text=True, check=True).stdout.splitlines()[-1])
+        self.assertEqual(run("01a1ea91-c621-7612-8d92-e5414f0ad6ea")["last_input_tokens"], 207000)
+        self.assertIsNone(run("01a1ea91-c621-7612-8d92-e5414f0a0000")["last_input_tokens"])
+        self.assertEqual(run("../x")["error_kind"], "bad_arguments")
 
     def test_summary_pages_threads_without_losing_totals_or_rounds(self):
         for i in range(12):
