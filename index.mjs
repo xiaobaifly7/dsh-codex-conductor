@@ -1747,6 +1747,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         : 'accepted_deviations=逐条通过且原会话用户已明确接受原报告偏差或范围外改动。') +
       '不能把 Codex 自报 met 当作独立核验。审计/核对类任务逐项判断是否完成核对：已完成记 met；被审正文的缺陷写入 notes/结论，不因此记 needs_changes。' +
       '全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes。' +
+      '被拒时回执附一份可直接修改提交的骨架，只需替换其中的占位。' +
       'verified 不能与原报告矛盾：报告自标 not_met/blocked 的条目要写你自己的核验证据；报告的未决项和阻塞须在 notes 逐项写「unresolved#N: 依据」「blocker:<id>: 依据」。' +
       'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),

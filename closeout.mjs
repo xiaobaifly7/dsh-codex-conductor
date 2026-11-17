@@ -130,6 +130,9 @@ export function prepareReview(args, source) {
     if (Array.isArray(review.blockers) && review.blockers.length) problems.push(`${review.status} 不能带活动 blockers；有阻塞请记 needs_changes`);
   }
   if (review.status === 'verified') problems.push(...unaddressed(review, source, acceptance));
+  if (JSON.stringify([review.status, review.criteria, review.accepted_deviations, review.notes]).includes(TODO)) {
+    problems.push(`骨架里还有 ${TODO} 占位没有换成你的结论或依据`);
+  }
   if (review.status === 'needs_changes' && !deviations.length && Array.isArray(review.criteria) && review.criteria.length &&
       review.criteria.every((c) => c?.status === 'met') && !(review.blockers ?? []).length) {
     problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met 或加 blocker');
@@ -163,7 +166,35 @@ function unaddressed(review, source, acceptance) {
   return problems;
 }
 
-export function reviewRejection(jobId, source, { fixed, problems }) {
+// 被拒后直接给出可提交的骨架：沿用本次已填好的条目，只把还缺的位置留成占位，规划端改完占位即可一次提交。
+export const TODO = '<待填>';
+export function reviewSkeleton(jobId, source, review = {}) {
+  const { acceptance, deviations } = reviewTargets(source);
+  const report = source?.structured;
+  const status = STATUSES.includes(review.status) ? review.status : TODO;
+  const given = new Map((Array.isArray(review.criteria) ? review.criteria : [])
+    .filter((c) => c && Number.isInteger(c.index)).map((c) => [c.index, c]));
+  const criteria = acceptance ? acceptance.map((_a, i) => {
+    const c = given.get(i + 1);
+    return { index: i + 1, status: MARKS.includes(c?.status) ? c.status : TODO, evidence: nonempty(c?.evidence) ? c.evidence : TODO };
+  }) : review.criteria;
+  const skeleton = { job_id: jobId, status, criteria };
+  // needs_changes 不需要确认偏差，也不需要逐项说明未决项和阻塞。
+  if (status !== 'needs_changes') {
+    const acks = new Map((Array.isArray(review.accepted_deviations) ? review.accepted_deviations : [])
+      .filter((d) => d && typeof d === 'object').map((d) => [`${d.kind}#${d.index}`, d.evidence]));
+    if (deviations.length) skeleton.accepted_deviations = deviations.map((d) =>
+      ({ kind: d.kind, index: d.index, evidence: nonempty(acks.get(`${d.kind}#${d.index}`)) ? acks.get(`${d.kind}#${d.index}`) : TODO }));
+    const notes = typeof review.notes === 'string' ? review.notes : '';
+    const markers = [...(Array.isArray(report?.unresolved) ? report.unresolved : []).map((_u, i) => `unresolved#${i + 1}`),
+      ...(Array.isArray(report?.blockers) ? report.blockers : []).map((b) => `blocker:${b?.id ?? '?'}`)];
+    const text = [notes, ...markers.filter((m) => !notes.includes(m)).map((m) => `${m}: ${TODO}`)].filter(nonempty).join('\n');
+    if (text) skeleton.notes = text;
+  } else if (nonempty(review.notes)) skeleton.notes = review.notes;
+  return skeleton;
+}
+
+export function reviewRejection(jobId, source, { fixed, problems, review }) {
   const { acceptance, deviations } = reviewTargets(source);
   const shape = `{job_id:"${jobId}", status:"verified|needs_changes|accepted_deviations", ` +
     `criteria:[${acceptance ? `恰好 ${acceptance.length} 项，index 1..${acceptance.length} 各一次，` : ''}{index, status:"met|not_met|blocked", evidence}], ` +
@@ -174,6 +205,8 @@ export function reviewRejection(jobId, source, { fixed, problems }) {
     (fixed.length ? `\n（以下已自动修正，无需再改：${fixed.join('；')}）` : '') +
     `\n应提交的形状：${shape}` +
     (acceptance ? `\n验收清单：${acceptance.map((a, i) => `${i + 1}. ${clip(label(a))}`).join('；')}` : '') +
+    `\n可直接修改后提交的骨架（把每个 ${TODO} 换成你的结论或依据；记 needs_changes 时可删去 accepted_deviations 和 notes 里的标记行）：\n` +
+    JSON.stringify(reviewSkeleton(jobId, source, review ?? {})) +
     '\n结论和证据由你核验后填写，插件不会代填。';
 }
 

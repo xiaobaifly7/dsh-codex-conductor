@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } from './closeout.mjs';
+import { prepareReview, reviewRejection, reviewSkeleton, TODO, pendingCloseout, closeoutRefusal, closeoutSince } from './closeout.mjs';
 
 const acceptance = ['第一条', '第二条'];
 const report = (extra = {}) => ({ summary: 's', criteria: acceptance.map((criterion) => ({ criterion, status: 'met', evidence: 'e' })),
@@ -101,4 +101,24 @@ test('criteria without index are aligned by text, by position only when they car
   const exact = prepareReview({ status: 'needs_changes', criteria: [{ criterion: 'docs updated', status: 'not_met', evidence: 'x' },
     { criterion: 'tests pass', status: 'met', evidence: 'y' }] }, src);
   assert.deepEqual([exact.problems, exact.review.criteria.map((c) => c.index)], [[], [2, 1]]);
+});
+
+test('a rejection carries a pre-filled review skeleton that only leaves the missing parts as placeholders', () => {
+  const src = source({ out_of_scope: ['x.txt'] }, { deviations: ['偏差甲'], unresolved: ['数据未刷新'],
+    blockers: [{ id: 'B1', kind: 'environment', message: '网络断开', question: '', resolution: '' }] });
+  const result = prepareReview({ status: 'verified', criteria: [met(1)], notes: '已核对', accepted_deviations: [{ kind: 'reported', index: 1, evidence: '用户已接受' }] }, src);
+  const message = reviewRejection('J1', src, result);
+  const skeleton = JSON.parse(message.split('\n').find((line) => line.startsWith('{"job_id"')));
+  assert.deepEqual(skeleton, { job_id: 'J1', status: 'verified',
+    criteria: [{ index: 1, status: 'met', evidence: '核对 1' }, { index: 2, status: TODO, evidence: TODO }],
+    accepted_deviations: [{ kind: 'reported', index: 1, evidence: '用户已接受' }, { kind: 'scope', index: 1, evidence: TODO }],
+    notes: `已核对\nunresolved#1: ${TODO}\nblocker:B1: ${TODO}` });
+  // 原样提交骨架会被拒；把占位换掉后一次通过。
+  assert.ok(prepareReview(skeleton, src).problems.some((p) => p.includes('占位')));
+  const filled = JSON.parse(JSON.stringify(skeleton).replaceAll(TODO, 'met').replace('"evidence":"met"', '"evidence":"复核 2"')
+    .replace('"evidence":"met"', '"evidence":"范围外改动已核对"').replace('unresolved#1: met', 'unresolved#1: 已刷新').replace('blocker:B1: met', 'blocker:B1: 已恢复'));
+  assert.deepEqual(prepareReview(filled, src).problems, []);
+  // needs_changes 的骨架不要求确认偏差或标记。
+  const nc = reviewSkeleton('J1', src, { status: 'needs_changes', criteria: [met(1)] });
+  assert.deepEqual(Object.keys(nc), ['job_id', 'status', 'criteria']);
 });
