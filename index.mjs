@@ -1175,13 +1175,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function closeoutCheck(owner, tool, signal) {
     if (cfg.closeoutGuard === false || !owner) return '';
     try {
-      // shortcut: 只看截止时间后开始的前 1000 单；单会话超过时漏判只会放行，届时再翻页。
-      const mine = await conductor.list({ owner, started_between: [closeoutFrom, Date.now() / 1000 + 86_400], limit: 1000 }, signal);
-      if (!Array.isArray(mine.jobs)) throw new Error(mine.error ?? mine.error_kind ?? '任务列表不可用');
-      return closeoutRefusal(tool, pendingCloseout(mine.jobs, closeoutFrom));
+      // runner 每页最多 100 条；截止时间之后开始的任务逐页取全。
+      const jobs = [];
+      const until = Date.now() / 1000 + 86_400;
+      for (let offset = 0; offset !== null;) {
+        const page = await conductor.list({ owner, started_between: [closeoutFrom, until], limit: 100, offset }, signal);
+        if (!Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
+        jobs.push(...page.jobs);
+        offset = page.next_offset ?? null;
+      }
+      return closeoutRefusal(tool, pendingCloseout(jobs, closeoutFrom));
     } catch (error) {
-      signal?.throwIfAborted();
-      ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
+      // 从不抛出：派单可能先于这里的结果结束；中止由调用方在等待后处理。
+      if (!signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
       return '';
     }
   }
@@ -1224,10 +1230,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
         (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
       // 收尾护栏只拦开新工作的 codex_run；续接、返工（resume）和核验照常放行。读不到记录或判定出错时放行并记警告。
-      if (!continuation && !args.resume && !verificationOf) {
-        const refusal = await closeoutCheck(owner, tool, exec?.signal);
-        if (refusal) throw new Error(refusal);
-      }
+      // 与其余预检查询并行，启动前再取结果；只多等最慢的一个查询，判定仍以本次派单时的记录为准。
+      const closeout = cfg.closeoutGuard !== false && owner && !continuation && !args.resume && !verificationOf
+        ? closeoutCheck(owner, tool, exec?.signal) : null;
       if (args.resume && owner) {
         // 新一轮的结果不能替代同线程更早问题的用户回复。
         for (let offset = 0; offset !== null;) {
@@ -1293,6 +1298,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           throw reject(`${tool}: 已有 ${running.total} 个 Codex 任务在运行或排队，达到 maxRunningJobs=${cfg.maxRunningJobs} 的上限，未启动 Codex。` +
             '用 codex_jobs（status="running"）查看，等其中一个结束后再派同一单，不要改为自己动手。');
         }
+      }
+      if (closeout) {
+        const refusal = await closeout;
+        exec?.signal?.throwIfAborted();
+        if (refusal) throw new Error(refusal);
       }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,

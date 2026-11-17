@@ -5373,3 +5373,41 @@ test('close-out guard leaves codex_continue and codex_run with resume allowed wh
     await assert.rejects(h.tools.codex_run.execute(RUN, { agent: agentAt('/work/current', log) }), /未收尾.*FLAG/);
   }
 });
+
+test('close-out guard pages within the runner limit, sees jobs that settle between dispatches and runs alongside other preflights', async () => {
+  const now = Date.now() / 1000;
+  const job = (job_id, extra = {}) => ({ job_id, execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: now + 60, started_at: now, ...extra });
+  // runner 每页最多 100 条：第二页里的待收尾任务也要看到。
+  const paged = harness({ config: { closeoutGuard: true, listResult: (argv) => argv.includes('--started-between')
+    ? argv[argv.indexOf('--offset') + 1] === '0' ? { jobs: [job('OK', { verification_status: 'verified' })], total: 2, next_offset: 1 }
+      : { jobs: [job('LATE')], total: 2, next_offset: null } : { jobs: [], total: 0 } } });
+  await assert.rejects(paged.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') }), /LATE/);
+  const guardCalls = paged.calls.filter(argv => argv.includes('--started-between'));
+  assert.equal(guardCalls.length, 2);
+  assert.ok(guardCalls.every(argv => Number(argv[argv.indexOf('--limit') + 1]) <= 100));
+  // 两次派单之间刚结束的任务：不缓存“无待收尾”，第二次照样拦。
+  let current = [job('RUNNING', { execution_status: 'running', finished_at: null, review_status: 'pending' })];
+  const settling = harness({ config: { closeoutGuard: true, startResult: { job_id: 'J', status: 'completed' },
+    listResult: (argv) => argv.includes('--started-between') ? { jobs: current, total: current.length } : { jobs: [], total: 0 } } });
+  assert.equal((await settling.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') })).job_id, 'J');
+  current = [job('RUNNING')];
+  await assert.rejects(settling.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') }), /RUNNING/);
+  // 查询出错、超时（query 把超时转成 bridge_error）或抛错时放行。
+  for (const listResult of [{ status: 'failed', error_kind: 'bridge_error', error: 'query timed out', retryable: true },
+    () => { throw new Error('wsl gone'); }]) {
+    const h = harness({ config: { closeoutGuard: true, listResult, startResult: { job_id: 'J', status: 'completed' } } });
+    assert.equal((await h.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') })).job_id, 'J');
+  }
+  // 与运行数上限查询并行：上限查询还没返回时，收尾查询已经发出。
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const parallel = harness({ config: { closeoutGuard: true, maxRunningJobs: 5, startResult: { job_id: 'J', status: 'completed' },
+    listResult: (argv) => argv.includes('--status') ? gate.then(() => ({ jobs: [], total: 0 })) : { jobs: [], total: 0 } } });
+  const pendingRun = parallel.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') });
+  for (let i = 0; i < 20 && !parallel.calls.some(argv => argv.includes('--started-between')); i++) await new Promise((r) => setImmediate(r));
+  assert.ok(parallel.calls.some(argv => argv.includes('--started-between')));
+  assert.ok(!parallel.calls.some(argv => argv[0] === 'start'));
+  release();
+  assert.equal((await pendingRun).job_id, 'J');
+});
