@@ -1856,7 +1856,7 @@ class RunnerTests(unittest.TestCase):
                 yield entry
 
         with mock.patch.object(codex_runner, "snapshot", side_effect=lambda *a, **k: real_snapshot(*a, **{**k, "budget": 0.1})),                 mock.patch.object(codex_runner.os, "walk", side_effect=slow_walk):
-            self.assertEqual(codex_runner.snapshot_before(str(root), ["keep", "single.txt"]), (None, None))
+            self.assertIsNone(codex_runner.snapshot_before(str(root), ["keep", "single.txt"])[0])
         self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), codex_runner.too_big_trees())
         # The slow directory is skipped from now on; the other scope entries are still snapshotted.
         with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered scope entry")):
@@ -1867,6 +1867,23 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(codex_runner.snapshot_before(str(root), ["other.txt"])[1], [os.path.realpath(root / "other.txt")])
         self.assertEqual(self.control("forget-too-big", "--cwd", str(root)), {"status": "completed", "removed": True})
         self.assertEqual(codex_runner.too_big_trees(), {})
+
+    def test_slow_scope_entry_within_budget_is_used_now_and_skipped_later(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        real_walk = codex_runner.os.walk
+
+        def slow_walk(top, *args, **kwargs):
+            for entry in real_walk(top, *args, **kwargs):
+                time.sleep(0.2)
+                yield entry
+
+        with mock.patch.object(codex_runner, "SCOPE_SLOW_S", 0.1), mock.patch.object(codex_runner.os, "walk", side_effect=slow_walk):
+            before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
+        self.assertEqual(sorted(before), ["keep/a.txt", "single.txt"])
+        self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), codex_runner.too_big_trees())
+        before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
+        self.assertEqual(list(before), ["single.txt"])
 
     def test_forget_too_big_removes_only_the_normalized_key_and_is_idempotent(self):
         codex_runner, root = self.big_tree()

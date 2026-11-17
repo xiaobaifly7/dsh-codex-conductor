@@ -643,6 +643,7 @@ TOO_BIG_TTL = 7 * 86400
 # Hashing a tree for a diff can exceed its budget where the stat-only snapshot does not, so it has its own entry.
 DIFF_TOO_BIG = "diff:"
 SCOPE_TOO_BIG = "scope:"
+SCOPE_SLOW_S = 5  # a scope entry that alone takes longer than this to walk is skipped on later jobs
 DIFF_BUDGET = 20
 LATE_DIFF_BUDGET = 4  # per step, twice per late diff: a status query must stay quick
 DIFF_MAX_BYTES = 5 * 1024 ** 2
@@ -655,7 +656,8 @@ GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c"
 
 def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
-    None when the walk exceeds the budget. The scope entry being walked when the budget ran out is appended to slow."""
+    None when the walk exceeds the budget. With scope, entries that took over SCOPE_SLOW_S to walk, or that were being
+    walked when the budget ran out, are appended to slow."""
     deadline = time.monotonic() + budget
     files = {}
 
@@ -676,6 +678,7 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
         if not os.path.isdir(top):
             add(top)  # a scoped file, or one that does not exist yet
             continue
+        started = time.monotonic()
         for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
             if time.monotonic() > deadline:
                 if slow is not None and scope:
@@ -688,6 +691,8 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
                         slow.append(top)
                     return None
                 add(os.path.join(dirpath, name))
+        if slow is not None and scope and time.monotonic() - started > SCOPE_SLOW_S:
+            slow.append(top)
     return files if time.monotonic() <= deadline else None
 
 
@@ -808,8 +813,8 @@ def snapshot_before(cwd, scope_args):
         before = snapshot(cwd, scope=scope, slow=slow) if scope else None
     except OSError:
         return None, scope
-    if before is None and slow:
-        remember_too_big(slow[0], SCOPE_TOO_BIG)
+    for path in slow:
+        remember_too_big(path, SCOPE_TOO_BIG)
     return (before, scope) if scope else (None, None)
 
 
