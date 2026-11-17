@@ -297,6 +297,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `codexBin` | 自动查找 | WSL 内 codex 的路径；默认先查 PATH（跳过 `/mnt/` 下的 Windows 版），再查 `~/.npm-global/bin`、`~/.local/bin`、`/usr/local/bin` |
 | `codexHome` | Codex 默认 | 传给 Codex 的 `CODEX_HOME` |
 | `runnerHome` | `~/.local/state/codex-runner` | 任务记录和日志目录 |
+| `runnerAgentsMd` | 留空（沿用） | 未传 `use_user_config` 的任务使用的用户级 AGENTS.md：留空沿用 `CODEX_HOME` 里的；`none` 不带；绝对路径换成该文件。通过 `runnerHome/codex-home` 下的符号链接实现，需要 WSL |
 | `maxStorageMb` | 留空（不限制） | `jobs` 与 `runs` 合计大小上限（MiB），须为正有限数字，可含小数；启动时尽力清理最旧的已结束任务，保留活任务和本次任务 |
 | `maxSessionJobs` | 留空（不限制） | 每个会话累计可派的 Codex 任务数上限，须为正整数；达到后不启动 Codex 并说明原因 |
 | `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
@@ -561,6 +562,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
 | `closeoutGuard` | `true` | Refuse a new-work `codex_run` while the session owns finished jobs whose report flags something and that have no `codex_review`, or a `needs_changes` job with no follow-up round (continue, resume, verify and queries stay allowed); jobs started before 0.9.103 was first loaded never count, and unreadable records fail open with a warning; `false` switches it off |
+| `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`: empty keeps the one in `CODEX_HOME`, `none` leaves it out, an absolute path uses that file instead (symlinks under `runnerHome/codex-home`, needs WSL) |
 | `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |
 | `maxRunningJobs` | Empty (unlimited) | Positive integer limit on Codex jobs that are running or queued for a write lock; at the limit a dispatch is refused with the reason instead of starting Codex |

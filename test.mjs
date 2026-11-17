@@ -210,6 +210,20 @@ test('wsl.exe argv uses the default distro and Codex config unless configured', 
   assert.deepEqual(runnerArgv({ ...base, distro: 'Ubuntu', codexHome: '/home/u/.codex', codexBin: '/home/u/bin/codex' }, ['cancel', 'J']),
     ['-d', 'Ubuntu', '-e', 'env', 'CODEX_HOME=/home/u/.codex', 'CODEX_RUNNER_CMD=["/home/u/bin/codex"]',
       'python3', '/mnt/c/p/runner/codex_runner.py', 'cancel', 'J']);
+  assert.deepEqual(runnerArgv({ ...base, runnerAgentsMd: 'none' }, ['start']),
+    ['-e', 'env', 'CODEX_RUNNER_AGENTS_MD=none', 'python3', '/mnt/c/p/runner/codex_runner.py', 'start']);
+});
+
+test('runnerAgentsMd accepts none or an absolute path and stays unset by default', () => {
+  const seen = (runnerAgentsMd) => {
+    const warnings = [];
+    apply({ tools: { register() {}, guard() {} }, on() {}, logger: { warn: (text) => warnings.push(text) } },
+      runnerAgentsMd === undefined ? {} : { runnerAgentsMd }, async () => ({ jobs: [], total: 0 }));
+    return { warnings };
+  };
+  for (const value of ['none', '/home/u/agents.md', 'C:\\agents.md']) assert.deepEqual(seen(value).warnings, [], value);
+  for (const value of ['relative.md', 'none\n/x', 1]) assert.match(seen(value).warnings.join(), /runnerAgentsMd/, String(value));
+  assert.deepEqual(seen(undefined).warnings, []);
 });
 
 const cfg = { roots: [normPath('F:\\work\\项目')], denyTools: new Set(), allowCommands: [] };

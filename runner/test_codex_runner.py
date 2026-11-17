@@ -1670,13 +1670,46 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(mcp, ["mcp_servers.alpha.enabled=false", "mcp_servers.a b.enabled=false"])
             self.assertEqual(cmd[cmd.index(mcp[0]) - 1], "-c")
             self.assertIn("hooks", cmd)
+            self.assertIn("skills.include_instructions=false", cmd)
             args.use_user_config = True
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
             self.assertFalse(any("mcp_servers" in part for part in cmd))
+            self.assertNotIn("skills.include_instructions=false", cmd)
             args.use_user_config = False
             (home / "config.toml").write_text("not = [valid toml")
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
             self.assertFalse(any("mcp_servers" in part for part in cmd))
+
+    @unittest.skipIf(os.name == "nt", "symlinks need Developer Mode on Windows")
+    def test_user_agents_md_can_be_left_out_or_replaced(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import argparse
+        import codex_runner
+
+        real = Path(self.tmp.name) / "codex-home"
+        (real / "sessions").mkdir(parents=True)
+        (real / "config.toml").write_text("")
+        (real / "AGENTS.md").write_text("long user instructions")
+        short = Path(self.tmp.name) / "short.md"
+        short.write_text("short")
+        args = argparse.Namespace(use_user_config=False, model=None, effort=None, sandbox="read-only", schema=None)
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "runner"), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(real)}):
+            _, env = codex_runner.build_command(args, Path(self.tmp.name), None)
+            self.assertEqual(env["CODEX_HOME"], str(real))
+            for choice, expected in (("none", None), (str(short), "short"), ("none", None)):
+                with self.subTest(choice=choice), mock.patch.dict(os.environ, {"CODEX_RUNNER_AGENTS_MD": choice}):
+                    _, env = codex_runner.build_command(args, Path(self.tmp.name), "thread-1")
+                    home = Path(env["CODEX_HOME"])
+                    self.assertNotEqual(home, real)
+                    self.assertEqual((home / "sessions").resolve(), (real / "sessions").resolve())
+                    self.assertTrue((home / "config.toml").is_symlink())
+                    agents = home / "AGENTS.md"
+                    self.assertEqual(agents.read_text() if agents.exists() else None, expected)
+            args.use_user_config = True
+            with mock.patch.dict(os.environ, {"CODEX_RUNNER_AGENTS_MD": "none"}):
+                _, env = codex_runner.build_command(args, Path(self.tmp.name), None)
+                self.assertEqual(env["CODEX_HOME"], str(real))
 
     def test_writer_changes_come_from_a_snapshot_diff_or_codex_events(self):
         sys.path.insert(0, str(RUNNER.parent))

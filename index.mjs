@@ -46,6 +46,8 @@ const DEFAULTS = {
   codexBin: '',
   codexHome: '',
   runnerHome: '',
+  // Codex 任务用的用户级 AGENTS.md：留空沿用 CODEX_HOME 里的；none 不带；绝对路径换成该文件（仅未传 use_user_config 的任务）
+  runnerAgentsMd: '',
   routerCheckUrl: '',
   codexRoute: null,
   model: '',
@@ -173,6 +175,7 @@ export function runnerArgv(cfg, args) {
   const env = [
     cfg.codexHome && `CODEX_HOME=${cfg.codexHome}`,
     cfg.runnerHome && `CODEX_RUNNER_HOME=${cfg.runnerHome}`,
+    cfg.runnerAgentsMd && `CODEX_RUNNER_AGENTS_MD=${cfg.runnerAgentsMd}`,
     router && `CODEX_RUNNER_ROUTER_URL=${router.origin}`,
     routeUrl && `CODEX_RUNNER_ROUTE_PROVIDER=${route.provider}`,
     routeUrl && `CODEX_RUNNER_ROUTE_URL=${routeUrl.href}`,
@@ -812,6 +815,7 @@ function settings(config, logger) {
         : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
+      : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
       : key === 'autoResume' ? value !== null && typeof value === 'object' && !Array.isArray(value)

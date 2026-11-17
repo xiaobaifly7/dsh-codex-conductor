@@ -46,7 +46,11 @@ else:
 
 # Codex keeps its own provider config and credentials, so only sandbox and approval are pinned;
 # its MCP servers and hooks stay off unless --use-user-config.
-STRIP_USER_EXTRAS = ["--disable", "hooks"]
+# Also off: the skills listing (39.7k characters every request; in a week of jobs it mostly led to reading
+# using-superpowers and verification-before-completion as the first tool call), and the goal and image tools
+# described inside the exec tool (one job in a week used goals, none used images).
+STRIP_USER_EXTRAS = ["--disable", "hooks", "-c", "skills.include_instructions=false",
+                     "--disable", "goals", "--disable", "image_generation"]
 
 HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
@@ -359,6 +363,34 @@ def disable_user_mcp_servers():
     return out
 
 
+def replace_user_agents_md(env):
+    """Opt-in CODEX_RUNNER_AGENTS_MD: "none" leaves the user-level AGENTS.md out of jobs, a file path puts that file
+    in its place. Codex reads it only from CODEX_HOME, so jobs get a home of symlinks to every other entry of the
+    real one (same config, sessions and state databases, so resume still finds the thread)."""
+    choice = env.get("CODEX_RUNNER_AGENTS_MD")
+    if not choice:
+        return
+    real = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+    home = HOME / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    # shortcut: symlinks need Linux/WSL (Windows needs Developer Mode); a failure here fails the job visibly.
+    for entry in real.iterdir():
+        if entry.name != "AGENTS.md":
+            try:
+                (home / entry.name).symlink_to(entry)
+            except FileExistsError:  # another job linked it first
+                pass
+    link = home / "AGENTS.md"
+    if choice == "none":
+        link.unlink(missing_ok=True)
+    else:
+        temp = home / f".AGENTS.md.{os.getpid()}"
+        temp.unlink(missing_ok=True)
+        temp.symlink_to(Path(local_path(choice)))
+        os.replace(temp, link)  # atomic, so a job starting at the same time never sees it missing
+    env["CODEX_HOME"] = str(home)
+
+
 def build_command(args, run_dir, thread_id):
     prefix, env = launcher()
     cmd = [*prefix, "exec"]
@@ -367,6 +399,7 @@ def build_command(args, run_dir, thread_id):
     cmd += ["--json", "--skip-git-repo-check", "-o", str(run_dir / "last_message.txt")]
     if not args.use_user_config:
         cmd += STRIP_USER_EXTRAS + disable_user_mcp_servers()
+        replace_user_agents_md(env)
     cmd += ["-c", 'approval_policy="never"']
     route = env.get("CODEX_RUNNER_ROUTE_URL")
     if route:
