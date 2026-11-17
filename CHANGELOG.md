@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.106` 会话交接：长会话每一步都要重发整段历史，越来越慢；现在可以把目标和 Codex 任务转到新会话。在插件状态目录写 `handover-request.json`（`{"sessionId":"…","note":"…"}`），插件用与界面“新对话”相同的 `sessionController.create` 在原工作目录、原预设下新建会话，记录交接（`handover.json`，可成链，原子写入，只有本机请求文件能写），按已有记录机械生成交接单并写到文件，暂停原会话的目标，把交接单作为新会话的首条消息发出，再按剩余轮数为新会话创建同一目标；结果写进 `handover-result.json`。原会话有进行中的回合或运行中的任务时拒绝，`force` 可强制；插件建不了会话时可在界面新建后用 `adopt` 接管；`revert` 撤回。交接后新会话就是原会话任务的归属方：查看、产物读取、验收、续接、核验、取消、`codex_jobs` / `codex_summary` 和收尾护栏都包含原会话的任务（runner `list` / `summary` 新增 `--also-owner`）；原会话只能查看，不能再派活或处理任务，也不会再被任务通知自动唤醒。
+
 `0.9.105` 修正收尾护栏：0.9.103/0.9.104 每次按 1000 条一页向 runner 查任务，runner 只接受 1 到 100，查询每次都报 `bad_arguments`，护栏一直按“读不到记录”放行，从未真正拦过；现改为每页 100 条逐页取全。收尾查询改为在派单预检一开始就发出、与其余预检查询（如 `maxRunningJobs` 的运行数查询）并行，启动 Codex 前再取结果，不再在其他查询之后串行多等一次 WSL 往返；判定仍以本次派单时的任务记录为准，查询出错或超时仍放行。注意：升级后护栏开始生效，已有未验收或 `needs_changes` 未跟进任务的会话，下一次开新工作的 `codex_run` 会被拒绝。
 
 `0.9.104` 修正 0.9.103 复审发现的问题。`codex_review` 补 `index` 时，带条文却对不上任何一条验收原文的条目不再按位置补（此前顺序颠倒会把结论记到别的验收项上），改为在同一条回执里报出并附验收清单；不带条文且条数相符时仍按位置补，条文恰好对上一条时按条文补。`update_goal(action=complete)` 的收尾检查只对用过 conductor 的会话执行（本实例加载后派过单，或会话记录里有 `codex_run`/`codex_continue`/`codex_verify` 调用），其他会话不再为此调用 runner。补测试：有待收尾任务时 `codex_continue`、带 `resume` 的 `codex_run` 和 `codex_verify` 照常放行。README 写明收尾护栏的已知限制。`gemini_write` 判断文件是否相同时改用 bigint 的 stat：NTFS 文件号超过 2^53，相邻创建的文件可能被误判为同一个，导致合法的 `reuse_draft` 被拒。
@@ -107,6 +109,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.106` Session hand-over. A long session resends its whole history every step and keeps getting slower; the goal and the Codex jobs can now move to a fresh session. Write `handover-request.json` (`{"sessionId":"…","note":"…"}`) in the plugin's state directory: the plugin creates a session with the UI's own `sessionController.create` in the old working directory and preset, records the hand-over (`handover.json`, chains allowed, written atomically, only local request files write it), writes a brief built mechanically from existing records, pauses the old session's goal, sends the brief as the new session's first message and creates the same goal there with the remaining rounds; the outcome goes to `handover-result.json`. A session with a turn in progress or running jobs is refused unless `force` is given; if the plugin cannot create a session, create one in the UI and use `adopt`; `revert` undoes a hand-over. After a hand-over the new session owns the old session's jobs: reads, product reads, review, continue, verify, cancel, `codex_jobs` / `codex_summary` and the close-out guard all include them (runner `list` / `summary` gain `--also-owner`); the old session can only read, can no longer dispatch or act on jobs, and is no longer auto-woken by job notices.
 
 `0.9.105` fixes the close-out guard. 0.9.103/0.9.104 asked the runner for 1000 jobs per page, but the runner accepts 1 to 100, so every query failed with `bad_arguments` and the guard always failed open and never refused anything; it now pages at 100. The guard's query now starts at the beginning of the dispatch preflight and runs alongside the other preflight queries (such as the `maxRunningJobs` count), and its result is awaited just before Codex starts, instead of adding a sequential WSL round trip; the decision still uses the job records as of this dispatch, and errors or timeouts still fail open. Note: after upgrading, the guard takes effect, so a session that already has unreviewed flagged jobs or a `needs_changes` job without a follow-up gets its next new-work `codex_run` refused.
 
