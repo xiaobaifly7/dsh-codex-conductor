@@ -72,6 +72,8 @@ const DEFAULTS = {
   handoverSuggestMessages: 5000,
   // 新派活的验收标准超过这么多条时，在派活回执里提醒一句（不拦截）；0 关闭
   acceptanceWarnAbove: 8,
+  // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
+  continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
   autoHandover: AUTO_HANDOVER_DEFAULTS,
   maxSessionTokens: null,
@@ -378,10 +380,11 @@ export function createConductor(cfg, run = runRunner) {
   }
 
   const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
+  const threadSize = (threadId, signal) => query(['thread-size', threadId], signal);
   const doctor = (signal) => run(cfg, ['doctor'], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   const rollback = (jobId, { check = false } = {}, signal) =>
     run(cfg, ['rollback', jobId, ...(check ? ['--check'] : [])], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
-  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback };
+  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '' } = {}) {
@@ -824,7 +827,7 @@ function settings(config, logger) {
         : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
-      : ['handoverSuggestMessages', 'acceptanceWarnAbove'].includes(key) ? Number.isInteger(value) && value >= 0
+      : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
@@ -1259,6 +1262,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const latest = Array.isArray(page.jobs) ? page.jobs[0]?.job_id : undefined;
     if (!latest) throw new Error(`${hint}本会话没有这个线程上的任务。`);
     return { jobId: latest, note: `按线程 ${id} 解析为任务 ${latest}（本会话在该线程上最新的任务${page.total > 1 ? `，该线程共 ${page.total} 单` : ''}）；以后请直接传任务号。` };
+  }
+
+  // 续接时是否开新线程：回答阻塞问题是对话，始终沿用原线程；其余按 fresh 参数或原线程大小决定。
+  // 新线程只拿到 prepareContinuation 写好的上轮交接内容（原任务、验收、上轮差距、核验意见、改动文件），不重发旧线程历史。
+  async function continuationThread(plan, args, signal) {
+    const thread = plan.args.resume;
+    if (!thread) return null;
+    if (plan.continuation.answers.length) return { mode: 'resume', reason: 'answers', parent_thread_id: thread };
+    if (args.fresh === false) return { mode: 'resume', reason: 'requested', parent_thread_id: thread };
+    if (args.fresh === true) return { mode: 'fresh', reason: 'requested', parent_thread_id: thread };
+    const limit = cfg.continueFreshAboveTokens ?? 0;
+    if (!limit) return null;
+    let size;
+    try { size = (await conductor.threadSize(thread, signal))?.last_input_tokens; } catch { signal?.throwIfAborted(); }
+    if (!Number.isSafeInteger(size)) return { mode: 'resume', reason: 'size_unknown', parent_thread_id: thread };
+    return { mode: size > limit ? 'fresh' : 'resume', reason: 'size', parent_thread_id: thread, parent_last_input_tokens: size, threshold: limit };
   }
 
   // 本会话（含交接前任）在收尾截止时间之后开始的全部任务；runner 每页最多 100 条，逐页取全。
@@ -1771,6 +1790,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       answers: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
       resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
+      fresh: { type: 'boolean', description: '不传时由插件决定：不带 answers 且原线程很大时开新线程（附上轮交接内容），否则沿用原线程。' +
+        'true 强制开新线程，false 强制沿用原线程；带 answers 的续接始终沿用原线程。' },
       wait_seconds: { type: 'integer', minimum: 0, description: waitSecondsDescription },
     }, required: ['job_id'] },
     output: OUTPUT,
@@ -1779,6 +1800,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const owner = exec?.agent?.id;
       if (!owner) throw continuationError('codex_continue: 当前调用没有会话 ID');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw continuationError('wait_seconds 必须是非负整数');
+      if (args.fresh !== undefined && typeof args.fresh !== 'boolean') throw continuationError('fresh 必须是布尔值');
       const key = `${owner}:${args.job_id}`;
       if (continuations.has(key)) return continuations.get(key);
       const pending = (async () => {
@@ -1793,15 +1815,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           return { ...child, reused: true, reused_existing_child: true, submitted: false, ...(bg ? { background_job_id: bg.id } : {}),
             next: `本次 answers/resolution 未应用，继续使用 job ${child.job_id}；要补充新内容请对 ${child.job_id} 调 codex_continue。\n${nextStep(child, undefined, undefined, cfg)}` };
         }
-        const plan = prepareContinuation(source, args, owner);
+        // 归属已按交接别名核对；交给 prepareContinuation 的是原任务自己的归属方。
+        const plan = prepareContinuation(source, args, source.context.owner);
         const needsReply = plan.ready && plan.blocking.questions.length > 0 &&
           !canAnswer(exec.agent.session?.log ?? [], source, owner);
         if (!plan.ready || needsReply) return { ...source, continuation_ready: false, blocking: plan.blocking,
           remaining_questions: needsReply ? plan.blocking.questions : plan.remaining_questions,
           next: cfg.plannerAnswers && plan.blocking.questions.length ? plan.next + PLANNER_ANSWERS : needsReply
             ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
-        return dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
+        const thread = await continuationThread(plan, args, exec?.signal);
+        if (thread?.mode === 'fresh') delete plan.args.resume;
+        const value = await dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
           exec, plan.continuation, plan.task);
+        if (!thread) return value;
+        const line = thread.mode === 'fresh'
+          ? `已开新线程续接（原线程 ${thread.parent_thread_id}${thread.parent_last_input_tokens ? ` 上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），任务里附了上轮交接内容；之后的返工对这个新任务的 job_id 调 codex_continue。`
+          : '';
+        return { ...value, continuation_thread: thread, ...(line ? { next: value.next ? `${line}\n${value.next}` : line } : {}) };
       })();
       continuations.set(key, pending);
       try { return await pending; } finally { continuations.delete(key); }

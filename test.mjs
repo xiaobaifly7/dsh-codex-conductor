@@ -1257,7 +1257,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, listResult, outputResult, reviewResult, summaryResult, productsResult, ...pluginConfig } = config;
+  const { startResult, cancelResult, listResult, outputResult, reviewResult, summaryResult, productsResult, threadSizeResult, ...pluginConfig } = config;
   const run = (_cfg, argv, options = {}) => {
     calls.push(argv);
     requests.push({ argv, ...options });
@@ -1267,6 +1267,8 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (argv[0] === 'list') return Promise.resolve((typeof listResult === 'function' ? listResult(argv) : listResult) ?? { jobs: [], total: 0 });
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'review') return Promise.resolve(reviewResult);
+    if (argv[0] === 'thread-size') return typeof threadSizeResult === 'function' ? threadSizeResult(argv)
+      : Promise.resolve(threadSizeResult ?? { status: 'completed', thread_id: argv[1], last_input_tokens: null });
     if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
     if (argv[0] === 'products') return Promise.resolve((typeof productsResult === 'function' ? productsResult(argv) : productsResult) ??
       { status: 'completed', owner: argv[2], paths: [] });
@@ -5590,4 +5592,55 @@ test('a new-work codex_run with too many acceptance items gets one soft line and
   const runtime = await h.handlers['tools/execute']({ name: 'codex_runtime', arguments: {}, agent: exec.agent },
     async () => ({ value: {}, content: [{ type: 'text', text: 'ok' }] }));
   assert.match(runtime.content.at(-1).text, /新派活验收标准：\d+ 单，平均/);
+});
+
+test('codex_continue opens a fresh thread for a large thread unless answers are given, and keeps the parent link', async () => {
+  const start = (h) => h.calls.find((argv) => argv[0] === 'start');
+  const payload = (h) => JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin);
+  const run = async ({ size, args = {}, kind = 'implementation', config = {}, log = [] } = {}) => {
+    const source = workflowSource(kind);
+    source.structured.files_changed = ['src/csv.js'];
+    const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' },
+      threadSizeResult: size === 'throw' ? () => Promise.reject(new Error('wsl down')) : { status: 'completed', last_input_tokens: size }, ...config } });
+    h.finals.PARENT = source;
+    const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', wait_seconds: 0, ...args }, { agent: agentAt('/work/current', log) });
+    return { h, value };
+  };
+  // 大线程、无回答：不带 --resume，任务里有上轮交接内容，父任务链接不变。
+  const big = await run({ size: 250000 });
+  assert.equal(big.value.job_id, 'CHILD');
+  assert.ok(!start(big.h).includes('--resume'));
+  assert.deepEqual(big.value.continuation_thread, { mode: 'fresh', reason: 'size', parent_thread_id: 'THREAD', parent_last_input_tokens: 250000, threshold: 100000 });
+  assert.match(big.value.next, /已开新线程续接（原线程 THREAD 上次请求约 250000 输入 token）/);
+  assert.equal(payload(big.h).context.continuation.parent_job_id, 'PARENT');
+  assert.match(payload(big.h).prompt, /修复 CSV 解析[\s\S]*上轮未满足项[\s\S]*上轮改动文件：src\/csv\.js[\s\S]*CSV 解析测试通过/);
+  // 小线程、读不到大小、fresh:false、阈值 0：沿用原线程。
+  for (const options of [{ size: 50000 }, { size: 'throw' }, { size: 250000, args: { fresh: false } }, { size: 250000, config: { continueFreshAboveTokens: 0 } }]) {
+    const { h } = await run(options);
+    assert.equal(start(h)[start(h).indexOf('--resume') + 1], 'THREAD', JSON.stringify(options));
+  }
+  // fresh:true 即使线程小也开新线程，且不查线程大小。
+  const forced = await run({ size: 10, args: { fresh: true } });
+  assert.ok(!start(forced.h).includes('--resume'));
+  assert.ok(!forced.h.calls.some((argv) => argv[0] === 'thread-size'));
+  // 回答阻塞问题是对话：始终沿用原线程。
+  const [registered, settled, human] = answeredParent;
+  const answered = await run({ size: 900000, kind: 'user_input', args: { fresh: true, answers: [{ id: 'format', answer: '保留旧格式' }] },
+    log: [human, registered, settled, { ...human, time: 13_000 }] });
+  assert.equal(start(answered.h)[start(answered.h).indexOf('--resume') + 1], 'THREAD');
+  assert.equal(answered.value.continuation_thread.reason, 'answers');
+  await assert.rejects(run({ args: { fresh: 'yes' } }), /fresh 必须是布尔值/);
+});
+
+test('a hand-over successor can continue the job of its predecessor', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link('S1', 'S2');
+  t.after(() => aliases.unlink('S1', 'S2'));
+  const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
+  h.finals.PARENT = workflowSource('implementation');
+  const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', wait_seconds: 0 }, { agent: { ...agentAt('/work/current'), id: 'S2' } });
+  assert.equal(value.job_id, 'CHILD');
+  const payload = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin);
+  assert.deepEqual([payload.context.owner, payload.context.continuation.parent_job_id], ['S2', 'PARENT']);
 });

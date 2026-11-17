@@ -169,6 +169,7 @@ window.__ModuleLoader__.load({
       maxSessionTokens: [(v) => Number.isInteger(v) && v > 0, '每个会话的用量上限请填正整数，或留空。'],
       handoverSuggestMessages: [(v) => Number.isInteger(v) && v >= 0, '建议交接的消息数请填 0 或正整数（0 表示关闭），或留空恢复默认 5000。'],
       acceptanceWarnAbove: [(v) => Number.isInteger(v) && v >= 0, '验收标准条数提醒请填 0 或正整数（0 表示关闭），或留空恢复默认 8。'],
+      continueFreshAboveTokens: [(v) => Number.isInteger(v) && v >= 0, '续接开新线程的阈值请填 0 或正整数（0 表示总是沿用原线程），或留空恢复默认 100000。'],
     };
     // 多行文本框一行一个，空行忽略；提交时整体替换数组。[最多几项, 单项检查, 提示]
     const LISTS = {
@@ -735,6 +736,7 @@ window.__ModuleLoader__.load({
               field('maxSessionTokens', '每个会话的用量上限（token）', '一个会话里 Codex 任务累计用量的上限；留空表示不限制。'),
               field('handoverSuggestMessages', '建议交接的消息数', '会话消息数超过这个值时提示可以交接到新会话（只提示）；0 表示关闭，留空恢复默认 5000。'),
               field('acceptanceWarnAbove', '验收标准条数提醒', '新派活的验收标准超过这么多条时，提醒 DeepSeek 把偏好写进任务正文（不拦截）；0 表示关闭，留空恢复默认 8。'),
+              field('continueFreshAboveTokens', '续接开新线程的阈值（token）', '不带回答的续接，原线程上次请求超过这么多输入 token 时改开新线程，只带上轮交接内容；0 表示总是沿用原线程，留空恢复默认 100000。'),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
               settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,

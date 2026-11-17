@@ -128,6 +128,8 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (nonempty(report.summary)) notes.push(`上轮摘要：${report.summary}`);
   for (const item of report.criteria.filter((item) => item.status !== 'met')) notes.push(`上轮未满足项：${item.criterion}（${item.status}）：${item.evidence}`);
   for (const item of [...report.deviations, ...report.unresolved]) notes.push(`上轮待处理信息：${item}`);
+  // 开新线程续接时，Codex 只能从这里知道上轮动过哪些文件。
+  if (report.files_changed.length) notes.push(`上轮改动文件：${report.files_changed.slice(0, 50).join('、')}${report.files_changed.length > 50 ? ` 等 ${report.files_changed.length} 个` : ''}`);
   if (nonempty(value.verification?.notes)) notes.push(`独立核验意见：${value.verification.notes}`);
   for (const item of value.verification?.criteria ?? []) {
     if (item.status !== 'met') notes.push(`独立核验第 ${item.index} 条（${item.status}）：${item.evidence}`);
