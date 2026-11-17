@@ -1976,7 +1976,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }); };
   ctx.on('agent/created', ({ agent }) => recoverAgent(agent));
   for (const agent of ctx.get?.('agents')?.list?.() ?? []) recoverAgent(agent);
-  registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox });
+  // 已交接出去的会话不再被任务通知唤醒，由后继会话查询这些任务。
+  registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox, retired: (id) => Boolean(aliases.successor(id)) });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();

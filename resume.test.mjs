@@ -1383,7 +1383,7 @@ test('auto resume watcher: an instance loaded while the old scan is still unwind
   assert.equal(f.calls.filter(([op]) => op === 'list').length, 2);
 });
 
-function autoWakeFixture(t, enabled = true) {
+function autoWakeFixture(t, enabled = true, retired) {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const bus = new EventEmitter();
   const cleanups = [], wakes = [], warnings = [], infos = [], messages = [];
@@ -1421,7 +1421,7 @@ function autoWakeFixture(t, enabled = true) {
   };
   const dispose = () => { for (const cleanup of cleanups.splice(0)) cleanup(); };
   t.after(dispose);
-  registerAutoWake({ ctx, enabled });
+  registerAutoWake({ ctx, enabled, ...(retired ? { retired } : {}) });
   return { agent, inbox, agents, services, bus, session, wakes, warnings, infos, messages, notice, event, idle, endTurn, dispose,
     tick: ms => t.mock.timers.tick(ms) };
 }
@@ -1595,4 +1595,12 @@ test('auto wake: configuration disables all automatic attempts', t => {
   f.notice(); f.endTurn(); f.tick(60_000);
   assert.deepEqual(f.wakes, []);
   assert.equal(f.bus.eventNames().length, 0);
+});
+
+test('auto wake: a session handed over to a successor is never woken for its old notices', t => {
+  const f = autoWakeFixture(t, true, () => true);
+  f.notice();
+  f.endTurn();
+  f.tick(60_000);
+  assert.deepEqual(f.wakes, []);
 });

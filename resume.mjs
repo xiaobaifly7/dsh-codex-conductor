@@ -343,7 +343,7 @@ export function registerResumeRequests({ ctx, directory, autoResume }) {
   return check;
 }
 
-export function registerAutoWake({ ctx, enabled = true }) {
+export function registerAutoWake({ ctx, enabled = true, retired = () => false }) {
   if (!enabled) return;
   const batches = new Map();
   const delays = [1000, 5000];
@@ -390,7 +390,7 @@ export function registerAutoWake({ ctx, enabled = true }) {
   // tool-jobs emits this only after inserting its notice; a settled job alone may have been awaited.
   listen('agent/inbox/inserted', ({ agent, message }) => {
     if (message.source?.kind !== 'tool-jobs' || message.source.form !== 'notice' ||
-        ctx.get?.('agents')?.get(agent.id) !== agent) return;
+        ctx.get?.('agents')?.get(agent.id) !== agent || retired(agent.id)) return;
     const text = message.content?.find(block => block.type === 'text')?.text;
     const id = /^background job (\S+)(?:\s|$)/.exec(text ?? '')?.[1];
     const job = id && ctx.get?.('jobs')?.list(agent.id).find(job => job.id === id && job.owner === agent.id &&
