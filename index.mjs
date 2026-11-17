@@ -1183,6 +1183,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try { return (typeof value === 'string' ? JSON.parse(value) : value)?.action; } catch { return undefined; }
   };
   // 收尾护栏：本会话有未收尾的已结束任务时返回拒绝说明，否则返回空串；读不到记录或判定出错时放行并记警告。
+  // runner 任务号形如 YYYYMMDD-HHMMSS-xxxxxx，Codex 线程号是 UUID，两者不会重合。只读查询误传线程号时，
+  // 解析为本会话（含交接前任）在该线程上最新的任务；验收、核验、续接、取消仍要求确切的任务号。
+  const THREAD_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  async function threadJob(id, exec, tool, signal) {
+    if (!THREAD_ID.test(id)) return { jobId: id };
+    const owner = exec?.agent?.id;
+    const hint = `${tool}: ${id} 看起来是 Codex 线程号，不是任务号（job_id）；线程号只用于 codex_run 的 resume，任务号请用 codex_jobs 查。`;
+    if (!owner) throw new Error(hint);
+    const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), thread_id: id, limit: 1 }, signal);
+    const latest = Array.isArray(page.jobs) ? page.jobs[0]?.job_id : undefined;
+    if (!latest) throw new Error(`${hint}本会话没有这个线程上的任务。`);
+    return { jobId: latest, note: `按线程 ${id} 解析为任务 ${latest}（本会话在该线程上最新的任务${page.total > 1 ? `，该线程共 ${page.total} 单` : ''}）；以后请直接传任务号。` };
+  }
+
   // 本会话（含交接前任）在收尾截止时间之后开始的全部任务；runner 每页最多 100 条，逐页取全。
   async function sessionJobs(owner, signal) {
     const jobs = [];
@@ -1475,6 +1489,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
+      // 普通任务号不经过 await，保持原来的调用时序。
+      const { jobId, note: threadNote } = THREAD_ID.test(args.job_id) ? await threadJob(args.job_id, exec, 'codex_status', exec?.signal) : { jobId: args.job_id };
+      args = { ...args, job_id: jobId };
       const seconds = Math.min(args.wait_seconds ?? 0, 86_400);
       const value = await queryWithTimeout(async (signal) => {
         const bg = liveBackground(args.job_id, exec);
@@ -1487,7 +1504,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
       const result = value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
-      return dampenStatus(result, exec, 'codex_status', seconds) ?? result;
+      const shown = dampenStatus(result, exec, 'codex_status', seconds) ?? result;
+      return !threadNote ? shown : typeof shown.rendered === 'string' ? { ...shown, rendered: `${threadNote}\n${shown.rendered}` }
+        : { ...shown, next: shown.next ? `${threadNote}\n${shown.next}` : threadNote };
     },
   });
 
@@ -1659,8 +1678,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.artifact !== undefined && !['report', 'result', 'context', 'review', 'stderr', 'events', 'diff'].includes(args.artifact)) throw new Error('codex_output: artifact 无效');
       if (args.offset !== undefined && (!Number.isInteger(args.offset) || args.offset < 0)) throw new Error('codex_output: offset 必须是非负整数');
       if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 8000)) throw new Error('codex_output: limit 必须是 1–8000 的整数');
+      // 普通任务号不经过 await，保持原来的调用时序。
+      const { jobId, note: threadNote } = THREAD_ID.test(args.job_id) ? await threadJob(args.job_id, exec, 'codex_output', exec?.signal) : { jobId: args.job_id };
+      args = { ...args, job_id: jobId };
       await ensureOwnJob(args.job_id, exec, 'codex_output');
-      const value = await conductor.output(args.job_id, args, exec?.signal);
+      const value = { ...await conductor.output(args.job_id, args, exec?.signal), ...(threadNote ? { thread_note: threadNote } : {}) };
       return value.error_kind === 'artifact_pending' || (value.status === 'pending' && !value.error_kind && !value.error)
         ? { ...value, note: `任务还在运行，报告尚未生成；${waitForJob(args.job_id)}` }
         : value;

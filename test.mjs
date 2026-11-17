@@ -5446,3 +5446,29 @@ test('a handed-over session owns exactly its predecessors\' jobs, carries the cl
   const guardCall = guarded.calls.find((argv) => argv.includes('--started-between'));
   assert.deepEqual(guardCall.slice(guardCall.indexOf('--also-owner'), guardCall.indexOf('--also-owner') + 2), ['--also-owner', 'S1']);
 });
+
+test('read-only codex_status and codex_output resolve a thread id to the latest owned job on it; mutating tools do not', async () => {
+  const thread = '01a1e970-1234-4abc-8def-0123456789ab';
+  const source = workflowSource('implementation');
+  const listResult = (argv) => argv.includes('--thread-id') && argv[argv.indexOf('--thread-id') + 1] === thread
+    ? { jobs: [{ job_id: 'PARENT', thread_id: thread }], total: 2 } : { jobs: [], total: 0 };
+  const h = harness({ config: { listResult } });
+  h.finals.PARENT = source;
+  const exec = { agent: agentAt('/work/current') };
+  const status = await h.tools.codex_status.execute({ job_id: thread }, exec);
+  assert.equal(status.job_id, 'PARENT');
+  assert.match(h.tools.codex_status.output.render({}, status)[0].text, /按线程 01a1e970-1234-4abc-8def-0123456789ab 解析为任务 PARENT.*共 2 单/);
+  const listed = h.calls.find((argv) => argv[0] === 'list');
+  assert.deepEqual(listed.slice(listed.indexOf('--owner'), listed.indexOf('--owner') + 2), ['--owner', 'S1']);
+  const output = await h.tools.codex_output.execute({ job_id: thread }, exec);
+  assert.equal(h.calls.at(-1)[1], 'PARENT');
+  assert.match(output.thread_note, /解析为任务 PARENT/);
+  // 不认识的线程号：保留报错，并提示这是线程号。
+  await assert.rejects(h.tools.codex_output.execute({ job_id: '99999999-1234-4abc-8def-0123456789ab' }, exec), /看起来是 Codex 线程号.*没有这个线程上的任务/);
+  // 普通任务号不额外查询；验收等写操作不解析线程号。
+  const before = h.calls.length;
+  await h.tools.codex_status.execute({ job_id: 'PARENT' }, exec);
+  assert.ok(!h.calls.slice(before).some((argv) => argv[0] === 'list'));
+  await assert.rejects(h.tools.codex_review.execute({ job_id: thread, status: 'verified', criteria: [{ index: 1, status: 'met', evidence: 'x' }] }, exec));
+  assert.ok(!h.calls.some((argv) => argv[0] === 'review'));
+});
