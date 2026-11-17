@@ -57,11 +57,13 @@ export function prepareReview(args, source) {
       if (c.index == null && acceptance) {
         const hits = acceptance.flatMap((a, i) => (nonempty(criterion) && label(a).trim() === criterion.trim() ? [i + 1] : []));
         if (hits.length === 1) { c.index = hits[0]; fixed.push(`criteria 第 ${n + 1} 项按条文对齐到 index ${hits[0]}`); }
-        else if (byOrder) { c.index = n + 1; fixed.push(`criteria 第 ${n + 1} 项按顺序补 index ${n + 1}`); }
+        // 带条文却对不上时不按位置猜，避免把结论记到别的验收项上。
+        else if (byOrder && !nonempty(criterion)) { c.index = n + 1; fixed.push(`criteria 第 ${n + 1} 项按顺序补 index ${n + 1}`); }
       }
       const extra = Object.keys(c).filter((k) => !['index', 'status', 'evidence'].includes(k));
       if (extra.length) problems.push(`criteria 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
-      if (!Number.isInteger(c.index)) problems.push(`criteria 第 ${n + 1} 项缺少整数 index（从 1 开始，对应验收标准序号）`);
+      if (!Number.isInteger(c.index)) problems.push(`criteria 第 ${n + 1} 项缺少整数 index（从 1 开始，对应验收标准序号）` +
+        (nonempty(criterion) ? `；条文「${clip(criterion)}」对不上任何一条验收标准原文，请按下面的验收清单写 index` : ''));
       if (!MARKS.includes(c.status)) problems.push(`criteria 第 ${n + 1} 项 status 无效（${JSON.stringify(c.status) ?? '未填'}），只能是 ${MARKS.join(' / ')}`);
       if (!nonempty(c.evidence)) problems.push(`criteria 第 ${n + 1} 项 evidence 为空，需写你核验的依据`);
       return c;
@@ -170,7 +172,9 @@ export function reviewRejection(jobId, source, { fixed, problems }) {
   return `codex_review: 未写入核验记录，共 ${problems.length} 处问题，一次改完再提交：\n` +
     problems.map((p, i) => `${i + 1}. ${p}`).join('\n') +
     (fixed.length ? `\n（以下已自动修正，无需再改：${fixed.join('；')}）` : '') +
-    `\n应提交的形状：${shape}\n结论和证据由你核验后填写，插件不会代填。`;
+    `\n应提交的形状：${shape}` +
+    (acceptance ? `\n验收清单：${acceptance.map((a, i) => `${i + 1}. ${clip(label(a))}`).join('；')}` : '') +
+    '\n结论和证据由你核验后填写，插件不会代填。';
 }
 
 // 收尾护栏：本会话已结束、报告有标记却没有 codex_review 的任务，以及 needs_changes 后既无后续轮次也无新核验的任务。

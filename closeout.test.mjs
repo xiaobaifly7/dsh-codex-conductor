@@ -83,3 +83,22 @@ test('close-out cut-off is written once and then kept', (t) => {
   assert.equal(closeoutSince(path.join(dir, 'state'), 2000), 1000);
   assert.equal(closeoutSince(undefined, 3000), 3000);
 });
+
+test('criteria without index are aligned by text, by position only when they carry no text', () => {
+  // 条文与验收原文不一致且顺序颠倒：不按位置补 index，报问题并附验收清单。
+  const reversed = { status: 'needs_changes', criteria: [{ criterion: 'Docs are updated', status: 'not_met', evidence: 'README untouched' },
+    { criterion: 'Tests pass', status: 'met', evidence: 'npm test ok' }] };
+  const src = source({ context: { owner: 'a', acceptance: ['tests pass', 'docs updated'] } });
+  const result = prepareReview(reversed, src);
+  assert.deepEqual(result.review.criteria.map((c) => c.index), [undefined, undefined]);
+  assert.ok(result.problems.some((p) => p.includes('第 1 项缺少整数 index') && p.includes('Docs are updated')));
+  assert.ok(!result.fixed.some((f) => f.includes('按顺序')));
+  assert.match(reviewRejection('J1', src, result), /验收清单：1\. tests pass；2\. docs updated/);
+  // 没有条文且条数相符：按位置补。
+  const plain = prepareReview({ status: 'verified', criteria: [{ status: 'met', evidence: 'a' }, { status: 'met', evidence: 'b' }] }, src);
+  assert.deepEqual([plain.problems, plain.review.criteria.map((c) => c.index)], [[], [1, 2]]);
+  // 条文恰好对上一条：按条文补，即使顺序颠倒。
+  const exact = prepareReview({ status: 'needs_changes', criteria: [{ criterion: 'docs updated', status: 'not_met', evidence: 'x' },
+    { criterion: 'tests pass', status: 'met', evidence: 'y' }] }, src);
+  assert.deepEqual([exact.problems, exact.review.criteria.map((c) => c.index)], [[], [2, 1]]);
+});
