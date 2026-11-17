@@ -26,6 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { createAliases } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -933,8 +934,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
     (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'planner-prompt.md') : '');
-  const productReads = createProductReads(cfg, owner => conductor.products(owner), { plannerFile });
+  // 后继会话也能读交接前任任务的产物；任一查询失败就整体按失败处理。
+  const productReads = createProductReads(cfg, async (owner) => {
+    const values = await Promise.all(aliases.owners(owner).map((id) => conductor.products(id)));
+    return values.find((v) => v?.status !== 'completed' || !Array.isArray(v.paths)) ??
+      { ...values[0], owner, paths: values.flatMap((v) => v.paths) };
+  }, { plannerFile });
   const productJobs = new Map();
+  // 交接后后继会话也是前任会话任务的归属方；没有交接记录时只认本会话。
+  const aliases = createAliases(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
+  const owns = (id, owner) => Boolean(id && owner) && aliases.owners(id).includes(owner);
   const restrictedReads = exec => cfg.plannerReads === 'products' && inWorkspace(sessionCwd(exec), cfg.roots);
   const rememberJob = (value, owner = value.context?.owner) => {
     if (!owner || !value.job_id) return;
@@ -944,17 +953,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const rememberProducts = (value, owner = value.context?.owner) => {
     if (cfg.plannerReads === 'products') rememberJob(value, owner);
     if (cfg.plannerReads === 'products' && owner && !unknownState(value) && ['completed', 'failed', 'cancelled'].includes(value.status) &&
-        (!value.context?.owner || value.context.owner === owner)) productReads.add(owner, productPaths(value));
+        (!value.context?.owner || owns(owner, value.context.owner))) productReads.add(owner, productPaths(value));
   };
   const checkJobOwner = (value, exec, tool) => {
     if (!unknownState(value)) rememberJob(value);
-    if (!exec?.agent?.id || (value.context?.owner ?? productJobs.get(value.job_id)) !== exec.agent.id || unknownState(value)) {
+    if (!owns(exec?.agent?.id, value.context?.owner ?? productJobs.get(value.job_id)) || unknownState(value)) {
       throw new Error(`${tool}: 暂时无法确认任务属于本会话，不能读取它的产物；请用 codex_jobs 查本会话的任务。`);
     }
-    rememberProducts(value);
+    rememberProducts(value, exec.agent.id);
   };
   async function ensureOwnJob(jobId, exec, tool) {
-    if (!restrictedReads(exec) || productJobs.get(jobId) === exec?.agent?.id) return;
+    if (!restrictedReads(exec) || owns(exec?.agent?.id, productJobs.get(jobId))) return;
     if (productJobs.has(jobId)) throw new Error(`${tool}: 任务不属于本会话，不能读取它的产物；请用 codex_jobs 查本会话的任务。`);
     checkJobOwner(await conductor.waitJob(jobId, 0, exec?.signal), exec, tool);
   }
@@ -1181,7 +1190,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const jobs = [];
       const until = Date.now() / 1000 + 86_400;
       for (let offset = 0; offset !== null;) {
-        const page = await conductor.list({ owner, started_between: [closeoutFrom, until], limit: 100, offset }, signal);
+        // 交接前任的任务同样要收尾，截止时间规则不变。
+        const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [closeoutFrom, until], limit: 100, offset }, signal);
         if (!Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
         jobs.push(...page.jobs);
         offset = page.next_offset ?? null;
@@ -1418,7 +1428,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!owner) throw new Error('codex_verify: 当前调用没有会话 ID');
       let source = await conductor.waitJob(args.job_id, 0, exec?.signal);
       if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
-      if (source.context?.owner !== owner) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
+      if (!owns(owner, source.context?.owner)) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
       if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
       if (!source.cwd || !source.log_dir || typeof source.context.task !== 'string' || !Array.isArray(source.context.acceptance) || !source.context.acceptance.length ||
           !['read-only', 'workspace-write', 'danger-full-access'].includes(source.sandbox)) throw new Error('codex_verify: 原任务缺少目录、任务书、验收标准或执行设置，无法独立核验');
@@ -1495,7 +1505,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // open 模式也不取消别的会话的任务；本会话登记着的后台任务不用再查，归属未知的旧任务仍可取消。
       if (!bg && !restrictedReads(exec) && exec?.agent?.id) {
         const owner = (await conductor.waitJob(args.job_id, 0, exec.signal)).context?.owner;
-        if (owner && owner !== exec.agent.id) {
+        if (owner && !owns(exec.agent.id, owner)) {
           throw new Error(`codex_cancel: 任务 ${args.job_id} 属于另一个会话，未取消。确需取消时在该会话里操作，或由用户在设置的“Codex 指挥”面板取消。`);
         }
       }
@@ -1558,7 +1568,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const filters = Object.fromEntries(['status', 'needs_attention', 'limit', 'offset', 'thread_id', 'parent_job']
       .filter((key) => args[key] !== undefined).map((key) => [key, args[key]]));
     return { owner, linked, settled, filters: { ...filters, ...(cwd !== undefined ? { cwd } : {}),
-      ...(owner !== undefined ? { owner, ...(!restrictedReads(exec) ? { job_ids: [...linked.keys()] } : {}) } : {}) } };
+      ...(owner !== undefined ? { owner, also_owners: aliases.predecessors(owner),
+        ...(!restrictedReads(exec) ? { job_ids: [...linked.keys()] } : {}) } : {}) } };
   }
 
   async function recoverBackground(agent) {
@@ -1680,7 +1691,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const pending = (async () => {
         const source = withReport(await conductor.waitJob(args.job_id, 0));
         exec?.signal?.throwIfAborted();
-        if (source.context?.owner !== owner) throw continuationError('codex_continue: 原任务归属未知或不属于当前会话');
+        if (!owns(owner, source.context?.owner)) throw continuationError('codex_continue: 原任务归属未知或不属于当前会话');
         const children = await conductor.list({ owner, parent_job: args.job_id, limit: 1 }, exec?.signal);
         if (!Array.isArray(children.jobs)) throw continuationError(`codex_continue: 无法核对已有续接：${children.error ?? children.status}`);
         if (children.jobs.length) {
@@ -1735,7 +1746,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_review: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       const owner = exec?.agent?.id;
       const source = await conductor.waitJob(args.job_id, 0);
-      if (!owner || source.context?.owner !== owner) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
+      if (!owns(owner, source.context?.owner)) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
       const prepared = prepareReview(args, source);
@@ -1990,6 +2001,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
     // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
+    // 已交接出去的会话只能读，不能再派活、验收或取消，避免两个会话同时处理同一批任务。
+    if (['codex_run', 'codex_continue', 'codex_verify', 'codex_review', 'codex_cancel', 'gemini_write'].includes(exec.name)) {
+      const successor = aliases.successor(exec.agent?.id);
+      if (successor) {
+        const message = `${exec.name}: 本会话已交接给 ${successor}，任务改由新会话处理；这里只能查看记录。`;
+        return { isError: true, error: { message }, content: [{ type: 'text', text: `Error: ${message}` }] };
+      }
+    }
     if (exec.name === 'update_goal' && goalAction(exec.arguments) === 'complete' && usedConductor(exec.agent)) {
       const refusal = await closeoutCheck(exec.agent?.id, 'update_goal', exec.signal);
       if (refusal) return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };

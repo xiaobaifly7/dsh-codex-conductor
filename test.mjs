@@ -46,6 +46,8 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
         `globalThis[${JSON.stringify(traceKey)}].push('panel-${version}');\nexport const registerPanel = () => {};\n`);
       writeFileSync(path.join(dir, 'closeout.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('closeout-${version}');\nexport const prepareReview = () => ({}), reviewRejection = () => '';\n`);
+      writeFileSync(path.join(dir, 'handover.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('handover-${version}');\nexport const createAliases = () => ({ owners: (id) => [id], predecessors: () => [], successor: () => undefined });\n`);
       writeFileSync(path.join(dir, 'guard.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
         readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));
@@ -53,7 +55,7 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['closeout-new', 'closeout-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['closeout-new', 'closeout-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
@@ -5410,4 +5412,37 @@ test('close-out guard pages within the runner limit, sees jobs that settle betwe
   assert.ok(!parallel.calls.some(argv => argv[0] === 'start'));
   release();
   assert.equal((await pendingRun).job_id, 'J');
+});
+
+test('a handed-over session owns exactly its predecessors\' jobs, carries the close-out guard and retires the predecessor', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link('S1', 'S2');
+  t.after(() => aliases.unlink('S1', 'S2'));
+  const as = (id) => ({ ...agentAt('/work/current'), id });
+  const source = workflowSource('implementation');
+  source.structured.blockers = [];
+  const review = { job_id: 'PARENT', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '只读测试确认已通过' }] };
+  const h = harness({ config: { reviewResult: { ...source, verification_status: 'verified' } } });
+  h.finals.PARENT = source;
+  // 后继 S2 可以验收前任 S1 的任务；无关会话 S3 不行。
+  assert.equal((await h.tools.codex_review.execute(review, { agent: as('S2') })).verification_status, 'verified');
+  await assert.rejects(h.tools.codex_review.execute(review, { agent: as('S3') }), /不属于当前会话/);
+  // 前任已交接：不能再派活或验收，只能查看。
+  const retired = await h.handlers['tools/execute']({ name: 'codex_review', arguments: review, agent: as('S1') }, async () => ({ value: 'ran' }));
+  assert.match(retired.error.message, /已交接给 S2/);
+  assert.equal((await h.handlers['tools/execute']({ name: 'codex_status', arguments: {}, agent: as('S1') }, async () => ({ value: 'ran' }))).value, 'ran');
+  // codex_jobs 和收尾护栏都带上前任；没有交接记录的会话不带。
+  await h.tools.codex_jobs.execute({ session_id: 'current' }, { agent: as('S2') });
+  const listed = h.calls.filter((argv) => argv[0] === 'list').at(-1);
+  assert.deepEqual(listed.slice(listed.indexOf('--owner'), listed.indexOf('--owner') + 4), ['--owner', 'S2', '--also-owner', 'S1']);
+  await h.tools.codex_jobs.execute({ session_id: 'current' }, { agent: as('S3') });
+  assert.ok(!h.calls.filter((argv) => argv[0] === 'list').at(-1).includes('--also-owner'));
+  const pending = { job_id: 'OLD', execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: Date.now() / 1000 + 60, started_at: Date.now() / 1000, context: { owner: 'S1' } };
+  const guarded = harness({ config: { closeoutGuard: true, listResult: (argv) => argv.includes('--started-between')
+    ? { jobs: argv.includes('--also-owner') ? [pending] : [], total: 1 } : { jobs: [], total: 0 } } });
+  await assert.rejects(guarded.tools.codex_run.execute(RUN, { agent: as('S2') }), /未收尾.*OLD/);
+  const guardCall = guarded.calls.find((argv) => argv.includes('--started-between'));
+  assert.deepEqual(guardCall.slice(guardCall.indexOf('--also-owner'), guardCall.indexOf('--also-owner') + 2), ['--also-owner', 'S1']);
 });

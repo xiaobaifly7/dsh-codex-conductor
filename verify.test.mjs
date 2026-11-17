@@ -455,3 +455,16 @@ test('codex_verify is never subject to the close-out guard', async () => {
   assert.ok(h.calls.some(({ argv }) => argv[0] === 'start'));
   assert.ok(!h.calls.some(({ argv }) => argv[0] === 'list' && argv.includes('--started-between')));
 });
+
+test('a successor session may verify its predecessor\'s job; an unrelated session may not', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link(exec.agent.id, 'successor-session');
+  t.after(() => aliases.unlink(exec.agent.id, 'successor-session'));
+  const h = harness();
+  const caller = (id) => ({ agent: { ...exec.agent, id } });
+  await h.verify({}, caller('successor-session'));
+  assert.equal(h.payload().context.owner, 'successor-session');
+  assert.equal(h.payload().context.verification_of, 'SOURCE-1');
+  await assert.rejects(harness().verify({}, caller('stranger-session')), /不属于当前会话/);
+});
