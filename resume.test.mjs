@@ -1604,3 +1604,52 @@ test('auto wake: a session handed over to a successor is never woken for its old
   f.tick(60_000);
   assert.deepEqual(f.wakes, []);
 });
+
+test('fallback auto resume after a delay only resumes sessions still interrupted, skipping those resumed meanwhile, handed over, archived or stopped', async (t) => {
+  const f = fixture(t, 'autoresume');
+  const hostStart = Date.now() + 60_000;
+  // 强杀：日志里最后一个回合只有 turn/start，没有停机名单。
+  f.add('session-crash');
+  // 延迟期间被 auto-continue 续上：启动后又开了回合（原始日志里看得到）。
+  f.add('session-other');
+  f.rawEvents.get('session-other').push({ type: 'turn/start', time: hostStart + 1, data: {} });
+  // 已加载、内存日志里启动后已有新回合：不必读原始日志。
+  const live = f.add('session-live');
+  live.session = { log: [{ type: 'turn/start', time: hostStart + 5 }] };
+  f.add('session-retired');
+  f.add('session-archived');
+  f.add('session-stopped', [start(), aborted('user')]);
+  // 读原始日志超时：跳过并记明。
+  f.add('session-huge');
+  const open = f.services.sessionPersistence.open;
+  f.services.sessionPersistence.open = async (id, mode, options) => id !== 'session-huge' ? open(id, mode, options) : {
+    read: (_offset, _limit, readOptions) => new Promise((_resolve, reject) => readOptions.signal.addEventListener('abort', () => reject(readOptions.signal.reason))),
+    close: async () => {} };
+  const result = await processAutoResume({ ...f, autoResume: { ...f.autoResume, delaySeconds: 180 }, delayed: true, hostStart, readLimitMs: 20,
+    retired: (id) => id === 'session-retired', archived: (id) => id === 'session-archived' });
+  const reasons = Object.fromEntries(result.sessions.map((entry) => [entry.sessionId, `${entry.status}:${entry.reason}`]));
+  assert.deepEqual(reasons, { 'session-crash': 'resumed:message_submitted', 'session-other': 'skipped:resumed_after_start',
+    'session-live': 'skipped:resumed_after_start', 'session-retired': 'skipped:handed_over', 'session-archived': 'skipped:archived',
+    'session-stopped': 'skipped:user_stopped', 'session-huge': 'skipped:read_timeout' });
+  assert.deepEqual([result.trigger, result.delaySeconds], ['fallback', 180]);
+  assert.deepEqual(f.messages.map((m) => m.id), ['session-crash']);
+  assert.ok(!f.calls.some(([kind, id]) => kind === 'rawRead' && id === 'session-live'), 'a live session resumed after start is not read from disk');
+  assert.deepEqual(f.saved(), result);
+});
+
+test('fallback auto resume waits for delaySeconds after host start; zero keeps the immediate scan', async (t) => {
+  const f = fixture(t, 'autoresume');
+  f.add('session-crash');
+  registerResumeRequests({ ctx: f.ctx, directory: f.directory, autoResume: { ...f.autoResume, delaySeconds: 0.001 } });
+  f.ready();
+  assert.equal(f.calls.some(([kind]) => kind === 'list'), false, 'nothing runs inside the ready callback');
+  for (let i = 0; i < 50 && !fs.existsSync(f.file('autoresume-result.json')); i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(f.saved().trigger, 'fallback');
+  const g = fixture(t, 'autoresume');
+  g.add('session-crash');
+  registerResumeRequests({ ctx: g.ctx, directory: g.directory, autoResume: { ...g.autoResume, delaySeconds: 0 } });
+  g.ready();
+  for (let i = 0; i < 50 && !fs.existsSync(g.file('autoresume-result.json')); i++) await new Promise((r) => setTimeout(r, 5));
+  assert.equal(g.saved().trigger, undefined);
+  assert.deepEqual(g.messages.map((m) => m.id), ['session-crash']);
+});

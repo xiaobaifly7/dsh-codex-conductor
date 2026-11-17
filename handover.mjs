@@ -222,7 +222,10 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
     { priority: 1, title: '待收尾', lines: ['## 待收尾',
       `- 报告有标记、尚未 codex_review：${fit(pending.unreviewed, 1000).join('、') || '无'}`,
       `- 记了 needs_changes、还没有后续轮次：${fit(pending.needsChanges, 1000).join('、') || '无'}`,
-      `- 仍在运行：${running.map((j) => j.job_id).join('、') || '无'}（结束通知会发到原会话；用 codex_status 查询）`] },
+      ...(running.length ? ['- 仍在运行（这些任务随交接转给本会话：用 codex_status 等待并验收，不要重派；结束通知会转到本会话）：',
+        ...running.map((j) => `  - ${j.job_id}：${firstLine(j.context?.task, 60).replace(/\|/g, '/') || '（无标题）'}` +
+          `${Number.isFinite(j.started_at) ? `（已运行 ${Math.max(0, Math.round((Date.parse(at) / 1000 - j.started_at) / 60))} 分钟）` : ''}`)]
+        : ['- 仍在运行：无'])] },
     { priority: 5.5, title: '任务', key: 'tasks', lines: [taskSection(false)] },
     { priority: 6, title: '如何回看旧会话', lines: ['## 如何回看旧会话', `- 旧会话 ID：${from}（已冻结，只能查看）`,
       ...(sessionRead ? [`- 用 session_read 回查：session_read(sessionId="${from}", mode="summary") 看结构化摘要；mode="search" 加 query 搜关键词；mode="tail" 看最后若干事件。`] : []),
@@ -401,23 +404,29 @@ async function renameSuccessor(controller, to, title) {
   } catch (error) { return `failed:${error?.message ?? error}`; }
 }
 
-// 启动时修复旧版本留下的链接：继任会话不在任何工作区、原会话在时补进原会话的工作区；
-// 标题还是旧的固定标题时改成带来源的标题。每条链接只处理一次（打 repaired 标记），失败只记日志。
+// 启动时修复旧版本留下的链接：继任会话不在任何工作区、原会话在时补进原会话的工作区（repaired 标记，只做一次）；
+// 标题仍以旧的交接前缀开头（宿主按首条消息自动起的名）时改成带来源的标题（titleRepaired 标记，独立于 repaired，只做一次）。
+// 用户自己改过的标题、已经是 [交接←…] 的标题不动。失败只记日志。
 export async function repairLinks({ registry, controller, aliases, directory, logger }) {
   for (const [to, link] of Object.entries(aliases.links())) {
-    if (link.repaired) continue;
+    if (link.repaired && link.titleRepaired) continue;
     const entry = { at: new Date().toISOString(), action: 'repair', from: link.from, to, origin: 'startup', status: 'unchanged' };
-    const marks = { repaired: new Date().toISOString() };
+    const marks = {};
     try {
-      if (registry?.list && !workspaceOf(registry, to) && workspaceOf(registry, link.from)) {
-        const placed = await placeInWorkspace(registry, link.from, to);
-        entry.placement = placed.workspace;
-        if (placed.workspaceId) Object.assign(marks, { workspaceId: placed.workspaceId, ...(placed.pin === 'pinned' ? { pinned: true } : {}) });
+      if (!link.repaired) {
+        marks.repaired = entry.at;
+        if (registry?.list && !workspaceOf(registry, to) && workspaceOf(registry, link.from)) {
+          const placed = await placeInWorkspace(registry, link.from, to);
+          entry.placement = placed.workspace;
+          if (placed.workspaceId) Object.assign(marks, { workspaceId: placed.workspaceId, ...(placed.pin === 'pinned' ? { pinned: true } : {}) });
+        }
       }
-      const resolve = async (id) => (await controller?.resolveAgent?.(id))?.agent;
-      const successor = await resolve(to);
-      if (titleOf(successor)?.trim() === LEGACY_HANDOVER_TITLE) {
-        entry.title = await renameSuccessor(controller, to, successorTitle(link.from, titleOf(await resolve(link.from))));
+      if (!link.titleRepaired) {
+        marks.titleRepaired = entry.at;
+        const resolve = async (id) => (await controller?.resolveAgent?.(id))?.agent;
+        if (titleOf(await resolve(to))?.trim().startsWith(LEGACY_HANDOVER_TITLE)) {
+          entry.title = await renameSuccessor(controller, to, successorTitle(link.from, titleOf(await resolve(link.from))));
+        }
       }
       if (entry.placement || entry.title) entry.status = [entry.placement, entry.title].some((v) => v?.startsWith('failed')) ? 'failed' : 'repaired';
     } catch (error) {
@@ -472,9 +481,41 @@ export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, 
   return checks;
 }
 
+// 链路末端的继任会话：A→B→C 时 A、B 都解析到 C。
+export function lastSuccessor(aliases, id) {
+  let to = aliases.successor(id);
+  for (const seen = new Set([id]); to && !seen.has(to) && aliases.successor(to); seen.add(to)) to = aliases.successor(to);
+  return to;
+}
+
+// 宿主 tool-jobs 在任务结束时把通知发给任务属主（交接前派出的任务属主仍是前任）：属主空闲就直接开一个新回合。
+// 交接出去的会话收到 Codex 任务的结束通知时，在回合第一步之前把通知转给链路末端的继任会话；本回合只有这些通知时
+// 返回 reject，前任以 blocked 结束这一回合，不调用模型。撤回后前任不再有继任，通知照常留给它自己。
+export async function forwardRetiredNotices({ agent, messages, aliases, jobs, resolve }) {
+  const successor = lastSuccessor(aliases, agent?.id);
+  if (!successor || !Array.isArray(messages)) return undefined;
+  const codex = new Set((jobs?.list?.(agent.id) ?? []).filter((job) => job.kind === 'codex' && /^Codex /.test(job.label ?? '')).map((job) => job.id));
+  const notices = messages.filter((m) => m?.source?.kind === 'tool-jobs' && m.source.form === 'notice' &&
+    codex.has(/^background job (\S+)(?:\s|$)/.exec(textOf(m.content))?.[1]));
+  if (!notices.length) return undefined;
+  let delivered = false;
+  try {
+    const target = await resolve(successor);
+    if (target) {
+      const text = `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
+        notices.map((m) => textOf(m.content)).join('\n\n');
+      const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin:codex-conductor' } };
+      if (target.status === 'idle') target.followup(message);
+      else target.inject(message);
+      delivered = true;
+    }
+  } catch {}
+  return { successor, delivered, forwarded: notices.length, reject: notices.length === messages.length };
+}
+
 export async function handOver(ctx, deps, request) {
   const { aliases, sessionJobs, pendingOf, since, directory, deliverWaitMs = 8_000, autoContinue,
-    disableAutoContinue: turnOffAutoContinue = true, autoMessage, sessionRead = () => false, contextDeadlineMs, workspaces = () => undefined } = deps;
+    disableAutoContinue: turnOffAutoContinue = true, autoMessage, sessionRead = () => false, contextDeadlineMs, workspaces = () => undefined, withRunningJobs = false } = deps;
   const result = { status: 'refused', from: request.from ?? request.revert?.from, to: request.to ?? request.revert?.to ?? null, steps: {} };
   const refuse = (reason, extra = {}) => Object.assign(result, { reason, ...extra });
   const controller = ctx.get('sessionController');
@@ -538,7 +579,8 @@ export async function handOver(ctx, deps, request) {
   let jobs;
   try { jobs = await sessionJobs(from); } catch (error) { return refuse('jobs_unreadable', { error: String(error?.message ?? error) }); }
   const running = jobs.filter((j) => (j.execution_status ?? j.status) === 'running').map((j) => j.job_id);
-  if (!force && running.length) return refuse('jobs_running', { running });
+  // 带任务交接（withRunningJobs）：运行中的任务随交接转给继任，结束通知由插件转投；有回合在跑时仍然拒绝。
+  if (!force && !withRunningJobs && running.length) return refuse('jobs_running', { running });
   const goal = goals?.get(agentA);
   const header = agentA.session?.header ?? {};
   let to = request.to;
@@ -727,9 +769,11 @@ export function createHistoryTracker({ directory, threshold, now = Date.now, wri
 }
 
 const HOUR = 3_600_000;
-// 自动交接没成（又有任务在跑、用户开了新回合、交接被拒或回滚）之后，过这么久才再试，免得每个回合都暂停再恢复目标。
+// 自动交接没成之后过这么久才再试，免得每个回合都暂停再恢复目标；撞上新回合（turn_running）时下一个回合边界就再试。
 export const RETRY_COOLDOWN_MS = 30 * 60_000;
-export const AUTO_HANDOVER_DEFAULTS = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true };
+export const TURN_RETRY_COOLDOWN_MS = 2 * 60_000;
+export const AUTO_HANDOVER_DEFAULTS = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true,
+  withRunningJobs: true };
 
 // 纯判定：会话标了建议交接之后这一次要做什么。remind 是面板提醒；act 为 ask（confirm 模式询问）或 auto（执行交接，
 // 来源 origin 为 auto，或用户在面板同意过的 confirm / panel）。名下是否还有运行中的 Codex 任务由调用方最后再查。
@@ -800,11 +844,12 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       return false;
     }
   };
-  const giveUp = (agent, record, paused, why) => {
+  const giveUp = (agent, record, paused, why, turn = false) => {
     const resumed = resumeGoal(agent, paused);
-    record.retryAfter = new Date(now() + RETRY_COOLDOWN_MS).toISOString();
+    const wait = turn ? TURN_RETRY_COOLDOWN_MS : RETRY_COOLDOWN_MS;
+    record.retryAfter = new Date(now() + wait).toISOString();
     delete record.pending;
-    logger?.info?.(`[codex-conductor] 会话 ${agent?.id} 本次没有自动交接（${why}）${resumed ? '，已恢复目标' : ''}，30 分钟后再试。`);
+    logger?.info?.(`[codex-conductor] 会话 ${agent?.id} 本次没有自动交接（${why}）${resumed ? '，已恢复目标' : ''}，${wait / 60_000} 分钟后再试。`);
   };
   return {
     // value 是 history.observe(agent) 的结果；会话每次转为空闲时同步调用（第一个 await 之前的部分与 goal 排下一轮同属这次事件）。
@@ -826,11 +871,13 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
         // 询问不打断目标循环；执行交接前先同步暂停目标。
         const paused = step.act === 'auto' ? pauseGoal(agent) : undefined;
         try {
-          // 查任务期间会话可能又开始了新回合。
-          const quiet = await runningJobs(id) === 0 && agent.status === 'idle';
+          // 带任务交接时不必等任务结束（它们随交接转给继任），询问也就不必等。查任务期间会话可能又开始了新回合。
+          const carry = settings().withRunningJobs !== false;
+          const jobsQuiet = carry || await runningJobs(id) === 0;
+          const quiet = jobsQuiet && agent.status === 'idle';
           if (step.act === 'ask') {
             if (quiet) Object.assign(record, { open: 'ask', askedAt: at, askedMessages: value.messages });
-          } else if (!quiet) giveUp(agent, record, paused, agent.status === 'idle' ? '有 Codex 任务在运行' : '会话又开始了新回合');
+          } else if (!quiet) giveUp(agent, record, paused, agent.status === 'idle' ? '有 Codex 任务在运行' : '会话又开始了新回合', agent.status !== 'idle');
           else {
             submit({ sessionId: id, origin: step.origin, requestedAt: at });
             if (step.origin === 'auto') record.autoAt = [...(record.autoAt ?? []).filter((t) => now() - Date.parse(t) < 24 * HOUR), at];
@@ -852,7 +899,12 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       const record = validSessionId(id) ? read()[id] : undefined;
       if (!record?.pending || record.pending.requestedAt !== result.requestedAt) return;
       if (['handed_over', 'handed_over_with_issues'].includes(result.status)) delete record.pending;
-      else giveUp(agentOf(id), record, record.pending.goal, `交接${result.status}${result.reason ? `：${result.reason}` : ''}`);
+      else {
+        // 没交接成的尝试不占“24 小时一次”的名额。
+        record.autoAt = (record.autoAt ?? []).filter((at) => at !== record.pending.requestedAt);
+        giveUp(agentOf(id), record, record.pending.goal, `交接${result.status}${result.reason ? `：${result.reason}` : ''}`,
+          result.reason === 'turn_running');
+      }
       save(id, record);
     },
     // 面板上的“同意交接 / 现在交接”：记下同意，在会话下一个回合边界按自动交接的流程执行；“暂不交接 / 知道了”进入冷却。

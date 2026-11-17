@@ -66,6 +66,13 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.111：带着运行中的任务交接、重启后的兜底续接、自动生成的交接标题也改名
+
+- **带任务交接**（`autoHandover.withRunningJobs`，默认 `true`）：自动交接、询问后同意的交接和面板按钮发起的交接，在会话没有回合在跑、但名下有运行中的 Codex 任务时照常进行（`turn_running` 仍一律拒绝）；面板询问也不再等任务结束。交接单“待收尾”逐条列出运行中任务的编号、标题和已运行时长，并写明“这些任务随交接转给本会话：用 `codex_status` 等待并验收，不要重派”；自检 `jobs` 覆盖这些任务。宿主的后台任务机制会把任务结束通知发给任务属主（交接前派出的任务属主仍是前任），属主空闲时直接开一个新回合；现在插件在前任这一回合的第一步之前拦下 Codex 任务的结束通知，转给链路末端的继任会话（A→B→C 时转给 C；继任空闲就开新回合，正忙就放进它的下一步），前任这一回合以 `blocked` 结束、不调用模型。撤回后前任不再有继任，通知照常留给它。`false` 时保持旧行为（有任务就放弃，稍后重试）。
+- 放弃自动交接后的重试冷却：撞上新回合（`turn_running`）时 2 分钟，其他原因 30 分钟；没交接成的尝试不占“24 小时一次”的名额。
+- **重启后的兜底续接**（`autoResume.delaySeconds`，默认 `0` = 原来的立即续接）：大于 0 时，宿主进程启动这么多秒后才扫描（热重载不重新计时，每个宿主进程仍只扫一次），按会话此刻的实际状态重新判断：有回合在跑、宿主启动之后已经开过回合（说明 `dsh-client-auto-continue`、目标循环或用户已经续上）、已交接出去、已归档、用户手动停止、目标被暂停或仍由目标循环驱动的都跳过，其余才发 `autoResume.message`。强杀（没有机会写停机名单）原本就能识别：原始日志里最后一个回合只有 `turn/start` 没有 `turn/end`。宿主没有只读日志尾部的接口，兜底时读一个会话的原始日志最多等 60 秒，超时记 `read_timeout` 跳过。结果写进 `autoresume-result.json`，带 `trigger: "fallback"` 和每个会话的跳过原因。
+- **标题修复放宽**：以 `[codex-conductor 交接]` 开头的标题（宿主按首条交接消息自动起的名）都视为“没有标题”，继任会话改名为 `[交接←<原会话短 id>] <原会话标题>`；启动修复用独立的一次性标记 `titleRepaired`，0.9.109 已修过工作区的链接也会补做一次标题。用户自己改过的标题、已经是 `[交接←…]` 的标题不动。
+
 ### 0.9.110：续接开新线程、已交接会话的开场说明、写任务起步更快
 
 - 续接开新线程：`codex_continue` 不带 `answers`、且原线程上一次请求超过 `continueFreshAboveTokens`（默认 100000 输入 token，0 表示总是沿用原线程）时，改开新的 Codex 线程，只带上轮交接内容（原任务、验收标准、上轮未满足项和证据、偏差与未决项、独立核验意见、阻塞、上轮改动文件），不再每个请求重发旧线程的整段历史。线程大小由 runner 的只读命令 `thread-size` 从该线程的 rollout 读取；读不到时沿用原线程。`fresh: true` / `false` 可逐次指定；带 `answers` 的续接（回答阻塞问题）始终沿用原线程。新任务仍以 `parent_job_id` 挂在原任务下：收尾护栏、交接自检、`codex_jobs` 的 `parent_job` 和 `codex_summary` 的分组都照旧（summary 把续接放进父任务所在的组，用量按线程分别累加）。`codex_run` 带 `resume` 仍沿用原线程。
@@ -365,6 +372,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `autoHandover.remindStepMessages` | `2000` | 同一会话再次提醒需要再涨的消息数，正整数 |
 | `autoHandover.startupDelayMinutes` | `10` | 宿主进程启动后多少分钟内不自动交接（只约束 `auto`），非负数 |
 | `autoHandover.disableAutoContinue` | `true` | 交接后通过宿主设置服务把旧会话在 `dsh-client-auto-continue` 里的模式设为 `off`，撤回时恢复；`false` 不做 |
+| `autoHandover.withRunningJobs` | `true` | 会话空闲但名下有运行中的 Codex 任务时也交接：任务随交接转给继任，结束通知转投给继任；`false` 时有任务就放弃、稍后重试 |
 | `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools`，已有的拒绝规则仍然优先 |
 | `allowTools` | `[]` | 白名单模式下额外放行的工具名，不区分大小写，`*` 结尾表示前缀匹配；不能放行 `write`、`run_code` 等已被拒绝的工具 |
 | `maxRunningJobs` | 留空（不限制） | 同时运行或排队等写锁的 Codex 任务数上限，须为正整数；达到上限时 `codex_run` / `codex_continue` / `codex_verify` 不启动 Codex 并说明原因，等其中一个结束后再派 |
@@ -377,6 +385,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `waitSeconds` | `0` | 无法登记后台任务时，`codex_run` / `codex_continue` / `codex_verify` 默认同步等待的秒数；登记后台后立即返回，随后在本轮用 `codex_status(wait_seconds: 3600)` 等待 |
 | `autoWakeBlockedInbox` | `true` | 本插件后台完成通知滞留时，自动唤醒随后被门禁拒绝的空闲会话；同批最多两次（1 秒、5 秒），用尽写警告日志；设为 `false` 关闭 |
 | `autoResume` | `{enabled:true,maxAgeHours:12,message:"Harness 已重启，接着上次中断的地方继续。",exclude:[]}` | 宿主就绪后，每进程自动续接一次最近中断或活动 Goal 未驱动的主会话；同进程热重载不重复 |
+| `autoResume.delaySeconds` | `0` | 大于 0 时宿主启动这么多秒后才续接，只补到那时仍没有新回合的会话（兜底，让 `dsh-client-auto-continue` 先续）；0 为立即续接 |
 | `timeoutSeconds` | 留空（runner 为 `3600`） | 每次 Codex 尝试的总超时秒数，须为正有限数字，可含小数；不含等待写锁的时间 |
 | `lockTimeoutSeconds` | 留空（无限等待） | 等待目录写锁的超时秒数，须为正有限数字，可含小数；超时不启动 Codex，返回可重试的 `lock_timeout` |
 | `idleTimeoutSeconds` | 留空（runner 为 `600`） | 空闲超时秒数，须为正有限数字，可含小数；命令执行期间暂停，命令完成后恢复 |
@@ -538,6 +547,13 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
 
+### 0.9.111: Hand over with running jobs, fallback resume after a restart, and retitle auto-generated hand-over titles
+
+- **Hand over with running jobs** (`autoHandover.withRunningJobs`, default `true`): automatic, agreed and panel hand-overs proceed when no turn is running even if Codex jobs are (`turn_running` is still always refused), and the panel question no longer waits for jobs. The brief's close-out section lists each running job with its id, title and elapsed time and tells the successor to wait for and review them with `codex_status`, not to redispatch them; the `jobs` self-check covers them. The host's background-job layer sends a job's completion notice to the job owner (still the predecessor for jobs started before the hand-over) and opens a turn when the owner is idle; the plugin now intercepts Codex job notices before the first step of that turn, forwards them to the last successor in the chain (C for A→B→C; a new turn if it is idle, its next step if busy), and the predecessor's turn ends `blocked` without a model call. After a revert the predecessor has no successor and keeps its notices. `false` keeps the old behaviour (give up while jobs run, retry later).
+- Retry after giving up: 2 minutes when a new turn got in the way (`turn_running`), 30 minutes otherwise; failed attempts do not count against the once-a-day limit.
+- **Fallback resume after a restart** (`autoResume.delaySeconds`, default `0` = the immediate resume as before): above 0 the scan runs that many seconds after the host process started (hot reloads do not restart the clock; still once per host process) and re-checks each session's actual state: a running turn, a turn started after the host started (`dsh-client-auto-continue`, the goal loop or the user got there first), a hand-over, an archive, a user stop, or a goal that is paused or still driven by the goal loop all skip; only the rest get `autoResume.message`. Forced kills were already recognised: the raw log's last turn has a `turn/start` without a `turn/end`. The host cannot read just a log's tail, so a fallback read waits at most 60 seconds per session and records `read_timeout` otherwise. `autoresume-result.json` carries `trigger: "fallback"` and the skip reason of each session.
+- **Wider title repair**: any title starting with `[codex-conductor 交接]` (the host's automatic title from the first hand-over message) counts as no title, and the successor is renamed `[交接←<short predecessor id>] <predecessor title>`; the startup repair uses a separate one-time `titleRepaired` mark, so links already repaired by 0.9.109 get their title fixed once. Titles the user changed, and `[交接←…]` titles, are left alone.
+
 ### 0.9.110: Fresh-thread continuations, a notice in handed-over sessions, faster write-job startup
 
 - Fresh continuations: when `codex_continue` carries no `answers` and the parent thread's last request exceeded `continueFreshAboveTokens` (default 100000 input tokens, 0 = always resume), the job starts a new Codex thread with the previous round's brief only (original task, acceptance list, unmet criteria with evidence, deviations and unresolved items, the independent review, blockers, files changed) instead of re-sending the old thread on every request. The runner's read-only `thread-size` reads the size from the thread's rollout; when it is unknown the thread is resumed. `fresh: true` / `false` overrides per call; continuations with `answers` (answering blocking questions) always resume. The new job is still linked by `parent_job_id`, so the close-out guard, the hand-over self-check, `codex_jobs parent_job` and `codex_summary` grouping are unchanged (summary keeps the continuation in its parent's group and sums usage per thread). `codex_run` with `resume` still resumes.
@@ -686,6 +702,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `autoHandover.remindStepMessages` | `2000` | Further messages before the same session is reminded again; positive integer |
 | `autoHandover.startupDelayMinutes` | `10` | Minutes after the host process starts during which `auto` does not hand over; non-negative |
 | `autoHandover.disableAutoContinue` | `true` | After a hand-over, set the old session's `dsh-client-auto-continue` mode to `off` through the host settings service and restore it on revert; `false` skips this |
+| `autoHandover.withRunningJobs` | `true` | Hand over an idle session even while its Codex jobs run: the jobs move to the successor and their completion notices are forwarded to it; `false` gives up while jobs run and retries later |
 | `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`: empty keeps the one in `CODEX_HOME`, `none` leaves it out, an absolute path uses that file instead (symlinks under `runnerHome/codex-home`, needs WSL) |
 | `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |

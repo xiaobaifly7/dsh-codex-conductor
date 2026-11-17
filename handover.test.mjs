@@ -492,7 +492,7 @@ test('auto hand-over asks in the panel or submits a request only when the sessio
   const root = dir(t);
   const aliases = createAliases(root);
   let clock = Date.parse('2026-11-17T12:00:00Z');
-  let settings = { ...AUTO_HANDOVER_DEFAULTS };
+  let settings = { ...AUTO_HANDOVER_DEFAULTS, withRunningJobs: false };
   let running = 1;
   const submitted = [];
   const auto = createAutoHandover({ directory: root, settings: () => settings, aliases, now: () => clock, uptime: () => 3_600_000,
@@ -670,7 +670,7 @@ test('in a goal loop auto hand-over pauses the goal at the idle edge, hands over
   const agents = new Map();
   let clock = Date.parse('2026-11-17T12:00:00Z');
   let running = 0;
-  let settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' };
+  let settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto', withRunningJobs: false };
   const submitted = [];
   const auto = createAutoHandover({ directory: root, settings: () => settings, aliases, now: () => clock, uptime: () => 3_600_000,
     runningJobs: async () => running, submit: (request) => submitted.push(request), goals: () => goals, agentOf: (id) => agents.get(id) });
@@ -717,4 +717,95 @@ test('in a goal loop auto hand-over pauses the goal at the idle edge, hands over
   auto.answer('session-D', true);
   await auto.observe(d, big);
   assert.deepEqual([submitted.at(-1).sessionId, submitted.at(-1).origin, goals.byAgent.get(d).phase], ['session-D', 'confirm', 'paused']);
+});
+
+test('title repair also covers auto-generated hand-over titles and runs once per link even after an earlier repair', async (t) => {
+  const { repairLinks } = await import('./handover.mjs');
+  const root = dir(t);
+  const aliases = createAliases(root);
+  aliases.link('session-0200eab4-aaaa', 'session-897a5c8a-bbbb');
+  aliases.link('session-user-from', 'session-user-to');
+  aliases.link('session-new-from', 'session-new-to');
+  // 0.9.109 已修过工作区的链接：只缺标题修复。
+  aliases.annotate('session-897a5c8a-bbbb', { repaired: '2026-11-18T03:00:00.000Z', workspaceId: 'W1' });
+  const sessions = { 'session-0200eab4-aaaa': '继续 AI 编程助手对话', 'session-897a5c8a-bbbb': '[codex-conductor 交接] 本会话接手会话 session-0200eab4…',
+    'session-user-from': '原标题', 'session-user-to': '我自己起的名字', 'session-new-from': '原标题', 'session-new-to': '[交接←new-from] 原标题' };
+  const renames = [];
+  const controller = { resolveAgent: async (id) => ({ agent: { id, session: { log: [{ type: 'session/title', data: { title: sessions[id] } }] } } }),
+    rename: async (request) => { renames.push(request); sessions[request.sessionId] = request.title; } };
+  await repairLinks({ registry: undefined, controller, aliases, directory: root });
+  assert.deepEqual(renames, [{ sessionId: 'session-897a5c8a-bbbb', title: '[交接←0200eab4] 继续 AI 编程助手对话' }]);
+  assert.ok(Object.values(aliases.links()).every((link) => link.repaired && link.titleRepaired));
+  assert.equal(aliases.links()['session-897a5c8a-bbbb'].workspaceId, 'W1', 'earlier marks stay');
+  await repairLinks({ registry: undefined, controller, aliases, directory: root });
+  assert.equal(renames.length, 1, 'once per link');
+});
+
+test('a hand-over with running Codex jobs carries them to the successor and lists them; a running turn still refuses', async (t) => {
+  const h = host(t);
+  const a = h.agent('session-A');
+  const startedAt = Date.now() / 1000 - 600;
+  const jobs = [{ job_id: 'J-run', execution_status: 'running', started_at: startedAt, context: { task: '重写解析器\n细节' } },
+    { job_id: 'J-done', execution_status: 'completed' }];
+  const deps = { sessionJobs: async (owner) => (owner === 'session-A' || h.aliases.predecessors(owner).includes('session-A') ? jobs : []) };
+  assert.equal((await h.request({ sessionId: 'session-A' }, deps)).reason, 'jobs_running', 'withRunningJobs off keeps the refusal');
+  const carried = await h.request({ sessionId: 'session-A', origin: 'auto' }, { ...deps, withRunningJobs: true });
+  assert.deepEqual([carried.status, carried.running, carried.checks.jobs], ['handed_over', ['J-run'], 'ok']);
+  const brief = readFileSync(carried.briefPath, 'utf8');
+  assert.match(brief, /仍在运行（这些任务随交接转给本会话：用 codex_status 等待并验收，不要重派；结束通知会转到本会话）：\n  - J-run：重写解析器（已运行 10 分钟）/);
+  h.agent('session-B');
+  h.agents.get('session-B').status = 'running';
+  assert.equal((await h.request({ sessionId: 'session-B' }, { ...deps, withRunningJobs: true })).reason, 'turn_running');
+  assert.ok(a);
+});
+
+test('job notices of a handed-over session go to the last successor and end the old turn without a model step; a revert returns them', async () => {
+  const { forwardRetiredNotices, lastSuccessor } = await import('./handover.mjs');
+  const links = { 'session-B': { from: 'session-A' }, 'session-C': { from: 'session-B' } };
+  const aliases = { successor: (id) => Object.keys(links).find((to) => links[to].from === id) };
+  assert.equal(lastSuccessor(aliases, 'session-A'), 'session-C');
+  const notice = (id) => ({ id: `m-${id}`, role: 'user', content: [{ type: 'text', text: `background job ${id} completed\n结果` }], source: { kind: 'tool-jobs', form: 'notice' } });
+  const jobs = { list: () => [{ id: 'bg-1', kind: 'codex', label: 'Codex 20261118-010203-abcdef · 任务' }, { id: 'bg-2', kind: 'bash', label: 'npm test' }] };
+  const received = [];
+  const successor = { id: 'session-C', status: 'idle', followup: (m) => received.push(['followup', m]), inject: (m) => received.push(['inject', m]) };
+  const resolve = async (id) => (id === 'session-C' ? successor : undefined);
+  const agentA = { id: 'session-A' };
+  const only = await forwardRetiredNotices({ agent: agentA, messages: [notice('bg-1')], aliases, jobs, resolve });
+  assert.deepEqual([only.successor, only.delivered, only.reject], ['session-C', true, true]);
+  assert.equal(received[0][0], 'followup');
+  assert.equal(received[0][1].source.kind, 'plugin:codex-conductor');
+  assert.match(received[0][1].content[0].text, /原会话 session-A 交接前派出的任务已结束[\s\S]*background job bg-1 completed/);
+  // 继任正在跑：放进下一步，不另开回合；混着别的输入时照转，但不拦前任这一回合。
+  successor.status = 'running';
+  const mixed = await forwardRetiredNotices({ agent: agentA, messages: [notice('bg-1'), { id: 'u', source: { kind: 'user' }, content: [] }], aliases, jobs, resolve });
+  assert.deepEqual([mixed.reject, received.at(-1)[0]], [false, 'inject']);
+  // 非 Codex 的后台任务、没有交接的会话：不管。
+  assert.equal(await forwardRetiredNotices({ agent: agentA, messages: [notice('bg-2')], aliases, jobs, resolve }), undefined);
+  delete links['session-B'];
+  assert.equal(await forwardRetiredNotices({ agent: agentA, messages: [notice('bg-1')], aliases, jobs, resolve }), undefined, 'after a revert the notice stays with the original session');
+});
+
+test('a goal-loop session with running jobs is handed over at the idle edge; a new turn retries after two minutes, other failures after thirty', async (t) => {
+  const { createAutoHandover, AUTO_HANDOVER_DEFAULTS, TURN_RETRY_COOLDOWN_MS, RETRY_COOLDOWN_MS } = await import('./handover.mjs');
+  const root = dir(t);
+  const aliases = createAliases(root);
+  const goals = goalLoop();
+  let clock = Date.parse('2026-11-18T03:34:46Z');
+  const submitted = [];
+  let checked = 0;
+  const auto = createAutoHandover({ directory: root, settings: () => ({ ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' }), aliases, now: () => clock, uptime: () => 3_600_000,
+    runningJobs: async () => { checked++; return 1; }, submit: (request) => submitted.push(request), goals: () => goals, agentOf: () => agent });
+  const agent = { id: 'session-4175cc7a', status: 'idle' };
+  goals.byAgent.set(agent, { id: 'G', revision: 1, phase: 'active', activation: 'armed' });
+  const big = { messages: 16800, threshold: 5000, suggest: true };
+  await auto.observe(agent, big);
+  assert.deepEqual([submitted.length, checked, goals.byAgent.get(agent).phase], [1, 0, 'paused'], 'running jobs no longer block the hand-over');
+  auto.settled({ from: agent.id, requestedAt: submitted[0].requestedAt, status: 'refused', reason: 'turn_running' });
+  const record = () => JSON.parse(readFileSync(path.join(root, 'auto-handover.json'), 'utf8')).sessions[agent.id];
+  assert.equal(Date.parse(record().retryAfter) - clock, TURN_RETRY_COOLDOWN_MS);
+  assert.equal(goals.byAgent.get(agent).phase, 'active', 'the paused goal is restored');
+  clock += TURN_RETRY_COOLDOWN_MS + 1;
+  await auto.observe(agent, big);
+  auto.settled({ from: agent.id, requestedAt: submitted[1].requestedAt, status: 'refused', reason: 'successor_unavailable' });
+  assert.equal(Date.parse(record().retryAfter) - clock, RETRY_COOLDOWN_MS);
 });

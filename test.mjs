@@ -120,7 +120,7 @@ test('apply auto resume: injected services wait for appReady and receive merged 
         } }, { autoResume: setting });
       } finally { process.env.LOCALAPPDATA = previous; }
       const loaded = JSON.parse(readFileSync(path.join(directory, 'loaded.json'), 'utf8'));
-      assert.deepEqual(loaded.autoResume, { enabled: true, maxAgeHours: setting?.maxAgeHours ?? 12, excludeCount: setting ? 1 : 0 });
+      assert.deepEqual(loaded.autoResume, { enabled: true, maxAgeHours: setting?.maxAgeHours ?? 12, excludeCount: setting ? 1 : 0, delaySeconds: 0 });
       const submitted = Promise.withResolvers();
       const agent = { id: 'session-load', status: 'idle', followup: submitted.resolve };
       const now = Date.now();
@@ -1278,7 +1278,9 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (argv[0] === 'status') return new Promise((r) => setImmediate(r, finals[argv[1]] ?? { job_id: argv[1], status: 'running', seconds_since_last_event: 1 }));
     return Promise.resolve(cancelResult ?? { job_id: argv[1], status: 'cancelled' });
   };
-  const ctx = { tools: { register: (t) => { tools[t.name] = t; }, guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; },
+  // 插件注册了两个 agent/pre-step 中间件：按注册顺序串起来，先注册的在外层；其他事件仍只保留最后一个处理函数。
+  const ctx = { tools: { register: (t) => { tools[t.name] = t; }, guard: (g) => guards.push(g) },
+    on: (ev, fn) => { const outer = ev === 'agent/pre-step' && handlers[ev]; handlers[ev] = outer ? (arg, next) => outer(arg, (...rest) => fn(arg, next, ...rest)) : fn; },
     logger: { warn: (text) => warnings.push(text) },
     ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
   // 收尾护栏会多一次 list 调用；只有专门测它的用例才打开。
@@ -4240,8 +4242,8 @@ test('settings warns and defaults each invalid entry without losing valid config
 });
 
 test('auto resume settings: defaults and partial overrides retain exact message and sanitize loaded metadata', async () => {
-  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] };
-  for (const overrides of [undefined, {}, { enabled: false }, { maxAgeHours: 0.5 },
+  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0 };
+  for (const overrides of [undefined, {}, { enabled: false }, { maxAgeHours: 0.5 }, { delaySeconds: 180 },
     { message: '😀'.repeat(2000), exclude: ['session-private', 'session_2'] }]) {
     const tools = {}, warnings = [];
     let actual;
@@ -4255,19 +4257,21 @@ test('auto resume settings: defaults and partial overrides retain exact message 
     assert.deepEqual(actual, expected);
     assert.deepEqual(warnings, []);
     const loaded = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
-    assert.deepEqual(loaded.autoResume, { enabled: expected.enabled, maxAgeHours: expected.maxAgeHours, excludeCount: expected.exclude.length });
+    assert.deepEqual(loaded.autoResume, { enabled: expected.enabled, maxAgeHours: expected.maxAgeHours, excludeCount: expected.exclude.length,
+      delaySeconds: expected.delaySeconds });
     assert.equal(JSON.stringify(loaded).includes('session-private'), false);
     assert.equal(Object.hasOwn(loaded.autoResume, 'message'), false);
   }
 });
 
 test('auto resume settings: invalid outer and nested fields warn and default independently', async () => {
-  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] };
+  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0 };
   const cases = [
     ...[null, false, 'enabled', []].map(value => ({ value, key: 'autoResume', expected: defaults })),
     ...[0, -1, NaN, Infinity, '12'].map(value => ({ value: { enabled: false, maxAgeHours: value },
       key: 'autoResume.maxAgeHours', expected: { ...defaults, enabled: false } })),
     { value: { enabled: 'false', maxAgeHours: 2 }, key: 'autoResume.enabled', expected: { ...defaults, maxAgeHours: 2 } },
+    ...[-1, NaN, '180'].map(value => ({ value: { enabled: false, delaySeconds: value }, key: 'autoResume.delaySeconds', expected: { ...defaults, enabled: false } })),
     ...[null, 1, '😀'.repeat(2001)].map(message => ({ value: { message, enabled: false },
       key: 'autoResume.message', expected: { ...defaults, enabled: false } })),
     ...['session-one', [null], [''], ['../session-one'], ['session-one\n'], ['x'.repeat(101)]].map(exclude =>
@@ -5494,7 +5498,7 @@ test('a long session gets one hand-over suggestion per turn on codex_run and cod
 });
 
 test('auto hand-over settings default to confirm, warn and default invalid fields one by one and list unknown sub-keys', async () => {
-  const defaults = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true };
+  const defaults = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true, withRunningJobs: true };
   const cases = [
     { value: undefined, expected: defaults, warn: null },
     { value: { mode: 'auto', cooldownHours: 0.5, startupDelayMinutes: 0, disableAutoContinue: false }, warn: null,
@@ -5505,6 +5509,7 @@ test('auto hand-over settings default to confirm, warn and default invalid field
     { value: { remindStepMessages: 0 }, expected: defaults, warn: 'autoHandover.remindStepMessages' },
     { value: { startupDelayMinutes: '10' }, expected: defaults, warn: 'autoHandover.startupDelayMinutes' },
     { value: { disableAutoContinue: 'no' }, expected: defaults, warn: 'autoHandover.disableAutoContinue' },
+    { value: { withRunningJobs: 'yes' }, expected: defaults, warn: 'autoHandover.withRunningJobs' },
     { value: { mode: 'notify', messages: 3000 }, expected: { ...defaults, mode: 'notify' }, warn: 'autoHandover.messages' },
   ];
   for (const { value, expected, warn } of cases) {
@@ -5534,7 +5539,7 @@ test('a session turning idle runs the auto hand-over check: confirm asks once, o
   const big = (id) => ({ id, status: 'idle', session: { header: { cwd: '/work/w' },
     log: [{ type: 'user/message' }, { type: 'assistant/message' }, { type: 'tool/result' }] } });
   const idle = async (h, agent) => { agent.status = 'idle'; h.handlers['agent/status']({ agent, status: 'idle' }); await settle(); };
-  const confirm = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm' } } });
+  const confirm = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm', withRunningJobs: false } } });
   const asked = big('session-wire-confirm');
   // 回合进行中的状态变化不触发。
   confirm.handlers['agent/status']({ agent: { ...asked, status: 'running' }, status: 'running' });
@@ -5550,7 +5555,7 @@ test('a session turning idle runs the auto hand-over check: confirm asks once, o
   const off = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'off' } } });
   await idle(off, big('session-wire-off'));
   assert.equal(state()['session-wire-off'], undefined);
-  const busy = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm' }, listResult: { jobs: [{ job_id: 'J1', status: 'running' }], total: 1 } } });
+  const busy = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm', withRunningJobs: false }, listResult: { jobs: [{ job_id: 'J1', status: 'running' }], total: 1 } } });
   await idle(busy, big('session-wire-busy'));
   assert.equal(state()['session-wire-busy'].open, 'remind', 'a running Codex job only leaves a reminder, never a question');
 });
@@ -5656,4 +5661,26 @@ test('handover-pending lists sessions with an auto hand-over pending or a hand-o
   writeFileSync(path.join(root, 'handover-result.json'), JSON.stringify({ from: 'session-F' }));
   assert.deepEqual(handoverPendingSessions(root), ['session-A', 'session-C', 'session-D', 'session-E']);
   assert.deepEqual(handoverPendingSessions(path.join(root, 'missing')), []);
+});
+
+test('the pre-step hook forwards a Codex job notice of a handed-over session to its successor and ends that turn without a model step', async () => {
+  const directory = path.join(localAppData, 'dsh-codex-conductor');
+  mkdirSync(directory, { recursive: true });
+  const file = path.join(directory, 'handover.json');
+  let links = {};
+  try { links = JSON.parse(readFileSync(file, 'utf8')).links ?? {}; } catch {}
+  writeFileSync(file, JSON.stringify({ links: { ...links, 'session-wire-new': { from: 'session-wire-old', at: '2026-11-18T00:00:00.000Z' } } }));
+  const received = [];
+  const successor = { id: 'session-wire-new', status: 'idle', followup: (message) => received.push(message), inject: () => assert.fail('idle successor') };
+  const agents = { get: (id) => (id === 'session-wire-new' ? successor : undefined) };
+  const jobs = { list: () => [{ id: 'bg-9', kind: 'codex', label: 'Codex 20261118-000000-abcdef · 任务', owner: 'session-wire-old', status: 'completed' }] };
+  const h = harness({ agents, jobs });
+  const notice = { id: 'n1', role: 'user', content: [{ type: 'text', text: 'background job bg-9 completed' }], source: { kind: 'tool-jobs', form: 'notice' } };
+  let entered = false;
+  const decision = await h.handlers['agent/pre-step']({ agent: { id: 'session-wire-old' }, messages: [notice] }, async () => { entered = true; return { kind: 'enter' }; });
+  assert.deepEqual([decision, entered, received.length], [{ kind: 'reject' }, false, 1]);
+  assert.match(received[0].content[0].text, /background job bg-9 completed/);
+  // 没有交接的会话照常进入这一步。
+  assert.deepEqual(await h.handlers['agent/pre-step']({ agent: { id: 'session-wire-other' }, messages: [notice] }, async () => ({ kind: 'enter' })), { kind: 'enter' });
+  writeFileSync(file, JSON.stringify({ links }));
 });

@@ -5,6 +5,8 @@ import { performance } from 'node:perf_hooks';
 
 // Stable across module reloads; timeOrigin distinguishes reused PIDs.
 const HOST_PROCESS = `${process.pid}:${performance.timeOrigin}`;
+// 兜底续接读一个会话的原始日志最多等这么久（大会话的压缩日志要整份解压，宿主没有只读尾部的接口）。
+const FALLBACK_READ_LIMIT_MS = 60_000;
 
 function validSessionId(id) {
   return typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
@@ -212,7 +214,9 @@ export function processGoalRequest(options) {
   return processRequest(options, 'goal');
 }
 
-export async function processAutoResume({ ctx, directory, autoResume, signal }) {
+// delayed（兜底）：宿主启动 delaySeconds 秒后才扫，按会话此刻的实际状态重新判断，只补仍没被续上的会话。
+export async function processAutoResume({ ctx, directory, autoResume, signal, delayed = false, retired = () => false, archived = () => false,
+  hostStart = performance.timeOrigin, readLimitMs = FALLBACK_READ_LIMIT_MS }) {
   if (!autoResume.enabled || signal?.aborted) return;
   const stateFile = path.join(directory, 'autoresume-state.json');
   const readState = () => {
@@ -243,8 +247,10 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
   };
   signal?.addEventListener('abort', interrupt, { once: true });
   const requestedAt = new Date().toISOString();
-  const result = { requestedAt, status: 'processed', sessions: [] };
+  const result = { requestedAt, status: 'processed', ...(delayed ? { trigger: 'fallback', delaySeconds: autoResume.delaySeconds } : {}), sessions: [] };
   const cutoff = Date.now() - autoResume.maxAgeHours * 3600_000;
+  // 宿主启动之后开过的回合说明别的机制（auto-continue、目标循环、用户）已经续上了。
+  const startedAfterBoot = (events) => events?.some((event) => event?.type === 'turn/start' && Number(event.time) >= hostStart);
   try {
     const query = ctx.get('sessionQuery');
     const persistence = ctx.get('sessionPersistence');
@@ -259,16 +265,31 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
         else if (autoResume.exclude.includes(sessionId)) entry = skipped('excluded', { excluded: true });
         else if (!sessionId.startsWith('session-')) entry = skipped('fork', { mainSession: false });
         else if (ctx.get('agents').get(sessionId)?.status === 'running') entry = skipped('running', { agentStatus: 'running' });
+        else if (delayed && retired(sessionId)) entry = skipped('handed_over', { handedOver: true });
+        else if (delayed && archived(sessionId)) entry = skipped('archived', { archived: true });
+        else if (delayed && startedAfterBoot(ctx.get('agents').get(sessionId)?.session?.log)) entry = skipped('resumed_after_start', { live: true });
         else {
           // listSessions has no update time; stat avoids decompressing old JSONL logs.
           const { mtimeMs: updatedAt } = await fs.promises.stat(persistence.locate(header).path);
           if (updatedAt < cutoff) entry = skipped('too_old', { updatedAt, cutoff });
           else {
             // query.readSession also synthesizes interrupted endings, so inspect the raw read handle first.
-            const handle = await persistence.open(sessionId, 'read', { signal });
+            const readSignal = delayed ? AbortSignal.any([signal ?? new AbortController().signal, AbortSignal.timeout(readLimitMs)]) : signal;
+            const handle = await persistence.open(sessionId, 'read', { signal: readSignal });
             let events;
-            try { ({ events } = await handle.read(0, undefined, { signal })); }
+            try { ({ events } = await handle.read(0, undefined, { signal: readSignal })); }
+            catch (error) {
+              if (!delayed || signal?.aborted || !readSignal.aborted) throw error;
+            }
             finally { await handle.close(); }
+            if (delayed && !events) {
+              result.sessions.push({ ...skipped('read_timeout', { updatedAt, readLimitMs }) });
+              continue;
+            }
+            if (delayed && startedAfterBoot(events)) {
+              result.sessions.push(skipped('resumed_after_start', { updatedAt }));
+              continue;
+            }
             const lastTurn = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
             const automatic = { lastTurn: lastTurn?.type === 'turn/start' ? 'unterminated' : lastTurn?.data?.reason?.kind ?? 'none',
               cancelCause: lastTurn?.data?.reason?.reason?.kind ?? null,
@@ -297,7 +318,7 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
   return result;
 }
 
-export function registerResumeRequests({ ctx, directory, autoResume }) {
+export function registerResumeRequests({ ctx, directory, autoResume, retired, archived }) {
   let stopped = false;
   let pending = Promise.resolve();
   const controller = new AbortController();
@@ -335,10 +356,19 @@ export function registerResumeRequests({ ctx, directory, autoResume }) {
       watcher.on('error', (error) => { warn(error); watcher.close(); });
     } catch (error) { warn(error); }
     void check();
+    let timer;
     const cancelReady = autoResume?.enabled ? ctx.get('appReady').onReady(() => {
-      pending = pending.then(() => stopped ? undefined : processAutoResume({ ctx, directory, autoResume, signal: controller.signal })).catch(warn);
+      const delayed = autoResume.delaySeconds > 0;
+      const run = () => {
+        pending = pending.then(() => stopped ? undefined : processAutoResume({ ctx, directory, autoResume, signal: controller.signal,
+          delayed, retired, archived })).catch(warn);
+      };
+      if (!delayed) return run();
+      // 从宿主进程启动算起（插件热重载不重新计时）；每个宿主进程仍只扫一次。
+      timer = setTimeout(run, Math.max(0, autoResume.delaySeconds * 1000 - (Date.now() - performance.timeOrigin)));
+      timer.unref?.();
     }) : undefined;
-    return () => { stopped = true; controller.abort(); cancelReady?.(); watcher?.close(); };
+    return () => { stopped = true; controller.abort(); cancelReady?.(); clearTimeout(timer); watcher?.close(); };
   });
   return check;
 }

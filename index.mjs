@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -58,7 +58,8 @@ const DEFAULTS = {
   serviceTier: '',
   waitSeconds: 0,
   autoWakeBlockedInbox: true,
-  autoResume: { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] },
+  // delaySeconds > 0：宿主启动后等这么久再续接，只补那些到时仍没有新回合的会话（让 auto-continue 先扫）；0 立即续接
+  autoResume: { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0 },
   timeoutSeconds: null,
   idleTimeoutSeconds: null,
   retries: null,
@@ -864,6 +865,7 @@ function settings(config, logger) {
     const value = autoResume[key];
     const valid = key === 'enabled' ? typeof value === 'boolean'
       : key === 'maxAgeHours' ? Number.isFinite(value) && value > 0
+      : key === 'delaySeconds' ? Number.isFinite(value) && value >= 0
       : key === 'message' ? typeof value === 'string' && [...value].length <= 2000
       : Array.isArray(value) && value.every(id => typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id));
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoResume.${key}，使用默认值`);
@@ -875,7 +877,7 @@ function settings(config, logger) {
     const value = autoHandover[key];
     const valid = key === 'mode' ? ['off', 'notify', 'confirm', 'auto'].includes(value)
       : key === 'remindStepMessages' ? Number.isSafeInteger(value) && value > 0
-      : key === 'disableAutoContinue' ? typeof value === 'boolean'
+      : ['disableAutoContinue', 'withRunningJobs'].includes(key) ? typeof value === 'boolean'
       : Number.isFinite(value) && value >= 0;
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoHandover.${key}，使用默认值`);
     return [key, valid ? value : fallback];
@@ -2133,6 +2135,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (status !== 'idle') return;
     try { void autoHandover.observe(agent, history.observe(agent)).catch(() => {}); } catch {}
   });
+  // 交接出去的会话收到 Codex 任务结束通知时转给继任会话，前任这一回合不调用模型就结束。
+  ctx.on('agent/pre-step', async (step, next) => {
+    let forwarded;
+    try {
+      forwarded = await forwardRetiredNotices({ agent: step.agent, messages: step.messages, aliases, jobs: ctx.get?.('jobs'),
+        resolve: async (id) => ctx.get?.('agents')?.get?.(id) ?? (await ctx.get?.('sessionController')?.resolveAgent?.(id))?.agent });
+    } catch (error) { ctx.logger?.warn?.(`[codex-conductor] 转交任务通知失败：${error?.message ?? error}`); }
+    if (forwarded) ctx.logger?.info?.(`[codex-conductor] 会话 ${step.agent?.id} 的 ${forwarded.forwarded} 条任务通知已转给 ${forwarded.successor}` +
+      `${forwarded.delivered ? '' : '（继任会话不可用，未送达）'}。`);
+    return forwarded?.reject ? { kind: 'reject' } : next();
+  });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
@@ -2266,7 +2279,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
-        autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length },
+        autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length,
+          delaySeconds: cfg.autoResume.delaySeconds },
         autoHandover: cfg.autoHandover,
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
@@ -2291,7 +2305,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return () => clearInterval(timer);
   });
   if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
-    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume });
+    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume,
+      // 兜底续接跳过已交接出去的（冻结的）会话和已归档的会话。
+      retired: (id) => Boolean(aliases.successor(id)),
+      archived: (id) => Boolean(ctx.get?.('workspaceRegistry')?.archivedSessionIds?.includes?.(id)) });
     registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,
       sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom),
       disableAutoContinue: cfg.autoHandover.disableAutoContinue,
@@ -2299,7 +2316,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       autoContinue: (id) => autoContinueFromSettings(ctx.get?.('settings'))(id),
       // 交接单里“最近的用户指令”排除重启续接的固定话术；有 session_read 工具时写上回看旧会话的用法。
       autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')),
-      workspaces, onResult: (result) => autoHandover.settled(result) });
+      workspaces, onResult: (result) => autoHandover.settled(result), withRunningJobs: cfg.autoHandover.withRunningJobs });
   });
   // 旧版本交接出的继任会话落在“未分组”、标题是固定的交接标题：工作区服务可用后对每条现存链接修复一次。
   if (resumeDirectory) ctx.inject?.(['workspaceRegistry', 'sessionController'], (repairCtx) => {
