@@ -47,7 +47,7 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
       writeFileSync(path.join(dir, 'closeout.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('closeout-${version}');\nexport const prepareReview = () => ({}), reviewRejection = () => '';\n`);
       writeFileSync(path.join(dir, 'handover.mjs'),
-        `globalThis[${JSON.stringify(traceKey)}].push('handover-${version}');\nexport const createAliases = () => ({ owners: (id) => [id], predecessors: () => [], successor: () => undefined });\n`);
+        `globalThis[${JSON.stringify(traceKey)}].push('handover-${version}');\nexport const createAliases = () => ({ owners: (id) => [id], predecessors: () => [], successor: () => undefined }), registerHandoverRequests = () => {};\n`);
       writeFileSync(path.join(dir, 'guard.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
         readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));

@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { createAliases } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { createAliases, registerHandoverRequests } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -1183,20 +1183,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try { return (typeof value === 'string' ? JSON.parse(value) : value)?.action; } catch { return undefined; }
   };
   // 收尾护栏：本会话有未收尾的已结束任务时返回拒绝说明，否则返回空串；读不到记录或判定出错时放行并记警告。
+  // 本会话（含交接前任）在收尾截止时间之后开始的全部任务；runner 每页最多 100 条，逐页取全。
+  async function sessionJobs(owner, signal) {
+    const jobs = [];
+    const until = Date.now() / 1000 + 86_400;
+    for (let offset = 0; offset !== null;) {
+      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [closeoutFrom, until], limit: 100, offset }, signal);
+      if (!Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
+      jobs.push(...page.jobs);
+      offset = page.next_offset ?? null;
+    }
+    return jobs;
+  }
+
   async function closeoutCheck(owner, tool, signal) {
     if (cfg.closeoutGuard === false || !owner) return '';
     try {
-      // runner 每页最多 100 条；截止时间之后开始的任务逐页取全。
-      const jobs = [];
-      const until = Date.now() / 1000 + 86_400;
-      for (let offset = 0; offset !== null;) {
-        // 交接前任的任务同样要收尾，截止时间规则不变。
-        const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [closeoutFrom, until], limit: 100, offset }, signal);
-        if (!Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
-        jobs.push(...page.jobs);
-        offset = page.next_offset ?? null;
-      }
-      return closeoutRefusal(tool, pendingCloseout(jobs, closeoutFrom));
+      return closeoutRefusal(tool, pendingCloseout(await sessionJobs(owner, signal), closeoutFrom));
     } catch (error) {
       // 从不抛出：派单可能先于这里的结果结束；中止由调用方在等待后处理。
       if (!signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
@@ -2077,5 +2080,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const resumeDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
   if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
     registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume });
+    registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,
+      sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom) });
   });
 }
