@@ -5472,3 +5472,21 @@ test('read-only codex_status and codex_output resolve a thread id to the latest 
   await assert.rejects(h.tools.codex_review.execute({ job_id: thread, status: 'verified', criteria: [{ index: 1, status: 'met', evidence: 'x' }] }, exec));
   assert.ok(!h.calls.some((argv) => argv[0] === 'review'));
 });
+
+test('a long session gets one hand-over suggestion per turn on codex_run and codex_jobs, and codex_runtime shows its size', async () => {
+  const log = [{ type: 'user/message', data: { turn: 1 } }, { type: 'assistant/message', data: { turn: 1 } }, { type: 'tool/result', data: { turn: 1 } }];
+  const agent = agentAt('/work/current', log);
+  const h = harness({ config: { handoverSuggestMessages: 2, startResult: { job_id: 'J', status: 'completed' } } });
+  const first = await h.tools.codex_run.execute(RUN, { agent });
+  assert.match(first.next, /\[建议交接\] 本会话已有 3 条消息，超过 2 条[\s\S]*不要自己发起交接/);
+  assert.doesNotMatch((await h.tools.codex_run.execute(RUN, { agent })).next ?? '', /建议交接/);
+  log.push({ type: 'user/message', data: { turn: 2 } });
+  assert.match((await h.tools.codex_jobs.execute({ session_id: 'current' }, { agent })).handover_hint, /4 条消息/);
+  const runtime = await h.handlers['tools/execute']({ name: 'codex_runtime', arguments: {}, agent },
+    async () => ({ value: { state: 'synchronized' }, content: [{ type: 'text', text: 'ok' }] }));
+  assert.deepEqual(runtime.value.session_history, { messages: 4, threshold: 2, suggest: true });
+  assert.match(runtime.content.at(-1).text, /本会话消息数 4（建议交接阈值 2）：建议由操作员交接到新会话/);
+  // 0 关闭提示。
+  const off = harness({ config: { handoverSuggestMessages: 0, startResult: { job_id: 'J', status: 'completed' } } });
+  assert.doesNotMatch((await off.tools.codex_run.execute(RUN, { agent })).next ?? '', /建议交接/);
+});

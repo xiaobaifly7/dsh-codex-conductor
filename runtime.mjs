@@ -257,14 +257,14 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
   maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置',
   timeoutSeconds: '每次尝试的总超时秒数', idleTimeoutSeconds: '空闲超时秒数', retries: '自动重试次数',
-  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接', maxSessionJobs: '每个会话的任务数上限',
+  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接', maxSessionJobs: '每个会话的任务数上限', handoverSuggestMessages: '建议交接的消息数',
   maxSessionTokens: '每个会话的用量上限', jobDiff: '记录每单的改动', closeoutGuard: '未收尾时拒绝开新任务', toolPolicy: '工具放行方式', allowTools: '白名单工具',
   plannerReadAllow: '额外允许读取的路径' };
 // null clears a limit and restores the runner default.
 const count = (v) => Number.isInteger(v) && v > 0;
 const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) => v > 0, timeoutSeconds: (v) => v > 0,
   idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: count,
-  maxSessionJobs: count, maxSessionTokens: count };
+  maxSessionJobs: count, maxSessionTokens: count, handoverSuggestMessages: (v) => Number.isInteger(v) && v >= 0 };
 // Lists are replaced as a whole; an entry is one line of plain text.
 const listSettings = { allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v)],
   plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\/|\\\\)[^\r\n]*$/.test(v)] };

@@ -254,3 +254,56 @@ export function registerHandoverRequests({ ctx, directory, ...deps }) {
   });
   return check;
 }
+
+// 会话历史越长每步越慢；只提示“建议交接”，从不自动交接。会话日志只追加，按日志数组累计，每次只数新增事件。
+const MESSAGE_TYPES = new Set(['assistant/message', 'tool/result', 'user/message', 'system/message', 'developer/message']);
+export function createHistoryTracker({ directory, threshold, now = Date.now, writeEveryMs = 30_000 }) {
+  const counts = new WeakMap();
+  const file = directory && path.join(directory, 'history-status.json');
+  let sessions = {};
+  try { sessions = JSON.parse(fs.readFileSync(file, 'utf8')).sessions ?? {}; } catch {}
+  let written = 0;
+  let dirty = false;
+  let timer;
+  const count = (log) => {
+    if (!Array.isArray(log)) return undefined;
+    let entry = counts.get(log);
+    if (!entry || entry.scanned > log.length) entry = { scanned: 0, messages: 0 };
+    for (let i = entry.scanned; i < log.length; i++) if (MESSAGE_TYPES.has(log[i]?.type)) entry.messages++;
+    entry.scanned = log.length;
+    counts.set(log, entry);
+    return entry.messages;
+  };
+  // 供外部看门狗读取：只有会话 ID、消息数、是否建议交接、阈值和时间。
+  const flush = () => {
+    clearTimeout(timer);
+    timer = undefined;
+    if (!file || !dirty) return;
+    const old = now() - 7 * 86_400_000;
+    for (const [id, value] of Object.entries(sessions)) if (!(Date.parse(value.at) >= old)) delete sessions[id];
+    try {
+      fs.mkdirSync(directory, { recursive: true });
+      writeJsonAtomic(file, { updatedAt: new Date(now()).toISOString(), threshold: threshold(), sessions });
+      written = now();
+      dirty = false;
+    } catch {}
+  };
+  return {
+    observe(agent) {
+      const messages = count(agent?.session?.log);
+      if (messages === undefined || !validSessionId(agent?.id)) return undefined;
+      const limit = threshold();
+      const value = { messages, threshold: limit, suggest: limit > 0 && messages > limit };
+      const previous = sessions[agent.id];
+      if (previous?.messages !== messages || previous?.suggest !== value.suggest) {
+        sessions[agent.id] = { messages, suggest: value.suggest, at: new Date(now()).toISOString() };
+        dirty = true;
+      }
+      if (now() - written >= writeEveryMs) flush();
+      else if (dirty && !timer) { timer = setTimeout(flush, writeEveryMs - (now() - written)); timer.unref?.(); }
+      return value;
+    },
+    snapshot: () => ({ threshold: threshold(), sessions: Object.entries(sessions).map(([sessionId, value]) => ({ sessionId, ...value })) }),
+    flush,
+  };
+}

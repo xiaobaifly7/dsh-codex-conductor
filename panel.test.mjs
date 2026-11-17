@@ -237,7 +237,7 @@ test('panel settings expose editable fields and read scope counts while redactin
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' },
     timeoutSeconds: null, idleTimeoutSeconds: null, retries: null, maxRunningJobs: null, autoResume: { enabled: true },
     roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [],
-    toolPolicy: 'denylist', allowTools: [], plannerReadAllow: [], maxSessionJobs: null, maxSessionTokens: null, jobDiff: false, closeoutGuard: true, seenTools: [] };
+    toolPolicy: 'denylist', allowTools: [], plannerReadAllow: [], maxSessionJobs: null, maxSessionTokens: null, jobDiff: false, closeoutGuard: true, handoverSuggestMessages: 5000, seenTools: [] };
   assert.deepEqual(panelSettings(cfg), expected);
   const tools = { toolPolicy: 'allowlist', allowTools: ['codex_run', 'mcp__docs__*'], maxSessionJobs: 20, maxSessionTokens: 5000000,
     jobDiff: true, seenTools: new Set(['zeta_tool', 'alpha_tool']) };
@@ -357,7 +357,7 @@ test('panel reads the current connection on every request as authentication appe
 test('panel HTTP implements every valid route using only stub runtime/conductor', async (t) => {
   const f = fixture(t);
   const status = await f.request('GET', '/status');
-  assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg) } });
+  assert.deepEqual(status, { status: 200, body: { runtime: f.state, settings: panelSettings(f.cfg), history: null } });
   assert.deepEqual(f.runtime.execute.mock.calls[0].arguments[0], { action: 'status' });
   assert.equal(f.runtime.execute.mock.calls[0].arguments[1].panel, true, 'status polls are marked as panel reads');
   assert.ok(f.runtime.execute.mock.calls[0].arguments[1].signal instanceof AbortSignal);

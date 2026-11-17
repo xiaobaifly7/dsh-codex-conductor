@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { createAliases, registerHandoverRequests } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { createAliases, registerHandoverRequests, createHistoryTracker } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -68,6 +68,8 @@ const DEFAULTS = {
   maxRunningJobs: null,
   // 每个会话累计可派的任务数、累计用量（token）上限；留空不限制
   maxSessionJobs: null,
+  // 会话消息数超过这个值时提示“建议交接”（只提示，不自动交接）；0 关闭
+  handoverSuggestMessages: 5000,
   maxSessionTokens: null,
   // 可写任务在 git 仓库里记录本单改动的 diff（可回滚）；false 关闭
   jobDiff: true,
@@ -818,6 +820,7 @@ function settings(config, logger) {
         : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
+      : key === 'handoverSuggestMessages' ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
@@ -944,6 +947,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 交接后后继会话也是前任会话任务的归属方；没有交接记录时只认本会话。
   const aliases = createAliases(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
   const owns = (id, owner) => Boolean(id && owner) && aliases.owners(id).includes(owner);
+  const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+    threshold: () => cfg.handoverSuggestMessages ?? 0 });
+  // 超过阈值时给规划端一行提示，每个回合最多一次；交接只能由操作员发起。
+  const hintedTurns = new Map();
+  const handoverHint = (agent) => {
+    const value = history.observe(agent);
+    if (!value?.suggest) return '';
+    const log = agent.session.log;
+    let turn;
+    for (let i = log.length - 1; i >= Math.max(0, log.length - 200) && turn === undefined; i--) turn = log[i]?.data?.turn;
+    if (hintedTurns.get(agent.id) === turn) return '';
+    if (hintedTurns.size > 500) hintedTurns.clear();
+    hintedTurns.set(agent.id, turn);
+    return `[建议交接] 本会话已有 ${value.messages} 条消息，超过 ${value.threshold} 条，每一步都会变慢。请在给用户的汇报里说一句：` +
+      '操作员可以把本会话交接到新会话继续。你不要自己发起交接。';
+  };
   const restrictedReads = exec => cfg.plannerReads === 'products' && inWorkspace(sessionCwd(exec), cfg.roots);
   const rememberJob = (value, owner = value.context?.owner) => {
     if (!owner || !value.job_id) return;
@@ -1420,7 +1439,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       const unknown = Object.keys(args ?? {}).filter(key => !Object.hasOwn(runTool.parameters.properties, key));
       if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
-      return dispatch(args, exec);
+      const value = await dispatch(args, exec);
+      const hint = handoverHint(exec?.agent);
+      return hint ? { ...value, next: value.next ? `${value.next}\n${hint}` : hint } : value;
     },
   };
   ctx.tools.register(runTool);
@@ -1647,11 +1668,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         signal.throwIfAborted();
         const value = await conductor.list(filters, signal);
         if (!Array.isArray(value.jobs)) return value;
+        const hint = handoverHint(exec?.agent);
         return { ...value, jobs: value.jobs.map((job) => {
           const bg = linked.get(job.job_id);
           return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner,
             ...(bg.status ? { background_status: bg.status } : {}) } : {}) };
-        }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}) };
+        }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}),
+          ...(hint ? { handover_hint: hint } : {}) };
       }, exec?.signal);
     },
   });
@@ -1890,7 +1913,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     profileFile: cfg.runtimeProfileFile,
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
-  registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile });
+  registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
+    history: () => history.snapshot() });
 
   const geminiText = (value) => {
     let summary = '';
@@ -2005,6 +2029,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
   ctx.on('agent/turn-stopping', ({ agent, turn }) => {
+    try { history.observe(agent); } catch {}
     try {
       if (!inWorkspace(agent?.session?.header?.cwd, cfg.roots) || liveBackground(undefined, { agent })) return;
       const key = `${agent.id}:${turn}`;
@@ -2046,6 +2071,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       catch (error) { denied = guardError(exec, error); }
       if (denied !== undefined) return { isError: true, error: { message: denied },
         content: [{ type: 'text', text: `Error: ${denied}` }] };
+    }
+    // codex_runtime 给操作员看本会话的历史长度和是否建议交接。
+    if (exec.name === 'codex_runtime') {
+      const result = await next();
+      const value = history.observe(exec.agent);
+      if (result.isError || !value) return result;
+      const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
+        (value.suggest ? '：建议由操作员交接到新会话。' : '');
+      return { ...result, ...(result.value && typeof result.value === 'object' ? { value: { ...result.value, session_history: value } } : {}),
+        content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。
     if (exec.name !== 'job_output' || exec.arguments?.wait === true || !exec.agent?.id) return next();

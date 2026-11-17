@@ -122,3 +122,28 @@ test('hand-over request creates the successor, links it, pauses the old goal, de
   deps.sessionJobs = async () => { throw new Error('wsl down'); };
   assert.deepEqual([(await request({ sessionId: 'session-C' })).reason, aliases.successor('session-C')], ['jobs_unreadable', undefined]);
 });
+
+test('history tracker counts messages incrementally, flags sessions over the threshold and writes a small status file', async (t) => {
+  const { createHistoryTracker } = await import('./handover.mjs');
+  const root = dir(t);
+  let clock = 1_000_000;
+  let threshold = 3;
+  const tracker = createHistoryTracker({ directory: root, threshold: () => threshold, now: () => clock, writeEveryMs: 1000 });
+  const log = [{ type: 'user/message' }, { type: 'turn/start' }, { type: 'assistant/message' }, { type: 'tool/call' }, { type: 'tool/result' }];
+  const agent = { id: 'session-A', session: { log } };
+  assert.deepEqual(tracker.observe(agent), { messages: 3, threshold: 3, suggest: false });
+  log.push({ type: 'assistant/message' });
+  assert.deepEqual(tracker.observe(agent), { messages: 4, threshold: 3, suggest: true });
+  // 状态文件只含会话 ID、消息数、是否建议、阈值和时间；写入有节流，flush 立即写。
+  tracker.flush();
+  const file = JSON.parse(readFileSync(path.join(root, 'history-status.json'), 'utf8'));
+  assert.deepEqual(Object.keys(file), ['updatedAt', 'threshold', 'sessions']);
+  assert.deepEqual(file.sessions['session-A'], { messages: 4, suggest: true, at: new Date(clock).toISOString() });
+  threshold = 0;
+  assert.equal(tracker.observe(agent).suggest, false);
+  assert.equal(tracker.observe({ id: 'session-B', session: {} }), undefined);
+  // 新实例（重载）接着用已有的状态文件。
+  clock += 2000;
+  const reloaded = createHistoryTracker({ directory: root, threshold: () => 5, now: () => clock });
+  assert.deepEqual(reloaded.snapshot().sessions.map((s) => s.sessionId), ['session-A']);
+});

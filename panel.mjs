@@ -114,6 +114,7 @@ export function panelSettings(cfg) {
       ['toolPolicy', cfg.toolPolicy ?? 'denylist'], ['allowTools', [...(cfg.allowTools ?? [])]],
       ['plannerReadAllow', [...(cfg.plannerReadAllow ?? [])]],
       ...['maxSessionJobs', 'maxSessionTokens'].map((key) => [key, cfg[key] ?? null]), ['jobDiff', cfg.jobDiff === true],
+      ['handoverSuggestMessages', cfg.handoverSuggestMessages ?? 5000],
       ['closeoutGuard', cfg.closeoutGuard !== false],
       // 受护栏会话里出现过、白名单模式下不会放行的工具名；只读，不是设置项。
       ['seenTools', [...(cfg.seenTools ?? [])].sort()]]));
@@ -121,7 +122,7 @@ export function panelSettings(cfg) {
 
 // No runner commands come from HTTP input; file names from HTTP are only matched against fixed directory listings.
 export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerInjected = false, executorFile, geminiHistoryFile,
-  selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
+  history = () => null, selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
   let saving = false;
   const selftests = new Map();
   const promptFile = (kind = 'planner') => {
@@ -180,7 +181,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       return { saved: true };
     }
     if (route === '/status') {
-      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg) };
+      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg), history: history() };
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;

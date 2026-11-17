@@ -167,6 +167,7 @@ window.__ModuleLoader__.load({
       maxStorageMb: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
       maxSessionJobs: [(v) => Number.isInteger(v) && v > 0, '每个会话最多派几单请填正整数，或留空。'],
       maxSessionTokens: [(v) => Number.isInteger(v) && v > 0, '每个会话的用量上限请填正整数，或留空。'],
+      handoverSuggestMessages: [(v) => Number.isInteger(v) && v >= 0, '建议交接的消息数请填 0 或正整数（0 表示关闭），或留空恢复默认 5000。'],
     };
     // 多行文本框一行一个，空行忽略；提交时整体替换数组。[最多几项, 单项检查, 提示]
     const LISTS = {
@@ -275,6 +276,9 @@ window.__ModuleLoader__.load({
             statusRow('规划端读取范围', activeSettings ? activeSettings.plannerReads === 'products' ? '只读 Codex 的产物' : '不限制读取' : '未读到', '这是当前正在生效的读取范围。'),
             statusRow('额外允许读取的路径', activeSettings ? `${activeSettings.plannerReadAllowCount ?? 0} 条` : '未读到', '这里只显示数量，需要修改时请编辑插件配置。'),
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
+            statusRow('建议交接的会话', !status.history ? '未读到' : !status.history.threshold ? '提示已关闭'
+              : status.history.sessions.filter((s) => s.suggest).map((s) => `${s.sessionId}（${s.messages} 条消息）`).join('、') || '暂无',
+              `消息数超过 ${status.history?.threshold || '设定值'} 条的会话每一步都会变慢，可以按 README 的步骤交接到新会话；这里只提示，不会自动交接。`),
             statusRow('护栏工作区', !activeSettings ? '未读到' : roots.includes('*') ? '所有会话' : roots.length ? roots.join('、') : '未启用护栏',
               '在这些目录里的会话，规划端不能直接改文件，改动交给 Codex。'),
             statusRow('主机访问', !activeSettings ? '未读到' : !activeSettings.allowHostAccess ? '未开启'
@@ -691,6 +695,7 @@ window.__ModuleLoader__.load({
               field('maxStorageMb', '任务记录占用空间上限（MiB）', '超过上限时会清理最旧的已结束任务记录；留空表示不限制。'),
               field('maxSessionJobs', '每个会话最多派几单', '一个会话累计派出的任务数上限；留空表示不限制。'),
               field('maxSessionTokens', '每个会话的用量上限（token）', '一个会话里 Codex 任务累计用量的上限；留空表示不限制。'),
+              field('handoverSuggestMessages', '建议交接的消息数', '会话消息数超过这个值时提示可以交接到新会话（只提示）；0 表示关闭，留空恢复默认 5000。'),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
               settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,
