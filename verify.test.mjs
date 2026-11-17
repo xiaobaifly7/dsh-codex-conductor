@@ -447,3 +447,11 @@ test('nextStep closes verified and accepted_deviations jobs before products or v
     }
   }
 });
+
+test('codex_verify is never subject to the close-out guard', async () => {
+  // 收尾护栏默认开启；核验原任务正是收尾的一步，不查也不拦。
+  const h = harness();
+  await h.verify();
+  assert.ok(h.calls.some(({ argv }) => argv[0] === 'start'));
+  assert.ok(!h.calls.some(({ argv }) => argv[0] === 'list' && argv.includes('--started-between')));
+});

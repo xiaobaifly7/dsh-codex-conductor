@@ -5353,3 +5353,23 @@ test('close-out guard refuses new-work codex_run until finished jobs are reviewe
   assert.equal((await goalWith(fresh(), [{ type: 'tool/call', data: { name: 'codex_run' } }])).isError, true);
   assert.equal((await goalWith(fresh(), [{ type: 'tool/call', data: { name: 'tool_call', arguments: '{"name":"codex_verify"}' } }])).isError, true);
 });
+
+test('close-out guard leaves codex_continue and codex_run with resume allowed while jobs await close-out', async () => {
+  const parent = withReport(workflowSource('task_conflict'));
+  const latest = withReport({ ...workflowSource('implementation'), job_id: 'CHILD' });
+  const pending = { job_id: 'FLAG', execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: Date.now() / 1000 + 60, started_at: Date.now() / 1000 };
+  for (const tool of ['codex_run', 'codex_continue']) {
+    const listResult = (argv) => argv.includes('--started-between') ? { jobs: [pending], total: 1 } : !argv.includes('--thread-id') ? { jobs: [] }
+      : argv[argv.indexOf('--offset') + 1] === '0' ? { jobs: [latest], next_offset: 1 } : { jobs: [parent] };
+    const h = harness({ config: { closeoutGuard: true, plannerAnswers: true, listResult, startResult: { job_id: 'NEXT', status: 'completed' } } });
+    h.finals.CHILD = latest;
+    const args = tool === 'codex_run'
+      ? { ...RUN, write: true, scope: ['src'], resume: parent.thread_id } : { job_id: 'CHILD', wait_seconds: 0 };
+    const log = [...answeredParent.slice(0, 2), { type: 'user/message', time: 12_000, data: { source: { kind: 'tool-jobs' } } }];
+    assert.equal((await h.tools[tool].execute(args, { agent: agentAt('/work/current', log) })).job_id, 'NEXT', tool);
+    assert.ok(!h.calls.some(argv => argv[0] === 'list' && argv.includes('--started-between')), tool);
+    // 同一会话开新工作的 codex_run 仍被拒。
+    await assert.rejects(h.tools.codex_run.execute(RUN, { agent: agentAt('/work/current', log) }), /未收尾.*FLAG/);
+  }
+});
