@@ -1398,7 +1398,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         cwd: source.cwd, write: false, scope: [], writable_roots: [],
         host_access: source.sandbox === 'danger-full-access',
         use_user_config: source.task_options?.use_user_config === true,
-        ...(source.task_options?.effort ? { effort: source.task_options.effort } : {}),
+        // 核验只读：配置了 readOnlyEffort 时按它，否则沿用原任务的思考程度。
+        ...((cfg.readOnlyEffort || source.task_options?.effort) ? { effort: cfg.readOnlyEffort || source.task_options.effort } : {}),
         model: source.task_options?.model ?? '',
         service_tier: source.task_options?.service_tier ?? '',
         ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),

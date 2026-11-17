@@ -235,7 +235,7 @@ test('verification inherits original cwd and model options, never original write
     const flag = name => argv[argv.indexOf(name) + 1];
     assert.equal(flag('--cwd'), source.cwd);
     assert.equal(flag('--model'), source.task_options.model);
-    assert.equal(flag('--effort'), source.task_options.effort);
+    assert.equal(flag('--effort'), 'medium');
     assert.equal(flag('--service-tier'), source.task_options.service_tier);
     assert.ok(argv.includes('--use-user-config'));
     if (sandbox === 'danger-full-access') assert.equal(flag('--sandbox'), sandbox);
@@ -261,11 +261,20 @@ test('original false user-config and explicit empty model/tier do not use curren
   for (const flag of ['--use-user-config', '--model', '--service-tier']) assert.equal(h.start().argv.includes(flag), false, flag);
 });
 
+test('verification uses readOnlyEffort when set and the original effort otherwise', async () => {
+  for (const [readOnlyEffort, expected] of [['medium', 'medium'], ['', 'low']]) {
+    const h = harness({ config: { readOnlyEffort } });
+    await h.verify();
+    const argv = h.start().argv;
+    assert.equal(argv[argv.indexOf('--effort') + 1], expected, readOnlyEffort);
+  }
+});
+
 test('unspecified original model options keep Codex defaults instead of changed plugin defaults', async () => {
   for (const options of [undefined, { effort: null, use_user_config: false }]) {
     const source = sourceJob();
     source.task_options = options;
-    const h = harness({ source });
+    const h = harness({ source, config: { readOnlyEffort: '' } });
     await h.verify();
     for (const flag of ['--use-user-config', '--model', '--service-tier', '--effort']) {
       assert.equal(h.start().argv.includes(flag), false, flag);
