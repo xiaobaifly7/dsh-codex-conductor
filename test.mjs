@@ -5511,7 +5511,8 @@ test('codex_review accepts an open criterion kept under accepted_deviations with
   parent.structured.blockers = [];
   const args = { job_id: 'PARENT', status: 'accepted_deviations', criteria: [{ index: 1, status: 'blocked', evidence: '仍缺权限，本期不做' }] };
   const run = (plannerAnswers) => {
-    const h = harness({ config: { plannerAnswers, listResult: { jobs: [], total: 0 }, reviewResult: { ...parent, verification_status: 'accepted_deviations' } } });
+    const h = harness({ config: { plannerAnswers, listResult: { jobs: [], total: 0 }, reviewResult: {
+      ...parent, verification_status: 'accepted_deviations', verification: { time: now + 101 } } } });
     h.finals.PARENT = parent;
     return { h, call: h.tools.codex_review.execute(args, { agent: agentAt('/work/current') }) };
   };
@@ -5923,7 +5924,7 @@ test('codex_review finds independent support in a later verification, a later ro
   const stats = () => { try { return JSON.parse(readFileSync(statsFile, 'utf8')).total; } catch { return {}; } };
   const run = async ({ jobs = [], finals = {}, log = [], config = {}, args = review } = {}) => {
     const h = harness({ config: { plannerAnswers: true, listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
-      reviewResult: { ...parent, verification_status: args.status }, ...config } });
+      reviewResult: { ...parent, verification_status: args.status, verification: { time: now + 101 } }, ...config } });
     h.finals.PARENT = parent;
     Object.assign(h.finals, finals);
     return h.tools.codex_review.execute(args, { agent: agentAt('/work/current', log) });
@@ -6108,7 +6109,8 @@ test('the real runner status shape (no finished_at) keeps the independent rule: 
   const apply = (source, config = {}) => {
     process.env.LOCALAPPDATA = root;
     try {
-      const h = harness({ config: { plannerAnswers: true, reviewResult: { ...source, verification_status: 'accepted_deviations' }, ...config } });
+      const h = harness({ config: { plannerAnswers: true, reviewResult: { ...source, verification_status: 'accepted_deviations',
+        verification: { time: fixture.verification.time + 1 } }, ...config } });
       h.finals[source.job_id] = source;
       return h;
     } finally { process.env.LOCALAPPDATA = previous; }
@@ -6127,6 +6129,39 @@ test('the real runner status shape (no finished_at) keeps the independent rule: 
   assert.equal((await h.tools.codex_review.execute(review, { agent: agentAt('/work/current') })).verification_status, 'accepted_deviations');
   const stats = JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8'));
   assert.deepEqual([stats.total.met_planner_level, stats.total.all_met, stats.total.rejected_unsupported], [1, undefined, 2]);
+});
+
+const runnerFixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${name}.json`, import.meta.url), 'utf8'));
+const acceptedFixture = () => runnerFixture('runner-status-c0874f');
+const fixtureReview = ({ job_id, verification: { criteria, status, notes, accepted_deviations } }) =>
+  ({ job_id, criteria, status, notes, accepted_deviations });
+
+test('release E: closeout counts only a fresh, successful review of a real runner record', async () => {
+  const source = acceptedFixture();
+  const review = fixtureReview(source);
+  const stats = () => {
+    try { return JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'closeout-stats.json'), 'utf8')).total; }
+    catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+  };
+  const before = stats();
+  const run = async (reply) => {
+    const h = harness({ config: { plannerAnswers: true, acceptOpenEvidence: 'off', reviewResult: reply } });
+    h.finals[source.job_id] = source;
+    return h.tools.codex_review.execute(review, { agent: agentAt('/work/current') });
+  };
+  await run(source); // status 名相同，但回复携带原来的验收。
+  await run({ ...source, verification: undefined });
+  const fresh = { ...source, verification: { ...source.verification, time: source.verification.time + 1 } };
+  await run({ ...fresh, error_kind: 'invalid_record' });
+  assert.deepEqual(stats(), before);
+  await run(fresh);
+  assert.equal(stats().accepted_open, (before.accepted_open ?? 0) + 1);
+  // 真实记录显式写了 accepted。删掉该字段后才走推定，且仍须真正写入才计数。
+  review.criteria[0] = { ...review.criteria[0], accepted: undefined };
+  await run(source);
+  assert.equal(stats().accepted_inferred, before.accepted_inferred);
+  assert.ok((await run(fresh)).review_fixes.some(fix => fix.includes('视为接受未满足')));
+  assert.equal(stats().accepted_inferred, (before.accepted_inferred ?? 0) + 1);
 });
 
 test('watchdog top-ups, plugin-sent messages and auto-answers are not a user reply', () => {

@@ -2258,7 +2258,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error(reviewRejection(job_id, source, prepared));
       }
       const result = await conductor.review(job_id, review, owner, exec?.signal);
-      if (['verified', 'accepted_deviations'].includes(review.status) && result.verification_status === review.status) {
+      const appended = !result.error_kind && result.verification_status === review.status &&
+        Number.isFinite(result.verification?.time) && result.verification.time > (source.verification?.time ?? -Infinity);
+      if (appended && ['verified', 'accepted_deviations'].includes(review.status)) {
         // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
         const flaggedMet = flaggedCriteria(source).some((f) => (f.row ? review.report_rows ?? [] : review.criteria)
           .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
@@ -2270,10 +2272,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
           `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
       }
-      if (prepared.inferred && result.verification_status === review.status) countCloseout(owner, 'accepted_inferred');
+      if (prepared.inferred && appended) countCloseout(owner, 'accepted_inferred');
       const value = withReport(result);
-      const fixedLine = prepared.fixed.length ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
-      return { ...value, ...(prepared.fixed.length ? { review_fixes: prepared.fixed } : {}), next: [fixedLine, nextStep(value, undefined, undefined, cfg)].filter(Boolean).join('\n') };
+      const fixed = appended && prepared.fixed.length;
+      const fixedLine = fixed ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
+      return { ...value, ...(fixed ? { review_fixes: prepared.fixed } : {}), next: [fixedLine, nextStep(value, undefined, undefined, cfg)].filter(Boolean).join('\n') };
     },
   });
 

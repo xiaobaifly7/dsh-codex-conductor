@@ -2,6 +2,11 @@
 
 [English](#english)
 
+0.9.NEXT
+-------
+
+- 结案统计只计 runner 确认新写入的验收，旧记录和错误回执不再重复计数。
+
 `0.9.123` 的失败回执给出失败原因、尝试次数、记录的改动文件数及下一步。规划端按失败类别处理，避免连续原样重派。模型拒绝保持终态。runner 处理超时前已入队的完成事件，避免把已收到的完成结果误判为超时。
 
 `0.9.122` 的 `runnerAgentsMd: bundled` 可选用随包附带的短版执行指令，默认仍沿用用户文件。派单可用 `must_verify` 标记必须实测的验收项，核验优先覆盖，结案记 `met` 须有独立核验结果。本版首次加载后记录的返工欠账跟踪到后继轮复核通过，Goal 完成时提醒干净但未复核的写入任务。新增默认关闭的 `modelAB`，按新线程的任务号确定模型，续接保留原分配。新增只读对照脚本 `tools/model_ab_stats.py`。
@@ -141,6 +146,11 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+0.9.NEXT
+-------
+
+- Closeout statistics count only newly appended reviews confirmed by the runner. Stale and error replies do not add counts.
 
 `0.9.123` adds the cause, attempt count, recorded file count and next step to failure receipts. The planner follows the guidance for each failure before dispatching again. Model refusals remain terminal. The runner processes completion events already queued at a deadline so a received result is kept.
 
