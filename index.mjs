@@ -1031,6 +1031,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     Date.now() / 1000, 'closeout-rework-since.json');
   const acceptOpenFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     Date.now() / 1000, 'accept-open-evidence-since.json');
+  const autoVerifyFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+    Date.now() / 1000, 'auto-verify-since.json');
   const beforeCutoff = (source, since) => {
     if (Number.isFinite(source.finished_at)) return source.finished_at < since;
     // 拿不到结束时间时看任务号里的开始时间（runner 所在系统的本地时间，时区不定，按 ±14 小时取界）：
@@ -1152,9 +1154,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
   const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
   const ledgerFile = stateDirectory && path.join(stateDirectory, 'accepted-open.json');
+  const unreadableLedgerLine = '未完成项台账不可读';
   const readLedger = () => {
-    try { if (ledgerFile) return JSON.parse(readFileSync(ledgerFile, 'utf8')); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    try {
+      if (ledgerFile) {
+        const ledger = JSON.parse(readFileSync(ledgerFile, 'utf8'));
+        if (!Array.isArray(ledger?.items) || !Array.isArray(ledger.completions)) throw new Error('格式无效');
+        return ledger;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') {
+        ctx.logger?.warn?.(`[codex-conductor] ${unreadableLedgerLine}：${error.message}`);
+        return null;
+      }
+    }
     return { since: acceptOpenFrom, items: [], completions: [] };
   };
   const saveLedger = (ledger) => {
@@ -1163,42 +1176,58 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const textHash = (text) => typeof text === 'string' ? createHash('sha1').update(text).digest('hex').slice(0, 12) : undefined;
   const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
   const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
-  const ledgerLine = ({ items, completions }) =>
-    `未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
-    `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`;
+  const ledgerLine = (ledger) => {
+    if (!ledger) return unreadableLedgerLine;
+    const { items, completions } = ledger;
+    return `未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
+      `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`;
+  };
 
   async function recordAcceptedOpen(source, { review, acceptedOpen }, owner, at) {
     if (!ledgerFile || beforeCutoff(source, acceptOpenFrom)) return;
-    const jobId = source.job_id;
-    const session = source.context.owner;
-    const blockers = source.structured?.blockers;
-    const blocker_kinds = Array.isArray(blockers) ? [...new Set(blockers.map(blocker => blocker?.kind).filter(Boolean))] : [];
-    const items = acceptedOpen.map(entry => ({
-      session, job_id: jobId, ...entry, text_hash: textHash(reviewItemText(source, entry)), blocker_kinds, at,
-    }));
-    const met = new Set([...review.criteria, ...(review.report_rows ?? [])].filter(c => c.status === 'met')
-      .map(c => textHash(reviewItemText(source, c))));
-    const ancestors = new Set();
-    if (met.size && !source.context.verification_of && readLedger().items.length) {
+    const warning = '本次复核已写入，未能更新未完成项台账。';
+    try {
+      let ledger = readLedger();
+      if (!ledger) return warning;
+      const jobId = source.job_id;
+      const session = source.context.owner;
+      const blockers = source.structured?.blockers;
+      const blocker_kinds = Array.isArray(blockers) ? [...new Set(blockers.map(blocker => blocker?.kind).filter(Boolean))] : [];
+      const items = acceptedOpen.map(entry => ({
+        session, job_id: jobId, ...entry, text_hash: textHash(reviewItemText(source, entry)), blocker_kinds, at,
+      }));
+      const met = new Set([...review.criteria, ...(review.report_rows ?? [])].filter(c => c.status === 'met')
+        .map(c => textHash(reviewItemText(source, c))));
+      const ancestors = new Set();
       let parent = parentOf(source);
-      for (let hops = 0; hops < 10 && parent && !ancestors.has(parent); hops++) {
-        const round = await conductor.waitJob(parent, 0);
-        if (!owns(owner, round.context?.owner)) break;
-        ancestors.add(parent);
-        parent = parentOf(round);
+      if (parent && met.size && !source.context.verification_of && ledger.items.length) {
+        for (let hops = 0; hops < 10 && parent && !ancestors.has(parent); hops++) {
+          const round = await conductor.waitJob(parent, 0);
+          if (unknownState(round)) throw new Error(round.error ?? round.error_kind ?? round.status);
+          if (!owns(owner, round.context?.owner)) break;
+          ancestors.add(parent);
+          parent = parentOf(round);
+        }
+        // 查上轮期间可能已有别的复核写入台账。
+        ledger = readLedger();
+        if (!ledger) return warning;
       }
+      const remaining = ledger.items.filter(item => item.job_id !== jobId &&
+        !(ancestors.has(item.job_id) && item.at <= at && met.has(item.text_hash)));
+      if (items.length || remaining.length !== ledger.items.length) saveLedger({ ...ledger, items: [...remaining, ...items] });
+    } catch (error) {
+      ctx.logger?.warn?.(`[codex-conductor] ${warning} ${error?.message ?? error}`);
+      return warning;
     }
-    const ledger = readLedger();
-    const remaining = ledger.items.filter(item => item.job_id !== jobId &&
-      !(ancestors.has(item.job_id) && item.at <= at && met.has(item.text_hash)));
-    if (items.length || remaining.length !== ledger.items.length) saveLedger({ ...ledger, items: [...remaining, ...items] });
   }
 
   async function acceptedOpenLedger(owner, signal) {
     const scope = aliases.owners(owner);
     const view = ({ since, items, completions }) => ({ since, items: items.filter(item => scope.includes(item.session)),
       completions: completions.filter(entry => scope.includes(entry.session)) });
-    const snapshot = view(readLedger());
+    const initial = readLedger();
+    if (!initial) return null;
+    const snapshot = view(initial);
     if (!snapshot.items.length) return snapshot;
     const byJob = new Map(ledgerJobIds(snapshot.items).map(id => [id, []]));
     for (const item of snapshot.items) byJob.get(item.job_id).push(item);
@@ -1242,6 +1271,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     // runner 查询期间可能有新的复核，只移除刚才核实的那一条记录。
     const ledger = readLedger();
+    if (!ledger) return null;
     const items = ledger.items.filter(item => !resolved.has(itemId(item)));
     const next = { ...ledger, items };
     if (items.length !== ledger.items.length) saveLedger(next);
@@ -1401,7 +1431,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const originalOwner = value.context?.owner;
     if (cfg.autoVerify === 'off' || !id || !originalOwner || value.context.write !== true || value.context.verification_of ||
-        value.execution_status !== 'completed' || !validReport(value.report) ||
+        value.execution_status !== 'completed' || value.verification_status !== 'unreviewed' ||
+        beforeCutoff(value, autoVerifyFrom) || !validReport(value.report) ||
         (!flaggedCriteria(value).length && !value.context.must_verify?.length)) return value;
     let pending = autoVerifications.get(id);
     if (!pending) {
@@ -1783,7 +1814,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const { effort: requested, effort_reason: reason } = args;
       const configured = defaultEffort(cfg, args.write);
       const listed = EFFORT_REASONS.includes(reason);
-      if (configured && requested !== undefined && cfg.effortOverride === 'config') {
+      if (configured && requested !== undefined && requested !== configured && cfg.effortOverride === 'config') {
         effortLine = `effort=${requested} 未生效：effortOverride=config 下使用配置的推理强度，本单按默认 ${configured}`;
       } else if (configured && !listed && cfg.effortOverride === 'raise-only-listed' &&
           EFFORTS.indexOf(requested) > EFFORTS.indexOf(configured)) {
@@ -2515,13 +2546,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const result = await conductor.review(job_id, review, owner, exec?.signal);
       const appended = !result.error_kind && result.verification_status === review.status &&
         Number.isFinite(result.verification?.time) && result.verification.time > (source.verification?.time ?? -Infinity);
+      let ledgerWarning;
       if (appended && ['verified', 'accepted_deviations'].includes(review.status)) {
         // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
         const flaggedMet = flaggedCriteria(source).some((f) => (f.row ? review.report_rows ?? [] : review.criteria)
           .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
         countCloseout(owner, openAccepted(review) ? 'accepted_open'
           : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
-        await recordAcceptedOpen(source, prepared, owner, result.verification.time);
+        ledgerWarning = await recordAcceptedOpen(source, prepared, owner, result.verification.time);
       }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
@@ -2532,7 +2564,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const value = withReport(result);
       const fixed = appended && prepared.fixed.length;
       const fixedLine = fixed ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
-      return { ...value, ...(fixed ? { review_fixes: prepared.fixed } : {}), next: [fixedLine, nextStep(value, undefined, undefined, cfg)].filter(Boolean).join('\n') };
+      return { ...value, ...(fixed ? { review_fixes: prepared.fixed } : {}),
+        next: [fixedLine, nextStep(value, undefined, undefined, cfg), ledgerWarning].filter(Boolean).join('\n') };
     },
   });
 
@@ -2559,8 +2592,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
           `已结束轮次耗时合计：${typeof g.finished_duration_s === 'number' ? `${Math.round(g.finished_duration_s)} 秒` : '未知'}；用量（${g.usage_scope}）：${g.usage == null ? '未知（原始用量不完整）' : JSON.stringify(g.usage)}`,
           ...(g.rounds_truncated ? ['只展示最新轮次明细；总轮数、文件集合与耗时按全部匹配记录计算。'] : []),
-        ].join('\n')), ...(value.accepted_open_ledger ? [ledgerLine(value.accepted_open_ledger)] : [])].join('\n\n')
-      : [JSON.stringify(value, null, 2), value.accepted_open_ledger && ledgerLine(value.accepted_open_ledger)].filter(Boolean).join('\n') }] },
+        ].join('\n')), ...(value.accepted_open_ledger === undefined ? [] : [ledgerLine(value.accepted_open_ledger)])].join('\n\n')
+      : [JSON.stringify(value, null, 2), value.accepted_open_ledger !== undefined && ledgerLine(value.accepted_open_ledger)].filter(Boolean).join('\n') }] },
     async execute(args = {}, exec) {
       const selected = args.cwd !== undefined || args.session_id !== undefined ? args : { session_id: 'current', ...args };
       const { filters } = await historySelection(selected, exec);
@@ -2836,12 +2869,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       goal = {};
       // 宿主冻结参数对象，但工具体在中间件之后从 exec 读取参数。
       const { acknowledge_open_items, ...nativeArgs } = goalArgs;
-      if (Object.hasOwn(goalArgs, 'acknowledge_open_items')) exec.arguments = nativeArgs;
+      if (Object.hasOwn(goalArgs, 'acknowledge_open_items')) {
+        exec.arguments = typeof exec.arguments === 'string' ? JSON.stringify(nativeArgs) : nativeArgs;
+      }
       const owner = exec.agent?.id;
       let refusal = usedConductor(exec.agent) ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '';
       if (!refusal) {
-        const { items } = await acceptedOpenLedger(owner, exec.signal);
-        if (items.length) {
+        const ledger = await acceptedOpenLedger(owner, exec.signal);
+        goal.ledgerUnreadable = ledger === null;
+        const items = ledger?.items;
+        if (items?.length) {
           const jobIds = ledgerJobIds(items);
           const listing = jobIds.map(id => `${id}（${[...new Set(items.filter(item => item.job_id === id).map(item => item.status))].join('、')}）`);
           const userConfirmed = cfg.plannerAnswers || hasUserReply(exec.agent.session?.log ?? [],
@@ -2895,7 +2932,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
-    if (goal?.unreviewedWrites?.length || goal?.completion) {
+    if (goal?.unreviewedWrites?.length || goal?.completion || goal?.ledgerUnreadable) {
       const result = await next();
       if (result.isError) return result;
       const content = [...(result.content ?? [])];
@@ -2903,10 +2940,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         text: `以下写入任务报告无异常，尚未经过 codex_review：${goal.unreviewedWrites.join('、')}。` });
       if (goal.completion) {
         const ledger = readLedger();
-        ledger.completions.push({ ...goal.completion, at: Date.now() / 1000 });
-        saveLedger(ledger);
-        content.push({ type: 'text', text: `目标以 ${goal.completion.open_count} 项未完成项完成：${goal.completion.job_ids.join('、')}` });
+        if (ledger) {
+          ledger.completions.push({ ...goal.completion, at: Date.now() / 1000 });
+          // 目标已经完成，记录写失败只提示，不把完成改报成错误。
+          try { saveLedger(ledger); } catch (error) { ctx.logger?.warn?.(`[codex-conductor] 未能记录以未完成项完成目标：${error?.message ?? error}`); }
+          content.push({ type: 'text', text: `目标以 ${goal.completion.open_count} 项未完成项完成：${goal.completion.job_ids.join('、')}` });
+        } else {
+          goal.ledgerUnreadable = true;
+        }
       }
+      if (goal.ledgerUnreadable) content.push({ type: 'text', text: `${unreadableLedgerLine}，未核对未完成项` });
       return { ...result, content };
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。

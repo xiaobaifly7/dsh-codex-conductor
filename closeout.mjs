@@ -214,7 +214,7 @@ export function prepareReview(args, source) {
       const flag = flagged.get(key);
       const original = flag?.status ?? reportRowOf(acceptance, source.structured?.criteria, c.index)?.status;
       if (original === 'met' || (!flag && !required.has(key))) continue;
-      const strict = source.openLevel === 'strict' && c.status === 'not_met';
+      const strict = source.openLevel === 'strict' && (original === 'not_met' || c.status === 'not_met');
       if (strict ? kinds.some(kind => kind === 'verification' || kind === 'user') : kinds.length) continue;
       openUnsupported++;
       const where = c.row ? `报告第 ${c.row} 行（对不上验收清单）` : `报告第 ${c.index} 条`;

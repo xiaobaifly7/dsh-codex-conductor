@@ -6352,9 +6352,102 @@ test('release B: a later closing review or a mapped verification clears only res
   assert.deepEqual((await ledger()).items, []);
 });
 
-const autoSource = (id) => ({ ...workflowSource('implementation'), job_id: id, log_dir: `/logs/${id}` });
+test('rework 3: ancestor lookup failure preserves the saved review result', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
+    reviewResult: ([, id], { stdin }) => {
+      const review = JSON.parse(stdin);
+      return { ...h.finals[id], verification_status: review.status, verification: { ...review, time: source.verification.time + 1 } };
+    },
+  });
+  const exec = { agent: agentAt('/work') };
+  const review = fixtureReview(source);
+  await h.tools.codex_review.execute(review, exec);
+  const file = path.join(state, 'accepted-open.json');
+  const before = readFileSync(file, 'utf8');
+  h.finals.CHILD = { ...source, job_id: 'CHILD', verification: null, verification_status: 'unreviewed',
+    context: { ...source.context, continuation: { parent_job_id: source.job_id } } };
+  Object.defineProperty(h.finals, source.job_id, { get() { throw new Error('上轮状态查询失败'); } });
+  const criteria = review.criteria.map(({ index, evidence }) => ({ index, status: 'met', evidence }));
+  const value = await h.tools.codex_review.execute({ ...review, job_id: 'CHILD', criteria }, exec);
+  assert.equal(value.verification_status, 'accepted_deviations');
+  assert.match(value.next, /本次复核已写入，未能更新未完成项台账/);
+  assert.ok(h.warnings.some(line => line.includes('上轮状态查询失败')));
+  assert.equal(h.calls.filter(argv => argv[0] === 'review' && argv[1] === 'CHILD').length, 1);
+  assert.equal(readFileSync(file, 'utf8'), before);
+});
+
+test('rework 4: a corrupt ledger is reported and preserved across tools', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off',
+    reviewResult: { ...source, verification: { ...source.verification, time: source.verification.time + 1 } } });
+  const file = path.join(state, 'accepted-open.json');
+  const corrupt = '{"items":';
+  writeFileSync(file, corrupt);
+  const agent = agentAt('/work');
+  const middleware = (name, arguments_, value) =>
+    h.handlers['tools/execute']({ name, arguments: arguments_, agent }, async () => ({ value, content: [] }));
+  const [review, summary, runtime, goal] = await Promise.all([
+    h.tools.codex_review.execute(fixtureReview(source), { agent }),
+    h.tools.codex_summary.execute({}, { agent }),
+    middleware('codex_runtime', {}, {}),
+    middleware('update_goal', { action: 'complete' }, 'completed'),
+  ]);
+  assert.equal(review.verification_status, 'accepted_deviations');
+  assert.match(review.next, /本次复核已写入，未能更新未完成项台账/);
+  assert.equal(summary.accepted_open_ledger, null);
+  const summaryText = h.tools.codex_summary.output.render({}, summary)[0].text;
+  assert.match(summaryText, /未完成项台账不可读$/);
+  assert.match(runtime.content.at(-1).text, /未完成项台账不可读$/);
+  assert.doesNotMatch(summaryText + runtime.content.at(-1).text, /未完成但接受的条目/);
+  assert.equal(goal.value, 'completed');
+  assert.equal(goal.content.at(-1).text, '未完成项台账不可读，未核对未完成项');
+  assert.ok(h.warnings.some(line => line.includes('未完成项台账不可读')));
+  assert.equal(readFileSync(file, 'utf8'), corrupt);
+});
+
+test('rework 5: update_goal preserves object and JSON string argument forms', async () => {
+  const h = harness();
+  const nativeArgs = { action: 'complete', goal_id: 'G1', revision: 1 };
+  const input = Object.freeze({ ...nativeArgs, acknowledge_open_items: true });
+  for (const arguments_ of [input, JSON.stringify(input)]) {
+    const exec = { name: 'update_goal', arguments: arguments_, agent: agentAt('/work') };
+    const result = await h.handlers['tools/execute'](exec, async () => {
+      assert.deepEqual(exec.arguments, typeof arguments_ === 'string' ? JSON.stringify(nativeArgs) : nativeArgs);
+      return { value: 'completed' };
+    });
+    assert.equal(result.value, 'completed');
+  }
+});
+
+const autoSource = (id) => ({ ...workflowSource('implementation'), job_id: id, log_dir: `/logs/${id}`,
+  verification_status: 'unreviewed', finished_at: Date.now() / 1000 });
 const queryStatus = (h, job_id, agent = agentAt('/work/original')) =>
   h.tools.codex_status.execute({ job_id, wait_seconds: 0 }, { agent });
+
+test('rework 2: auto verification requires an unreviewed job at or after the cutoff', async (t) => {
+  const { make, state } = acceptedFixtureHarness(t);
+  const since = Date.now() / 1000;
+  const marker = path.join(state, 'auto-verify-since.json');
+  writeFileSync(marker, JSON.stringify({ since }));
+  const h = make({ autoVerify: 'flagged' });
+  const cases = [
+    ['VERIFIED', since, 'verified'],
+    ['ACCEPTED', since, 'accepted_deviations'],
+    ['REWORK', since, 'needs_changes'],
+    ['OLD', since - 3600, 'unreviewed'],
+    ['20000101-000000-aaaaaa', undefined, 'unreviewed'],
+    ['AT-CUTOFF', since, 'unreviewed'],
+  ];
+  const autoChecks = [];
+  for (const [jobId, finished_at, verification_status] of cases) {
+    h.finals[jobId] = { ...autoSource(jobId), finished_at, verification_status };
+    if ((await queryStatus(h, jobId)).auto_verify) autoChecks.push(jobId);
+  }
+  assert.deepEqual(autoChecks, ['AT-CUTOFF']);
+  assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
+  assert.deepEqual(JSON.parse(readFileSync(marker, 'utf8')), { since });
+});
 
 test('release C: overlapping finish observers and manual verification dispatch only one check', async () => {
   const source = autoSource('FLAGGED');
@@ -6497,6 +6590,15 @@ test('release D: effort policies use the write/read default and record requested
   await continued.tools.codex_continue.execute({ job_id: 'PARENT', resolution: '已补齐实现前置条件' }, { agent: agentAt('/work') });
   const argv = continued.calls.find(args => args[0] === 'start');
   assert.equal(argv[argv.indexOf('--effort') + 1], 'low');
+});
+
+test('rework 6: an effort equal to config stays effective without a warning', async () => {
+  const h = harness({ config: { effort: 'medium', effortOverride: 'config' } });
+  const value = await h.tools.codex_run.execute({ ...RUN, write: true, effort: 'medium' }, { agent: agentAt('/work') });
+  assert.doesNotMatch(value.next, /effort=.*未生效/);
+  const { argv, stdin } = h.requests.find(request => request.argv[0] === 'start');
+  assert.equal(argv[argv.indexOf('--effort') + 1], 'medium');
+  assert.deepEqual(JSON.parse(stdin).context.routing.effort, { requested: 'medium', applied: 'medium' });
 });
 
 test('release E: closeout counts only a fresh, successful review of a real runner record', async (t) => {

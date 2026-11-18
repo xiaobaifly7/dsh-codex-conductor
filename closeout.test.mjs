@@ -11,6 +11,20 @@ const report = (extra = {}) => ({ summary: 's', criteria: acceptance.map((criter
 const source = (extra = {}, rep = {}) => ({ job_id: 'J1', status: 'completed', context: { owner: 'a', acceptance }, structured: report(rep), ...extra });
 const met = (index) => ({ index, status: 'met', evidence: `核对 ${index}` });
 
+test('rework 1: strict uses reported not_met even when the review says blocked', () => {
+  const criteria = report().criteria;
+  criteria[1].status = 'not_met';
+  const src = source({ openLevel: 'strict', openSupport: { 2: ['later_round'] } }, { criteria });
+  const review = { status: 'accepted_deviations', criteria: [
+    met(1), { index: 2, status: 'blocked', evidence: '后续仍未完成', accepted: '接受未完成' },
+  ] };
+  const strict = prepareReview(review, src);
+  assert.equal(strict.openUnsupported, 1);
+  assert.match(strict.problems[0], /Codex 报告第 2 条为 not_met.*①.*③.*④/);
+  assert.doesNotMatch(strict.problems[0], /②/);
+  assert.deepEqual(prepareReview(review, { ...src, openLevel: 'relaxed' }).problems, []);
+});
+
 test('review repair fixes unambiguous shapes without inventing verdicts', () => {
   const byOrder = prepareReview({ job_id: 'J1', status: 'verified', note: 'n',
     criteria: JSON.stringify([{ status: 'met', evidence: 'a' }, { status: 'met', evidence: 'b' }]) }, source());
