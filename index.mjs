@@ -1014,6 +1014,7 @@ const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 // 同一宿主内热重载后，旧的后台观察仍可能与新实例同时看到完成。
 const hostVerifications = globalThis[Symbol.for('dsh-codex-conductor.verifications')] ??= new WeakMap();
 const hostParkedReviews = globalThis[Symbol.for('dsh-codex-conductor.parkedReviews')] ??= new Map();
+const hostAutoVerifyScans = globalThis[Symbol.for('dsh-codex-conductor.autoVerifyScans')] ??= new Map();
 const automaticVerification = Symbol('automaticVerification');
 
 export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
@@ -1059,7 +1060,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       return statuses.get(id);
     };
   };
-  async function criterionSupport(source, owner, log, signal, checkOpen) {
+  async function criterionSupport(source, owner, log, signal, checkOpen, strictLookup = false) {
     const flagged = flaggedCriteria(source);
     const required = mustVerifyCriteria(source);
     const support = {};
@@ -1078,10 +1079,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const jobs = [];
     const from = Number.isFinite(source.started_at) ? source.started_at : evidenceFrom;
-    const lookup = (request) => request.catch(() => { signal?.throwIfAborted(); });
+    const lookup = async (request) => {
+      try {
+        const value = await request;
+        if (strictLookup && (!value || unknownState(value))) {
+          throw new Error(value?.error ?? value?.error_kind ?? '无法核对复核依据');
+        }
+        return value;
+      } catch (error) {
+        signal?.throwIfAborted();
+        if (strictLookup) throw error;
+      }
+    };
     for (let offset = 0; offset !== null && offset < 500;) {
       const page = await lookup(conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [from, Date.now() / 1000 + 86_400], limit: 100, offset }, signal));
-      if (page?.error_kind || !Array.isArray(page?.jobs)) break;
+      if (page?.error_kind || !Array.isArray(page?.jobs)) {
+        if (strictLookup) throw new Error(page?.error ?? page?.error_kind ?? '任务列表不可用');
+        break;
+      }
       jobs.push(...page.jobs);
       offset = page.next_offset ?? null;
     }
@@ -1193,7 +1208,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
   const parkedEvaluations = hostParkedReviews.get(parkedFile) ?? new Map();
   if (parkedFile) hostParkedReviews.set(parkedFile, parkedEvaluations);
-  const parkedWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 挂起复核处理失败：${error?.message ?? error}`);
+  const parkedWarning = (error) => { ctx.logger?.warn?.(`[codex-conductor] 挂起复核处理失败：${error?.message ?? error}`); };
   const readParkedReviews = () => {
     try {
       if (parkedFile) {
@@ -1207,6 +1222,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return [];
   };
   const parkedFor = (owner) => (readParkedReviews() ?? []).filter(entry => !owner || owns(owner, entry.owner));
+  const parkedGoalRefusal = (owner) => {
+    if (!owner) return '';
+    const entry = parkedFor(owner)[0] ?? [...parkedEvaluations.values()].find(e => e.pending && owns(owner, e.owner));
+    return entry ? `update_goal: 会话目标暂不能标记完成。${entry.job_id} 有挂起复核，等待核验 ${entry.verification_id} 的复核处理结束。` : '';
+  };
   const ledgerFile = stateDirectory && path.join(stateDirectory, 'accepted-open.json');
   const unreadableLedgerLine = '未完成项台账不可读';
   const readLedger = () => {
@@ -1572,6 +1592,27 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     !beforeCutoff(value, autoVerifyFrom) && validReport(value.report) && (flaggedCriteria(value).length || value.context.must_verify?.length);
   const autoVerifyWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 补派自动核验失败：${error?.message ?? error}`);
 
+  async function hasLaterRound(source) {
+    const id = source.job_id;
+    const list = async filters => {
+      const page = await conductor.list(filters);
+      if (page.error_kind || !Array.isArray(page.jobs)) {
+        throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
+      }
+      return page;
+    };
+    const children = await list({ parent_job: id, limit: 1 });
+    if (children.jobs.some(job => job.parent_job_id === id || job.context?.continuation?.parent_job_id === id)) return true;
+    if (!source.thread_id || !Number.isFinite(source.started_at)) return false;
+    for (let offset = 0; offset !== null;) {
+      const page = await list({ thread_id: source.thread_id, limit: 100, offset });
+      if (page.jobs.some(job => !job.context?.verification_of && job.job_id !== id &&
+          job.thread_id === source.thread_id && job.started_at > source.started_at)) return true;
+      offset = page.next_offset ?? null;
+    }
+    return false;
+  }
+
   async function withAutoVerification(value, exec, { source, catchup = false } = {}) {
     if (cfg.autoVerify === 'off') return value;
     const id = value.job_id;
@@ -1596,11 +1637,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           const current = source ?? await conductor.waitJob(id, 0);
           if (unknownState(current)) return skipped(current.error ?? current.error_kind ?? current.status, 'error');
           if (!source && !eligibleForAutoVerification(withReport(current))) return;
-          const children = await conductor.list({ parent_job: id, limit: 1 });
-          if (children.error_kind || !Array.isArray(children.jobs)) {
-            return skipped(`无法核对后续轮次：${children.error ?? children.error_kind ?? '任务列表不可用'}`);
-          }
-          if (children.jobs.some(job => job.parent_job_id === id || job.context?.continuation?.parent_job_id === id)) {
+          if (await hasLaterRound(current)) {
             return catchup ? undefined : skipped('已有后续轮次');
           }
           owner = lastSuccessor(aliases, current.context.owner) ?? current.context.owner;
@@ -1652,14 +1689,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   async function observeParkedReview(value) {
-    const { job_id: verificationId, context } = value;
-    if (!context?.verification_of || cancelUnconfirmed(value)) return;
+    const { job_id: verificationId } = value;
+    if (value.error_kind !== 'unknown_job' && cancelUnconfirmed(value)) return;
     const prior = parkedEvaluations.get(verificationId);
     if (prior?.pending) return prior.result;
-    const entry = readParkedReviews()?.find(e => e.job_id === context.verification_of && e.verification_id === verificationId);
+    const entry = readParkedReviews()?.find(e => e.verification_id === verificationId);
     if (!entry) return prior?.result;
-    if (!owns(lastSuccessor(aliases, entry.owner) ?? entry.owner, context.owner)) return;
-    const evaluation = { owner: entry.owner, pending: true };
+    const evaluation = { job_id: entry.job_id, verification_id: verificationId, owner: entry.owner, pending: true };
     evaluation.result = evaluateParkedReview(entry).catch(parkedWarning).then(receipt => {
       evaluation.pending = false;
       if (!receipt) parkedEvaluations.delete(verificationId);
@@ -1672,39 +1708,44 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function evaluateParkedReview(entry) {
     const { job_id, owner: storedOwner, verification_id, review, park_support, at } = entry;
     const successor = () => lastSuccessor(aliases, storedOwner) ?? storedOwner;
-    let source;
     let level;
-    let superseded;
     let prepared = { review, fixed: [], problems: [] };
     const outcome = (outcome, line) => ({ parked_review: { job_id, outcome }, line: `${job_id} 的挂起复核${line}` });
-    try {
+    let source = await conductor.waitJob(job_id, 0);
+    if (unknownState(source)) return;
+    if (owns(successor(), source.context?.owner) && !(source.verification?.time > at)) {
+      const supports = await criterionSupport(source, successor(), [], undefined, true, true);
+      const openSupport = { ...supports.openSupport };
+      for (const [key, kinds] of Object.entries(park_support)) openSupport[key] = [...new Set([...kinds, ...(openSupport[key] ?? [])])];
+      level = evidenceLevel(source);
+      prepared = prepareReview(review, { ...source, evidenceLevel: level, openLevel: openEvidenceLevel(source), ...supports, openSupport });
+      // 依据查询期间可能已有人工复核。读到确定状态之后再认领。
       source = await conductor.waitJob(job_id, 0);
-      if (unknownState(source) || !owns(successor(), source.context?.owner)) throw new Error('无法确认原任务状态或归属');
-      superseded = source.verification?.time > at;
-      if (!superseded) {
-        const supports = await criterionSupport(source, successor(), [], undefined, true);
-        const openSupport = { ...supports.openSupport };
-        for (const [key, kinds] of Object.entries(park_support)) openSupport[key] = [...new Set([...kinds, ...(openSupport[key] ?? [])])];
-        level = evidenceLevel(source);
-        prepared = prepareReview(review, { ...source, evidenceLevel: level, openLevel: openEvidenceLevel(source), ...supports, openSupport });
-      }
-    } catch (error) { prepared.problems.push(String(error?.message ?? error)); }
+      if (unknownState(source)) return;
+    }
 
     // 同一宿主的新旧实例同步认领。准备好结论后再读并原子移除，避免核验期间重提或正常写入的复核被覆盖。
     const entries = readParkedReviews();
     const current = entries?.find(e => e.job_id === job_id && e.verification_id === verification_id);
-    if (!current) return;
-    if (JSON.stringify(current) !== JSON.stringify(entry)) return evaluateParkedReview(current);
-    writeJsonAtomic(parkedFile, entries.filter(e => e !== current));
-    if (superseded) return outcome('superseded', '已有更新的复核，已跳过。');
-
     const owner = successor();
+    const owned = owns(owner, source.context?.owner);
+    const superseded = owned && source.verification?.time > at;
+    if (current) {
+      if (JSON.stringify(current) !== JSON.stringify(entry)) return evaluateParkedReview(current);
+      writeJsonAtomic(parkedFile, entries.filter(e => e !== current));
+    }
+    if (superseded) return outcome('superseded', '已有更新的复核，已跳过。');
+    if (!current) return;
+    if (!owned) {
+      countCloseout(owner, 'parked_rejected');
+      return outcome('rejected', '未通过，未写入：无法确认原任务归属。');
+    }
     if (!prepared.problems.length) {
       try {
-        const { appended } = await submitReview(job_id, source, prepared, level, owner);
+        const { appended, ledgerWarning } = await submitReview(job_id, source, prepared, level, owner, undefined, { parkedAt: at });
         if (!appended) throw new Error('runner 未追加复核记录');
         countCloseout(owner, 'parked_recorded');
-        return outcome('recorded', `已按核验结论写入（${review.status}）。`);
+        return outcome('recorded', `已按核验结论写入（${review.status}）。${ledgerWarning ?? ''}`);
       } catch (error) { prepared.problems.push(String(error?.message ?? error)); }
     }
     countCloseout(owner, 'parked_rejected');
@@ -1712,7 +1753,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   async function scanParkedReviews(owner, signal) {
-    const entries = parkedFor(owner).filter(e => !parkedEvaluations.get(e.verification_id)?.pending);
+    const entries = (readParkedReviews() ?? []).filter(e => !parkedEvaluations.get(e.verification_id)?.pending);
     const pending = [...parkedEvaluations.values()].filter(e => e.pending && (!owner || owns(owner, e.owner)));
     await Promise.all([...pending.map(e => e.result), ...entries.map(async ({ verification_id }) => {
       const value = await conductor.waitJob(verification_id, 0, signal);
@@ -1729,9 +1770,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   async function scanAutoVerifications(limit, owner) {
     const jobs = [];
-    // 只看截止时间前两天起开始的任务：跨版本切换时在跑的任务也能覆盖到，不必翻完全部历史。
+    // 从截止时间前七天起扫描，覆盖长时间排队后跨过截止时间才结束的任务。
     const filters = { ...(owner ? { owner, also_owners: aliases.predecessors(owner) } : {}),
-      started_between: [autoVerifyFrom - 2 * 86_400, Date.now() / 1000 + 86_400] };
+      started_between: [autoVerifyFrom - 7 * 86_400, Date.now() / 1000 + 86_400] };
     for (let offset = 0; offset !== null;) {
       const page = await conductor.list({ ...filters, limit: 100, offset });
       if (page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
@@ -1739,9 +1780,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       offset = page.next_offset ?? null;
     }
     const linked = new Set(jobs.flatMap(job => [job.parent_job_id, job.context?.continuation?.parent_job_id, job.context?.verification_of]));
+    const latestStart = new Map();
+    for (const job of jobs) {
+      if (job.thread_id && !job.context?.verification_of && Number.isFinite(job.started_at) &&
+          job.started_at > (latestStart.get(job.thread_id) ?? -Infinity)) latestStart.set(job.thread_id, job.started_at);
+    }
     let started = 0;
     for (const job of jobs) {
-      if (!automaticCandidate(job) || linked.has(job.job_id) ||
+      if (!automaticCandidate(job) || linked.has(job.job_id) || latestStart.get(job.thread_id) > job.started_at ||
           (Number.isFinite(job.finished_at) && beforeCutoff(job, autoVerifyFrom))) continue;
       // 列表行不带 must_verify 和原报告，完整状态也供后续派单使用。
       const source = await conductor.waitJob(job.job_id, 0);
@@ -1754,7 +1800,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
   }
 
-  const lastAutoVerifyScan = new Map();
+  const lastAutoVerifyScan = hostAutoVerifyScans.get(stateDirectory) ?? new Map();
+  hostAutoVerifyScans.set(stateDirectory, lastAutoVerifyScan);
   async function catchUpAutoVerifications(owner) {
     if (!owner) return;
     const parkedScan = scanParkedReviews(owner).catch(parkedWarning);
@@ -2087,8 +2134,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       const refusal = closeoutRefusal(tool, pending);
       if (refusal) logRefusal({ session: owner, tool, unreviewed: pending.unreviewed, needs_changes: pending.needsChanges });
-      const parked = goal && parkedFor(owner).filter(e => pending.unreviewed.includes(e.job_id));
-      return parked?.length ? `${refusal}\n${parked.map(e => `${e.job_id} 有挂起复核，核验 ${e.verification_id} 结束后会判定。`).join('\n')}` : refusal;
+      return refusal;
     } catch (error) {
       // 从不抛出：派单可能先于这里的结果结束；中止由调用方在等待后处理。
       if (!signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
@@ -2813,13 +2859,28 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
 
   const ACCEPTED_FIELD = { type: 'string', minLength: 1, description: '只用于 accepted_deviations 里保留 not_met/blocked 的条目：为什么接受这一条未满足。其他情况省略。' };
-  async function submitReview(job_id, source, prepared, level, owner, signal, normal = false) {
+  async function submitReview(job_id, source, prepared, level, owner, signal, { normal = false, parkedAt } = {}) {
     const { review } = prepared;
     const previousTime = source.verification?.time ?? -Infinity;
-    const result = await conductor.review(job_id, review, owner, signal);
+    let result;
+    let submitError;
+    try { result = await conductor.review(job_id, review, owner, signal); }
+    catch (error) {
+      if (parkedAt === undefined) throw error;
+      submitError = error;
+    }
     // runner 返回作业状态，执行时的错误会和新写入的复核一起返回。
-    const appended = result.verification_status === review.status &&
-      Number.isFinite(result.verification?.time) && result.verification.time > previousTime;
+    const matchesReview = (value, since) => value?.verification_status === review.status &&
+      Number.isFinite(value.verification?.time) && value.verification.time > since && !unknownState(value);
+    let appended = matchesReview(result, previousTime);
+    if (!appended && parkedAt !== undefined && result?.error_kind !== 'bad_arguments') {
+      const latest = await conductor.waitJob(job_id, 0, signal);
+      if (matchesReview(latest, parkedAt)) {
+        result = latest;
+        appended = true;
+      }
+    }
+    if (!appended && submitError) throw submitError;
     if (appended && normal) {
       try {
         const entries = readParkedReviews();
@@ -2838,7 +2899,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, signal);
     }
     // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
-    if (result.error_kind === 'bad_arguments' && !result.job_id) {
+    if (result?.error_kind === 'bad_arguments' && !result.job_id) {
       throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
         `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
     }
@@ -2909,13 +2970,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         // 只有结案复核仅缺保留开放项的依据、没有缺依据的 met，且用户确认已过关，才挂起等待本任务正在跑的核验。
         if (parkedFile && closing && verification_id && prepared.problems.length === prepared.openUnsupported &&
             prepared.unsupported === 0 && canAnswer(log, source, owner)) {
+          const jobs = await sessionJobs(owner, exec?.signal).catch(() => { exec?.signal?.throwIfAborted(); });
+          const deferred = jobs && closeoutDeferral(jobs, pendingCloseout(jobs, closeoutFrom, reworkFrom));
           const entries = readParkedReviews();
           if (entries) {
             const entry = { job_id, owner, verification_id, review, park_support: supports.openSupport, at: Date.now() / 1000 };
             writeJsonAtomic(parkedFile, [...entries.filter(e => e.job_id !== job_id), entry]);
             countCloseout(owner, 'review_parked');
+            const verification = await conductor.waitJob(verification_id, 0).catch(parkedWarning);
+            const settled = verification && await observeParkedReview(verification).catch(parkedWarning);
+            if (settled) return { status: settled.parked_review.outcome, job_id, verification_id,
+              parked_review: settled.parked_review, next: settled.line };
+            const running = verification?.status === 'running';
+            const dispatchHint = running && deferred?.job_id === job_id ? `现在可以派写入范围不与 ${job_id} 重叠的下一单。`
+              : '新任务须等待挂起复核的结果。';
             return { status: 'parked', job_id, verification_id,
-              next: `${job_id} 的复核已挂起：核验 ${verification_id} 还在跑，结束后插件按依据规则判定，结果在 ${verification_id} 的完成通知里（通过即写入；不通过附骨架）。现在可以派写入范围不与 ${job_id} 重叠的下一单。` };
+              next: `${job_id} 的复核已挂起：核验 ${verification_id} ${running ? '还在跑，结束后' : '待确认结果，'}插件按依据规则判定，` +
+                `结果在 ${verification_id} 的完成通知里（通过即写入；不通过附骨架）。${dispatchHint}` };
           }
         }
         if (prepared.unsupported) countCloseout(owner, 'rejected_unsupported');
@@ -2923,7 +2994,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const running = verification_id && prepared.unsupported && !prepared.openUnsupported ? `核验 ${verification_id} 正在跑，等它结束再记；` : '';
         throw new Error(running + reviewRejection(job_id, source, prepared));
       }
-      const { appended, result, ledgerWarning } = await submitReview(job_id, source, prepared, level, owner, exec?.signal, true);
+      const { appended, result, ledgerWarning } = await submitReview(job_id, source, prepared, level, owner, exec?.signal, { normal: true });
       const value = withReport(result);
       const fixed = appended && prepared.fixed.length;
       const fixedLine = fixed ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
@@ -3236,9 +3307,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         exec.arguments = typeof exec.arguments === 'string' ? JSON.stringify(nativeArgs) : nativeArgs;
       }
       const owner = exec.agent?.id;
-      let refusal = usedConductor(exec.agent) || (owner && parkedFor(owner).length)
-        ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '';
-      const ledger = await acceptedOpenLedger(owner, exec.signal);
+      const parked = parkedGoalRefusal(owner);
+      let refusal = parked || (usedConductor(exec.agent)
+        ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '');
+      const ledger = parked ? undefined : await acceptedOpenLedger(owner, exec.signal);
+      refusal = parked || parkedGoalRefusal(owner) || refusal;
       const items = ledger?.items;
       if (!refusal) {
         goal.ledgerUnreadable = ledger === null;
@@ -3266,6 +3339,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       let denied;
       try { denied = await productReads.check(exec, ...productReadLocation(exec)); }
       catch (error) { denied = guardError(exec, error); }
+      if (goal && denied === undefined) denied = parkedGoalRefusal(exec.agent?.id) || undefined;
       if (denied !== undefined) return { isError: true, error: { message: denied },
         content: [{ type: 'text', text: `Error: ${denied}` }] };
     }

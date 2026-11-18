@@ -1271,7 +1271,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, listResult, outputResult, reviewResult, summaryResult, productsResult, threadSizeResult, ...pluginConfig } = config;
+  const { startResult, cancelResult, listResult, outputResult, reviewResult, statusResult, summaryResult, productsResult, threadSizeResult, ...pluginConfig } = config;
   const run = (_cfg, argv, options = {}) => {
     calls.push(argv);
     requests.push({ argv, ...options });
@@ -1290,7 +1290,8 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (argv[0] === 'status' && argv[3] === '20') return new Promise((resolve) =>
       (waiters[argv[1]] ??= []).push({ resolve, onProgress: options.onProgress }));
     // 下一轮事件循环才答：后台循环的等待参数若不是 20，也不会只靠微任务空转、饿死 answer()
-    if (argv[0] === 'status') return new Promise((r) => setImmediate(r, finals[argv[1]] ?? { job_id: argv[1], status: 'running', seconds_since_last_event: 1 }));
+    if (argv[0] === 'status') return new Promise(resolve => setImmediate(resolve))
+      .then(() => statusResult?.(argv) ?? finals[argv[1]] ?? { job_id: argv[1], status: 'running', seconds_since_last_event: 1 });
     return Promise.resolve(cancelResult ?? { job_id: argv[1], status: 'cancelled' });
   };
   // 插件注册了两个 agent/pre-step 中间件：按注册顺序串起来，先注册的在外层；其他事件仍只保留最后一个处理函数。
@@ -6208,6 +6209,20 @@ test('later verification follows criterion text for met and open support', async
   }
 });
 
+test('exact report row beats positional met support', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  source.context.acceptance = ['A', 'B'];
+  source.structured = { ...source.structured, criteria: [resultRow('A', 'blocked'), resultRow('B', 'met')],
+    deviations: [], unresolved: [], blockers: [] };
+  writeFileSync(path.join(state, 'closeout-evidence-since.json'), JSON.stringify({ since: source.finished_at - 1 }));
+  const later = finishedRound(source, 'LATER', ['A', 'B'], [resultRow('Paraphrase of B', 'met'), resultRow('A', 'blocked')],
+    source.finished_at, { parent_job_id: source.job_id });
+  const h = make({ listResult: { jobs: [later] }, reviewResult: source });
+  h.finals.LATER = later;
+  await assert.rejects(h.tools.codex_review.execute(verifiedReview(source), { agent: agentAt('/work') }), /第 1 条.*没有独立依据/);
+  assert.ok(!h.calls.some(argv => argv[0] === 'review'));
+});
+
 test('later verification cannot support a must_verify item with ambiguous text', async (t) => {
   const { source, make } = acceptedFixtureHarness(t);
   const text = '相同验收内容';
@@ -6540,6 +6555,18 @@ test('later-round ledger archives twelve ancestor items on an appended closing r
   assert.equal(stats.sessions.S1.ledger_cleared_by_later_round, 12);
 });
 
+test('exact blocked report row preserves ancestor ledger items', async (t) => {
+  const f = laterRoundLedgerFixture(t);
+  const [first, second] = f.later.structured.criteria;
+  f.later.structured.criteria.splice(0, 2, { ...second, criterion: 'Paraphrase of the second item' },
+    { ...first, criterion: f.later.context.acceptance[0], status: 'blocked' });
+  const view = await f.summary();
+  const indexOne = items => items.filter(item => item.job_id !== f.later.job_id && item.index === 1);
+  assert.ok(indexOne(view.accepted_open_ledger.items).every(item => !item.later_met_by));
+  await f.submit();
+  assert.deepEqual(indexOne(f.stored().items), indexOne(f.input.items));
+});
+
 test('later-round ledger requires an unambiguous match and refuses partial clearing on lookup failure', async (t) => {
   const cases = {
     'different text at the index': ({ later }) => { later.context.acceptance[0] = 'changed'; },
@@ -6743,7 +6770,7 @@ function autoVerifyFixture(t) {
   const runner = {};
   const starts = [];
   const completed = (id, fields = {}, context = {}) => runner[id] = { ...structuredClone(source),
-    job_id: id, cwd: '/work/original', sandbox: 'workspace-write', verification: null,
+    job_id: id, thread_id: id, cwd: '/work/original', sandbox: 'workspace-write', verification: null,
     verification_status: 'unreviewed', ...fields, context: { ...source.context, ...context } };
   const list = argv => {
     const arg = name => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
@@ -6751,8 +6778,11 @@ function autoVerifyFixture(t) {
     const owners = [owner, ...argv.flatMap((item, i) => item === '--also-owner' ? [argv[i + 1]] : [])];
     const parent = arg('--parent-job');
     const status = arg('--status');
+    const thread = arg('--thread-id');
+    const from = +arg('--started-between');
     const matching = Object.values(runner).filter(job => (!owner || owners.includes(job.context.owner)) &&
       (!status || job.execution_status === status) &&
+      (!thread || job.thread_id === thread) && (!Number.isFinite(from) || job.started_at >= from) &&
       (!parent || job.parent_job_id === parent || job.context.continuation?.parent_job_id === parent));
     const offset = +arg('--offset');
     const rows = matching.slice(offset, offset + Math.min(2, +arg('--limit'))).map(({ structured, context, ...row }) => ({
@@ -6823,7 +6853,10 @@ function parkedReviewFixture(t) {
   const file = path.join(state, 'parked-reviews.json');
   const read = (name) => JSON.parse(readFileSync(path.join(state, `${name}.json`), 'utf8'));
   const parked = () => fs.existsSync(file) ? read('parked-reviews') : [];
-  return { id, state, source, v, rows, review, writes, load, agent, submit, status, complete, parked, read };
+  const goal = (h, owner) => h.handlers['tools/execute'](
+    { name: 'update_goal', arguments: { action: 'complete', acknowledge_open_items: true }, agent: agent(owner) },
+    async () => ({ value: 'completed' }));
+  return { id, state, source, v, rows, review, writes, load, agent, submit, status, complete, parked, read, goal };
 }
 
 test('parked review persists the fixed review, replaces it, and two observers record it once', async (t) => {
@@ -6962,6 +6995,192 @@ test('parked review catches finished verifications on load, session calls and be
   });
 });
 
+test('parked evaluation respects a newer manual review written during support lookup', async (t) => {
+  for (const reviewer of ['external', 'codex_review']) await t.test(reviewer, async (t) => {
+    const f = parkedReviewFixture(t);
+    let manual;
+    const h = f.load({
+      statusResult: ([, id]) => id === f.id ? structuredClone(f.source) : undefined,
+      listResult: async () => { await manual?.(); return { jobs: f.rows }; },
+    });
+    assert.equal((await f.submit(h)).status, 'parked');
+    const at = f.parked()[0].at;
+    manual = async () => {
+      if (reviewer === 'codex_review') {
+        const criteria = f.review.criteria.map(({ accepted, ...c }) => c);
+        await f.submit(h, { ...f.review, status: 'needs_changes', criteria });
+      } else {
+        f.source.verification_status = 'needs_changes';
+        f.source.verification = { status: 'needs_changes', time: at + 1 };
+      }
+    };
+    f.complete();
+    assert.deepEqual((await f.status(h)).parked_review, { job_id: f.id, outcome: 'superseded' });
+    assert.equal(f.source.verification_status, 'needs_changes');
+    assert.deepEqual(f.writes.map(write => write.submitted.status), reviewer === 'codex_review' ? ['needs_changes'] : []);
+    assert.deepEqual(f.parked(), []);
+  });
+});
+
+test('parked review blocks goal completion independently of the close-out list', async (t) => {
+  for (const unavailable of ['bridge error', 'before cutoff']) await t.test(unavailable, async (t) => {
+    const f = parkedReviewFixture(t);
+    let goal = false;
+    if (unavailable === 'before cutoff') writeFileSync(path.join(f.state, 'closeout-since.json'), JSON.stringify({ since: f.source.started_at + 1 }));
+    const h = f.load({ closeoutGuard: true, listResult: argv => {
+      if (goal && unavailable === 'bridge error') return { error_kind: 'bridge_error' };
+      return { jobs: f.rows.filter(job => job.started_at >= +argv[argv.indexOf('--started-between') + 1]) };
+    } });
+    writeFileSync(path.join(f.state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' } } }));
+    assert.equal((await f.submit(h, f.review, 'S2')).status, 'parked');
+    // The entry must also block a successor that never called a Codex tool.
+    writeFileSync(path.join(f.state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' }, S3: { from: 'S2' } } }));
+    goal = true;
+    const result = await f.goal(h, 'S3');
+    assert.equal(result.isError, true);
+    assert.match(result.error.message, new RegExp(`${f.id}.*挂起复核.*VERIFY`));
+  });
+});
+
+test('parked evaluation blocks goal completion through the ledger write across reload', async (t) => {
+  const f = parkedReviewFixture(t);
+  const reply = Promise.withResolvers();
+  const appended = Promise.withResolvers();
+  const h = f.load({ reviewResult: async (_argv, { stdin }) => {
+    const review = JSON.parse(stdin);
+    f.source.verification_status = review.status;
+    f.source.verification = { ...review, time: Date.now() / 1000 + 1 };
+    appended.resolve();
+    await reply.promise;
+    return f.source;
+  } });
+  assert.equal((await f.submit(h)).status, 'parked');
+  f.complete();
+  const settlement = f.status(h);
+  await appended.promise;
+  const successor = f.load();
+  try {
+    assert.deepEqual(f.parked(), []);
+    assert.equal(fs.existsSync(path.join(f.state, 'accepted-open.json')), false);
+    const result = await f.goal(successor);
+    assert.equal(result.isError, true);
+    assert.match(result.error.message, new RegExp(`${f.id}.*挂起复核.*VERIFY`));
+  } finally { reply.resolve(); await settlement; }
+  assert.equal(f.read('accepted-open').items.length, 4);
+  assert.equal((await f.goal(successor)).value, 'completed');
+});
+
+test('parked recorded outcome includes the ledger write warning', async (t) => {
+  const f = parkedReviewFixture(t);
+  const h = f.load();
+  assert.equal((await f.submit(h)).status, 'parked');
+  writeFileSync(path.join(f.state, 'accepted-open.json'), 'invalid JSON');
+  f.complete();
+  const result = await f.status(h);
+  assert.equal(result.parked_review?.outcome, 'recorded');
+  assert.match(result.next, /本次复核已写入，未能更新未完成项台账/);
+});
+
+test('parked receipt requires an allowed close-out deferral', async (t) => {
+  for (const reason of ['finished verification', 'second pending job']) await t.test(reason, async (t) => {
+    const f = parkedReviewFixture(t);
+    const h = f.load({ closeoutGuard: true });
+    const extra = reason === 'finished verification' ? { ...f.v, status: 'failed', execution_status: 'failed' } : f.source;
+    f.rows.push({ ...extra, job_id: 'OTHER-JOB' });
+    const result = await f.submit(h);
+    assert.equal(result.status, 'parked');
+    assert.match(result.next, /新任务.*等待.*结果/);
+    assert.doesNotMatch(result.next, /现在可以派/);
+  });
+});
+
+test('parked scans settle pruned and terminal verifications across sessions', async (t) => {
+  for (const mode of ['pruned on reload', 'terminal from unrelated session', 'original ownership mismatch']) await t.test(mode, async (t) => {
+    const f = parkedReviewFixture(t);
+    const h = f.load();
+    assert.equal((await f.submit(h)).status, 'parked');
+    f.complete();
+    if (mode === 'pruned on reload') {
+      f.rows.pop();
+      f.load({ statusResult: ([, id]) => id === 'VERIFY' ? { status: 'failed', error_kind: 'unknown_job' } : undefined });
+    } else {
+      if (mode === 'original ownership mismatch') {
+        f.v.context.owner = 'V-OWNER';
+        f.source.context.owner = 'OTHER';
+      }
+      await h.handlers['tools/execute']({ name: 'codex_jobs', arguments: {}, agent: f.agent('OTHER') }, async () => ({ value: {} }));
+    }
+    await settleAutoVerify();
+    assert.deepEqual(f.parked(), []);
+    const recorded = mode === 'terminal from unrelated session';
+    assert.equal(f.writes.length, Number(recorded));
+    assert.equal(f.read('closeout-stats').total[recorded ? 'parked_recorded' : 'parked_rejected'], 1);
+  });
+});
+
+test('parking immediately settles a verification that already ended', async (t) => {
+  for (const terminal of ['completed', 'failed']) await t.test(terminal, async (t) => {
+    const f = parkedReviewFixture(t);
+    const h = f.load({ statusResult: ([, id]) => id === 'VERIFY' && f.parked().length ? f.complete(terminal) : undefined });
+    const result = await f.submit(h);
+    const outcome = terminal === 'completed' ? 'recorded' : 'rejected';
+    assert.equal(result.status, outcome);
+    assert.deepEqual(result.parked_review, { job_id: f.id, outcome });
+    if (outcome === 'rejected') assert.match(result.next, /可直接修改后提交的骨架/);
+    assert.equal(f.writes.length, Number(outcome === 'recorded'));
+    assert.deepEqual(f.parked(), []);
+  });
+});
+
+test('parked evaluation retries transient original and support reads', async (t) => {
+  for (const failing of ['original status', 'support list', 'support status']) await t.test(failing, async (t) => {
+    const f = parkedReviewFixture(t);
+    let fail = false;
+    let verificationReads = 0;
+    const unavailable = { status: 'failed', error_kind: 'bridge_error' };
+    const h = f.load({
+      listResult: () => fail && failing === 'support list' ? unavailable : { jobs: f.rows },
+      statusResult: ([, id]) => {
+        if (fail && failing === 'original status' && id === f.id) return unavailable;
+        // The first VERIFY read observes completion, the next one supplies the evidence.
+        if (fail && failing === 'support status' && id === 'VERIFY' && ++verificationReads > 1) return unavailable;
+      },
+    });
+    assert.equal((await f.submit(h)).status, 'parked');
+    f.complete();
+    fail = true;
+    assert.equal((await f.status(h)).parked_review, undefined);
+    assert.equal(f.parked().length, 1);
+    assert.deepEqual(f.writes, []);
+    fail = false;
+    assert.equal((await f.status(h)).parked_review?.outcome, 'recorded');
+    assert.equal(f.writes.length, 1);
+  });
+});
+
+test('parked evaluation recovers an appended review after a lost reply', async (t) => {
+  for (const failure of ['thrown', 'ambiguous']) await t.test(failure, async (t) => {
+    const f = parkedReviewFixture(t);
+    let submits = 0;
+    let at;
+    const h = f.load({ reviewResult: (_argv, { stdin }) => {
+      submits++;
+      const review = JSON.parse(stdin);
+      f.source.verification_status = review.status;
+      f.source.verification = { ...review, time: at + 1 };
+      if (failure === 'thrown') throw new Error('review reply lost');
+      return { status: 'failed', error_kind: 'bridge_error' };
+    } });
+    assert.equal((await f.submit(h)).status, 'parked');
+    at = f.parked()[0].at;
+    f.complete();
+    assert.deepEqual((await f.status(h)).parked_review, { job_id: f.id, outcome: 'recorded' });
+    assert.equal(submits, 1);
+    assert.equal(f.read('accepted-open').items.length, 4);
+    assert.deepEqual(f.parked(), []);
+  });
+});
+
 test('auto catch-up starts two on load and one per session scan through handover', async (t) => {
   const f = autoVerifyFixture(t);
   let now = Date.now();
@@ -6996,6 +7215,57 @@ test('auto catch-up starts two on load and one per session scan through handover
   assert.equal(f.starts.at(-1).verification_of, 'FOURTH');
   assert.equal(f.stats().auto_verify_started, 5);
   assert.equal(f.stats().auto_verify_catchup, 5);
+});
+
+test('auto verification skips a same-thread resume on completion and catch-up', async (t) => {
+  const f = autoVerifyFixture(t);
+  const addRounds = id => {
+    const source = f.completed(id);
+    f.completed(`${id}-CHECK`, { thread_id: id, started_at: source.started_at + 3 },
+      { write: false, verification_of: 'UNRELATED' });
+    f.completed(`${id}-RESUME`, { thread_id: id, started_at: source.started_at + 1 }, { write: false });
+    return source;
+  };
+  addRounds('CATCHUP');
+  const h = f.load();
+  await settleAutoVerify();
+  const onLoad = {
+    starts: f.starts.map(start => start.verification_of),
+    sourceRead: h.calls.some(([command, id]) => command === 'status' && id === 'CATCHUP'),
+  };
+  h.finals.FINISH = addRounds('FINISH');
+  const result = await queryStatus(h, 'FINISH');
+  assert.deepEqual({ ...onLoad, skipped: result.auto_verify?.skipped },
+    { starts: [], sourceRead: false, skipped: '已有后续轮次' });
+  assert.deepEqual(f.starts, []);
+});
+
+test('auto catch-up includes jobs started within seven days before the cutoff', async (t) => {
+  const f = autoVerifyFixture(t);
+  f.completed('TOO-OLD', { started_at: f.since - 7 * 86_400 - 1 });
+  f.completed('WEEK', { started_at: f.since - 7 * 86_400 });
+  f.load();
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['WEEK']);
+});
+
+test('auto catch-up keeps the session debounce across reload', async (t) => {
+  const f = autoVerifyFixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  await f.call(f.load());
+  await settleAutoVerify();
+  const reloaded = f.load();
+  await settleAutoVerify();
+  reloaded.finals.DEBOUNCED = f.completed('DEBOUNCED');
+  now += 59_999;
+  await f.call(reloaded);
+  await settleAutoVerify();
+  assert.deepEqual(f.starts, []);
+  now += 1;
+  await f.call(reloaded);
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['DEBOUNCED']);
 });
 
 test('auto catch-up finds existing verifications across two fresh reloads', async (t) => {

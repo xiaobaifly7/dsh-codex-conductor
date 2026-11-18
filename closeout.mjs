@@ -426,8 +426,14 @@ export function acceptanceIndexOfRow(acceptance, rows, i) {
   return hit >= 0 ? hit + 1 : rows.length === acceptance.length ? i + 1 : 0;
 }
 // 某条验收（从 1 起）在报告里对应的行；对不上时 undefined。
-export const reportRowOf = (acceptance, rows, index) =>
-  (Array.isArray(rows) ? rows.find((_c, i) => acceptanceIndexOfRow(acceptance, rows, i) === index) : undefined);
+export function reportRowOf(acceptance, rows, index) {
+  if (!Array.isArray(acceptance) || !Array.isArray(rows)) return;
+  const text = label(acceptance[index - 1]).trim();
+  // 同一编号可能同时命中原文和位置，原文优先。
+  return (acceptance.findIndex(item => label(item).trim() === text) === index - 1
+    ? rows.find(row => nonempty(row?.criterion) && row.criterion.trim() === text) : undefined) ??
+    (acceptanceIndexOfRow(acceptance, rows, index - 1) === index ? rows[index - 1] : undefined);
+}
 
 // 原报告自标 blocked / not_met 的条目：能对上验收清单的按验收编号（key 为编号），对不上的按报告行号（row，key 为 row<k>）。
 export function flaggedCriteria(source) {
