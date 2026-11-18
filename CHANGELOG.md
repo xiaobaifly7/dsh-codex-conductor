@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.116` 同一宿主进程热重载时，记录卸载前仍在运行的回合。默认等 20 秒后复核并续上符合条件的中断回合，连续重载会接着处理剩余名单。缺少卸载记录时，只在确认同进程重载后检查最近 10 分钟的中断。`autoResume.reloadDelaySeconds: 0` 关闭此功能，结果以 `trigger: "reload"` 记录。
+
 `0.9.115` 新增 `autoAnswer`。宿主提问默认等 10 分钟后按推荐代答，支持多选、自由文本和多题。高风险与排除项保留给用户。Codex 指挥面板显示等待和历史，支持立即按推荐回答或取消单条代答。热重载保留提出时间，已超时的恢复提问另等 30 秒。
 
 `0.9.114` 结案质量：Codex 报告自标 `blocked` / `not_met` 的验收项，结案（`verified` 和 `accepted_deviations` 一样）记成 `met` 时，默认（`closeoutEvidence: independent`）要有独立依据——晚于该轮结束、核验本单元并把这一条判 met 的核验任务（核验任务现在把每个自标未满足的原验收项单列一条）、同一单元后续轮次报告这一条 met、或原会话用户在作业结束后的真实回复。这收紧了 0.9.103 的规则：那条只管 `verified`、只拦照抄报告原文，规划端自己写的证据就能过；现在它只在 `closeoutEvidence: planner` 下沿用，`off` 不查。缺依据时一次列出三条路（核验、返工、照实记未满足）。新增“未满足但接受”：`accepted_deviations` 的条目可保留未满足状态并写 `accepted` 原因，与接受偏差同一道用户确认，`summary` 的 `accepted_open` 列出。本机首次加载这一版之前结束的任务按 planner 规则结案（`closeout-evidence-since.json`）。结案结果计入 `closeout-stats.json`、`codex_runtime` 显示；任务 context 记 `routing`，收尾护栏拒绝记入 `closeout-refusals.jsonl`。
@@ -125,6 +127,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.116` records running turns before a same-process hot reload and rechecks interrupted turns after 20 seconds by default. Pending recovery survives consecutive reloads. With no unload snapshot, a confirmed same-process reload checks interruptions from the last 10 minutes. Set `autoResume.reloadDelaySeconds: 0` to disable it. Results use `trigger: "reload"`.
 
 `0.9.115` adds `autoAnswer` for Host questions. After 10 minutes by default, it submits recommended choices or configured free text, including multi-select questions and batches. Risky and excluded questions stay with the user. The Codex panel shows pending questions and history, with actions to answer now or reserve a question for the user. Reloads retain the original timing and give overdue restored questions 30 extra seconds.
 

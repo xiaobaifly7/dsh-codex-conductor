@@ -60,7 +60,8 @@ const DEFAULTS = {
   waitSeconds: 0,
   autoWakeBlockedInbox: true,
   // delaySeconds > 0：宿主启动后等这么久再续接，只补那些到时仍没有新回合的会话（让 auto-continue 先扫）；0 立即续接
-  autoResume: { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0 },
+  autoResume: { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [],
+    delaySeconds: 0, reloadDelaySeconds: 20 },
   timeoutSeconds: null,
   idleTimeoutSeconds: null,
   retries: null,
@@ -872,6 +873,7 @@ function settings(config, logger) {
     const valid = key === 'enabled' ? typeof value === 'boolean'
       : key === 'maxAgeHours' ? Number.isFinite(value) && value > 0
       : key === 'delaySeconds' ? Number.isFinite(value) && value >= 0
+      : key === 'reloadDelaySeconds' ? Number.isFinite(value) && value >= 0 && value * 1000 <= 2_147_483_647
       : key === 'message' ? typeof value === 'string' && [...value].length <= 2000
       : Array.isArray(value) && value.every(id => typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id));
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoResume.${key}，使用默认值`);
@@ -2494,11 +2496,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.logger?.info?.(`[codex-conductor] active v${loadedIdentity.version ?? '?'}；护栏工作区 ${cfg.roots.join(', ') || '(未配置)'}`);
   // 桌面宿主日志不落盘，留一个加载标记，便于确认插件是否在运行中的 DSH 里生效
   // 没有 LOCALAPPDATA（Linux 上跑测试）时不写，免得落到当前目录
+  let previousLoad;
   if (process.env.LOCALAPPDATA) try {
     const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
     mkdirSync(dir, { recursive: true });
     const loadedFile = path.join(dir, 'loaded.json');
     const { record } = loadedRecord(loadedFile);
+    if (record) previousLoad = { pid: record.pid, at: Date.parse(record.loadedAt) };
     if (!record || record.pid === process.pid || pidReused(record.pid, record.loadedAt)) writeFileSync(loadedFile,
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
         ...(cfg.unknownConfig.length ? { unknownConfig: cfg.unknownConfig } : {}),
@@ -2508,7 +2512,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         plannerAnswers: cfg.plannerAnswers === true,
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length,
-          delaySeconds: cfg.autoResume.delaySeconds },
+          delaySeconds: cfg.autoResume.delaySeconds, reloadDelaySeconds: cfg.autoResume.reloadDelaySeconds },
         autoHandover: cfg.autoHandover,
         autoAnswer: { enabled: cfg.autoAnswer.enabled, afterMinutes: cfg.autoAnswer.afterMinutes, subagents: cfg.autoAnswer.subagents,
           excludeCount: cfg.autoAnswer.excludeSessions.length, riskyPatternEnabled: cfg.autoAnswer.riskyPattern !== '',
@@ -2536,8 +2540,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return () => clearInterval(timer);
   });
   if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
-    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume,
-      // 兜底续接跳过已交接出去的（冻结的）会话和已归档的会话。
+    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume, pluginFiber: ctx.fiber, previousLoad,
+      // 自动兜底和热重载续接都跳过已交接和已归档的会话。
       retired: (id) => Boolean(aliases.successor(id)),
       archived: (id) => Boolean(ctx.get?.('workspaceRegistry')?.archivedSessionIds?.includes?.(id)) });
     registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,

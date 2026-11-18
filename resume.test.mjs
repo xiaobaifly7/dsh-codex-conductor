@@ -17,6 +17,7 @@ const goal = (extra = {}) => ({ id: 'goal-1', revision: 7, phase: 'paused', acti
   roundsStarted: 1, maxGoalRounds: 3, ...extra });
 const row = (sessionId, reason, method = null) => ({ sessionId,
   status: method ? 'resumed' : 'skipped', reason, method });
+const hostProcess = `${process.pid}:${performance.timeOrigin}`;
 const autoDefaults = { enabled: true, maxAgeHours: 12,
   message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [] };
 
@@ -34,8 +35,9 @@ function fixture(t, kind = 'resume') {
   const claims = () => fs.readdirSync(directory).filter(name => claimPattern.test(name));
   const assertClaimed = () => {
     if (autoResume) {
-      assert.equal(JSON.parse(fs.readFileSync(file('autoresume-state.json'), 'utf8')).hostProcess,
-        `${process.pid}:${performance.timeOrigin}`, 'reserve this process before any scan or submission');
+      const state = JSON.parse(fs.readFileSync(file('autoresume-state.json'), 'utf8'));
+      assert.ok(state.hostProcess === hostProcess || state.reload?.hostProcess === hostProcess,
+        'reserve this process before any scan or submission');
       return;
     }
     assert.equal(fs.existsSync(file(`${kind}-request.json`)), false);
@@ -1652,4 +1654,199 @@ test('fallback auto resume waits for delaySeconds after host start; zero keeps t
   for (let i = 0; i < 50 && !fs.existsSync(g.file('autoresume-result.json')); i++) await new Promise((r) => setTimeout(r, 5));
   assert.equal(g.saved().trigger, undefined);
   assert.deepEqual(g.messages.map((m) => m.id), ['session-crash']);
+});
+
+const timedTurn = (event, time, turn = 1) => ({ ...event, time, data: { ...event.data, turn } });
+
+function reloadFixture(t) {
+  const boot = Math.ceil(performance.timeOrigin);
+  t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: boot + 720_000 });
+  const f = fixture(t, 'autoresume');
+  Object.assign(f.autoResume, { delaySeconds: 900, reloadDelaySeconds: 20, message: '接着当前会话继续。' });
+  const stateFile = f.file('autoresume-state.json');
+  const state = () => JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  const saveState = (value) => fs.writeFileSync(stateFile, JSON.stringify(value));
+  const record = (agent, events) => {
+    agent.session = { log: events };
+    f.events.set(agent.id, events);
+    f.rawEvents.set(agent.id, events);
+    f.modified(agent.id, Date.now());
+  };
+  const begin = (id, secondsAgo = 1) => {
+    const agent = f.add(`session-${id}`);
+    record(agent, [timedTurn(start(), Date.now() - secondsAgo * 1000)]);
+    agent.status = 'running';
+    return agent;
+  };
+  const finish = (agent, ending = interrupted(), time = Date.now()) => {
+    record(agent, [...agent.session.log, timedTurn(ending, time)]);
+    agent.status = 'idle';
+  };
+  const load = (options = {}) => {
+    const pluginFiber = { state: 0 };
+    const check = registerResumeRequests({ ...f, pluginFiber, ...options });
+    f.ready();
+    return { check, unloading() { pluginFiber.state = 5; f.bus.emit('internal/status', pluginFiber); },
+      dispose: () => f.cleanups.splice(0).forEach(cleanup => cleanup()) };
+  };
+  return { ...f, boot, state, saveState, begin, finish, record, load,
+    advance: ms => t.mock.timers.tick(ms), reasons: () => Object.fromEntries(f.saved().sessions.map(s => [s.sessionId, s.reason])) };
+}
+
+test('reload resume snapshots only running sessions before cleanup and waits before resuming goals or sending a message', async (t) => {
+  const f = reloadFixture(t);
+  const old = f.load();
+  const running = ['ready', 'disarmed', 'armed', 'paused'].map(id => f.begin(id));
+  const [ready, disarmed, armed, paused] = running;
+  f.add('session-idle', [timedTurn(start(), Date.now() - 1000), timedTurn(interrupted(), Date.now())]);
+  f.goalViews.set(disarmed, goal({ phase: 'active' }));
+  f.goalViews.set(armed, goal({ phase: 'active', activation: 'armed' }));
+  f.goalViews.set(paused, goal());
+  f.bus.emit('internal/status', { state: 5 });
+  assert.equal(f.state().reload.unloadedAt, undefined, 'unrelated plugin disposal does not take a snapshot');
+  old.unloading();
+  assert.equal(f.state().reload.hostProcess, hostProcess);
+  assert.equal(f.state().reload.unloadedAt, Date.now());
+  assert.deepEqual(Object.keys(f.state().reload.pending), running.map(a => a.id));
+  for (const agent of running) f.finish(agent);
+  old.dispose();
+  const active = f.load();
+  f.advance(19_999);
+  await active.check();
+  assert.deepEqual(f.messages, []);
+  assert.deepEqual(f.resumes, []);
+  f.advance(1);
+  await active.check();
+  assert.deepEqual(f.messages.map(({ id, message }) => [id, message.content[0].text]), [[ready.id, f.autoResume.message]]);
+  assert.deepEqual(f.resumes, [{ agent: disarmed, value: { id: 'goal-1', revision: 7 } }]);
+  assert.deepEqual(f.reasons(), { 'session-ready': 'message_submitted', 'session-disarmed': 'goal_resumed',
+    'session-armed': 'native_goal_driver', 'session-paused': 'goal_paused' });
+  assert.deepEqual([f.saved().trigger, f.saved().delaySeconds], ['reload', 20]);
+  assert.equal(f.calls.some(([kind]) => kind === 'list'), false, 'a snapshot avoids scanning other sessions');
+  active.dispose();
+});
+
+test('reload resume rechecks progress, user stops, handover, archive and the interruption window', async (t) => {
+  const f = reloadFixture(t);
+  const old = f.load();
+  const next = f.begin('next'), stopped = f.begin('stopped'), retired = f.begin('retired'), archived = f.begin('archived');
+  const running = f.begin('running'), past = f.begin('past', 90), completed = f.begin('completed');
+  old.dispose();
+  f.finish(stopped, aborted('user'));
+  f.finish(past, interrupted(), Date.now() - 60_001);
+  f.finish(completed, end());
+  for (const agent of [next, retired, archived]) f.finish(agent);
+  let shouldSkip = false;
+  const active = f.load({ retired: id => shouldSkip && id === retired.id, archived: id => shouldSkip && id === archived.id });
+  f.advance(1_000);
+  f.record(next, [...next.session.log, timedTurn(start(), Date.now(), 2), timedTurn(interrupted(), Date.now(), 2)]);
+  shouldSkip = true;
+  f.advance(19_000);
+  await active.check();
+  assert.deepEqual(f.reasons(), { 'session-next': 'resumed_after_reload', 'session-stopped': 'user_stopped',
+    'session-retired': 'handed_over', 'session-archived': 'archived', [running.id]: 'running',
+    'session-past': 'interruption_outside_reload_window', 'session-completed': 'not_interrupted' });
+  assert.deepEqual(f.messages, []);
+  active.dispose();
+});
+
+test('reload resume leaves the startup delay and shutdown list to the first load in a new host', async (t) => {
+  const f = reloadFixture(t);
+  const old = f.add('session-old', [timedTurn(start(), f.boot - 2_000), timedTurn(interrupted(), f.boot - 1_000)]);
+  f.modified(old.id, f.boot - 1_000);
+  f.saveState({ hostProcess: 'previous-host:1', resumed: [], pending: [old.id], reload: { hostProcess: 'previous-host:1',
+    unloadedAt: f.boot - 1_000, pending: { [old.id]: { at: f.boot - 1_000 } }, submitted: {} } });
+  // A saved loaded.json with the same pid but predating this process cannot trigger reload recovery.
+  const active = f.load({ previousLoad: { pid: process.pid, at: Math.floor(performance.timeOrigin) - 1000 } });
+  f.advance(20_000);
+  await active.check();
+  assert.equal(fs.existsSync(f.file('autoresume-result.json')), false);
+  assert.deepEqual(f.calls, []);
+  f.advance(160_000);
+  await active.check();
+  assert.equal(f.saved().trigger, 'fallback');
+  assert.deepEqual(f.messages.map(({ id }) => id), [old.id]);
+  f.rootFiber.state = 5;
+  f.bus.emit('internal/status', f.rootFiber);
+  active.dispose();
+  assert.equal(f.state().reload.unloadedAt, undefined, 'root teardown is not a hot reload');
+});
+
+test('reload resume carries unfinished nominations across another reload and never resubmits a completed nomination', async (t) => {
+  const f = reloadFixture(t);
+  const first = f.load();
+  const done = f.begin('done'), waiting = f.begin('waiting');
+  first.dispose();
+  for (const agent of [done, waiting]) f.finish(agent);
+  const second = f.load();
+  const resolve = f.services.sessionController.resolveAgent;
+  const entered = Promise.withResolvers(), release = Promise.withResolvers();
+  f.services.sessionController.resolveAgent = async (id) => {
+    if (id === waiting.id) { entered.resolve(); await release.promise; }
+    return resolve(id);
+  };
+  f.advance(20_000);
+  await entered.promise;
+  assert.deepEqual(f.messages.map(({ id }) => id), [done.id]);
+  const next = f.begin('new-reload');
+  second.dispose();
+  f.finish(next);
+  f.services.sessionController.resolveAgent = resolve;
+  const third = f.load();
+  f.advance(20_000);
+  await third.check();
+  release.resolve();
+  await second.check();
+  assert.deepEqual(f.messages.map(({ id }) => id), [done.id, waiting.id, next.id]);
+  assert.deepEqual(f.reasons(), { [done.id]: 'already_resumed', [waiting.id]: 'message_submitted', [next.id]: 'message_submitted' });
+  assert.deepEqual(f.state().reload.pending, {});
+  third.dispose();
+});
+
+test('reload resume does nothing when off, leaving the startup schedule alone', async (t) => {
+  for (const setting of [{ reloadDelaySeconds: 0 }, { enabled: false }]) await t.test(JSON.stringify(setting), async (t) => {
+    const f = reloadFixture(t);
+    const state = { hostProcess, resumed: [] };
+    f.saveState(state);
+    f.add('session-interrupted', [timedTurn(start(), Date.now() - 2_000), timedTurn(interrupted(), Date.now() - 1_000)]);
+    Object.assign(f.autoResume, setting);
+    const active = f.load();
+    f.advance(20_000);
+    await active.check();
+    active.dispose();
+    assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.state(), state);
+    assert.equal(fs.existsSync(f.file('autoresume-result.json')), false);
+  });
+});
+
+test('reload resume falls back to recent interrupted rounds when a same-process legacy load had no snapshot', async (t) => {
+  for (const marker of ['startup state', 'loaded.json']) await t.test(marker, async (t) => {
+    const f = reloadFixture(t), now = Date.now();
+    const candidate = f.add('session-recent', [timedTurn(start(), now - 2_000), timedTurn(interrupted(), now - 1_000)]);
+    const stale = f.add('session-stale', [timedTurn(start(), now - 601_000), timedTurn(interrupted(), now - 600_001)]);
+    const open = f.add('session-open', [timedTurn(start(), now - 2_000)]);
+    for (const agent of [candidate, stale, open]) f.modified(agent.id, now);
+    if (marker === 'startup state') f.saveState({ hostProcess, resumed: [] });
+    else f.autoResume.delaySeconds = 0;
+    const active = f.load(marker === 'loaded.json' ? { previousLoad: { pid: process.pid, at: now - 3_000 } } : undefined);
+    await active.check();
+    assert.deepEqual(f.messages, [], 'startup must leave post-start turns to the reload delay');
+    f.advance(20_000);
+    await active.check();
+    assert.deepEqual(f.messages.map(({ id }) => id), [candidate.id]);
+    assert.deepEqual(f.reasons(), { [candidate.id]: 'message_submitted', [stale.id]: 'interruption_outside_reload_window',
+      [open.id]: 'not_interrupted' });
+    active.dispose();
+    // Simulate an unload that could not take a snapshot. The previous reply still has no turn/start.
+    const updated = f.state();
+    delete updated.reload.unloadedAt;
+    f.saveState(updated);
+    const next = f.load();
+    f.advance(20_000);
+    await next.check();
+    assert.deepEqual(f.messages.map(({ id }) => id), [candidate.id]);
+    assert.equal(f.reasons()[candidate.id], 'already_resumed');
+    next.dispose();
+  });
 });

@@ -122,7 +122,8 @@ test('apply auto resume: injected services wait for appReady and receive merged 
         } }, { autoResume: setting });
       } finally { process.env.LOCALAPPDATA = previous; }
       const loaded = JSON.parse(readFileSync(path.join(directory, 'loaded.json'), 'utf8'));
-      assert.deepEqual(loaded.autoResume, { enabled: true, maxAgeHours: setting?.maxAgeHours ?? 12, excludeCount: setting ? 1 : 0, delaySeconds: 0 });
+      assert.deepEqual(loaded.autoResume, { enabled: true, maxAgeHours: setting?.maxAgeHours ?? 12, excludeCount: setting ? 1 : 0,
+        delaySeconds: 0, reloadDelaySeconds: 20 });
       const submitted = Promise.withResolvers();
       const agent = { id: 'session-load', status: 'idle', followup: submitted.resolve };
       const now = Date.now();
@@ -173,7 +174,8 @@ test('apply auto resume: injected services wait for appReady and receive merged 
         get: name => services[name], effect: factory => cleanups.push(factory()) });
       await tick();
       assert.equal(scans, 0);
-      assert.equal(readdirSync(directory).includes('autoresume-state.json'), false);
+      assert.equal(Object.hasOwn(JSON.parse(readFileSync(path.join(directory, 'autoresume-state.json'), 'utf8')), 'hostProcess'), false,
+        'the reload marker does not claim the startup scan');
       onReady();
       const message = await submitted.promise;
       assert.equal(message.role, 'user');
@@ -4250,8 +4252,9 @@ test('settings warns and defaults each invalid entry without losing valid config
 });
 
 test('auto resume settings: defaults and partial overrides retain exact message and sanitize loaded metadata', async () => {
-  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0 };
-  for (const overrides of [undefined, {}, { enabled: false }, { maxAgeHours: 0.5 }, { delaySeconds: 180 },
+  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0, reloadDelaySeconds: 20 };
+  for (const overrides of [undefined, {}, { enabled: false }, { maxAgeHours: 0.5 }, { delaySeconds: 180, reloadDelaySeconds: 0 },
+    { reloadDelaySeconds: 35 },
     { message: '😀'.repeat(2000), exclude: ['session-private', 'session_2'] }]) {
     const tools = {}, warnings = [];
     let actual;
@@ -4266,20 +4269,21 @@ test('auto resume settings: defaults and partial overrides retain exact message 
     assert.deepEqual(warnings, []);
     const loaded = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
     assert.deepEqual(loaded.autoResume, { enabled: expected.enabled, maxAgeHours: expected.maxAgeHours, excludeCount: expected.exclude.length,
-      delaySeconds: expected.delaySeconds });
+      delaySeconds: expected.delaySeconds, reloadDelaySeconds: expected.reloadDelaySeconds });
     assert.equal(JSON.stringify(loaded).includes('session-private'), false);
     assert.equal(Object.hasOwn(loaded.autoResume, 'message'), false);
   }
 });
 
 test('auto resume settings: invalid outer and nested fields warn and default independently', async () => {
-  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0 };
+  const defaults = { enabled: true, maxAgeHours: 12, message: 'Harness 已重启，接着上次中断的地方继续。', exclude: [], delaySeconds: 0, reloadDelaySeconds: 20 };
   const cases = [
     ...[null, false, 'enabled', []].map(value => ({ value, key: 'autoResume', expected: defaults })),
     ...[0, -1, NaN, Infinity, '12'].map(value => ({ value: { enabled: false, maxAgeHours: value },
       key: 'autoResume.maxAgeHours', expected: { ...defaults, enabled: false } })),
     { value: { enabled: 'false', maxAgeHours: 2 }, key: 'autoResume.enabled', expected: { ...defaults, maxAgeHours: 2 } },
     ...[-1, NaN, '180'].map(value => ({ value: { enabled: false, delaySeconds: value }, key: 'autoResume.delaySeconds', expected: { ...defaults, enabled: false } })),
+    ...[-1, Infinity, '20', 3_000_000].map(value => ({ value: { reloadDelaySeconds: value }, key: 'autoResume.reloadDelaySeconds', expected: defaults })),
     ...[null, 1, '😀'.repeat(2001)].map(message => ({ value: { message, enabled: false },
       key: 'autoResume.message', expected: { ...defaults, enabled: false } })),
     ...['session-one', [null], [''], ['../session-one'], ['session-one\n'], ['x'.repeat(101)]].map(exclude =>
