@@ -45,10 +45,20 @@ export function prepareReview(args, source) {
   const unknown = Object.keys(review).filter((k) => !['status', 'criteria', 'notes', 'accepted_deviations', 'blockers', 'report_rows'].includes(k));
   if (unknown.length) problems.push(`不认识的字段：${unknown.join('、')}（只接受 job_id、status、criteria、report_rows、notes、accepted_deviations、blockers）`);
   const extraRows = flaggedCriteria(source).filter((f) => f.row);
+  let inferred = 0;
   // accepted 的检查（criteria 与 report_rows 共用）；骨架留下的占位在用不上时直接去掉，用得上时给出带结构示例的提示。
   const checkAccepted = (c, n, field) => {
-    if (!('accepted' in c)) return;
     const open = review.status === 'accepted_deviations' && c.status !== 'met';
+    // 规划端选了 accepted_deviations、这一条照实保留 not_met/blocked 却没写 accepted：意图是“接受未满足”，接受原因取这一条的 evidence 并在结果里说明。
+    // 只补 accepted，从不把任何条目推定为 met；照样经过接受偏差的用户确认。
+    if (c.accepted == null && open && MARKS.includes(c.status) && nonempty(c.evidence)) {
+      c.accepted = `${INFERRED}${c.evidence.trim()}`;
+      fixed.push(`${field} 第 ${n + 1} 项（${c.row ? `报告第 ${c.row} 行` : `index ${c.index}`}=${c.status}）没写 accepted：按 accepted_deviations 视为接受未满足，` +
+        '接受原因取这一条的 evidence；不是本意就改记 needs_changes，或核实后记 met');
+      inferred++;
+      return;
+    }
+    if (c.accepted === undefined) { delete c.accepted; return; }
     if (placeholder(c.accepted) && !open) { delete c.accepted; fixed.push(`${field} 第 ${n + 1} 项去掉未填的 accepted 占位`); return; }
     if (placeholder(c.accepted)) problems.push(`${field} 第 ${n + 1} 项的 accepted 还是 ${TODO}：写明为什么接受这一条未满足，形如 ${acceptedExample(c)}；不接受就核实后改记 met，或改记 needs_changes`);
     else if (!nonempty(c.accepted) || !open) problems.push(`${field} 第 ${n + 1} 项的 accepted 只用于 accepted_deviations 里未满足（not_met/blocked）的条目，写明为什么接受未满足；记 met 或 needs_changes 时删去 accepted`);
@@ -190,7 +200,7 @@ export function prepareReview(args, source) {
     problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met' +
       (extraRows.length ? `（对不上验收清单的报告第 ${extraRows.map((f) => f.row).join('、')} 行在 report_rows 标）` : '') + ' 或加 blocker');
   }
-  return { review, fixed, problems, unsupported: level === 'independent' ? missing.length : 0 };
+  return { review, fixed, problems, unsupported: level === 'independent' ? missing.length : 0, inferred };
 }
 
 // 报告自标 blocked / not_met、结案结论却记成 met 的条目。independent：需要独立依据（source.support[index]：
@@ -209,7 +219,7 @@ function flaggedMet(review, source, level) {
     }
     if (source?.support?.[key]?.length) return [];
     return [`Codex ${where}为 ${status}，${review.status} 记成 met 但没有独立依据（规划端自己写的证据不算）。三选一：` +
-      `① codex_verify ${job}（核验会单列这一条；下一单与本任务写入范围不重叠时，也可在下一单带 verify_previous: "${job}"，与下一单并行），核验判 met 后再记；` +
+      `① ${deferralPath([job])}（核验会单列这一条），核验判 met 后再记；` +
       `② codex_continue ${job} 返工这一条；` +
       `③ 这一条保留 ${status}：记 accepted_deviations 并写 accepted 说明为什么接受未满足，或记 needs_changes`];
   });
@@ -234,6 +244,8 @@ function unaddressed(review, source, acceptance) {
 
 // 被拒后直接给出可提交的骨架：沿用本次已填好的条目，只把还缺的位置留成占位，规划端改完占位即可一次提交。
 export const TODO = '<待填>';
+// 由 evidence 推定的 accepted 带这个前缀，记录里能和规划端亲手写的区分开。
+export const INFERRED = '（按 evidence 推定）';
 export function reviewSkeleton(jobId, source, review = {}) {
   const { acceptance, deviations } = reviewTargets(source);
   const report = source?.structured;
@@ -306,10 +318,22 @@ export function pendingCloseout(jobs, since) {
   return { unreviewed, needsChanges };
 }
 
+// 核验中放行：唯一的待验收任务正由它的第一次核验处理（核验在跑，或本次调用用 verify_previous 派核验），且没有别的待收尾任务时，
+// 允许派不重叠的新任务。每个任务只放行一次：已有结束的核验就不再放行，核验结束后照常要先验收，所以不能靠连环核验一直拖着不验收。
+export function closeoutDeferral(jobs, { unreviewed, needsChanges }, deferFor) {
+  if (unreviewed.length !== 1 || needsChanges.length) return null;
+  const [id] = unreviewed;
+  const checks = jobs.filter((job) => job?.context?.verification_of === id);
+  if (checks.some((job) => job.execution_status !== 'running')) return null;
+  return checks.length ? { job_id: id, via: 'running' } : deferFor === id ? { job_id: id, via: 'verify_previous' } : null;
+}
+export const deferralPath = (ids) => `先对 ${ids.join('、')} 派 codex_verify（或在下一单上带 verify_previous），核验在跑时可以派不重叠的下一单`;
+
 export function closeoutRefusal(tool, { unreviewed, needsChanges }) {
   if (!unreviewed.length && !needsChanges.length) return '';
   return `${tool}: 本会话还有已结束但未收尾的 Codex 任务，${tool === 'update_goal' ? '会话目标暂不能标记完成' : '未启动新任务'}。` +
     (unreviewed.length ? `报告标出问题却没有验收记录，先用 codex_review 记录：${unreviewed.join('、')}。` : '') +
+    (unreviewed.length && tool === 'codex_run' ? `需要核验再记的：${deferralPath(unreviewed)}（同一时间只放行一个待验收任务，每个任务只放行一次）。` : '') +
     (needsChanges.length ? `已记 needs_changes 但没有后续轮次：${needsChanges.join('、')}；用 codex_continue 或带 resume 的 codex_run 返工，` +
       '或核实后用 codex_review 记 accepted_deviations（写明理由）或 verified。' : '') +
     'codex_continue、codex_verify、codex_review、codex_status、codex_output、codex_cancel 仍可使用。';

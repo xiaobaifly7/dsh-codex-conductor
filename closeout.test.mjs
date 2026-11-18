@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { prepareReview, reviewRejection, reviewSkeleton, TODO, pendingCloseout, closeoutRefusal, closeoutSince } from './closeout.mjs';
+import { prepareReview, reviewRejection, reviewSkeleton, TODO, INFERRED, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince } from './closeout.mjs';
 
 const acceptance = ['第一条', '第二条'];
 const report = (extra = {}) => ({ summary: 's', criteria: acceptance.map((criterion) => ({ criterion, status: 'met', evidence: 'e' })),
@@ -130,8 +130,8 @@ test('closing verdicts need independent support for criteria the report marked b
   for (const status of ['verified', 'accepted_deviations']) {
     const bare = prepareReview({ status, criteria: [met(1), met2] }, src('independent'));
     assert.equal(bare.unsupported, 1, status);
-    assert.ok(bare.problems.some((p) => p.includes('第 2 条为 blocked') && p.includes('没有独立依据') && p.includes('codex_verify J1') &&
-      p.includes('verify_previous: "J1"') && p.includes('codex_continue J1') && p.includes('accepted')), status);
+    assert.ok(bare.problems.some((p) => p.includes('第 2 条为 blocked') && p.includes('没有独立依据') &&
+      p.includes('先对 J1 派 codex_verify（或在下一单上带 verify_previous），核验在跑时可以派不重叠的下一单') && p.includes('codex_continue J1') && p.includes('accepted')), status);
     for (const kind of ['verification', 'later_round', 'user']) {
       assert.deepEqual(prepareReview({ status, criteria: [met(1), met2] }, src('independent', { 2: [kind] })).problems, [], `${status} ${kind}`);
     }
@@ -148,7 +148,12 @@ test('accepted_deviations can record an open criterion as accepted although not 
   const ok = prepareReview({ status: 'accepted_deviations', criteria: [met(1), open] }, src);
   assert.deepEqual([ok.problems, ok.unsupported], [[], 0]);
   assert.equal(ok.review.criteria[1].accepted, '用户已同意本期不做');
-  assert.ok(prepareReview({ status: 'accepted_deviations', criteria: [met(1), { ...open, accepted: undefined }] }, src).problems
+  // 没写 accepted：按 accepted_deviations 的意图接受，原因取 evidence，并在 fixed 里说明。
+  const inferred = prepareReview({ status: 'accepted_deviations', criteria: [met(1), { ...open, accepted: undefined }] }, src);
+  assert.deepEqual([inferred.problems, inferred.inferred, inferred.review.criteria[1].accepted], [[], 1, `${INFERRED}仍无权限`]);
+  assert.ok(inferred.fixed.some((f) => f.includes('index 2=blocked') && f.includes('视为接受未满足')));
+  // 从不推定 met：verified 里的未满足照样被拒。
+  assert.ok(prepareReview({ status: 'verified', criteria: [met(1), { ...open, accepted: undefined }] }, src).problems
     .some((p) => p.includes('2=blocked') && p.includes('加 accepted 字段')));
   assert.ok(prepareReview({ status: 'verified', criteria: [met(1), open] }, src).problems.some((p) => p.includes('accepted 只用于')));
   assert.ok(prepareReview({ status: 'accepted_deviations', criteria: [{ ...met(1), accepted: 'x' }, open] }, src).problems.some((p) => p.includes('accepted 只用于')));
@@ -176,12 +181,13 @@ test('flagged report rows that match no acceptance criterion must be addressed i
   const rowsMet = [{ row: 8, status: 'met', evidence: '我看过' }, { row: 13, status: 'met', evidence: '我看过' }];
   const bare = prepareReview({ status: 'verified', criteria: allMet(5), report_rows: rowsMet }, src);
   assert.equal(bare.unsupported, 2);
-  assert.ok(bare.problems.some((p) => p.includes('报告第 8 行（对不上验收清单）为 not_met') && p.includes('codex_verify V')));
+  assert.ok(bare.problems.some((p) => p.includes('报告第 8 行（对不上验收清单）为 not_met') && p.includes('先对 V 派 codex_verify')));
   assert.deepEqual(prepareReview({ status: 'verified', criteria: allMet(5), report_rows: rowsMet }, { ...src, support: { row8: ['verification'], row13: ['user'] } }).problems, []);
   // 照实保留：accepted_deviations 加 accepted；verified 不行。
   const open = [{ row: 8, status: 'not_met', evidence: '确实不对' }, { row: 13, status: 'not_met', evidence: '确实不对' }];
-  assert.ok(prepareReview({ status: 'accepted_deviations', criteria: allMet(5), report_rows: open }, src).problems
+  assert.ok(prepareReview({ status: 'verified', criteria: allMet(5), report_rows: open }, src).problems
     .some((p) => p.includes('报告第 8 行=not_met') && p.includes('{"row":8,"status":"not_met","evidence":"<核验依据>","accepted":"<为什么接受未满足>"}')));
+  assert.equal(prepareReview({ status: 'accepted_deviations', criteria: allMet(5), report_rows: open }, src).inferred, 2);
   assert.deepEqual(prepareReview({ status: 'accepted_deviations', criteria: allMet(5), report_rows: open.map((r) => ({ ...r, accepted: '不影响本单结论' })) }, src).problems, []);
   assert.ok(prepareReview({ status: 'verified', criteria: allMet(5), report_rows: open }, src).problems.some((p) => p.startsWith('verified 要求每条验收都 met')));
   // needs_changes：验收全 met 时，把报告行记 not_met 即可（不再被“全 met 不能 needs_changes”挡住）。
@@ -206,31 +212,59 @@ test('flagged report rows that match no acceptance criterion must be addressed i
   assert.equal(reviewSkeleton('V', aligned, { status: 'verified', criteria: allMet(2) }).report_rows, undefined);
 });
 
-test('the skeleton keeps accepted for open criteria under accepted_deviations: replaying the 4c0261 loop', () => {
-  // 4c0261：验收 12 条，报告第 3、8 行 blocked；规划端连续 4 次提交 accepted_deviations，第 3 条保留 blocked 却没有 accepted。
+test('replaying the 4c0261 loop: an open criterion kept under accepted_deviations is accepted on the first try; the skeleton keeps accepted', () => {
+  // 4c0261：验收 12 条，报告第 3、8 行 blocked；规划端连续 4 次提交 accepted_deviations，第 3 条保留 blocked 却没有 accepted，每次都被拒。
   const statuses = Array.from({ length: 12 }, (_v, i) => ([2, 7].includes(i) ? 'blocked' : 'met'));
   const src = { ...rowsSource(12, statuses), support: { 8: ['later_round'] } };
   const attempt = { job_id: 'V', status: 'accepted_deviations', criteria: allMet(12).map((c) => (c.index === 3 ? { index: 3, status: 'blocked', evidence: '仍无法核实' } : c)) };
-  for (let round = 1; round <= 4; round++) {
-    const result = prepareReview(attempt, src);
-    assert.equal(result.problems.length, 1, `round ${round}`);
-    // 提示点名 accepted 字段并给出一行结构示例。
-    assert.match(result.problems[0], /3=blocked 未满足.*加 accepted 字段.*\{"index":3,"status":"blocked","evidence":"<核验依据>","accepted":"<为什么接受未满足>"\}/);
-    const skeleton = JSON.parse(reviewRejection('V', src, result).split('\n').find((line) => line.startsWith('{"job_id"')));
-    assert.deepEqual(skeleton.criteria[2], { index: 3, status: 'blocked', evidence: '仍无法核实', accepted: TODO });
-    assert.equal(skeleton.criteria.filter((c) => 'accepted' in c).length, 1);
-    // 原样提交骨架：只得到一条点名 accepted 占位的提示，不再是同一条拒绝。
-    assert.deepEqual(prepareReview(skeleton, src).problems, [`criteria 第 3 项的 accepted 还是 ${TODO}：写明为什么接受这一条未满足，形如 ` +
-      '{"index":3,"status":"blocked","evidence":"<核验依据>","accepted":"<为什么接受未满足>"}；不接受就核实后改记 met，或改记 needs_changes']);
-  }
-  // 填上原因即通过；规划端已写的 accepted 在骨架里保留。
+  const first = prepareReview(attempt, src);
+  assert.deepEqual([first.problems, first.inferred, first.review.criteria[2].accepted], [[], 1, `${INFERRED}仍无法核实`]);
+  assert.ok(first.fixed.some((f) => f.includes('criteria 第 3 项（index 3=blocked）没写 accepted')));
+  // 有别的问题时骨架给这一条带上 accepted 占位；原样提交占位只得到一条点名 accepted 的提示（带一行结构示例）。
+  const other = prepareReview({ ...attempt, criteria: attempt.criteria.map((c) => (c.index === 5 ? { ...c, evidence: '' } : c)) }, src);
+  const skeleton = JSON.parse(reviewRejection('V', src, other).split('\n').find((line) => line.startsWith('{"job_id"')));
+  assert.equal(skeleton.criteria.filter((c) => 'accepted' in c).length, 1);
+  assert.deepEqual(skeleton.criteria[2], { index: 3, status: 'blocked', evidence: '仍无法核实', accepted: `${INFERRED}仍无法核实` });
+  const leftTodo = { ...skeleton, criteria: skeleton.criteria.map((c) => (c.index === 3 ? { ...c, accepted: TODO } : c.index === 5 ? { ...c, evidence: '核对 5' } : c)) };
+  assert.deepEqual(prepareReview(leftTodo, src).problems, [`criteria 第 3 项的 accepted 还是 ${TODO}：写明为什么接受这一条未满足，形如 ` +
+    '{"index":3,"status":"blocked","evidence":"<核验依据>","accepted":"<为什么接受未满足>"}；不接受就核实后改记 met，或改记 needs_changes']);
+  // 骨架里没有可沿用的原因时留占位。
+  assert.equal(reviewSkeleton('V', src, { ...attempt, criteria: attempt.criteria.map((c) => (c.index === 3 ? { ...c, evidence: '' } : c)) }).criteria[2].accepted, TODO);
+  // 规划端亲手写的 accepted 原样保留。
   const filled = { ...attempt, criteria: attempt.criteria.map((c) => (c.index === 3 ? { ...c, accepted: '环境限制，用户同意后补' } : c)) };
-  assert.deepEqual(prepareReview(filled, src).problems, []);
+  const ok = prepareReview(filled, src);
+  assert.deepEqual([ok.problems, ok.inferred, ok.review.criteria[2].accepted], [[], 0, '环境限制，用户同意后补']);
   assert.equal(reviewSkeleton('V', src, filled).criteria[2].accepted, '环境限制，用户同意后补');
-  // 改主意记 needs_changes 时，未填的占位自动去掉，不额外报错。
+  // 改记 needs_changes 时，未填的占位自动去掉，不额外报错。
   const switched = prepareReview({ ...attempt, status: 'needs_changes', criteria: attempt.criteria.map((c) => (c.index === 3 ? { ...c, accepted: TODO } : c)) }, src);
   assert.deepEqual(switched.problems, []);
   assert.ok(!('accepted' in switched.review.criteria[2]) && switched.fixed.some((f) => f.includes('去掉未填的 accepted 占位')));
   // verified 的骨架不带 accepted。
   assert.ok(reviewSkeleton('V', src, { status: 'verified', criteria: attempt.criteria }).criteria.every((c) => !('accepted' in c)));
+});
+
+test('verification deferral: only the single unreviewed job, only while its first verification runs, never alongside other pending work', () => {
+  const done = (job_id, extra = {}) => ({ job_id, execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: 200, started_at: 100, ...extra });
+  const check = (job_id, execution_status, of = 'A') => ({ job_id, execution_status, finished_at: execution_status === 'running' ? null : 300, started_at: 250,
+    context: { verification_of: of } });
+  const defer = (jobs, deferFor) => closeoutDeferral(jobs, pendingCloseout(jobs, 100), deferFor);
+  assert.deepEqual(defer([done('A'), check('V1', 'running')]), { job_id: 'A', via: 'running' });
+  assert.deepEqual(defer([done('A')], 'A'), { job_id: 'A', via: 'verify_previous' });
+  assert.equal(defer([done('A')]), null);
+  assert.equal(defer([done('A')], 'OTHER'), null);
+  // 每个任务只放行一次：已有结束（完成、失败、取消）的核验就不再放行，哪怕又派了一次核验。
+  for (const status of ['completed', 'failed', 'cancelled']) {
+    assert.equal(defer([done('A'), check('V1', status)]), null, status);
+    assert.equal(defer([done('A'), check('V1', status), check('V2', 'running')], 'A'), null, status);
+  }
+  // 同一时间只放行一个待验收任务；有 needs_changes 没跟进时也不放行。
+  assert.equal(defer([done('A'), check('V1', 'running'), done('B'), check('V2', 'running', 'B')]), null);
+  assert.equal(defer([done('A'), check('V1', 'running'), done('NC', { verification_status: 'needs_changes' })]), null);
+  // 核验判 needs_changes、规划端记下后：A 成了没跟进的 needs_changes，照常拦。
+  assert.equal(defer([done('A', { verification_status: 'needs_changes' }), check('V1', 'completed')]), null);
+  // 护栏拒绝文字给出这条路；update_goal 不给（核验中的任务仍未收尾）。
+  assert.match(closeoutRefusal('codex_run', { unreviewed: ['A'], needsChanges: [] }),
+    /先对 A 派 codex_verify（或在下一单上带 verify_previous），核验在跑时可以派不重叠的下一单（同一时间只放行一个待验收任务，每个任务只放行一次）/);
+  assert.ok(!closeoutRefusal('update_goal', { unreviewed: ['A'], needsChanges: [] }).includes('verify_previous'));
 });

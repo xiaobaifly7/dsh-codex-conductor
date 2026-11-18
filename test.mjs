@@ -5397,6 +5397,83 @@ test('close-out guard leaves codex_continue and codex_run with resume allowed wh
   }
 });
 
+test('codex_run may dispatch non-overlapping new work while the only unreviewed job is being verified, and the deferral is bounded', async () => {
+  const now = Date.now() / 1000;
+  const done = (job_id, extra = {}) => ({ job_id, execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: now + 60, started_at: now, ...extra });
+  const check = (job_id, execution_status) => ({ job_id, execution_status, report_status: execution_status === 'running' ? 'pending' : 'valid',
+    review_status: 'needs_verification', verification_status: 'unreviewed', started_at: now + 70, finished_at: execution_status === 'running' ? null : now + 200,
+    context: { verification_of: 'A' } });
+  const source = { job_id: 'A', status: 'completed', execution_status: 'completed', cwd: '/work/original', log_dir: '/logs/A', sandbox: 'workspace-write',
+    scope: ['docs'], scope_paths: ['/work/original/docs'], files_changed: [], finished_at: now + 60,
+    context: { owner: 'S1', task: '整理文档', acceptance: ['索引已更新'], write: true } };
+  const statsFile = path.join(localAppData, 'dsh-codex-conductor', 'closeout-stats.json');
+  const deferredCount = () => { try { return JSON.parse(readFileSync(statsFile, 'utf8')).total.deferred_dispatch ?? 0; } catch { return 0; } };
+  const harnessFor = (jobs, { running = 0, ...config } = {}) => {
+    const h = harness({ config: { closeoutGuard: true, startResult: { job_id: 'NEXT', status: 'completed' },
+      listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : argv.includes('--status') ? { jobs: [], total: running } : { jobs: [], total: 0 },
+      ...config } });
+    h.finals.A = source;
+    return h;
+  };
+  const run = (h, args = {}) => h.tools.codex_run.execute({ ...RUN, write: true, scope: ['src'], ...args }, { agent: agentAt('/work/original') });
+  const before = deferredCount();
+  // 核验在跑，新单写 src、A 的产物在 docs：放行，结果说明，并计数。
+  const h = harnessFor([done('A'), check('V1', 'running')]);
+  const value = await run(h);
+  assert.equal(value.job_id, 'NEXT');
+  assert.deepEqual(value.closeout_deferred, { job_id: 'A', via: 'running' });
+  assert.match(value.next, /任务 A 还没有验收，因为它的核验正在跑，这一单先放行；核验结束后要先对 A 记 codex_review/);
+  // 核验中的任务仍未收尾：会话目标不能标记完成。
+  const goal = await h.handlers['tools/execute']({ name: 'update_goal', arguments: { action: 'complete' }, agent: agentAt('/work/original') }, async () => ({ value: 'done' }));
+  assert.match(goal.error.message, /会话目标暂不能标记完成.*A/);
+  // 写入范围与 A 重叠：用 verify_previous 已有的重叠检查拒绝。
+  await assert.rejects(run(harnessFor([done('A'), check('V1', 'running')]), { scope: ['docs/new.md'] }), /与任务 A 的产物或 scope 重叠，不能边改边核验.*核验还在跑/);
+  // 只读的新单不查重叠。
+  assert.equal((await run(harnessFor([done('A'), check('V1', 'running')]), { write: false, scope: [] })).job_id, 'NEXT');
+  // 核验结束（判 met、失败或 blocked 都一样）：A 的验收到期，照常拒绝，拒绝文字给出这条路。
+  for (const status of ['completed', 'failed']) {
+    await assert.rejects(run(harnessFor([done('A'), check('V1', status)])),
+      /未收尾.*A.*先对 A 派 codex_verify（或在下一单上带 verify_previous），核验在跑时可以派不重叠的下一单/, status);
+  }
+  // 再核验一次也不再放行（每个任务一次）；另有待验收任务时不放行。
+  await assert.rejects(run(harnessFor([done('A'), check('V1', 'completed'), { ...check('V2', 'running') }])), /未收尾/);
+  await assert.rejects(run(harnessFor([done('A'), check('V1', 'running'), done('B')])), /未收尾.*A、B/);
+  // 核验判 needs_changes 后记下：A 要先返工（codex_continue 不受护栏限制），新单被拒。
+  await assert.rejects(run(harnessFor([done('A', { verification_status: 'needs_changes' }), check('V1', 'completed')])), /needs_changes 但没有后续轮次：A/);
+  // 本单带 verify_previous: A：放行，同时派出核验。
+  const vp = harnessFor([done('A')]);
+  const viaParam = await run(vp, { verify_previous: 'A' });
+  assert.deepEqual(viaParam.closeout_deferred, { job_id: 'A', via: 'verify_previous' });
+  assert.equal(vp.calls.filter((argv) => argv[0] === 'start').length, 2);
+  assert.match(viaParam.next, /核验随本单派出，这一单先放行/);
+  // maxRunningJobs：靠 verify_previous 放行时新单和核验要两个名额，只剩一个时不派。
+  await assert.rejects(run(harnessFor([done('A')], { maxRunningJobs: 2, running: 1 }), { verify_previous: 'A' }), /新单和核验放不下两单，未启动 Codex/);
+  assert.equal((await run(harnessFor([done('A')], { maxRunningJobs: 3, running: 1 }), { verify_previous: 'A' })).job_id, 'NEXT');
+  // 不靠放行的普通派单不受这条影响。
+  assert.equal((await run(harnessFor([], { maxRunningJobs: 2, running: 1 }))).job_id, 'NEXT');
+  assert.equal(deferredCount() - before, 4);
+});
+
+test('codex_review accepts an open criterion kept under accepted_deviations without accepted, says so, and still needs the user confirmation', async () => {
+  const now = Date.now() / 1000;
+  const parent = { ...workflowSource('implementation'), finished_at: now + 100, started_at: now + 50 };
+  parent.structured.blockers = [];
+  const args = { job_id: 'PARENT', status: 'accepted_deviations', criteria: [{ index: 1, status: 'blocked', evidence: '仍缺权限，本期不做' }] };
+  const run = (plannerAnswers) => {
+    const h = harness({ config: { plannerAnswers, listResult: { jobs: [], total: 0 }, reviewResult: { ...parent, verification_status: 'accepted_deviations' } } });
+    h.finals.PARENT = parent;
+    return { h, call: h.tools.codex_review.execute(args, { agent: agentAt('/work/current') }) };
+  };
+  const { h, call } = run(true);
+  const value = await call;
+  assert.equal(value.verification_status, 'accepted_deviations');
+  assert.ok(value.review_fixes.some((f) => f.includes('index 1=blocked') && f.includes('视为接受未满足')));
+  assert.match(value.next, /^插件已按你的意图修正后写入：/);
+  assert.equal(JSON.parse(h.requests.find(({ argv }) => argv[0] === 'review').stdin).criteria[0].accepted, '（按 evidence 推定）仍缺权限，本期不做');
+  await assert.rejects(run(false).call, /尚未收到作业结束后的用户确认/);
+});
+
 test('close-out guard pages within the runner limit, sees jobs that settle between dispatches and runs alongside other preflights', async () => {
   const now = Date.now() / 1000;
   const job = (job_id, extra = {}) => ({ job_id, execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
@@ -5467,6 +5544,12 @@ test('a handed-over session owns exactly its predecessors\' jobs, carries the cl
   await assert.rejects(guarded.tools.codex_run.execute(RUN, { agent: as('S2') }), /未收尾.*OLD/);
   const guardCall = guarded.calls.find((argv) => argv.includes('--started-between'));
   assert.deepEqual(guardCall.slice(guardCall.indexOf('--also-owner'), guardCall.indexOf('--also-owner') + 2), ['--also-owner', 'S1']);
+  // 交接时前任的任务正在核验（核验也是前任派的）：后继照样按“核验中”放行不重叠的新任务。
+  const check = { job_id: 'V', execution_status: 'running', started_at: Date.now() / 1000 + 70, context: { owner: 'S1', verification_of: 'OLD' } };
+  const deferred = harness({ config: { closeoutGuard: true, startResult: { job_id: 'NEXT', status: 'completed' }, listResult: (argv) => argv.includes('--started-between')
+    ? { jobs: argv.includes('--also-owner') ? [pending, check] : [], total: 2 } : { jobs: [], total: 0 } } });
+  deferred.finals.OLD = { ...pending, status: 'completed', cwd: '/work/original', scope: ['docs'], files_changed: [], context: { owner: 'S1', task: '整理文档', acceptance: ['索引已更新'], write: true } };
+  assert.deepEqual((await deferred.tools.codex_run.execute({ ...RUN, write: true, scope: ['src'] }, { agent: as('S2') })).closeout_deferred, { job_id: 'OLD', via: 'running' });
 });
 
 test('read-only codex_status and codex_output resolve a thread id to the latest owned job on it; mutating tools do not', async () => {
@@ -5797,7 +5880,7 @@ test('codex_review finds independent support in a later verification, a later ro
   };
   const before = stats();
   // 没有任何独立依据：拒绝，计入 rejected_unsupported。
-  await assert.rejects(run(), /第 1 条为 blocked.*没有独立依据[\s\S]*codex_verify PARENT[\s\S]*verify_previous/);
+  await assert.rejects(run(), /第 1 条为 blocked.*没有独立依据[\s\S]*先对 PARENT 派 codex_verify（或在下一单上带 verify_previous），核验在跑时可以派不重叠的下一单/);
   // 晚于这一轮结束的核验判这一条 met：通过，计入 all_met。
   const listed = { job_id: 'V1', execution_status: 'completed', finished_at: now + 200, started_at: now + 150, context: { owner: 'S1', verification_of: 'PARENT' } };
   assert.equal((await run({ jobs: [listed], finals: { V1: verifyJob('met') } })).verification_status, 'verified');

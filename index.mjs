@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM, VERIFY_ROW, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM, VERIFY_ROW, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -1412,7 +1412,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // verify_previous：派这一单的同时核验一个已结束的任务。核验只读、不加锁；新单只读，或写入范围与被核验任务的产物和 scope
   // 互不包含时才允许，否则核验可能读到新单改到一半的文件。路径按 normPath 比较（/mnt 下不分大小写），任一方向包含即算重叠。
-  async function verifyPreviousCheck(jobId, args, exec, tool) {
+  async function verifyPreviousCheck(jobId, args, exec, tool, running = false) {
     if (jobId === undefined) return null;
     if (typeof jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(jobId)) throw new Error(`${tool}: verify_previous 必须是 runner job_id`);
     const source = withReport(await conductor.waitJob(jobId, 0, exec?.signal));
@@ -1429,7 +1429,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const overlap = mine.filter((a) => theirs.some((b) => under(a, b) || under(b, a)));
     if (overlap.length) {
       throw new Error(`${tool}: 这一单的写入范围（${overlap.slice(0, 3).join('、')}）与任务 ${jobId} 的产物或 scope 重叠，不能边改边核验，未派出这一单。` +
-        `请先 codex_verify ${jobId} 并等它结束、记完 codex_review，再派这一单；或去掉 verify_previous。`);
+        (running ? `任务 ${jobId} 的核验还在跑，等它结束、记完 codex_review 再派这一单；或把这一单的写入范围改到不重叠的路径。`
+          : `请先 codex_verify ${jobId} 并等它结束、记完 codex_review，再派这一单；或去掉 verify_previous。`));
     }
     return { source, overlap };
   }
@@ -1474,10 +1475,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return jobs;
   }
 
-  async function closeoutCheck(owner, tool, signal) {
+  // plan（只有 codex_run 传）：{ args, exec, guard }。唯一的待验收任务正在核验时放行不重叠的新任务，guard.deferred 记下放行依据。
+  async function closeoutCheck(owner, tool, signal, plan) {
     if (cfg.closeoutGuard === false || !owner) return '';
     try {
-      const pending = pendingCloseout(await sessionJobs(owner, signal), closeoutFrom);
+      const jobs = await sessionJobs(owner, signal);
+      const pending = pendingCloseout(jobs, closeoutFrom);
+      const deferred = plan && closeoutDeferral(jobs, pending, plan.args.verify_previous);
+      if (deferred) {
+        // 核验已在跑：与 verify_previous 同一道重叠检查（verify_previous 的重叠在派单前已经查过）。
+        if (deferred.via === 'running') {
+          try { await verifyPreviousCheck(deferred.job_id, plan.args, plan.exec, tool, true); }
+          catch (error) { return String(error?.message ?? error); }
+        }
+        plan.guard.deferred = deferred;
+        return '';
+      }
       const refusal = closeoutRefusal(tool, pending);
       if (refusal) logRefusal({ session: owner, tool, unreviewed: pending.unreviewed, needs_changes: pending.needsChanges });
       return refusal;
@@ -1513,7 +1526,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return Object.keys(routing).length ? routing : undefined;
   };
 
-  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing) {
+  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing, guard = {}) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
@@ -1553,7 +1566,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 收尾护栏只拦开新工作的 codex_run；续接、返工（resume）和核验照常放行。读不到记录或判定出错时放行并记警告。
       // 与其余预检查询并行，启动前再取结果；只多等最慢的一个查询，判定仍以本次派单时的记录为准。
       const closeout = cfg.closeoutGuard !== false && owner && !continuation && !args.resume && !verificationOf
-        ? closeoutCheck(owner, tool, exec?.signal) : null;
+        ? closeoutCheck(owner, tool, exec?.signal, { args, exec, guard }) : null;
       if (args.resume && owner) {
         // 新一轮的结果不能替代同线程更早问题的用户回复。
         for (let offset = 0; offset !== null;) {
@@ -1610,8 +1623,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             '先向用户说明进度和还差什么，由用户决定是否调高上限；不要改为自己动手。');
         }
       }
+      let runningTotal;
       if (cfg.maxRunningJobs != null) {
         const running = await conductor.list({ status: 'running', limit: 1 }, exec?.signal);
+        runningTotal = running.total;
         exec?.signal?.throwIfAborted();
         if (!Number.isSafeInteger(running.total)) throw preflightUnavailable('无法核对正在运行的任务数', running);
         // 本进程里其他尚未拿到 job_id 的派单也计入。
@@ -1624,6 +1639,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const refusal = await closeout;
         exec?.signal?.throwIfAborted();
         if (refusal) throw new Error(refusal);
+        // 靠本次 verify_previous 的核验放行时，新单和核验都要启动；运行数只够一单时不派，免得待验收任务没人核验。
+        if (guard.deferred?.via === 'verify_previous' && runningTotal !== undefined && runningTotal + dispatching >= cfg.maxRunningJobs) {
+          throw reject(`${tool}: 任务 ${guard.deferred.job_id} 还没有验收，靠本次 verify_previous 的核验放行新任务，但已有 ${runningTotal} 个任务在运行，` +
+            `达到 maxRunningJobs=${cfg.maxRunningJobs}，新单和核验放不下两单，未启动 Codex。先 codex_verify ${guard.deferred.job_id}，或等运行中的任务结束。`);
+        }
       }
       // 预检（待答问题、收尾护栏）按原线程做完后才换成新线程：规划端任务原文完整保留，前面附上一轮交接内容。
       if (fresh) {
@@ -1674,7 +1694,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       (cfg.plannerReads === 'products' ? 'completed 后先机械核对产物、出处和数字，内容是否属实用 codex_verify，' : 'completed 后你要逐条只读核验，') +
       (cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
-      (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝；唯一一个待验收任务的核验在跑（或本单带 verify_previous 核验它）时，可以派写入范围不重叠的新任务。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       'verify_previous 可在派这一单的同时只读核验上一单（写入范围重叠时拒绝）。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
@@ -1737,15 +1757,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         else fresh = { brief: previousRoundBrief(parent),
           continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: `codex_run 以新线程接续线程 ${thread.parent_thread_id}` } };
       }
-      const value = await dispatch(args, exec, undefined, args.task, undefined, fresh, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
+      const guard = {};
+      const value = await dispatch(args, exec, undefined, args.task, undefined, fresh, routingOf(thread, verifyPrevious ? args.verify_previous : undefined), guard);
+      const deferred = guard.deferred && value.job_id ? guard.deferred : null;
+      if (deferred) countCloseout(exec?.agent?.id, 'deferred_dispatch');
       const threadLine = !thread ? '' : thread.mode === 'fresh'
         ? `已开新线程（原线程 ${thread.parent_thread_id}，上一轮任务 ${thread.parent_job_id}${thread.parent_last_input_tokens ? `，原线程上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），` +
           `新任务 ${value.job_id ?? '（见上）'}；任务里附了上一轮交接内容。之后的返工请对新任务 ${value.job_id ?? ''} 调 codex_continue，不要再 resume 原线程。`
         : thread.superseded_threads ? `线程 ${thread.superseded_threads[0]} 已由新线程接续，本次改为接续线程 ${thread.parent_thread_id}（任务 ${thread.parent_job_id}）。` : '';
       const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
-      const hints = [threadLine, verify?.line, acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
+      const deferLine = !deferred ? '' : deferred.via === 'verify_previous' && verify?.error
+        ? `任务 ${deferred.job_id} 还没有验收，本该由随本单派出的核验处理，但核验没有派出；再派新任务会被拒，先 codex_verify ${deferred.job_id}。`
+        : `任务 ${deferred.job_id} 还没有验收，因为它的核验${deferred.via === 'running' ? '正在跑' : '随本单派出'}，这一单先放行；` +
+          `核验结束后要先对 ${deferred.job_id} 记 codex_review（或记 needs_changes 并返工），才能再派新任务。`;
+      const hints = [threadLine, verify?.line, deferLine, acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
       const { line: _verifyLine, ...verifyResult } = verify ?? {};
-      const shown = { ...value, ...(thread ? { continuation_thread: thread } : {}), ...(verify ? { verify_previous: verifyResult } : {}) };
+      const shown = { ...value, ...(thread ? { continuation_thread: thread } : {}), ...(verify ? { verify_previous: verifyResult } : {}),
+        ...(deferred ? { closeout_deferred: deferred } : {}) };
       return hints ? { ...shown, next: shown.next ? `${shown.next}\n${hints}` : hints } : shown;
     },
   };
@@ -2161,8 +2189,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
           `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
       }
+      if (prepared.inferred && result.verification_status === review.status) countCloseout(owner, 'accepted_inferred');
       const value = withReport(result);
-      return { ...value, next: nextStep(value, undefined, undefined, cfg) };
+      const fixedLine = prepared.fixed.length ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
+      return { ...value, ...(prepared.fixed.length ? { review_fixes: prepared.fixed } : {}), next: [fixedLine, nextStep(value, undefined, undefined, cfg)].filter(Boolean).join('\n') };
     },
   });
 
@@ -2478,7 +2508,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       try { closeouts = closeoutStatsFile && JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
       const mineCloseouts = closeouts?.sessions?.[exec.agent?.id] ?? {};
       const closeoutLine = closeouts ? `结案验收（自 ${closeouts.since} 起，本会话 / 全部）：全部满足 ${mineCloseouts.all_met ?? 0} / ${closeouts.total.all_met ?? 0}，` +
-        `未满足但接受 ${mineCloseouts.accepted_open ?? 0} / ${closeouts.total.accepted_open ?? 0}，缺独立依据被拒 ${mineCloseouts.rejected_unsupported ?? 0} / ${closeouts.total.rejected_unsupported ?? 0}；` +
+        `未满足但接受 ${mineCloseouts.accepted_open ?? 0} / ${closeouts.total.accepted_open ?? 0}（其中按 evidence 推定接受原因 ${mineCloseouts.accepted_inferred ?? 0} / ${closeouts.total.accepted_inferred ?? 0}），` +
+        `缺独立依据被拒 ${mineCloseouts.rejected_unsupported ?? 0} / ${closeouts.total.rejected_unsupported ?? 0}，` +
+        `自标未满足按 planner 级别记 met ${mineCloseouts.met_planner_level ?? 0} / ${closeouts.total.met_planner_level ?? 0}；` +
+        `核验中放行新任务 ${mineCloseouts.deferred_dispatch ?? 0} / ${closeouts.total.deferred_dispatch ?? 0}；` +
         `closeoutEvidence=${cfg.closeoutEvidence}` : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}`;
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
