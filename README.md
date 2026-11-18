@@ -390,7 +390,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `codexBin` | 自动查找 | WSL 内 codex 的路径；默认先查 PATH（跳过 `/mnt/` 下的 Windows 版），再查 `~/.npm-global/bin`、`~/.local/bin`、`/usr/local/bin` |
 | `codexHome` | Codex 默认 | 传给 Codex 的 `CODEX_HOME` |
 | `runnerHome` | `~/.local/state/codex-runner` | 任务记录和日志目录 |
-| `runnerAgentsMd` | 留空（沿用） | 未传 `use_user_config` 的任务使用的用户级 AGENTS.md：留空沿用 `CODEX_HOME` 里的；`none` 不带；绝对路径换成该文件。通过 `runnerHome/codex-home` 下的符号链接实现，需要 WSL |
+| `runnerAgentsMd` | 留空（沿用） | 未传 `use_user_config` 的任务使用的用户级 AGENTS.md。留空沿用 `CODEX_HOME` 里的文件，`none` 省略它，`bundled` 换成随包附带的 [executor-agents.md](executor-agents.md)，也可填绝对路径。runner 在 WSL 用符号链接替换，`resume` 同样使用替换后的用户级文件并保留原会话。 |
 | `maxStorageMb` | 留空（不限制） | `jobs` 与 `runs` 合计大小上限（MiB），须为正有限数字，可含小数；启动时尽力清理最旧的已结束任务，保留活任务和本次任务 |
 | `maxSessionJobs` | 留空（不限制） | 每个会话累计可派的 Codex 任务数上限，须为正整数；达到后不启动 Codex 并说明原因 |
 | `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
@@ -782,7 +782,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `autoHandover.startupDelayMinutes` | `10` | Minutes after the host process starts during which `auto` does not hand over; non-negative |
 | `autoHandover.disableAutoContinue` | `true` | After a hand-over, set the old session's `dsh-client-auto-continue` mode to `off` through the host settings service and restore it on revert; `false` skips this |
 | `autoHandover.withRunningJobs` | `true` | Hand over an idle session even while its Codex jobs run: the jobs move to the successor and their completion notices are forwarded to it; `false` gives up while jobs run and retries later |
-| `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`: empty keeps the one in `CODEX_HOME`, `none` leaves it out, an absolute path uses that file instead (symlinks under `runnerHome/codex-home`, needs WSL) |
+| `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`. Empty keeps the file in `CODEX_HOME`, `none` omits it, `bundled` uses the shipped [executor-agents.md](executor-agents.md), and an absolute path uses that file. The runner uses WSL symlinks and applies the same replacement on `resume` while keeping the existing session. |
 | `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and the two configured allowlists, subject to the other guard rules |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |
 | `mcpWriteAllow` | `[]` | Exempts matching MCP tools from the write and execute action-name check and counts them in allowlist mode. Each entry starts with `mcp__`. Matching ignores case and a trailing `*` matches a prefix. For draw.io use `mcpWriteAllow: ['mcp__drawio__*', 'mcp__drawio-skill__*']` |

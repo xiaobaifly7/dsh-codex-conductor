@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.122` 的 `runnerAgentsMd: bundled` 可选用随包附带的短版执行指令，默认仍沿用用户文件。
+
 `0.9.121` 改写派单和执行提示。规划端按可独立验收的结果拆单，派单前核对写入权限、运行前置和本轮可取得的证据。执行端遇到方法不可用时，在原授权内换等价方法，区分实测不符的 `not_met` 和缺前置的 `blocked`，并明确关键观测、清理或恢复失败须以非零状态退出。
 
 `0.9.120` 让核验能与下一单并行，并少拒结案验收。之前收尾护栏只要有已结束未验收的任务就拒绝开新工作的 `codex_run`，而结案依据规则要它先核验，于是规划端只能干等核验结束；`verify_previous` 本身是 `codex_run` 的参数，同样被拒，正好在它要解决的场景里用不上（0.9.118 上线后 8 次核验 0 次走 verify_previous，同会话并行为 0）。现在本会话唯一一个待验收任务正在核验（它的第一次核验在跑，或本单带 `verify_previous` 核验它）且没有别的待收尾任务时，放行写入范围不与它重叠的新任务；每个任务只放行一次，核验结束后照常要先验收；靠 `verify_previous` 放行且设了 `maxRunningJobs` 时要放得下两单；结果带 `closeout_deferred`，`codex_runtime` 计 `deferred_dispatch`。缺依据的拒绝和收尾护栏的拒绝都写明这条路。`accepted_deviations` 里保留未满足却没写 `accepted` 的条目，按接受未满足处理（原因取 evidence，带“（按 evidence 推定）”前缀，结果里的 `review_fixes` 说明，照样经过用户确认），不再拒绝；从不推定 met。`codex_runtime` 补上 `met_planner_level` 和 `accepted_inferred`。
@@ -137,6 +139,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.122` adds the opt-in `runnerAgentsMd: bundled` for the shipped short executor instructions. The default still uses the user's file.
 
 `0.9.121` revises dispatch and execution prompts. The planner splits work into independently verifiable outcomes and checks write permissions, runtime prerequisites and available evidence before dispatching. Codex can use equivalent methods within the original authorization, distinguishes observed mismatches (`not_met`) from missing prerequisites (`blocked`), and must surface critical observation, cleanup or recovery failures with a nonzero script exit.
 

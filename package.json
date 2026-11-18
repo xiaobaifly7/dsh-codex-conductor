@@ -24,6 +24,7 @@
     "autoanswer.mjs",
     "report.schema.json",
     "report.v2.schema.json",
+    "executor-agents.md",
     "runner/codex_runner.py",
     "tools/Test-PsSyntax.ps1",
     "cordis.patch.yml",

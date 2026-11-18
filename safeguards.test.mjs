@@ -10,7 +10,9 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-safeguards-'));
 process.env.LOCALAPPDATA = localAppData;
 test.after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-const { apply, composePrompt, hasUserReply } = await import('./index.mjs');
+const { apply, composePrompt, hasUserReply, runnerArgv } = await import('./index.mjs');
+const { wslPath } = await import('./guard.mjs');
+const { fileURLToPath } = await import('node:url');
 const { pidReused, saveRuntimeSettings, validatePanelSettings } = await import('./runtime.mjs');
 
 const exec = (id = 'S1', cwd = '/repo', log = []) => ({ agent: { id, session: { header: { cwd }, log } } });
@@ -35,6 +37,28 @@ test('unknown configuration keys are reported in the log and the load marker', (
   assert.ok(warnings.some(text => /未知配置项 workspace/.test(text)));
   const marker = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
   assert.deepEqual(marker.unknownConfig, ['workspace']);
+});
+
+test('bundled executor instructions reach the runner only when configured', async () => {
+  const file = wslPath(fileURLToPath(new URL('./executor-agents.md', import.meta.url)));
+  for (const [config, expected] of [
+    [{}, []],
+    [{ runnerAgentsMd: 'bundled' }, [`CODEX_RUNNER_AGENTS_MD=${file}`]],
+    [{ runnerAgentsMd: 'none' }, ['CODEX_RUNNER_AGENTS_MD=none']],
+  ]) {
+    let argv;
+    const tools = {};
+    apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {} },
+      config, async (cfg, args) => {
+        if (args[0] === 'start') {
+          argv = runnerArgv(cfg, args);
+          return { job_id: 'J1', status: 'completed' };
+        }
+        return { jobs: [] };
+      });
+    await tools.codex_run.execute({ task: 'Inspect project files.', acceptance: ['Layout is reported'], write: false }, exec());
+    assert.deepEqual(argv.filter(arg => arg.startsWith('CODEX_RUNNER_AGENTS_MD=')), expected);
+  }
 });
 
 test('mcpWriteAllow defaults, warns on invalid values and reports the effective list', () => {

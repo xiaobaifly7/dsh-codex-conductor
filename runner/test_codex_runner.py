@@ -10,6 +10,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -1679,6 +1680,28 @@ class RunnerTests(unittest.TestCase):
             (home / "config.toml").write_text("not = [valid toml")
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
             self.assertFalse(any("mcp_servers" in part for part in cmd))
+
+    def test_bundled_user_agents_md_is_visible_to_fresh_and_resumed_invocations(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        real = Path(self.tmp.name) / "codex-home"
+        real.mkdir()
+        (real / "AGENTS.md").write_text("long user instructions", encoding="utf-8")
+        short = RUNNER.parent.parent / "executor-agents.md"
+        args = SimpleNamespace(use_user_config=False, model=None, effort=None, sandbox="read-only", schema=None)
+        # Use a file hard link as a test double where Windows symlinks require extra privileges.
+        links = mock.patch.object(Path, "symlink_to", Path.hardlink_to) if os.name == "nt" else nullcontext()
+        with links, mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "runner"), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(real), "CODEX_RUNNER_AGENTS_MD": str(short)}):
+            for thread in (None, "thread-1"):
+                cmd, env = codex_runner.build_command(args, real, thread)
+                self.assertEqual("resume" in cmd, thread is not None)
+                self.assertEqual((Path(env["CODEX_HOME"]) / "AGENTS.md").read_bytes(), short.read_bytes())
+            os.environ.pop("CODEX_RUNNER_AGENTS_MD")
+            _, env = codex_runner.build_command(args, real, None)
+            self.assertEqual(Path(env["CODEX_HOME"]), real)
+            self.assertEqual((real / "AGENTS.md").read_text(encoding="utf-8"), "long user instructions")
 
     @unittest.skipIf(os.name == "nt", "symlinks need Developer Mode on Windows")
     def test_user_agents_md_can_be_left_out_or_replaced(self):

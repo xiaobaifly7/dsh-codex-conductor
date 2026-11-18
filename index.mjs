@@ -39,6 +39,7 @@ export const name = 'codex-conductor';
 export const inject = ['tools'];
 
 const here = (file) => wslPath(fileURLToPath(new URL(file, import.meta.url)));
+const bundledAgentsMd = here('./executor-agents.md');
 
 // 留空的项都沿用 WSL 默认发行版和 Codex 自己的配置
 const DEFAULTS = {
@@ -213,7 +214,7 @@ export function runnerArgv(cfg, args) {
   const env = [
     cfg.codexHome && `CODEX_HOME=${cfg.codexHome}`,
     cfg.runnerHome && `CODEX_RUNNER_HOME=${cfg.runnerHome}`,
-    cfg.runnerAgentsMd && `CODEX_RUNNER_AGENTS_MD=${cfg.runnerAgentsMd}`,
+    cfg.runnerAgentsMd && `CODEX_RUNNER_AGENTS_MD=${cfg.runnerAgentsMd === 'bundled' ? bundledAgentsMd : cfg.runnerAgentsMd}`,
     router && `CODEX_RUNNER_ROUTER_URL=${router.origin}`,
     routeUrl && `CODEX_RUNNER_ROUTE_PROVIDER=${route.provider}`,
     routeUrl && `CODEX_RUNNER_ROUTE_URL=${routeUrl.href}`,
@@ -865,7 +866,7 @@ function settings(config, logger) {
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
       : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
-      : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
+      : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'mcpWriteAllow' ? Array.isArray(value) && value.every(name => typeof name === 'string' && /^mcp__/i.test(name.trim()))
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
