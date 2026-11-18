@@ -4,6 +4,8 @@
 
 ## 0.9.NEXT
 
+正在核验时可先提交结案复核。用户确认已通过、唯一缺口是开放项依据时，插件挂起复核，并在核验结束后写入或附骨架拒绝。结果随核验通知送达，支持交接、热重载和会话补扫。`codex_runtime` 显示挂起数，统计记录 `review_parked`、`parked_recorded` 和 `parked_rejected`。
+
 后续轮次的报告和新写入的成功结案复核都记 `met` 时，可销掉同一交接链内、十跳父链上早于复核入账的旧验收项。清单须等长、同编号原文完全相同且在两份清单中各只出现一次。摘要展示最近 500 条销项记录，统计记入 `ledger_cleared_by_later_round`。运行状态、摘要、目标完成拒绝和写任务完成回执会提示后续报告已满足的开放项。
 
 插件加载或热重载时补派最多两单自动核验，会话调用 `codex_*` 时补派最多一单，每 60 秒最多扫描一次。读取旧的已渲染结果时也检查是否需要自动核验。已有核验或后续轮次的任务跳过，补派次数记入 `auto_verify_catchup`。
@@ -151,6 +153,8 @@
 ## English
 
 ### 0.9.NEXT
+
+Closing reviews can be submitted during verification. If the user-confirmation gate passes and the only missing evidence is for open items, the plugin parks the review and records it or returns a rejection with a skeleton after verification. Completion notices carry the outcome across handover, and reload and session catch-up process finished verifications. `codex_runtime` shows the pending count, with counters `review_parked`, `parked_recorded`, and `parked_rejected`.
 
 A later round can clear an older acceptance item when its report and newly appended closing review both mark it `met`. The item must predate the review and belong to an ancestor within ten parent links in the same handover chain. The acceptance lists must be the same length, with the same text at the same index appearing once in each list. Summary shows the latest 500 archived items, and `ledger_cleared_by_later_round` counts the clears. Runtime, summary, goal completion refusals, and write-job completion notices flag open items that a later report already marks met.
 

@@ -1013,6 +1013,7 @@ const CANCEL_SETTLE_MS = 30_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 // 同一宿主内热重载后，旧的后台观察仍可能与新实例同时看到完成。
 const hostVerifications = globalThis[Symbol.for('dsh-codex-conductor.verifications')] ??= new WeakMap();
+const hostParkedReviews = globalThis[Symbol.for('dsh-codex-conductor.parkedReviews')] ??= new Map();
 const automaticVerification = Symbol('automaticVerification');
 
 export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
@@ -1043,6 +1044,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   const evidenceLevel = (source) => cfg.closeoutEvidence === 'independent' && beforeCutoff(source, evidenceFrom)
     ? 'planner' : cfg.closeoutEvidence;
+  const openEvidenceLevel = (source) => beforeCutoff(source, acceptOpenFrom) ? 'off' : cfg.acceptOpenEvidence;
   // 原报告自标未满足的条目各有哪些独立依据：晚于这一轮结束、核验本单元的核验任务判这一条 met；同一单元的后续轮次报告这一条 met；
   // 原会话用户在作业结束后有过真实回复（与 accepted_deviations 的用户确认同一判定，但不因 plannerAnswers 放宽）。
   const openAccepted = (review) => [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]
@@ -1095,8 +1097,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (job.thread_id && threads.get(job.thread_id) === undefined) threads.set(job.thread_id, job.started_at);
       }
     }
-    const runningVerification = checkOpen ? jobs.find(job =>
-      job.execution_status === 'running' && job.context?.verification_of === source.job_id)?.job_id : undefined;
+    const runningVerification = jobs.find(job =>
+      job.execution_status === 'running' && job.context?.verification_of === source.job_id)?.job_id;
     const later = jobs.filter((job) => job.job_id !== source.job_id && job.execution_status === 'completed' &&
       job.finished_at > (source.finished_at ?? 0) &&
       (job.context?.verification_of ? unit.has(job.context.verification_of) : unit.has(job.job_id)));
@@ -1188,6 +1190,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
   const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
+  const parkedEvaluations = hostParkedReviews.get(parkedFile) ?? new Map();
+  if (parkedFile) hostParkedReviews.set(parkedFile, parkedEvaluations);
+  const parkedWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 挂起复核处理失败：${error?.message ?? error}`);
+  const readParkedReviews = () => {
+    try {
+      if (parkedFile) {
+        const entries = JSON.parse(readFileSync(parkedFile, 'utf8'));
+        if (!Array.isArray(entries)) throw new Error('parked-reviews.json 格式无效');
+        return entries;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') { parkedWarning(error); return null; }
+    }
+    return [];
+  };
+  const parkedFor = (owner) => (readParkedReviews() ?? []).filter(entry => !owner || owns(owner, entry.owner));
   const ledgerFile = stateDirectory && path.join(stateDirectory, 'accepted-open.json');
   const unreadableLedgerLine = '未完成项台账不可读';
   const readLedger = () => {
@@ -1591,9 +1610,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (!result.job_id || unknownState(result)) return skipped(result.error ?? result.error_kind ?? result.status, 'error');
           countCloseout(owner, 'auto_verify_started');
           if (catchup) countCloseout(owner, 'auto_verify_catchup');
-          const line = `插件已自动派出对 ${id} 的只读核验 ${result.job_id}` +
-            (result.status === 'running' ? '，正在跑；核验在跑时可以派不重叠的新任务（收尾护栏会放行），'
-              : `，状态 ${result.status}；`) + `核验结束后按结论记 codex_review ${id}。`;
+          const line = `插件已自动派出对 ${id} 的只读核验 ${result.job_id}` + (result.status === 'running'
+            ? `，正在跑。现在就可以记 codex_review ${id}：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起到核验结束再判），然后派写入范围不与 ${id} 重叠的下一单；不必等核验。`
+            : `，状态 ${result.status}；核验结束后按结论记 codex_review ${id}。`);
           return { auto_verify: { job_id: result.job_id, status: result.status }, line };
         } catch (error) {
           return skipped(String(error?.message ?? error));
@@ -1632,9 +1651,80 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
   }
 
+  async function observeParkedReview(value) {
+    const { job_id: verificationId, context } = value;
+    if (!context?.verification_of || cancelUnconfirmed(value)) return;
+    const prior = parkedEvaluations.get(verificationId);
+    if (prior?.pending) return prior.result;
+    const entry = readParkedReviews()?.find(e => e.job_id === context.verification_of && e.verification_id === verificationId);
+    if (!entry) return prior?.result;
+    if (!owns(lastSuccessor(aliases, entry.owner) ?? entry.owner, context.owner)) return;
+    const evaluation = { owner: entry.owner, pending: true };
+    evaluation.result = evaluateParkedReview(entry).catch(parkedWarning).then(receipt => {
+      evaluation.pending = false;
+      if (!receipt) parkedEvaluations.delete(verificationId);
+      return receipt;
+    });
+    parkedEvaluations.set(verificationId, evaluation);
+    return evaluation.result;
+  }
+
+  async function evaluateParkedReview(entry) {
+    const { job_id, owner: storedOwner, verification_id, review, park_support, at } = entry;
+    const successor = () => lastSuccessor(aliases, storedOwner) ?? storedOwner;
+    let source;
+    let level;
+    let superseded;
+    let prepared = { review, fixed: [], problems: [] };
+    const outcome = (outcome, line) => ({ parked_review: { job_id, outcome }, line: `${job_id} 的挂起复核${line}` });
+    try {
+      source = await conductor.waitJob(job_id, 0);
+      if (unknownState(source) || !owns(successor(), source.context?.owner)) throw new Error('无法确认原任务状态或归属');
+      superseded = source.verification?.time > at;
+      if (!superseded) {
+        const supports = await criterionSupport(source, successor(), [], undefined, true);
+        const openSupport = { ...supports.openSupport };
+        for (const [key, kinds] of Object.entries(park_support)) openSupport[key] = [...new Set([...kinds, ...(openSupport[key] ?? [])])];
+        level = evidenceLevel(source);
+        prepared = prepareReview(review, { ...source, evidenceLevel: level, openLevel: openEvidenceLevel(source), ...supports, openSupport });
+      }
+    } catch (error) { prepared.problems.push(String(error?.message ?? error)); }
+
+    // 同一宿主的新旧实例同步认领。准备好结论后再读并原子移除，避免核验期间重提或正常写入的复核被覆盖。
+    const entries = readParkedReviews();
+    const current = entries?.find(e => e.job_id === job_id && e.verification_id === verification_id);
+    if (!current) return;
+    if (JSON.stringify(current) !== JSON.stringify(entry)) return evaluateParkedReview(current);
+    writeJsonAtomic(parkedFile, entries.filter(e => e !== current));
+    if (superseded) return outcome('superseded', '已有更新的复核，已跳过。');
+
+    const owner = successor();
+    if (!prepared.problems.length) {
+      try {
+        const { appended } = await submitReview(job_id, source, prepared, level, owner);
+        if (!appended) throw new Error('runner 未追加复核记录');
+        countCloseout(owner, 'parked_recorded');
+        return outcome('recorded', `已按核验结论写入（${review.status}）。`);
+      } catch (error) { prepared.problems.push(String(error?.message ?? error)); }
+    }
+    countCloseout(owner, 'parked_rejected');
+    return outcome('rejected', `未通过，未写入：${reviewRejection(job_id, source, prepared)}`);
+  }
+
+  async function scanParkedReviews(owner, signal) {
+    const entries = parkedFor(owner).filter(e => !parkedEvaluations.get(e.verification_id)?.pending);
+    const pending = [...parkedEvaluations.values()].filter(e => e.pending && (!owner || owns(owner, e.owner)));
+    await Promise.all([...pending.map(e => e.result), ...entries.map(async ({ verification_id }) => {
+      const value = await conductor.waitJob(verification_id, 0, signal);
+      await observeParkedReview(value);
+    })]);
+  }
+
   async function withCompletionNotices(value, exec) {
-    const [result, notices] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec)]);
-    return notices.length ? { ...result, next: [result.next, ...notices].filter(Boolean).join('\n') } : result;
+    const [result, notices, parked] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
+      value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined]);
+    return notices.length || parked ? { ...result, ...(parked ? { parked_review: parked.parked_review } : {}),
+      next: [parked?.line ?? result.next, ...notices].filter(Boolean).join('\n') } : result;
   }
 
   async function scanAutoVerifications(limit, owner) {
@@ -1667,10 +1757,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const lastAutoVerifyScan = new Map();
   async function catchUpAutoVerifications(owner) {
     if (!owner) return;
+    const parkedScan = scanParkedReviews(owner).catch(parkedWarning);
     const now = Date.now();
-    if (now - (lastAutoVerifyScan.get(owner) ?? -Infinity) < 60_000) return;
+    if (cfg.autoVerify === 'off' || now - (lastAutoVerifyScan.get(owner) ?? -Infinity) < 60_000) return parkedScan;
     lastAutoVerifyScan.set(owner, now);
-    await scanAutoVerifications(1, owner).catch(autoVerifyWarning);
+    await Promise.all([parkedScan, scanAutoVerifications(1, owner).catch(autoVerifyWarning)]);
   }
 
   // log 通道只供原生面板观察，job_output 过滤它，模型只收到一次最终 result。
@@ -1806,13 +1897,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function verifyRendered(value, exec, source) {
     const { job_id: id, rendered } = value;
     let receipt = await autoVerifications.get(id);
+    let parked = await parkedEvaluations.get(id)?.result;
     const items = value.status === 'completed' ? completionLedgerItems(id, exec?.agent?.id) : [];
     const auto = !receipt && cfg.autoVerify !== 'off';
+    const checkParked = !parked && parkedFor(exec?.agent?.id).some(entry => entry.verification_id === id);
     const lines = [];
-    if (auto || items.length) {
+    if (auto || items.length || checkParked) {
       try {
         const current = source && source.status !== 'running' ? source : await conductor.waitJob(id, 0, exec?.signal);
         if (items.length) lines.push(...await laterRoundNotices(current, exec, items));
+        if (checkParked) parked = await observeParkedReview(current).catch(parkedWarning);
         if (auto) {
           await withAutoVerification(withReport(current), exec, { source: current });
           receipt = await autoVerifications.get(id);
@@ -1820,7 +1914,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       } catch (error) { autoVerifyWarning(error); }
     }
     if (receipt) lines.push(receipt.line);
+    if (parked) lines.push(parked.line);
     return { ...value, ...(receipt ? { auto_verify: receipt.auto_verify } : {}),
+      ...(parked ? { parked_review: parked.parked_review } : {}),
       rendered: [rendered, ...lines.filter(line => !rendered.includes(line))].join('\n') };
   }
 
@@ -1971,6 +2067,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function closeoutCheck(owner, tool, signal, plan, goal) {
     if ((!goal && cfg.closeoutGuard === false) || !owner) return '';
     try {
+      if (plan) await scanParkedReviews(owner, signal).catch(parkedWarning);
       const jobs = await sessionJobs(owner, signal);
       if (goal) goal.unreviewedWrites = jobs.filter(job => job?.context?.write === true && !job.context.verification_of &&
         job.execution_status === 'completed' && job.report_status === 'valid' && job.review_status === 'needs_verification' &&
@@ -1985,11 +2082,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           catch (error) { return String(error?.message ?? error); }
         }
         plan.guard.deferred = deferred;
+        plan.guard.parkedReview = parkedFor(owner).some(e => e.job_id === deferred.job_id);
         return '';
       }
       const refusal = closeoutRefusal(tool, pending);
       if (refusal) logRefusal({ session: owner, tool, unreviewed: pending.unreviewed, needs_changes: pending.needsChanges });
-      return refusal;
+      const parked = goal && parkedFor(owner).filter(e => pending.unreviewed.includes(e.job_id));
+      return parked?.length ? `${refusal}\n${parked.map(e => `${e.job_id} 有挂起复核，核验 ${e.verification_id} 结束后会判定。`).join('\n')}` : refusal;
     } catch (error) {
       // 从不抛出：派单可能先于这里的结果结束；中止由调用方在等待后处理。
       if (!signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
@@ -2307,6 +2406,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
       const deferLine = !deferred ? '' : deferred.via === 'verify_previous' && verify?.error
         ? `任务 ${deferred.job_id} 还没有验收，本该由随本单派出的核验处理，但核验没有派出；再派新任务会被拒，先 codex_verify ${deferred.job_id}。`
+        : guard.parkedReview ? `任务 ${deferred.job_id} 的挂起复核会在核验结束后判定，这一单先放行。`
         : `任务 ${deferred.job_id} 还没有验收，因为它的核验${deferred.via === 'running' ? '正在跑' : '随本单派出'}，这一单先放行；` +
           `核验结束后要先对 ${deferred.job_id} 记 codex_review（或记 needs_changes 并返工），才能再派新任务。`;
       const hints = [threadLine, verify?.line, deferLine, acceptanceHint(args), handoverHint(exec?.agent)].filter(Boolean).join('\n');
@@ -2713,6 +2813,39 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
 
   const ACCEPTED_FIELD = { type: 'string', minLength: 1, description: '只用于 accepted_deviations 里保留 not_met/blocked 的条目：为什么接受这一条未满足。其他情况省略。' };
+  async function submitReview(job_id, source, prepared, level, owner, signal, normal = false) {
+    const { review } = prepared;
+    const previousTime = source.verification?.time ?? -Infinity;
+    const result = await conductor.review(job_id, review, owner, signal);
+    // runner 返回作业状态，执行时的错误会和新写入的复核一起返回。
+    const appended = result.verification_status === review.status &&
+      Number.isFinite(result.verification?.time) && result.verification.time > previousTime;
+    if (appended && normal) {
+      try {
+        const entries = readParkedReviews();
+        const retained = entries?.filter(e => e.job_id !== job_id || e.at > result.verification.time);
+        if (retained && retained.length < entries.length) writeJsonAtomic(parkedFile, retained);
+      } catch (error) { parkedWarning(error); }
+    }
+    let ledgerWarning;
+    if (appended && ['verified', 'accepted_deviations'].includes(review.status)) {
+      // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
+      const flaggedMet = flaggedCriteria(source).some((f) => (f.row ? review.report_rows ?? [] : review.criteria)
+        .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
+      countCloseout(owner, openAccepted(review) ? 'accepted_open'
+        : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
+      ledgerWarning = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time);
+      if (!ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, signal);
+    }
+    // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
+    if (result.error_kind === 'bad_arguments' && !result.job_id) {
+      throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
+        `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
+    }
+    if (prepared.inferred && appended) countCloseout(owner, 'accepted_inferred');
+    return { appended, result, ledgerWarning };
+  }
+
   ctx.tools.register({
     name: 'codex_review',
     description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
@@ -2754,11 +2887,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
       const level = evidenceLevel(source);
-      const openLevel = beforeCutoff(source, acceptOpenFrom) ? 'off' : cfg.acceptOpenEvidence;
+      const openLevel = openEvidenceLevel(source);
       const checkOpen = openLevel !== 'off' && args.status === 'accepted_deviations';
       let supports;
-      if ((checkOpen || level === 'independent' || source.context?.must_verify?.length) && ['verified', 'accepted_deviations'].includes(args.status)) {
-        try { supports = await criterionSupport(source, owner, exec.agent.session?.log ?? [], exec?.signal, checkOpen); } catch { exec?.signal?.throwIfAborted(); }
+      const closing = ['verified', 'accepted_deviations'].includes(args.status);
+      const log = exec.agent.session?.log ?? [];
+      if (closing && (checkOpen || level === 'independent' || source.context?.must_verify?.length)) {
+        try { supports = await criterionSupport(source, owner, log, exec?.signal, checkOpen); } catch { exec?.signal?.throwIfAborted(); }
       }
       const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, ...supports });
       const { review } = prepared;
@@ -2766,34 +2901,29 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // “未满足但接受”的条目与接受偏差同一道用户确认。
       if (!prepared.openUnsupported && ((Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0) ||
           openAccepted(review)) &&
-          !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
+          !canAnswer(log, source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
       if (prepared.problems.length) {
+        const verification_id = supports?.runningVerification;
+        // 只有结案复核仅缺保留开放项的依据、没有缺依据的 met，且用户确认已过关，才挂起等待本任务正在跑的核验。
+        if (parkedFile && closing && verification_id && prepared.problems.length === prepared.openUnsupported &&
+            prepared.unsupported === 0 && canAnswer(log, source, owner)) {
+          const entries = readParkedReviews();
+          if (entries) {
+            const entry = { job_id, owner, verification_id, review, park_support: supports.openSupport, at: Date.now() / 1000 };
+            writeJsonAtomic(parkedFile, [...entries.filter(e => e.job_id !== job_id), entry]);
+            countCloseout(owner, 'review_parked');
+            return { status: 'parked', job_id, verification_id,
+              next: `${job_id} 的复核已挂起：核验 ${verification_id} 还在跑，结束后插件按依据规则判定，结果在 ${verification_id} 的完成通知里（通过即写入；不通过附骨架）。现在可以派写入范围不与 ${job_id} 重叠的下一单。` };
+          }
+        }
         if (prepared.unsupported) countCloseout(owner, 'rejected_unsupported');
         if (prepared.openUnsupported) countCloseout(owner, 'rejected_open_unsupported');
-        throw new Error(reviewRejection(job_id, source, prepared));
+        const running = verification_id && prepared.unsupported && !prepared.openUnsupported ? `核验 ${verification_id} 正在跑，等它结束再记；` : '';
+        throw new Error(running + reviewRejection(job_id, source, prepared));
       }
-      const result = await conductor.review(job_id, review, owner, exec?.signal);
-      // runner 返回作业状态，执行时的错误会和新写入的复核一起返回。
-      const appended = result.verification_status === review.status &&
-        Number.isFinite(result.verification?.time) && result.verification.time > (source.verification?.time ?? -Infinity);
-      let ledgerWarning;
-      if (appended && ['verified', 'accepted_deviations'].includes(review.status)) {
-        // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
-        const flaggedMet = flaggedCriteria(source).some((f) => (f.row ? review.report_rows ?? [] : review.criteria)
-          .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
-        countCloseout(owner, openAccepted(review) ? 'accepted_open'
-          : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
-        ledgerWarning = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time);
-        if (!ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, exec?.signal);
-      }
-      // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
-      if (result.error_kind === 'bad_arguments' && !result.job_id) {
-        throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
-          `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
-      }
-      if (prepared.inferred && appended) countCloseout(owner, 'accepted_inferred');
+      const { appended, result, ledgerWarning } = await submitReview(job_id, source, prepared, level, owner, exec?.signal, true);
       const value = withReport(result);
       const fixed = appended && prepared.fixed.length;
       const fixedLine = fixed ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
@@ -3106,7 +3236,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         exec.arguments = typeof exec.arguments === 'string' ? JSON.stringify(nativeArgs) : nativeArgs;
       }
       const owner = exec.agent?.id;
-      let refusal = usedConductor(exec.agent) ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '';
+      let refusal = usedConductor(exec.agent) || (owner && parkedFor(owner).length)
+        ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '';
       const ledger = await acceptedOpenLedger(owner, exec.signal);
       const items = ledger?.items;
       if (!refusal) {
@@ -3138,7 +3269,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (denied !== undefined) return { isError: true, error: { message: denied },
         content: [{ type: 'text', text: `Error: ${denied}` }] };
     }
-    if (cfg.autoVerify !== 'off' && exec.name?.startsWith('codex_')) {
+    if ((parkedFile || cfg.autoVerify !== 'off') && exec.name?.startsWith('codex_')) {
       // 先让验收或续接落盘，补派时才能看到这次调用的结果。
       const execute = next;
       next = async () => {
@@ -3158,6 +3289,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       let closeouts;
       try { closeouts = closeoutStatsFile && JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
       const mineCloseouts = closeouts?.sessions?.[exec.agent?.id] ?? {};
+      const parked = exec.agent?.id ? parkedFor(exec.agent.id).length : 0;
       const closeoutLine = closeouts ? `结案验收（自 ${closeouts.since} 起，本会话 / 全部）：全部满足 ${mineCloseouts.all_met ?? 0} / ${closeouts.total.all_met ?? 0}，` +
         `未满足但接受 ${mineCloseouts.accepted_open ?? 0} / ${closeouts.total.accepted_open ?? 0}（其中按 evidence 推定接受原因 ${mineCloseouts.accepted_inferred ?? 0} / ${closeouts.total.accepted_inferred ?? 0}），` +
         `缺独立依据被拒 ${mineCloseouts.rejected_unsupported ?? 0} / ${closeouts.total.rejected_unsupported ?? 0}，` +
@@ -3173,9 +3305,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
-          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}\n${ledgerLine(ledger)}`;
+          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}\n挂起复核（本会话含前任）：${parked} 单\n${ledgerLine(ledger)}`;
       return { ...result, ...(result.value && typeof result.value === 'object'
-        ? { value: { ...result.value, session_history: value, accepted_open_ledger: ledger, ...(acceptance ? { acceptance_stats: acceptance } : {}),
+        ? { value: { ...result.value, session_history: value, accepted_open_ledger: ledger, parked_reviews: parked, ...(acceptance ? { acceptance_stats: acceptance } : {}),
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
@@ -3296,5 +3428,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     void repairLinks({ registry: repairCtx.get('workspaceRegistry'), controller: repairCtx.get('sessionController'), aliases,
       directory: resumeDirectory, logger: ctx.logger }).catch((error) => ctx.logger?.warn?.(`[codex-conductor] 旧交接修复失败：${error?.message ?? error}`));
   });
-  if (cfg.autoVerify !== 'off') void Promise.resolve().then(() => scanAutoVerifications(2)).catch(autoVerifyWarning);
+  if (parkedFile || cfg.autoVerify !== 'off') void Promise.resolve().then(() => Promise.all([
+    scanParkedReviews().catch(parkedWarning), cfg.autoVerify !== 'off' && scanAutoVerifications(2).catch(autoVerifyWarning),
+  ]));
 }
