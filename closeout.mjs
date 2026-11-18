@@ -38,11 +38,21 @@ export function prepareReview(args, source) {
   if (review.notes == null) review.notes = '';
   if (review.accepted_deviations == null) review.accepted_deviations = [];
   if (review.blockers == null) delete review.blockers;
-  for (const key of ['criteria', 'accepted_deviations', 'blockers']) {
+  if (review.report_rows == null) delete review.report_rows;
+  for (const key of ['criteria', 'accepted_deviations', 'blockers', 'report_rows']) {
     if (typeof review[key] === 'string' && Array.isArray(asArray(review[key]))) { review[key] = asArray(review[key]); fixed.push(`${key} 由字符串解析为数组`); }
   }
-  const unknown = Object.keys(review).filter((k) => !['status', 'criteria', 'notes', 'accepted_deviations', 'blockers'].includes(k));
-  if (unknown.length) problems.push(`不认识的字段：${unknown.join('、')}（只接受 job_id、status、criteria、notes、accepted_deviations、blockers）`);
+  const unknown = Object.keys(review).filter((k) => !['status', 'criteria', 'notes', 'accepted_deviations', 'blockers', 'report_rows'].includes(k));
+  if (unknown.length) problems.push(`不认识的字段：${unknown.join('、')}（只接受 job_id、status、criteria、report_rows、notes、accepted_deviations、blockers）`);
+  const extraRows = flaggedCriteria(source).filter((f) => f.row);
+  // accepted 的检查（criteria 与 report_rows 共用）；骨架留下的占位在用不上时直接去掉，用得上时给出带结构示例的提示。
+  const checkAccepted = (c, n, field) => {
+    if (!('accepted' in c)) return;
+    const open = review.status === 'accepted_deviations' && c.status !== 'met';
+    if (placeholder(c.accepted) && !open) { delete c.accepted; fixed.push(`${field} 第 ${n + 1} 项去掉未填的 accepted 占位`); return; }
+    if (placeholder(c.accepted)) problems.push(`${field} 第 ${n + 1} 项的 accepted 还是 ${TODO}：写明为什么接受这一条未满足，形如 ${acceptedExample(c)}；不接受就核实后改记 met，或改记 needs_changes`);
+    else if (!nonempty(c.accepted) || !open) problems.push(`${field} 第 ${n + 1} 项的 accepted 只用于 accepted_deviations 里未满足（not_met/blocked）的条目，写明为什么接受未满足；记 met 或 needs_changes 时删去 accepted`);
+  };
   if (!STATUSES.includes(review.status)) problems.push(`status 缺失或无效（${JSON.stringify(review.status) ?? '未填'}）；必须由你判定为 ${STATUSES.join(' / ')} 之一`);
   if (typeof review.notes !== 'string') problems.push('notes 必须是字符串');
 
@@ -61,9 +71,7 @@ export function prepareReview(args, source) {
         else if (byOrder && !nonempty(criterion)) { c.index = n + 1; fixed.push(`criteria 第 ${n + 1} 项按顺序补 index ${n + 1}`); }
       }
       const extra = Object.keys(c).filter((k) => !['index', 'status', 'evidence', 'accepted'].includes(k));
-      if ('accepted' in c && (!nonempty(c.accepted) || c.status === 'met' || review.status !== 'accepted_deviations')) {
-        problems.push(`criteria 第 ${n + 1} 项的 accepted 只用于 accepted_deviations 里未满足（not_met/blocked）的条目，写明为什么接受未满足`);
-      }
+      checkAccepted(c, n, 'criteria');
       if (extra.length) problems.push(`criteria 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
       if (!Number.isInteger(c.index)) problems.push(`criteria 第 ${n + 1} 项缺少整数 index（从 1 开始，对应验收标准序号）` +
         (nonempty(criterion) ? `；条文「${clip(criterion)}」对不上任何一条验收标准原文，请按下面的验收清单写 index` : ''));
@@ -79,6 +87,35 @@ export function prepareReview(args, source) {
       for (const i of missing) problems.push(`缺少验收标准 ${i}：「${clip(label(acceptance[i - 1]))}」`);
       if (outside.length) problems.push(`index ${outside.join('、')} 超出范围：原任务只有 ${acceptance.length} 条验收标准（不要按 Codex 报告或其他任务的条目编号）`);
       if (twice.length) problems.push(`index ${twice.join('、')} 重复出现，每条验收标准只记一次`);
+    }
+  }
+
+  // 报告行数与验收条数不同时，报告自标 not_met/blocked 又对不上任何验收原文的行：结案结论须在 report_rows 逐行处理。
+  if (review.report_rows !== undefined) {
+    if (!Array.isArray(review.report_rows)) problems.push('report_rows 必须是数组');
+    else {
+      review.report_rows = review.report_rows.map((raw, n) => {
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { problems.push(`report_rows 第 ${n + 1} 项不是对象`); return raw; }
+        const r = { ...raw, row: asInt(raw.row) };
+        const extra = Object.keys(r).filter((k) => !['row', 'status', 'evidence', 'accepted'].includes(k));
+        if (extra.length) problems.push(`report_rows 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
+        checkAccepted(r, n, 'report_rows');
+        if (!extraRows.some((f) => f.row === r.row)) problems.push(`report_rows 第 ${n + 1} 项的 row ${JSON.stringify(r.row) ?? '未填'} 不需要单独处理；` +
+          (extraRows.length ? `只有报告第 ${extraRows.map((f) => f.row).join('、')} 行需要` : '这份报告没有需要单独处理的行，去掉 report_rows'));
+        if (!MARKS.includes(r.status)) problems.push(`report_rows 第 ${n + 1} 项 status 无效（${JSON.stringify(r.status) ?? '未填'}），只能是 ${MARKS.join(' / ')}`);
+        if (!nonempty(r.evidence)) problems.push(`report_rows 第 ${n + 1} 项 evidence 为空，需写你核验的依据`);
+        return r;
+      });
+      const rows = review.report_rows.map((r) => r?.row).filter(Number.isInteger);
+      const twice = [...new Set(rows.filter((x, k) => rows.indexOf(x) !== k))];
+      if (twice.length) problems.push(`report_rows 的 row ${twice.join('、')} 重复出现，每行只记一次`);
+    }
+  }
+  if (review.status !== 'needs_changes' && STATUSES.includes(review.status)) {
+    const given = Array.isArray(review.report_rows) ? review.report_rows : [];
+    for (const f of extraRows.filter((f) => !given.some((r) => r?.row === f.row))) {
+      problems.push(`Codex 报告第 ${f.row} 行标 ${f.status}，对不上任何一条验收标准（${rowCounts(source)}）；${review.status} 需在 report_rows 写 ` +
+        `{"row":${f.row},"status":"met|not_met|blocked","evidence":"<核验依据>"}：记 met 需要独立依据，保留 ${f.status} 时 accepted_deviations 加 accepted 写接受原因，否则记 needs_changes`);
     }
   }
 
@@ -128,12 +165,14 @@ export function prepareReview(args, source) {
     });
   }
   if (review.status !== 'needs_changes' && STATUSES.includes(review.status) && Array.isArray(review.criteria)) {
-    const open = review.criteria.filter((c) => c && MARKS.includes(c.status) && c.status !== 'met');
+    const open = [...review.criteria, ...(Array.isArray(review.report_rows) ? review.report_rows : [])]
+      .filter((c) => c && MARKS.includes(c.status) && c.status !== 'met');
     // accepted_deviations 可以“未满足但接受”：条目保留 not_met/blocked，并在 accepted 写明接受原因。
     const unaccepted = review.status === 'accepted_deviations' ? open.filter((c) => !nonempty(c.accepted)) : open;
+    const names = unaccepted.map((c) => `${c.row ? `报告第 ${c.row} 行` : c.index}=${c.status}`).join('、');
     if (unaccepted.length) problems.push(review.status === 'accepted_deviations'
-      ? `accepted_deviations 里 ${unaccepted.map((c) => `${c.index}=${c.status}`).join('、')} 未满足：核实后改记 met，或保留原状态并写 accepted 说明为什么接受未满足，或改记 needs_changes`
-      : `verified 要求每条验收都 met；${unaccepted.map((c) => `${c.index}=${c.status}`).join('、')} 未通过，改记 needs_changes，或改用 accepted_deviations 并给这些条目写 accepted 说明接受原因`);
+      ? `accepted_deviations 里 ${names} 未满足：核实后改记 met，或保留原状态并在这一条加 accepted 字段写明为什么接受未满足（形如 ${acceptedExample(unaccepted[0])}），或改记 needs_changes`
+      : `verified 要求每条验收都 met；${names} 未通过，改记 needs_changes，或改用 accepted_deviations 并给这些条目加 accepted 字段写接受原因（形如 ${acceptedExample(unaccepted[0])}）`);
     if (Array.isArray(review.blockers) && review.blockers.length) problems.push(`${review.status} 不能带活动 blockers；有阻塞请记 needs_changes`);
   }
   // closeoutEvidence：independent 要求独立依据，planner 只拦照抄报告的证据（0.9.103 规则，扩到所有结案结论），off 不查。
@@ -141,12 +180,15 @@ export function prepareReview(args, source) {
   const missing = review.status !== 'needs_changes' && STATUSES.includes(review.status) && level !== 'off' ? flaggedMet(review, source, level) : [];
   problems.push(...missing);
   if (review.status === 'verified') problems.push(...unaddressed(review, source, acceptance));
-  if (JSON.stringify([review.status, review.criteria, review.accepted_deviations, review.notes]).includes(TODO)) {
+  // accepted 的占位已在上面单独提示。
+  const withoutAccepted = (list) => (Array.isArray(list) ? list.map((c) => (c && typeof c === 'object' ? { ...c, accepted: undefined } : c)) : list);
+  if (JSON.stringify([review.status, withoutAccepted(review.criteria), withoutAccepted(review.report_rows), review.accepted_deviations, review.notes]).includes(TODO)) {
     problems.push(`骨架里还有 ${TODO} 占位没有换成你的结论或依据`);
   }
   if (review.status === 'needs_changes' && !deviations.length && Array.isArray(review.criteria) && review.criteria.length &&
-      review.criteria.every((c) => c?.status === 'met') && !(review.blockers ?? []).length) {
-    problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met 或加 blocker');
+      [...review.criteria, ...(Array.isArray(review.report_rows) ? review.report_rows : [])].every((c) => c?.status === 'met') && !(review.blockers ?? []).length) {
+    problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met' +
+      (extraRows.length ? `（对不上验收清单的报告第 ${extraRows.map((f) => f.row).join('、')} 行在 report_rows 标）` : '') + ' 或加 blocker');
   }
   return { review, fixed, problems, unsupported: level === 'independent' ? missing.length : 0 };
 }
@@ -155,17 +197,18 @@ export function prepareReview(args, source) {
 // 晚于该轮结束的核验任务判这一条 met、同一单元的后续轮次报告这一条 met，或原会话用户在作业结束后的确认）；
 // planner：只要求不照抄报告原文（0.9.103 规则）。规划端自己写的证据不算独立依据。
 function flaggedMet(review, source, level) {
-  if (!Array.isArray(review.criteria)) return [];
   const job = source?.job_id ?? '?';
-  return flaggedCriteria(source).flatMap(({ index, status, evidence }) => {
-    const entry = review.criteria.find((r) => r?.index === index);
+  return flaggedCriteria(source).flatMap(({ key, index, row, status, evidence }) => {
+    const list = row ? review.report_rows : review.criteria;
+    const entry = Array.isArray(list) ? list.find((r) => (row ? r?.row === row : r?.index === index)) : undefined;
     if (entry?.status !== 'met' || !nonempty(entry.evidence)) return [];
+    const where = row ? `报告第 ${row} 行（对不上验收清单）` : `报告第 ${index} 条`;
     if (level === 'planner') {
       if (entry.evidence.trim() !== String(evidence ?? '').trim()) return [];
-      return [`Codex 报告第 ${index} 条为 ${status}；${review.status} 需要你在 criteria index ${index} 写出自己核实已满足的证据，不能照抄报告原文，否则记 needs_changes`];
+      return [`Codex ${where}为 ${status}；${review.status} 需要你在 ${row ? `report_rows row ${row}` : `criteria index ${index}`} 写出自己核实已满足的证据，不能照抄报告原文，否则记 needs_changes`];
     }
-    if (source?.support?.[index]?.length) return [];
-    return [`Codex 报告第 ${index} 条为 ${status}，${review.status} 记成 met 但没有独立依据（规划端自己写的证据不算）。三选一：` +
+    if (source?.support?.[key]?.length) return [];
+    return [`Codex ${where}为 ${status}，${review.status} 记成 met 但没有独立依据（规划端自己写的证据不算）。三选一：` +
       `① codex_verify ${job}（核验会单列这一条；下一单与本任务写入范围不重叠时，也可在下一单带 verify_previous: "${job}"，与下一单并行），核验判 met 后再记；` +
       `② codex_continue ${job} 返工这一条；` +
       `③ 这一条保留 ${status}：记 accepted_deviations 并写 accepted 说明为什么接受未满足，或记 needs_changes`];
@@ -197,11 +240,21 @@ export function reviewSkeleton(jobId, source, review = {}) {
   const status = STATUSES.includes(review.status) ? review.status : TODO;
   const given = new Map((Array.isArray(review.criteria) ? review.criteria : [])
     .filter((c) => c && Number.isInteger(c.index)).map((c) => [c.index, c]));
+  // accepted_deviations 里保留 not_met/blocked 的条目带上 accepted：沿用已填的原因，没有就留占位。
+  const withAccepted = (entry, c) => (status === 'accepted_deviations' && ['not_met', 'blocked'].includes(entry.status)
+    ? { ...entry, accepted: nonempty(c?.accepted) && !placeholder(c.accepted) ? c.accepted : TODO } : entry);
   const criteria = acceptance ? acceptance.map((_a, i) => {
     const c = given.get(i + 1);
-    return { index: i + 1, status: MARKS.includes(c?.status) ? c.status : TODO, evidence: nonempty(c?.evidence) ? c.evidence : TODO };
+    return withAccepted({ index: i + 1, status: MARKS.includes(c?.status) ? c.status : TODO, evidence: nonempty(c?.evidence) ? c.evidence : TODO }, c);
   }) : review.criteria;
   const skeleton = { job_id: jobId, status, criteria };
+  const rows = new Map((Array.isArray(review.report_rows) ? review.report_rows : [])
+    .filter((r) => r && Number.isInteger(r.row)).map((r) => [r.row, r]));
+  const extraRows = flaggedCriteria(source).filter((f) => f.row);
+  if (extraRows.length && (status !== 'needs_changes' || rows.size)) skeleton.report_rows = extraRows.map(({ row }) => {
+    const r = rows.get(row);
+    return withAccepted({ row, status: MARKS.includes(r?.status) ? r.status : TODO, evidence: nonempty(r?.evidence) ? r.evidence : TODO }, r);
+  });
   // needs_changes 不需要确认偏差，也不需要逐项说明未决项和阻塞。
   if (status !== 'needs_changes') {
     const acks = new Map((Array.isArray(review.accepted_deviations) ? review.accepted_deviations : [])
@@ -219,8 +272,11 @@ export function reviewSkeleton(jobId, source, review = {}) {
 
 export function reviewRejection(jobId, source, { fixed, problems, review }) {
   const { acceptance, deviations } = reviewTargets(source);
+  const extraRows = flaggedCriteria(source).filter((f) => f.row);
   const shape = `{job_id:"${jobId}", status:"verified|needs_changes|accepted_deviations", ` +
-    `criteria:[${acceptance ? `恰好 ${acceptance.length} 项，index 1..${acceptance.length} 各一次，` : ''}{index, status:"met|not_met|blocked", evidence}], ` +
+    `criteria:[${acceptance ? `恰好 ${acceptance.length} 项，index 1..${acceptance.length} 各一次，` : ''}{index, status:"met|not_met|blocked", evidence, accepted?:"accepted_deviations 里保留 not_met/blocked 时写接受原因"}], ` +
+    (extraRows.length ? `report_rows:[${rowCounts(source)}，第 ${extraRows.map((f) => `${f.row} 行（${f.status}）`).join('、')}对不上验收清单，` +
+      '通过时须逐行记 {row, status:"met|not_met|blocked", evidence, accepted?}], ' : '') +
     `accepted_deviations:[${deviations.length ? `通过时须覆盖 ${deviations.map((d) => `${d.kind}#${d.index}`).join('、')}，` : '本任务没有可确认的偏差，留空；'}{kind:"reported|scope", index, evidence}], ` +
     'notes?:string, blockers?:[{id, kind, message, question, resolution}]}';
   return `codex_review: 未写入核验记录，共 ${problems.length} 处问题，一次改完再提交：\n` +
@@ -272,19 +328,42 @@ export function closeoutSince(directory, now = Date.now() / 1000, name = 'closeo
   return now;
 }
 
-// 原报告自标 blocked / not_met 的验收项（按验收清单编号）。
+const placeholder = (v) => typeof v === 'string' && v.trim() === TODO;
+const acceptedExample = (c) => `{${c?.row ? `"row":${c.row}` : `"index":${Number.isInteger(c?.index) ? c.index : 1}`},` +
+  `"status":"${['not_met', 'blocked'].includes(c?.status) ? c.status : 'blocked'}","evidence":"<核验依据>","accepted":"<为什么接受未满足>"}`;
+const rowCounts = (source) => {
+  const { acceptance } = reviewTargets(source);
+  return `报告 ${(source?.structured ?? source?.report)?.criteria?.length ?? 0} 行、验收 ${acceptance?.length ?? 0} 条`;
+};
+
+// 报告行与验收项的对应：条文与某条验收原文一致就按条文；报告行数与验收条数相同时按位置。
+// 条数不同时位置不可信（核验报告曾按抽查结论逐行汇报），对不上的行不猜，返回 0。
+export function acceptanceIndexOfRow(acceptance, rows, i) {
+  if (!Array.isArray(acceptance) || !Array.isArray(rows)) return 0;
+  const c = rows[i];
+  const hit = acceptance.findIndex((a) => nonempty(c?.criterion) && label(a).trim() === c.criterion.trim());
+  return hit >= 0 ? hit + 1 : rows.length === acceptance.length ? i + 1 : 0;
+}
+// 某条验收（从 1 起）在报告里对应的行；对不上时 undefined。
+export const reportRowOf = (acceptance, rows, index) =>
+  (Array.isArray(rows) ? rows.find((_c, i) => acceptanceIndexOfRow(acceptance, rows, i) === index) : undefined);
+
+// 原报告自标 blocked / not_met 的条目：能对上验收清单的按验收编号（key 为编号），对不上的按报告行号（row，key 为 row<k>）。
 export function flaggedCriteria(source) {
   const { acceptance } = reviewTargets(source);
   const report = source?.structured ?? source?.report;
-  return (Array.isArray(report?.criteria) ? report.criteria : []).flatMap((c, i) => {
+  const rows = Array.isArray(report?.criteria) ? report.criteria : [];
+  return rows.flatMap((c, i) => {
     if (!c || !['not_met', 'blocked'].includes(c.status)) return [];
-    const hit = acceptance?.findIndex((a) => nonempty(c.criterion) && label(a).trim() === c.criterion.trim());
-    const index = hit >= 0 ? hit + 1 : i + 1;
-    return [{ index, status: c.status, criterion: acceptance ? label(acceptance[index - 1]) : c.criterion, evidence: c.evidence }];
+    const index = acceptance ? acceptanceIndexOfRow(acceptance, rows, i) : i + 1;
+    if (!index) return [{ key: `row${i + 1}`, row: i + 1, status: c.status, criterion: c.criterion, evidence: c.evidence }];
+    return [{ key: String(index), index, status: c.status, criterion: acceptance ? label(acceptance[index - 1]) : c.criterion, evidence: c.evidence }];
   });
 }
 
-// 核验任务为每个自标未满足的原验收项单列一条验收，核验报告的这一条就是该项的独立结论。
-export const verifyCriterionItem = ({ index, status, criterion }) =>
-  `原验收第 ${index} 条（原报告标 ${status}）：${String(criterion ?? '').trim()}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
+// 核验任务为每个自标未满足的原验收项（或对不上验收清单的报告行）单列一条验收，核验报告的这一条就是该项的独立结论。
+export const verifyCriterionItem = ({ index, row, status, criterion }) =>
+  `${row ? `原报告第 ${row} 行（原报告标 ${status}，未对上原验收清单）` : `原验收第 ${index} 条（原报告标 ${status}）`}：${String(criterion ?? '').trim()}` +
+  '——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。';
 export const VERIFY_ITEM = /^原验收第 (\d+) 条（原报告标 /;
+export const VERIFY_ROW = /^原报告第 (\d+) 行（原报告标 /;

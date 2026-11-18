@@ -2544,6 +2544,23 @@ class RunnerTests(unittest.TestCase):
         # An older record without the field stays readable.
         self.assertEqual(self.control("status", "accept-open")["verification_status"], "accepted_deviations")
 
+    def test_review_report_rows_follow_the_criteria_rules(self):
+        # A report with more rows than acceptance criteria: row 3 is flagged and matches no criterion.
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "met", "evidence": "ok"},
+                                              {"criterion": "sample a", "status": "met", "evidence": "ok"},
+                                              {"criterion": "sample b", "status": "not_met", "evidence": "wrong"}])
+        jd = self.stored_job("extra-rows", {"status": "completed", "structured": report}, context=self.sample_context())
+        base = self.sample_review(status="accepted_deviations")
+        row = {"row": 3, "status": "not_met", "evidence": "still wrong"}
+        for rows in ([{**row, "row": 4}], [row, row], [{**row, "evidence": " "}], [{**row, "extra": 1}]):
+            self.assertRegex(self.submit_review(jd.name, {**base, "report_rows": rows})["error"], "report_rows entries")
+        self.assertRegex(self.submit_review(jd.name, {**base, "report_rows": [row]})["error"], "Passing review requires all criteria met")
+        # needs_changes with every criterion met is legitimate when a report row stays open.
+        self.assertEqual(self.submit_review(jd.name, {**base, "status": "needs_changes", "report_rows": [row]})["verification_status"], "needs_changes")
+        value = self.submit_review(jd.name, {**base, "report_rows": [{**row, "accepted": "owner accepts"}]})
+        self.assertEqual(value["verification_status"], "accepted_deviations")
+        self.assertEqual(self.control("summary", "--job-id", "extra-rows")["groups"][0]["accepted_open"], [{"row": 3, "status": "not_met"}])
+
     def test_status_reports_when_the_job_started_and_finished(self):
         jd = self.stored_job("timed", {"status": "completed", "structured": self.sample_report()}, context=self.sample_context())
         os.utime(jd / "args.json", (1000, 1000))

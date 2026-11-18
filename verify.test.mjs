@@ -348,7 +348,7 @@ test('generated task embeds original task, acceptance, all products and report.v
     assert.ok(prompt.includes(normPath(`${source.cwd}/${file}`)), file);
   }
   for (const text of ['逐条回到原始出处', '原文、上下文、数字与计算', '核对的结论', '出处（文件与行号或可定位的来源）',
-    '是否属实（属实/不属实/无法确认）', '不属实时实际是什么', '不属实用 not_met', '无法确认用 blocked',
+    '是否属实（属实/不属实/无法确认）', '不属实时实际是什么', '有结论不属实时记 not_met', '有无法确认时记 blocked', '条数与验收标准相同，不要为每条抽查结论另加一行',
     'summary 汇总抽查数和结果', '不要只复述原报告', '不要运行会产生写入的测试或命令', 'files_changed 必须为 []']) {
     assert.ok(prompt.includes(text), text);
   }
@@ -531,4 +531,10 @@ test('a verification lists every criterion the original report marked blocked or
   const clean = harness();
   await clean.verify();
   assert.ok(!clean.payload().context.acceptance.some((item) => item.startsWith('原验收第 ')));
+  // 报告比验收多出一行且这一行对不上验收原文：按报告行号单列。
+  const extra = sourceJob();
+  extra.structured.criteria.push({ criterion: '额外抽查的一条', status: 'not_met', evidence: '不属实' });
+  const hx = harness({ source: extra });
+  await hx.verify();
+  assert.equal(hx.payload().context.acceptance.at(-1), '原报告第 3 行（原报告标 not_met，未对上原验收清单）：额外抽查的一条——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。');
 });

@@ -5827,6 +5827,49 @@ test('codex_review finds independent support in a later verification, a later ro
   assert.equal((await h.tools.codex_review.execute(review, { agent: agentAt('/work/current') })).verification_status, 'verified');
 });
 
+test('codex_review maps report rows to items before counting support, and extra flagged rows go through report_rows', async () => {
+  const now = Date.now() / 1000;
+  const parent = { ...workflowSource('implementation'), finished_at: now + 100, started_at: now + 50 };
+  parent.structured.blockers = [];
+  const item = (head, text) => `${head}：${text}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
+  const row = (criterion, status) => ({ criterion, status, evidence: 'e' });
+  const verifyJob = (id, of, acceptance, criteria) => ({ job_id: id, status: 'completed', execution_status: 'completed', finished_at: now + 200, started_at: now + 150,
+    context: { owner: 'S1', verification_of: of, task: '核验', acceptance, write: false },
+    structured: { summary: 's', criteria, files_changed: [], deviations: [], unresolved: [], blockers: [] } });
+  const listed = (id, of) => ({ job_id: id, execution_status: 'completed', finished_at: now + 200, started_at: now + 150, context: { owner: 'S1', verification_of: of } });
+  const run = async (source, args, jobs = [], finals = {}) => {
+    const h = harness({ config: { plannerAnswers: true, listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
+      reviewResult: { ...source, verification_status: args.status } } });
+    h.finals[source.job_id] = source;
+    Object.assign(h.finals, finals);
+    const value = await h.tools.codex_review.execute(args, { agent: agentAt('/work/current') });
+    return { value, h };
+  };
+  const review = { job_id: 'PARENT', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '我自己看过了' }] };
+  const items = ['读取原任务书', item('原验收第 1 条（原报告标 blocked）', 'CSV 解析测试通过')];
+  // 核验报告按抽查结论逐行汇报（4 行对 2 条验收）：第 2 行只是一条抽查，不能当作原验收第 1 条的结论。
+  const samples = [row('读取原任务书', 'met'), row('抽查 1', 'met'), row('抽查 2', 'not_met'), row('抽查 3', 'met')];
+  await assert.rejects(run(parent, review, [listed('V1', 'PARENT')], { V1: verifyJob('V1', 'PARENT', items, samples) }), /第 1 条为 blocked.*没有独立依据/);
+  // 同一份报告里有一行条文与核验项一致并判 met：算依据。
+  const named = [...samples, row(items[1], 'met')];
+  assert.equal((await run(parent, review, [listed('V1', 'PARENT')], { V1: verifyJob('V1', 'PARENT', items, named) })).value.verification_status, 'verified');
+  // 原报告多出一行 blocked、对不上验收原文：结案须在 report_rows 处理，记 met 需要核验对这一行的结论。
+  const wide = { ...parent, job_id: 'WIDE', structured: { ...parent.structured, criteria: [row('CSV 解析测试通过', 'met'), row('另查的一条', 'blocked')] } };
+  const base = { job_id: 'WIDE', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '复核通过' }] };
+  await assert.rejects(run(wide, base), /报告第 2 行标 blocked，对不上任何一条验收标准（报告 2 行、验收 1 条）/);
+  const withRow = { ...base, report_rows: [{ row: 2, status: 'met', evidence: '复核通过' }] };
+  await assert.rejects(run(wide, withRow), /报告第 2 行（对不上验收清单）为 blocked.*没有独立依据/);
+  const rowItems = ['读取原任务书', item('原报告第 2 行（原报告标 blocked，未对上原验收清单）', '另查的一条')];
+  const { value, h } = await run(wide, withRow, [listed('V2', 'WIDE')], { V2: verifyJob('V2', 'WIDE', rowItems, [row('读取原任务书', 'met'), row('改写过的核验项', 'met')]) });
+  assert.equal(value.verification_status, 'verified');
+  assert.deepEqual(JSON.parse(h.requests.find(({ argv }) => argv[0] === 'review').stdin).report_rows, withRow.report_rows);
+  // 工具参数声明了 accepted 和 report_rows：规划端按 schema 调用时能写出这两个字段。
+  const props = h.tools.codex_review.parameters.properties;
+  assert.equal(props.criteria.items.properties.accepted.type, 'string');
+  assert.deepEqual(props.report_rows.items.required, ['row', 'status', 'evidence']);
+  assert.equal(props.report_rows.items.properties.accepted.type, 'string');
+});
+
 test('routing is recorded in the job context and close-out refusals are logged with job ids only', async () => {
   const thread = { THREAD: [{ job_id: 'PARENT', thread_id: 'THREAD' }] };
   const h = harness({ config: { continueFreshAboveTokens: 100000, threadSizeResult: { status: 'completed', last_input_tokens: 250000 },

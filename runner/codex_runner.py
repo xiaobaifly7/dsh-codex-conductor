@@ -1520,7 +1520,7 @@ def blocking_summary(value):
 
 def validate_review(review, value, submitting=False):
     fields = {"status", "criteria", "notes", "accepted_deviations"}
-    if (not isinstance(review, dict) or not fields <= set(review) or set(review) - fields - {"blockers"} or
+    if (not isinstance(review, dict) or not fields <= set(review) or set(review) - fields - {"blockers", "report_rows"} or
             not isinstance(review["status"], str) or
             review["status"] not in ("verified", "needs_changes", "accepted_deviations") or
             not isinstance(review["notes"], str) or not valid_blockers(review.get("blockers", []))):
@@ -1547,6 +1547,20 @@ def validate_review(review, value, submitting=False):
             raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence; "
                              "accepted is only for a not_met/blocked criterion of an accepted_deviations review")
         indexes.append(criterion["index"])
+    # "report_rows" (optional): report rows flagged not_met/blocked that match no acceptance criterion
+    # (the report has a different number of rows); same status, evidence and "accepted" rules as criteria.
+    rows = review.get("report_rows", [])
+    row_count = len(report["criteria"]) if valid_report(report) else 0
+    if (not isinstance(rows, list) or any(
+            not isinstance(r, dict) or not {"row", "status", "evidence"} <= set(r) or set(r) - {"row", "status", "evidence", "accepted"} or
+            type(r["row"]) is not int or not 1 <= r["row"] <= row_count or
+            not isinstance(r["status"], str) or r["status"] not in ("met", "not_met", "blocked") or
+            not isinstance(r["evidence"], str) or not r["evidence"].strip() or
+            ("accepted" in r and (r["status"] == "met" or review["status"] != "accepted_deviations" or
+                                  not isinstance(r["accepted"], str) or not r["accepted"].strip()))
+            for r in rows) or len({r["row"] for r in rows}) != len(rows)):
+        raise ValueError("report_rows entries require a unique report row number, status and nonempty evidence; "
+                         "accepted is only for a not_met/blocked row of an accepted_deviations review")
     if sorted(indexes) != list(range(1, len(acceptance) + 1)):
         counts = Counter(indexes)
         expected = set(range(1, len(acceptance) + 1))
@@ -1578,10 +1592,10 @@ def validate_review(review, value, submitting=False):
             raise ValueError("Deviation acknowledgements require real unique indexes and nonempty evidence" + deviation_hint)
         acknowledged.add((deviation["kind"], deviation["index"]))
     if review["status"] != "needs_changes":
-        if (any(c["status"] != "met" and "accepted" not in c for c in criteria) or acknowledged != expected or review.get("blockers")):
+        if (any(c["status"] != "met" and "accepted" not in c for c in criteria + rows) or acknowledged != expected or review.get("blockers")):
             raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers" + deviation_hint)
     # Only new submissions: older stored reviews may already hold this contradiction and must stay readable.
-    elif submitting and all(c["status"] == "met" for c in criteria) and not review.get("blockers") and not expected:
+    elif submitting and all(c["status"] == "met" for c in criteria + rows) and not review.get("blockers") and not expected:
         raise ValueError("所有验收项都 met 且无阻塞/偏差时不能记 needs_changes；"
                          "被审对象（正文、产品）的缺陷写进 notes 或结论，审计任务本身记 verified；"
                          "若确有执行缺口，把对应 criterion 标 not_met 或加 blocker 并给出证据。")
@@ -2031,7 +2045,8 @@ def summarize_jobs(args):
         if closed:
             open_items = {k: [] for k in open_items}
         # Criteria a closing review accepted although they are not met stay visible after close-out.
-        accepted_open = [{"index": c["index"], "status": c["status"]} for c in (verification or {}).get("criteria", []) if c.get("accepted")]
+        accepted_open = ([{"index": c["index"], "status": c["status"]} for c in (verification or {}).get("criteria", []) if c.get("accepted")] +
+                         [{"row": r["row"], "status": r["status"]} for r in (verification or {}).get("report_rows", []) if r.get("accepted")])
         result.append({"group_id": kind + ":" + identifier, "thread_id": latest.get("thread_id"),
                        "job_ids": [j["job_id"] for j in rounds], "total_rounds": len(rounds),
                        "rounds": [{k: j.get(k) for k in ("job_id", "parent_job_id", "status", "execution_status",

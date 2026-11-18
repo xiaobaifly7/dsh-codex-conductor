@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM, VERIFY_ROW, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -434,7 +434,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
     (fixed ? '\n## 用户的固定要求\n以下要求适用于每一单，不增加权限，也不扩大范围；与上面的任务、验收标准或执行约束冲突时，' +
       `以上面的为准，并在 deviations 里说明。\n${fixed}\n` : '') +
-    '\n## 最后汇报\n最终答复只输出符合给定 JSON 格式的对象：summary 概述结果；criteria 按上面的顺序逐条给出 ' +
+    '\n## 最后汇报\n最终答复只输出符合给定 JSON 格式的对象：summary 概述结果；criteria 按上面的顺序逐条给出（条数与验收标准相同，一条对一条，不拆分、不合并、不另加）' +
     'status（met / not_met / blocked）和 evidence（具体证据：命令与输出、文件与行号）；files_changed 列出改动的文件；' +
     'deviations 列出与计划不一致的地方及原因（没有就空数组）；unresolved 列出没解决的问题。\n' +
     'blockers 列出真实阻塞，没有就 []；每项包含唯一 id、kind、message、question、resolution 五个字符串。' +
@@ -469,8 +469,9 @@ function verificationTask(source, { focus = '', samples = 8 } = {}) {
     `重点：${focus || '优先核对关键结论、数字和引用。'}\n` +
     `独立抽查 ${samples} 条带出处的结论；不足 ${samples} 条则全部核对，并说明实际条数。不要只复述原报告。\n` +
     `逐条回到原始出处，检查原文、上下文、数字与计算；找不到出处、出处不支持结论时明确说无法确认，不要猜测。\n` +
-    `每条在 criteria 的 evidence 中单独一行写明：核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
-    `按 report.v2.schema.json 返回；不属实用 not_met，无法确认用 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
+    `criteria 只按验收标准逐条给出，条数与验收标准相同，不要为每条抽查结论另加一行。抽查的每条结论写在第 3 条验收的 evidence 里，各占一行：` +
+    `核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
+    `按 report.v2.schema.json 返回；第 3 条在有结论不属实时记 not_met，没有不属实但有无法确认时记 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
     `这是只读核验，写入范围为空：不要修改产物、源码、日志或系统状态，不要运行会产生写入的测试或命令；files_changed 必须为 []。`;
 }
 
@@ -982,12 +983,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   // 原报告自标未满足的条目各有哪些独立依据：晚于这一轮结束、核验本单元的核验任务判这一条 met；同一单元的后续轮次报告这一条 met；
   // 原会话用户在作业结束后有过真实回复（与 accepted_deviations 的用户确认同一判定，但不因 plannerAnswers 放宽）。
+  const openAccepted = (review) => [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]
+    .some((c) => typeof c?.accepted === 'string' && c.accepted.trim());
   async function criterionSupport(source, owner, log, signal) {
     const flagged = flaggedCriteria(source);
     const support = {};
     if (!flagged.length) return support;
     const add = (index, kind) => { (support[index] ??= []).includes(kind) || support[index].push(kind); };
-    if (hasUserReply(log, source, owner, cfg.autoResume.message)) for (const f of flagged) add(f.index, 'user');
+    if (hasUserReply(log, source, owner, cfg.autoResume.message)) for (const f of flagged) add(f.key, 'user');
     const jobs = [];
     const from = Number.isFinite(source.started_at) ? source.started_at : evidenceFrom;
     for (let offset = 0; offset !== null && offset < 500;) {
@@ -1005,15 +1008,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const report = full.structured;
       const acceptance = full.context?.acceptance;
       if (!validReport(report) || !Array.isArray(acceptance)) continue;
+      // 报告行按条文或（条数相同时）位置对应验收项；对不上的行不当作任何一条的结论。
       if (full.context?.verification_of) {
         acceptance.forEach((item, i) => {
-          const m = VERIFY_ITEM.exec(item);
-          if (m && report.criteria[i]?.status === 'met' && flagged.some((f) => f.index === Number(m[1]))) add(Number(m[1]), 'verification');
+          const m = VERIFY_ITEM.exec(item) ?? VERIFY_ROW.exec(item);
+          const key = m && (m[0].startsWith('原验收') ? String(m[1]) : `row${m[1]}`);
+          if (m && reportRowOf(acceptance, report.criteria, i + 1)?.status === 'met' && flagged.some((f) => f.key === key)) add(key, 'verification');
         });
       } else {
         for (const f of flagged) {
           const i = acceptance.findIndex((a) => a.trim() === String(f.criterion ?? '').trim());
-          if (i >= 0 && report.criteria[i]?.status === 'met') add(f.index, 'later_round');
+          if (i >= 0 && reportRowOf(acceptance, report.criteria, i + 1)?.status === 'met') add(f.key, 'later_round');
         }
       }
     }
@@ -2084,6 +2089,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
   });
 
+  const ACCEPTED_FIELD = { type: 'string', minLength: 1, description: '只用于 accepted_deviations 里保留 not_met/blocked 的条目：为什么接受这一条未满足。其他情况省略。' };
   ctx.tools.register({
     name: 'codex_review',
     description: '规划端独立检查后记录逐条验收证据，保留 Codex 原报告。verified=全部核验通过，needs_changes=仍需修正，' +
@@ -2093,13 +2099,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes。' +
       '被拒时回执附一份可直接修改提交的骨架，只需替换其中的占位。' +
       'verified 不能与原报告矛盾：报告自标 not_met/blocked 的条目要写你自己的核验证据；报告的未决项和阻塞须在 notes 逐项写「unresolved#N: 依据」「blocker:<id>: 依据」。' +
+      'accepted_deviations 可以把核实后仍未满足的条目保留 not_met/blocked，并在该条目的 accepted 写接受原因。' +
       'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
       criteria: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
-          evidence: { type: 'string', minLength: 1 } }, required: ['index', 'status', 'evidence'] } },
+          evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD }, required: ['index', 'status', 'evidence'] } },
+      report_rows: { type: 'array', description: 'Codex 报告行数与验收条数不同时，报告自标 not_met/blocked 又对不上任何验收原文的行，按报告行号（从 1 起）逐行记录；规则与 criteria 相同。没有这种行时省略。',
+        items: { type: 'object', additionalProperties: false, properties: { row: { type: 'integer', minimum: 1 },
+          status: { type: 'string', enum: ['met', 'not_met', 'blocked'] }, evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD },
+        required: ['row', 'status', 'evidence'] } },
       notes: { type: 'string', description: '没有补充说明可省略。' },
       accepted_deviations: { type: 'array', description: cfg.plannerAnswers
         ? '规划端按用户原始目标和已有事实接受偏差或范围外改动时，逐项记录决定依据；没有时可省略。' + PLANNER_ANSWERS
@@ -2129,7 +2140,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
       // “未满足但接受”的条目与接受偏差同一道用户确认。
       if (((Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0) ||
-          (Array.isArray(review.criteria) && review.criteria.some((c) => typeof c?.accepted === 'string' && c.accepted.trim()))) &&
+          openAccepted(review)) &&
           !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
@@ -2140,8 +2151,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const result = await conductor.review(job_id, review, owner, exec?.signal);
       if (['verified', 'accepted_deviations'].includes(review.status) && result.verification_status === review.status) {
         // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
-        const flaggedMet = flaggedCriteria(source).some((f) => review.criteria.some((c) => c?.index === f.index && c.status === 'met'));
-        countCloseout(owner, review.criteria.some((c) => typeof c?.accepted === 'string' && c.accepted.trim()) ? 'accepted_open'
+        const flaggedMet = flaggedCriteria(source).some((f) => (f.row ? review.report_rows ?? [] : review.criteria)
+          .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
+        countCloseout(owner, openAccepted(review) ? 'accepted_open'
           : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
       }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
