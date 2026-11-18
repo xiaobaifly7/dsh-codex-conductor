@@ -72,8 +72,29 @@ test('close-out guard picks unreviewed flagged jobs and needs_changes without fo
   assert.deepEqual(pending, { unreviewed: ['A'], needsChanges: ['NC'] });
   const message = closeoutRefusal('codex_run', pending);
   assert.match(message, /codex_review 记录：A。/);
-  assert.match(message, /needs_changes 但没有后续轮次：NC；/);
+  assert.match(message, /needs_changes 尚未结案，最新轮次：NC；/);
   assert.equal(closeoutRefusal('codex_run', { unreviewed: [], needsChanges: [] }), '');
+});
+
+test('new rework debt follows the latest execution round until a successor closes it', () => {
+  const original = { job_id: 'ROOT', thread_id: 'original', started_at: 100, finished_at: 110,
+    execution_status: 'completed', verification_status: 'needs_changes', verification: { time: 150 } };
+  const child = { job_id: 'NEXT', parent_job_id: 'ROOT', thread_id: 'new-thread', started_at: 160,
+    execution_status: 'completed', verification_status: 'unreviewed', finished_at: 170 };
+  const resumed = { ...child, job_id: 'LATEST', parent_job_id: null, started_at: 180, finished_at: 190 };
+  const debt = (...jobs) => pendingCloseout(jobs, 90, 120).needsChanges;
+  assert.deepEqual(debt(original), ['ROOT']);
+  for (const execution_status of ['failed', 'cancelled', 'running', 'completed']) {
+    assert.deepEqual(debt({ ...resumed, execution_status }, original, child), ['LATEST']);
+  }
+  for (const verification_status of ['verified', 'accepted_deviations']) {
+    assert.deepEqual(debt(original, child, { ...resumed, verification_status }), []);
+  }
+  assert.deepEqual(debt(original, { ...child, context: { verification_of: 'ROOT' }, verification_status: 'verified' }), ['ROOT']);
+  assert.deepEqual(debt({ ...original, verification: { time: 119 } }, child), []);
+  const flagged = { ...child, report_status: 'valid', review_status: 'needs_attention' };
+  const jobs = [original, flagged];
+  assert.deepEqual(closeoutDeferral(jobs, pendingCloseout(jobs, 90, 120), 'NEXT'), { job_id: 'NEXT', via: 'verify_previous' });
 });
 
 test('close-out cut-off is written once and then kept', (t) => {

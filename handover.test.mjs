@@ -395,7 +395,7 @@ test('in an extremely long brief the next step and the pending close-out still s
   assert.deepEqual(brief.match(/^## .*/gm).map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 待收尾']);
   assert.match(brief, /## 下一步\n先返工 J1998/);
   assert.match(brief, /尚未 codex_review：J2000、J1999/);
-  assert.match(brief, /还没有后续轮次：J1998/);
+  assert.match(brief, /needs_changes 尚未结案，最新轮次：J1998/);
 });
 
 test('after a hand-over the plugin checks goal, settings, jobs, delivery and the frozen predecessor, and reports issues without rolling back', async (t) => {

@@ -5384,6 +5384,22 @@ test('close-out guard refuses new-work codex_run until finished jobs are reviewe
   assert.equal((await goalWith(fresh(), [{ type: 'tool/call', data: { name: 'tool_call', arguments: '{"name":"codex_verify"}' } }])).isError, true);
 });
 
+test('Goal completion warns only for clean unreviewed write jobs', async () => {
+  const clean = { job_id: 'WRITER', started_at: Date.now() / 1000, finished_at: Date.now() / 1000 + 1,
+    execution_status: 'completed', report_status: 'valid', review_status: 'needs_verification',
+    verification_status: 'unreviewed', context: { write: true } };
+  const jobs = [clean, { ...clean, job_id: 'READER', context: { write: false } },
+    { ...clean, job_id: 'REVIEWED', verification_status: 'verified' }];
+  const h = harness({ config: { closeoutGuard: true, listResult: { jobs, total: jobs.length } } });
+  const result = await h.handlers['tools/execute']({ name: 'update_goal', arguments: { action: 'complete' },
+    agent: agentAt('/work/original', [{ type: 'tool/call', data: { name: 'codex_run' } }]) },
+  async () => ({ value: 'done', content: [{ type: 'text', text: 'Goal completed' }] }));
+  assert.equal(result.value, 'done');
+  assert.equal(result.content[0].text, 'Goal completed');
+  assert.match(result.content[1].text, /codex_review：WRITER。/);
+  assert.doesNotMatch(result.content[1].text, /READER|REVIEWED/);
+});
+
 test('close-out guard leaves codex_continue and codex_run with resume allowed while jobs await close-out', async () => {
   const parent = withReport(workflowSource('task_conflict'));
   const latest = withReport({ ...workflowSource('implementation'), job_id: 'CHILD' });
@@ -5447,7 +5463,7 @@ test('codex_run may dispatch non-overlapping new work while the only unreviewed 
   await assert.rejects(run(harnessFor([done('A'), check('V1', 'completed'), { ...check('V2', 'running') }])), /未收尾/);
   await assert.rejects(run(harnessFor([done('A'), check('V1', 'running'), done('B')])), /未收尾.*A、B/);
   // 核验判 needs_changes 后记下：A 要先返工（codex_continue 不受护栏限制），新单被拒。
-  await assert.rejects(run(harnessFor([done('A', { verification_status: 'needs_changes' }), check('V1', 'completed')])), /needs_changes 但没有后续轮次：A/);
+  await assert.rejects(run(harnessFor([done('A', { verification_status: 'needs_changes' }), check('V1', 'completed')])), /needs_changes 尚未结案，最新轮次：A/);
   // 本单带 verify_previous: A：放行，同时派出核验。
   const vp = harnessFor([done('A')]);
   const viaParam = await run(vp, { verify_previous: 'A' });

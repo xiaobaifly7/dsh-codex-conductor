@@ -221,7 +221,7 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
     // 待收尾很短却是接手时最要紧的，与“下一步”同为 1，永不省略。
     { priority: 1, title: '待收尾', lines: ['## 待收尾',
       `- 报告有标记、尚未 codex_review：${fit(pending.unreviewed, 1000).join('、') || '无'}`,
-      `- 记了 needs_changes、还没有后续轮次：${fit(pending.needsChanges, 1000).join('、') || '无'}`,
+      `- needs_changes 尚未结案，最新轮次：${fit(pending.needsChanges, 1000).join('、') || '无'}`,
       ...(running.length ? ['- 仍在运行（这些任务随交接转给本会话：用 codex_status 等待并验收，不要重派；结束通知会转到本会话）：',
         ...running.map((j) => `  - ${j.job_id}：${firstLine(j.context?.task, 60).replace(/\|/g, '/') || '（无标题）'}` +
           `${Number.isFinite(j.started_at) ? `（已运行 ${Math.max(0, Math.round((Date.parse(at) / 1000 - j.started_at) / 60))} 分钟）` : ''}`)]

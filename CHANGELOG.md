@@ -2,7 +2,7 @@
 
 [English](#english)
 
-`0.9.122` 的 `runnerAgentsMd: bundled` 可选用随包附带的短版执行指令，默认仍沿用用户文件。派单可用 `must_verify` 标记必须实测的验收项，核验优先覆盖，结案记 `met` 须有独立核验结果。
+`0.9.122` 的 `runnerAgentsMd: bundled` 可选用随包附带的短版执行指令，默认仍沿用用户文件。派单可用 `must_verify` 标记必须实测的验收项，核验优先覆盖，结案记 `met` 须有独立核验结果。本版首次加载后记录的返工欠账跟踪到后继轮复核通过，Goal 完成时提醒干净但未复核的写入任务。
 
 `0.9.121` 改写派单和执行提示。规划端按可独立验收的结果拆单，派单前核对写入权限、运行前置和本轮可取得的证据。执行端遇到方法不可用时，在原授权内换等价方法，区分实测不符的 `not_met` 和缺前置的 `blocked`，并明确关键观测、清理或恢复失败须以非零状态退出。
 
@@ -140,7 +140,7 @@
 
 ## English
 
-`0.9.122` adds the opt-in `runnerAgentsMd: bundled` for the shipped short executor instructions. The default still uses the user's file. Dispatches can mark criteria with `must_verify`. Verification checks them first, and closeout requires an independent verification result to mark them `met`.
+`0.9.122` adds the opt-in `runnerAgentsMd: bundled` for the shipped short executor instructions. The default still uses the user's file. Dispatches can mark criteria with `must_verify`. Verification checks them first, and closeout requires an independent verification result to mark them `met`. Rework debt recorded from this version's first load stays open until a successor passes review. Goal completion warns about clean unreviewed write jobs.
 
 `0.9.121` revises dispatch and execution prompts. The planner splits work into independently verifiable outcomes and checks write permissions, runtime prerequisites and available evidence before dispatching. Codex can use equivalent methods within the original authorization, distinguishes observed mismatches (`not_met`) from missing prerequisites (`blocked`), and must surface critical observation, cleanup or recovery failures with a nonzero script exit.
 

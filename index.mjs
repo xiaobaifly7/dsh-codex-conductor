@@ -981,6 +981,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 独立依据规则从本机第一次加载这一版起生效；之前结束的任务按 planner 规则（0.9.103）结案，不会因升级变难收尾。
   const evidenceFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     Date.now() / 1000, 'closeout-evidence-since.json');
+  const reworkFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+    Date.now() / 1000, 'closeout-rework-since.json');
   const evidenceLevel = (source) => {
     const level = cfg.closeoutEvidence ?? 'independent';
     if (level !== 'independent') return level;
@@ -1491,11 +1493,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   // plan（只有 codex_run 传）：{ args, exec, guard }。唯一的待验收任务正在核验时放行不重叠的新任务，guard.deferred 记下放行依据。
-  async function closeoutCheck(owner, tool, signal, plan) {
-    if (cfg.closeoutGuard === false || !owner) return '';
+  async function closeoutCheck(owner, tool, signal, plan, goal) {
+    if ((!goal && cfg.closeoutGuard === false) || !owner) return '';
     try {
       const jobs = await sessionJobs(owner, signal);
-      const pending = pendingCloseout(jobs, closeoutFrom);
+      if (goal) goal.unreviewedWrites = jobs.filter(job => job?.context?.write === true && !job.context.verification_of &&
+        job.execution_status === 'completed' && job.report_status === 'valid' && job.review_status === 'needs_verification' &&
+        job.verification_status === 'unreviewed').map(job => job.job_id);
+      if (cfg.closeoutGuard === false) return '';
+      const pending = pendingCloseout(jobs, closeoutFrom, reworkFrom);
       const deferred = plan && closeoutDeferral(jobs, pending, plan.args.verify_previous);
       if (deferred) {
         // 核验已在跑：与 verify_previous 同一道重叠检查（verify_previous 的重叠在派单前已经查过）。
@@ -2505,8 +2511,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         return { isError: true, error: { message }, content: [{ type: 'text', text: `Error: ${message}` }] };
       }
     }
+    let goal;
     if (exec.name === 'update_goal' && goalAction(exec.arguments) === 'complete' && usedConductor(exec.agent)) {
-      const refusal = await closeoutCheck(exec.agent?.id, 'update_goal', exec.signal);
+      goal = {};
+      const refusal = await closeoutCheck(exec.agent?.id, 'update_goal', exec.signal, undefined, goal);
       if (refusal) return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
     }
     if (inWorkspace(sessionCwd(exec), cfg.roots)) {
@@ -2540,6 +2548,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ? { value: { ...result.value, session_history: value, ...(acceptance ? { acceptance_stats: acceptance } : {}),
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
+    }
+    if (goal?.unreviewedWrites?.length) {
+      const result = await next();
+      if (result.isError) return result;
+      const text = `以下写入任务报告无异常，尚未经过 codex_review：${goal.unreviewedWrites.join('、')}。`;
+      return { ...result, content: [...(result.content ?? []), { type: 'text', text }] };
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。
     if (exec.name !== 'job_output' || exec.arguments?.wait === true || !exec.agent?.id) return next();
@@ -2625,7 +2639,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       retired: (id) => Boolean(aliases.successor(id)),
       archived: (id) => Boolean(ctx.get?.('workspaceRegistry')?.archivedSessionIds?.includes?.(id)) });
     registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,
-      sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom),
+      sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom, reworkFrom),
       disableAutoContinue: cfg.autoHandover.disableAutoContinue,
       // 交接时通过宿主设置服务关掉旧会话在 dsh-client-auto-continue 里的自动继续；没装该插件时什么都不做。
       autoContinue: (id) => autoContinueFromSettings(ctx.get?.('settings'))(id),

@@ -308,27 +308,48 @@ export function reviewRejection(jobId, source, { fixed, problems, review }) {
     '\n结论和证据由你核验后填写，插件不会代填。';
 }
 
-// 收尾护栏：本会话已结束、报告有标记却没有 codex_review 的任务，以及 needs_changes 后既无后续轮次也无新核验的任务。
-// 核验任务（verification_of）的验收记在原任务上；取消、无有效报告的失败和截止时间之前结束的任务都不拦。
-export function pendingCloseout(jobs, since) {
+// 后续重开线程靠 parent_job_id 关联，原线程里的 resume 靠 thread_id 关联。
+function pendingRework(job, rounds) {
+  const ids = new Set([job.job_id]);
+  const threads = new Map(job.thread_id ? [[job.thread_id, job.started_at]] : []);
+  let latest = job;
+  for (const other of rounds) {
+    if (other.job_id === job.job_id ||
+        !(ids.has(other.parent_job_id) || other.started_at > threads.get(other.thread_id))) continue;
+    if (other.execution_status === 'completed' && ['verified', 'accepted_deviations'].includes(other.verification_status)) return null;
+    ids.add(other.job_id);
+    if (other.thread_id && !threads.has(other.thread_id)) threads.set(other.thread_id, other.started_at);
+    latest = other;
+  }
+  return latest.job_id;
+}
+
+// 核验任务的验收记在原任务上。新口径只跟踪本版加载之后记录的 needs_changes。
+export function pendingCloseout(jobs, since, reworkSince = Infinity) {
   const unreviewed = [];
-  const needsChanges = [];
+  const needsChanges = new Set();
+  const rounds = jobs.filter(job => job && !job.context?.verification_of).sort((a, b) => a.started_at - b.started_at);
   for (const job of jobs) {
     if (!job || job.context?.verification_of || !(job.finished_at >= since)) continue;
     if (job.verification_status === 'unreviewed' && job.review_status === 'needs_attention' &&
         ['completed', 'failed'].includes(job.execution_status) && job.report_status === 'valid') unreviewed.push(job.job_id);
-    else if (job.verification_status === 'needs_changes' && !jobs.some((other) => other && other.job_id !== job.job_id &&
-        (other.parent_job_id === job.job_id || (job.thread_id && other.thread_id === job.thread_id && other.started_at > job.started_at)))) {
-      needsChanges.push(job.job_id);
+    else if (job.verification_status === 'needs_changes') {
+      if (job.verification?.time >= reworkSince) {
+        const latest = pendingRework(job, rounds);
+        if (latest) needsChanges.add(latest);
+      } else if (!jobs.some(other => other && other.job_id !== job.job_id &&
+          (other.parent_job_id === job.job_id || (job.thread_id && other.thread_id === job.thread_id && other.started_at > job.started_at)))) {
+        needsChanges.add(job.job_id);
+      }
     }
   }
-  return { unreviewed, needsChanges };
+  return { unreviewed, needsChanges: [...needsChanges] };
 }
 
 // 核验中放行：唯一的待验收任务正由它的第一次核验处理（核验在跑，或本次调用用 verify_previous 派核验），且没有别的待收尾任务时，
 // 允许派不重叠的新任务。每个任务只放行一次：已有结束的核验就不再放行，核验结束后照常要先验收，所以不能靠连环核验一直拖着不验收。
 export function closeoutDeferral(jobs, { unreviewed, needsChanges }, deferFor) {
-  if (unreviewed.length !== 1 || needsChanges.length) return null;
+  if (unreviewed.length !== 1 || needsChanges.some(id => id !== unreviewed[0])) return null;
   const [id] = unreviewed;
   const checks = jobs.filter((job) => job?.context?.verification_of === id);
   if (checks.some((job) => job.execution_status !== 'running')) return null;
@@ -341,7 +362,7 @@ export function closeoutRefusal(tool, { unreviewed, needsChanges }) {
   return `${tool}: 本会话还有已结束但未收尾的 Codex 任务，${tool === 'update_goal' ? '会话目标暂不能标记完成' : '未启动新任务'}。` +
     (unreviewed.length ? `报告标出问题却没有验收记录，先用 codex_review 记录：${unreviewed.join('、')}。` : '') +
     (unreviewed.length && tool === 'codex_run' ? `需要核验再记的：${deferralPath(unreviewed)}（同一时间只放行一个待验收任务，每个任务只放行一次）。` : '') +
-    (needsChanges.length ? `已记 needs_changes 但没有后续轮次：${needsChanges.join('、')}；用 codex_continue 或带 resume 的 codex_run 返工，` +
+    (needsChanges.length ? `needs_changes 尚未结案，最新轮次：${needsChanges.join('、')}；用 codex_continue 或带 resume 的 codex_run 返工，` +
       '或核实后用 codex_review 记 accepted_deviations（写明理由）或 verified。' : '') +
     'codex_continue、codex_verify、codex_review、codex_status、codex_output、codex_cancel 仍可使用。';
 }
