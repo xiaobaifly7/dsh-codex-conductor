@@ -1203,7 +1203,7 @@ test('a background Gemini record is labelled', async (t) => {
 test('the hand-over section submits from suggestions, prompts and links, and explains refusals in plain words', async (t) => {
   const service = panelService();
   service.status.handover = { mode: 'confirm',
-    suggestions: [{ sessionId: 'session-big', cwd: 'D:\\work', messages: 6200, suggest: true }],
+    suggestions: [{ sessionId: 'session-big', cwd: 'D:\\work', messages: 6200, suggest: true, blocked: '会话链已交接 6 次，达到自动交接上限 6 次。' }],
     prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }],
     links: [{ from: 'session-old', to: 'session-new', at: '2026-11-17T02:00:00.000Z', origin: 'auto', autoContinue: 'manual_required' }],
     result: { status: 'refused', reason: 'jobs_running', from: 'session-big', running: ['J1', 'J2'], origin: 'panel' },
@@ -1214,7 +1214,7 @@ test('the hand-over section submits from suggestions, prompts and links, and exp
   const section = () => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接');
   const shown = () => text(section());
   for (const value of ['空闲时询问，同意后交接', 'session-big', 'D:\\work · 6200 条消息', 'session-old → session-new', '自动交接',
-    '当前有 2 个 Codex 任务在运行，结束后再交接。', '最近的交接记录']) assert.ok(shown().includes(value), value);
+    '达到自动交接上限 6 次', '当前有 2 个 Codex 任务在运行，结束后再交接。', '最近的交接记录']) assert.ok(shown().includes(value), value);
   const posts = () => host.requests.filter((request) => request.body);
   // 建议列表：点开填一句下一步，确认后才提交。
   await click(host, '交接到新会话');

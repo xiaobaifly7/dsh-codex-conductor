@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.127` 会话交接按链保存人工用户指令原文和时间。交接单保留近期指令，并给出完整档案的路径、条数和时间范围。继任会话在 `plannerReads: products` 下也可读取这一个档案。交接自检查文件和条数，档案写入失败会报告但仍交接。自动交接新增链深度上限 `maxChainDepth` 和链级间隔 `minHoursBetween`，两者默认 6，均可设为 0 关闭相应限制。面板显示拦截原因，手动交接仍可用。
+
 `0.9.126` 统一规划端的派单与等待提示。长等前先后台派齐独立且 scope 和写入目标互不重叠的只读调查、核验或写任务，再并行等待多单。写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须逐单完成并核对。
 
 `0.9.125` 处理 0.9.124 上线后看到的三处问题。未完成项台账只增不减：后续轮次的结案复核把某条记为 met 时，可销掉前几轮同一条的未完成项，条件全部满足才销——后续轮次经父链（十跳内）接在前一轮之后、同一交接链、验收清单等长且该编号原文相同且在两边都只出现一次、后续轮次报告这一条为 met、复核记 met、条目早于这次复核入账；查询失败不销。销掉的条目移入 `cleared`（`codex_summary` 显示由哪一轮销掉）。读取台账时标出后续轮次已报告满足、还没销掉的条目，后续轮次的完成通知点名可一并销掉的前一轮条目。跨版本切换时在跑、结束后没人派核验的任务：加载或热重载时补派最多两单，会话每次调用 `codex_*` 后再补一单（60 秒一次，不占调用时间），已复核、已有后续轮次或已有核验的不派。核验在跑时可以先交结案复核：只缺未完成项依据、没有缺依据的 met、用户确认已过时，复核挂起（`parked-reviews.json`），核验结束后插件只读判定，在核验完成通知里给出“可原样提交”的复核或拒绝原因和骨架，由规划端再提交一次；插件自己从不写复核。挂起期间 `update_goal(complete)` 被拒。自动核验的通知改成“现在就可以记 codex_review，然后去派不重叠的下一单”。报告行与验收项对应时，原文相同的行优先于按位置对上的行。
@@ -147,6 +149,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.127` Archives the original text and timestamps of human user instructions per hand-over chain. The brief keeps its recent-instructions section and gives the archive path, count and time range. Linked successors can read that exact archive under `plannerReads: products`. The self-check verifies that the file exists and still has enough entries. A write failure is reported and hand-over proceeds. Automatic hand-over now has a chain depth limit (`maxChainDepth`) and a chain-wide interval in hours (`minHoursBetween`), both defaulting to 6. Set either to 0 to disable that limit. The panel shows why an automatic hand-over was blocked and keeps manual hand-over available.
 
 `0.9.126` aligns planner dispatch and wait guidance. Dispatch the batch of independent investigations, verifications, and writes with disjoint scopes and write targets before waiting on multiple jobs in parallel. Finish and check each write before dispatching the next when they share a file, directory, workspace, host, VM or service, or have dependencies.
 

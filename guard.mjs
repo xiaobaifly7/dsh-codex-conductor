@@ -1043,7 +1043,7 @@ export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd
   return targets.every(Boolean) ? targets : null;
 }
 
-export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '', refreshTimeoutMs = 3_000 } = {}) {
+export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '', refreshTimeoutMs = 3_000, handoverArchive = () => undefined } = {}) {
   const sessions = new Map();
   const limit = 10_000;
   const stateFor = (owner) => {
@@ -1118,7 +1118,10 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
       if (cfg.plannerReads === 'open') return GEMINI_UNKNOWN_DENY;
     }
     if (cfg.plannerReads === 'open') return undefined;
-    if (targets && targets.every(file => allowed(file, state, directories))) return undefined;
+    if (targets) {
+      const archive = readPath(handoverArchive(owner));
+      if (targets.every(file => file === archive || allowed(file, state, directories))) return undefined;
+    }
     if (targets && state && !state.pending && now() - state.refreshed >= 25_000) {
       state.refreshed = now();
       state.pending = Promise.resolve().then(() => refresh(owner)).then(value => {

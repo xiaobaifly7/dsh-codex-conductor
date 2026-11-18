@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, lastSuccessor, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -931,6 +931,7 @@ function settings(config, logger) {
     const value = autoHandover[key];
     const valid = key === 'mode' ? ['off', 'notify', 'confirm', 'auto'].includes(value)
       : key === 'remindStepMessages' ? Number.isSafeInteger(value) && value > 0
+      : key === 'maxChainDepth' ? Number.isSafeInteger(value) && value >= 0
       : ['disableAutoContinue', 'withRunningJobs'].includes(key) ? typeof value === 'boolean'
       : Number.isFinite(value) && value >= 0;
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 autoHandover.${key}，使用默认值`);
@@ -1193,7 +1194,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const values = await Promise.all(aliases.owners(owner).map((id) => conductor.products(id)));
     return values.find((v) => v?.status !== 'completed' || !Array.isArray(v.paths)) ??
       { ...values[0], owner, paths: values.flatMap((v) => v.paths) };
-  }, { plannerFile });
+  }, { plannerFile, handoverArchive: (owner) => {
+    if (!stateDirectory || !owner) return;
+    const links = aliases.links();
+    const root = aliases.predecessors(owner, links).at(-1);
+    if (root && links[owner]?.instructions?.root === root) return instructionArchivePath(stateDirectory, root);
+  } });
   const productJobs = new Map();
   // 交接后后继会话也是前任会话任务的归属方；没有交接记录时只认本会话。
   const aliases = createAliases(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
@@ -3069,7 +3075,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
   registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
-    history: () => history.snapshot(), handover: () => autoHandover.snapshot(history.snapshot().sessions), autoAnswer,
+    history: () => history.snapshot(), handover: () => {
+      const { sessions, threshold } = history.snapshot();
+      return autoHandover.snapshot(sessions, threshold);
+    }, autoAnswer,
     answerHandover: async (id, accept) => {
       const value = autoHandover.answer(id, accept);
       // 会话此刻正停着（没有回合在跑）就不等下一个回合边界，马上按自动交接的流程走。

@@ -248,7 +248,7 @@ window.__ModuleLoader__.load({
     const HANDOVER_MODES = { off: '关闭（只标记建议交接）', notify: '只提醒', confirm: '空闲时询问，同意后交接', auto: '空闲时自动交接' };
     const QUEUED_HINT = '旧会话输入框里还有排队未发的消息的话，请先发出或清空——它们不会跟到新会话。';
     const CHECK_TEXT = { goal: '目标逐字接上', settings: '预设、模型、权限和工作目录一致', jobs: '新会话能查到待处理的任务', delivered: '交接单已送达',
-      predecessorFrozen: '旧会话已冻结', workspace: '新会话在原会话的分组里' };
+      instructions: '完整用户指令档案', predecessorFrozen: '旧会话已冻结', workspace: '新会话在原会话的分组里' };
     const ORIGIN_TEXT = { panel: '面板', auto: '自动交接', confirm: '询问后同意', tool: '工具', file: '请求文件', startup: '启动修复' };
     // 交接被拒或撤回被拦时，把结果里的原因说成人话。
     function handoverReason(result) {
@@ -913,6 +913,7 @@ window.__ModuleLoader__.load({
               handover.suggestions.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '建议交接的会话' }, ...handover.suggestions.map((item) =>
                 h('li', { key: item.sessionId, className: 'dcc-job' },
                   h('strong', null, item.sessionId), h('small', null, `${item.cwd || '工作目录未知'} · ${item.messages} 条消息`),
+                  item.blocked ? h('small', { className: 'dcc-warn' }, item.blocked) : null,
                   h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(`handover:${item.sessionId}`) }, '交接到新会话'),
                   confirmSession === `handover:${item.sessionId}` ? h('div', { className: 'dcc-confirm' },
                     h('label', { className: 'dcc-field' }, h('span', null, '给新会话的下一步（可空）'),

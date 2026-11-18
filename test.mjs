@@ -1499,6 +1499,30 @@ test('products middleware refuses failed or timed-out recovery without dispatchi
   }
 });
 
+test('products permits only the linked successor to read its exact instruction archive across reload and revert', async (t) => {
+  const { createAliases, instructionArchivePath } = await import('./handover.mjs');
+  const directory = path.join(localAppData, 'dsh-codex-conductor');
+  const aliases = createAliases(directory);
+  const root = 'archive-root', successor = 'archive-successor';
+  const file = instructionArchivePath(directory, root);
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify([{ text: '保留原文', at: '2026-11-19T00:00:00Z' }]));
+  aliases.link(root, successor, { instructions: { root, count: 1 } });
+  t.after(() => { if (aliases.successor(root)) aliases.unlink(root, successor); });
+  const read = (h, id, targets = { path: file }) => hostExecute(h,
+    { name: 'read', arguments: targets, agent: { ...agentAt('/repo'), id } },
+    async () => ({ content: [{ type: 'text', text: readFileSync(file, 'utf8') }] }));
+  const config = { workspaces: ['/repo'], plannerReads: 'products' };
+  const h = harness({ config });
+  assert.match((await read(h, successor)).content[0].text, /保留原文/);
+  assert.equal((await read(h, 'unrelated')).isError, true);
+  assert.equal((await read(h, successor, { paths: [file, path.join(path.dirname(file), 'unrelated.json')] })).isError, true);
+  const reloaded = harness({ config });
+  assert.match((await read(reloaded, successor)).content[0].text, /保留原文/);
+  aliases.unlink(root, successor);
+  assert.equal((await read(reloaded, successor)).isError, true);
+});
+
 function workflowSource(kind = 'user_input') {
   return { job_id: 'PARENT', status: 'completed', thread_id: 'THREAD', cwd: '/work/original', sandbox: 'workspace-write',
     scope: ['src'], scope_paths: ['/work/original/src'],
@@ -5657,7 +5681,8 @@ test('a long session gets one hand-over suggestion per turn on codex_run and cod
 });
 
 test('auto hand-over settings default to confirm, warn and default invalid fields one by one and list unknown sub-keys', async () => {
-  const defaults = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true, withRunningJobs: true };
+  const defaults = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true,
+    withRunningJobs: true, maxChainDepth: 6, minHoursBetween: 6 };
   const cases = [
     { value: undefined, expected: defaults, warn: null },
     { value: { mode: 'auto', cooldownHours: 0.5, startupDelayMinutes: 0, disableAutoContinue: false }, warn: null,
@@ -5669,6 +5694,10 @@ test('auto hand-over settings default to confirm, warn and default invalid field
     { value: { startupDelayMinutes: '10' }, expected: defaults, warn: 'autoHandover.startupDelayMinutes' },
     { value: { disableAutoContinue: 'no' }, expected: defaults, warn: 'autoHandover.disableAutoContinue' },
     { value: { withRunningJobs: 'yes' }, expected: defaults, warn: 'autoHandover.withRunningJobs' },
+    { value: { maxChainDepth: 0, minHoursBetween: 0 }, expected: { ...defaults, maxChainDepth: 0, minHoursBetween: 0 }, warn: null },
+    { value: { minHoursBetween: 0.5 }, expected: { ...defaults, minHoursBetween: 0.5 }, warn: null },
+    ...[-1, 2.5, '6'].map((value) => ({ value: { maxChainDepth: value }, expected: defaults, warn: 'autoHandover.maxChainDepth' })),
+    ...[-1, '6'].map((value) => ({ value: { minHoursBetween: value }, expected: defaults, warn: 'autoHandover.minHoursBetween' })),
     { value: { mode: 'notify', messages: 3000 }, expected: { ...defaults, mode: 'notify' }, warn: 'autoHandover.messages' },
   ];
   for (const { value, expected, warn } of cases) {

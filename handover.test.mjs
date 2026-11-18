@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createAliases } from './handover.mjs';
@@ -48,7 +48,7 @@ test('hand-over request creates the successor, links it, pauses the old goal, de
   const prompts = [];
   const created = [];
   const agent = (id, status = 'idle', header = { cwd: '/work/project', agentPreset: 'planner' }) => {
-    const value = { id, status, session: { header } };
+    const value = { id, status, session: { header, log: [] } };
     agents.set(id, value);
     return value;
   };
@@ -89,7 +89,7 @@ test('hand-over request creates the successor, links it, pauses the old goal, de
   assert.equal(result.status, 'handed_over');
   assert.equal(result.to, 'session-B');
   assert.deepEqual(created, [{ cwd: '/work/project', agentPreset: 'planner' }]);
-  assert.deepEqual(result.steps, { session: 'created', alias: 'linked', workspace: 'unavailable', title: 'unavailable', autoContinue: 'not_installed', predecessorGoal: 'paused', delivered: 'prompted', successorGoal: 'created' });
+  assert.deepEqual(result.steps, { session: 'created', alias: 'linked', workspace: 'unavailable', title: 'unavailable', autoContinue: 'not_installed', instructions: 'written', predecessorGoal: 'paused', delivered: 'prompted', successorGoal: 'created' });
   assert.deepEqual(result.pending, { unreviewed: ['J1'], needsChanges: [] });
   assert.deepEqual(aliases.owners('session-B'), ['session-B', 'session-A']);
   assert.equal(goalsByAgent.get(a).phase, 'paused');
@@ -182,6 +182,84 @@ function host(t, hooks = {}) {
   };
   return { root, agent, agents, goalsByAgent, aliases, request, prompts, renames };
 }
+
+const userEvent = (text, time, kind = 'user') => ({
+  type: 'user/message', time, data: { content: [{ type: 'text', text }], ...(kind ? { source: { kind } } : {}) },
+});
+const entriesAt = (file) => JSON.parse(readFileSync(file, 'utf8'));
+
+test('the first archive preserves all original human instructions and the brief points to it', async (t) => {
+  const h = host(t);
+  const source = h.agent('session-A');
+  const original = ['  第一条长期指令\n' + '长'.repeat(800) + '\n ', ...Array.from({ length: 13 }, (_, i) => `要求 ${i}`)];
+  source.session.log.push(...original.map((text, i) => userEvent(text, i + 1)),
+    userEvent('继续。', 20), userEvent('重启后的固定提示', 21), userEvent('[codex-conductor 交接] 自动交接单', 22),
+    userEvent('插件消息', 23, 'plugin:example'), userEvent('系统消息', 24, 'system'), userEvent('工具通知', 25, 'tool-jobs'),
+    userEvent('来源不明', 26, null), { ...userEvent('工具结果', 27), type: 'tool/result' });
+  const result = await h.request({ sessionId: source.id }, { autoMessage: '重启后的固定提示' });
+  const file = path.join(h.root, 'handovers', 'instructions-session-A.json');
+  assert.equal(result.instructions.file, file);
+  assert.deepEqual(entriesAt(file), original.map((text, i) => ({ text, at: new Date(i + 1).toISOString() })));
+  assert.equal(result.checks.instructions, 'ok');
+  const brief = readFileSync(result.briefPath, 'utf8');
+  assert.ok(brief.includes(file));
+  assert.match(brief, /共 14 条，时间范围 1970-01-01T00:00:00.001Z 至 1970-01-01T00:00:00.014Z。早于最近 12 条的指令仍然有效/);
+  assert.match(brief, /最近的用户指令[\s\S]*要求 12/);
+  assert.doesNotMatch(brief, /第一条长期指令/);
+});
+
+test('a successor appends its instructions to the same archive without duplicating its predecessors, including after a revert', async (t) => {
+  const h = host(t);
+  const a = h.agent('session-A');
+  a.session.log.push(userEvent('重复输入的真实指令', 1));
+  const first = await h.request({ sessionId: a.id });
+  const b = h.agents.get(first.to);
+  b.session.log.push(userEvent('重复输入的真实指令', 1), userEvent('更新', 2));
+  const second = await h.request({ sessionId: b.id });
+  assert.equal(second.instructions.file, first.instructions.file);
+  assert.deepEqual(entriesAt(second.instructions.file).map(({ text }) => text), ['重复输入的真实指令', '重复输入的真实指令', '更新']);
+  assert.equal((await h.request({ revert: { from: b.id, to: second.to } })).status, 'reverted');
+  const retry = await h.request({ sessionId: b.id });
+  assert.equal(retry.instructions.count, 3);
+  assert.deepEqual(entriesAt(retry.instructions.file).map(({ text }) => text), ['重复输入的真实指令', '重复输入的真实指令', '更新']);
+});
+
+test('an existing chain without an archive backfills its linked predecessors in timestamp order', async (t) => {
+  const h = host(t);
+  h.agent('session-A').session.log.push(userEvent('原会话较晚的指令', 2));
+  const b = h.agent('session-B');
+  b.session.log.push(userEvent('被接管会话里较早的指令', 1));
+  h.aliases.link('session-A', b.id);
+  const result = await h.request({ sessionId: b.id });
+  assert.equal(result.instructions.root, 'session-A');
+  assert.deepEqual(entriesAt(result.instructions.file).map(({ text }) => text), ['被接管会话里较早的指令', '原会话较晚的指令']);
+});
+
+test('an archive write failure is reported by the hand-over and self-check without preventing delivery', async (t) => {
+  const h = host(t);
+  const a = h.agent('session-A');
+  a.session.log.push(userEvent('需要在下一次补齐的指令', 1));
+  const file = path.join(h.root, 'handovers', 'instructions-session-A.json');
+  mkdirSync(file, { recursive: true });
+  const result = await h.request({ sessionId: a.id });
+  assert.equal(result.status, 'handed_over_with_issues');
+  assert.match(result.steps.instructions, /^failed:.+/);
+  assert.equal(result.checks.instructions, result.steps.instructions);
+  assert.equal(h.aliases.successor(a.id), result.to);
+  assert.match(h.prompts[0].content[0].text, /完整用户指令档案未能保存/);
+  rmSync(file, { recursive: true });
+  const retry = await h.request({ sessionId: result.to });
+  assert.equal(retry.checks.instructions, 'ok');
+  assert.deepEqual(entriesAt(retry.instructions.file).map(({ text }) => text), ['需要在下一次补齐的指令']);
+});
+
+test('the self-check detects an archive shortened after the brief is built', async (t) => {
+  const h = host(t, { prompt: () => writeFileSync(path.join(h.root, 'handovers', 'instructions-session-A.json'), '[]') });
+  h.agent('session-A').session.log.push(userEvent('保留', 1));
+  const result = await h.request({ sessionId: 'session-A' });
+  assert.equal(result.status, 'handed_over_with_issues');
+  assert.equal(result.checks.instructions, 'failed:count_below_brief');
+});
 
 test('every hand-over, adoption and revert records its origin and request time in the result, the link, the brief and the history', async (t) => {
   const { appendHandoverHistory, readHandoverHistory } = await import('./handover.mjs');
@@ -386,16 +464,18 @@ test('the brief has every section in order, caps each section and drops whole se
   assert.match(smallest, /本单超过 100 字符，省略了：接手须知、如何回看旧会话、任务、旧会话最后的进展、最近的用户指令、目标。/);
 });
 
-test('in an extremely long brief the next step and the pending close-out still survive', async () => {
+test('in an extremely long brief the next step, pending close-out and archive reference still survive', async () => {
   const { buildBrief, sessionContext } = await import('./handover.mjs');
   const log = Array.from({ length: 50 }, (_, i) => ({ type: 'user/message', time: i, data: { source: { kind: 'user' }, content: [{ type: 'text', text: `要求 ${i}：${'很长'.repeat(5000)}` }] } }));
   const brief = buildBrief({ from: 'session-A', to: 'session-B', at: '2026-11-17T09:30:00.000Z', cwd: '/w', since: 0,
     goal: { phase: 'active', objective: '目标'.repeat(50_000), roundsStarted: 1, maxGoalRounds: 3 }, jobs: briefJobs(2000),
-    pending: { unreviewed: ['J2000', 'J1999'], needsChanges: ['J1998'] }, context: sessionContext(log), note: `先返工 J1998。${'说明'.repeat(8000)}` });
+    pending: { unreviewed: ['J2000', 'J1999'], needsChanges: ['J1998'] }, context: sessionContext(log), note: `先返工 J1998。${'说明'.repeat(8000)}`,
+    instructionArchive: { file: '/state/handovers/instructions-session-A.json', count: 50, first: new Date(0).toISOString(), last: new Date(49).toISOString() } });
   assert.deepEqual(brief.match(/^## .*/gm).map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 待收尾']);
   assert.match(brief, /## 下一步\n先返工 J1998/);
   assert.match(brief, /尚未 codex_review：J2000、J1999/);
   assert.match(brief, /needs_changes 尚未结案，最新轮次：J1998/);
+  assert.ok(brief.includes('/state/handovers/instructions-session-A.json，共 50 条'));
 });
 
 test('after a hand-over the plugin checks goal, settings, jobs, delivery and the frozen predecessor, and reports issues without rolling back', async (t) => {
@@ -406,7 +486,7 @@ test('after a hand-over the plugin checks goal, settings, jobs, delivery and the
   const deps = { sessionJobs: async (owner) => (owner === 'session-A' || h.aliases.predecessors(owner).includes('session-A') ? jobsA : []),
     pendingOf: () => ({ unreviewed: ['J1'], needsChanges: [] }) };
   const ok = await h.request({ sessionId: 'session-A' }, deps);
-  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', predecessorFrozen: 'ok', workspace: 'skipped:unavailable' }]);
+  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', instructions: 'ok', predecessorFrozen: 'ok', workspace: 'skipped:unavailable' }]);
   // 目标没有逐字接上、轮数不对、模型路由不同、新会话查不到待验收任务：如实报告，不回滚。
   const g = host(t, { goalPatch: { objective: '完成迁移', maxGoalRounds: 3 } });
   const b = g.agent('session-B');
@@ -485,6 +565,58 @@ test('auto hand-over decisions honour mode, idleness, links, cooldown, the start
   assert.equal(step({ uptimeMs: 9 * 60_000 }).act, 'ask', 'the startup delay only holds back automatic hand-overs');
   assert.equal(step({ record: { autoAt: [hours(23)] } }, { mode: 'auto' }).act, null);
   assert.equal(step({ record: { autoAt: [hours(25)] } }, { mode: 'auto' }).act, 'auto');
+});
+
+test('the depth limit blocks automatic hand-over, appears in state and the panel, and leaves manual hand-over available', async (t) => {
+  const { createAutoHandover, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
+  const h = host(t);
+  const from = h.agent('session-A');
+  const first = await h.request({ sessionId: from.id });
+  const successor = h.agents.get(first.to);
+  const settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto', maxChainDepth: 1 };
+  const submitted = [];
+  const auto = createAutoHandover({ directory: h.root, settings: () => settings, aliases: h.aliases, uptime: () => 3_600_000,
+    submit: (request) => submitted.push(request) });
+  const suggestion = { sessionId: successor.id, messages: 20, threshold: 10, suggest: true };
+  const step = await auto.observe(successor, suggestion);
+  assert.equal(step.act, null);
+  assert.match(step.blocked, /已交接 1 次，达到自动交接上限 1 次/);
+  assert.deepEqual(submitted, []);
+  assert.equal(entriesAt(path.join(h.root, 'auto-handover.json')).sessions[successor.id].blocked, step.blocked);
+  const { threshold, ...tracked } = suggestion;
+  assert.equal(auto.snapshot([tracked], threshold).suggestions[0].blocked, step.blocked);
+  assert.equal(auto.snapshot([tracked], tracked.messages).suggestions[0].blocked, undefined);
+  settings.maxChainDepth = 0;
+  assert.equal((await auto.observe(successor, suggestion)).act, 'auto');
+  assert.equal(submitted.length, 1);
+  settings.maxChainDepth = 1;
+  assert.equal((await h.request({ sessionId: successor.id, origin: 'panel' })).status, 'handed_over');
+});
+
+test('the automatic interval follows a chain even through a manual hand-over and a new controller instance', async (t) => {
+  const { createAutoHandover, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
+  const h = host(t);
+  const a = h.agent('session-A');
+  const settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' };
+  let now = Date.now() - 5 * 3_600_000; // 请求可能在宿主处理前已等待了数小时。
+  const options = { directory: h.root, settings: () => settings, aliases: h.aliases, now: () => now, uptime: () => 3_600_000 };
+  const auto = createAutoHandover(options);
+  const suggestion = { messages: 20, threshold: 10, suggest: true };
+  assert.equal((await auto.observe(a, suggestion)).origin, 'auto');
+  const first = await h.request(entriesAt(path.join(h.root, 'handover-request.json')), { onResult: auto.settled });
+  const manual = await h.request({ sessionId: first.to, origin: 'panel' });
+  const c = h.agents.get(manual.to);
+  const reloaded = createAutoHandover(options);
+  now = Date.parse(h.aliases.links()[first.to].at) + 6 * 3_600_000 - 1;
+  const step = await reloaded.observe(c, suggestion);
+  assert.equal(step.act, null);
+  assert.match(step.blocked, /同一会话链自动交接至少间隔 6 小时/);
+  assert.equal(entriesAt(path.join(h.root, 'auto-handover.json')).sessions[c.id].blocked, step.blocked);
+  const unlimited = createAutoHandover({ ...options, settings: () => ({ ...settings, minHoursBetween: 0 }), submit: () => {} });
+  assert.equal(unlimited.snapshot([{ ...suggestion, sessionId: c.id }]).suggestions[0].blocked, undefined);
+  now++;
+  assert.equal((await reloaded.observe(c, suggestion)).origin, 'auto');
+  assert.equal(entriesAt(path.join(h.root, 'auto-handover.json')).sessions[c.id].blocked, undefined);
 });
 
 test('auto hand-over asks in the panel or submits a request only when the session is idle with no running Codex job', async (t) => {
