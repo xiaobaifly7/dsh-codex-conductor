@@ -421,8 +421,9 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `codexRoute` | 空 | `{ provider, baseUrl }`，只给插件启动的 Codex 指定已有的自定义提供方与 HTTP(S) 地址，不改 Codex 配置文件。未设置 `routerCheckUrl` 时，启动前向该地址的主机请求 `HEAD /`，确认网关有响应。环回地址只在该 Codex 进程中绕过代理。 |
 | `model` | Codex 配置 | 默认模型 |
 | `modelAB` | `{ enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 }` | 开启后按新任务号的确定性哈希分配，`share` 是第一个模型的份额，取值 0–1。续接和返工保留已记录的线程模型。单次 `model` 优先，首次显式指定或临时改用其他模型的任务不计入对照。核验用配置的默认模型。无效值告警并回落默认，未知子键记入 `unknownConfig`。 |
-| `effort` | Codex 配置 | 默认推理强度，`codex_run` 的 `effort` 可单次覆盖 |
+| `effort` | Codex 配置 | 写任务的默认推理强度。 |
 | `readOnlyEffort` | 同 `effort` | 只读任务（`write=false`）的默认推理强度，留空时用 `effort` |
+| `effortOverride` | `planner` | `codex_run` 单次覆盖规则。`planner` 接受传入的 `effort`，`raise-only-listed` 允许等于或低于默认，提高时须带 `effort_reason`（`concurrency_or_locking`、`cross_session_state`、`security_boundary`、`data_migration`、`prior_rework`），`config` 使用配置的默认强度。默认强度为空时维持原解析规则。请求和实际值写入 `context.routing.effort`，`codex_continue` 沿用父任务实际强度。 |
 | `serviceTier` | Codex 配置 | 例如 `fast`（Codex 的 Fast 模式） |
 | `waitSeconds` | `0` | 无法登记后台任务时，`codex_run` / `codex_continue` / `codex_verify` 默认同步等待的秒数；登记后台后立即返回，随后在本轮用 `codex_status(wait_seconds: 3600)` 等待 |
 | `autoWakeBlockedInbox` | `true` | 本插件后台完成通知滞留时，自动唤醒随后被门禁拒绝的空闲会话；同批最多两次（1 秒、5 秒），用尽写警告日志；设为 `false` 关闭 |
@@ -795,6 +796,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `closeoutEvidence` | `independent` | What supports recording a criterion the report marked unmet as met when closing: `independent` sources, `planner` own non-copied evidence, `off` no check |
 | `acceptOpenEvidence` | `strict` | Accepting a flagged or `must_verify` item as open takes a mapped verification, a later round that still reports it open, a real user reply, or an actionable user blocker. `strict` accepts only verification or a user reply for `not_met`. `relaxed` accepts all four kinds and `off` disables the check. Items originally reported `met` are exempt. Jobs finished before first load keep the old rules. |
 | `autoVerify` | `flagged` | Automatically dispatch one read-only verification for a completed write job with a valid report and flagged or `must_verify` items. The latest handover successor owns it. The result explains a skip when a verification already exists or cannot start. `off` disables it. |
+| `effortOverride` | `planner` | `codex_run` per-call effort policy. `planner` accepts overrides. `raise-only-listed` accepts equal or lower effort, and requires an `effort_reason` to raise it: `concurrency_or_locking`, `cross_session_state`, `security_boundary`, `data_migration`, or `prior_rework`. `config` uses the configured default. Writes use `effort`, reads use `readOnlyEffort` or `effort`. An empty default keeps the existing resolution. Requests and applied values appear in `context.routing.effort`. `codex_continue` inherits the parent's applied effort. |
 | `autoHandover` | see below | What happens once a session is flagged; an object whose keys may be omitted one by one. Invalid values warn and fall back to the default; unknown sub-keys go to `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` flags only and keeps the panel button; `notify` adds a panel reminder; `confirm` asks in the panel once the session is idle with no running Codex job and hands over on agreement; `auto` hands over directly under the same conditions |
 | `autoHandover.cooldownHours` | `12` | Hours without questions or automatic hand-overs after a decline, a dismissed reminder or an unanswered question; non-negative |

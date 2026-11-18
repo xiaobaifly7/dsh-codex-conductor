@@ -1342,7 +1342,8 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
       assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
         const args = { ...RUN, write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
-          cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, model: 'chosen', effort: 'low', wait_seconds: 1 };
+          cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, model: 'chosen',
+          effort: 'low', effort_reason: 'prior_rework', wait_seconds: 1 };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
         const ran = await h.tools.codex_run.execute(args, exec);
         assert.equal(ran.job_id, 'J');
@@ -6456,6 +6457,46 @@ test('release C: synchronous must_verify-only completion starts a check and excl
   off.finals.OFF = autoSource('OFF');
   assert.equal((await queryStatus(off, 'OFF')).auto_verify, undefined);
   assert.ok(!off.calls.some(argv => argv[0] === 'start'));
+});
+
+test('release D: effort policies use the write/read default and record requested and applied effort', async () => {
+  const reasons = ['concurrency_or_locking', 'cross_session_state', 'security_boundary', 'data_migration', 'prior_rework'];
+  for (const [mode, write, requested, reason, applied, ignored] of [
+    [undefined, true, 'high', undefined, 'high', false],
+    ['raise-only-listed', true, 'max', undefined, 'medium', true],
+    ['raise-only-listed', true, 'high', 'invalid', 'medium', true],
+    ['raise-only-listed', true, 'xhigh', 'prior_rework', 'xhigh', false],
+    ['raise-only-listed', false, 'medium', undefined, 'low', true],
+    ['raise-only-listed', true, 'medium', undefined, 'medium', false],
+    ['raise-only-listed', true, 'low', undefined, 'low', false],
+    ['raise-only-listed', true, undefined, 'cross_session_state', 'medium', false],
+    ['config', true, 'low', undefined, 'medium', true],
+    ['config', false, 'high', 'security_boundary', 'low', true],
+    ['invalid', true, 'high', undefined, 'high', false],
+  ]) {
+    const h = harness({ config: { effort: 'medium', readOnlyEffort: 'low', effortOverride: mode } });
+    assert.deepEqual(h.tools.codex_run.parameters.properties.effort_reason.enum, reasons);
+    const result = await h.tools.codex_run.execute({ ...RUN, write,
+      ...(requested === undefined ? {} : { effort: requested }), ...(reason === undefined ? {} : { effort_reason: reason }) },
+    { agent: agentAt('/work') });
+    const { argv, stdin } = h.requests.find(r => r.argv[0] === 'start');
+    assert.equal(argv[argv.indexOf('--effort') + 1], applied);
+    assert.deepEqual(JSON.parse(stdin).context.routing.effort,
+      { requested: requested ?? null, ...(reasons.includes(reason) ? { reason } : {}), applied });
+    if (ignored) assert.match(result.next, new RegExp(`effort=${requested} 未生效：effortOverride=${mode} .*本单按默认 ${applied}`));
+    else assert.doesNotMatch(result.next, /effort=.*未生效/);
+    if (mode === 'invalid') assert.ok(h.warnings.some(line => /无效的配置 effortOverride/.test(line)));
+  }
+
+  const h = harness({ config: { effortOverride: 'config' } });
+  await h.tools.codex_run.execute({ ...RUN, effort: 'high' }, { agent: agentAt('/work') });
+  assert.equal(h.calls.find(argv => argv[0] === 'start').includes('high'), true);
+
+  const continued = harness({ config: { effort: 'medium', effortOverride: 'config' } });
+  continued.finals.PARENT = workflowSource('implementation'); // 原单实际用 low。
+  await continued.tools.codex_continue.execute({ job_id: 'PARENT', resolution: '已补齐实现前置条件' }, { agent: agentAt('/work') });
+  const argv = continued.calls.find(args => args[0] === 'start');
+  assert.equal(argv[argv.indexOf('--effort') + 1], 'low');
 });
 
 test('release E: closeout counts only a fresh, successful review of a real runner record', async (t) => {

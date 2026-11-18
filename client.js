@@ -725,6 +725,7 @@ window.__ModuleLoader__.load({
               field('model', 'Codex 模型', '填写要使用的模型名；留空则沿用 Codex 配置。'),
               field('effort', '执行时的思考程度', '越高通常想得越久，也可能花更多时间。', [['', '跟随 Codex 配置'], ...EFFORTS]),
               field('readOnlyEffort', '只读任务的思考程度', '用于查看代码、分析和复核。', [['', '跟随执行设置'], ...EFFORTS]),
+              field('effortOverride', '单次推理强度覆盖', '控制 codex_run 能否覆盖写入或只读任务的默认强度。', [['planner', '由规划端指定（默认）'], ['raise-only-listed', '提高强度须填写列明的原因'], ['config', '使用配置强度']]),
               field('serviceTier', '速度档', '跟随 Codex 配置，或使用账号支持的加速档位。', [['', '跟随 Codex 配置'], ['fast', 'fast'], ['ultrafast', 'ultrafast']]),
               field('timeoutSeconds', '每次尝试的总超时秒数', 'Codex 的一次尝试最多跑多久；留空表示沿用默认。'),
               field('idleTimeoutSeconds', '空闲超时秒数', 'Codex 多久没有动静就判定卡住；留空表示沿用默认。'),

@@ -261,6 +261,7 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   maxSessionTokens: '每个会话的用量上限', jobDiff: '记录每单的改动', closeoutGuard: '未收尾时拒绝开新任务', toolPolicy: '工具放行方式', allowTools: '白名单工具',
   acceptOpenEvidence: '接受未完成项的依据',
   autoVerify: '完成后自动核验',
+  effortOverride: '单次推理强度覆盖',
   plannerReadAllow: '额外允许读取的路径' };
 // null clears a limit and restores the runner default.
 const count = (v) => Number.isInteger(v) && v > 0;
@@ -291,6 +292,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'closeoutEvidence') valid = ['independent', 'planner', 'off'].includes(v);
     else if (key === 'acceptOpenEvidence') valid = ['strict', 'relaxed', 'off'].includes(v);
     else if (key === 'autoVerify') valid = ['off', 'flagged'].includes(v);
+    else if (key === 'effortOverride') valid = ['planner', 'raise-only-listed', 'config'].includes(v);
     else if (key === 'jobDiff' || key === 'closeoutGuard') valid = typeof v === 'boolean';
     else if (Object.hasOwn(listSettings, key)) {
       valid = Array.isArray(v) && v.length <= listSettings[key][0] && v.every((item) => typeof item === 'string' && listSettings[key][1](item));

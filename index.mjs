@@ -56,6 +56,7 @@ const DEFAULTS = {
   model: '',
   modelAB: { enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 },
   effort: '',
+  effortOverride: 'planner',
   // 只读任务的推理强度，留空与 effort 相同
   readOnlyEffort: '',
   serviceTier: '',
@@ -344,8 +345,7 @@ export function createConductor(cfg, run = runRunner) {
   async function start(args, cwd, signal, context) {
     const argv = ['start', '--cwd', cwd];
     const hostAccess = args.host_access ?? (cfg.defaultHostAccess === true);
-    const effort = args.effort ?? (context?.verification_of ? undefined
-      : args.write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort);
+    const effort = args.effort ?? (context?.verification_of ? undefined : defaultEffort(cfg, args.write));
     if (effort) argv.push('--effort', effort);
     const model = args.model ?? cfg.model;
     const serviceTier = args.service_tier ?? cfg.serviceTier;
@@ -523,6 +523,10 @@ export function hasUserReply(log, job, owner, autoMessage) {
   return Number.isInteger(settled) && settled >= 0 ? user > settled :
     Number.isFinite(replyAt) && Number.isFinite(job.finished_at) && replyAt > job.finished_at * 1000;
 }
+
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const EFFORT_REASONS = ['concurrency_or_locking', 'cross_session_state', 'security_boundary', 'data_migration', 'prior_rework'];
+const defaultEffort = (cfg, write) => write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort;
 
 export function validateRun(args) {
   if (typeof args?.task !== 'string' || args.task.trim().length < 10) throw new Error('codex_run: task 必须写清目标、相关路径和约束（至少 10 个字符）');
@@ -895,6 +899,7 @@ function settings(config, logger) {
       : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
       : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
       : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
+      : key === 'effortOverride' ? ['planner', 'raise-only-listed', 'config'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
@@ -1773,6 +1778,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
+    let effortLine;
+    if (!continuation && !verificationOf && (args.effort !== undefined || args.effort_reason !== undefined)) {
+      const { effort: requested, effort_reason: reason } = args;
+      const configured = defaultEffort(cfg, args.write);
+      const listed = EFFORT_REASONS.includes(reason);
+      if (configured && requested !== undefined && cfg.effortOverride === 'config') {
+        effortLine = `effort=${requested} 未生效：effortOverride=config 下使用配置的推理强度，本单按默认 ${configured}`;
+      } else if (configured && !listed && cfg.effortOverride === 'raise-only-listed' &&
+          EFFORTS.indexOf(requested) > EFFORTS.indexOf(configured)) {
+        effortLine = `effort=${requested} 未生效：effortOverride=raise-only-listed 下提高推理强度要带 effort_reason（${EFFORT_REASONS.join('、')}），本单按默认 ${configured}`;
+      }
+      const applied = effortLine ? configured : requested ?? (configured || null);
+      if (effortLine) args = { ...args, effort: applied };
+      routing = { ...routing, effort: { requested: requested ?? null, ...(listed ? { reason } : {}), applied } };
+    }
     if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
       throw reject('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
     }
@@ -1921,7 +1941,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } else {
       value = withReport(started);
     }
-    return value.rendered ? value : notifyOnDone(await finish(value), exec, finish);
+    const shown = value.rendered ? value : notifyOnDone(await finish(value), exec, finish);
+    if (!effortLine) return shown;
+    return shown.rendered ? { ...shown, rendered: `${shown.rendered}\n${effortLine}` }
+      : { ...shown, next: [shown.next, effortLine].filter(Boolean).join('\n') };
   }
 
   const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
@@ -1977,8 +2000,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         verify_previous: { type: 'string', description: '可选：一个已结束任务的 job_id，派这一单的同时只读核验它；这一单可写且写入范围与它的产物或 scope 重叠时拒绝。' },
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
         model: { type: 'string', description: '可选，显式指定本次任务的模型。' },
-        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
+        effort: { type: 'string', enum: EFFORTS, description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
           `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
+        effort_reason: { type: 'string', enum: EFFORT_REASONS, description: '提高推理强度的原因：并发或锁、跨会话状态、安全边界、数据迁移、上一轮实现需返工。effortOverride=raise-only-listed 时提高强度必填。' },
         wait_seconds: { type: 'integer', description: waitSecondsDescription },
       },
       required: ['task', 'acceptance', 'write'],
