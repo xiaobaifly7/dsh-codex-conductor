@@ -1276,7 +1276,8 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     requests.push({ argv, ...options });
     // answer() 放弃后让后台循环出错退出，否则进程挂住不结束
     if (closed) return Promise.reject(new Error('harness closed'));
-    if (argv[0] === 'start') return Promise.resolve(startResult ?? { job_id: `J${++n}`, status: 'running' });
+    if (argv[0] === 'start') return Promise.resolve((typeof startResult === 'function' ? startResult(argv, options) : startResult) ??
+      { job_id: `J${++n}`, status: 'running' });
     if (argv[0] === 'list') return Promise.resolve((typeof listResult === 'function' ? listResult(argv) : listResult) ?? { jobs: [], total: 0 });
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
     if (argv[0] === 'review') return Promise.resolve(typeof reviewResult === 'function' ? reviewResult(argv, options) : reviewResult);
@@ -1297,7 +1298,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     logger: { warn: (text) => warnings.push(text) },
     ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
   // 收尾护栏会多一次 list 调用；只有专门测它的用例才打开。
-  apply(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, continueFreshAboveTokens: 0, ...pluginConfig }, run, launchGemini);
+  apply(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, autoVerify: 'off', continueFreshAboveTokens: 0, ...pluginConfig }, run, launchGemini);
   const answer = async (job, value) => {
     for (let i = 0; !waiters[job]?.length; i++) {
       if (i === 1000) {
@@ -6149,11 +6150,11 @@ function acceptedFixtureHarness(t) {
   const source = acceptedFixture();
   const cutoff = path.join(state, 'accept-open-evidence-since.json');
   writeFileSync(cutoff, JSON.stringify({ since: source.finished_at - 1 }));
-  const make = (config) => {
+  const make = (config, options) => {
     const previous = process.env.LOCALAPPDATA;
     process.env.LOCALAPPDATA = root;
     try {
-      const h = harness({ config });
+      const h = harness({ ...options, config });
       h.finals[source.job_id] = source;
       return h;
     } finally { process.env.LOCALAPPDATA = previous; }
@@ -6348,6 +6349,113 @@ test('release B: a later closing review or a mapped verification clears only res
   closed.criteria = closed.criteria.map(({ index, evidence }) => ({ index, status: 'met', evidence }));
   await submit(closed);
   assert.deepEqual((await ledger()).items, []);
+});
+
+const autoSource = (id) => ({ ...workflowSource('implementation'), job_id: id, log_dir: `/logs/${id}` });
+const queryStatus = (h, job_id, agent = agentAt('/work/original')) =>
+  h.tools.codex_status.execute({ job_id, wait_seconds: 0 }, { agent });
+
+test('release C: overlapping finish observers and manual verification dispatch only one check', async () => {
+  const source = autoSource('FLAGGED');
+  const start = Promise.withResolvers();
+  const running = [];
+  const h = harness({ config: { autoVerify: undefined, listResult: () => ({ jobs: running }),
+    startResult: (_argv, { stdin }) => JSON.parse(stdin).context.verification_of ? start.promise : { job_id: 'NEXT', status: 'completed' } } });
+  h.finals.FLAGGED = source;
+  const first = queryStatus(h, 'FLAGGED');
+  const second = queryStatus(h, 'FLAGGED');
+  const starts = () => h.requests.filter(r => r.argv[0] === 'start');
+  for (let i = 0; i < 10 && !starts().length; i++) await tick();
+  assert.equal(starts().length, 1);
+  const args = { job_id: 'FLAGGED', wait_seconds: 0 };
+  const exec = { agent: agentAt('/work/original') };
+  const manual = h.tools.codex_verify.execute(args, exec);
+  await tick();
+  await tick();
+  assert.equal(starts().length, 1);
+  start.resolve({ job_id: 'CHECK', status: 'running' });
+  const result = await first;
+  assert.deepEqual(result.auto_verify, { job_id: 'CHECK', status: 'running' });
+  assert.deepEqual((await second).auto_verify, result.auto_verify);
+  assert.match(result.next, /插件已自动派出对 FLAGGED 的只读核验 CHECK，正在跑；核验在跑时可以派不重叠的新任务/);
+  assert.equal((await manual).next, '对 FLAGGED 的核验已在跑（任务 CHECK），不重复派');
+  running.push({ job_id: 'CHECK', execution_status: 'running', context: { verification_of: 'FLAGGED' } });
+  assert.equal((await h.tools.codex_verify.execute(args, exec)).job_id, 'CHECK');
+  assert.equal(starts().length, 1);
+  const context = JSON.parse(starts()[0].stdin).context;
+  assert.equal(context.verification_of, 'FLAGGED');
+  assert.equal(context.write, false);
+  const next = await h.tools.codex_run.execute({ ...RUN, verify_previous: 'FLAGGED' }, exec);
+  assert.equal(next.verify_previous.job_id, 'CHECK');
+  assert.match(next.next, /对 FLAGGED 的核验已在跑（任务 CHECK），不重复派/);
+  assert.equal(starts().filter(({ stdin }) => JSON.parse(stdin).context.verification_of === 'FLAGGED').length, 1);
+});
+
+test('release C: a background completion after handover dispatches its check for the last successor', async (t) => {
+  const { make, state } = acceptedFixtureHarness(t);
+  const jobs = fakeJobs();
+  const h = make({ autoVerify: 'flagged' }, { jobs });
+  const original = autoSource('J1');
+  const started = await h.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('/work/original') });
+  assert.ok(started.background_job_id);
+  writeFileSync(path.join(state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' }, S3: { from: 'S2' } } }));
+  h.finals.J1 = original;
+  await h.answer('J1', original);
+  const notice = await jobs.started[0].done;
+  assert.match(notice.result, /插件已自动派出对 J1 的只读核验 J2/);
+  assert.equal(jobs.started[1].spec.owner, 'S3');
+  const starts = h.requests.filter(request => request.argv[0] === 'start');
+  assert.equal(JSON.parse(starts[1].stdin).context.owner, 'S3');
+  assert.deepEqual((await queryStatus(h, 'J1')).auto_verify, { job_id: 'J2', status: 'running' });
+  assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 2);
+  await h.answer('J2', { ...original, job_id: 'J2', context: { ...original.context, owner: 'S3', write: false, verification_of: 'J1' } });
+  await jobs.started[1].done;
+});
+
+test('release C: capacity and an earlier completed verification skip automatic dispatch', async (t) => {
+  const { make, state } = acceptedFixtureHarness(t);
+  const capped = make({ autoVerify: 'flagged', maxRunningJobs: 1,
+    listResult: argv => ({ jobs: [], total: argv.includes('--owner') ? 0 : 1 }) });
+  capped.finals.CAP = autoSource('CAP');
+  const value = await queryStatus(capped, 'CAP');
+  assert.match(value.auto_verify?.skipped ?? '', /达到 maxRunningJobs=1 的上限/);
+  assert.match(value.next, /插件未自动派出对 CAP 的核验：.*之后可用 codex_verify CAP/s);
+  assert.deepEqual((await queryStatus(capped, 'CAP')).auto_verify, value.auto_verify);
+  assert.ok(!capped.calls.some(argv => argv[0] === 'start'));
+  assert.equal(JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8')).total.auto_verify_skipped, 1);
+
+  const old = { job_id: 'OLD-CHECK', execution_status: 'completed', context: { verification_of: 'CHECKED' } };
+  const h = make({ autoVerify: 'flagged', listResult: argv => argv.includes('--status') ? { jobs: [] } : { jobs: [old] } });
+  h.finals.CHECKED = autoSource('CHECKED');
+  assert.deepEqual((await queryStatus(h, 'CHECKED')).auto_verify, { skipped: '已存在核验 OLD-CHECK（completed）' });
+  assert.equal((await h.tools.codex_verify.execute({ job_id: 'CHECKED' }, { agent: agentAt('/work') })).job_id, 'J1');
+
+  const failed = make({ autoVerify: 'flagged', startResult: { status: 'failed', error_kind: 'bridge_error', error: 'runner 不可用' } });
+  failed.finals.ERROR = autoSource('ERROR');
+  const receipt = await queryStatus(failed, 'ERROR');
+  assert.deepEqual(receipt.auto_verify, { error: 'runner 不可用' });
+  assert.match(receipt.next, /插件未自动派出对 ERROR 的核验：runner 不可用。之后可用 codex_verify ERROR。/);
+});
+
+test('release C: synchronous must_verify-only completion starts a check and excluded jobs never do', async () => {
+  const h = harness({ config: { autoVerify: 'bad-value' } });
+  const must = autoSource('J1');
+  must.context.must_verify = [1];
+  must.structured.criteria[0].status = 'met';
+  h.finals.J1 = must;
+  const result = await h.tools.codex_run.execute({ ...RUN, must_verify: [1], write: true }, { agent: agentAt('/work/original') });
+  assert.deepEqual(result.auto_verify, { job_id: 'J2', status: 'running' });
+  assert.ok(h.warnings.some(line => /无效的配置 autoVerify/.test(line)));
+  for (const [id, context] of Object.entries({ READ: { write: false }, VERIFY: { verification_of: 'J1' } })) {
+    h.finals[id] = autoSource(id);
+    Object.assign(h.finals[id].context, context);
+    assert.equal((await queryStatus(h, id)).auto_verify, undefined);
+  }
+  assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 2);
+  const off = harness({ config: { autoVerify: 'off' } });
+  off.finals.OFF = autoSource('OFF');
+  assert.equal((await queryStatus(off, 'OFF')).auto_verify, undefined);
+  assert.ok(!off.calls.some(argv => argv[0] === 'start'));
 });
 
 test('release E: closeout counts only a fresh, successful review of a real runner record', async (t) => {

@@ -8,6 +8,7 @@
 - 结案统计只计 runner 确认新写入的验收，旧记录和错误回执不再重复计数。
 - 新增 `acceptOpenEvidence`，默认要求为接受仍未完成的条目提供依据，`not_met` 须经核验或用户确认。
 - 已接受的未完成项进入跨交接台账，后续确认满足时销项。带开放项完成目标须显式确认。
+- 写任务完成后，默认自动核验有未完成项或 `must_verify` 的有效报告。手动核验复用正在启动或运行的任务。
 
 `0.9.123` 的失败回执给出失败原因、尝试次数、记录的改动文件数及下一步。规划端按失败类别处理，避免连续原样重派。模型拒绝保持终态。runner 处理超时前已入队的完成事件，避免把已收到的完成结果误判为超时。
 
@@ -155,6 +156,7 @@
 - Closeout statistics count only newly appended reviews confirmed by the runner. Stale and error replies do not add counts.
 - `acceptOpenEvidence` defaults to requiring support when accepting open items. `not_met` needs verification or a user reply by default.
 - Accepted open items stay visible across handovers and clear when later evidence shows they are met. Goal completion with open items requires acknowledgement.
+- By default, completed write jobs with flagged or `must_verify` items get automatic verification. Manual requests reuse starting or running verifications.
 
 `0.9.123` adds the cause, attempt count, recorded file count and next step to failure receipts. The planner follows the guidance for each failure before dispatching again. Model refusals remain terminal. The runner processes completion events already queued at a deadline so a received result is kept.
 

@@ -238,7 +238,7 @@ test('panel settings expose editable fields and read scope counts while redactin
   const expected = { acceptOpenEvidence: 'strict', model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' },
     timeoutSeconds: null, idleTimeoutSeconds: null, retries: null, maxRunningJobs: null, autoResume: { enabled: true },
-    roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [],
+    roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [], autoVerify: 'flagged',
     toolPolicy: 'denylist', allowTools: [], plannerReadAllow: [], maxSessionJobs: null, maxSessionTokens: null, jobDiff: false, closeoutGuard: true, handoverSuggestMessages: 5000, acceptanceWarnAbove: 8, continueFreshAboveTokens: 100000, closeoutEvidence: 'independent', seenTools: [] };
   assert.deepEqual(panelSettings(cfg), expected);
   const tools = { toolPolicy: 'allowlist', allowTools: ['codex_run', 'mcp__docs__*'], maxSessionJobs: 20, maxSessionTokens: 5000000,

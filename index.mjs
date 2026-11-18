@@ -81,6 +81,7 @@ const DEFAULTS = {
   // independent 需独立依据（核验任务、后续轮次或用户确认）；planner 规划端自己的非照抄证据即可；off 不查
   closeoutEvidence: 'independent',
   acceptOpenEvidence: 'strict',
+  autoVerify: 'flagged',
   // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
   continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
@@ -893,6 +894,7 @@ function settings(config, logger) {
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
       : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
       : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
+      : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
@@ -1004,6 +1006,9 @@ const BG_WAIT = 20;
 // runner 取消后会立即写下结果，后台循环一秒内就能看到，这里只是上限
 const CANCEL_SETTLE_MS = 30_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
+// 同一宿主内热重载后，旧的后台观察仍可能与新实例同时看到完成。
+const hostVerifications = globalThis[Symbol.for('dsh-codex-conductor.verifications')] ??= new WeakMap();
+const automaticVerification = Symbol('automaticVerification');
 
 export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const cfg = settings(config, ctx.logger);
@@ -1379,8 +1384,54 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '原始结果或原任务背景可将 artifact 改为 result 或 context；继续读取时使用返回的 next_offset。';
   }
 
+  const jobService = ctx.get?.('jobs');
+  const verificationState = hostVerifications.get(jobService) ?? { starts: new Map(), automatic: new Map() };
+  if (jobService) hostVerifications.set(jobService, verificationState);
+  const { starts: verificationStarts, automatic: autoVerifications } = verificationState;
+  async function withAutoVerification(value, exec) {
+    const id = value.job_id;
+    if (value.rendered) {
+      const receipt = await autoVerifications.get(id);
+      return receipt ? { ...value, auto_verify: receipt.auto_verify } : value;
+    }
+    const originalOwner = value.context?.owner;
+    if (cfg.autoVerify === 'off' || !id || !originalOwner || value.context.write !== true || value.context.verification_of ||
+        value.execution_status !== 'completed' || !validReport(value.report) ||
+        (!flaggedCriteria(value).length && !value.context.must_verify?.length)) return value;
+    let pending = autoVerifications.get(id);
+    if (!pending) {
+      pending = (async () => {
+        let owner = originalOwner;
+        const seen = new Set([owner]);
+        for (let next = aliases.successor(owner); next && !seen.has(next); next = aliases.successor(owner)) {
+          seen.add(owner = next);
+        }
+        const skipped = (reason, key = 'skipped') => {
+          countCloseout(owner, 'auto_verify_skipped');
+          return { auto_verify: { [key]: reason }, line: `插件未自动派出对 ${id} 的核验：${reason}。之后可用 codex_verify ${id}。` };
+        };
+        try {
+          const agent = exec?.agent?.id === owner ? exec.agent : ctx.get?.('agents')?.get?.(owner) ?? { id: owner };
+          const result = await verifyTool.execute({ job_id: id, wait_seconds: 0 }, { agent, [automaticVerification]: true });
+          if (result.existing_verification) return skipped(`已存在核验 ${result.job_id}（${result.status}）`);
+          if (!result.job_id || unknownState(result)) return skipped(result.error ?? result.error_kind ?? result.status, 'error');
+          countCloseout(owner, 'auto_verify_started');
+          const line = `插件已自动派出对 ${id} 的只读核验 ${result.job_id}` +
+            (result.status === 'running' ? '，正在跑；核验在跑时可以派不重叠的新任务（收尾护栏会放行），'
+              : `，状态 ${result.status}；`) + `核验结束后按结论记 codex_review ${id}。`;
+          return { auto_verify: { job_id: result.job_id, status: result.status }, line };
+        } catch (error) {
+          return skipped(String(error?.message ?? error));
+        }
+      })();
+      autoVerifications.set(id, pending);
+    }
+    const { auto_verify, line } = await pending;
+    return { ...value, auto_verify, next: [value.next, line].filter(Boolean).join('\n') };
+  }
+
   // log 通道只供原生面板观察，job_output 过滤它，模型只收到一次最终 result。
-  async function watch(jobId, handle, finish, state) {
+  async function watch(jobId, handle, finish, state, exec) {
     const publish = (value) => {
       const warning = value.status === 'monitor_failed' && state.cancelNotice ? `\n${state.cancelNotice}` : '';
       const text = render(value)[0].text + warning + outputEntry(jobId, state.logDir);
@@ -1424,7 +1475,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (++bridgeErrors < 3) continue;
           throw new Error(value.error);
         }
-        return publish(finish(value));
+        return publish(await finish(value, exec));
       }
     } catch (error) {
       const lost = withReport({ job_id: jobId, status: 'monitor_failed', error: String(error?.message ?? error) });
@@ -1459,7 +1510,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             handle.append(`${state.cancelNotice}\n`, { channel: 'log' });
           };
           return {
-            done: watch(jobId, handle, finish, state),
+            done: watch(jobId, handle, finish, state, exec),
             cancel: () => {
               cancelNotice('正在请求 runner 取消');
               return conductor.cancel(jobId).then((value) => {
@@ -1500,16 +1551,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 这次等待已算作被等到，DSH 不会再作为通知送回，所以在这里原样交回（结果只给一次，再读就回退到 runner）
       const rendered = bg.jobs.read?.(bg.id, bg.owner)?.result;
       // 后台监控自己出错时存的只是「先查询」的提示，改查 runner 拿真实状态（仍在运行会重新登记）
-      if (typeof rendered === 'string' && !rendered.startsWith('monitor_failed')) return { job_id: jobId, status: /^\S+/.exec(rendered)?.[0], rendered };
+      if (typeof rendered === 'string' && !rendered.startsWith('monitor_failed')) {
+        return withAutoVerification({ job_id: jobId, status: /^\S+/.exec(rendered)?.[0], rendered });
+      }
     }
     // 后台任务已结算时 runner 的结果文件已在，只查一次取完整结果
     return withReport(await conductor.waitJob(jobId, bg ? 0 : seconds, signal));
   }
 
   // 后台监控与本轮长等待共用同一任务；空闲会话仍能收到完成通知。
-  const finishStatus = (value) => {
+  const finishStatus = (value, exec) => {
     rememberProducts(value);
-    return { ...value, next: nextStep(value, undefined, undefined, cfg) };
+    return withAutoVerification({ ...value, next: nextStep(value, undefined, undefined, cfg) }, exec);
   };
 
   function notifyOnDone(value, exec, finish) {
@@ -1609,9 +1662,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function startVerifyPrevious(jobId, exec) {
     try {
       const value = await verifyTool.execute({ job_id: jobId, wait_seconds: 0 }, exec);
+      if (!value.job_id) throw new Error(value.error ?? value.error_kind ?? value.status);
       return { job_id: value.job_id, ...(value.background_job_id ? { background_job_id: value.background_job_id } : {}), status: value.status,
-        line: `已同时派出对 ${jobId} 的只读核验（任务 ${value.job_id}），结果由完成通知送达；拿到后按原验收用 codex_review 记录 ${jobId}。` +
-          '核验若判 needs_changes，用 codex_continue 返工原任务（续接不受收尾护栏限制）。' };
+        line: value.existing_verification ? value.next
+          : `已同时派出对 ${jobId} 的只读核验（任务 ${value.job_id}），结果由完成通知送达；拿到后按原验收用 codex_review 记录 ${jobId}。` +
+            '核验若判 needs_changes，用 codex_continue 返工原任务（续接不受收尾护栏限制）。' };
     } catch (error) {
       return { error: String(error?.message ?? error), line: `对 ${jobId} 的核验没有派出：${error?.message ?? error}。这一单已经派出；之后再用 codex_verify ${jobId}。` };
     }
@@ -1735,8 +1790,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       rememberProducts(value, exec?.agent?.id);
       const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
         ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
-      return { ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
-        { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers, plannerReads: cfg.plannerReads }) + reminder };
+      return withAutoVerification({ ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
+        { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers, plannerReads: cfg.plannerReads }) + reminder }, exec);
     };
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
     exec?.signal?.throwIfAborted();
@@ -1846,6 +1901,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ...(verificationOf ? { verification_of: verificationOf } : {}),
         ...(routing ? { routing } : {}),
       });
+      guard.onStarted?.(started);
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
     } finally { dispatching--; if (writer) startingWrites.delete(writer); }
     if (exec?.signal?.aborted) {
@@ -1865,7 +1921,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } else {
       value = withReport(started);
     }
-    return value.rendered ? value : notifyOnDone(finish(value), exec, finish);
+    return value.rendered ? value : notifyOnDone(await finish(value), exec, finish);
   }
 
   const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
@@ -1977,6 +2033,25 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   ctx.tools.register(runTool);
 
+  async function findVerification(jobId, owner, automatic, signal) {
+    for (let offset = 0; offset !== null;) {
+      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner),
+        ...(automatic ? {} : { status: 'running' }), limit: 100, offset }, signal);
+      if (page.error_kind || !Array.isArray(page.jobs)) {
+        throw new Error(`codex_verify: 无法核对已有核验：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
+      }
+      const existing = page.jobs.find(job => job.context?.verification_of === jobId &&
+        (automatic || (job.execution_status ?? job.status) === 'running'));
+      if (existing) return { job_id: existing.job_id, status: existing.execution_status ?? existing.status };
+      offset = page.next_offset ?? null;
+    }
+  }
+  const reuseVerification = (id, value) => {
+    if (!value.job_id) return value;
+    const next = value.status === 'running' ? `对 ${id} 的核验已在跑（任务 ${value.job_id}），不重复派` : undefined;
+    return { ...value, existing_verification: true, ...(next ? { next } : {}) };
+  };
+
   const verifyTool = {
     name: 'codex_verify',
     description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录和主机访问，' +
@@ -1997,35 +2072,67 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('codex_verify: wait_seconds 必须是非负整数');
       const owner = exec?.agent?.id;
       if (!owner) throw new Error('codex_verify: 当前调用没有会话 ID');
-      let source = await conductor.waitJob(args.job_id, 0, exec?.signal);
+      const source = await conductor.waitJob(args.job_id, 0, exec?.signal);
       if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
       if (!owns(owner, source.context?.owner)) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
       if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
       if (!source.cwd || !source.log_dir || typeof source.context.task !== 'string' || !Array.isArray(source.context.acceptance) || !source.context.acceptance.length ||
           !['read-only', 'workspace-write', 'danger-full-access'].includes(source.sandbox)) throw new Error('codex_verify: 原任务缺少目录、任务书、验收标准或执行设置，无法独立核验');
-      source = withReport(source);
-      rememberProducts(source);
-      const samples = args.samples ?? 8;
-      const required = mustVerifyCriteria(source);
-      return dispatch({ task: verificationTask(source, { ...args, samples }, required),
-        acceptance: [...required.map(verifyCriterionItem), '读取原任务书、验收标准和已产出的文件，明确核验范围。',
-          `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
-          '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
-          '全程只读，不修改任何文件或系统状态。',
-          // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
-          ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key)).map(verifyCriterionItem)],
-        cwd: source.cwd, write: false, scope: [], writable_roots: [],
-        host_access: source.sandbox === 'danger-full-access',
-        use_user_config: source.task_options?.use_user_config === true,
-        // 核验只读：配置了 readOnlyEffort 时按它，否则沿用原任务的思考程度。
-        ...((cfg.readOnlyEffort || source.task_options?.effort) ? { effort: cfg.readOnlyEffort || source.task_options.effort } : {}),
-        model: cfg.modelAB.enabled ? cfg.model : source.task_options?.model ?? '',
-        service_tier: source.task_options?.service_tier ?? '',
-        ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
-      }, exec, undefined, undefined, source.job_id);
+      const id = source.job_id;
+      const automatic = exec[automaticVerification] === true;
+      const pending = verificationStarts.get(id);
+      if (pending) {
+        const { value, error, existing } = await pending;
+        exec?.signal?.throwIfAborted();
+        if (error) throw error;
+        if (existing && value.status !== 'running' && !automatic) return verifyTool.execute(args, exec);
+        return reuseVerification(id, value);
+      }
+      const receipt = Promise.withResolvers();
+      verificationStarts.set(id, receipt.promise);
+      const release = () => { if (verificationStarts.get(id) === receipt.promise) verificationStarts.delete(id); };
+      try {
+        const existing = await findVerification(id, owner, automatic, exec?.signal);
+        if (existing) {
+          receipt.resolve({ value: existing, existing: true });
+          return reuseVerification(id, existing);
+        }
+        return await dispatchVerification(source, args, exec, started => {
+          receipt.resolve({ value: started });
+          release();
+        });
+      } catch (error) {
+        receipt.resolve({ error });
+        throw error;
+      } finally {
+        release();
+      }
     },
   };
   ctx.tools.register(verifyTool);
+
+  function dispatchVerification(source, args, exec, onStarted) {
+    source = withReport(source);
+    rememberProducts(source);
+    const samples = args.samples ?? 8;
+    const required = mustVerifyCriteria(source);
+    return dispatch({ task: verificationTask(source, { ...args, samples }, required),
+      acceptance: [...required.map(verifyCriterionItem), '读取原任务书、验收标准和已产出的文件，明确核验范围。',
+        `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
+        '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
+        '全程只读，不修改任何文件或系统状态。',
+        // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
+        ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key)).map(verifyCriterionItem)],
+      cwd: source.cwd, write: false, scope: [], writable_roots: [],
+      host_access: source.sandbox === 'danger-full-access',
+      use_user_config: source.task_options?.use_user_config === true,
+      // 核验只读：配置了 readOnlyEffort 时按它，否则沿用原任务的思考程度。
+      ...((cfg.readOnlyEffort || source.task_options?.effort) ? { effort: cfg.readOnlyEffort || source.task_options.effort } : {}),
+      model: cfg.modelAB.enabled ? cfg.model : source.task_options?.model ?? '',
+      service_tier: source.task_options?.service_tier ?? '',
+      ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
+    }, exec, undefined, undefined, source.job_id, undefined, undefined, { onStarted });
+  }
 
   ctx.tools.register({
     ...PRESENT.codex_status,
@@ -2061,7 +2168,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         return collect(args.job_id, bg, seconds, exec?.signal);
       }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
-      const result = value.rendered ? value : notifyOnDone(finishStatus(value), exec, finishStatus);
+      const result = value.rendered ? value : notifyOnDone(await finishStatus(value, exec), exec, finishStatus);
       const shown = dampenStatus(result, exec, 'codex_status', seconds) ?? result;
       return !threadNote ? shown : typeof shown.rendered === 'string' ? { ...shown, rendered: `${threadNote}\n${shown.rendered}` }
         : { ...shown, next: shown.next ? `${threadNote}\n${shown.next}` : threadNote };
@@ -2112,7 +2219,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       } else {
         next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
       }
-      return { ...done, next };
+      return withAutoVerification({ ...done, next }, exec);
     },
   });
 
@@ -2751,6 +2858,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         `接受未完成项缺依据被拒 ${mineCloseouts.rejected_open_unsupported ?? 0} / ${closeouts.total.rejected_open_unsupported ?? 0}，` +
         `自标未满足按 planner 级别记 met ${mineCloseouts.met_planner_level ?? 0} / ${closeouts.total.met_planner_level ?? 0}；` +
         `核验中放行新任务 ${mineCloseouts.deferred_dispatch ?? 0} / ${closeouts.total.deferred_dispatch ?? 0}；` +
+        `自动核验派出 ${mineCloseouts.auto_verify_started ?? 0} / ${closeouts.total.auto_verify_started ?? 0}，` +
+        `跳过 ${mineCloseouts.auto_verify_skipped ?? 0} / ${closeouts.total.auto_verify_skipped ?? 0}；` +
         `closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`
         : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`;
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +

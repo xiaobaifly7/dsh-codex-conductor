@@ -405,6 +405,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
 | `closeoutEvidence` | `independent` | 结案时自标未满足的条目记成满足所需的依据：`independent` 独立依据，`planner` 规划端自己的非照抄证据，`off` 不查 |
 | `acceptOpenEvidence` | `strict` | 自标未完成或列为 `must_verify` 的条目以未完成结案时，需有独立核验、后续轮次仍未完成、用户回复，或可确认的待用户处理阻塞。`strict` 对 `not_met` 只接受独立核验和用户回复，`relaxed` 接受以上四类，`off` 关闭检查。原报告标 `met` 的条目免查，且首次加载此版前结束的任务沿用旧规则。 |
+| `autoVerify` | `flagged` | 写任务执行完成、报告有效，且有自标未完成项或 `must_verify` 时自动派一次只读核验。交接后由最新继任会话接管，已有核验或派不出时在回执说明。`off` 关闭。 |
 | `autoHandover` | 见下 | 标记建议交接之后怎么办，对象，各键可单独省略；无效值告警并回落默认值，未知子键写进 `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` 只标记并保留面板按钮；`notify` 另加面板提醒；`confirm` 会话空闲且没有运行中的 Codex 任务时在面板询问，同意才交接；`auto` 同样条件下直接交接 |
 | `autoHandover.cooldownHours` | `12` | 拒绝、点“知道了”或询问没人理之后多少小时内不再询问或自动交接，非负数 |
@@ -793,6 +794,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |
 | `closeoutEvidence` | `independent` | What supports recording a criterion the report marked unmet as met when closing: `independent` sources, `planner` own non-copied evidence, `off` no check |
 | `acceptOpenEvidence` | `strict` | Accepting a flagged or `must_verify` item as open takes a mapped verification, a later round that still reports it open, a real user reply, or an actionable user blocker. `strict` accepts only verification or a user reply for `not_met`. `relaxed` accepts all four kinds and `off` disables the check. Items originally reported `met` are exempt. Jobs finished before first load keep the old rules. |
+| `autoVerify` | `flagged` | Automatically dispatch one read-only verification for a completed write job with a valid report and flagged or `must_verify` items. The latest handover successor owns it. The result explains a skip when a verification already exists or cannot start. `off` disables it. |
 | `autoHandover` | see below | What happens once a session is flagged; an object whose keys may be omitted one by one. Invalid values warn and fall back to the default; unknown sub-keys go to `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` flags only and keeps the panel button; `notify` adds a panel reminder; `confirm` asks in the panel once the session is idle with no running Codex job and hands over on agreement; `auto` hands over directly under the same conditions |
 | `autoHandover.cooldownHours` | `12` | Hours without questions or automatic hand-overs after a decline, a dismissed reminder or an unanswered question; non-negative |
@@ -809,7 +811,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 
 Execution, reconnect, exit-grace, status-wait and snapshot budgets use monotonic time; event/retry timestamps and displayed durations retain wall time. Unfinished `command_execution` items are tracked by ID: idle timeout pauses until all matching commands complete, while total timeout and reconnect limits remain active. Read-only resume threads survive route-check failures. Writers retain the full retry prompt until the current attempt reports command, file-change or assistant-message work; thread/turn startup and configuration warnings alone do not prove the user's continuation answer was saved. Failure classification reads only stderr added during the current attempt, while the full log retains all attempts.
 
-After Harness reopens, resuming an existing session reattaches its recorded, unsettled Codex jobs. Hot reload also checks open sessions. Recovery verifies the runner's owner, preserves native completion delivery, and never starts another Codex run.
+After Harness reopens, resuming an existing session reattaches its recorded, unsettled Codex jobs. Hot reload also checks open sessions. Recovery checks ownership and attaches completion delivery to the existing run. Eligible write completions observed during recovery follow the same `autoVerify` policy.
 
 Recovery and pending scope checks reuse paginated task records instead of a separate status process for every job; unverifiable scopes still block dispatch. Workers publish their own PID and creation time on startup, so status/cancel work even if the launching parent disconnects before recording them. If a dead worker's Codex identity still matches a present process, status explicitly reports `residual_codex_pid` and `retryable=false`; stop the residual process before redispatching. The status query only marks it and does not kill it.
 

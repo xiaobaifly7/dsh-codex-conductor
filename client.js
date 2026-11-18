@@ -739,6 +739,7 @@ window.__ModuleLoader__.load({
               field('continueFreshAboveTokens', '续接开新线程的阈值（token）', '不带回答的续接，原线程上次请求超过这么多输入 token 时改开新线程，只带上轮交接内容；0 表示总是沿用原线程，留空恢复默认 100000。'),
               field('closeoutEvidence', '结案依据要求', '原报告自标未满足的条目要记成满足时需要什么依据。', [['independent', '需要独立依据（默认）'], ['planner', '规划端自己的证据即可'], ['off', '不检查']]),
               field('acceptOpenEvidence', '接受未完成项的依据', '保留原报告标出的未完成项时需要什么依据。', [['strict', '未满足须核验或用户确认（默认）'], ['relaxed', '也接受返工结果或待用户处理的阻塞'], ['off', '不检查']]),
+              field('autoVerify', '完成后自动核验', '写任务完成且报告有未完成项或任务有 must_verify 时，自动派出只读核验。', [['flagged', '自动核验（默认）'], ['off', '关闭']]),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
               settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,
