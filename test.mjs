@@ -3,6 +3,7 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter, getEventListeners } from 'node:events';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -1278,7 +1279,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (argv[0] === 'start') return Promise.resolve(startResult ?? { job_id: `J${++n}`, status: 'running' });
     if (argv[0] === 'list') return Promise.resolve((typeof listResult === 'function' ? listResult(argv) : listResult) ?? { jobs: [], total: 0 });
     if (argv[0] === 'output') return Promise.resolve(outputResult ?? { job_id: argv[1], text: '', eof: true, next_offset: null });
-    if (argv[0] === 'review') return Promise.resolve(reviewResult);
+    if (argv[0] === 'review') return Promise.resolve(typeof reviewResult === 'function' ? reviewResult(argv, options) : reviewResult);
     if (argv[0] === 'thread-size') return typeof threadSizeResult === 'function' ? threadSizeResult(argv)
       : Promise.resolve(threadSizeResult ?? { status: 'completed', thread_id: argv[1], last_input_tokens: null });
     if (argv[0] === 'summary') return Promise.resolve(summaryResult ?? { groups: [], total: 0, total_jobs: 0 });
@@ -2069,9 +2070,11 @@ test('codex_summary defaults to the current owner, passes thread filters and nev
   const summary = { total: 0, total_jobs: 0, groups: [] };
   const h = harness({ config: { summaryResult: summary } });
   const exec = { agent: agentAt('/work/current') };
-  assert.deepEqual(await h.tools.codex_summary.execute({}, exec), summary);
-  assert.deepEqual(await h.tools.codex_summary.execute({ thread_id: 'THREAD' }, exec), summary);
-  assert.deepEqual(await h.tools.codex_summary.execute({ limit: 2, offset: 4 }, exec), summary);
+  for (const args of [{}, { thread_id: 'THREAD' }, { limit: 2, offset: 4 }]) {
+    const { accepted_open_ledger, ...value } = await h.tools.codex_summary.execute(args, exec);
+    assert.deepEqual(value, summary);
+    assert.deepEqual(accepted_open_ledger.items, []);
+  }
   assert.deepEqual(h.calls, [['summary', '--owner', 'S1'], ['summary', '--owner', 'S1', '--thread-id', 'THREAD'],
     ['summary', '--owner', 'S1', '--limit', '2', '--offset', '4']]);
 });
@@ -4436,7 +4439,9 @@ test('codex_summary renders error-kind totals for the full filtered range on eve
     error_kinds: { router_down: 4, idle_timeout: 2, schema_invalid: 1 } };
   const h = harness({ config: { summaryResult: summary } });
   const value = await h.tools.codex_summary.execute({ limit: 1, offset: 2 }, { agent: agentAt('/work') });
-  assert.deepEqual(value, summary);
+  const { accepted_open_ledger, ...runnerSummary } = value;
+  assert.deepEqual(runnerSummary, summary);
+  assert.deepEqual(accepted_open_ledger.completions, []);
   const render = input => h.tools.codex_summary.output.render({}, input)[0].text;
   assert.match(render(value), /错误分类（全部匹配任务）：router_down=4、idle_timeout=2、schema_invalid=1/);
   assert.match(render({ ...summary, error_kinds: {} }), /错误分类（全部匹配任务）：无/);
@@ -6234,17 +6239,127 @@ test('release A: strict and relaxed distinguish verification, later rounds, user
   assert.equal((await run({ jobs: [later, v] })).verification_status, 'accepted_deviations');
 });
 
-test('release E: closeout counts only a fresh, successful review of a real runner record', async () => {
-  const source = acceptedFixture();
+test('release B: accepted items stay visible across handover and require acknowledgement to complete a goal', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const listed = runnerFixture('runner-list-row-c0874f');
+  const at = source.verification.time + 1;
+  const reviewResult = { ...source, verification: { ...source.verification, time: at } };
+  const listResult = { jobs: [listed], total: 1 };
+  const reply = (time) => ({ type: 'user/message', time: time * 1000,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '确认接受未完成项' }] } });
+  const h = make({ listResult, reviewResult });
+  await h.tools.codex_review.execute(fixtureReview(source), { agent: agentAt('/work', [reply(at - 0.5)]) });
+  const file = path.join(state, 'accepted-open.json');
+  const persisted = () => JSON.parse(readFileSync(file, 'utf8'));
+  const { since, items } = persisted();
+  assert.equal(since, source.finished_at - 1);
+  assert.equal(items.length, 4);
+  assert.deepEqual(items[0], { session: 'S1', job_id: listed.job_id, key: '1', index: 1, status: 'blocked',
+    text_hash: createHash('sha1').update(source.context.acceptance[0]).digest('hex').slice(0, 12),
+    blocker_kinds: ['implementation'], support: ['user'], at });
+  assert.ok(!JSON.stringify(persisted()).includes('<text-'));
+  const stale = make({ plannerAnswers: true, acceptOpenEvidence: 'off', listResult, reviewResult: source });
+  await stale.tools.codex_review.execute(fixtureReview(source), { agent: agentAt('/work') });
+  assert.deepEqual(persisted().items, items);
+
+  writeFileSync(path.join(state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' } } }));
+  const successor = (log = [], id = 'S2') => ({ ...agentAt('/work', log), id });
+  const planner = make({ plannerAnswers: true, listResult });
+  const summary = async (agent) => planner.tools.codex_summary.execute({}, { agent });
+  assert.deepEqual((await summary(successor([], 'OTHER'))).accepted_open_ledger.items, []);
+  const visible = await summary(successor());
+  assert.deepEqual(visible.accepted_open_ledger.items, items);
+  assert.match(planner.tools.codex_summary.output.render({}, visible)[0].text, /未完成但接受的条目（本会话含前任）：4 项/);
+  const runtime = await planner.handlers['tools/execute']({ name: 'codex_runtime', arguments: {}, agent: successor() },
+    async () => ({ value: {}, content: [] }));
+  assert.match(runtime.content.at(-1).text, /以未完成项完成目标 0 次（最近 0 项）/);
+
+  let calls = 0;
+  const goal = (host, ack, log, isError = false) => {
+    const nativeArgs = { action: 'complete', goal_id: 'G1', revision: 1 };
+    const arguments_ = Object.freeze({ ...nativeArgs, ...(ack ? { acknowledge_open_items: true } : {}) });
+    const exec = { name: 'update_goal', arguments: arguments_, agent: successor(log) };
+    return host.handlers['tools/execute'](exec, async () => {
+      calls++;
+      assert.deepEqual(exec.arguments, nativeArgs);
+      return { isError, value: 'native' };
+    });
+  };
+  const refused = await goal(planner, false);
+  assert.match(refused.error.message, /4 项.*c0874f（blocked）.*acknowledge_open_items: true/);
+  assert.match((await goal(h, true, [reply(at - 0.5)])).error.message, /由用户确认这些未完成项/);
+  assert.equal(calls, 0);
+  assert.equal((await goal(planner, true, [], true)).isError, true);
+  assert.deepEqual(persisted().completions, []);
+  assert.equal((await goal(planner, true)).content.at(-1).text, `目标以 4 项未完成项完成：${listed.job_id}`);
+  await goal(h, true, [reply(at + 1)]);
+  assert.deepEqual(persisted().completions.map(({ at: time, ...entry }) => [Number.isFinite(time), entry]), [
+    [true, { session: 'S2', open_count: 4, job_ids: [listed.job_id], acknowledged_by: 'planner' }],
+    [true, { session: 'S2', open_count: 4, job_ids: [listed.job_id], acknowledged_by: 'user' }],
+  ]);
+  const value = await planner.tools.codex_run.execute(RUN, { agent: successor() });
+  assert.equal(value.status, 'running');
+});
+
+test('release B: a later closing review or a mapped verification clears only resolved ledger items', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const listed = runnerFixture('runner-list-row-c0874f');
+  const at = source.verification.time + 1;
+  const id = source.job_id;
+  const jobs = [listed];
+  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
+    listResult: () => ({ jobs }),
+    reviewResult: ([, job_id], { stdin }) => {
+      const value = h.finals[job_id];
+      const review = JSON.parse(stdin);
+      return { ...value, verification_status: review.status, verification: { ...review, time: at + (job_id === id ? 0 : 3) } };
+    },
+  });
+  const exec = { agent: agentAt('/work') };
+  const submit = args => h.tools.codex_review.execute(args, exec);
+  const ledger = async () => (await h.tools.codex_summary.execute({}, exec)).accepted_open_ledger;
+  await submit(fixtureReview(source));
+  assert.equal((await ledger()).items.length, 4);
+
+  // 名义上是后续轮，但只有第 4 项的原文确实相同。
+  const later = { ...source, job_id: 'LATER', finished_at: at + 1, verification: null,
+    context: { ...source.context, continuation: { parent_job_id: id }, acceptance: [source.context.acceptance[3]] },
+    structured: { ...source.structured, deviations: [], criteria: [{ criterion: source.context.acceptance[3], status: 'met', evidence: '已实测' }] } };
+  h.finals.LATER = later;
+  jobs.push({ ...listed, job_id: 'LATER', parent_job_id: id, finished_at: later.finished_at });
+  await submit({ job_id: 'LATER', status: 'accepted_deviations', criteria: [{ index: 1, status: 'met', evidence: '已实测' }] });
+  assert.deepEqual((await ledger()).items.map(item => item.index), [1, 2, 3]);
+
+  const verification = (job_id, target, finished_at, keys) => {
+    const context = { owner: 'S1', verification_of: target,
+      acceptance: keys.map(key => `原验收第 ${key} 条（原报告标 blocked）：核实原验收`) };
+    const structured = { ...source.structured, criteria: context.acceptance.map(criterion => ({ criterion, status: 'met', evidence: '已复核' })) };
+    jobs.push({ job_id, context, execution_status: 'completed', finished_at });
+    h.finals[job_id] = { status: 'completed', context, structured };
+  };
+  verification('OLD', id, at - 1, [1]);
+  verification('CHECK', id, at + 1, [2]);
+  // 下一轮把原来的第 3 项重排为第 1 项，须按条文销项。
+  later.context.acceptance = [source.context.acceptance[2]];
+  verification('CHECK-LATER', 'LATER', at + 2, [1]);
+  assert.deepEqual((await ledger()).items.map(item => item.index), [1]);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(state, 'accepted-open.json'), 'utf8')).items.map(item => item.index), [1]);
+  const closed = fixtureReview(source);
+  closed.criteria = closed.criteria.map(({ index, evidence }) => ({ index, status: 'met', evidence }));
+  await submit(closed);
+  assert.deepEqual((await ledger()).items, []);
+});
+
+test('release E: closeout counts only a fresh, successful review of a real runner record', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
   const review = fixtureReview(source);
   const stats = () => {
-    try { return JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'closeout-stats.json'), 'utf8')).total; }
+    try { return JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8')).total; }
     catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
   };
   const before = stats();
   const run = async (reply) => {
-    const h = harness({ config: { plannerAnswers: true, acceptOpenEvidence: 'off', reviewResult: reply } });
-    h.finals[source.job_id] = source;
+    const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', reviewResult: reply });
     return h.tools.codex_review.execute(review, { agent: agentAt('/work/current') });
   };
   await run(source); // status 名相同，但回复携带原来的验收。

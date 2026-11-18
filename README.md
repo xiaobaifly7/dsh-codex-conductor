@@ -86,6 +86,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 截止：本机第一次加载这一版之后结束的任务才按 `independent` 要求（`closeout-evidence-since.json`），之前结束的任务按 `planner` 规则，不会因升级变难收尾。
 - 统计：`closeout-stats.json` 按会话和总数记结案结果（`all_met` 全部满足、`accepted_open` 未满足但接受、`rejected_unsupported` 缺独立依据被拒），`codex_runtime` 显示。任务 context 新增 `routing`（续接方式、原线程、父任务、被接替的线程、`verify_previous`），收尾护栏拒绝时把被点名的任务号记进 `closeout-refusals.jsonl`。
 
+从首次加载本版起结束的任务，成功结案后会把接受的未完成项记入 `accepted-open.json`，保存编号、状态、条文哈希、阻塞与依据类型等元数据。后续轮次结案或独立核验确认满足后销项。`codex_runtime` 和 `codex_summary` 显示本会话及交接前任的条目与完成记录。有开放项时，规划端完成目标须传 `update_goal(action=complete, acknowledge_open_items=true)`。关闭 `plannerAnswers` 时还须有晚于最近一项的真实用户回复。
+
 ### 0.9.112：codex_run 续接也开新线程、派活时同时核验上一单
 
 - `codex_run` 带 `resume`：原线程上次请求超过 `continueFreshAboveTokens`（默认 100000）时改开新线程，规划端写的任务原文完整保留，前面附上一轮交接内容（上一轮的任务书和验收标准、逐条自报的状态和证据、偏差、未决、阻塞、改动文件、最新验收结论和意见）。“上一轮”是该线程上本会话（含交接前任）最新的任务，新任务以 `parent_job_id` 挂在它下面，所以工作单元、`codex_summary` 分组、收尾护栏的“后续轮次”、交接自检和别名都把它当作这条线程的后续。`fresh: true` / `false` 可逐次指定；线程小、读不到大小时照旧沿用原线程。结果写明开了新线程、原线程、上一轮任务和新任务号，并提示以后对新任务返工、不要再 resume 原线程；之后若仍 resume 已被接替的旧线程，插件自动改接接替它的线程上最新的任务并说明。
@@ -616,6 +618,8 @@ The Codex panel lists pending questions and the ten latest history entries. You 
 - Report rows and acceptance items: a report row maps to an acceptance item by identical text, or by position when the report has exactly as many rows as there are items. When the counts differ, a flagged row (`blocked` / `not_met`) that matches no item is addressed by its report row number in `report_rows` (`{row, status, evidence, accepted?}`): a closing review must list every such row, with the same rules as `criteria` (met needs independent support; kept open needs `accepted` under `accepted_deviations`). Verifications count as support only for rows that map to their items this way, and list unmapped flagged rows as their own items ("原报告第 k 行…"). Verification jobs now report exactly one row per item, with the sampled claims inside the evidence of item 3.
 - Cut-off: only jobs finished after this version first loaded on the machine (`closeout-evidence-since.json`) are held to `independent`; earlier jobs close under the `planner` rule, so upgrading does not make them harder to close.
 - Measurement: `closeout-stats.json` counts closing outcomes per session and overall (`all_met`, `accepted_open`, `rejected_unsupported`), shown by `codex_runtime`. Job contexts gain `routing` (continuation mode, parent thread, parent job, superseded threads, `verify_previous`), and close-out refusals log the named job ids to `closeout-refusals.jsonl`.
+
+Successful closing reviews for jobs finished since first load record accepted open items in `accepted-open.json`. The ledger stores item identifiers, statuses, text hashes, blocker and support kinds, and timestamps. A later closing review or independent verification can clear items it confirms as met. `codex_runtime` and `codex_summary` show items and completions for this session and its handover predecessors. To complete a goal with open items, pass `update_goal(action=complete, acknowledge_open_items=true)`. With `plannerAnswers` off, a real user reply after the latest item is also required.
 
 ### 0.9.112: Fresh threads for codex_run resumes, and verifying the previous job alongside the next one
 

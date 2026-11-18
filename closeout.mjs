@@ -28,6 +28,10 @@ export function reviewTargets(source) {
   ] };
 }
 
+export const reviewItemText = (source, { row, index }) => row
+  ? source.structured?.criteria?.[row - 1]?.criterion
+  : label(reviewTargets(source).acceptance?.[index - 1]);
+
 export function prepareReview(args, source) {
   const { job_id: _job, ...input } = args ?? {};
   const review = { ...input };

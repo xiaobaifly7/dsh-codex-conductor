@@ -13,7 +13,7 @@
 // 护栏 fail-closed：范围内判定出错就拒绝并给出原因；范围外的会话完全不受影响。
 
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, reviewItemText, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -1141,6 +1141,102 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
   const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  const ledgerFile = stateDirectory && path.join(stateDirectory, 'accepted-open.json');
+  const readLedger = () => {
+    try { if (ledgerFile) return JSON.parse(readFileSync(ledgerFile, 'utf8')); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+    return { since: acceptOpenFrom, items: [], completions: [] };
+  };
+  const saveLedger = (ledger) => {
+    if (ledgerFile) writeJsonAtomic(ledgerFile, { ...ledger, items: ledger.items.slice(-2000), completions: ledger.completions.slice(-500) });
+  };
+  const textHash = (text) => typeof text === 'string' ? createHash('sha1').update(text).digest('hex').slice(0, 12) : undefined;
+  const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
+  const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
+  const ledgerLine = ({ items, completions }) =>
+    `未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
+    `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`;
+
+  async function recordAcceptedOpen(source, { review, acceptedOpen }, owner, at) {
+    if (!ledgerFile || beforeCutoff(source, acceptOpenFrom)) return;
+    const jobId = source.job_id;
+    const session = source.context.owner;
+    const blockers = source.structured?.blockers;
+    const blocker_kinds = Array.isArray(blockers) ? [...new Set(blockers.map(blocker => blocker?.kind).filter(Boolean))] : [];
+    const items = acceptedOpen.map(entry => ({
+      session, job_id: jobId, ...entry, text_hash: textHash(reviewItemText(source, entry)), blocker_kinds, at,
+    }));
+    const met = new Set([...review.criteria, ...(review.report_rows ?? [])].filter(c => c.status === 'met')
+      .map(c => textHash(reviewItemText(source, c))));
+    const ancestors = new Set();
+    if (met.size && !source.context.verification_of && readLedger().items.length) {
+      let parent = parentOf(source);
+      for (let hops = 0; hops < 10 && parent && !ancestors.has(parent); hops++) {
+        const round = await conductor.waitJob(parent, 0);
+        if (!owns(owner, round.context?.owner)) break;
+        ancestors.add(parent);
+        parent = parentOf(round);
+      }
+    }
+    const ledger = readLedger();
+    const remaining = ledger.items.filter(item => item.job_id !== jobId &&
+      !(ancestors.has(item.job_id) && item.at <= at && met.has(item.text_hash)));
+    if (items.length || remaining.length !== ledger.items.length) saveLedger({ ...ledger, items: [...remaining, ...items] });
+  }
+
+  async function acceptedOpenLedger(owner, signal) {
+    const scope = aliases.owners(owner);
+    const view = ({ since, items, completions }) => ({ since, items: items.filter(item => scope.includes(item.session)),
+      completions: completions.filter(entry => scope.includes(entry.session)) });
+    const snapshot = view(readLedger());
+    if (!snapshot.items.length) return snapshot;
+    const byJob = new Map(ledgerJobIds(snapshot.items).map(id => [id, []]));
+    for (const item of snapshot.items) byJob.get(item.job_id).push(item);
+    const resolved = new Set();
+    const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
+    try {
+      const jobs = new Map();
+      for (let offset = 0; offset !== null;) {
+        const page = await conductor.list({ owner, also_owners: scope.slice(1), limit: 100, offset }, signal);
+        if (page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
+        for (const job of page.jobs) jobs.set(job.job_id, job);
+        offset = page.next_offset ?? null;
+      }
+      for (const job of jobs.values()) {
+        const target = job.context?.verification_of;
+        if (!target || job.execution_status !== 'completed') continue;
+        const candidates = [];
+        for (let id = target, hops = 0; id && hops <= 10; id = parentOf(jobs.get(id)), hops++) {
+          for (const item of byJob.get(id) ?? []) if (job.finished_at > item.at && !resolved.has(itemId(item))) candidates.push(item);
+        }
+        if (!candidates.length) continue;
+        const full = await conductor.waitJob(job.job_id, 0, signal);
+        const acceptance = full.context?.acceptance;
+        if (full.error_kind || !Array.isArray(acceptance) || !validReport(full.structured)) continue;
+        const met = acceptance.flatMap((text, i) => {
+          const key = verificationItemKey(text);
+          return key && reportRowOf(acceptance, full.structured.criteria, i + 1)?.status === 'met' ? [key] : [];
+        });
+        if (!met.length) continue;
+        // 后续轮次的编号可能不同，回查该轮条文才能销掉前任条目。
+        const round = candidates.some(item => item.job_id !== target) ? await conductor.waitJob(target, 0, signal) : undefined;
+        const hashes = round ? met.map(key => textHash(reviewItemText(round,
+          key.startsWith('row') ? { row: Number(key.slice(3)) } : { index: Number(key) }))) : [];
+        for (const item of candidates) if (item.job_id === target ? met.includes(item.key) : hashes.includes(item.text_hash)) {
+          resolved.add(itemId(item));
+        }
+      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      ctx.logger?.warn?.(`[codex-conductor] 未能回查已接受的未完成项：${error?.message ?? error}`);
+    }
+    // runner 查询期间可能有新的复核，只移除刚才核实的那一条记录。
+    const ledger = readLedger();
+    const items = ledger.items.filter(item => !resolved.has(itemId(item)));
+    const next = { ...ledger, items };
+    if (items.length !== ledger.items.length) saveLedger(next);
+    return view(next);
+  }
   const autoAnswer = registerAutoAnswer({ ctx, settings: cfg.autoAnswer, directory: stateDirectory });
   // 工作区（侧栏分组）、目标和会话都是可选的宿主服务，取不到时相应步骤降级。
   const workspaces = () => ctx.get?.('workspaceRegistry');
@@ -1436,8 +1532,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return dispatchedSessions.has(agent?.id) || !Array.isArray(log) || log.some((e) => e?.type === 'tool/call' &&
       (DISPATCH_TOOLS.test(e.data?.name ?? '') || (e.data?.name === 'tool_call' && DISPATCH_TOOLS.test(String(e.data.arguments)))));
   };
-  const goalAction = (value) => {
-    try { return (typeof value === 'string' ? JSON.parse(value) : value)?.action; } catch { return undefined; }
+  const goalArguments = (value) => {
+    try { return typeof value === 'string' ? JSON.parse(value) : value; } catch { return undefined; }
   };
   // 收尾护栏：本会话有未收尾的已结束任务时返回拒绝说明，否则返回空串；读不到记录或判定出错时放行并记警告。
   // runner 任务号形如 YYYYMMDD-HHMMSS-xxxxxx，Codex 线程号是 UUID，两者不会重合。只读查询误传线程号时，
@@ -2294,6 +2390,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
         countCloseout(owner, openAccepted(review) ? 'accepted_open'
           : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
+        await recordAcceptedOpen(source, prepared, owner, result.verification.time);
       }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
@@ -2331,11 +2428,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
           `已结束轮次耗时合计：${typeof g.finished_duration_s === 'number' ? `${Math.round(g.finished_duration_s)} 秒` : '未知'}；用量（${g.usage_scope}）：${g.usage == null ? '未知（原始用量不完整）' : JSON.stringify(g.usage)}`,
           ...(g.rounds_truncated ? ['只展示最新轮次明细；总轮数、文件集合与耗时按全部匹配记录计算。'] : []),
-        ].join('\n'))].join('\n\n') : JSON.stringify(value, null, 2) }] },
+        ].join('\n')), ...(value.accepted_open_ledger ? [ledgerLine(value.accepted_open_ledger)] : [])].join('\n\n')
+      : [JSON.stringify(value, null, 2), value.accepted_open_ledger && ledgerLine(value.accepted_open_ledger)].filter(Boolean).join('\n') }] },
     async execute(args = {}, exec) {
       const selected = args.cwd !== undefined || args.session_id !== undefined ? args : { session_id: 'current', ...args };
       const { filters } = await historySelection(selected, exec);
-      return conductor.summary(filters, exec?.signal);
+      const [summary, ledger] = await Promise.all([
+        conductor.summary(filters, exec?.signal), acceptedOpenLedger(exec?.agent?.id, exec?.signal),
+      ]);
+      return { ...summary, accepted_open_ledger: ledger };
     },
   });
 
@@ -2599,9 +2700,31 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
     }
     let goal;
-    if (exec.name === 'update_goal' && goalAction(exec.arguments) === 'complete' && usedConductor(exec.agent)) {
+    const goalArgs = exec.name === 'update_goal' && goalArguments(exec.arguments);
+    if (goalArgs?.action === 'complete') {
       goal = {};
-      const refusal = await closeoutCheck(exec.agent?.id, 'update_goal', exec.signal, undefined, goal);
+      // 宿主冻结参数对象，但工具体在中间件之后从 exec 读取参数。
+      const { acknowledge_open_items, ...nativeArgs } = goalArgs;
+      if (Object.hasOwn(goalArgs, 'acknowledge_open_items')) exec.arguments = nativeArgs;
+      const owner = exec.agent?.id;
+      let refusal = usedConductor(exec.agent) ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '';
+      if (!refusal) {
+        const { items } = await acceptedOpenLedger(owner, exec.signal);
+        if (items.length) {
+          const jobIds = ledgerJobIds(items);
+          const listing = jobIds.map(id => `${id}（${[...new Set(items.filter(item => item.job_id === id).map(item => item.status))].join('、')}）`);
+          const userConfirmed = cfg.plannerAnswers || hasUserReply(exec.agent.session?.log ?? [],
+            { finished_at: Math.max(...items.map(item => item.at)) }, owner, cfg.autoResume.message);
+          if (!userConfirmed || acknowledge_open_items !== true) {
+            refusal = `update_goal: 本会话含前任仍有 ${items.length} 项未完成但接受的条目：${listing.join('、')}。` +
+              (userConfirmed ? '' : '请先由用户确认这些未完成项，收到用户回复后再继续。') +
+              '接受这些未完成项并结束目标时，请在 update_goal(action=complete) 中传 acknowledge_open_items: true。';
+          } else {
+            goal.completion = { session: owner, open_count: items.length, job_ids: jobIds,
+              acknowledged_by: cfg.plannerAnswers ? 'planner' : 'user' };
+          }
+        }
+      }
       if (refusal) return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
     }
     if (inWorkspace(sessionCwd(exec), cfg.roots)) {
@@ -2616,6 +2739,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const result = await next();
       const value = history.observe(exec.agent);
       if (result.isError || !value) return result;
+      const ledger = await acceptedOpenLedger(exec.agent?.id, exec.signal);
       let acceptance;
       try { acceptance = acceptanceStatsFile && JSON.parse(readFileSync(acceptanceStatsFile, 'utf8')); } catch {}
       let closeouts;
@@ -2632,17 +2756,25 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
-          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}`;
+          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}\n${ledgerLine(ledger)}`;
       return { ...result, ...(result.value && typeof result.value === 'object'
         ? { value: { ...result.value, session_history: value, ...(acceptance ? { acceptance_stats: acceptance } : {}),
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
-    if (goal?.unreviewedWrites?.length) {
+    if (goal?.unreviewedWrites?.length || goal?.completion) {
       const result = await next();
       if (result.isError) return result;
-      const text = `以下写入任务报告无异常，尚未经过 codex_review：${goal.unreviewedWrites.join('、')}。`;
-      return { ...result, content: [...(result.content ?? []), { type: 'text', text }] };
+      const content = [...(result.content ?? [])];
+      if (goal.unreviewedWrites?.length) content.push({ type: 'text',
+        text: `以下写入任务报告无异常，尚未经过 codex_review：${goal.unreviewedWrites.join('、')}。` });
+      if (goal.completion) {
+        const ledger = readLedger();
+        ledger.completions.push({ ...goal.completion, at: Date.now() / 1000 });
+        saveLedger(ledger);
+        content.push({ type: 'text', text: `目标以 ${goal.completion.open_count} 项未完成项完成：${goal.completion.job_ids.join('、')}` });
+      }
+      return { ...result, content };
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。
     if (exec.name !== 'job_output' || exec.arguments?.wait === true || !exec.agent?.id) return next();
