@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.121` 改写派单和执行提示。规划端按可独立验收的结果拆单，派单前核对写入权限、运行前置和本轮可取得的证据。执行端遇到方法不可用时，在原授权内换等价方法，区分实测不符的 `not_met` 和缺前置的 `blocked`，并明确关键观测、清理或恢复失败须以非零状态退出。
+
 `0.9.120` 让核验能与下一单并行，并少拒结案验收。之前收尾护栏只要有已结束未验收的任务就拒绝开新工作的 `codex_run`，而结案依据规则要它先核验，于是规划端只能干等核验结束；`verify_previous` 本身是 `codex_run` 的参数，同样被拒，正好在它要解决的场景里用不上（0.9.118 上线后 8 次核验 0 次走 verify_previous，同会话并行为 0）。现在本会话唯一一个待验收任务正在核验（它的第一次核验在跑，或本单带 `verify_previous` 核验它）且没有别的待收尾任务时，放行写入范围不与它重叠的新任务；每个任务只放行一次，核验结束后照常要先验收；靠 `verify_previous` 放行且设了 `maxRunningJobs` 时要放得下两单；结果带 `closeout_deferred`，`codex_runtime` 计 `deferred_dispatch`。缺依据的拒绝和收尾护栏的拒绝都写明这条路。`accepted_deviations` 里保留未满足却没写 `accepted` 的条目，按接受未满足处理（原因取 evidence，带“（按 evidence 推定）”前缀，结果里的 `review_fixes` 说明，照样经过用户确认），不再拒绝；从不推定 met。`codex_runtime` 补上 `met_planner_level` 和 `accepted_inferred`。
 
 `0.9.119` 补上 0.9.118 上线后发现的两处缺口。报告多出的行：报告行数与验收条数不同时（核验报告几乎都是这样），不再按位置把报告行对到验收编号；自标 `blocked` / `not_met` 又对不上任何验收原文的行，结案结论必须在新字段 `report_rows`（`{row, status, evidence, accepted?}`）逐行处理，规则与 `criteria` 相同——记 met 要独立依据，保留未满足要在 `accepted_deviations` 里写 `accepted`；之前只按验收条数提交就能结案，这些行没人处理。核验报告只有对得上核验项的行才算依据（之前条数不同时按位置取行，抽查行会被当成某条原验收的结论）；对不上验收清单的自标未满足行，核验任务单列一条。核验任务的提示改为一条验收只回报一行、抽查结论写进第 3 条的 evidence；所有任务的提示写明 criteria 条数与验收标准相同。`accepted`：`codex_review` 的参数 schema 之前没有声明 `accepted`（条目 `additionalProperties: false`），规划端按 schema 写不出这个字段，“未满足但接受”实际用不了；现已声明，描述里也写明用法。被拒时的骨架给 `accepted_deviations` 里保留未满足的条目带上 `accepted`（沿用已填的，否则留占位），未填的占位单独提示并给出一行结构示例，改记 met 或 needs_changes 时自动去掉。runner 的 `validate_review` 接受 `report_rows`，`summary` 的 `accepted_open` 也列出接受的报告行。
@@ -135,6 +137,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.121` revises dispatch and execution prompts. The planner splits work into independently verifiable outcomes and checks write permissions, runtime prerequisites and available evidence before dispatching. Codex can use equivalent methods within the original authorization, distinguishes observed mismatches (`not_met`) from missing prerequisites (`blocked`), and must surface critical observation, cleanup or recovery failures with a nonzero script exit.
 
 `0.9.120` lets a verification run alongside the next unit and rejects fewer closing reviews. The close-out guard refused new-work `codex_run` while any finished job was unreviewed, and the closing-evidence rule asks for a verification first, so the planner had to wait for the verification. `verify_previous` is a `codex_run` parameter, so it was refused too, in exactly the case it was built for (after 0.9.118 went live: 0 of 8 verifications through `verify_previous`, same-session parallelism 0). Now, when the session's only unreviewed job is being verified (its first verification is running, or this unit carries `verify_previous` for it) and nothing else awaits close-out, new work whose writes do not overlap that job is let through. Each job gets this once; after its verification finishes, its review is due as before. With `verify_previous` as the reason and `maxRunningJobs` set, both jobs must fit. The result carries `closeout_deferred`; `codex_runtime` counts `deferred_dispatch`. The missing-support rejection and the guard refusal both state this path. An `accepted_deviations` entry kept unmet without `accepted` is now accepted as such (reason taken from its evidence, prefixed "（按 evidence 推定）", reported in `review_fixes`, same user confirmation) instead of rejected; `met` is never inferred. `codex_runtime` also shows `met_planner_level` and `accepted_inferred`.
 

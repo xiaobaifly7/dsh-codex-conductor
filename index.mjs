@@ -163,7 +163,7 @@ export function plannerPrompt(file) {
 
 export function plannerSection(text) {
   return text ? '## 派活给 Codex 前的规划要求（用户设定）\n' +
-    '每次用 codex_run 派活前，都按下面的要求规划、写 task 和 acceptance。这是用户给你的规划要求，不要原样抄进给 Codex 的 task。\n\n' +
+    '按下列要求写 task 和 acceptance，派单前核对授权与本轮可取证性。不要原样抄给 Codex。\n\n' +
     text : '';
 }
 
@@ -421,7 +421,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
-    '- 任务明确禁止某些访问或状态变更时，运行相关脚本前先只读检查是否触及这些限制；存在冲突或无法确认时，不执行相关步骤并标为 blocked。\n' +
+    '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
     (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
     (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些 Python re 正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
       '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
@@ -429,14 +429,17 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
       '只做任务需要的事；任务没有点名的虚拟机、文件和网络设置，不要删除、停止、重建或改配置。\n' : '') +
     (hostAccess && !write ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
-    '- 任务与现状不符、验收标准之间互相冲突，或者按计划做不到时，不要自行改方案或取舍：做完能做的部分，' +
-    '在 deviations 里写清冲突和原因，并把对应验收标准标为 blocked。\n' +
+    '- 计划步骤、工具或路径不可用时，在原授权内换方法证明同一验收结果。不得扩大写入、主机访问或目标范围。' +
+    '在 deviations 写明换了什么、为何等价。完成可做的部分。\n' +
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
+    '- 脚本的关键观测、清理或恢复失败时，须以非零状态退出。\n' +
     (fixed ? '\n## 用户的固定要求\n以下要求适用于每一单，不增加权限，也不扩大范围；与上面的任务、验收标准或执行约束冲突时，' +
       `以上面的为准，并在 deviations 里说明。\n${fixed}\n` : '') +
     '\n## 最后汇报\n最终答复只输出符合给定 JSON 格式的对象：summary 概述结果；criteria 按上面的顺序逐条给出（条数与验收标准相同，一条对一条，不拆分、不合并、不另加）' +
     'status（met / not_met / blocked）和 evidence（具体证据：命令与输出、文件与行号）；files_changed 列出改动的文件；' +
     'deviations 列出与计划不一致的地方及原因（没有就空数组）；unresolved 列出没解决的问题。\n' +
+    '实测结果不符记 not_met；缺权限、环境、输入或证据无法事后补采时记 blocked，写明缺失的前置。' +
+    '同一前置导致多条未测时，首条写清，其余引用。未运行的步骤不得报通过。\n' +
     'blockers 列出真实阻塞，没有就 []；每项包含唯一 id、kind、message、question、resolution 五个字符串。' +
     'kind 只用 user_input（缺用户信息）、task_conflict（任务冲突需用户取舍）、environment（环境条件未满足）、implementation（实现待修）。' +
     '前两类必须写清 question；其余没有问题时 question 留空，resolution 写已知解除条件，不确定原因时不要猜分类。\n' +
@@ -1108,8 +1111,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       mkdirSync(path.dirname(acceptanceStatsFile), { recursive: true });
       writeJsonAtomic(acceptanceStatsFile, stats);
     } catch {}
-    return over ? `[验收条数] 这单带了 ${items} 条验收标准（提醒阈值 ${limit}）。验收标准只放交付必须满足、能拿证据判断的条目；` +
-      '偏好、顺手的改进和“尽量”类要求写进 task 正文，下次派活时精简。' : '';
+    return over ? `[验收条数] 这单带了 ${items} 条验收标准（提醒阈值 ${limit}）。下次先按共同前置拆单，只留本轮可取证的必验结果；` +
+      '偏好写进 task 正文。' : '';
   };
   // 超过阈值时给规划端一行提示，每个回合最多一次；规划端自己不发起交接。
   const hintedTurns = new Map();
@@ -1685,12 +1688,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex 执行（它看不到本对话）。登记为 Harness 后台任务后直接返回两个任务号；' + WAIT_GUIDANCE + '必须给出验收标准和 write：' +
-      '要改文件、做修复、建备份或运行会产生写入的测试/部署，按用户授权传 write=true；纯只读核查传 false；scope 限定允许改动的路径。' +
-      '同一授权范围内，一单完成一个可验收结果，路径、平台和参数适配在单内处理。' +
-      '教程修订后的终检与目录导航同一单：write=true，scope 只含目录页，正文与素材只读。不要同时要求写入和禁止 mtime 变化。' +
-      '沙箱内跨目录写入还要用 writable_roots 指定额外可写目录，并将实际写入目标列入 scope。Codex 会按验收标准逐条回报 ' +
-      '（report），结果里还会标出它自报未满足、偏离计划和超出 scope 的改动。' +
+    description: '把任务交给 WSL 里的 Codex（它看不到本对话）。登记后台任务后返回两个任务号。' + WAIT_GUIDANCE +
+      '一单一个可独立验收的结果，超过 8 条先按共同前置拆单。路径、平台和参数适配在原授权内处理。' +
+      '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
+      '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
+      '教程终检与补目录导航同单，write=true，scope 只含目录页，正文与素材只读。Codex 逐条回报验收，列出偏差和范围外改动。' +
       (cfg.plannerReads === 'products' ? 'completed 后先机械核对产物、出处和数字，内容是否属实用 codex_verify，' : 'completed 后你要逐条只读核验，') +
       (cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
@@ -1707,16 +1709,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       type: 'object',
       properties: {
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
-        acceptance: { type: 'array', minItems: 1, items: { type: 'string' }, description: '验收标准，至少 1 条，不设条数上限；每条去除首尾空白后至少 4 个字符，写成可核验的结果：做完后应当存在什么、运行什么检查得到什么。' },
+        acceptance: { type: 'array', minItems: 1, items: { type: 'string' }, description: '至少 1 条，每条去除首尾空白后至少 4 个字符。只写结果、正常观测入口和预期值，只要求本轮可取得的证据。' +
+          '哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，仅在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并写明用途。' },
         write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（使用沙箱时为 workspace-write）；' +
           'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
-          `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。测试/部署若会生成或删除文件、改变远端状态，也属于写入；须按用户授权设置 true 并在 scope/task 写明目标，不能同时要求这些操作和禁止任何写入。` },
+          `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。生成或删除文件、改变远端状态也需 true，按授权在 scope/task 写明目标。不得同时要求写入和禁止写入。` },
         ...(cfg.allowHostAccess === true ? { host_access: { type: 'boolean', default: cfg.defaultHostAccess === true,
           description: 'true 时 Codex 在沙箱外运行（danger-full-access），' +
           '可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令）、连接 Hyper-V 虚拟机；write 仍决定能否改动（文件、虚拟机、网络和系统状态）：' +
           '要启动/停止/新建虚拟机，或运行会建、改虚拟机的脚本，也要传 write=true，否则 Codex 只做只读调查。不再有沙箱，只靠提示约束。' +
           (cfg.defaultHostAccess === true ? '当前默认 true，新任务和 resume 都可省略；false 为本次任务恢复沙箱。' : '只在任务需要时传。') } } : {}),
-        scope: { type: 'array', items: { type: 'string' }, description: '允许 Codex 改动的文件或目录（相对任务目录或绝对路径）。须覆盖所有获准的写入目标，包括新建的临时脚本、备份和工作区外的复制目的地。若任务必需的写入超出用户授权，先澄清再派单。' +
+        scope: { type: 'array', items: { type: 'string' }, description: '允许改动的文件或目录（相对任务目录或绝对路径）。覆盖获准的启动必写路径、临时脚本、备份和复制目的地等全部写入目标。必需写入超出授权时，先澄清再派单。' +
           '不展开通配符；动态命名的备份须在派活前确定具体文件名并列入 scope。' +
           '它不增加沙箱写权限；给了就写进约束，完成后在 out_of_scope 里列出范围外的改动。' },
         writable_roots: { type: 'array', items: { type: 'string' }, description: '本次任务在 cwd 以外需要写入的已有目录（Windows 路径或 /mnt/...）；需要 write=true。' +

@@ -989,8 +989,14 @@ test('codex_run validation requires acceptance criteria', () => {
   assert.throws(() => validateRun({ ...writable, write: false, writable_roots: ['E:\\results'] }), /write=true/);
   validateRun({ ...writable, writable_roots: ['E:\\results'] });
   const prompt = composePrompt('做事情做事情', ['甲条件成立'], ['src/a.py', 'tests/']);
-  assert.match(prompt, /## 验收标准[\s\S]*1\. 甲条件成立[\s\S]*## 执行约束[\s\S]*只允许改动这些路径：src\/a\.py、tests\/[\s\S]*blocked[\s\S]*## 最后汇报[\s\S]*JSON/);
+  assert.match(prompt, /## 验收标准[\s\S]*1\. 甲条件成立[\s\S]*## 执行约束[\s\S]*只允许改动这些路径：src\/a\.py、tests\/[\s\S]*## 最后汇报[\s\S]*JSON[\s\S]*blocked/);
   assert.doesNotMatch(composePrompt('做事情做事情', ['甲条件成立']), /只允许改动/);
+  assert.match(prompt, /脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步/);
+  assert.match(prompt, /计划步骤、工具或路径不可用时，在原授权内换方法证明同一验收结果。不得扩大写入、主机访问或目标范围。在 deviations 写明换了什么、为何等价。完成可做的部分/);
+  assert.match(prompt, /不要为了通过验收去修改验收脚本、测试或判据本身/);
+  assert.match(prompt, /关键观测、清理或恢复失败时，须以非零状态退出/);
+  assert.match(prompt, /实测结果不符记 not_met；缺权限、环境、输入或证据无法事后补采时记 blocked，写明缺失的前置/);
+  assert.match(prompt, /同一前置导致多条未测时，首条写清，其余引用。未运行的步骤不得报通过/);
   assert.match(prompt, /Windows 路径优先写成 D:\/docs\/log\.txt[\s\S]*反斜杠时按 JSON 转义/);
   assert.match(prompt, /单独的结论行）写进 summary 即算满足[\s\S]*不要因此标 blocked/);
 });
@@ -1354,9 +1360,9 @@ test('tool descriptions guide audit judgement, dispatch scope and context recove
     assert.match(tools.codex_review.description, /正文的缺陷写入 notes\/结论，不因此记 needs_changes/);
     assert.match(tools.codex_review.description, /全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes/);
     assert.match(tools.codex_review.description, /Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正/);
-    assert.match(tools.codex_run.description, /同一授权范围内，一单完成一个可验收结果，路径、平台和参数适配在单内处理/);
-    assert.match(tools.codex_run.description, /教程修订后的终检与目录导航同一单：write=true，scope 只含目录页，正文与素材只读/);
-    assert.match(tools.codex_run.description, /不要同时要求写入和禁止 mtime 变化/);
+    assert.match(tools.codex_run.description, /一单一个可独立验收的结果.*路径、平台和参数适配在原授权内处理/);
+    assert.match(tools.codex_run.description, /教程终检与补目录导航同单，write=true，scope 只含目录页，正文与素材只读/);
+    assert.match(tools.codex_run.parameters.properties.write.description, /不得同时要求写入和禁止写入/);
     assert.match(tools.codex_summary.description, /上下文压缩或接手后先调 codex_summary，再按需读具体 job/);
   }
 });
@@ -3184,7 +3190,7 @@ test('the planner prompt file starts as a template and is injected as a system p
   assert.equal(sections[0].text(), '');
   // 改完文件下一次组装就生效；注释去掉，{{…}} 原样保留
   writeFileSync(file, '<!-- 说明 -->\n先列依赖，一次派一件。\n{{literal}}');
-  assert.match(sections[0].text(), /^## 派活给 Codex 前的规划要求（用户设定）\n[\s\S]*\n\n先列依赖，一次派一件。\n\{\{literal\}\}$/);
+  assert.match(sections[0].text(), /^## 派活给 Codex 前的规划要求（用户设定）\n按下列要求写 task 和 acceptance，派单前核对授权与本轮可取证性。不要原样抄给 Codex。\n\n先列依赖，一次派一件。\n\{\{literal\}\}$/);
   // 已有文件不会被模板覆盖；文件被删也不抛错
   apply(ctx, { workspaces: [], plannerPromptFile: file });
   assert.match(readFileSync(file, 'utf8'), /先列依赖/);
@@ -5687,7 +5693,7 @@ test('a new-work codex_run with too many acceptance items gets one soft line and
   const h = harness({ config: { acceptanceWarnAbove: 2, startResult: { job_id: 'J', status: 'completed' } } });
   const exec = { agent: agentAt('/work/current') };
   const many = { ...RUN, acceptance: ['测试一通过', '测试二通过', '测试三通过'] };
-  assert.match((await h.tools.codex_run.execute(many, exec)).next, /\[验收条数\] 这单带了 3 条验收标准（提醒阈值 2）[\s\S]*写进 task 正文/);
+  assert.match((await h.tools.codex_run.execute(many, exec)).next, /\[验收条数\] 这单带了 3 条验收标准（提醒阈值 2）[\s\S]*先按共同前置拆单，只留本轮可取证的必验结果；偏好写进 task 正文/);
   assert.doesNotMatch((await h.tools.codex_run.execute({ ...RUN, acceptance: ['测试一通过', '测试二通过'] }, exec)).next ?? '', /验收条数/);
   const after = JSON.parse(readFileSync(statsFile, 'utf8'));
   assert.deepEqual([after.dispatches - before.dispatches, after.over - before.over, after.items - before.items], [2, 1, 5]);

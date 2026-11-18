@@ -19,6 +19,26 @@ async function executionDenial(guard, execute, exec) {
   return result.isError ? result.error.message : undefined;
 }
 
+test('codex_run guides the planner to dispatch authorized, independently verifiable work', (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-planner-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const tools = {};
+  const previous = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = root;
+  try {
+    apply({ tools: { register: tool => { tools[tool.name] = tool; }, guard() {} }, on() {} }, { allowHostAccess: true });
+  } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
+  const { description, parameters: { properties } } = tools.codex_run;
+  assert.match(description, /一单一个可独立验收的结果，超过 8 条先按共同前置拆单/);
+  assert.match(description, /派单前核对授权。要交文件或启动会落盘的程序就用 write=true/);
+  assert.match(description, /scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots/);
+  assert.match(description, /真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access/);
+  assert.match(properties.scope.description, /覆盖获准的启动必写路径.*必需写入超出授权时，先澄清再派单/);
+  assert.match(properties.writable_roots.description, /cwd 以外需要写入的已有目录.*需要 write=true/);
+  assert.match(properties.acceptance.description, /结果、正常观测入口和预期值，只要求本轮可取得的证据/);
+  assert.match(properties.acceptance.description, /哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，仅在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并写明用途/);
+});
+
 test('products blocks file/search readers including MCP aliases and every mixed target', async () => {
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
   scope.add('S1', ['/repo/product.md']);

@@ -105,7 +105,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 续接开新线程：`codex_continue` 不带 `answers`、且原线程上一次请求超过 `continueFreshAboveTokens`（默认 100000 输入 token，0 表示总是沿用原线程）时，改开新的 Codex 线程，只带上轮交接内容（原任务、验收标准、上轮未满足项和证据、偏差与未决项、独立核验意见、阻塞、上轮改动文件），不再每个请求重发旧线程的整段历史。线程大小由 runner 的只读命令 `thread-size` 从该线程的 rollout 读取；读不到时沿用原线程。`fresh: true` / `false` 可逐次指定；带 `answers` 的续接（回答阻塞问题）始终沿用原线程。新任务仍以 `parent_job_id` 挂在原任务下：收尾护栏、交接自检、`codex_jobs` 的 `parent_job` 和 `codex_summary` 的分组都照旧（summary 把续接放进父任务所在的组，用量按线程分别累加）。`codex_run` 带 `resume` 仍沿用原线程。
 - 已交接的会话收到用户消息时，第一步之前插一条说明：本会话已于何时交接给哪个会话、这里的 Codex 工具已停用、请告诉用户到新会话继续；同一条消息只说明一次。被拒的工具调用也写明新会话 ID 和这句说明。
 - 写任务起步：在 `/mnt/...` 这类很大的任务目录里，scope 中单独一项遍历超过 5 秒、或用光 20 秒快照预算时，记为太大（与任务目录同样保留 7 天），之后的任务跳过这一项快照、只靠 Codex 的改文件事件；其他 scope 项照常快照。`forget-too-big` 会一并清掉任务目录下的这些记录。
-- 验收标准条数：新派活的验收标准超过 `acceptanceWarnAbove`（默认 8，0 关闭）条时，派活回执里提醒一句把偏好写进 task 正文；只提醒不拦截，条数累计在状态目录的 `acceptance-stats.json`，`codex_runtime` 会显示。
+- 验收标准条数：新派活的验收标准超过 `acceptanceWarnAbove`（默认 8，0 关闭）条时，回执提醒下次按共同前置拆单，把偏好写进 task 正文。提醒不拦截，条数累计在状态目录的 `acceptance-stats.json`，`codex_runtime` 会显示。
 - 状态目录新增 `handover-pending.json`（每 2 秒刷新，只含会话 ID）：列出有自动交接排队、或交接请求还没处理完的会话，外部看门狗可据此暂不向这些会话发消息。
 
 ### 0.9.109：继任会话留在原分组、带来源的标题、目标循环里的自动交接
@@ -199,6 +199,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 
 ### 任务生命周期
+
+从 `0.9.121` 起，`codex_run` 提示规划端一单只派一个可独立验收的结果，验收超过 8 条先按共同前置拆单。交付文件或启动会落盘的程序须按授权传 `write=true`，`scope` 列全必写路径。沙箱模式下，额外可写目录用 `writable_roots` 指定。真机、网络和宿主能力写入前置条件，按配置和授权设置 `host_access`。每条验收写结果、正常观测入口和预期值，证据须能在本轮取得。哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，只在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并注明用途。
+
+计划步骤、工具或路径不可用时，Codex 可在原授权内用等价方法验证同一结果，并在 `deviations` 说明替换及等价理由。副作用无法确认、会越权或破坏数据时，停下该步。实测不符记 `not_met`。缺权限、环境、输入或证据无法补采时记 `blocked`，写明缺失的前置。同一前置导致多条未测时，其余条目引用首条。脚本关键观测、清理或恢复失败须以非零状态退出，未运行的步骤不能报通过。
 
 - 任务目录：传了 `cwd` 就用它；否则会话工作区落在某个带 `cwd` 的 `workspaces` 条目里时，用该条目的 `cwd`（有多条时取路径最长的那条）；再否则用会话工作区。只在 `task` 里写目录不会切换任务目录。
 
@@ -620,7 +624,7 @@ The Codex panel lists pending questions and the ten latest history entries. You 
 - Fresh continuations: when `codex_continue` carries no `answers` and the parent thread's last request exceeded `continueFreshAboveTokens` (default 100000 input tokens, 0 = always resume), the job starts a new Codex thread with the previous round's brief only (original task, acceptance list, unmet criteria with evidence, deviations and unresolved items, the independent review, blockers, files changed) instead of re-sending the old thread on every request. The runner's read-only `thread-size` reads the size from the thread's rollout; when it is unknown the thread is resumed. `fresh: true` / `false` overrides per call; continuations with `answers` (answering blocking questions) always resume. The new job is still linked by `parent_job_id`, so the close-out guard, the hand-over self-check, `codex_jobs parent_job` and `codex_summary` grouping are unchanged (summary keeps the continuation in its parent's group and sums usage per thread). `codex_run` with `resume` still resumes.
 - A handed-over session that receives a user message gets one notice before its first step: when and to which session it was handed over, that Codex tools are disabled there, and that the user should continue in the new session. Refused tool calls name the successor too.
 - Write-job startup: in large task directories such as `/mnt/...`, a scope entry whose walk alone takes over 5 s, or that exhausts the 20 s snapshot budget, is remembered as too big (7 days, like the task directory) and skipped by later jobs, which then rely on Codex's file events for it; other scope entries are still snapshotted. `forget-too-big` clears these entries under the task directory.
-- Acceptance lists: a new-work dispatch with more than `acceptanceWarnAbove` (default 8, 0 = off) items gets one line suggesting preferences go into the task text; it never blocks, and counts accumulate in `acceptance-stats.json` in the state directory, shown by `codex_runtime`.
+- A new dispatch with more than `acceptanceWarnAbove` (default 8, 0 = off) items gets a reminder to split future work by shared prerequisites and put preferences in the task text. The reminder never blocks dispatch. Counts accumulate in `acceptance-stats.json` in the state directory and appear in `codex_runtime`.
 - New `handover-pending.json` in the state directory (refreshed every 2 s, session ids only): sessions with an auto hand-over pending or an unprocessed hand-over request, so an external watchdog can leave them alone.
 
 ### 0.9.109: Successors stay in the predecessor's group, carry a telling title, and auto hand-over works inside goal loops
@@ -735,6 +739,10 @@ Success and read-denial guidance both delegate one `codex_run` task with `write=
 Explain completed work, check results and remaining gaps in plain language. If execution has finished but acceptance is pending, say “The work is finished; I am checking it.” Job IDs, thread IDs and internal state names are unnecessary unless the user asks for diagnostics.
 
 ### Task lifecycle
+
+From `0.9.121`, `codex_run` asks for one independently verifiable outcome per dispatch. If there are more than eight criteria, split the work by shared prerequisites before dispatching. Set `write=true` with authorization for file deliverables or programs that write on startup. List all required write paths in `scope` and use `writable_roots` for extra writable directories in the sandbox. Record real-machine, network and host requirements as prerequisites, and set `host_access` where needed and authorized. Each criterion specifies the outcome, the normal entry point and the expected value. Require evidence obtainable in the current run. Request hashes, checksums, per-file listings, nanosecond timestamps, progress files, or proof of zero writes or outbound transfers throughout only for data integrity, authenticity, backup and recovery, or a security boundary. State the purpose.
+
+If a planned step, tool or path is unavailable, Codex can verify the same outcome by an equivalent method within the original authorization and explain the substitution in `deviations`. Stop a step if its side effects are uncertain or it would exceed authorization or damage data. Report a measured mismatch as `not_met`. Use `blocked` for missing permissions, environment or inputs, or evidence that cannot be collected after the fact. Name the missing prerequisite once and reference the first criterion from others blocked by it. Scripts must exit nonzero if critical observation, cleanup or recovery fails. Report a step as passed only if it ran.
 
 `codex_run` requires acceptance criteria and an explicit `write` (`true` for changes, `false` for read-only investigation). Criteria have no item-count limit; dispatch, continuation, reports and independent review preserve their full list and order. Explicit `cwd` wins; otherwise use the most specific matching `{path, cwd}` workspace entry, then the session workspace. Mentioning a directory only in the task does not change it.
 
