@@ -235,7 +235,7 @@ test('panel settings expose editable fields and read scope counts while redactin
   const cfg = { model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, token: 'secret', runner: 'secret',
     gemini: { model: 'gemini', effort: 'low', command: 'secret' } };
-  const expected = { acceptOpenEvidence: 'strict', model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
+  const expected = { acceptOpenEvidence: 'strict', ownerDecisions: 'planner', model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' },
     timeoutSeconds: null, idleTimeoutSeconds: null, retries: null, maxRunningJobs: null, autoResume: { enabled: true },
     roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [], autoVerify: 'flagged',

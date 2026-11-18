@@ -179,6 +179,17 @@ test('a custom risk pattern applies to question text and an empty pattern disabl
   await pending.result;
 });
 
+test('owner-only marker skips auto-answer without an intent', async (t) => {
+  const tick = clock(t), h = host(t, { settings: { riskyPattern: '' } }), panel = h.load();
+  const pending = h.open([question(undefined, { question: '[owner_only] 请选择。' })]);
+  tick();
+  await flush();
+  assert.equal(panel.snapshot().recent[0]?.reason, 'skipped_owner_only');
+  assert.equal(pending.providerSignal.aborted, false);
+  pending.submit(humanAnswer);
+  assert.deepEqual(await pending.result, humanAnswer);
+});
+
 test('excluded sessions and host review or approval intents stay manual even with no risk pattern', async (t) => {
   const tick = clock(t), h = host(t, { allowSubagents: true,
     settings: { riskyPattern: '', excludeSessions: ['session-a'], subagents: false } }), panel = h.load();

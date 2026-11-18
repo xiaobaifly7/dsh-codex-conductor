@@ -64,7 +64,13 @@ export function blockingState(value) {
   return result('clear', 'verify');
 }
 
-export function prepareContinuation(value, { answers = [], resolution = '' } = {}, owner) {
+export const ownerBlockerIds = (blockers) => [...new Set((Array.isArray(blockers) ? blockers : [])
+  .filter(blocker => questionKind(blocker ?? {}) && nonempty(blocker.id)).map(blocker => blocker.id))];
+
+export const resolvedBlockerIds = (ids, { answers, resolution } = {}) => nonempty(resolution) ? ids :
+  ids.filter(id => Array.isArray(answers) && answers.some(answer => answer?.id === id && nonempty(answer.answer)));
+
+export function prepareContinuation(value, { answers = [], resolution = '' } = {}, owner, plannerDecides = false) {
   value = object(value) ? value : {};
   const blocking = blockingState(value);
   const refuse = (next, remaining_questions = blocking.questions) => ({ ready: false, blocking, next, remaining_questions });
@@ -99,7 +105,9 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   }
   normalized.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const remaining = blocking.questions.filter(({ id }) => !ids.has(id));
-  if (remaining.length) return refuse('仍有问题未回答；保留已有回答并补齐以下问题后再准备续跑。', remaining);
+  if (remaining.length && !(plannerDecides && nonempty(resolution))) {
+    return refuse('仍有问题未回答；保留已有回答并补齐以下问题后再准备续跑。', remaining);
+  }
   if (blocking.next_action === 'done' && !normalized.length && !nonempty(resolution)) return refuse('原任务已独立核验通过，没有新增信息，无需续跑。', []);
   const report = reportOf(value);
   const lost = executionOf(value) === 'failed' && value.error_kind === 'executor_lost' &&

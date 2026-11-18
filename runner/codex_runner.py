@@ -63,6 +63,7 @@ REPEAT_MIN_SECONDS = 60
 REPEAT_FAILURES = 2
 REPEAT_WINDOW_HOURS = 24
 REPEAT_TOTALS = {"blocked": 0, "seconds_avoided": 0}
+OWNER_ONLY_REASONS = ("irreversible_data", "outward_action", "spending", "credentials", "security_boundary")
 POWERSHELL_BUILTINS = frozenset("""
     Write-Host Write-Output Get-Content Set-Content Out-File Select-Object Where-Object ForEach-Object
     Test-Path Join-Path Get-Date Start-Sleep Out-Null Format-List Format-Table Get-ChildItem New-Item
@@ -574,7 +575,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     if kind == "item.started":
                         if item.get("status") == "in_progress":
                             active_commands.add(item.get("id"))
-                        if repeat_guard:
+                        if repeat_guard and repeat_guard.enabled:
                             step = repeat_guard.step(item)
                             if step:
                                 block = repeat_guard.check_start(step)
@@ -588,7 +589,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                                     command_starts[item["id"]] = (step, received)
                     elif kind == "item.completed":
                         active_commands.discard(item.get("id"))
-                        if repeat_guard:
+                        if repeat_guard and repeat_guard.enabled:
                             started_command = command_starts.pop(item.get("id"), None)
                             repeat_guard.complete(item, started_command, received)
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
@@ -619,7 +620,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     state["commands"] += 1
                 elif kind == "item.completed" and item.get("type") == "file_change":
                     state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
-                    if repeat_guard:
+                    if repeat_guard and item.get("changes"):
                         # Only Codex file-change events are observable here, including during a report turn.
                         repeat_guard.clear()
             with acquire_file_lock(run_dir / "process.lock", blocking=True):
@@ -787,15 +788,22 @@ class RepeatGuard:
         self.job_dir = job_dir
         self.blocked = None
 
-    def step(self, item):
-        command = item.get("command")
-        if not isinstance(command, str) or not command:
-            return None
+    @staticmethod
+    def step_names(command):
+        if not isinstance(command, str):
+            return set()
         names = set(re.findall(r"\b[A-Z][a-z]+-[A-Z][A-Za-z]+\b", command)) - POWERSHELL_BUILTINS
         for match in SCRIPT_NAMES.finditer(command):
             name = match["quoted"] or match["bare"]
             if not re.search(r"tmp|temp|run_|wrap", name, re.I):
-                names.add(re.sub(r"\d", "#", name))
+                names.add(name)
+        return names
+
+    def step(self, item):
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        names = {re.sub(r"\d", "#", name) for name in self.step_names(command)}
         signature = self.cwd_key + "\0" + json.dumps(sorted(names)) if names else re.sub(r"\d+", "#", command)
         return hashlib.sha1(signature.encode("utf-8", "surrogatepass")).hexdigest()
 
@@ -805,7 +813,7 @@ class RepeatGuard:
         cutoff = now - 3600 * self.window_hours
         recent = {key: value for key, value in steps.items() if key != "_changed_at" and value["last_at"] >= cutoff}
         changed_at = steps.get("_changed_at", 0)
-        if recent or changed_at >= cutoff:
+        if recent or changed_at:
             recent["_changed_at"] = changed_at
         return recent
 
@@ -829,27 +837,31 @@ class RepeatGuard:
                 os.replace(tmp, self.path)
 
     def standing(self, steps):
-        return [{"step": key[:8], **{k: record[k] for k in ("failures", "seconds", "last_exit", "last_at")}}
+        return [{"step": key[:8], "words": record.get("words", []),
+                 **{k: record[k] for k in ("failures", "seconds", "last_exit", "last_at")}}
                 for key, record in sorted(steps.items()) if key != "_changed_at" and record["failures"] >= self.threshold]
 
     def snapshot(self, *, blocking=True):
-        if not self.enabled or not self.path.exists():
-            return REPEAT_TOTALS.copy(), []
+        if not self.path.exists():
+            return REPEAT_TOTALS.copy(), [], 0
         lock = acquire_file_lock(self.lock, blocking=blocking)
         if lock is None:
-            return REPEAT_TOTALS.copy(), []
+            return REPEAT_TOTALS.copy(), [], 0
         with lock:
             data = read_step_failures(self.path)
-        return {**REPEAT_TOTALS, **data.get("_totals", {})}, self.standing(self.recent(data, time.time()))
+        return ({**REPEAT_TOTALS, **data.get("_totals", {})},
+                self.standing(self.recent(data, time.time())) if self.enabled else [],
+                data.get(self.cwd_hash, {}).get("_changed_at", 0))
 
-    def clear(self):
+    def clear(self, *, file_changed=True):
         with self.edit() as (steps, _, now):
+            changed_at = now if file_changed else steps.get("_changed_at", 0)
             steps.clear()
-            steps["_changed_at"] = now
+            steps["_changed_at"] = changed_at
 
     def prepare_prompt(self, prompt, allow_rerun):
         if allow_rerun:
-            self.clear()
+            self.clear(file_changed=False)
         if not self.enabled:
             return prompt
         with self.edit() as (steps, _, _):
@@ -895,9 +907,15 @@ class RepeatGuard:
                 jobs = prior.get("jobs", [])
                 job_id = self.job_dir.name
                 jobs = [job for job in jobs if job != job_id] + [job_id]
+                words = set(prior.get("words", []))
+                for name in self.step_names(item.get("command")):
+                    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
+                    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", separated)
+                    words.update(hashlib.sha1(word.encode("utf-8")).hexdigest()[:8]
+                                 for word in re.findall(r"[a-z0-9]+", separated.lower()))
                 steps.setdefault("_changed_at", 0)
                 steps[step] = {"failures": prior.get("failures", 0) + 1, "seconds": prior.get("seconds", 0) + seconds,
-                               "last_exit": exit_code, "last_at": now, "jobs": jobs[-10:]}
+                               "last_exit": exit_code, "last_at": now, "jobs": jobs[-10:], "words": sorted(words)}
 
     def blocks(self):
         try:
@@ -1341,7 +1359,7 @@ def execute(args, prompt, run_dir):
             else:
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
                 runner_event(run_dir, attempt, "codex_running", last_error_kind)
-                state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard if repeat_guard.enabled else None)
+                state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard)
                 followup_thread = thread_id if args.sandbox == "read-only" else state["thread_id"]
                 thread_id = state["thread_id"]
                 event_changes += state["file_changes"]
@@ -1574,7 +1592,9 @@ def task_context(value):
             raise ValueError("context.dispatcher requires a positive pid and version/revision strings or null")
     if "continuation" in value:
         continuation = value["continuation"]
-        if not isinstance(continuation, dict) or set(continuation) != {"parent_job_id", "answers", "resolution"}:
+        required = {"parent_job_id", "answers", "resolution"}
+        metadata = {"decided_by", "decision_basis", "decided_at", "resolves"}
+        if not isinstance(continuation, dict) or set(continuation) not in (required, required | metadata):
             raise ValueError("continuation must contain parent_job_id, answers and resolution")
         if not isinstance(continuation["parent_job_id"], str):
             raise ValueError("continuation.parent_job_id must be a job identifier")
@@ -1591,6 +1611,15 @@ def task_context(value):
                     answer["id"] in ids):
                 raise ValueError("continuation answers require unique nonempty id and answer strings")
             ids.add(answer["id"])
+        if "decided_by" in continuation:
+            decided_at, resolves = continuation["decided_at"], continuation["resolves"]
+            if (continuation["decided_by"] != "planner" or continuation["decision_basis"] != "standing_authorization" or
+                    type(decided_at) not in (int, float) or not 0 < decided_at < float("inf") or
+                    not isinstance(resolves, list) or not resolves or
+                    any(not isinstance(blocker, str) or not blocker.strip() for blocker in resolves) or
+                    len(set(resolves)) != len(resolves) or
+                    (not continuation["resolution"].strip() and not set(resolves) <= ids)):
+                raise ValueError("continuation has invalid planner decision metadata")
     return value
 
 
@@ -1797,6 +1826,10 @@ def validate_review(review, value, submitting=False):
         report["criteria"] if valid_report(report) else None)
     if acceptance is None:
         raise ValueError("Review requires context acceptance or a valid legacy report")
+
+    def valid_owner_only(entry):
+        return "owner_only" not in entry or ("accepted" in entry and entry["owner_only"] in OWNER_ONLY_REASONS)
+
     criteria = review["criteria"]
     if not isinstance(criteria, list):
         raise ValueError("review.criteria must be an array")
@@ -1804,21 +1837,22 @@ def validate_review(review, value, submitting=False):
     for criterion in criteria:
         # "accepted" (optional) records an open criterion that accepted_deviations accepts although it is not met.
         if (not isinstance(criterion, dict) or not {"index", "status", "evidence"} <= set(criterion) or
-                set(criterion) - {"index", "status", "evidence", "accepted"} or
+                set(criterion) - {"index", "status", "evidence", "accepted", "owner_only"} or not valid_owner_only(criterion) or
                 type(criterion["index"]) is not int or
                 not isinstance(criterion["status"], str) or criterion["status"] not in ("met", "not_met", "blocked") or
                 not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip() or
                 ("accepted" in criterion and (criterion["status"] == "met" or review["status"] != "accepted_deviations" or
                                               not isinstance(criterion["accepted"], str) or not criterion["accepted"].strip()))):
             raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence; "
-                             "accepted is only for a not_met/blocked criterion of an accepted_deviations review")
+                             "accepted is only for a not_met/blocked criterion of an accepted_deviations review; owner_only requires valid reason and accepted")
         indexes.append(criterion["index"])
     # "report_rows" (optional): report rows flagged not_met/blocked that match no acceptance criterion
     # (the report has a different number of rows); same status, evidence and "accepted" rules as criteria.
     rows = review.get("report_rows", [])
     row_count = len(report["criteria"]) if valid_report(report) else 0
     if (not isinstance(rows, list) or any(
-            not isinstance(r, dict) or not {"row", "status", "evidence"} <= set(r) or set(r) - {"row", "status", "evidence", "accepted"} or
+            not isinstance(r, dict) or not {"row", "status", "evidence"} <= set(r) or
+            set(r) - {"row", "status", "evidence", "accepted", "owner_only"} or not valid_owner_only(r) or
             type(r["row"]) is not int or not 1 <= r["row"] <= row_count or
             not isinstance(r["status"], str) or r["status"] not in ("met", "not_met", "blocked") or
             not isinstance(r["evidence"], str) or not r["evidence"].strip() or
@@ -1826,7 +1860,7 @@ def validate_review(review, value, submitting=False):
                                   not isinstance(r["accepted"], str) or not r["accepted"].strip()))
             for r in rows) or len({r["row"] for r in rows}) != len(rows)):
         raise ValueError("report_rows entries require a unique report row number, status and nonempty evidence; "
-                         "accepted is only for a not_met/blocked row of an accepted_deviations review")
+                         "accepted is only for a not_met/blocked row of an accepted_deviations review; owner_only requires valid reason and accepted")
     if sorted(indexes) != list(range(1, len(acceptance) + 1)):
         counts = Counter(indexes)
         expected = set(range(1, len(acceptance) + 1))
@@ -2769,8 +2803,8 @@ def main():
         return
     if args.command == "repeat-guard":
         try:
-            totals, standing = RepeatGuard(args.cwd, vars(args)).snapshot()
-            emit({"status": "completed", "totals": totals, "standing": standing})
+            totals, standing, changed_at = RepeatGuard(args.cwd, vars(args)).snapshot()
+            emit({"status": "completed", "totals": totals, "standing": standing, "_changed_at": changed_at})
         except (OSError, ValueError, TypeError, KeyError) as e:
             emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
         return

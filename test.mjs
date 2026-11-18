@@ -1489,7 +1489,8 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
         const args = { ...RUN, write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
           cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, model: 'chosen',
-          effort: 'low', effort_reason: 'prior_rework', rerun_after_change: '用户已修好虚拟机', wait_seconds: 1 };
+          effort: 'low', effort_reason: 'prior_rework', rerun_after_change: '用户已修好虚拟机', wait_seconds: 1,
+          acceptance_needs: [{ index: 1, steps: ['Invoke-Pytest'] }], expect_blocked: [] };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
         const ran = await h.tools.codex_run.execute(args, exec);
         assert.equal(ran.job_id, 'J');
@@ -1724,11 +1725,11 @@ test('independent verification closes a failed round without rewriting its execu
   }
 });
 
-test('codex_run cannot resume a thread whose latest owned task needs a user answer', async () => {
+test('codex_run directs an unanswered latest task to codex_continue', async () => {
   const source = withReport(workflowSource('task_conflict'));
   const h = harness({ config: { listResult: { jobs: [{ job_id: source.job_id, blocking: source.blocking }] } } });
   const exec = { agent: agentAt('/work/current') };
-  await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id }, exec), /PARENT.*用户回答.*codex_continue/);
+  await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id }, exec), /PARENT.*待决定.*codex_continue/);
   assert.deepEqual(h.calls, [['list', '--limit', '100', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
 });
 
@@ -1817,7 +1818,7 @@ test('all continuation refusal receipts lead with the reason and keep the origin
   ];
   for (const row of rows) {
     const source = { ...workflowSource(row.kind), ...row.source };
-    const h = harness();
+    const h = harness({ config: { ownerDecisions: 'owner' } });
     h.finals.PARENT = source;
     const value = await h.tools.codex_continue.execute({ job_id: 'PARENT', ...row.args },
       { agent: agentAt('/work/current', row.replied ? answeredParent : []) });
@@ -1865,7 +1866,7 @@ test('both resume paths reject an older unanswered task on the same thread', asy
       return argv[argv.indexOf('--offset') + 1] === '0'
         ? { jobs: [latest], next_offset: 1 } : { jobs: [parent] };
     };
-    const h = harness({ config: { listResult, startResult: { job_id: 'NEXT', status: 'completed' } } });
+    const h = harness({ config: { ownerDecisions: 'owner', listResult, startResult: { job_id: 'NEXT', status: 'completed' } } });
     h.finals.CHILD = latest;
     const args = tool === 'codex_run'
       ? { ...RUN, write: true, scope: ['src'], resume: parent.thread_id } : { job_id: 'CHILD', wait_seconds: 0 };
@@ -1915,7 +1916,7 @@ test('codex_continue requires a real reply after the report or review raised que
       source.verification = { status: 'needs_changes', time: 12, blockers: source.structured.blockers };
       source.structured.blockers = [];
     }
-    const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' } } });
+    const h = harness({ config: { ownerDecisions: 'owner', startResult: { job_id: 'CHILD', status: 'completed' } } });
     h.finals.PARENT = source;
     const args = { job_id: 'PARENT', answers: [{ id: 'format', answer: '保留旧格式' }, { id: 'columns', answer: '保留旧列' }],
       resolution: '已有补充信息', wait_seconds: 0 };
@@ -1927,13 +1928,14 @@ test('codex_continue requires a real reply after the report or review raised que
     const replied = { agent: agentAt('/work/current', [...log, { ...human, time: 13_000 }]) };
     assert.equal((await h.tools.codex_continue.execute(args, replied)).job_id, 'CHILD');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
+    assert.equal(JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin).context.continuation.decided_by, undefined);
   }
 });
 
 test('plannerAnswers applies complete planner answers without a user reply and keeps answer validation', async () => {
   const source = workflowSource('task_conflict');
   source.structured.blockers.push({ ...source.structured.blockers[0], id: 'columns', question: '是否保留旧列？' });
-  const h = harness({ config: { plannerAnswers: true, listResult: (argv) =>
+  const h = harness({ config: { ownerDecisions: 'owner', plannerAnswers: true, listResult: (argv) =>
     ({ jobs: argv.includes('--thread-id') ? [withReport(source)] : [] }),
     startResult: { job_id: 'CHILD', status: 'completed' } } });
   h.finals.PARENT = source;
@@ -2037,6 +2039,31 @@ test('codex_continue shares concurrent dispatch and reuses an existing child aft
   const query = after.calls.find((argv) => argv[0] === 'list');
   assert.equal(query[query.indexOf('--parent-job') + 1], 'PARENT');
   assert.equal(query[query.indexOf('--owner') + 1], 'S1');
+});
+
+test('codex_continue reuses the predecessor-owned child after handover', async (t) => {
+  const saved = process.env.LOCALAPPDATA;
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-owner-child-'));
+  process.env.LOCALAPPDATA = root;
+  t.after(() => {
+    process.env.LOCALAPPDATA = saved;
+    rmSync(root, { recursive: true, force: true });
+  });
+  const state = path.join(root, 'dsh-codex-conductor');
+  mkdirSync(state);
+  writeFileSync(path.join(state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' } } }));
+  const h = harness({ config: { listResult: argv => ({
+    jobs: argv.includes('--parent-job') && argv[argv.indexOf('--also-owner') + 1] === 'S1' ? [{ job_id: 'CHILD' }] : [],
+  }) } });
+  h.finals.PARENT = workflowSource();
+  h.finals.CHILD = { job_id: 'CHILD', status: 'running', context: {
+    ...h.finals.PARENT.context, continuation: { parent_job_id: 'PARENT', answers: [], resolution: '已处理' },
+  } };
+  const result = await h.tools.codex_continue.execute({ job_id: 'PARENT', resolution: '再次续接' },
+    { agent: { ...agentAt('/work/current'), id: 'S2' } });
+  assert.equal(result.job_id, 'CHILD');
+  assert.equal(result.reused_existing_child, true);
+  assert.equal(h.calls.some(([cmd]) => cmd === 'start'), false);
 });
 
 test('codex_continue persists user decisions through two new threads and a plugin reload', async () => {
@@ -2243,7 +2270,8 @@ test('codex_summary defaults to the current owner, passes thread filters and nev
   const h = harness({ config: { summaryResult: summary } });
   const exec = { agent: agentAt('/work/current') };
   for (const args of [{}, { thread_id: 'THREAD' }, { limit: 2, offset: 4 }]) {
-    const { accepted_open_ledger, ...value } = await h.tools.codex_summary.execute(args, exec);
+    const { accepted_open_ledger, owner_decisions, ...value } = await h.tools.codex_summary.execute(args, exec);
+    assert.ok(Array.isArray(owner_decisions));
     assert.deepEqual(value, summary);
     assert.deepEqual(accepted_open_ledger.items, []);
   }
@@ -4670,7 +4698,8 @@ test('codex_summary renders error-kind totals for the full filtered range on eve
     error_kinds: { router_down: 4, idle_timeout: 2, schema_invalid: 1 } };
   const h = harness({ config: { summaryResult: summary } });
   const value = await h.tools.codex_summary.execute({ limit: 1, offset: 2 }, { agent: agentAt('/work') });
-  const { accepted_open_ledger, ...runnerSummary } = value;
+  const { accepted_open_ledger, owner_decisions, ...runnerSummary } = value;
+  assert.ok(Array.isArray(owner_decisions));
   assert.deepEqual(runnerSummary, summary);
   assert.deepEqual(accepted_open_ledger.completions, []);
   const render = input => h.tools.codex_summary.output.render({}, input)[0].text;
@@ -6110,7 +6139,7 @@ test('codex_run with resume starts a fresh thread for a large thread, keeps the 
   const big = await run({ resume: 'THREAD' }, 250000);
   assert.ok(!big.start.includes('--resume'));
   assert.equal(big.payload.context.task, '把空列也解析成空字符串并补测试');
-  assert.deepEqual(big.payload.context.continuation, { parent_job_id: 'PARENT', answers: [], resolution: 'codex_run 以新线程接续线程 THREAD' });
+  assert.deepEqual(big.payload.context.continuation, { parent_job_id: 'PARENT', answers: [], resolution: '' });
   assert.match(big.payload.prompt, /上一轮交接（任务 PARENT，原线程 THREAD[\s\S]*修复 CSV 解析[\s\S]*1\. CSV 解析测试通过[\s\S]*上一轮改动文件：src\/csv\.js[\s\S]*最新验收结论：needs_changes[\s\S]*解析仍漏空列[\s\S]*## 本轮任务（规划端原文）\n把空列也解析成空字符串并补测试/);
   assert.equal(big.value.continuation_thread.mode, 'fresh');
   assert.match(big.value.next, /已开新线程（原线程 THREAD，上一轮任务 PARENT，原线程上次请求约 250000 输入 token），新任务 J9[\s\S]*对新任务 J9 调 codex_continue，不要再 resume 原线程/);
@@ -6407,6 +6436,151 @@ function finishedRound(source, job_id, acceptance, criteria, after, extra = {}) 
 const verifiedReview = ({ job_id, context }) => ({ job_id, status: 'verified',
   criteria: context.acceptance.map((_item, i) => ({ index: i + 1, status: 'met', evidence: '已核对' })) });
 
+function decisionFixture(t, kind = 'task_conflict') {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const acceptance = Array.from({ length: 9 }, (_, i) => `验收项目 ${i + 1}`);
+  source.context.acceptance = acceptance;
+  source.context.task = '核对原任务的九条验收项目并记录结果';
+  source.structured = { ...source.structured, criteria: acceptance.map(text => resultRow(text, 'blocked')),
+    deviations: [], unresolved: [],
+    blockers: [{ id: 'choice-1', kind, message: '受阻', question: kind === 'environment' ? '' : '选哪个方案？', resolution: '' }] };
+  Object.assign(source, { cwd: '/work', sandbox: 'workspace-write', out_of_scope: [], verification: null, verification_status: 'unreviewed' });
+  const jobs = [source];
+  const review = { ...verifiedReview(source), status: 'accepted_deviations',
+    criteria: acceptance.map((_text, i) => ({ index: i + 1, status: 'blocked', evidence: '核对结果', accepted: '暂留未完成' })) };
+  const setup = (config = {}) => {
+    let time = source.finished_at;
+    const h = make({ closeoutEvidence: 'off', startResult: { status: 'running', job_id: 'CHILD' },
+      listResult: argv => ({ jobs: argv.includes('--parent-job') ? jobs.slice(1) : jobs }),
+      reviewResult: ([, id], { stdin }) => {
+        const review = JSON.parse(stdin);
+        return { ...h.finals[id], verification_status: review.status, verification: { ...review, time: ++time } };
+      }, ...config });
+    for (const job of jobs) h.finals[job.job_id] = job;
+    return h;
+  };
+  return { source, state, jobs, review, setup, exec: { agent: agentAt('/work') } };
+}
+
+test('owner decisions gate nine accepted-open items independently of plannerAnswers and evidence', async (t) => {
+  const { source, jobs, state, review, setup, exec } = decisionFixture(t);
+  const { job_id } = source;
+  for (const plannerAnswers of [false, true]) {
+    const h = setup({ plannerAnswers, acceptOpenEvidence: 'off' });
+    await assert.rejects(h.tools.codex_review.execute(review, exec), /待决定的阻塞 choice-1.*codex_continue.*owner_only/);
+    assert.equal(h.calls.some(([cmd]) => cmd === 'review'), false);
+  }
+  const owner = setup({ ownerDecisions: 'owner', plannerAnswers: true, acceptOpenEvidence: 'relaxed' });
+  await assert.rejects(owner.tools.codex_review.execute(review, exec), /接受它未满足需要依据/);
+  const file = path.join(state, 'accepted-open.json');
+  const items = () => JSON.parse(readFileSync(file, 'utf8')).items;
+  const human = { type: 'user/message', time: (source.finished_at + 1) * 1000,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '接受偏差' }] } };
+  await owner.tools.codex_review.execute(review, { agent: agentAt('/work', [human]) });
+  assert.deepEqual(items().map(item => item.support), Array.from({ length: 9 }, () => ['user']));
+  const summary = await owner.tools.codex_summary.execute({}, exec);
+  assert.match(owner.tools.codex_summary.output.render({}, summary)[0].text, /可由规划端决定后继续/);
+
+  const child = finishedRound(source, 'FOLLOWUP', source.context.acceptance, source.structured.criteria, source.finished_at);
+  child.context.continuation = { parent_job_id: job_id, answers: [{ id: 'other', answer: '已决定' }], resolution: ' ' };
+  jobs.push(child);
+  await assert.rejects(setup({ acceptOpenEvidence: 'off' }).tools.codex_review.execute(review, exec), /待决定的阻塞 choice-1/);
+  for (const decision of [{ answers: [{ id: 'choice-1', answer: '已决定' }], resolution: '' }, { answers: [], resolution: '已解决' }]) {
+    Object.assign(child.context.continuation, decision);
+    const h = setup({ acceptOpenEvidence: 'strict' });
+    assert.equal((await h.tools.codex_review.execute(review, exec)).verification_status, 'accepted_deviations');
+    assert.ok(items().every(item => item.support.includes('later_round') && !item.support.includes('user_blocker')));
+  }
+});
+
+test('owner-only items are recorded, prompted once, and marked asked by the host tool', async (t) => {
+  const { source, state, review, setup, exec } = decisionFixture(t);
+  const h = setup({ acceptOpenEvidence: 'off' });
+  const submit = criteria => h.tools.codex_review.execute({ ...review, criteria }, exec);
+  const reserved = review.criteria.map(item => ({ ...item, owner_only: 'outward_action' }));
+  await assert.rejects(submit([review.criteria[0], ...reserved.slice(1)]), /待决定的阻塞/);
+  await assert.rejects(submit(reserved.map(item => ({ ...item, owner_only: 'other' }))), /owner_only/);
+  assert.match((await submit(reserved)).next, /ask_user_question.*owner_only.*\[owner_only\]/);
+  assert.ok(!(await submit(reserved)).next.includes('ask_user_question'));
+  const file = path.join(state, 'accepted-open.json');
+  const items = () => JSON.parse(readFileSync(file, 'utf8')).items;
+  assert.equal(items().length, 9);
+  assert.ok(items().every(item => item.needs_owner === 'outward_action' && item.asked === false));
+  const summary = async () => h.tools.codex_summary.output.render({}, await h.tools.codex_summary.execute({}, exec))[0].text;
+  assert.match(await summary(), /未问/);
+  const otherId = 'OTHER-UNIT';
+  h.finals[otherId] = { ...source, job_id: otherId, thread_id: 'OTHER-THREAD' };
+  await h.tools.codex_review.execute({ ...review, job_id: otherId, criteria: reserved }, exec);
+  const ask = (question, intent = 'owner_only') => h.handlers['tools/execute']({ ...exec, name: 'ask_user_question',
+    arguments: { questions: [{ id: 'choice-1', intent, question }] } }, async () => ({ value: {} }));
+  await ask('[owner_only] 请选择。');
+  assert.equal(items().some(item => item.asked), false);
+  await ask(`[owner_only] ${review.job_id} 请选择。`);
+  assert.ok(items().every(item => item.asked === (item.job_id === review.job_id)));
+  await ask('[owner_only] 另一个决策请选择。');
+  assert.ok(items().every(item => item.asked === true));
+  assert.match(await summary(), /已问/);
+});
+
+test('planner continuation records decisions, counters and handover visibility', async (t) => {
+  const { source, state, setup, exec } = decisionFixture(t);
+  const h = setup();
+  const dispatch = () => h.tools.codex_continue.execute({ job_id: source.job_id, resolution: '按现有目标选择方案 A' }, exec);
+  assert.equal((await dispatch()).job_id, 'CHILD');
+  const { continuation } = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin).context;
+  const { decided_at } = continuation;
+  assert.ok(Number.isFinite(decided_at));
+  assert.deepEqual(continuation, { parent_job_id: source.job_id, answers: [], resolution: '按现有目标选择方案 A',
+    decided_by: 'planner', decision_basis: 'standing_authorization', decided_at, resolves: ['choice-1'] });
+  assert.deepEqual(JSON.parse(readFileSync(path.join(state, 'owner-decisions.json'), 'utf8')), { decisions: [
+    { session: 'S1', job_id: 'CHILD', parent_job_id: source.job_id, blocker_ids: ['choice-1'], at: decided_at },
+  ] });
+  assert.equal(JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8')).sessions.S1.owner_decisions_by_planner, 1);
+  writeFileSync(path.join(state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' } } }));
+  const successor = setup();
+  const next = { agent: { ...exec.agent, id: 'S2' } };
+  const summary = await successor.tools.codex_summary.execute({}, next);
+  assert.match(successor.tools.codex_summary.output.render({}, summary)[0].text, /代所有者决定 1 项（任务 CHILD）/);
+  const runtime = await successor.handlers['tools/execute']({ ...next, name: 'codex_runtime', arguments: {} },
+    async () => ({ value: {}, content: [] }));
+  assert.match(runtime.content.at(-1).text, /代所有者决定 1 项（任务 CHILD）/);
+});
+
+test('predispatch warns only for the unchanged same-index environment block and declared step words', async (t) => {
+  const { source, setup, state, exec } = decisionFixture(t, 'environment');
+  const [first, second] = source.context.acceptance;
+  source.structured.criteria.slice(1).forEach(item => { item.status = 'met'; });
+  const repeat = { status: 'completed', standing: [], _changed_at: source.finished_at - 1 };
+  const h = setup({ repeatGuardResult: () => repeat });
+  const run = (acceptance, extra = {}) => h.tools.codex_run.execute({ ...RUN, cwd: source.cwd,
+    resume: source.thread_id, acceptance, ...extra }, exec);
+  const environment = /第 1 条在本环境上一轮已受阻且之后无改动/;
+  assert.match((await run([first, second])).next, environment);
+  assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, 1);
+  assert.equal(h.calls.some(argv => argv[0] === 'thread-size' || argv.includes('--parent-job')), false);
+  assert.doesNotMatch((await run(['新的验收内容', second])).next, environment);
+  assert.doesNotMatch((await run([second, first])).next, /上一轮已受阻/);
+  assert.doesNotMatch((await run([first, second], { cwd: '/different' })).next, environment);
+  repeat._changed_at = source.finished_at + 1;
+  assert.doesNotMatch((await run([first, second])).next, environment);
+  repeat._changed_at = 0;
+  const continued = await h.tools.codex_continue.execute({ job_id: source.job_id, resolution: '已检查运行环境' }, exec);
+  assert.match(continued.next, environment);
+  source.structured.blockers[0].kind = 'implementation';
+  assert.doesNotMatch((await run([first, second])).next, environment);
+  repeat.standing = [{ ...standingFailure, words: ['0eaa389e'] }];
+  const declared = await run([first, second], { acceptance_needs: [{ index: 1, steps: ['Invoke-Pytest'] }], expect_blocked: [2] });
+  assert.match(declared.next, /第 1 条依赖的步骤 pytest 在本目录近期反复失败（2 次、约 26 分钟）/);
+  const { context, prompt } = JSON.parse(h.requests.filter(({ argv }) => argv[0] === 'start').at(-1).stdin);
+  assert.equal(context.routing.expect_blocked_count, 1);
+  assert.match(prompt, /第 2 条预计在本环境受阻：不要在这一条上花时间，直接标 blocked，blockers 写 environment 并说明原因。/);
+  const { sessions: { S1: stats } } = JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8'));
+  assert.equal(stats.predispatch_warnings, 3);
+  assert.equal(stats.expect_blocked_items, 1);
+  const runtime = await h.handlers['tools/execute']({ ...exec, name: 'codex_runtime' }, async () => ({ value: {} }));
+  assert.match(runtime.content.at(-1).text, /派单前提醒 3 \/ 3，预标受阻 1 \/ 1/);
+});
+
 test('later verification follows criterion text for met and open support', async (t) => {
   const { source, make, state } = acceptedFixtureHarness(t);
   const [a, b] = ['验收内容 A', '验收内容 B'];
@@ -6565,7 +6739,7 @@ test('release A: flagged open entries require support and show a running verific
   assert.equal(JSON.parse(readFileSync(cutoff, 'utf8')).since, finished_at + 1);
 });
 
-test('release A: strict and relaxed distinguish verification, later rounds, user blockers and user replies', async (t) => {
+test('release A: strict and relaxed distinguish verification, later rounds and real user replies', async (t) => {
   const { source, make } = acceptedFixtureHarness(t);
   const { job_id: id, finished_at } = source;
   const review = fixtureReview(source);
@@ -6578,7 +6752,7 @@ test('release A: strict and relaxed distinguish verification, later rounds, user
   const full = (acceptance, criteria, context = {}) => ({ ...source, context: { ...source.context, ...context, acceptance },
     structured: { ...source.structured, criteria } });
   const run = ({ jobs = [], config = {}, log = [], reportRows = items } = {}) => {
-    const h = make({ plannerAnswers: true, closeoutEvidence: 'off', listResult: { jobs: [listed, ...jobs] },
+    const h = make({ ownerDecisions: 'owner', plannerAnswers: true, closeoutEvidence: 'off', listResult: { jobs: [listed, ...jobs] },
       reviewResult: { ...source, verification: { ...source.verification, time: source.verification.time + 1 } }, ...config });
     h.finals.LATER = full(source.context.acceptance, source.structured.criteria);
     h.finals.VERIFY = full(items, reportRows.map(criterion => ({ criterion, status: 'blocked', evidence: '仍未实现' })), v.context);
@@ -6590,7 +6764,7 @@ test('release A: strict and relaxed distinguish verification, later rounds, user
   await assert.rejects(run({ jobs: [later, v], reportRows: items.slice(1) }), /第 1 条为 not_met/);
   assert.ok((await run({ jobs: [later, v] })).review_fixes.some(line => line.includes('视为接受未满足')));
   source.structured.blockers[0].kind = 'task_conflict';
-  assert.equal((await run({ config: { acceptOpenEvidence: 'relaxed' } })).verification_status, 'accepted_deviations');
+  await assert.rejects(run({ config: { acceptOpenEvidence: 'relaxed' } }), /第 1 条为 not_met/);
   await assert.rejects(run(), /第 1 条为 not_met/);
   const human = { type: 'user/message', time: (finished_at + 60) * 1000,
     data: { source: { kind: 'user' }, content: [{ type: 'text', text: '确认接受这几项' }] } };
@@ -6598,7 +6772,7 @@ test('release A: strict and relaxed distinguish verification, later rounds, user
   // must_verify 上原报告标 met，规划端降级时免查。
   source.context.must_verify = [1];
   source.structured.criteria[0].status = 'met';
-  assert.equal((await run()).verification_status, 'accepted_deviations');
+  assert.equal((await run({ jobs: [later] })).verification_status, 'accepted_deviations');
   // 报告省掉必验项，并留了一条对不上清单的报告行，只接受映射到这两项的核验。
   source.structured.blockers[0].kind = 'implementation';
   source.structured.criteria.forEach((criterion, i) => { criterion.criterion = source.context.acceptance[i]; });

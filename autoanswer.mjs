@@ -113,6 +113,7 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
       if (pending.get(item.id) === item) pending.delete(item.id);
     }
     function block(item) {
+      if (item.questions.some(q => q.question?.startsWith('[owner_only]'))) return 'owner_only';
       if (item.manual || (item.key && (!manual || manual.has(item.key)))) return 'manual';
       if (risk && item.questions.some((q) => [q.question, q.header, q.detail,
         ...(q.options ?? []).flatMap((o) => [o.label, o.description])].some((value) => value && risk.test(value)))) return 'risky';
@@ -152,7 +153,7 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
       if (!live(item)) { forget(item); return false; }
       const reason = block(item);
       if (reason) {
-        if (!immediate && ['risky', 'excluded'].includes(reason)) record(item, null, 'skipped_' + reason);
+        if (!immediate && ['risky', 'excluded', 'owner_only'].includes(reason)) record(item, null, 'skipped_' + reason);
         return false;
       }
       clearTimeout(item.timer);

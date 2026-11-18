@@ -13,20 +13,20 @@
 // 护栏 fail-closed：范围内判定出错就拒绝并给出原因；范围外的会话完全不受影响。
 
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
-const { validReport, blockingState, prepareContinuation, previousRoundBrief } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+const { validReport, blockingState, prepareContinuation, previousRoundBrief, ownerBlockerIds, resolvedBlockerIds } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS,
   REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -108,6 +108,7 @@ const DEFAULTS = {
   // 省略 host_access 时默认使用主机模式，仍须开启 allowHostAccess
   defaultHostAccess: false,
   plannerAnswers: false,
+  ownerDecisions: 'planner',
   plannerReads: 'open',
   plannerReadAllow: [],
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
@@ -376,7 +377,8 @@ export function createConductor(cfg, run = runRunner) {
     for (const pattern of cfg.ignoreChanges ?? []) argv.push('--ignore', pattern);
     const task = args.rerun_after_change ? `${args.task.trim()}\n\n## 规划端说明的变化\n${args.rerun_after_change.trim()}` : args.task;
     const prompt = composePrompt(task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
-      ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify });
+      ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify,
+      expectBlocked: args.expect_blocked });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -440,10 +442,11 @@ export function createConductor(cfg, run = runRunner) {
   return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [] } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [] } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     (mustVerify.length ? `\n验收第 ${mustVerify.join('、')} 条必须实测；在 evidence 写清实际运行或观测的结果及可回查的证据位置。` : '') +
+    expectBlocked.map(index => `\n第 ${index} 条预计在本环境受阻：不要在这一条上花时间，直接标 blocked，blockers 写 environment 并说明原因。`).join('') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
@@ -556,6 +559,15 @@ export function validateRun(args) {
     args.must_verify.some(i => !Number.isInteger(i) || i < 1 || i > args.acceptance.length))) {
     throw new Error(`codex_run: must_verify 必须是验收条目编号数组，编号为 1–${args.acceptance.length} 的整数`);
   }
+  const validIndex = index => Number.isInteger(index) && index >= 1 && index <= args.acceptance.length;
+  if (args.expect_blocked !== undefined && (!Array.isArray(args.expect_blocked) || !args.expect_blocked.every(validIndex))) {
+    throw new Error('codex_run: expect_blocked 必须是验收条目编号数组');
+  }
+  if (args.acceptance_needs !== undefined && (!Array.isArray(args.acceptance_needs) ||
+      args.acceptance_needs.some(entry => !validIndex(entry?.index) || !Array.isArray(entry.steps) ||
+        !entry.steps.length || entry.steps.some(step => typeof step !== 'string' || !step.trim())))) {
+    throw new Error('codex_run: acceptance_needs 必须列出验收条目编号 index 和非空步骤名称数组 steps');
+  }
   // 不传就默认只读时，实际常因此白跑一整轮（只读任务又不能 resume），所以必须明说
   if (typeof args.write !== 'boolean') {
     throw new Error('codex_run: write 必须是布尔值 true 或 false（不能省略，也不能写成字符串）：要改文件、做修复或建备份传 true，只读调查传 false');
@@ -643,6 +655,36 @@ const waitForJob = (jobId) => `先后台派齐本批独立且不重叠的任务�
 const RERUN_AFTER_CHANGE = { type: 'string', minLength: 1,
   description: '外部条件已经改变时填写具体变化（例如用户修好了虚拟机），允许本次重新运行此前反复失败的步骤。' };
 const minutes = seconds => Math.round(seconds / 60);
+const EXPECT_BLOCKED = { type: 'array', items: { type: 'integer', minimum: 1 },
+  description: '预计在本环境无法完成的验收条目编号（从 1 起）。执行端直接标 blocked 并说明环境原因。' };
+const ACCEPTANCE_NEEDS = { type: 'array', items: { type: 'object', additionalProperties: false,
+  properties: { index: { type: 'integer', minimum: 1 }, steps: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 } } },
+  required: ['index', 'steps'] }, description: '显式声明验收条目依赖的步骤名称（Verb-Noun 或脚本文件名），派单时提示本目录的近期重复失败。' };
+const stepWords = step => step.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2').replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+  .toLowerCase().match(/[a-z0-9]+/g) ?? [];
+function predispatchWarnings(args, cwd, parent, repeat) {
+  if (repeat?.status !== 'completed') return [];
+  const warnings = new Set();
+  const report = parent?.report ?? parent?.structured;
+  const previous = parent?.context?.acceptance;
+  if (parent?.cwd && normPath(parent.cwd) === normPath(cwd) && validReport(report) &&
+      report.blockers?.some(blocker => blocker.kind === 'environment') && Number.isFinite(parent.finished_at) &&
+      Number.isFinite(repeat._changed_at) && repeat._changed_at <= parent.finished_at) {
+    args.acceptance.forEach((criterion, i) => {
+      if (criterion === previous?.[i] && reportRowOf(previous, report.criteria, i + 1)?.status === 'blocked') {
+        warnings.add(`第 ${i + 1} 条在本环境上一轮已受阻且之后无改动：要么改验收项，要么先解决环境，要么在派单时用 expect_blocked 标出这一条`);
+      }
+    });
+  }
+  for (const { index, steps } of args.acceptance_needs ?? []) {
+    for (const word of new Set(steps.flatMap(stepWords))) {
+      const hash = createHash('sha1').update(word).digest('hex').slice(0, 8);
+      const failure = repeat.standing?.find(entry => entry.words?.includes(hash));
+      if (failure) warnings.add(`第 ${index} 条依赖的步骤 ${word} 在本目录近期反复失败（${failure.failures} 次、约 ${minutes(failure.seconds)} 分钟）：先解决环境、改验收项，或用 expect_blocked 标出这一条`);
+    }
+  }
+  return [...warnings];
+}
 function repeatStandingLine(standing) {
   if (!standing?.length) return '';
   const failures = standing.reduce((sum, step) => sum + step.failures, 0);
@@ -674,7 +716,7 @@ function failureReceipt(value, cause) {
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
-export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open' } = {}) {
+export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions } = {}) {
   const blocking = blockingState(value);
   if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
   if (value.error_kind === 'executor_lost') {
@@ -684,7 +726,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
-  if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers })
+  if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers, ownerDecisions })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
     .replace('先用 git status 或对比文件确认现状', '先用 git status 核对文件列表，内容核对交给 codex_verify')
     .replace('再用 git status 或对比文件核对已有产物', '再用 git status 核对产物列表，内容核对交给 codex_verify') +
@@ -726,7 +768,11 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   if (value.status === 'completed' || blocking.blockers.length || ['verified', 'accepted_deviations', 'needs_changes', 'invalid'].includes(value.verification_status)) {
     if (blocking.next_action === 'ask_user') {
       const environment = blocking.blockers.some((b) => b.kind === 'environment');
-      const guidance = plannerAnswers
+      const guidance = ownerDecisions === 'planner'
+        ? '按所有者的常设授权，依据当前目标选方案，用 codex_continue 提交 answers（包含选定方案、理由及放弃的方案）或 resolution。' +
+          '不可逆数据变更、对外动作、花钱、账号凭据及扩大安全边界留给所有者。' +
+          (environment ? '同时用 resolution 说明环境条件已满足的证据。' : '') + '\n'
+        : plannerAnswers
         ? PLANNER_ANSWERS + (environment
           ? '同时核实报告里的环境解除条件；答案齐全且条件已满足后，用 codex_continue 同时提交 answers 和 resolution，resolution 写明条件已满足的具体证据。条件未齐备时先不要续接；不要重复派活：\n'
           : '用 codex_continue 提交 answers；不要重复派活：\n')
@@ -945,6 +991,7 @@ function settings(config, logger) {
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
       : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
       : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
+      : key === 'ownerDecisions' ? ['planner', 'owner'].includes(value)
       : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
       : key === 'effortOverride' ? ['planner', 'raise-only-listed', 'config'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
@@ -1133,10 +1180,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       for (const f of flagged) add(support, f.key, 'user');
       for (const key of openTargets.keys()) add(openSupport, key, 'user');
     }
-    if (checkOpen && Array.isArray(source.structured?.blockers) &&
-        source.structured.blockers.some(b => ['user_input', 'task_conflict'].includes(b?.kind)) && canAnswer(log, source, owner)) {
-      for (const key of openTargets.keys()) add(openSupport, key, 'user_blocker');
-    }
     const jobs = [];
     const from = Number.isFinite(source.started_at) ? source.started_at : evidenceFrom;
     const lookup = async (request) => {
@@ -1219,6 +1262,33 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     return { support, openSupport, runningVerification };
   }
+  async function undecidedOwnerBlockers(source, owner, signal, blockers = source.structured?.blockers) {
+    const pending = new Set(ownerBlockerIds(blockers));
+    try {
+      for (let offset = 0; pending.size && offset !== null;) {
+        const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), parent_job: source.job_id, limit: 100, offset }, signal);
+        if (!Array.isArray(page?.jobs)) break;
+        for (const { job_id } of page.jobs) {
+          if (job_id === source.job_id) continue;
+          const child = await conductor.waitJob(job_id, 0, signal);
+          const decision = child.context?.continuation;
+          if (!unknownState(child) && owns(owner, child.context?.owner) && decision?.parent_job_id === source.job_id) {
+            for (const id of resolvedBlockerIds([...pending], decision)) pending.delete(id);
+          }
+          if (!pending.size) break;
+        }
+        offset = page.next_offset ?? null;
+      }
+    } catch { signal?.throwIfAborted(); }
+    return [...pending];
+  }
+  async function ownerReviewProblem(source, prepared, owner, signal) {
+    if (cfg.ownerDecisions !== 'planner' || !prepared.acceptedOpen.some(entry => !entry.owner_only)) return '';
+    const ids = await undecidedOwnerBlockers(source, owner, signal);
+    return ids.length ? `${source.job_id} 的报告有待决定的阻塞 ${ids.join('、')}（user_input/task_conflict）。` +
+      `按所有者的常设授权由你决定：用 codex_continue ${source.job_id} 提交 answers（每个问题写选定方案、理由和放弃的方案）或 resolution 后继续；` +
+      '只有不可逆删除或覆盖、对外发送或发布、花钱、账号或凭据、扩大安全边界这几类留给所有者——那样在对应条目写 owner_only: <原因>。' : '';
+  }
   const statusQueries = new Map();
   function dampenStatus(value, exec, tool, seconds = 0) {
     const owner = exec?.agent?.id;
@@ -1289,6 +1359,41 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return entry ? `update_goal: 会话目标暂不能标记完成。${entry.job_id} 有挂起复核，等待核验 ${entry.verification_id} 的复核处理结束。` : '';
   };
   const ledgerFile = stateDirectory && path.join(stateDirectory, 'accepted-open.json');
+  const decisionsFile = stateDirectory && path.join(stateDirectory, 'owner-decisions.json');
+  function readOwnerDecisions() {
+    try {
+      if (decisionsFile) {
+        const { decisions } = JSON.parse(readFileSync(decisionsFile, 'utf8'));
+        if (!Array.isArray(decisions)) throw new Error('格式无效');
+        return decisions;
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    return [];
+  }
+  function recordOwnerDecision(session, job_id, { parent_job_id, resolves: blocker_ids, decided_at: at }) {
+    try {
+      const decisions = readOwnerDecisions();
+      if (decisions.some(entry => entry.job_id === job_id)) return;
+      if (decisionsFile) writeJsonAtomic(decisionsFile, { decisions: [...decisions, { session, job_id, parent_job_id, blocker_ids, at }].slice(-500) });
+      countCloseout(session, 'owner_decisions_by_planner', blocker_ids.length);
+    } catch (error) {
+      ctx.logger?.warn?.(`[codex-conductor] 代所有者决定台账保存失败：${error.message}`);
+    }
+  }
+  function sessionOwnerDecisions(owner) {
+    try {
+      const scope = aliases.owners(owner);
+      return readOwnerDecisions().filter(entry => scope.includes(entry.session));
+    } catch (error) {
+      ctx.logger?.warn?.(`[codex-conductor] 代所有者决定台账不可读：${error.message}`);
+      return null;
+    }
+  }
+  const ownerDecisionLine = decisions => decisions
+    ? `代所有者决定 ${decisions.reduce((n, entry) => n + entry.blocker_ids.length, 0)} 项（任务 ${ledgerJobIds(decisions).join('、') || '无'}）`
+    : '代所有者决定台账不可读';
   const unreadableLedgerLine = '未完成项台账不可读';
   const readLedger = () => {
     try {
@@ -1317,6 +1422,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
   const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
+  const ownerKeys = item => (item.blocker_ids?.length ? item.blocker_ids : ['']).map(id => JSON.stringify([item.unit, id]));
   const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
   const laterRoundHint = (items) => {
     const marked = items.filter(item => item.later_met_by);
@@ -1329,7 +1435,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (!ledger) return unreadableLedgerLine;
     const { items, completions, cleared } = ledger;
     return [`未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
-      `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`, laterRoundHint(items),
+      `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`,
+      `待所有者决定 ${items.filter(item => item.needs_owner).length} 项`, laterRoundHint(items),
+      ...items.flatMap(item => {
+        const label = `${item.job_id}#${item.index ?? `row${item.row}`}`;
+        if (item.needs_owner) return [`${label} 待所有者决定（${item.needs_owner}，${item.asked ? '已问' : '未问'}）`];
+        return item.blocker_kinds?.some(kind => kind === 'user_input' || kind === 'task_conflict') ? [`${label} 可由规划端决定后继续`] : [];
+      }),
       ...(showCleared ? cleared.map(item => `${item.job_id}#${item.index} cleared by later round ${item.cleared_by}`) : []),
     ].filter(Boolean).join('\n');
   };
@@ -1376,25 +1488,84 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return matches;
   }
 
-  function recordAcceptedOpen(source, acceptedOpen, at) {
-    if (!ledgerFile || beforeCutoff(source, acceptOpenFrom)) return;
+  async function ownerUnit(source, owner, signal) {
+    let root = source;
+    const status = jobStatusLookup(signal, 10);
+    try {
+      for (let hop = 0; hop < 10 && parentOf(root); hop++) {
+        const parent = parentOf(root);
+        const lookup = status(parent);
+        if (!lookup) break;
+        const job = await lookup;
+        if (unknownState(job) || !owns(owner, job.context?.owner)) break;
+        root = job;
+      }
+    } catch { signal?.throwIfAborted(); }
+    return root.thread_id ? `thread:${root.thread_id}` : `job:${root.job_id}`;
+  }
+
+  function recordAcceptedOpen(source, acceptedOpen, at, owner, unit) {
+    if (!ledgerFile || (!unit && beforeCutoff(source, acceptOpenFrom))) return {};
     const warning = '本次复核已写入，未能更新未完成项台账。';
     try {
       const ledger = readLedger();
-      if (!ledger) return warning;
+      if (!ledger) return { ledgerWarning: warning };
       const jobId = source.job_id;
       const reviewTimes = ledger.review_times ?? {};
-      if (reviewTimes[jobId] > at || ledger.items.some(item => item.job_id === jobId && item.at > at)) return;
+      if (reviewTimes[jobId] > at || ledger.items.some(item => item.job_id === jobId && item.at > at)) return {};
       const session = source.context.owner;
       const blockers = source.structured?.blockers;
       const blocker_kinds = Array.isArray(blockers) ? [...new Set(blockers.map(blocker => blocker?.kind).filter(Boolean))] : [];
-      const items = acceptedOpen.map(entry => ({ session, job_id: jobId, ...entry, blocker_kinds, at }));
+      const blocker_ids = ownerBlockerIds(blockers);
+      const previous = ledger.items.filter(item => item.needs_owner && owns(owner, item.session));
+      const seen = new Set(previous.flatMap(ownerKeys));
+      const asked = new Set(previous.filter(item => item.asked).flatMap(ownerKeys));
+      const fresh = beforeCutoff(source, acceptOpenFrom) ? acceptedOpen.filter(entry => entry.owner_only) : acceptedOpen;
+      const items = fresh.map(({ owner_only, ...entry }) => {
+        const item = { session, job_id: jobId, ...entry, blocker_kinds, at };
+        if (owner_only) Object.assign(item, { needs_owner: owner_only, unit, blocker_ids, asked: ownerKeys({ unit, blocker_ids }).every(key => asked.has(key)) });
+        return item;
+      });
+      const newOwnerItems = items.filter(item => item.needs_owner && !previous.some(old => old.job_id === jobId && old.key === item.key));
+      const askOwner = items.some(item => item.needs_owner && ownerKeys(item).some(key => !seen.has(key)));
       const remaining = ledger.items.filter(item => item.job_id !== jobId);
       // 即使没有未完成项，也保留这次复核时间，防止迟到的旧回执恢复旧条目。
       saveLedger({ ...ledger, review_times: { ...reviewTimes, [jobId]: at }, items: [...remaining, ...items] });
+      if (newOwnerItems.length) countCloseout(owner, 'needs_owner_open', newOwnerItems.length);
+      return { askOwner: askOwner
+        ? `任务 ${jobId} 有事项须由所有者决定${blocker_ids.length ? `（阻塞 ${blocker_ids.join('、')}）` : ''}。` +
+          `用 ask_user_question 提问，intent 设为 owner_only，问题文字以 [owner_only] ${jobId} 开头。` : '' };
     } catch (error) {
       ctx.logger?.warn?.(`[codex-conductor] ${warning} ${error?.message ?? error}`);
-      return warning;
+      return { ledgerWarning: warning };
+    }
+  }
+
+  function observeOwnerQuestion(exec) {
+    const args = goalArguments(exec.arguments);
+    const questions = Array.isArray(args?.questions) ? args.questions : [args];
+    const marked = questions.filter(q => typeof q?.question === 'string' &&
+      (q.intent === 'owner_only' || q.question.startsWith('[owner_only]')));
+    if (!marked.length) return;
+    try {
+      const ledger = readLedger();
+      const ownedItems = ledger?.items.filter(item => item.needs_owner && owns(exec.agent?.id, item.session)) ?? [];
+      const pending = ownedItems.filter(item => !item.asked);
+      const units = new Set(pending.map(item => item.unit));
+      const asked = new Set();
+      for (const { question } of marked) {
+        const words = new Set(question.match(/[A-Za-z0-9_-]+/g));
+        const named = ownedItems.filter(item => words.has(item.job_id));
+        const items = named.length ? named : units.size === 1 ? pending : [];
+        for (const key of items.flatMap(ownerKeys)) asked.add(key);
+      }
+      const items = pending.filter(item => ownerKeys(item).every(key => asked.has(key)));
+      if (items.length) {
+        for (const item of items) item.asked = true;
+        saveLedger(ledger);
+      }
+    } catch (error) {
+      ctx.logger?.warn?.(`[codex-conductor] 向所有者提问的状态保存失败：${error.message}`);
     }
   }
 
@@ -1789,6 +1960,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const openSupport = { ...supports.openSupport };
       for (const [key, kinds] of Object.entries(park_support)) openSupport[key] = [...new Set([...kinds, ...(openSupport[key] ?? [])])];
       prepared = prepareReview(review, { ...source, evidenceLevel: evidenceLevel(source), openLevel: openEvidenceLevel(source), ...supports, openSupport });
+      const ownerProblem = await ownerReviewProblem(source, prepared, owner);
+      if (ownerProblem) prepared.problems = [ownerProblem];
       // 依据查询期间可能已有人工复核。读到确定状态之后再认领。
       source = await conductor.waitJob(job_id, 0);
       if (unavailable(source)) return;
@@ -2165,6 +2338,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return { mode: size > limit ? 'fresh' : 'resume', reason: 'size', ...base, parent_last_input_tokens: size, threshold: limit };
   }
 
+  async function previousJob(jobId, exec) {
+    try {
+      const value = withReport(await conductor.waitJob(jobId, 0, exec?.signal));
+      if (!unknownState(value) && owns(exec?.agent?.id, value.context?.owner)) return value;
+    } catch { exec?.signal?.throwIfAborted(); }
+  }
+
   // 本会话（含交接前任）在收尾截止时间之后开始的全部任务；runner 每页最多 100 条，逐页取全。
   async function sessionJobs(owner, signal) {
     const jobs = [];
@@ -2251,6 +2431,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
+    if (args.expect_blocked !== undefined) {
+      args = { ...args, expect_blocked: [...new Set(args.expect_blocked)] };
+      routing = { ...routing, expect_blocked_count: args.expect_blocked.length };
+    }
     let effortLine;
     if (!continuation && !verificationOf && (args.effort !== undefined || args.effort_reason !== undefined)) {
       const { effort: requested, effort_reason: reason } = args;
@@ -2285,12 +2469,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
         ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
       return withCompletionNotices({ ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
-        { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers, plannerReads: cfg.plannerReads }) + reminder }, exec);
+        { ...cfg, readOnly: args.write !== true }) + reminder }, exec);
     };
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
     exec?.signal?.throwIfAborted();
     let started;
     let standingLine;
+    let predispatch = [];
     dispatching++;
     dispatchGeneration++;
     if (writer) startingWrites.add(writer);
@@ -2305,16 +2490,32 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 与其余预检查询并行，启动前再取结果；只多等最慢的一个查询，判定仍以本次派单时的记录为准。
       const closeout = cfg.closeoutGuard !== false && owner && !continuation && !args.resume && !verificationOf
         ? closeoutCheck(owner, tool, exec?.signal, { args, exec, guard }) : null;
+      let latestOnThread;
       if (args.resume && owner) {
-        // 新一轮的结果不能替代同线程更早问题的用户回复。
+        const plannerDecides = cfg.ownerDecisions === 'planner';
         for (let offset = 0; offset !== null;) {
           const history = await conductor.list({ owner, thread_id: args.resume, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对待续接线程的任务', history);
-          const pending = history.jobs.find((job, index) => job.blocking?.next_action === 'ask_user' &&
-            ((!continuation && offset === 0 && index === 0) || !canAnswer(log, job, owner)));
-          if (pending) throw reject(cfg.plannerAnswers
-            ? `${tool}: 原任务 ${pending.job_id} 有待答问题，未启动 Codex。请用 codex_continue 提交 answers。${PLANNER_ANSWERS}`
+          if (offset === 0) latestOnThread = history.jobs[0];
+          let pending;
+          for (const [index, job] of history.jobs.entries()) {
+            if (job.blocking?.next_action !== 'ask_user') continue;
+            const latestRun = !continuation && offset === 0 && index === 0;
+            if (!latestRun) {
+              if (canAnswer(log, job, owner)) continue;
+              if (plannerDecides && continuation?.parent_job_id === job.job_id) continue;
+              const blockers = job.blocking.blockers;
+              if (plannerDecides && ownerBlockerIds(blockers).length &&
+                  !(await undecidedOwnerBlockers(job, owner, exec?.signal, blockers)).length) continue;
+            }
+            pending = job;
+            break;
+          }
+          if (pending) throw reject(plannerDecides
+            ? `${tool}: 原任务 ${pending.job_id} 有待决定的阻塞，未启动 Codex。按常设授权用 codex_continue 提交 answers 或 resolution。`
+            : cfg.plannerAnswers
+              ? `${tool}: 原任务 ${pending.job_id} 有待答问题，未启动 Codex。请用 codex_continue 提交 answers。${PLANNER_ANSWERS}`
             : `${tool}: 原任务 ${pending.job_id} 仍需用户回答，未启动 Codex。先向用户确认，再按最新任务状态用 codex_continue 处理。`);
           offset = history.next_offset ?? null;
         }
@@ -2391,6 +2592,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const repeat = await conductor.repeatGuard(cwd, exec?.signal);
       exec?.signal?.throwIfAborted();
       if (cfg.repeatFailureGuard.enabled && repeat?.status === 'completed') standingLine = repeatStandingLine(repeat.standing);
+      let parent = guard.parent;
+      if (!parent && !guard.threadLookedUp && args.resume && !verificationOf && !continuation && owner) {
+        const also_owners = aliases.predecessors(owner);
+        const job = also_owners.length ? (await conductor.list({ owner, also_owners, thread_id: args.resume,
+          limit: 1 }, exec?.signal).catch(() => undefined))?.jobs?.[0] ?? latestOnThread : latestOnThread;
+        if (job?.job_id) parent = await previousJob(job.job_id, exec);
+        exec?.signal?.throwIfAborted();
+      }
+      predispatch = predispatchWarnings(args, cwd, parent, repeat);
       if (args.rerun_after_change) routing = { ...routing, rerun_after_change: true };
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
@@ -2400,6 +2610,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ...(verificationOf ? { verification_of: verificationOf } : {}),
         ...(routing ? { routing } : {}),
       });
+      if (owner && started.job_id && !unknownState(started) && continuation?.decided_by === 'planner') {
+        recordOwnerDecision(owner, started.job_id, continuation);
+      }
+      if (owner && started.job_id && !unknownState(started)) {
+        if (predispatch.length) countCloseout(owner, 'predispatch_warnings', predispatch.length);
+        if (args.expect_blocked?.length) countCloseout(owner, 'expect_blocked_items', args.expect_blocked.length);
+      }
       guard.onStarted?.(started);
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
     } finally { dispatching--; if (writer) startingWrites.delete(writer); }
@@ -2422,8 +2639,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
     const key = shown.rendered ? 'rendered' : 'next';
-    const lines = [standingLine, effortLine].filter(line => line && !shown[key]?.includes(line));
-    return { ...shown, ...(shown.rendered && standingLine ? { next: standingLine } : {}),
+    const lines = [standingLine, effortLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
+    const renderedNext = [standingLine, ...predispatch].filter(Boolean).join('\n');
+    return { ...shown, ...(shown.rendered && renderedNext ? { next: [shown.next, renderedNext].filter(Boolean).join('\n') } : {}),
       ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
   }
 
@@ -2441,7 +2659,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
       '教程终检与补目录导航同单，write=true，scope 只含目录页，正文与素材只读。Codex 逐条回报验收，列出偏差和范围外改动。' +
       (cfg.plannerReads === 'products' ? 'completed 后先机械核对产物、出处和数字，内容是否属实用 codex_verify，' : 'completed 后你要逐条只读核验，') +
-      (cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
+      (cfg.ownerDecisions === 'planner' ? '原任务有待决定阻塞时按常设授权用 codex_continue 提交 answers 或 resolution；'
+        : cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
       (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝；唯一一个待验收任务的核验在跑（或本单带 verify_previous 核验它）时，可以派写入范围不重叠的新任务。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
@@ -2459,6 +2678,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         acceptance: { type: 'array', minItems: 1, items: { type: 'string' }, description: '至少 1 条，每条去除首尾空白后至少 4 个字符。只写结果、正常观测入口和预期值，只要求本轮可取得的证据。' +
           '哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，仅在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并写明用途。' },
         must_verify: { type: 'array', items: { type: 'integer', minimum: 1 }, description: '必须实测的验收条目编号（从 1 起）；记 met 前用 codex_verify 独立核验。' },
+        acceptance_needs: ACCEPTANCE_NEEDS,
+        expect_blocked: EXPECT_BLOCKED,
         write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（使用沙箱时为 workspace-write）；' +
           'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
           `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。生成或删除文件、改变远端状态也需 true，按授权在 scope/task 写明目标。不得同时要求写入和禁止写入。` },
@@ -2500,22 +2721,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, args, exec, 'codex_run');
       // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
       let thread = null;
-      if (args.resume && (cfg.modelAB.enabled || args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0)) {
+      const threadLookedUp = args.resume && (cfg.modelAB.enabled || args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0);
+      if (threadLookedUp) {
         try { thread = await runThread(args, exec); } catch { exec?.signal?.throwIfAborted(); }
       }
       if (thread && thread.parent_thread_id !== args.resume) args = { ...args, resume: thread.parent_thread_id };
-      let parent;
-      if (thread?.mode === 'fresh' || (cfg.modelAB.enabled && thread?.parent_job_id)) {
-        const value = withReport(await conductor.waitJob(thread.parent_job_id, 0, exec?.signal));
-        if (!unknownState(value) && owns(exec?.agent?.id, value.context?.owner)) parent = value;
-      }
+      const parent = thread?.parent_job_id ? await previousJob(thread.parent_job_id, exec) : undefined;
       let fresh;
       if (thread?.mode === 'fresh') {
         if (!parent) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
         else fresh = { brief: previousRoundBrief(parent),
-          continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: `codex_run 以新线程接续线程 ${thread.parent_thread_id}` } };
+          continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: '' } };
       }
-      const guard = {};
+      const guard = { parent, threadLookedUp };
       const route = retainThreadModel(args, parent, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
       const value = await dispatch(route.args, exec, undefined, args.task, undefined, fresh, route.routing, guard);
       const deferred = guard.deferred && value.job_id ? guard.deferred : null;
@@ -2868,9 +3086,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const continuations = new Map();
   ctx.tools.register({
     name: 'codex_continue',
-    description: (cfg.plannerAnswers ? '在规划端回答阻塞问题或环境条件已改变后续接原任务；' : '在用户回答阻塞问题或环境条件已改变后续接原任务；') +
+    description: (cfg.ownerDecisions === 'planner' || cfg.plannerAnswers ? '在规划端回答阻塞问题或环境条件已改变后续接原任务；' : '在用户回答阻塞问题或环境条件已改变后续接原任务；') +
       '先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
-      (cfg.plannerAnswers ? 'answers 用阻塞问题的 id，可由规划端回答；' + PLANNER_ANSWERS : 'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；') +
+      (cfg.ownerDecisions === 'planner' ? '按所有者常设授权提交 answers 或 resolution，写选定方案、理由和放弃的方案。不可逆或对外动作、花钱、账号凭据及扩大安全边界留给所有者；'
+        : cfg.plannerAnswers ? 'answers 用阻塞问题的 id，可由规划端回答；' + PLANNER_ANSWERS : 'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；') +
       '缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
       '已有后续轮次时返回该轮次，不从同一个父任务重复派活。后续修正请用最新 job_id。verify_previous 可在续接的同时只读核验另一单。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
@@ -2879,6 +3098,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       answers: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
       resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
+      acceptance_needs: ACCEPTANCE_NEEDS,
+      expect_blocked: EXPECT_BLOCKED,
       rerun_after_change: RERUN_AFTER_CHANGE,
       fresh: { type: 'boolean', description: '不传时由插件决定：不带 answers 且原线程很大时开新线程（附上轮交接内容），否则沿用原线程。' +
         'true 强制开新线程，false 强制沿用原线程；带 answers 的续接默认沿用原线程。' },
@@ -2901,7 +3122,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const source = withReport(await conductor.waitJob(args.job_id, 0));
         exec?.signal?.throwIfAborted();
         if (!owns(owner, source.context?.owner)) throw continuationError('codex_continue: 原任务归属未知或不属于当前会话');
-        const children = await conductor.list({ owner, parent_job: args.job_id, limit: 1 }, exec?.signal);
+        const children = await conductor.list({ owner, also_owners: aliases.predecessors(owner), parent_job: args.job_id, limit: 1 }, exec?.signal);
         if (!Array.isArray(children.jobs)) throw continuationError(`codex_continue: 无法核对已有续接：${children.error ?? children.status}`);
         if (children.jobs.length) {
           const child = withReport(await conductor.waitJob(children.jobs[0].job_id, 0));
@@ -2910,20 +3131,29 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             next: `本次 answers/resolution 未应用，继续使用 job ${child.job_id}；要补充新内容请对 ${child.job_id} 调 codex_continue。\n${nextStep(child, undefined, undefined, cfg)}` };
         }
         // 归属已按交接别名核对；交给 prepareContinuation 的是原任务自己的归属方。
-        const plan = prepareContinuation(source, args, source.context.owner);
+        const plannerDecides = cfg.ownerDecisions === 'planner';
+        const plan = prepareContinuation(source, args, source.context.owner, plannerDecides);
+        const log = exec.agent.session?.log ?? [];
         const needsReply = plan.ready && plan.blocking.questions.length > 0 &&
-          !canAnswer(exec.agent.session?.log ?? [], source, owner);
+          !plannerDecides && !canAnswer(log, source, owner);
         if (!plan.ready || needsReply) return { ...source, continuation_ready: false, blocking: plan.blocking,
           remaining_questions: needsReply ? plan.blocking.questions : plan.remaining_questions,
           next: cfg.plannerAnswers && plan.blocking.questions.length ? plan.next + PLANNER_ANSWERS : needsReply
             ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
+        const blockerIds = ownerBlockerIds([...(source.report?.blockers ?? []), ...plan.blocking.blockers]);
+        const resolves = resolvedBlockerIds(blockerIds, plan.continuation);
+        if (plannerDecides && resolves.length && !hasUserReply(log, source, owner, cfg.autoResume.message)) {
+          Object.assign(plan.continuation, { decided_by: 'planner', decision_basis: 'standing_authorization',
+            decided_at: Date.now() / 1000, resolves });
+        }
         const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, plan.args, exec, 'codex_continue');
         const thread = await continuationThread(plan, args, exec?.signal);
         if (thread?.mode === 'fresh') delete plan.args.resume;
         const route = retainThreadModel(plan.args, source, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
         const value = await dispatch({ ...route.args, rerun_after_change: args.rerun_after_change,
+          acceptance_needs: args.acceptance_needs, expect_blocked: args.expect_blocked,
           ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
-          exec, plan.continuation, plan.task, undefined, undefined, route.routing);
+          exec, plan.continuation, plan.task, undefined, undefined, route.routing, { parent: source });
         const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
         if (verify) {
           const { line: verifyLine, ...verifyResult } = verify;
@@ -2941,22 +3171,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
 
   const ACCEPTED_FIELD = { type: 'string', minLength: 1, description: '只用于 accepted_deviations 里保留 not_met/blocked 的条目：为什么接受这一条未满足。其他情况省略。' };
+  const OWNER_ONLY_FIELD = { type: 'string', enum: OWNER_ONLY_REASONS, description: '只用于有 accepted 的未满足条目，注明须由所有者决定的原因。' };
   async function submitReview(job_id, source, prepared, level, owner, signal) {
     const { review } = prepared;
     const previousTime = source.verification?.time ?? -Infinity;
+    const unit = prepared.acceptedOpen.some(entry => entry.owner_only) ? await ownerUnit(source, owner, signal) : undefined;
     const result = await conductor.review(job_id, review, owner, signal);
     // runner 返回作业状态，执行时的错误会和新写入的复核一起返回。
     const appended = result?.verification_status === review.status &&
       Number.isFinite(result.verification?.time) && result.verification.time > previousTime && !unknownState(result);
-    let ledgerWarning;
+    let ledger = {};
     if (appended && ['verified', 'accepted_deviations'].includes(review.status)) {
       // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
       const flaggedMet = flaggedCriteria(source).some((f) => (f.row ? review.report_rows ?? [] : review.criteria)
         .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
       countCloseout(owner, openAccepted(review) ? 'accepted_open'
         : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
-      ledgerWarning = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time);
-      if (!ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, signal);
+      ledger = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time, owner, unit);
+      if (!ledger.ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, signal);
     }
     // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
     if (result?.error_kind === 'bad_arguments' && !result.job_id) {
@@ -2964,7 +3196,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
     }
     if (prepared.inferred && appended) countCloseout(owner, 'accepted_inferred');
-    return { appended, result, ledgerWarning };
+    return { appended, result, ...ledger };
   }
 
   ctx.tools.register({
@@ -2983,10 +3215,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
       criteria: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
-          evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD }, required: ['index', 'status', 'evidence'] } },
+          evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD, owner_only: OWNER_ONLY_FIELD }, required: ['index', 'status', 'evidence'] } },
       report_rows: { type: 'array', description: 'Codex 报告行数与验收条数不同时，报告自标 not_met/blocked 又对不上任何验收原文的行，按报告行号（从 1 起）逐行记录；规则与 criteria 相同。没有这种行时省略。',
         items: { type: 'object', additionalProperties: false, properties: { row: { type: 'integer', minimum: 1 },
-          status: { type: 'string', enum: ['met', 'not_met', 'blocked'] }, evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD },
+          status: { type: 'string', enum: ['met', 'not_met', 'blocked'] }, evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD, owner_only: OWNER_ONLY_FIELD },
         required: ['row', 'status', 'evidence'] } },
       notes: { type: 'string', description: '没有补充说明可省略。' },
       accepted_deviations: { type: 'array', description: cfg.plannerAnswers
@@ -3016,20 +3248,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (closing && (checkOpen || level === 'independent' || source.context?.must_verify?.length)) {
         try { supports = await criterionSupport(source, owner, log, exec?.signal, checkOpen); } catch { exec?.signal?.throwIfAborted(); }
       }
+      const plannerDecides = cfg.ownerDecisions === 'planner' && args.status === 'accepted_deviations';
       const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, ...supports });
+      const ownerProblem = await ownerReviewProblem(source, prepared, owner, exec?.signal);
+      if (ownerProblem) throw new Error(reviewRejection(job_id, source, { ...prepared, problems: [ownerProblem] }));
       const { review } = prepared;
-      // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
-      // “未满足但接受”的条目与接受偏差同一道用户确认。
-      if (!prepared.openUnsupported && ((Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0) ||
-          openAccepted(review)) &&
-          !canAnswer(log, source, owner)) {
+      const opened = prepared.acceptedOpen;
+      const mayClose = canAnswer(log, source, owner) || (plannerDecides && !review.accepted_deviations?.length && opened.length > 0 &&
+        (ownerBlockerIds(source.structured?.blockers).length > 0 || opened.every(entry => entry.owner_only)));
+      if (!prepared.openUnsupported && (review.accepted_deviations?.length || openAccepted(review)) && !mayClose) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
       if (prepared.problems.length) {
         const verification_id = supports?.runningVerification;
         // 只有结案复核仅缺保留开放项的依据、没有缺依据的 met，且用户确认已过关，才挂起等待本任务正在跑的核验。
         if (parkedFile && closing && verification_id && prepared.problems.length === prepared.openUnsupported &&
-            prepared.unsupported === 0 && canAnswer(log, source, owner)) {
+            prepared.unsupported === 0 && mayClose) {
           exec?.signal?.throwIfAborted();
           const entries = readParkedReviews();
           if (entries) {
@@ -3050,12 +3284,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const running = verification_id && prepared.unsupported && !prepared.openUnsupported ? `核验 ${verification_id} 正在跑，等它结束再记；` : '';
         throw new Error(running + reviewRejection(job_id, source, prepared));
       }
-      const { appended, result, ledgerWarning } = await submitReview(job_id, source, prepared, level, owner, exec?.signal);
+      const { appended, result, ledgerWarning, askOwner } = await submitReview(job_id, source, prepared, level, owner, exec?.signal);
       const value = withReport(result);
       const fixed = appended && prepared.fixed.length;
       const fixedLine = fixed ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
       return { ...value, ...(fixed ? { review_fixes: prepared.fixed } : {}),
-        next: [fixedLine, nextStep(value, undefined, undefined, cfg), ledgerWarning].filter(Boolean).join('\n') };
+        next: [fixedLine, nextStep(value, undefined, undefined, cfg), ledgerWarning, askOwner].filter(Boolean).join('\n') };
     },
   });
 
@@ -3083,15 +3317,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
           `已结束轮次耗时合计：${typeof g.finished_duration_s === 'number' ? `${Math.round(g.finished_duration_s)} 秒` : '未知'}；用量（${g.usage_scope}）：${g.usage == null ? '未知（原始用量不完整）' : JSON.stringify(g.usage)}`,
           ...(g.rounds_truncated ? ['只展示最新轮次明细；总轮数、文件集合与耗时按全部匹配记录计算。'] : []),
-        ].join('\n')), ...(value.accepted_open_ledger === undefined ? [] : [ledgerLine(value.accepted_open_ledger, true)])].join('\n\n')
-      : [JSON.stringify(value, null, 2), value.accepted_open_ledger !== undefined && ledgerLine(value.accepted_open_ledger, true)].filter(Boolean).join('\n') }] },
+        ].join('\n')), ...(value.owner_decisions === undefined ? [] : [ownerDecisionLine(value.owner_decisions)]),
+        ...(value.accepted_open_ledger === undefined ? [] : [ledgerLine(value.accepted_open_ledger, true)])].join('\n\n')
+      : [JSON.stringify(value, null, 2), value.owner_decisions !== undefined && ownerDecisionLine(value.owner_decisions),
+        value.accepted_open_ledger !== undefined && ledgerLine(value.accepted_open_ledger, true)].filter(Boolean).join('\n') }] },
     async execute(args = {}, exec) {
       const selected = args.cwd !== undefined || args.session_id !== undefined ? args : { session_id: 'current', ...args };
       const { filters } = await historySelection(selected, exec);
       const [summary, ledger] = await Promise.all([
         conductor.summary(filters, exec?.signal), acceptedOpenLedger(exec?.agent?.id, exec?.signal),
       ]);
-      return { ...summary, accepted_open_ledger: ledger };
+      return { ...summary, accepted_open_ledger: ledger, owner_decisions: sessionOwnerDecisions(exec?.agent?.id) };
     },
   });
 
@@ -3347,6 +3583,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
+    if (exec.name === 'ask_user_question') observeOwnerQuestion(exec);
     // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
     // 已交接出去的会话只能读，不能再派活、验收或取消，避免两个会话同时处理同一批任务。
     if (['codex_run', 'codex_continue', 'codex_verify', 'codex_review', 'codex_cancel', 'gemini_write'].includes(exec.name)) {
@@ -3418,6 +3655,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const value = history.observe(exec.agent);
       if (result.isError || !value) return result;
       const [ledger, repeat] = await Promise.all([acceptedOpenLedger(exec.agent?.id, exec.signal), conductor.repeatGuard(undefined, exec.signal)]);
+      const decisions = sessionOwnerDecisions(exec.agent?.id);
       let acceptance;
       try { acceptance = acceptanceStatsFile && JSON.parse(readFileSync(acceptanceStatsFile, 'utf8')); } catch {}
       let closeouts;
@@ -3437,14 +3675,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         `自动核验派出 ${mineCloseouts.auto_verify_started ?? 0} / ${closeouts.total.auto_verify_started ?? 0}，` +
         `其中补派 ${mineCloseouts.auto_verify_catchup ?? 0} / ${closeouts.total.auto_verify_catchup ?? 0}，` +
         `跳过 ${mineCloseouts.auto_verify_skipped ?? 0} / ${closeouts.total.auto_verify_skipped ?? 0}；` +
+        `派单前提醒 ${mineCloseouts.predispatch_warnings ?? 0} / ${closeouts.total.predispatch_warnings ?? 0}，` +
+        `预标受阻 ${mineCloseouts.expect_blocked_items ?? 0} / ${closeouts.total.expect_blocked_items ?? 0}；` +
         `closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`
         : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`;
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
-          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}${repeatLine}\n挂起复核（本会话含前任）：${parked} 单\n${ledgerLine(ledger)}`;
+          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}${repeatLine}\n挂起复核（本会话含前任）：${parked} 单\n${ownerDecisionLine(decisions)}\n${ledgerLine(ledger)}`;
       return { ...result, ...(result.value && typeof result.value === 'object'
-        ? { value: { ...result.value, session_history: value, accepted_open_ledger: ledger, parked_reviews: parked, ...(acceptance ? { acceptance_stats: acceptance } : {}),
+        ? { value: { ...result.value, session_history: value, accepted_open_ledger: ledger, owner_decisions: decisions, parked_reviews: parked, ...(acceptance ? { acceptance_stats: acceptance } : {}),
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
@@ -3517,6 +3757,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           ...(cfg.gemini ? ['gemini_write'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
+        ownerDecisions: cfg.ownerDecisions,
         autoWakeBlockedInbox: cfg.autoWakeBlockedInbox,
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length,
           delaySeconds: cfg.autoResume.delaySeconds, reloadDelaySeconds: cfg.autoResume.reloadDelaySeconds },

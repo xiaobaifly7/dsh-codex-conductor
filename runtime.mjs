@@ -267,6 +267,7 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接', maxSessionJobs: '每个会话的任务数上限', handoverSuggestMessages: '建议交接的消息数', acceptanceWarnAbove: '验收标准条数提醒', continueFreshAboveTokens: '续接开新线程的阈值', closeoutEvidence: '结案依据要求',
   maxSessionTokens: '每个会话的用量上限', jobDiff: '记录每单的改动', closeoutGuard: '未收尾时拒绝开新任务', toolPolicy: '工具放行方式', allowTools: '白名单工具',
   acceptOpenEvidence: '接受未完成项的依据',
+  ownerDecisions: '待所有者事项由谁决定',
   autoVerify: '完成后自动核验',
   effortOverride: '单次推理强度覆盖',
   repeatFailureGuard: '重复失败拦截设置',
@@ -299,6 +300,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'toolPolicy') valid = ['denylist', 'allowlist'].includes(v);
     else if (key === 'closeoutEvidence') valid = ['independent', 'planner', 'off'].includes(v);
     else if (key === 'acceptOpenEvidence') valid = ['strict', 'relaxed', 'off'].includes(v);
+    else if (key === 'ownerDecisions') valid = ['planner', 'owner'].includes(v);
     else if (key === 'autoVerify') valid = ['off', 'flagged'].includes(v);
     else if (key === 'effortOverride') valid = ['planner', 'raise-only-listed', 'config'].includes(v);
     else if (key === 'jobDiff' || key === 'closeoutGuard') valid = typeof v === 'boolean';

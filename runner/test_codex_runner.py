@@ -393,6 +393,21 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("## 本目录近期反复失败的步骤", calls[0][1])
         self.assertEqual((changed["repeat_guard"]["standing"], kills), ([], 0))
 
+    def test_predispatch_repeat_guard_exposes_step_words_and_file_change(self):
+        import hashlib
+
+        command = "Invoke-BuildWidget; ./check_setup.py"
+        self.repeat_job("seed-words", [*self.repeat_step(1, command=command), *self.repeat_step(2, command=command)])
+        query = self.control("repeat-guard", "--cwd", str(self.cwd))
+        self.assertEqual(query["_changed_at"], 0)
+        words = ("invoke", "build", "widget", "check", "setup", "py")
+        self.assertEqual(set(query["standing"][0]["words"]),
+                         {hashlib.sha1(word.encode()).hexdigest()[:8] for word in words})
+        self.repeat_job("changed-words", [self.repeat_patch()])
+        query = self.control("repeat-guard", "--cwd", str(self.cwd))
+        self.assertGreater(query["_changed_at"], 0)
+        self.assertEqual(query["standing"], [])
+
     def test_repeat_guard_persists_and_new_worker_blocks_first_run(self):
         self.repeat_job("seed", [*self.repeat_step(1), *self.repeat_step(2, 2)])
         job = self.invoke("--sandbox", "workspace-write", "--no-diff", "--retries", "0",
@@ -407,14 +422,14 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), "do it")
         query = self.control("repeat-guard", "--cwd", str(self.cwd))
         self.assertEqual(query, {"status": "completed", "totals": {"blocked": 1, "seconds_avoided": 60},
-                                 "standing": done["repeat_guard"]["standing"]})
+                                 "standing": done["repeat_guard"]["standing"], "_changed_at": 0})
         record = json.loads((Path(self.env["CODEX_RUNNER_HOME"]) / "step-failures.json").read_text("utf-8"))
         cwd_key, = set(record) - {"_totals"}
         self.assertRegex(cwd_key, r"^[a-f0-9]{16}$")
         key, = set(record[cwd_key]) - {"_changed_at"}
         self.assertRegex(key, r"^[a-f0-9]{40}$")
         self.assertEqual(record[cwd_key][key]["jobs"], ["seed"])
-        self.assertEqual(set(record[cwd_key][key]), {"jobs", "failures", "seconds", "last_exit", "last_at"})
+        self.assertEqual(set(record[cwd_key][key]), {"jobs", "failures", "seconds", "last_exit", "last_at", "words"})
 
     def test_repeat_guard_worker_restart_before_job_finalization(self):
         dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
@@ -2923,6 +2938,43 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(codex_runner.task_context(ok)["routing"]["continuation_mode"], "fresh")
         with self.assertRaises(ValueError):
             codex_runner.task_context({**self.sample_context(), "routing": {"bad": {"nested": 1}}})
+
+    def test_owner_decision_context_requires_complete_typed_metadata(self):
+        import codex_runner
+
+        base = {"parent_job_id": "parent", "answers": [], "resolution": "use option A"}
+        decision = {"decided_by": "planner", "decision_basis": "standing_authorization",
+                    "decided_at": 1795050000.5, "resolves": ["choice-1"]}
+        validate = lambda continuation: codex_runner.task_context({**self.sample_context(), "continuation": continuation})
+        self.assertEqual(validate({**base, **decision})["continuation"], {**base, **decision})
+        for invalid in ({"decided_by": "planner"}, {**decision, "decided_by": "owner"},
+                        {**decision, "decided_at": True}, {**decision, "decided_at": float("nan")},
+                        {**decision, "resolves": [""]}, {**decision, "resolves": ["choice-1", "choice-1"]},
+                        {**decision, "extra": "invalid"}):
+            with self.assertRaises(ValueError):
+                validate({**base, **invalid})
+        with self.assertRaises(ValueError):
+            validate({**base, **decision, "resolution": ""})
+
+    def test_owner_only_review_requires_an_accepted_open_entry(self):
+        import codex_runner
+
+        source = {"context": self.sample_context(), "structured": self.sample_report()}
+        review = self.sample_review(status="accepted_deviations")
+        blocked = {"index": 1, "status": "blocked", "evidence": "pending", "accepted": "accepted",
+                   "owner_only": "spending"}
+        codex_runner.validate_review({**review, "criteria": [blocked]}, source, submitting=True)
+        for invalid in ({**blocked, "accepted": ""}, {**blocked, "owner_only": []},
+                        {**blocked, "owner_only": "unknown"}, {**blocked, "status": "met"},
+                        {key: value for key, value in blocked.items() if key != "accepted"}):
+            with self.assertRaises(ValueError):
+                codex_runner.validate_review({**review, "criteria": [invalid]}, source, submitting=True)
+        row = {**blocked, "row": 2}
+        del row["index"]
+        source["structured"]["criteria"].append({"criterion": "Extra check", "status": "blocked", "evidence": "pending"})
+        codex_runner.validate_review({**review, "report_rows": [row]}, source, submitting=True)
+        with self.assertRaises(ValueError):
+            codex_runner.validate_review({**review, "report_rows": [{**row, "owner_only": "unknown"}]}, source, submitting=True)
 
     @unittest.skipUnless(shutil.which("node"), "requires Node to capture the plugin envelope")
     def test_context_envelope_from_plugin_with_explicit_effort(self):

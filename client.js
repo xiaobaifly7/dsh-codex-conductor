@@ -745,7 +745,8 @@ window.__ModuleLoader__.load({
               field('acceptanceWarnAbove', '验收标准条数提醒', '新派活的验收标准超过这么多条时，提醒 DeepSeek 把偏好写进任务正文（不拦截）；0 表示关闭，留空恢复默认 8。'),
               field('continueFreshAboveTokens', '续接开新线程的阈值（token）', '不带回答的续接，原线程上次请求超过这么多输入 token 时改开新线程，只带上轮交接内容；0 表示总是沿用原线程，留空恢复默认 100000。'),
               field('closeoutEvidence', '结案依据要求', '原报告自标未满足的条目要记成满足时需要什么依据。', [['independent', '需要独立依据（默认）'], ['planner', '规划端自己的证据即可'], ['off', '不检查']]),
-              field('acceptOpenEvidence', '接受未完成项的依据', '保留原报告标出的未完成项时需要什么依据。', [['strict', '未满足须核验或用户确认（默认）'], ['relaxed', '也接受返工结果或待用户处理的阻塞'], ['off', '不检查']]),
+              field('acceptOpenEvidence', '接受未完成项的依据', '保留原报告标出的未完成项时需要什么依据。', [['strict', '未满足须核验或用户确认（默认）'], ['relaxed', '也接受后续轮次仍未完成的结果'], ['off', '不检查']]),
+              field('ownerDecisions', '待所有者事项由谁决定', '不可逆数据变更、对外动作、花钱、账号凭据及扩大安全边界由所有者决定。', [['planner', '规划端按常设授权决定（默认）'], ['owner', '沿用原有确认流程']]),
               field('autoVerify', '完成后自动核验', '写任务完成且报告有未完成项或任务有 must_verify 时，自动派出只读核验。', [['flagged', '自动核验（默认）'], ['off', '关闭']]),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
@@ -972,9 +973,9 @@ window.__ModuleLoader__.load({
             setStatus((old) => ({ ...old, autoAnswer: value.autoAnswer }));
             setMessages((old) => ({ ...old, autoAnswer: action === 'answer' ? '已按推荐提交回答。' : '已取消这条提问的自动代答。' }));
           });
-          const reasons = { risky: '高风险', excluded: '已排除', manual: '已选择自己回答', failed: '宿主提交失败' };
+          const reasons = { risky: '高风险', excluded: '已排除', owner_only: '须由所有者决定', manual: '已选择自己回答', failed: '宿主提交失败' };
           const decisions = { marked_recommended: '有推荐标记', first_option: '首项', free_text: '自由文本',
-            skipped_risky: '跳过高风险', skipped_excluded: '跳过已排除提问' };
+            skipped_risky: '跳过高风险', skipped_excluded: '跳过已排除提问', skipped_owner_only: '留给所有者回答' };
           return h('section', { 'aria-label': '自动代答' }, h('h3', null, '自动代答'),
             h('small', null, [enabled ? '已开启' : '已关闭', `${afterMinutes} 分钟`, enabled && !available ? '宿主提问服务不可用' : ''].filter(Boolean).join(' · ')),
             available && !pending.length ? h('p', null, '当前没有待答提问。') : null,

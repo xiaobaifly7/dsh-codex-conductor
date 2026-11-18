@@ -118,6 +118,7 @@ export function panelSettings(cfg) {
       ['handoverSuggestMessages', cfg.handoverSuggestMessages ?? 5000], ['acceptanceWarnAbove', cfg.acceptanceWarnAbove ?? 8],
       ['continueFreshAboveTokens', cfg.continueFreshAboveTokens ?? 100000], ['closeoutEvidence', cfg.closeoutEvidence ?? 'independent'],
       ['acceptOpenEvidence', cfg.acceptOpenEvidence ?? 'strict'],
+      ['ownerDecisions', cfg.ownerDecisions ?? 'planner'],
       ['autoVerify', cfg.autoVerify ?? 'flagged'],
       ['effortOverride', cfg.effortOverride ?? 'planner'],
       ['repeatFailureGuard', cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS],

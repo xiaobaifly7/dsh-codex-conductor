@@ -5,6 +5,7 @@ import path from 'node:path';
 const STATUSES = ['verified', 'needs_changes', 'accepted_deviations'];
 const MARKS = ['met', 'not_met', 'blocked'];
 const BLOCKER_KINDS = ['user_input', 'task_conflict', 'environment', 'implementation'];
+export const OWNER_ONLY_REASONS = ['irreversible_data', 'outward_action', 'spending', 'credentials', 'security_boundary'];
 const clip = (value, size = 60) => { const s = String(value ?? '').replace(/\s+/g, ' ').trim(); return s.length > size ? `${s.slice(0, size)}…` : s; };
 const label = (a) => (typeof a === 'string' ? a : a?.criterion ?? '');
 const nonempty = (s) => typeof s === 'string' && s.trim() !== '';
@@ -49,6 +50,10 @@ export function prepareReview(args, source) {
   // accepted 的检查（criteria 与 report_rows 共用）；骨架留下的占位在用不上时直接去掉，用得上时给出带结构示例的提示。
   const checkAccepted = (c, n, field) => {
     const open = review.status === 'accepted_deviations' && c.status !== 'met';
+    if (Object.hasOwn(c, 'owner_only') && (!open || !MARKS.includes(c.status) ||
+        !nonempty(c.accepted) || placeholder(c.accepted) || !OWNER_ONLY_REASONS.includes(c.owner_only))) {
+      problems.push(`${field} 第 ${n + 1} 项的 owner_only 只用于有 accepted 的未满足条目，原因须为 ${OWNER_ONLY_REASONS.join('、')}`);
+    }
     // 规划端选了 accepted_deviations、这一条照实保留 not_met/blocked 却没写 accepted：意图是“接受未满足”，接受原因取这一条的 evidence 并在结果里说明。
     // 只补 accepted，从不把任何条目推定为 met；照样经过接受偏差的用户确认。
     if (c.accepted == null && open && MARKS.includes(c.status) && nonempty(c.evidence)) {
@@ -80,7 +85,7 @@ export function prepareReview(args, source) {
         // 带条文却对不上时不按位置猜，避免把结论记到别的验收项上。
         else if (byOrder && !nonempty(criterion)) { c.index = n + 1; fixed.push(`criteria 第 ${n + 1} 项按顺序补 index ${n + 1}`); }
       }
-      const extra = Object.keys(c).filter((k) => !['index', 'status', 'evidence', 'accepted'].includes(k));
+      const extra = Object.keys(c).filter((k) => !['index', 'status', 'evidence', 'accepted', 'owner_only'].includes(k));
       checkAccepted(c, n, 'criteria');
       if (extra.length) problems.push(`criteria 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
       if (!Number.isInteger(c.index)) problems.push(`criteria 第 ${n + 1} 项缺少整数 index（从 1 开始，对应验收标准序号）` +
@@ -107,7 +112,7 @@ export function prepareReview(args, source) {
       review.report_rows = review.report_rows.map((raw, n) => {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { problems.push(`report_rows 第 ${n + 1} 项不是对象`); return raw; }
         const r = { ...raw, row: asInt(raw.row) };
-        const extra = Object.keys(r).filter((k) => !['row', 'status', 'evidence', 'accepted'].includes(k));
+        const extra = Object.keys(r).filter((k) => !['row', 'status', 'evidence', 'accepted', 'owner_only'].includes(k));
         if (extra.length) problems.push(`report_rows 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
         checkAccepted(r, n, 'report_rows');
         if (!extraRows.some((f) => f.row === r.row)) problems.push(`report_rows 第 ${n + 1} 项的 row ${JSON.stringify(r.row) ?? '未填'} 不需要单独处理；` +
@@ -207,8 +212,9 @@ export function prepareReview(args, source) {
     for (const c of [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]) {
       if (!c || !['blocked', 'not_met'].includes(c.status) || !nonempty(c.accepted) || placeholder(c.accepted)) continue;
       const key = c.row ? `row${c.row}` : String(c.index);
-      const kinds = source?.openSupport?.[key] ?? [];
-      acceptedOpen.push({ key, ...(c.row ? { row: c.row } : { index: c.index }), status: c.status, support: kinds });
+      const kinds = (source?.openSupport?.[key] ?? []).filter(kind => kind !== 'user_blocker');
+      acceptedOpen.push({ key, ...(c.row ? { row: c.row } : { index: c.index }), status: c.status, support: kinds,
+        ...(OWNER_ONLY_REASONS.includes(c.owner_only) ? { owner_only: c.owner_only } : {}) });
       if (!source?.openLevel || source.openLevel === 'off') continue;
       const flag = flagged.get(key);
       const original = flag?.status ?? reportRowOf(acceptance, source.structured?.criteria, c.index)?.status;
@@ -290,7 +296,8 @@ export function reviewSkeleton(jobId, source, review = {}) {
     .filter((c) => c && Number.isInteger(c.index)).map((c) => [c.index, c]));
   // accepted_deviations 里保留 not_met/blocked 的条目带上 accepted：沿用已填的原因，没有就留占位。
   const withAccepted = (entry, c) => (status === 'accepted_deviations' && ['not_met', 'blocked'].includes(entry.status)
-    ? { ...entry, accepted: nonempty(c?.accepted) && !placeholder(c.accepted) ? c.accepted : TODO } : entry);
+    ? { ...entry, accepted: nonempty(c?.accepted) && !placeholder(c.accepted) ? c.accepted : TODO,
+      ...(OWNER_ONLY_REASONS.includes(c?.owner_only) ? { owner_only: c.owner_only } : {}) } : entry);
   const criteria = acceptance ? acceptance.map((_a, i) => {
     const c = given.get(i + 1);
     return withAccepted({ index: i + 1, status: MARKS.includes(c?.status) ? c.status : TODO, evidence: nonempty(c?.evidence) ? c.evidence : TODO }, c);

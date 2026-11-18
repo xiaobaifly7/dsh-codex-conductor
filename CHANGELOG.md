@@ -6,6 +6,8 @@
 
 新增设置 `repeatFailureGuard`。派单回执、完成通知和多轮汇总显示目录内近期反复失败的步骤，运行状态显示本会话和 runner 的拦截统计。外部条件改变后，`codex_run` 和 `codex_continue` 可用 `rerun_after_change` 说明变化并重跑。
 
+新增 `ownerDecisions`。规划端默认按常设授权记录决定并续接，`owner_only` 事项留给所有者，提问跳过自动代答。报告级待答阻塞从接受未完成项的依据中移除。续接派单提示同项环境阻塞，`acceptance_needs` 提示近期失败的依赖步骤，`expect_blocked` 指示执行端按环境受阻汇报指定条目。
+
 runner 会为确认执行环境已中断的任务补写 `executor_lost` 结果，记录原因并恢复可用的线程号。后台完成通知引导先核对已有产物，再重派或续接。
 
 ### 已发布版本
@@ -163,6 +165,8 @@ runner 会为确认执行环境已中断的任务补写 `executor_lost` 结果�
 ### 0.9.NEXT
 
 Adds the `repeatFailureGuard` setting. Dispatch results, completion notices, and summaries surface standing failures in the task directory. Runtime status reports session and runner block counts. After an external condition changes, `codex_run` and `codex_continue` accept `rerun_after_change` to explain the change and allow a rerun.
+
+Adds `ownerDecisions` for recording decisions under standing authorization and escalating `owner_only` questions without auto-answering them. Report-level questions no longer support accepting individual open items. Dispatch warns about repeated environment blockers and standing failures in declared `acceptance_needs`. `expect_blocked` tells the executor which items to report as environment-blocked.
 
 The runner records an `executor_lost` result when executor loss is confirmed, with the reason and any recoverable thread ID. Background completion notices direct the planner to check existing artifacts before redispatching or resuming.
 
