@@ -10,7 +10,8 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-safeguards-'));
 process.env.LOCALAPPDATA = localAppData;
 test.after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-const { apply, composePrompt, hasUserReply, runnerArgv } = await import('./index.mjs');
+const { apply: applyPlugin, composePrompt, hasUserReply, runnerArgv } = await import('./index.mjs');
+const apply = (ctx, config, ...rest) => applyPlugin(ctx, { autoVerify: 'off', ...config }, ...rest);
 const { wslPath } = await import('./guard.mjs');
 const { fileURLToPath } = await import('node:url');
 const { pidReused, saveRuntimeSettings, validatePanelSettings } = await import('./runtime.mjs');

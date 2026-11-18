@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
+import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply as applyPlugin,
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX, hasUserReply } from './index.mjs';
 import { createPanelApi, PANEL_PATH } from './panel.mjs';
 import { wslPath, GEMINI_CHECK_HINT, GEMINI_READ_DENY } from './guard.mjs';
@@ -19,6 +19,7 @@ import './planner.test.mjs';
 import './verify.test.mjs';
 
 const packageVersion = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version;
+const apply = (ctx, config, ...rest) => applyPlugin(ctx, { autoVerify: 'off', ...config }, ...rest);
 
 // apply() 会在 %LOCALAPPDATA% 下写加载标记和规划要求模板，测试时改到临时目录
 const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
@@ -6593,6 +6594,179 @@ const autoSource = (id) => ({ ...workflowSource('implementation'), job_id: id, l
 const queryStatus = (h, job_id, agent = agentAt('/work/original')) =>
   h.tools.codex_status.execute({ job_id, wait_seconds: 0 }, { agent });
 
+function autoVerifyFixture(t) {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const since = source.finished_at;
+  writeFileSync(path.join(state, 'auto-verify-since.json'), JSON.stringify({ since }));
+  const runner = {};
+  const starts = [];
+  const completed = (id, fields = {}, context = {}) => runner[id] = { ...structuredClone(source),
+    job_id: id, cwd: '/work/original', sandbox: 'workspace-write', verification: null,
+    verification_status: 'unreviewed', ...fields, context: { ...source.context, ...context } };
+  const list = argv => {
+    const arg = name => argv.includes(name) ? argv[argv.indexOf(name) + 1] : undefined;
+    const owner = arg('--owner');
+    const owners = [owner, ...argv.flatMap((item, i) => item === '--also-owner' ? [argv[i + 1]] : [])];
+    const parent = arg('--parent-job');
+    const status = arg('--status');
+    const matching = Object.values(runner).filter(job => (!owner || owners.includes(job.context.owner)) &&
+      (!status || job.execution_status === status) &&
+      (!parent || job.parent_job_id === parent || job.context.continuation?.parent_job_id === parent));
+    const offset = +arg('--offset');
+    const rows = matching.slice(offset, offset + Math.min(2, +arg('--limit'))).map(({ structured, context, ...row }) => ({
+      ...row, context: { owner: context.owner, write: context.write, verification_of: context.verification_of,
+        ...(context.continuation ? { continuation: context.continuation } : {}) },
+    }));
+    return { jobs: rows, total: matching.length, next_offset: offset + rows.length < matching.length ? offset + rows.length : null };
+  };
+  const load = (config = {}, options, startBarrier) => {
+    const h = make({ autoVerify: 'flagged', listResult: list, startResult: async (_argv, { stdin }) => {
+      const { context } = JSON.parse(stdin);
+      starts.push(context);
+      const job_id = `CHECK-${starts.length}`;
+      await startBarrier;
+      return runner[job_id] = { job_id, status: 'completed', execution_status: 'completed', context };
+    }, ...config }, options);
+    Object.assign(h.finals, runner);
+    return h;
+  };
+  const call = (h, id = 'S1') => {
+    const agent = { ...agentAt('/work/original'), id };
+    return h.handlers['tools/execute']({ name: 'codex_jobs', arguments: {}, agent },
+      async () => ({ value: await h.tools.codex_jobs.execute({}, { agent }) }));
+  };
+  const stats = () => JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8')).total;
+  return { since, state, runner, completed, starts, load, call, stats };
+}
+
+const settleAutoVerify = async () => { for (let i = 0; i < 12; i++) await tick(); };
+
+test('auto catch-up starts two on load and one per session scan through handover', async (t) => {
+  const f = autoVerifyFixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  writeFileSync(path.join(f.state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' }, S3: { from: 'S2' } } }));
+  f.completed('FIRST', { started_at: f.since - 3600 });
+  f.completed('SECOND');
+  const required = f.completed('REQUIRED', {}, { must_verify: [1] });
+  for (const criterion of required.structured.criteria) criterion.status = 'met';
+  required.criteria_counts = { met: required.structured.criteria.length, not_met: 0, blocked: 0 };
+  f.completed('FOURTH');
+  f.completed('OTHER', {}, { owner: 'S4' });
+  const h = f.load();
+  assert.equal(f.starts.length, 0);
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['FIRST', 'SECOND']);
+  await f.call(h, 'S3');
+  // 补派在工具返回之后进行，不占调用时间。
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['FIRST', 'SECOND', 'REQUIRED']);
+  assert.ok(f.starts.every(c => c.owner === 'S3' && c.write === false));
+  now += 59_999;
+  await f.call(h, 'S3');
+  await settleAutoVerify();
+  assert.equal(f.starts.length, 3);
+  await f.call(h, 'S4');
+  await settleAutoVerify();
+  assert.equal(f.starts.at(-1).verification_of, 'OTHER');
+  now += 1;
+  await f.call(h, 'S3');
+  await settleAutoVerify();
+  assert.equal(f.starts.at(-1).verification_of, 'FOURTH');
+  assert.equal(f.stats().auto_verify_started, 5);
+  assert.equal(f.stats().auto_verify_catchup, 5);
+});
+
+test('auto catch-up finds existing verifications across two fresh reloads', async (t) => {
+  const f = autoVerifyFixture(t);
+  f.completed('FIRST');
+  f.completed('SECOND');
+  for (let i = 0; i < 3; i++) {
+    const h = f.load();
+    await settleAutoVerify();
+    assert.ok(h.calls.some(argv => argv[0] === 'list' && !argv.includes('--owner')));
+    assert.deepEqual(f.starts.map(c => c.verification_of), ['FIRST', 'SECOND']);
+  }
+});
+
+test('auto catch-up scans and excludes reviewed, superseded, read-only, verification, old and already checked jobs', async (t) => {
+  const f = autoVerifyFixture(t);
+  f.completed('REVIEWED', { verification_status: 'verified' });
+  f.completed('PARENT-TOP');
+  f.completed('PARENT-CONTEXT');
+  f.completed('CHILD-TOP', { parent_job_id: 'PARENT-TOP' }, { write: false });
+  f.completed('CHILD-CONTEXT', {}, { owner: 'S2', write: false, continuation: { parent_job_id: 'PARENT-CONTEXT' } });
+  f.completed('READ', {}, { write: false });
+  f.completed('OLD', { finished_at: f.since - 1 });
+  f.completed('CHECKED');
+  f.completed('CHECK', { status: 'failed', execution_status: 'failed' }, { owner: 'S2', verification_of: 'CHECKED' });
+  f.completed('VERIFY', {}, { verification_of: 'UNRELATED' });
+  f.completed('INVALID', { report_status: 'invalid', structured: null });
+  const h = f.load();
+  await settleAutoVerify();
+  assert.ok(h.calls.some(argv => argv[0] === 'list' && !argv.includes('--owner')));
+  assert.deepEqual(f.starts, []);
+  await f.call(h);
+  assert.deepEqual(f.starts, []);
+  assert.equal(fs.existsSync(path.join(f.state, 'closeout-stats.json')), false);
+});
+
+test('auto verification starts once from a stored rendered completion with one source status read', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const f = autoVerifyFixture(t);
+  const jobs = fakeJobs();
+  let finish;
+  jobs.start({ owner: 'S1', kind: 'codex', label: 'Codex RENDERED',
+    run: () => ({ done: new Promise(resolve => { finish = resolve; }), cancel() {} }) });
+  const start = Promise.withResolvers();
+  const h = f.load({}, { jobs }, start.promise);
+  await settleAutoVerify();
+  const pending = h.tools.codex_status.execute({ job_id: 'RENDERED', wait_seconds: 60 }, { agent: agentAt('/work/original') });
+  h.finals.RENDERED = f.completed('RENDERED');
+  finish({ status: 'completed', result: 'completed  job_id: RENDERED\n原回执' });
+  await settleAutoVerify();
+  assert.equal(f.starts.length, 1);
+  t.mock.timers.tick(70_000);
+  start.resolve();
+  const value = await pending;
+  assert.deepEqual(value.auto_verify, { job_id: 'CHECK-1', status: 'completed' });
+  assert.match(value.rendered, /原回执[\s\S]*插件已自动派出对 RENDERED 的只读核验 CHECK-1/);
+  assert.equal(h.calls.filter(argv => argv[0] === 'status' && argv[1] === 'RENDERED').length, 1);
+  await queryStatus(h, 'RENDERED');
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['RENDERED']);
+  assert.equal(f.stats().auto_verify_started, 1);
+  assert.equal(f.stats().auto_verify_catchup, undefined);
+});
+
+test('auto verification skips a superseded normal completion with a reason', async (t) => {
+  const f = autoVerifyFixture(t);
+  const h = f.load();
+  await settleAutoVerify();
+  for (const [parent, fields, context] of [['TOP', { parent_job_id: 'TOP' }, {}],
+    ['CONTEXT', {}, { continuation: { parent_job_id: 'CONTEXT' } }]]) {
+    h.finals[parent] = f.completed(parent);
+    f.completed(`${parent}-CHILD`, fields, { owner: 'S2', ...context });
+    const value = await queryStatus(h, parent);
+    assert.match(value.auto_verify?.skipped ?? '', /已有后续轮次/);
+  }
+  assert.deepEqual(f.starts, []);
+});
+
+test('auto catch-up records a full maxRunningJobs skip and retries when a slot opens', async (t) => {
+  const f = autoVerifyFixture(t);
+  f.completed('CAPPED');
+  f.completed('BUSY', { status: 'running', execution_status: 'running' }, { write: false });
+  const h = f.load({ maxRunningJobs: 1 });
+  await settleAutoVerify();
+  assert.deepEqual(f.starts, []);
+  assert.equal(f.stats().auto_verify_skipped, 1);
+  f.runner.BUSY.execution_status = 'completed';
+  await f.call(h);
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['CAPPED']);
+  assert.equal(f.stats().auto_verify_catchup, 1);
+});
+
 test('rework 2: auto verification requires an unreviewed job at or after the cutoff', async (t) => {
   const { make, state } = acceptedFixtureHarness(t);
   const since = Date.now() / 1000;
@@ -6618,12 +6792,11 @@ test('rework 2: auto verification requires an unreviewed job at or after the cut
 });
 
 test('release C: overlapping finish observers and manual verification dispatch only one check', async () => {
-  const source = autoSource('FLAGGED');
   const start = Promise.withResolvers();
   const running = [];
   const h = harness({ config: { autoVerify: undefined, listResult: () => ({ jobs: running }),
     startResult: (_argv, { stdin }) => JSON.parse(stdin).context.verification_of ? start.promise : { job_id: 'NEXT', status: 'completed' } } });
-  h.finals.FLAGGED = source;
+  h.finals.FLAGGED = autoSource('FLAGGED');
   const first = queryStatus(h, 'FLAGGED');
   const second = queryStatus(h, 'FLAGGED');
   const starts = () => h.requests.filter(r => r.argv[0] === 'start');

@@ -69,7 +69,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
     apply({ tools: { register(tool) { tools[tool.name] = tool; }, guard(value) { guard = value; } },
       on(name, handler) { handlers[name] = handler; },
       get(key) { return key === 'jobs' ? jobs : undefined; } },
-    { workspaces: ['/work'], allowHostAccess: true, waitSeconds: 0, model: 'new-default-model',
+    { workspaces: ['/work'], allowHostAccess: true, autoVerify: 'off', waitSeconds: 0, model: 'new-default-model',
       effort: 'high', readOnlyEffort: 'medium', serviceTier: 'new-default-tier', ...config }, run);
   } finally {
     if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;

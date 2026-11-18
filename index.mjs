@@ -26,7 +26,7 @@ const { registerResumeRequests, registerAutoWake } = await import(new URL(`./res
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, lastSuccessor, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -1377,7 +1377,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function ensureOwnJob(jobId, exec, tool) {
     if (!restrictedReads(exec) || owns(exec?.agent?.id, productJobs.get(jobId))) return;
     if (productJobs.has(jobId)) throw new Error(`${tool}: 任务不属于本会话，不能读取它的产物；请用 codex_jobs 查本会话的任务。`);
-    checkJobOwner(await conductor.waitJob(jobId, 0, exec?.signal), exec, tool);
+    const source = await conductor.waitJob(jobId, 0, exec?.signal);
+    checkJobOwner(source, exec, tool);
+    return source;
   }
   if (plannerFile && !existsSync(plannerFile)) try {
     mkdirSync(path.dirname(plannerFile), { recursive: true });
@@ -1442,35 +1444,51 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const verificationState = hostVerifications.get(jobService) ?? { starts: new Map(), automatic: new Map() };
   if (jobService) hostVerifications.set(jobService, verificationState);
   const { starts: verificationStarts, automatic: autoVerifications } = verificationState;
-  async function withAutoVerification(value, exec) {
+  const automaticCandidate = (job) => job.job_id && job.context?.owner && job.context.write === true &&
+    !job.context.verification_of && (job.execution_status ?? job.status) === 'completed' &&
+    (job.verification_status == null || job.verification_status === 'unreviewed') && job.report_status !== 'invalid';
+  const eligibleForAutoVerification = (value) => automaticCandidate(value) && value.verification_status === 'unreviewed' &&
+    !beforeCutoff(value, autoVerifyFrom) && validReport(value.report) && (flaggedCriteria(value).length || value.context.must_verify?.length);
+  const autoVerifyWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 补派自动核验失败：${error?.message ?? error}`);
+
+  async function withAutoVerification(value, exec, { source, catchup = false } = {}) {
+    if (cfg.autoVerify === 'off') return value;
     const id = value.job_id;
-    if (value.rendered) {
-      const receipt = await autoVerifications.get(id);
-      return receipt ? { ...value, auto_verify: receipt.auto_verify } : value;
-    }
-    const originalOwner = value.context?.owner;
-    if (cfg.autoVerify === 'off' || !id || !originalOwner || value.context.write !== true || value.context.verification_of ||
-        value.execution_status !== 'completed' || value.verification_status !== 'unreviewed' ||
-        beforeCutoff(value, autoVerifyFrom) || !validReport(value.report) ||
-        (!flaggedCriteria(value).length && !value.context.must_verify?.length)) return value;
+    if (!eligibleForAutoVerification(value)) return value;
     let pending = autoVerifications.get(id);
+    if (catchup && pending) {
+      const receipt = await pending;
+      if (receipt?.auto_verify.job_id || autoVerifications.get(id) !== pending) return value;
+      // 满额或启动失败的回执可在下次扫描时重试。
+      pending = undefined;
+    }
     if (!pending) {
       pending = (async () => {
-        let owner = originalOwner;
-        const seen = new Set([owner]);
-        for (let next = aliases.successor(owner); next && !seen.has(next); next = aliases.successor(owner)) {
-          seen.add(owner = next);
-        }
+        const originalOwner = value.context.owner;
+        let owner = lastSuccessor(aliases, originalOwner) ?? originalOwner;
         const skipped = (reason, key = 'skipped') => {
           countCloseout(owner, 'auto_verify_skipped');
+          if (catchup) autoVerifyWarning(`${id}：${reason}`);
           return { auto_verify: { [key]: reason }, line: `插件未自动派出对 ${id} 的核验：${reason}。之后可用 codex_verify ${id}。` };
         };
         try {
+          const current = source ?? await conductor.waitJob(id, 0);
+          if (unknownState(current)) return skipped(current.error ?? current.error_kind ?? current.status, 'error');
+          if (!source && !eligibleForAutoVerification(withReport(current))) return;
+          const children = await conductor.list({ parent_job: id, limit: 1 });
+          if (children.error_kind || !Array.isArray(children.jobs)) {
+            return skipped(`无法核对后续轮次：${children.error ?? children.error_kind ?? '任务列表不可用'}`);
+          }
+          if (children.jobs.some(job => job.parent_job_id === id || job.context?.continuation?.parent_job_id === id)) {
+            return catchup ? undefined : skipped('已有后续轮次');
+          }
+          owner = lastSuccessor(aliases, current.context.owner) ?? current.context.owner;
           const agent = exec?.agent?.id === owner ? exec.agent : ctx.get?.('agents')?.get?.(owner) ?? { id: owner };
-          const result = await verifyTool.execute({ job_id: id, wait_seconds: 0 }, { agent, [automaticVerification]: true });
-          if (result.existing_verification) return skipped(`已存在核验 ${result.job_id}（${result.status}）`);
+          const result = await verifyTool.execute({ job_id: id, wait_seconds: 0 }, { agent, [automaticVerification]: current });
+          if (result.existing_verification) return catchup ? undefined : skipped(`已存在核验 ${result.job_id}（${result.status}）`);
           if (!result.job_id || unknownState(result)) return skipped(result.error ?? result.error_kind ?? result.status, 'error');
           countCloseout(owner, 'auto_verify_started');
+          if (catchup) countCloseout(owner, 'auto_verify_catchup');
           const line = `插件已自动派出对 ${id} 的只读核验 ${result.job_id}` +
             (result.status === 'running' ? '，正在跑；核验在跑时可以派不重叠的新任务（收尾护栏会放行），'
               : `，状态 ${result.status}；`) + `核验结束后按结论记 codex_review ${id}。`;
@@ -1481,8 +1499,48 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       })();
       autoVerifications.set(id, pending);
     }
-    const { auto_verify, line } = await pending;
-    return { ...value, auto_verify, next: [value.next, line].filter(Boolean).join('\n') };
+    const receipt = await pending;
+    if (!receipt) {
+      if (autoVerifications.get(id) === pending) autoVerifications.delete(id);
+      return value;
+    }
+    return { ...value, auto_verify: receipt.auto_verify, next: [value.next, receipt.line].filter(Boolean).join('\n') };
+  }
+
+  async function scanAutoVerifications(limit, owner) {
+    const jobs = [];
+    // 只看截止时间前两天起开始的任务：跨版本切换时在跑的任务也能覆盖到，不必翻完全部历史。
+    const filters = { ...(owner ? { owner, also_owners: aliases.predecessors(owner) } : {}),
+      started_between: [autoVerifyFrom - 2 * 86_400, Date.now() / 1000 + 86_400] };
+    for (let offset = 0; offset !== null;) {
+      const page = await conductor.list({ ...filters, limit: 100, offset });
+      if (page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
+      jobs.push(...page.jobs);
+      offset = page.next_offset ?? null;
+    }
+    const linked = new Set(jobs.flatMap(job => [job.parent_job_id, job.context?.continuation?.parent_job_id, job.context?.verification_of]));
+    let started = 0;
+    for (const job of jobs) {
+      if (!automaticCandidate(job) || linked.has(job.job_id) ||
+          (Number.isFinite(job.finished_at) && beforeCutoff(job, autoVerifyFrom))) continue;
+      // 列表行不带 must_verify 和原报告，完整状态也供后续派单使用。
+      const source = await conductor.waitJob(job.job_id, 0);
+      if (unknownState(source)) {
+        autoVerifyWarning(`${job.job_id}：${source.error ?? source.error_kind ?? source.status}`);
+        continue;
+      }
+      const result = await withAutoVerification(withReport(source), undefined, { source, catchup: true });
+      if (result.auto_verify?.job_id && ++started >= limit) return;
+    }
+  }
+
+  const lastAutoVerifyScan = new Map();
+  async function catchUpAutoVerifications(owner) {
+    if (!owner) return;
+    const now = Date.now();
+    if (now - (lastAutoVerifyScan.get(owner) ?? -Infinity) < 60_000) return;
+    lastAutoVerifyScan.set(owner, now);
+    await scanAutoVerifications(1, owner).catch(autoVerifyWarning);
   }
 
   // log 通道只供原生面板观察，job_output 过滤它，模型只收到一次最终 result。
@@ -1607,11 +1665,26 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const rendered = bg.jobs.read?.(bg.id, bg.owner)?.result;
       // 后台监控自己出错时存的只是「先查询」的提示，改查 runner 拿真实状态（仍在运行会重新登记）
       if (typeof rendered === 'string' && !rendered.startsWith('monitor_failed')) {
-        return withAutoVerification({ job_id: jobId, status: /^\S+/.exec(rendered)?.[0], rendered });
+        return { job_id: jobId, status: /^\S+/.exec(rendered)?.[0], rendered };
       }
     }
     // 后台任务已结算时 runner 的结果文件已在，只查一次取完整结果
     return withReport(await conductor.waitJob(jobId, bg ? 0 : seconds, signal));
+  }
+
+  // 回执已消费，派核验不能占用状态查询的超时预算。
+  async function verifyRendered(value, exec, source) {
+    const { job_id: id, rendered } = value;
+    let receipt = await autoVerifications.get(id);
+    if (!receipt && cfg.autoVerify !== 'off') {
+      try {
+        const current = source && source.status !== 'running' ? source : await conductor.waitJob(id, 0, exec?.signal);
+        await withAutoVerification(withReport(current), exec, { source: current });
+        receipt = await autoVerifications.get(id);
+      } catch (error) { autoVerifyWarning(error); }
+    }
+    return receipt ? { ...value, auto_verify: receipt.auto_verify,
+      rendered: rendered.includes(receipt.line) ? rendered : `${rendered}\n${receipt.line}` } : value;
   }
 
   // 后台监控与本轮长等待共用同一任务；空闲会话仍能收到完成通知。
@@ -1992,7 +2065,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } else {
       value = withReport(started);
     }
-    const shown = value.rendered ? value : notifyOnDone(await finish(value), exec, finish);
+    const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
     if (!effortLine) return shown;
     return shown.rendered ? { ...shown, rendered: `${shown.rendered}\n${effortLine}` }
       : { ...shown, next: [shown.next, effortLine].filter(Boolean).join('\n') };
@@ -2109,9 +2182,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register(runTool);
 
   async function findVerification(jobId, owner, automatic, signal) {
+    const filters = automatic ? {} : { owner, also_owners: aliases.predecessors(owner), status: 'running' };
     for (let offset = 0; offset !== null;) {
-      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner),
-        ...(automatic ? {} : { status: 'running' }), limit: 100, offset }, signal);
+      const page = await conductor.list({ ...filters, limit: 100, offset }, signal);
       if (page.error_kind || !Array.isArray(page.jobs)) {
         throw new Error(`codex_verify: 无法核对已有核验：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
       }
@@ -2147,14 +2220,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('codex_verify: wait_seconds 必须是非负整数');
       const owner = exec?.agent?.id;
       if (!owner) throw new Error('codex_verify: 当前调用没有会话 ID');
-      const source = await conductor.waitJob(args.job_id, 0, exec?.signal);
+      const automatic = exec[automaticVerification];
+      const source = automatic ?? await conductor.waitJob(args.job_id, 0, exec?.signal);
       if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
       if (!owns(owner, source.context?.owner)) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
       if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
       if (!source.cwd || !source.log_dir || typeof source.context.task !== 'string' || !Array.isArray(source.context.acceptance) || !source.context.acceptance.length ||
           !['read-only', 'workspace-write', 'danger-full-access'].includes(source.sandbox)) throw new Error('codex_verify: 原任务缺少目录、任务书、验收标准或执行设置，无法独立核验');
       const id = source.job_id;
-      const automatic = exec[automaticVerification] === true;
       const pending = verificationStarts.get(id);
       if (pending) {
         const { value, error, existing } = await pending;
@@ -2233,17 +2306,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const { jobId, note: threadNote } = THREAD_ID.test(args.job_id) ? await threadJob(args.job_id, exec, 'codex_status', exec?.signal) : { jobId: args.job_id };
       args = { ...args, job_id: jobId };
       const seconds = Math.min(args.wait_seconds ?? 0, 86_400);
+      let source;
       const value = await queryWithTimeout(async (signal) => {
         const bg = liveBackground(args.job_id, exec);
         // 原生后台状态不一定带 runner 归属，热加载后的首次等待先查持久化任务。
         if (bg && restrictedReads(exec)) {
-          await ensureOwnJob(args.job_id, exec, 'codex_status');
+          source = await ensureOwnJob(args.job_id, exec, 'codex_status');
           signal.throwIfAborted();
         }
         return collect(args.job_id, bg, seconds, exec?.signal);
       }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
-      const result = value.rendered ? value : notifyOnDone(await finishStatus(value, exec), exec, finishStatus);
+      const result = value.rendered ? await verifyRendered(value, exec, source) : notifyOnDone(await finishStatus(value, exec), exec, finishStatus);
       const shown = dampenStatus(result, exec, 'codex_status', seconds) ?? result;
       return !threadNote ? shown : typeof shown.rendered === 'string' ? { ...shown, rendered: `${threadNote}\n${shown.rendered}` }
         : { ...shown, next: shown.next ? `${threadNote}\n${shown.next}` : threadNote };
@@ -2923,6 +2997,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (denied !== undefined) return { isError: true, error: { message: denied },
         content: [{ type: 'text', text: `Error: ${denied}` }] };
     }
+    if (cfg.autoVerify !== 'off' && exec.name?.startsWith('codex_')) {
+      // 先让验收或续接落盘，补派时才能看到这次调用的结果。
+      const execute = next;
+      next = async () => {
+        // 补派不占这次工具调用的返回时间。
+        try { return await execute(); }
+        finally { void catchUpAutoVerifications(exec.agent?.id); }
+      };
+    }
     // codex_runtime 给操作员看本会话的历史长度和是否建议交接。
     if (exec.name === 'codex_runtime') {
       const result = await next();
@@ -2941,6 +3024,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         `自标未满足按 planner 级别记 met ${mineCloseouts.met_planner_level ?? 0} / ${closeouts.total.met_planner_level ?? 0}；` +
         `核验中放行新任务 ${mineCloseouts.deferred_dispatch ?? 0} / ${closeouts.total.deferred_dispatch ?? 0}；` +
         `自动核验派出 ${mineCloseouts.auto_verify_started ?? 0} / ${closeouts.total.auto_verify_started ?? 0}，` +
+        `其中补派 ${mineCloseouts.auto_verify_catchup ?? 0} / ${closeouts.total.auto_verify_catchup ?? 0}，` +
         `跳过 ${mineCloseouts.auto_verify_skipped ?? 0} / ${closeouts.total.auto_verify_skipped ?? 0}；` +
         `closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`
         : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`;
@@ -3070,4 +3154,5 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     void repairLinks({ registry: repairCtx.get('workspaceRegistry'), controller: repairCtx.get('sessionController'), aliases,
       directory: resumeDirectory, logger: ctx.logger }).catch((error) => ctx.logger?.warn?.(`[codex-conductor] 旧交接修复失败：${error?.message ?? error}`));
   });
+  if (cfg.autoVerify !== 'off') void Promise.resolve().then(() => scanAutoVerifications(2)).catch(autoVerifyWarning);
 }

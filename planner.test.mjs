@@ -4,8 +4,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, shellReadTargets, wslPath } from './guard.mjs';
-import { apply, nextStep } from './index.mjs';
+import { apply as applyPlugin, nextStep } from './index.mjs';
 
+const apply = (ctx, config, ...rest) => applyPlugin(ctx, { autoVerify: 'off', ...config }, ...rest);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const call = (name, args = {}, owner = 'S1', cwd = '/repo') => ({ name, arguments: args, agent: { id: owner, session: { header: { cwd } } } });

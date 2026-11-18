@@ -357,7 +357,7 @@ test('apply warns for invalid or unknown autoAnswer configuration and writes nor
   const warnings = [];
   const ctx = { tools: { register() {} }, on() {}, logger: { warn: (message) => warnings.push(message) } };
   const inspect = (autoAnswer) => {
-    apply(ctx, { autoAnswer });
+    apply(ctx, { autoAnswer, autoVerify: 'off' });
     return JSON.parse(readFileSync(path.join(directory, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
   };
   const loaded = inspect({ enabled: 'false', afterMinutes: 0, freeText: ' ', riskyPattern: '(', subagents: null,

@@ -2,6 +2,10 @@
 
 [English](#english)
 
+## 0.9.NEXT
+
+插件加载或热重载时补派最多两单自动核验，会话调用 `codex_*` 时补派最多一单，每 60 秒最多扫描一次。读取旧的已渲染结果时也检查是否需要自动核验。已有核验或后续轮次的任务跳过，补派次数记入 `auto_verify_catchup`。
+
 `0.9.124` 让“未满足但接受”要有依据、看得见，并让核验自动派出。第四次测量里 17 次结案有 11 次是接受未满足，36 个自标未满足项有 34 个按未满足接受、16 个没有任何核验、后续轮次或用户回复。新增 `acceptOpenEvidence`（默认 `strict`）：接受报告自标未满足或 `must_verify` 的条目为未满足，要有核验看过这一条、后续轮次仍报未完成、作业结束后的用户回复，或报告带待用户处理的阻塞且用户确认关卡通过；报告或复核里为 `not_met` 的条目只认核验或用户回复；缺依据时一行列出可走的路（含并行核验）。截止文件 `accept-open-evidence-since.json` 之前结束的任务沿用旧规则。接受的未完成项记入 `accepted-open.json`（任务号、编号、状态、阻塞类别、依据类别，不存正文），由该任务最新的结案复核替换，或被直接核验该任务并判 met 的结论销掉；`codex_summary` / `codex_runtime` 显示，`update_goal(complete)` 在仍有条目时要传 `acknowledge_open_items: true`（`plannerAnswers` 关闭时还要用户回复），完成记录可见。新增 `autoVerify`（默认 `flagged`）：本版首次加载（`auto-verify-since.json`）之后结束、尚未复核、报告有效且有自标未满足项或 `must_verify` 的写任务，结束时由插件派出一次只读核验，完成通知写明核验在跑、可派不重叠的下一单；手动 `codex_verify` / `verify_previous` 复用正在跑的核验。新增 `effortOverride`（默认 `planner`，不改变行为）和 `codex_run` 的 `effort_reason`。结案统计只计 runner 确实新写入的复核（修正 `all_met` 多计）。
 
 `0.9.123` 的失败回执给出失败原因、尝试次数、记录的改动文件数及下一步。规划端按失败类别处理，避免连续原样重派。模型拒绝保持终态。runner 处理超时前已入队的完成事件，避免把已收到的完成结果误判为超时。
@@ -143,6 +147,10 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+### 0.9.NEXT
+
+Automatic verification catches up on eligible jobs at load or hot reload (up to two starts) and on `codex_*` calls (up to one start per scan, with one scan per session every 60 seconds). Collect also checks stored rendered results. Jobs with an existing verification or a later round are skipped. `auto_verify_catchup` counts starts from load and session scans.
 
 `0.9.124` makes "accepted although not met" rest on evidence and stay visible, and starts verifications automatically. In the fourth measurement 11 of 17 closing reviews were accept-open, 34 of 36 flagged items were accepted open and 16 had no verification, later round or user reply. New `acceptOpenEvidence` (default `strict`): accepting a flagged or `must_verify` item as open needs a verification that examined the item, a later round still reporting it open, a user reply after the job ended, or a user-input blocker in the report with the user-confirmation gate satisfied; an item that is `not_met` in the report or the review needs a verification or a user reply. A rejection lists the legal ways forward in one line, including the parallel verification path. Jobs finished before `accept-open-evidence-since.json` keep the old rule. Accepted open items are recorded in `accepted-open.json` (job id, item, status, blocker kinds, support kinds, no text). The job's latest closing review replaces them, and a direct verification of the job marking an item met removes it. `codex_summary` and `codex_runtime` show them, and `update_goal(complete)` needs `acknowledge_open_items: true` while any remain (with `plannerAnswers` off, also a user reply); completions with open items are recorded. New `autoVerify` (default `flagged`): an unreviewed write job finished after first load (`auto-verify-since.json`) with a valid report and flagged items or `must_verify` gets one read-only verification started by the plugin at completion; the notice says it is running and that non-overlapping work may be dispatched. Manual `codex_verify` / `verify_previous` reuse a running one. New `effortOverride` (default `planner`, no change) and the `codex_run` parameter `effort_reason`. Closing statistics count only reviews the runner actually appended (fixes the `all_met` over-count).
 
