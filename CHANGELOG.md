@@ -4,7 +4,7 @@
 
 ## 0.9.NEXT
 
-正在核验时可先提交结案复核。用户确认已通过、唯一缺口是开放项依据时，插件挂起复核，核验已结束则直接返回处理结果。加载和任一会话补扫均会处理已结束或已清理的核验，以原任务归属为准，并跳过已有更新复核的任务。原任务或依据暂时读不到时留待下次扫描，写入回执丢失时回查最新复核。挂起回执仅在收尾护栏可放行时提示派下一单；`update_goal(complete)` 在本会话或前任有挂起复核时拒绝，直到台账更新处理结束。处理结果会附拒绝骨架或台账更新失败提示（如适用）。`codex_runtime` 显示挂起数，统计记录 `review_parked`、`parked_recorded` 和 `parked_rejected`。
+正在核验时可先提交结案复核。用户确认已通过、唯一缺口是开放项依据时，插件挂起复核。核验结束后只读评估，判定随核验完成通知返回，核验已结束时可直接返回判定。`ready` 附可原样提交的单行 JSON，由规划端再次调用 `codex_review` 入账。`rejected` 附修改骨架或原任务已清理、归属不符的原因。已有更新复核则返回 `superseded`，暂时读不到原任务或依据则留待下次扫描。挂起或评估期间，本会话及其后继不能用 `update_goal(complete)` 完成目标，评估结束后按正常收尾护栏检查。`codex_runtime` 显示挂起数，统计记录 `review_parked`、`parked_ready` 和 `parked_rejected`。
 
 后续轮次的报告和新写入的成功结案复核都记 `met` 时，可销掉同一交接链内、十跳父链上早于复核入账的旧验收项。清单须等长、同编号原文完全相同且在两份清单中各只出现一次。核对报告行时，原文匹配优先于位置匹配。摘要展示最近 500 条销项记录，统计记入 `ledger_cleared_by_later_round`。运行状态、摘要、目标完成拒绝和写任务完成回执会提示后续报告已满足的开放项。
 
@@ -154,7 +154,7 @@
 
 ### 0.9.NEXT
 
-Closing reviews can be submitted during verification. If the user-confirmation gate passes and the only missing evidence is for open items, the plugin parks the review or returns the outcome directly if verification has already ended. Load and catch-up from any session process finished or pruned verifications, check ownership on the original job, and skip reviews superseded by a newer one. Transient evidence or status failures leave the entry for the next scan. A lost write reply is checked against the latest stored review. The parked receipt offers new work only when the close-out guard allows it. `update_goal(complete)` refuses for the session and its handover predecessors through the ledger update. Outcomes include a rejection skeleton or ledger warning when applicable. `codex_runtime` shows the pending count, with counters `review_parked`, `parked_recorded`, and `parked_rejected`.
+Closing reviews can be parked during verification if the user-confirmation gate passes and the only missing evidence is for open items. The verification completion notice reports a read-only verdict, which can also be returned directly if verification has already ended. A `ready` result gives the planner single-line JSON to record through a fresh `codex_review` call. A `rejected` result includes a review skeleton or the reason the job is pruned or outside the handover chain. A newer review yields `superseded`, and transient lookup failures leave the entry for the next scan. `update_goal(complete)` refuses while the session or a handover predecessor has a parked review or an evaluation in progress. The usual close-out guard applies after evaluation. `codex_runtime` shows the pending count, with counters `review_parked`, `parked_ready`, and `parked_rejected`.
 
 A later round can clear an older acceptance item when its report and newly appended closing review both mark it `met`. The item must predate the review and belong to an ancestor within ten parent links in the same handover chain. The acceptance lists must be the same length, with the same text at the same index appearing once in each list. Report row mapping gives exact text priority over position. Summary shows the latest 500 archived items, and `ledger_cleared_by_later_round` counts the clears. Runtime, summary, goal completion refusals, and write-job completion notices flag open items that a later report already marks met.
 

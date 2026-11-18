@@ -6846,7 +6846,7 @@ function parkedReviewFixture(t) {
     for (const row of rows) h.finals[row.job_id] = row;
     return h;
   };
-  const agent = (owner = 'S1') => ({ ...agentAt('/work/original'), id: owner });
+  const agent = (owner = 'S1', log) => ({ ...agentAt('/work/original', log), id: owner });
   const submit = (h, input = review, owner) => h.tools.codex_review.execute(input, { agent: agent(owner) });
   const status = (h, owner) => queryStatus(h, 'VERIFY', agent(owner));
   const complete = (status = 'completed') => Object.assign(v, { status, execution_status: status, finished_at: now - 1 });
@@ -6854,18 +6854,19 @@ function parkedReviewFixture(t) {
   const read = (name) => JSON.parse(readFileSync(path.join(state, `${name}.json`), 'utf8'));
   const parked = () => fs.existsSync(file) ? read('parked-reviews') : [];
   const goal = (h, owner) => h.handlers['tools/execute'](
-    { name: 'update_goal', arguments: { action: 'complete', acknowledge_open_items: true }, agent: agent(owner) },
+    { name: 'update_goal', arguments: { action: 'complete', acknowledge_open_items: true },
+      agent: agent(owner, [{ type: 'tool/call', data: { name: 'codex_run' } }]) },
     async () => ({ value: 'completed' }));
   return { id, state, source, v, rows, review, writes, load, agent, submit, status, complete, parked, read, goal };
 }
 
-test('parked review persists the fixed review, replaces it, and two observers record it once', async (t) => {
+test('parked review returns one advisory result across reload and records only on resubmission', async (t) => {
   const f = parkedReviewFixture(t);
   const h = f.load();
   const { job_id, notes, ...review } = f.review;
   const parked = await f.submit(h, { job_id, ...review, note: notes, criteria: JSON.stringify(review.criteria) });
   assert.deepEqual(parked, { status: 'parked', job_id, verification_id: 'VERIFY',
-    next: `${job_id} 的复核已挂起：核验 VERIFY 还在跑，结束后插件按依据规则判定，结果在 VERIFY 的完成通知里（通过即写入；不通过附骨架）。现在可以派写入范围不与 ${job_id} 重叠的下一单。` });
+    next: `${job_id} 的复核已挂起：核验 VERIFY 结束后，插件在 VERIFY 的完成通知里给出按依据规则的判定和可直接提交的复核，那时再提交一次 codex_review ${job_id}。挂起期间可以去派与 ${job_id} 写入范围不重叠的下一单（收尾护栏照常核对）。` });
   assert.deepEqual(f.parked().map(({ at, ...entry }) => [Number.isFinite(at), entry]), [[true,
     { job_id, owner: 'S1', verification_id: 'VERIFY', review: { ...review, notes }, park_support: {} }]]);
   assert.deepEqual(f.writes, []);
@@ -6877,15 +6878,23 @@ test('parked review persists the fixed review, replaces it, and two observers re
   await settleAutoVerify();
   f.complete();
   const results = await Promise.all([f.status(h), f.status(other)]);
+  const readyPrefix = `${job_id} 的挂起复核按核验结论可以通过，原样提交即可：`;
+  const resubmit = { job_id, ...review, notes: '替换后的复核' };
   for (const result of results) {
-    assert.deepEqual(result.parked_review, { job_id, outcome: 'recorded' });
-    assert.ok(result.next.includes(`${job_id} 的挂起复核已按核验结论写入（accepted_deviations）。`));
+    assert.deepEqual(result.parked_review, { job_id, outcome: 'ready' });
+    assert.ok(result.next.startsWith(readyPrefix));
+    assert.doesNotMatch(result.next, /[\r\n]/);
+    assert.deepEqual(JSON.parse(result.next.slice(readyPrefix.length)), resubmit);
   }
-  assert.equal(f.writes.length, 1);
-  assert.equal(f.writes[0].submitted.notes, '替换后的复核');
+  assert.deepEqual(f.writes, []);
+  assert.equal(f.source.verification_status, 'unreviewed');
+  assert.equal(fs.existsSync(path.join(f.state, 'accepted-open.json')), false);
   assert.deepEqual(f.parked(), []);
   const stats = f.read('closeout-stats').total;
-  assert.deepEqual([stats.review_parked, stats.parked_recorded, stats.accepted_open], [2, 1, 1]);
+  assert.deepEqual([stats.review_parked, stats.parked_ready, stats.accepted_open], [2, 1, undefined]);
+  assert.equal((await f.submit(other, JSON.parse(results[0].next.slice(readyPrefix.length)))).verification_status, 'accepted_deviations');
+  assert.deepEqual(f.writes, [{ reviewer: 'S1', submitted: { ...review, notes: '替换后的复核' } }]);
+  assert.equal(f.read('closeout-stats').total.accepted_open, 1);
   assert.deepEqual(f.read('accepted-open').items.map(item => item.support), Array.from({ length: 4 }, () => ['verification']));
 });
 
@@ -6930,29 +6939,36 @@ test('parked review rejection is on verification completion and leaves the close
     await assert.rejects(run(), /未收尾/);
     const result = await f.status(h);
     assert.deepEqual(result.parked_review, { job_id: f.id, outcome: 'rejected' });
-    assert.match(result.next, /挂起复核未通过，未写入：[\s\S]*可直接修改后提交的骨架/);
+    assert.match(result.next, /挂起复核按核验结论不能通过：[\s\S]*可直接修改后提交的骨架/);
     assert.equal(f.read('closeout-stats').total.parked_rejected, 1);
     assert.deepEqual(f.parked(), []);
     assert.deepEqual(f.writes, []);
   });
 });
 
-test('normal review drops a parked review and a newer external review supersedes it', async (t) => {
-  const f = parkedReviewFixture(t);
-  const h = f.load();
-  assert.equal((await f.submit(h)).status, 'parked');
-  const normal = f.load({ acceptOpenEvidence: 'off' });
-  assert.equal((await f.submit(normal)).verification_status, 'accepted_deviations');
-  assert.deepEqual(f.parked(), []);
-  assert.equal((await f.submit(h)).status, 'parked');
-  f.source.verification.time = f.parked()[0].at + 1;
-  f.complete();
-  assert.deepEqual((await f.status(h)).parked_review, { job_id: f.id, outcome: 'superseded' });
-  assert.equal(f.writes.length, 1);
-  assert.deepEqual(f.parked(), []);
+test('a newer manual review before verification ends supersedes the parked review', async (t) => {
+  for (const reviewer of ['external', 'codex_review']) await t.test(reviewer, async (t) => {
+    const f = parkedReviewFixture(t);
+    const h = f.load();
+    assert.equal((await f.submit(h)).status, 'parked');
+    if (reviewer === 'codex_review') {
+      const normal = f.load({ acceptOpenEvidence: 'off' });
+      assert.equal((await f.submit(normal)).verification_status, 'accepted_deviations');
+    } else {
+      f.source.verification_status = 'needs_changes';
+      f.source.verification = { status: 'needs_changes', time: f.parked()[0].at + 1 };
+    }
+    const manual = structuredClone(f.source.verification);
+    assert.equal(f.parked().length, 1);
+    f.complete();
+    assert.deepEqual((await f.status(h)).parked_review, { job_id: f.id, outcome: 'superseded' });
+    assert.deepEqual(f.source.verification, manual);
+    assert.equal(f.writes.length, reviewer === 'codex_review' ? 1 : 0);
+    assert.deepEqual(f.parked(), []);
+  });
 });
 
-test('parked review uses the handover successor and submit-time support on the background notice', async (t) => {
+test('parked review uses handover ownership and submit-time support on the background notice', async (t) => {
   const f = parkedReviewFixture(t);
   const jobs = fakeJobs();
   const h = f.load({}, { jobs });
@@ -6967,9 +6983,9 @@ test('parked review uses the handover successor and submit-time support on the b
   f.rows.pop();
   f.v.structured.criteria.shift();
   await h.answer('VERIFY', f.complete());
-  assert.match((await jobs.started[0].done).result, /挂起复核已按核验结论写入（accepted_deviations）/);
-  assert.deepEqual(f.writes.map(write => write.reviewer), ['S3']);
-  assert.deepEqual(f.read('accepted-open').items.find(item => item.index === 1).support, ['later_round']);
+  assert.match((await jobs.started[0].done).result, /挂起复核按核验结论可以通过，原样提交即可：\{/);
+  assert.equal(f.read('closeout-stats').sessions.S3.parked_ready, 1);
+  assert.deepEqual(f.writes, []);
 });
 
 test('parked review catches finished verifications on load, session calls and before dispatch', async (t) => {
@@ -6984,14 +7000,12 @@ test('parked review catches finished verifications on load, session calls and be
       await observer.handlers['tools/execute']({ name: 'codex_jobs', arguments: {}, agent: f.agent() }, async () => ({ value: {} }));
     }
     if (trigger === 'dispatch guard') {
-      const result = await h.tools.codex_run.execute(RUN, { agent: f.agent() });
-      assert.equal(result.job_id, 'NEXT');
-      assert.equal(result.closeout_deferred, undefined);
+      await assert.rejects(h.tools.codex_run.execute(RUN, { agent: f.agent() }), /未收尾/);
     }
     await settleAutoVerify();
-    assert.equal(f.writes.length, 1);
+    assert.deepEqual(f.writes, []);
     assert.deepEqual(f.parked(), []);
-    assert.deepEqual((await f.status(observer)).parked_review, { job_id: f.id, outcome: 'recorded' });
+    assert.deepEqual((await f.status(observer)).parked_review, { job_id: f.id, outcome: 'ready' });
   });
 });
 
@@ -7042,46 +7056,36 @@ test('parked review blocks goal completion independently of the close-out list',
   });
 });
 
-test('parked evaluation blocks goal completion through the ledger write across reload', async (t) => {
+test('parked evaluation blocks goal completion across reload until the advisory result', async (t) => {
   const f = parkedReviewFixture(t);
-  const reply = Promise.withResolvers();
-  const appended = Promise.withResolvers();
-  const h = f.load({ reviewResult: async (_argv, { stdin }) => {
-    const review = JSON.parse(stdin);
-    f.source.verification_status = review.status;
-    f.source.verification = { ...review, time: Date.now() / 1000 + 1 };
-    appended.resolve();
-    await reply.promise;
-    return f.source;
+  const lookup = Promise.withResolvers();
+  const resume = Promise.withResolvers();
+  const h = f.load({ closeoutGuard: true, listResult: async () => {
+    if (f.v.status === 'completed') {
+      lookup.resolve();
+      await resume.promise;
+    }
+    return { jobs: f.rows };
   } });
   assert.equal((await f.submit(h)).status, 'parked');
   f.complete();
   const settlement = f.status(h);
-  await appended.promise;
-  const successor = f.load();
+  await lookup.promise;
+  writeFileSync(path.join(f.state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' } } }));
+  const successor = f.load({ closeoutGuard: true });
   try {
-    assert.deepEqual(f.parked(), []);
-    assert.equal(fs.existsSync(path.join(f.state, 'accepted-open.json')), false);
-    const result = await f.goal(successor);
+    const result = await f.goal(successor, 'S2');
     assert.equal(result.isError, true);
     assert.match(result.error.message, new RegExp(`${f.id}.*挂起复核.*VERIFY`));
-  } finally { reply.resolve(); await settlement; }
-  assert.equal(f.read('accepted-open').items.length, 4);
-  assert.equal((await f.goal(successor)).value, 'completed');
+  } finally { resume.resolve(); await settlement; }
+  assert.deepEqual((await settlement).parked_review, { job_id: f.id, outcome: 'ready' });
+  const goal = await f.goal(successor, 'S2');
+  assert.match(goal.error.message, /未收尾/);
+  assert.doesNotMatch(goal.error.message, /挂起复核/);
+  assert.deepEqual(f.writes, []);
 });
 
-test('parked recorded outcome includes the ledger write warning', async (t) => {
-  const f = parkedReviewFixture(t);
-  const h = f.load();
-  assert.equal((await f.submit(h)).status, 'parked');
-  writeFileSync(path.join(f.state, 'accepted-open.json'), 'invalid JSON');
-  f.complete();
-  const result = await f.status(h);
-  assert.equal(result.parked_review?.outcome, 'recorded');
-  assert.match(result.next, /本次复核已写入，未能更新未完成项台账/);
-});
-
-test('parked receipt requires an allowed close-out deferral', async (t) => {
+test('parked receipt leaves dispatch subject to the close-out guard', async (t) => {
   for (const reason of ['finished verification', 'second pending job']) await t.test(reason, async (t) => {
     const f = parkedReviewFixture(t);
     const h = f.load({ closeoutGuard: true });
@@ -7089,8 +7093,8 @@ test('parked receipt requires an allowed close-out deferral', async (t) => {
     f.rows.push({ ...extra, job_id: 'OTHER-JOB' });
     const result = await f.submit(h);
     assert.equal(result.status, 'parked');
-    assert.match(result.next, /新任务.*等待.*结果/);
-    assert.doesNotMatch(result.next, /现在可以派/);
+    assert.match(result.next, /收尾护栏照常核对/);
+    await assert.rejects(h.tools.codex_run.execute(RUN, { agent: f.agent() }), /未收尾/);
   });
 });
 
@@ -7112,9 +7116,11 @@ test('parked scans settle pruned and terminal verifications across sessions', as
     }
     await settleAutoVerify();
     assert.deepEqual(f.parked(), []);
-    const recorded = mode === 'terminal from unrelated session';
-    assert.equal(f.writes.length, Number(recorded));
-    assert.equal(f.read('closeout-stats').total[recorded ? 'parked_recorded' : 'parked_rejected'], 1);
+    assert.deepEqual(f.writes, []);
+    assert.equal(f.read('closeout-stats').total[mode === 'terminal from unrelated session' ? 'parked_ready' : 'parked_rejected'], 1);
+    if (mode === 'original ownership mismatch') {
+      assert.match((await f.status(h, 'V-OWNER')).next, /按核验结论不能通过：无法确认原任务归属。/);
+    }
   });
 });
 
@@ -7123,11 +7129,12 @@ test('parking immediately settles a verification that already ended', async (t) 
     const f = parkedReviewFixture(t);
     const h = f.load({ statusResult: ([, id]) => id === 'VERIFY' && f.parked().length ? f.complete(terminal) : undefined });
     const result = await f.submit(h);
-    const outcome = terminal === 'completed' ? 'recorded' : 'rejected';
+    const outcome = terminal === 'completed' ? 'ready' : 'rejected';
     assert.equal(result.status, outcome);
     assert.deepEqual(result.parked_review, { job_id: f.id, outcome });
     if (outcome === 'rejected') assert.match(result.next, /可直接修改后提交的骨架/);
-    assert.equal(f.writes.length, Number(outcome === 'recorded'));
+    else assert.match(result.next, /原样提交即可：\{/);
+    assert.deepEqual(f.writes, []);
     assert.deepEqual(f.parked(), []);
   });
 });
@@ -7153,32 +7160,30 @@ test('parked evaluation retries transient original and support reads', async (t)
     assert.equal(f.parked().length, 1);
     assert.deepEqual(f.writes, []);
     fail = false;
-    assert.equal((await f.status(h)).parked_review?.outcome, 'recorded');
-    assert.equal(f.writes.length, 1);
+    await h.handlers['tools/execute']({ name: 'codex_jobs', arguments: {}, agent: f.agent() }, async () => ({ value: {} }));
+    await settleAutoVerify();
+    assert.deepEqual(f.parked(), []);
+    assert.equal((await f.status(h)).parked_review?.outcome, 'ready');
+    assert.deepEqual(f.writes, []);
   });
 });
 
-test('parked evaluation recovers an appended review after a lost reply', async (t) => {
-  for (const failure of ['thrown', 'ambiguous']) await t.test(failure, async (t) => {
-    const f = parkedReviewFixture(t);
-    let submits = 0;
-    let at;
-    const h = f.load({ reviewResult: (_argv, { stdin }) => {
-      submits++;
-      const review = JSON.parse(stdin);
-      f.source.verification_status = review.status;
-      f.source.verification = { ...review, time: at + 1 };
-      if (failure === 'thrown') throw new Error('review reply lost');
-      return { status: 'failed', error_kind: 'bridge_error' };
-    } });
-    assert.equal((await f.submit(h)).status, 'parked');
-    at = f.parked()[0].at;
-    f.complete();
-    assert.deepEqual((await f.status(h)).parked_review, { job_id: f.id, outcome: 'recorded' });
-    assert.equal(submits, 1);
-    assert.equal(f.read('accepted-open').items.length, 4);
-    assert.deepEqual(f.parked(), []);
-  });
+test('parked evaluation drops a pruned original job and releases the goal guard', async (t) => {
+  const f = parkedReviewFixture(t);
+  let pruned = false;
+  const h = f.load({ closeoutGuard: true, statusResult: ([, id]) =>
+    pruned && id === f.id ? { status: 'failed', error_kind: 'unknown_job' } : undefined });
+  assert.equal((await f.submit(h)).status, 'parked');
+  assert.match((await f.goal(h)).error.message, /挂起复核/);
+  f.rows.shift();
+  pruned = true;
+  f.complete();
+  const result = await f.status(h);
+  assert.deepEqual(result.parked_review, { job_id: f.id, outcome: 'rejected' });
+  assert.equal(result.next, `${f.id} 的挂起复核按核验结论不能通过：原任务已清理或不存在。`);
+  assert.deepEqual(f.parked(), []);
+  assert.equal((await f.goal(h)).value, 'completed');
+  assert.deepEqual(f.writes, []);
 });
 
 test('auto catch-up starts two on load and one per session scan through handover', async (t) => {
@@ -7403,7 +7408,7 @@ test('release C: overlapping finish observers and manual verification dispatch o
   const result = await first;
   assert.deepEqual(result.auto_verify, { job_id: 'CHECK', status: 'running' });
   assert.deepEqual((await second).auto_verify, result.auto_verify);
-  assert.ok(result.next.endsWith('插件已自动派出对 FLAGGED 的只读核验 CHECK，正在跑。现在就可以记 codex_review FLAGGED：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起到核验结束再判），然后派写入范围不与 FLAGGED 重叠的下一单；不必等核验。'));
+  assert.ok(result.next.endsWith('插件已自动派出对 FLAGGED 的只读核验 CHECK，正在跑。现在就可以记 codex_review FLAGGED：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起，核验结束后通知里给出判定和可直接提交的复核），然后去派与 FLAGGED 写入范围不重叠的下一单；不必等核验。'));
   assert.equal((await manual).next, '对 FLAGGED 的核验已在跑（任务 CHECK），不重复派');
   running.push({ job_id: 'CHECK', execution_status: 'running', context: { verification_of: 'FLAGGED' } });
   assert.equal((await h.tools.codex_verify.execute(args, exec)).job_id, 'CHECK');
