@@ -1,4 +1,5 @@
 """Fault-injection tests for codex_runner.py. They use a fake Codex, so they spend no model quota."""
+import argparse
 import errno
 import io
 import json
@@ -2705,6 +2706,35 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(codex_runner.task_context(ok)["routing"]["continuation_mode"], "fresh")
         with self.assertRaises(ValueError):
             codex_runner.task_context({**self.sample_context(), "routing": {"bad": {"nested": 1}}})
+
+    @unittest.skipUnless(shutil.which("node"), "requires Node to capture the plugin envelope")
+    def test_context_envelope_from_plugin_with_explicit_effort(self):
+        import codex_runner
+
+        plugin = """
+            import { apply } from './index.mjs';
+            let runTool;
+            apply({
+              tools: { register(tool) { if (tool.name === 'codex_run') runTool = tool; }, guard() {} },
+              on() {},
+            }, { closeoutGuard: false, autoVerify: 'off' }, async (_config, argv, { stdin }) => {
+              if (argv[0] !== 'start') throw new Error(argv[0]);
+              process.stdout.write(stdin);
+              return { status: 'completed', job_id: 'J1' };
+            });
+            await runTool.execute({
+              task: 'Check the result', acceptance: ['Result is valid'], write: false,
+              effort: 'high', effort_reason: 'prior_rework',
+            }, { agent: { id: 'S1', session: { header: { cwd: process.cwd() }, log: [] } } });
+        """
+        captured = subprocess.run(["node", "--input-type=module", "-e", plugin], cwd=RUNNER.parent.parent,
+                                  env={**self.env, "LOCALAPPDATA": self.tmp.name}, capture_output=True, check=True, timeout=15)
+        args = argparse.Namespace(context_json=True)
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(captured.stdout), encoding="utf-8")):
+            self.assertTrue(codex_runner.read_task_input(args, argparse.ArgumentParser()))
+        self.assertEqual(args.context["routing"], {
+            "effort_requested": "high", "effort_reason": "prior_rework", "effort_applied": "high",
+        })
 
     def test_stored_all_met_needs_changes_stays_readable_and_appendable(self):
         jd = self.stored_job("legacy-inconsistent-review",

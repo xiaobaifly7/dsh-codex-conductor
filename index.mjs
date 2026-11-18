@@ -1047,12 +1047,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 原会话用户在作业结束后有过真实回复（与 accepted_deviations 的用户确认同一判定，但不因 plannerAnswers 放宽）。
   const openAccepted = (review) => [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]
     .some((c) => typeof c?.accepted === 'string' && c.accepted.trim());
+  const verificationTargetText = (target, key) => key.startsWith('row')
+    ? target?.structured?.criteria?.[Number(key.slice(3)) - 1]?.criterion
+    : target?.context?.acceptance?.[Number(key) - 1];
+  const jobStatusLookup = (signal) => {
+    const statuses = new Map();
+    return (id) => {
+      if (!statuses.has(id)) statuses.set(id, conductor.waitJob(id, 0, signal));
+      return statuses.get(id);
+    };
+  };
   async function criterionSupport(source, owner, log, signal, checkOpen) {
     const flagged = flaggedCriteria(source);
     const required = mustVerifyCriteria(source);
     const support = {};
     const openSupport = {};
-    const openTargets = checkOpen ? new Map([...required, ...flagged].map(f => [f.key, f])) : new Map();
+    const targets = new Map([...required, ...flagged].map(f => [f.key, f]));
+    const openTargets = checkOpen ? targets : new Map();
     if (!flagged.length && !required.length) return { support, openSupport };
     const add = (map, key, kind) => { (map[key] ??= []).includes(kind) || map[key].push(kind); };
     if (hasUserReply(log, source, owner, cfg.autoResume.message)) {
@@ -1073,29 +1084,48 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       offset = page.next_offset ?? null;
     }
     const unit = new Set([source.job_id]);
+    const threads = new Map();
+    const first = jobs.find(job => job.job_id === source.job_id);
+    const sourceThread = source.thread_id ?? first?.thread_id;
+    if (sourceThread) threads.set(sourceThread, source.started_at ?? first?.started_at);
     for (const job of [...jobs].sort((a, b) => (a.started_at ?? 0) - (b.started_at ?? 0))) {
-      if (!job.context?.verification_of && unit.has(job.parent_job_id)) unit.add(job.job_id);
+      if (job.context?.verification_of || job.job_id === source.job_id) continue;
+      if (unit.has(parentOf(job)) || job.started_at > threads.get(job.thread_id)) {
+        unit.add(job.job_id);
+        if (job.thread_id && threads.get(job.thread_id) === undefined) threads.set(job.thread_id, job.started_at);
+      }
     }
     const runningVerification = checkOpen ? jobs.find(job =>
       job.execution_status === 'running' && job.context?.verification_of === source.job_id)?.job_id : undefined;
     const later = jobs.filter((job) => job.job_id !== source.job_id && job.execution_status === 'completed' &&
       job.finished_at > (source.finished_at ?? 0) &&
       (job.context?.verification_of ? unit.has(job.context.verification_of) : unit.has(job.job_id)));
+    const status = jobStatusLookup(signal);
     for (const job of later.slice(0, 10)) {
-      const full = await lookup(conductor.waitJob(job.job_id, 0, signal));
+      const full = await lookup(status(job.job_id));
       if (!full) continue;
       const report = full.structured;
       const acceptance = full.context?.acceptance;
       if (full.error_kind || !validReport(report) || !Array.isArray(acceptance)) continue;
       // 报告行按条文或（条数相同时）位置对应验收项；对不上的行不当作任何一条的结论。
-      if (full.context?.verification_of) {
+      const targetId = full.context?.verification_of;
+      if (targetId) {
+        const target = targetId === source.job_id ? source : await lookup(status(targetId));
         acceptance.forEach((item, i) => {
-          const key = verificationItemKey(item);
+          const targetKey = verificationItemKey(item);
+          if (!targetKey) return;
+          let key = targetKey;
+          if (targetId !== source.job_id) {
+            const text = verificationTargetText(target, targetKey);
+            if (typeof text !== 'string') return;
+            key = [...targets.values()].find(f => Boolean(f.row) === targetKey.startsWith('row') && f.criterion === text)?.key;
+          }
           const row = key && reportRowOf(acceptance, report.criteria, i + 1);
           if (row && openTargets.has(key)) add(openSupport, key, 'verification');
           if (row?.status !== 'met') return;
           if (flagged.some(f => f.key === key)) add(support, key, 'verification');
-          if (row.evidence.trim() && required.some(f => f.key === key && verifyCriterionItem(f) === item)) add(support, key, 'must_verify');
+          if (row.evidence.trim() && required.some(f => f.key === key &&
+              verifyCriterionItem({ ...f, index: Number(targetKey) }) === item)) add(support, key, 'must_verify');
         });
       } else {
         for (const f of flagged) {
@@ -1175,6 +1205,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   const textHash = (text) => typeof text === 'string' ? createHash('sha1').update(text).digest('hex').slice(0, 12) : undefined;
   const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
+  const earlierThreadRounds = (job, jobs) => job?.thread_id ? [...jobs].filter(round =>
+    round.thread_id === job.thread_id && round.context?.owner === job.context?.owner &&
+    !round.context?.verification_of && round.started_at < job.started_at)
+    .sort((a, b) => b.started_at - a.started_at).map(round => round.job_id) : [];
+  const matchingLedgerItems = (items, met, keyOf) => {
+    const counts = new Map();
+    for (const key of met) if (key !== undefined) counts.set(key, (counts.get(key) ?? 0) + 1);
+    return [...items].sort((a, b) => Boolean(a.row) - Boolean(b.row) || (a.index ?? a.row) - (b.index ?? b.row)).filter(item => {
+      const key = keyOf(item);
+      const count = counts.get(key);
+      if (!count) return false;
+      counts.set(key, count - 1);
+      return true;
+    });
+  };
   const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
   const ledgerLine = (ledger) => {
     if (!ledger) return unreadableLedgerLine;
@@ -1196,24 +1241,35 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const items = acceptedOpen.map(entry => ({
         session, job_id: jobId, ...entry, text_hash: textHash(reviewItemText(source, entry)), blocker_kinds, at,
       }));
-      const met = new Set([...review.criteria, ...(review.report_rows ?? [])].filter(c => c.status === 'met')
-        .map(c => textHash(reviewItemText(source, c))));
+      const met = [...review.criteria, ...(review.report_rows ?? [])].filter(c => c.status === 'met')
+        .map(c => textHash(reviewItemText(source, c)));
       const ancestors = new Set();
-      let parent = parentOf(source);
-      if (parent && met.size && !source.context.verification_of && ledger.items.length) {
-        for (let hops = 0; hops < 10 && parent && !ancestors.has(parent); hops++) {
-          const round = await conductor.waitJob(parent, 0);
+      if ((parentOf(source) || source.thread_id) && met.length && !source.context.verification_of && ledger.items.length) {
+        const thread = source.thread_id && Number.isFinite(source.started_at) ? await conductor.list({
+          owner: session, thread_id: source.thread_id, started_between: [0, source.started_at], limit: 100,
+        }) : { jobs: [] };
+        if (thread.error_kind || !Array.isArray(thread.jobs)) throw new Error(thread.error ?? thread.error_kind ?? '任务列表不可用');
+        const pending = [parentOf(source), ...earlierThreadRounds(source, thread.jobs)];
+        const listed = new Map(thread.jobs.map(job => [job.job_id, job]));
+        while (ancestors.size < 10 && pending.length) {
+          const id = pending.shift();
+          if (!id || id === jobId || ancestors.has(id)) continue;
+          const round = listed.get(id) ?? await conductor.waitJob(id, 0);
           if (unknownState(round)) throw new Error(round.error ?? round.error_kind ?? round.status);
-          if (!owns(owner, round.context?.owner)) break;
-          ancestors.add(parent);
-          parent = parentOf(round);
+          if (!owns(owner, round.context?.owner) || round.context?.verification_of) continue;
+          ancestors.add(id);
+          if (parentOf(round)) pending.unshift(parentOf(round));
         }
         // 查上轮期间可能已有别的复核写入台账。
         ledger = readLedger();
         if (!ledger) return warning;
       }
-      const remaining = ledger.items.filter(item => item.job_id !== jobId &&
-        !(ancestors.has(item.job_id) && item.at <= at && met.has(item.text_hash)));
+      const resolved = new Set();
+      for (const id of ancestors) {
+        const candidates = ledger.items.filter(item => item.job_id === id && item.at <= at);
+        for (const item of matchingLedgerItems(candidates, met, item => item.text_hash)) resolved.add(item);
+      }
+      const remaining = ledger.items.filter(item => item.job_id !== jobId && !resolved.has(item));
       if (items.length || remaining.length !== ledger.items.length) saveLedger({ ...ledger, items: [...remaining, ...items] });
     } catch (error) {
       ctx.logger?.warn?.(`[codex-conductor] ${warning} ${error?.message ?? error}`);
@@ -1223,16 +1279,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   async function acceptedOpenLedger(owner, signal) {
     const scope = aliases.owners(owner);
-    const view = ({ since, items, completions }) => ({ since, items: items.filter(item => scope.includes(item.session)),
+    const view = ({ since, items, completions }) => ({ since,
+      items: items.filter(item => scope.includes(item.session)).map(({ applied_checks, ...item }) => item),
       completions: completions.filter(entry => scope.includes(entry.session)) });
     const initial = readLedger();
     if (!initial) return null;
-    const snapshot = view(initial);
-    if (!snapshot.items.length) return snapshot;
-    const byJob = new Map(ledgerJobIds(snapshot.items).map(id => [id, []]));
-    for (const item of snapshot.items) byJob.get(item.job_id).push(item);
+    const snapshot = initial.items.filter(item => scope.includes(item.session));
+    if (!snapshot.length) return view(initial);
+    const byJob = new Map(ledgerJobIds(snapshot).map(id => [id, []]));
+    for (const item of snapshot) byJob.get(item.job_id).push(item);
     const resolved = new Set();
+    const appliedChecks = new Map();
     const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
+    const hashKey = (key, hash) => hash === undefined ? undefined : (key.startsWith('row') ? `row:${hash}` : hash);
+    const itemHashKey = item => hashKey(item.key, item.text_hash);
     try {
       const jobs = new Map();
       for (let offset = 0; offset !== null;) {
@@ -1241,28 +1301,50 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         for (const job of page.jobs) jobs.set(job.job_id, job);
         offset = page.next_offset ?? null;
       }
+      const status = jobStatusLookup(signal);
       for (const job of jobs.values()) {
         const target = job.context?.verification_of;
         if (!target || job.execution_status !== 'completed') continue;
-        const candidates = [];
-        for (let id = target, hops = 0; id && hops <= 10; id = parentOf(jobs.get(id)), hops++) {
-          for (const item of byJob.get(id) ?? []) if (job.finished_at > item.at && !resolved.has(itemId(item))) candidates.push(item);
+        const candidates = new Map();
+        const visited = new Set();
+        const pending = [target, ...earlierThreadRounds(jobs.get(target), jobs.values())];
+        while (visited.size <= 10 && pending.length) {
+          const id = pending.shift();
+          if (!id || visited.has(id)) continue;
+          visited.add(id);
+          const items = (byJob.get(id) ?? []).filter(item => job.finished_at > item.at &&
+            !resolved.has(itemId(item)) && !item.applied_checks?.includes(job.job_id));
+          if (items.length) candidates.set(id, items);
+          const parent = parentOf(jobs.get(id));
+          if (parent) pending.unshift(parent);
         }
-        if (!candidates.length) continue;
-        const full = await conductor.waitJob(job.job_id, 0, signal);
+        if (!candidates.size) continue;
+        const full = await status(job.job_id);
         const acceptance = full.context?.acceptance;
         if (full.error_kind || !Array.isArray(acceptance) || !validReport(full.structured)) continue;
-        const met = acceptance.flatMap((text, i) => {
+        const met = new Set(acceptance.flatMap((text, i) => {
           const key = verificationItemKey(text);
           return key && reportRowOf(acceptance, full.structured.criteria, i + 1)?.status === 'met' ? [key] : [];
-        });
-        if (!met.length) continue;
-        // 后续轮次的编号可能不同，回查该轮条文才能销掉前任条目。
-        const round = candidates.some(item => item.job_id !== target) ? await conductor.waitJob(target, 0, signal) : undefined;
-        const hashes = round ? met.map(key => textHash(reviewItemText(round,
-          key.startsWith('row') ? { row: Number(key.slice(3)) } : { index: Number(key) }))) : [];
-        for (const item of candidates) if (item.job_id === target ? met.includes(item.key) : hashes.includes(item.text_hash)) {
-          resolved.add(itemId(item));
+        }));
+        if (!met.size) continue;
+        const direct = candidates.get(target) ?? [];
+        for (const item of direct) if (met.has(item.key)) resolved.add(itemId(item));
+        candidates.delete(target);
+        if (!candidates.size) continue;
+        const round = await status(target);
+        const hashes = [...met].map(key => hashKey(key, textHash(verificationTargetText(round, key))));
+        for (const items of candidates.values()) {
+          const matched = matchingLedgerItems(items, hashes, itemHashKey);
+          for (const item of matched) resolved.add(itemId(item));
+          const used = new Set(matched.map(itemHashKey));
+          // 保留同文余项的抵扣记录，避免下次读取再次使用同一核验。
+          for (const item of items) {
+            const id = itemId(item);
+            if (used.has(itemHashKey(item)) && !resolved.has(id)) {
+              if (!appliedChecks.has(id)) appliedChecks.set(id, []);
+              appliedChecks.get(id).push(job.job_id);
+            }
+          }
         }
       }
     } catch (error) {
@@ -1272,9 +1354,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     // runner 查询期间可能有新的复核，只移除刚才核实的那一条记录。
     const ledger = readLedger();
     if (!ledger) return null;
-    const items = ledger.items.filter(item => !resolved.has(itemId(item)));
+    const items = ledger.items.filter(item => !resolved.has(itemId(item))).map(item => {
+      const checks = appliedChecks.get(itemId(item));
+      return checks ? { ...item, applied_checks: [...new Set([...(item.applied_checks ?? []), ...checks])] } : item;
+    });
     const next = { ...ledger, items };
-    if (items.length !== ledger.items.length) saveLedger(next);
+    if (items.length !== ledger.items.length) {
+      try { saveLedger(next); }
+      catch (error) { ctx.logger?.warn?.(`[codex-conductor] 未能保存销项后的未完成项台账：${error?.message ?? error}`); }
+    }
     return view(next);
   }
   const autoAnswer = registerAutoAnswer({ ctx, settings: cfg.autoAnswer, directory: stateDirectory });
@@ -1820,9 +1908,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           EFFORTS.indexOf(requested) > EFFORTS.indexOf(configured)) {
         effortLine = `effort=${requested} 未生效：effortOverride=raise-only-listed 下提高推理强度要带 effort_reason（${EFFORT_REASONS.join('、')}），本单按默认 ${configured}`;
       }
-      const applied = effortLine ? configured : requested ?? (configured || null);
+      const applied = effortLine ? configured : (requested ?? configured) || undefined;
       if (effortLine) args = { ...args, effort: applied };
-      routing = { ...routing, effort: { requested: requested ?? null, ...(listed ? { reason } : {}), applied } };
+      routing = { ...routing, ...(requested !== undefined ? { effort_requested: requested } : {}),
+        ...(listed ? { effort_reason: reason } : {}), ...(applied !== undefined ? { effort_applied: applied } : {}) };
     }
     if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
       throw reject('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
@@ -2544,7 +2633,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error(reviewRejection(job_id, source, prepared));
       }
       const result = await conductor.review(job_id, review, owner, exec?.signal);
-      const appended = !result.error_kind && result.verification_status === review.status &&
+      // runner 返回作业状态，执行时的错误会和新写入的复核一起返回。
+      const appended = result.verification_status === review.status &&
         Number.isFinite(result.verification?.time) && result.verification.time > (source.verification?.time ?? -Infinity);
       let ledgerWarning;
       if (appended && ['verified', 'accepted_deviations'].includes(review.status)) {

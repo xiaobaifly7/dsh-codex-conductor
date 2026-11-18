@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter, getEventListeners } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -6163,6 +6164,90 @@ function acceptedFixtureHarness(t) {
   return { source, cutoff, state, make };
 }
 
+const resultRow = (criterion, status) => ({ criterion, status, evidence: '核对结果' });
+function finishedRound(source, job_id, acceptance, criteria, after, extra = {}) {
+  return { ...source, job_id, started_at: after + 1, finished_at: after + 2,
+    verification: null, verification_status: 'unreviewed',
+    context: { owner: source.context.owner, acceptance }, thread_id: null, parent_job_id: null,
+    structured: { ...source.structured, criteria, deviations: [], unresolved: [], blockers: [] }, ...extra };
+}
+const verifiedReview = ({ job_id, context }) => ({ job_id, status: 'verified',
+  criteria: context.acceptance.map((_item, i) => ({ index: i + 1, status: 'met', evidence: '已核对' })) });
+
+test('later verification follows criterion text for met and open support', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const [a, b] = ['验收内容 A', '验收内容 B'];
+  source.context.acceptance = [a, b];
+  source.structured = { ...source.structured, criteria: [resultRow(a, 'not_met'), resultRow(b, 'met')],
+    deviations: [], unresolved: [], blockers: [] };
+  writeFileSync(path.join(state, 'closeout-evidence-since.json'), JSON.stringify({ since: source.finished_at - 1 }));
+  const later = finishedRound(source, 'LATER', [b, a], [resultRow(b, 'blocked')], source.finished_at, { parent_job_id: source.job_id });
+  const check = finishedRound(source, 'CHECK', [], [], later.finished_at);
+  check.context.verification_of = later.job_id;
+  const h = make({ plannerAnswers: true, listResult: { jobs: [later, check] }, reviewResult: source });
+  Object.assign(h.finals, { LATER: later, CHECK: check });
+  const met = verifiedReview(source);
+  const open = { ...met, status: 'accepted_deviations', criteria: [
+    { index: 1, status: 'not_met', evidence: '仍未实现', accepted: '接受未完成' }, met.criteria[1],
+  ] };
+  const submit = review => h.tools.codex_review.execute(review, { agent: agentAt('/work') });
+  const verify = (i, text) => {
+    const item = `原验收第 ${i} 条（原报告标 blocked）：${text}`;
+    check.context.acceptance = [item];
+    check.structured.criteria = [resultRow(item, 'met')];
+  };
+  verify(1, b);
+  for (const [review, problem] of [[met, /第 1 条为 not_met.*没有独立依据/], [open, /第 1 条为 not_met.*接受它未满足需要依据/]]) {
+    await t.test(review.status, () => assert.rejects(submit(review), problem));
+  }
+  verify(2, a);
+  for (const review of [met, open]) {
+    const before = h.calls.filter(argv => argv[0] === 'status' && argv[1] === 'LATER').length;
+    await submit(review);
+    assert.equal(h.calls.filter(argv => argv[0] === 'status' && argv[1] === 'LATER').length - before, 1);
+  }
+});
+
+test('same-thread follow-up without a parent provides independent support', async (t) => {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  writeFileSync(path.join(state, 'closeout-evidence-since.json'), JSON.stringify({ since: source.finished_at - 1 }));
+  source.structured.deviations = [];
+  source.structured.unresolved = [];
+  source.structured.blockers = [];
+  const acceptance = source.context.acceptance;
+  const later = finishedRound(source, 'LATER', acceptance, acceptance.map(text => resultRow(text, 'met')),
+    source.finished_at, { thread_id: source.thread_id });
+  const h = make({ plannerAnswers: true, listResult: { jobs: [later] }, reviewResult: source });
+  h.finals.LATER = later;
+  await h.tools.codex_review.execute(verifiedReview(source), { agent: agentAt('/work') });
+  assert.equal(h.calls.filter(argv => argv[0] === 'review').length, 1);
+});
+
+test('later verification maps unmatched report rows by text across rounds', async (t) => {
+  const { source, make } = acceptedFixtureHarness(t);
+  const [criterion, a, b] = ['必做验收项', '额外检查甲', '额外检查乙'];
+  source.context.acceptance = [criterion];
+  source.structured = { ...source.structured, criteria: [resultRow(criterion, 'met'), resultRow(a, 'not_met')],
+    deviations: [], unresolved: [], blockers: [] };
+  const later = finishedRound(source, 'LATER', [criterion], [resultRow(criterion, 'met'),
+    resultRow(b, 'blocked'), resultRow(a, 'not_met')], source.finished_at, { parent_job_id: source.job_id });
+  const check = finishedRound(source, 'CHECK', [], [], later.finished_at);
+  check.context.verification_of = later.job_id;
+  const h = make({ plannerAnswers: true, listResult: { jobs: [later, check] }, reviewResult: source });
+  Object.assign(h.finals, { LATER: later, CHECK: check });
+  const submit = (row, text) => {
+    const item = `原报告第 ${row} 行（原报告标 blocked，未对上原验收清单）：${text}`;
+    check.context.acceptance = [item];
+    check.structured.criteria = [resultRow(item, 'met')];
+    return h.tools.codex_review.execute({ ...verifiedReview(source), status: 'accepted_deviations',
+      report_rows: [{ row: 2, status: 'not_met', evidence: '未满足', accepted: '接受未完成' }],
+    }, { agent: agentAt('/work') });
+  };
+  await assert.rejects(submit(2, b), /第 2 行（对不上验收清单）为 not_met.*接受它未满足需要依据/);
+  await submit(3, a);
+  assert.equal(h.calls.filter(argv => argv[0] === 'review').length, 1);
+});
+
 test('release A: flagged open entries require support and show any running verification', async (t) => {
   const { source, make, cutoff, state } = acceptedFixtureHarness(t);
   const { job_id: id, finished_at } = source;
@@ -6377,6 +6462,90 @@ test('rework 3: ancestor lookup failure preserves the saved review result', asyn
   assert.equal(readFileSync(file, 'utf8'), before);
 });
 
+async function openLedgerFixture(t, acceptance) {
+  const { source, make, state } = acceptedFixtureHarness(t);
+  const at = source.verification.time + 1;
+  source.context.acceptance = acceptance;
+  source.structured = { ...source.structured, criteria: acceptance.map(text => resultRow(text, 'blocked')), deviations: [] };
+  const jobs = [source];
+  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
+    listResult: () => ({ jobs }),
+    reviewResult: ([, id], { stdin }) => {
+      const review = JSON.parse(stdin);
+      return { ...h.finals[id], verification_status: review.status, verification: { ...review, time: id === source.job_id ? at : at + 5 } };
+    },
+  });
+  const exec = { agent: agentAt('/work') };
+  const submit = review => h.tools.codex_review.execute(review, exec);
+  await submit({ ...verifiedReview(source), status: 'accepted_deviations', criteria: acceptance.map((_text, i) =>
+    ({ index: i + 1, status: 'blocked', evidence: '尚未完成', accepted: '接受未完成' })) });
+  const file = path.join(state, 'accepted-open.json');
+  const stored = () => JSON.parse(readFileSync(file, 'utf8'));
+  const summary = async () => (await h.tools.codex_summary.execute({}, exec)).accepted_open_ledger;
+  const add = round => { jobs.push(round); h.finals[round.job_id] = round; };
+  const verify = (target, i) => {
+    const item = `原验收第 ${i} 条（原报告标 blocked）：${target.context.acceptance[i - 1]}`;
+    const check = finishedRound(source, 'CHECK', [item], [resultRow(item, 'met')], Math.max(target.finished_at, at));
+    check.context.verification_of = target.job_id;
+    add(check);
+  };
+  return { source, h, exec, file, stored, summary, submit, add, verify, at };
+}
+
+test('ledger prune write failure leaves summary and goal completion usable', async (t) => {
+  const { source, h, exec, file, stored, summary, verify } = await openLedgerFixture(t, ['验收内容']);
+  verify(source, 1);
+  const before = stored();
+  const rename = fs.renameSync;
+  t.mock.method(fs, 'renameSync', (from, to) => {
+    if (to === file) throw new Error('模拟台账保存失败');
+    rename(from, to);
+  });
+  assert.deepEqual((await summary()).items, []);
+  const goal = await h.handlers['tools/execute']({ ...exec, name: 'update_goal', arguments: { action: 'complete' } },
+    async () => ({ value: 'completed' }));
+  assert.equal(goal.value, 'completed');
+  assert.deepEqual(stored(), before);
+  assert.equal(h.warnings.filter(line => line.includes('模拟台账保存失败')).length, 2);
+});
+
+test('ledger finds same-thread ancestors without parent links in one list call', async (t) => {
+  const [text, other] = ['验收内容', '另一项内容'];
+  const { source, add, submit, stored, h, at, verify, summary } = await openLedgerFixture(t, [text, other]);
+  const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'met')], at, { thread_id: source.thread_id });
+  add(later);
+  await submit(verifiedReview(later));
+  assert.deepEqual(stored().items.map(item => item.index), [2]);
+  assert.equal(h.calls.filter(argv => argv[0] === 'list').length, 1);
+  const next = finishedRound(source, 'NEXT', [other], [resultRow(other, 'blocked')], later.finished_at,
+    { thread_id: source.thread_id });
+  add(next);
+  verify(next, 1);
+  assert.deepEqual((await summary()).items, []);
+});
+
+test('one met item in a later review or verification removes only one duplicate ledger item', async (t) => {
+  for (const method of ['review', 'verification']) {
+    await t.test(method, async (st) => {
+      const text = '相同验收内容';
+      const { source, add, submit, stored, summary, verify, at, file } = await openLedgerFixture(st, [text, text]);
+      const before = stored();
+      assert.deepEqual(before.items.map(item => item.index), [1, 2]);
+      writeFileSync(file, JSON.stringify({ ...before, items: before.items.reverse() }));
+      const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'blocked')], at, { parent_job_id: source.job_id });
+      add(later);
+      if (method === 'review') {
+        await submit(verifiedReview(later));
+      } else {
+        verify(later, 1);
+        assert.deepEqual((await summary()).items.map(item => item.index), [2]);
+        assert.deepEqual((await summary()).items.map(item => item.index), [2]);
+      }
+      assert.deepEqual(stored().items.map(item => item.index), [2]);
+    });
+  }
+});
+
 test('rework 4: a corrupt ledger is reported and preserved across tools', async (t) => {
   const { source, make, state } = acceptedFixtureHarness(t);
   const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off',
@@ -6574,8 +6743,10 @@ test('release D: effort policies use the write/read default and record requested
     { agent: agentAt('/work') });
     const { argv, stdin } = h.requests.find(r => r.argv[0] === 'start');
     assert.equal(argv[argv.indexOf('--effort') + 1], applied);
-    assert.deepEqual(JSON.parse(stdin).context.routing.effort,
-      { requested: requested ?? null, ...(reasons.includes(reason) ? { reason } : {}), applied });
+    assert.deepEqual(JSON.parse(stdin).context.routing, {
+      ...(requested === undefined ? {} : { effort_requested: requested }),
+      ...(reasons.includes(reason) ? { effort_reason: reason } : {}), effort_applied: applied,
+    });
     if (ignored) assert.match(result.next, new RegExp(`effort=${requested} 未生效：effortOverride=${mode} .*本单按默认 ${applied}`));
     else assert.doesNotMatch(result.next, /effort=.*未生效/);
     if (mode === 'invalid') assert.ok(h.warnings.some(line => /无效的配置 effortOverride/.test(line)));
@@ -6584,6 +6755,9 @@ test('release D: effort policies use the write/read default and record requested
   const h = harness({ config: { effortOverride: 'config' } });
   await h.tools.codex_run.execute({ ...RUN, effort: 'high' }, { agent: agentAt('/work') });
   assert.equal(h.calls.find(argv => argv[0] === 'start').includes('high'), true);
+  await h.tools.codex_run.execute({ ...RUN, effort_reason: 'prior_rework' }, { agent: agentAt('/work') });
+  assert.deepEqual(JSON.parse(h.requests.filter(r => r.argv[0] === 'start').at(-1).stdin).context.routing,
+    { effort_reason: 'prior_rework' });
 
   const continued = harness({ config: { effort: 'medium', effortOverride: 'config' } });
   continued.finals.PARENT = workflowSource('implementation'); // 原单实际用 low。
@@ -6598,10 +6772,10 @@ test('rework 6: an effort equal to config stays effective without a warning', as
   assert.doesNotMatch(value.next, /effort=.*未生效/);
   const { argv, stdin } = h.requests.find(request => request.argv[0] === 'start');
   assert.equal(argv[argv.indexOf('--effort') + 1], 'medium');
-  assert.deepEqual(JSON.parse(stdin).context.routing.effort, { requested: 'medium', applied: 'medium' });
+  assert.deepEqual(JSON.parse(stdin).context.routing, { effort_requested: 'medium', effort_applied: 'medium' });
 });
 
-test('release E: closeout counts only a fresh, successful review of a real runner record', async (t) => {
+test('closeout counts and records fresh reviews even when execution failed', async (t) => {
   const { source, make, state } = acceptedFixtureHarness(t);
   const review = fixtureReview(source);
   const stats = () => {
@@ -6616,10 +6790,13 @@ test('release E: closeout counts only a fresh, successful review of a real runne
   await run(source); // status 名相同，但回复携带原来的验收。
   await run({ ...source, verification: undefined });
   const fresh = { ...source, verification: { ...source.verification, time: source.verification.time + 1 } };
-  await run({ ...fresh, error_kind: 'invalid_record' });
+  await assert.rejects(run({ status: 'failed', error_kind: 'bad_arguments', error: '复核参数错误' }), /复核操作失败/);
   assert.deepEqual(stats(), before);
-  await run(fresh);
+  const failedExecution = { ...fresh, status: 'failed', execution_status: 'failed', error_kind: 'schema_invalid' };
+  const saved = await run(failedExecution);
+  assert.equal(saved.verification.time, fresh.verification.time);
   assert.equal(stats().accepted_open, (before.accepted_open ?? 0) + 1);
+  assert.deepEqual(JSON.parse(readFileSync(path.join(state, 'accepted-open.json'), 'utf8')).items.map(item => item.index), [1, 2, 3, 4]);
   // 真实记录显式写了 accepted。删掉该字段后才走推定，且仍须真正写入才计数。
   review.criteria[0] = { ...review.criteria[0], accepted: undefined };
   await run(source);

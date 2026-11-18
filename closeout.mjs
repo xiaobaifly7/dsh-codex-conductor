@@ -203,7 +203,10 @@ export function prepareReview(args, source) {
   const acceptedOpen = [];
   let openUnsupported = 0;
   if (review.status === 'accepted_deviations') {
-    const flagged = new Map(flaggedCriteria(source).map(f => [f.key, f]));
+    const flagged = new Map();
+    for (const f of flaggedCriteria(source)) {
+      if (flagged.get(f.key)?.status !== 'not_met') flagged.set(f.key, f);
+    }
     const required = new Set(mustVerifyCriteria(source).map(f => f.key));
     for (const c of [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]) {
       if (!c || !['blocked', 'not_met'].includes(c.status) || !nonempty(c.accepted) || placeholder(c.accepted)) continue;

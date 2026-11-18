@@ -11,9 +11,10 @@ const report = (extra = {}) => ({ summary: 's', criteria: acceptance.map((criter
 const source = (extra = {}, rep = {}) => ({ job_id: 'J1', status: 'completed', context: { owner: 'a', acceptance }, structured: report(rep), ...extra });
 const met = (index) => ({ index, status: 'met', evidence: `核对 ${index}` });
 
-test('rework 1: strict uses reported not_met even when the review says blocked', () => {
+test('strict keeps any mapped not_met row even when a later row and the review say blocked', () => {
   const criteria = report().criteria;
   criteria[1].status = 'not_met';
+  criteria.push({ ...criteria[1], status: 'blocked' });
   const src = source({ openLevel: 'strict', openSupport: { 2: ['later_round'] } }, { criteria });
   const review = { status: 'accepted_deviations', criteria: [
     met(1), { index: 2, status: 'blocked', evidence: '后续仍未完成', accepted: '接受未完成' },
