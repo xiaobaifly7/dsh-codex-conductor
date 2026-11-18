@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.118` 修复 0.9.114 的结案依据规则在实际运行中从未生效：runner 的 `status` 输出不带 `finished_at`，截止判断因此把每个任务都当成截止之前结束、一律按 planner 规则结案，`criterionSupport` 从未运行。现在 `status` 与任务列表一样带 `started_at` / `finished_at`；拿不到结束时间时按任务号里的开始时间判断，只有明显早于截止时间（任务号时间加 14 小时仍早于截止）的才按 planner 规则，新任务和说不准的都按 independent。用户回复依据（以及接受偏差的用户确认）不再把插件自己代发的消息（续接、send-request，`source.via` 标记）和看门狗补发的“继续”当作用户回复；宿主提问的自动代答本来就不算。planner / off 级别下把自标未满足的条目记成 met 的结案，计为 `met_planner_level`，不再混进 `all_met`。端到端测试用从真实 runner status 输出脱敏的样本。
+
 `0.9.117` 新增 `mcpWriteAllow`（默认 `[]`）。名单内的 MCP 工具可通过动作名的写入和执行检查，也计入白名单模式。可用于让规划端直接调用 draw.io 绘图，其他护栏规则照常生效。
 
 `0.9.116` 同一宿主进程热重载时，记录卸载前仍在运行的回合。默认等 20 秒后复核并续上符合条件的中断回合，连续重载会接着处理剩余名单。缺少卸载记录时，只在确认同进程重载后检查最近 10 分钟的中断。`autoResume.reloadDelaySeconds: 0` 关闭此功能，结果以 `trigger: "reload"` 记录。
@@ -129,6 +131,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.118` fixes the 0.9.114 closing-evidence rule, which never took effect live: the runner's `status` output had no `finished_at`, so the cut-off check treated every job as finished before the cut-off and closed it under the planner rule; `criterionSupport` never ran. `status` now reports `started_at` / `finished_at` like the job listing; without a finish time the job id's start time decides, and only a job clearly before the cut-off (job id time plus 14 h still before it) keeps the planner rule, while new or uncertain jobs are held to independent. User-reply support (and the accepted-deviation user confirmation) no longer counts messages the plugin submits itself (resume, send-request; marked with `source.via`) or the watchdog's "继续" top-up; host-question auto-answers were already excluded. Closing reviews that record a flagged criterion as met at planner or off level are counted as `met_planner_level`, not `all_met`. The end-to-end test uses a fixture sanitised from a real runner status output.
 
 `0.9.117` adds `mcpWriteAllow` (default `[]`). Matching MCP tools pass the write and execute action-name check and count in allowlist mode. This lets the planner draw in draw.io while the other guard rules still apply.
 
