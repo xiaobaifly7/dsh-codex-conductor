@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.117` 新增 `mcpWriteAllow`（默认 `[]`）。名单内的 MCP 工具可通过动作名的写入和执行检查，也计入白名单模式。可用于让规划端直接调用 draw.io 绘图，其他护栏规则照常生效。
+
 `0.9.116` 同一宿主进程热重载时，记录卸载前仍在运行的回合。默认等 20 秒后复核并续上符合条件的中断回合，连续重载会接着处理剩余名单。缺少卸载记录时，只在确认同进程重载后检查最近 10 分钟的中断。`autoResume.reloadDelaySeconds: 0` 关闭此功能，结果以 `trigger: "reload"` 记录。
 
 `0.9.115` 新增 `autoAnswer`。宿主提问默认等 10 分钟后按推荐代答，支持多选、自由文本和多题。高风险与排除项保留给用户。Codex 指挥面板显示等待和历史，支持立即按推荐回答或取消单条代答。热重载保留提出时间，已超时的恢复提问另等 30 秒。
@@ -127,6 +129,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.117` adds `mcpWriteAllow` (default `[]`). Matching MCP tools pass the write and execute action-name check and count in allowlist mode. This lets the planner draw in draw.io while the other guard rules still apply.
 
 `0.9.116` records running turns before a same-process hot reload and rechecks interrupted turns after 20 seconds by default. Pending recovery survives consecutive reloads. With no unload snapshot, a confirmed same-process reload checks interruptions from the last 10 minutes. Set `autoResume.reloadDelaySeconds: 0` to disable it. Results use `trigger: "reload"`.
 

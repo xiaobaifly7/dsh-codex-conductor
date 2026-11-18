@@ -88,9 +88,10 @@ const DEFAULTS = {
   jobDiff: true,
   // 本会话有已结束、报告有标记却未 codex_review 或 needs_changes 未跟进的任务时，拒绝开新工作的 codex_run；false 关闭
   closeoutGuard: true,
-  // 受护栏会话的工具放行方式：denylist 只拒绝已知的写入/执行工具；allowlist 只放行已知只读工具和 allowTools
+  // 受护栏会话的工具放行方式，allowlist 只放行护栏认识的工具和配置的名单。
   toolPolicy: 'denylist',
   allowTools: [],
+  mcpWriteAllow: [],
   workspaces: [],
   denyTools: [],
   allowCommands: [],
@@ -859,6 +860,7 @@ function settings(config, logger) {
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
+      : key === 'mcpWriteAllow' ? Array.isArray(value) && value.every(name => typeof name === 'string' && /^mcp__/i.test(name.trim()))
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
        : ['autoResume', 'autoHandover', 'autoAnswer'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
@@ -940,6 +942,7 @@ function settings(config, logger) {
     allowCommands: patterns('allowCommands'),
     ignoreChanges: Array.isArray(config.ignoreChanges) ? config.ignoreChanges.map(String) : [],
     allowTools: config.allowTools.map(name => name.trim()),
+    mcpWriteAllow: config.mcpWriteAllow.map(name => name.trim()),
     seenTools: new Set(),
     unknownConfig,
   };
@@ -2518,7 +2521,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           excludeCount: cfg.autoAnswer.excludeSessions.length, riskyPatternEnabled: cfg.autoAnswer.riskyPattern !== '',
           customFreeText: cfg.autoAnswer.freeText !== AUTO_ANSWER_DEFAULTS.freeText },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
-        toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
+        toolPolicy: cfg.toolPolicy, mcpWriteAllow: cfg.mcpWriteAllow, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}

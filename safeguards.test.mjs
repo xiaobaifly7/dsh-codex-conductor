@@ -37,6 +37,24 @@ test('unknown configuration keys are reported in the log and the load marker', (
   assert.deepEqual(marker.unknownConfig, ['workspace']);
 });
 
+test('mcpWriteAllow defaults, warns on invalid values and reports the effective list', () => {
+  const pattern = 'MCP__DrawIO__*';
+  const tool = { ...exec(), name: 'mcp__drawio__create_new_diagram', arguments: {} };
+  const marker = path.join(localAppData, 'dsh-codex-conductor', 'loaded.json');
+  for (const value of [undefined, [` ${pattern} `], pattern, [pattern, 'write'], [pattern, 1]]) {
+    const warnings = [];
+    let guard;
+    apply({ tools: { register() {}, guard: fn => { guard = fn; } }, on() {}, logger: { warn: text => warnings.push(text) } },
+      { workspaces: ['/repo'], mcpWriteAllow: value });
+    const allowed = Array.isArray(value) && value.length === 1;
+    assert.deepEqual(JSON.parse(readFileSync(marker, 'utf8')).mcpWriteAllow, allowed ? [pattern] : []);
+    if (allowed) assert.equal(guard(tool), undefined);
+    else assert.match(guard(tool), /会改动文件或执行命令，已拒绝/);
+    if (value === undefined || allowed) assert.deepEqual(warnings, []);
+    else assert.deepEqual(warnings, ['[codex-conductor] 忽略无效的配置 mcpWriteAllow，使用默认值']);
+  }
+});
+
 test('maxRunningJobs refuses a dispatch at the limit without starting Codex', async () => {
   const run = argv => argv[0] === 'list' ? { jobs: [], total: argv.includes('--status') ? 2 : 0 }
     : { job_id: 'J1', status: 'completed', cwd: '/repo' };

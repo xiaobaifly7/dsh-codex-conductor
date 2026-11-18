@@ -401,8 +401,9 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `autoHandover.startupDelayMinutes` | `10` | 宿主进程启动后多少分钟内不自动交接（只约束 `auto`），非负数 |
 | `autoHandover.disableAutoContinue` | `true` | 交接后通过宿主设置服务把旧会话在 `dsh-client-auto-continue` 里的模式设为 `off`，撤回时恢复；`false` 不做 |
 | `autoHandover.withRunningJobs` | `true` | 会话空闲但名下有运行中的 Codex 任务时也交接：任务随交接转给继任，结束通知转投给继任；`false` 时有任务就放弃、稍后重试 |
-| `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools`，已有的拒绝规则仍然优先 |
+| `toolPolicy` | `denylist` | 受护栏会话的工具放行方式：`denylist` 只拒绝已知的写入和执行工具；`allowlist` 只放行本插件工具、shell 工具、护栏认识的读取和搜索类工具以及 `allowTools` 和 `mcpWriteAllow`，其他拒绝规则仍然优先 |
 | `allowTools` | `[]` | 白名单模式下额外放行的工具名，不区分大小写，`*` 结尾表示前缀匹配；不能放行 `write`、`run_code` 等已被拒绝的工具 |
+| `mcpWriteAllow` | `[]` | 仅豁免 MCP 动作名的写入和执行检查，同时计入白名单模式。每项须以 `mcp__` 开头，不区分大小写，`*` 结尾表示前缀匹配。draw.io 示例 `mcpWriteAllow: ['mcp__drawio__*', 'mcp__drawio-skill__*']` |
 | `maxRunningJobs` | 留空（不限制） | 同时运行或排队等写锁的 Codex 任务数上限，须为正整数；达到上限时 `codex_run` / `codex_continue` / `codex_verify` 不启动 Codex 并说明原因，等其中一个结束后再派 |
 | `routerCheckUrl` | 空 | Codex 使用固定本机模型网关时，可填其 HTTP(S) 地址。runner 在 WSL 内先探测该主机和端口；不可达时报 `router_down`，不会先启动 Codex。仅探测，不修改模型配置。 |
 | `codexRoute` | 空 | `{ provider, baseUrl }`，只给插件启动的 Codex 指定已有的自定义提供方与 HTTP(S) 地址，不改 Codex 配置文件。未设置 `routerCheckUrl` 时，启动前向该地址的主机请求 `HEAD /`，确认网关有响应。环回地址只在该 Codex 进程中绕过代理。 |
@@ -770,8 +771,9 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `autoHandover.disableAutoContinue` | `true` | After a hand-over, set the old session's `dsh-client-auto-continue` mode to `off` through the host settings service and restore it on revert; `false` skips this |
 | `autoHandover.withRunningJobs` | `true` | Hand over an idle session even while its Codex jobs run: the jobs move to the successor and their completion notices are forwarded to it; `false` gives up while jobs run and retries later |
 | `runnerAgentsMd` | Empty (keep) | User-level AGENTS.md for jobs without `use_user_config`: empty keeps the one in `CODEX_HOME`, `none` leaves it out, an absolute path uses that file instead (symlinks under `runnerHome/codex-home`, needs WSL) |
-| `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and `allowTools`, with existing denials still first |
+| `toolPolicy` | `denylist` | `denylist` refuses known write and execute tools; `allowlist` lets a guarded session use only this plugin's tools, shell tools, recognised read and search tools and the two configured allowlists, subject to the other guard rules |
 | `allowTools` | `[]` | Extra tool names for allowlist mode, case-insensitive, a trailing `*` is a prefix; cannot allow `write`, `run_code` or other refused tools |
+| `mcpWriteAllow` | `[]` | Exempts matching MCP tools from the write and execute action-name check and counts them in allowlist mode. Each entry starts with `mcp__`. Matching ignores case and a trailing `*` matches a prefix. For draw.io use `mcpWriteAllow: ['mcp__drawio__*', 'mcp__drawio-skill__*']` |
 | `maxRunningJobs` | Empty (unlimited) | Positive integer limit on Codex jobs that are running or queued for a write lock; at the limit a dispatch is refused with the reason instead of starting Codex |
 | `maxStorageMb` | Empty (unlimited) | Positive finite combined `jobs`/`runs` limit in MiB, including fractions; startup best-effort cleanup removes the oldest finished records, preserving active and current tasks. Null, empty or omitted passes no flag. |
 

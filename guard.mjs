@@ -34,16 +34,20 @@ const OBSIDIAN_READS = ['obsidian_read', 'obsidian_search', 'obsidian_frontmatte
 // 白名单模式下另外认识的只读入口：目录列表、引用查询、Seep 的结构化查询。
 const KNOWN_ACTIONS = new Set(['glob', 'ops_glob', 'obsidian_list', ...OBSIDIAN_READS, 'find_referencing_symbols', 'seep_r2_info', 'seep_status']);
 
-// toolPolicy: 'allowlist' 时放行的工具：本插件的工具、护栏有专门检查的 shell / 读取工具，以及 allowTools（* 结尾为前缀匹配）。
+function matchesTool(lower, patterns) {
+  return (patterns ?? []).some((entry) => {
+    const pattern = String(entry).toLowerCase();
+    return pattern.endsWith('*') ? lower.startsWith(pattern.slice(0, -1)) : lower === pattern;
+  });
+}
+
+// 白名单模式下，已知工具和两份工具名单都可通过这一关，仍须遵循其他护栏规则。
 export function knownTool(name, cfg = {}) {
   const lower = String(name ?? '').toLowerCase();
   const operation = lower.split('__').at(-1).replace(/^wsl-/, '');
   return lower.startsWith('codex_') || (lower === 'gemini_write' && Boolean(cfg.gemini)) || lower === 'tool_call' ||
     Object.hasOwn(SHELL_TOOLS, lower) || KNOWN_ACTIONS.has(operation) || SEARCH_TOOL.test(operation) || READ_TOOL.test(operation) ||
-    [...cfg.allowTools ?? []].some((entry) => {
-      const pattern = String(entry).toLowerCase();
-      return pattern.endsWith('*') ? lower.startsWith(pattern.slice(0, -1)) : lower === pattern;
-    });
+    (lower.startsWith('mcp__') && matchesTool(lower, cfg.mcpWriteAllow)) || matchesTool(lower, cfg.allowTools);
 }
 
 const READERS = new Set(['cd', 'pwd', 'ls', 'cat', 'head', 'tail', 'wc', 'grep', 'egrep', 'fgrep', 'stat',
@@ -1162,7 +1166,7 @@ export function decide(exec, cfg) {
     return deny(`${tool} 会直接改动文件或执行任意代码，已拒绝`);
   }
   if (frontmatterWrite(exec)) return deny(`${tool} 请求修改 frontmatter，已拒绝`);
-  if (lower.startsWith('mcp__') && MCP_WRITE.test(mcpAction(tool))) {
+  if (lower.startsWith('mcp__') && MCP_WRITE.test(mcpAction(tool)) && !matchesTool(lower, cfg.mcpWriteAllow)) {
     return deny(`${tool} 会改动文件或执行命令，已拒绝`);
   }
   if (cfg.toolPolicy === 'allowlist' && !knownTool(tool, cfg)) {
