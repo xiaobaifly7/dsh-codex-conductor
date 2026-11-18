@@ -6,6 +6,8 @@
 
 新增设置 `repeatFailureGuard`。派单回执、完成通知和多轮汇总显示目录内近期反复失败的步骤，运行状态显示本会话和 runner 的拦截统计。外部条件改变后，`codex_run` 和 `codex_continue` 可用 `rerun_after_change` 说明变化并重跑。
 
+runner 会为确认执行环境已中断的任务补写 `executor_lost` 结果，记录原因并恢复可用的线程号。后台完成通知引导先核对已有产物，再重派或续接。
+
 ### 已发布版本
 
 `0.9.128` 指令档案按消息来源保存所有非空白人工输入，保留以“继续”或 “continue” 开头的原文。交接链接状态缺失或不可读时暂停自动交接，面板手动交接仍可用。仅大小写不同的链首 ID 使用独立档案，小写 UUID 链沿用原路径。
@@ -161,6 +163,8 @@
 ### 0.9.NEXT
 
 Adds the `repeatFailureGuard` setting. Dispatch results, completion notices, and summaries surface standing failures in the task directory. Runtime status reports session and runner block counts. After an external condition changes, `codex_run` and `codex_continue` accept `rerun_after_change` to explain the change and allow a rerun.
+
+The runner records an `executor_lost` result when executor loss is confirmed, with the reason and any recoverable thread ID. Background completion notices direct the planner to check existing artifacts before redispatching or resuming.
 
 ### Released versions
 

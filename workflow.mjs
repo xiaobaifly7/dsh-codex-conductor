@@ -102,14 +102,16 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (remaining.length) return refuse('仍有问题未回答；保留已有回答并补齐以下问题后再准备续跑。', remaining);
   if (blocking.next_action === 'done' && !normalized.length && !nonempty(resolution)) return refuse('原任务已独立核验通过，没有新增信息，无需续跑。', []);
   const report = reportOf(value);
-  if (!validReport(report) || value.report_status === 'invalid' || verificationOf(value) === 'invalid' ||
+  const lost = executionOf(value) === 'failed' && value.error_kind === 'executor_lost' &&
+    value.report_status === 'missing' && report == null && nonempty(value.thread_id);
+  if ((!lost && !validReport(report)) || value.report_status === 'invalid' || verificationOf(value) === 'invalid' ||
       (object(value.verification) && Object.hasOwn(value.verification, 'blockers') && !validBlockers(value.verification.blockers))) {
     return refuse('报告无效或缺失，先查询并核实原报告，不能据此自动续跑。', []);
   }
   if (activeBlockers(blocking.blockers, verificationOf(value)).some((blocker) => blocker.kind === 'environment') && !nonempty(resolution)) {
     return refuse('环境条件仍需提供非空 resolution，说明条件已满足的具体证据。', []);
   }
-  if (blocking.state === 'unclassified' && !nonempty(resolution)) return refuse('旧报告仍有待核对事项；先查清原因，对照原任务范围区分真实缺口与已说明的验证边界，并用 resolution 说明处理依据。仅验证边界应先独立核验，不因此启动修正任务。', []);
+  if (!lost && blocking.state === 'unclassified' && !nonempty(resolution)) return refuse('旧报告仍有待核对事项；先查清原因，对照原任务范围区分真实缺口与已说明的验证边界，并用 resolution 说明处理依据。仅验证边界应先独立核验，不因此启动修正任务。', []);
   if (blocking.next_action === 'verify') return refuse('原任务自报已满足验收，先独立核验；未发现差距时不启动修正任务。', []);
   const options = value.task_options ?? {};
   const scope = value.scope_paths ?? value.scope;
@@ -125,11 +127,15 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   const previousAnswers = context.continuation?.answers ?? [];
   const task = previousAnswers.length ? `${context.task}\n\n规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : context.task;
   const notes = [`原任务 ${value.job_id} 的后续修正；原验收、cwd、scope 和 write 不变，以下信息不是新增权限，不得用回答扩大目录或改写验收。`];
-  if (nonempty(report.summary)) notes.push(`上轮摘要：${report.summary}`);
-  for (const item of report.criteria.filter((item) => item.status !== 'met')) notes.push(`上轮未满足项：${item.criterion}（${item.status}）：${item.evidence}`);
-  for (const item of [...report.deviations, ...report.unresolved]) notes.push(`上轮待处理信息：${item}`);
-  // 开新线程续接时，Codex 只能从这里知道上轮动过哪些文件。
-  if (report.files_changed.length) notes.push(`上轮改动文件：${report.files_changed.slice(0, 50).join('、')}${report.files_changed.length > 50 ? ` 等 ${report.files_changed.length} 个` : ''}`);
+  if (lost) {
+    notes.push('上轮执行环境中断，未生成报告。先核对已有改动，再继续原任务。');
+  } else {
+    if (nonempty(report.summary)) notes.push(`上轮摘要：${report.summary}`);
+    for (const item of report.criteria.filter((item) => item.status !== 'met')) notes.push(`上轮未满足项：${item.criterion}（${item.status}）：${item.evidence}`);
+    for (const item of [...report.deviations, ...report.unresolved]) notes.push(`上轮待处理信息：${item}`);
+    // 开新线程续接时，Codex 只能从这里知道上轮动过哪些文件。
+    if (report.files_changed.length) notes.push(`上轮改动文件：${report.files_changed.slice(0, 50).join('、')}${report.files_changed.length > 50 ? ` 等 ${report.files_changed.length} 个` : ''}`);
+  }
   if (nonempty(value.verification?.notes)) notes.push(`独立核验意见：${value.verification.notes}`);
   for (const item of value.verification?.criteria ?? []) {
     if (item.status !== 'met') notes.push(`独立核验第 ${item.index} 条（${item.status}）：${item.evidence}`);
@@ -137,7 +143,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   for (const blocker of blocking.blockers) notes.push(`阻塞 ${blocker.id}（${blocker.kind}）：${blocker.message}${blocker.resolution ? `；解除条件/已有信息：${blocker.resolution}` : ''}`);
   if (normalized.length) notes.push(`规划端回答（仅补充信息）：${JSON.stringify(normalized)}`);
   if (nonempty(resolution)) notes.push(`规划端解决依据（仅补充信息）：${resolution}`);
-  notes.push('只修正上轮差距，按原验收标准逐条报告；不能在原权限内完成时继续报告阻塞。');
+  notes.push(lost ? '补齐原任务缺项，按原验收标准逐条报告。' : '只修正上轮差距，按原验收标准逐条报告；不能在原权限内完成时继续报告阻塞。');
   const args = { task: `${task}\n\n## 上轮结果与本次修正\n${notes.join('\n')}`, cwd: value.cwd,
     acceptance: [...context.acceptance], write: context.write, host_access: value.sandbox === 'danger-full-access',
     use_user_config: options.use_user_config ?? false };

@@ -58,6 +58,7 @@ HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
              else Path.home() / ".local/state/codex-runner"))
 EXIT_GRACE_SECONDS = 20
+LOST_AFTER = 300
 REPEAT_MIN_SECONDS = 60
 REPEAT_FAILURES = 2
 REPEAT_WINDOW_HOURS = 24
@@ -175,10 +176,14 @@ def pid_alive(pid):
     return f'"{pid}"' in out
 
 
+def proc_start(pid):
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
 def process_start(pid):
     if not IS_WIN:
         try:
-            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            return proc_start(pid)
         except (OSError, IndexError):
             return None
     import ctypes
@@ -217,14 +222,17 @@ def recorded_pid(path):
     return pid if pid_alive(pid) else None
 
 
+def kernel_boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def boot_id():
     """Identifies this distro instance: the kernel boot id plus when this PID namespace's init (pid 1) started.
     The kernel boot id alone misses `wsl --terminate <distro>` or a distro auto-stop while the VM stays up — the
     kernel does not reboot but pids start over, so a bare pid could then name an unrelated process. init's start
     time (field 22 of /proc/1/stat, ticks since kernel boot) changes on every distro restart. None where no /proc."""
     try:
-        init_start = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()[19]
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + init_start
+        return kernel_boot_id() + ":" + proc_start(1)
     except (OSError, IndexError):
         return None
 
@@ -305,7 +313,7 @@ def write_lock_roots(cwd, sandbox, writable_roots, context=None):
     return {write_lock_key(p): p for p in roots}
 
 
-def earlier_writer_waiting(run_dir, roots):
+def earlier_writer_waiting(run_dir, roots, lost_after=LOST_AFTER):
     position = ((run_dir / "args.json").stat().st_mtime_ns, run_dir.name) \
         if run_dir.parent == HOME / "jobs" else None
     paths = [Path(tree_key(p)) for p in roots.values()]
@@ -351,7 +359,7 @@ def earlier_writer_waiting(run_dir, roots):
             other = ((job_dir / "args.json").stat().st_mtime_ns, job_dir.name)
         except FileNotFoundError:
             continue
-        if other < position and job_status(job_dir.name)["status"] == "running":
+        if other < position and job_status(job_dir.name, lost_after=lost_after)["status"] == "running":
             return True
     return False
 
@@ -824,10 +832,13 @@ class RepeatGuard:
         return [{"step": key[:8], **{k: record[k] for k in ("failures", "seconds", "last_exit", "last_at")}}
                 for key, record in sorted(steps.items()) if key != "_changed_at" and record["failures"] >= self.threshold]
 
-    def snapshot(self):
+    def snapshot(self, *, blocking=True):
         if not self.enabled or not self.path.exists():
             return REPEAT_TOTALS.copy(), []
-        with acquire_file_lock(self.lock, blocking=True):
+        lock = acquire_file_lock(self.lock, blocking=blocking)
+        if lock is None:
+            return REPEAT_TOTALS.copy(), []
+        with lock:
             data = read_step_failures(self.path)
         return {**REPEAT_TOTALS, **data.get("_totals", {})}, self.standing(self.recent(data, time.time()))
 
@@ -902,8 +913,8 @@ class RepeatGuard:
         event_log.write((json.dumps({"type": "runner.repeat_block", **block}) + "\n").encode("utf-8"))
         event_log.flush()
 
-    def summary(self):
-        return {"blocks": self.blocks(), "standing": self.snapshot()[1]}
+    def summary(self, *, blocking=True):
+        return {"blocks": self.blocks(), "standing": self.snapshot(blocking=blocking)[1]}
 
 
 def remember_too_big(cwd, prefix=""):
@@ -1280,7 +1291,7 @@ def execute(args, prompt, run_dir):
                     if admission is not None:
                         with admission:
                             # Keep overlap checks and all directory claims in one critical section.
-                            if not earlier_writer_waiting(run_dir, roots):
+                            if not earlier_writer_waiting(run_dir, roots, getattr(args, "lost_after", LOST_AFTER)):
                                 for key in sorted(roots):
                                     lock = acquire_write_lock(roots[key])
                                     if lock is None:
@@ -1473,9 +1484,11 @@ def read_prompt(strict=False):
     return prompt
 
 
-def write_result(job_dir, result):
+def write_result(job_dir, result, *, activity=None):
     tmp = job_dir / "result.json.tmp"
-    value = {**result, **runner_activity(job_dir / "events.jsonl")}
+    if activity is None:
+        activity = runner_activity(job_dir / "events.jsonl")
+    value = {**result, **activity}
     if "repeat_guard" not in value:
         value["repeat_guard"] = job_repeat_guard(job_dir)
     try:
@@ -1625,12 +1638,12 @@ def task_record(job_dir):
     return task
 
 
-def job_repeat_guard(job_dir):
+def job_repeat_guard(job_dir, *, blocking=True):
     # A damaged ledger must not prevent publishing another result, such as a cancellation or runner error.
     with suppress(OSError, ValueError, TypeError, KeyError):
         task = task_record(job_dir)
         if task.get("cwd"):
-            return RepeatGuard(task["cwd"], task, job_dir).summary()
+            return RepeatGuard(task["cwd"], task, job_dir).summary(blocking=blocking)
     return {"blocks": [], "standing": []}
 
 
@@ -1981,7 +1994,72 @@ def enriched_status(job_id, job_dir, value, record=None):
     return {**result, **activity}
 
 
-def job_status(job_id, record=None):
+def recorded_process_exited(pid_file):
+    pid = int(pid_file.read_text())
+    if pid <= 0:
+        return False
+    try:
+        actual = proc_start(pid)
+    except FileNotFoundError:
+        return True
+    expected = pid_file.with_suffix(".start").read_text().strip()
+    return actual.isdecimal() and expected.isdecimal() and int(actual) != int(expected)
+
+
+def executor_loss(job_dir, started_at, lost_after):
+    try:
+        current = uuid.UUID(kernel_boot_id())
+        try:
+            previous = uuid.UUID((job_dir / "boot_id").read_text().partition(":")[0].strip())
+        except FileNotFoundError:
+            previous = current
+        mtimes = []
+        for name in ("events.jsonl", "phase.json"):
+            with suppress(FileNotFoundError):
+                mtimes.append((job_dir / name).stat().st_mtime)
+        last_activity = max(mtimes) if mtimes else None
+        if previous != current:
+            return "boot_changed", started_at if last_activity is None else last_activity
+        if last_activity is not None and time.time() - last_activity >= lost_after and all(
+                recorded_process_exited(job_dir / name) for name in ("worker.pid", "codex.pid")):
+            return "worker_exited", last_activity
+    except (OSError, ValueError, IndexError):
+        pass  # A failed read or malformed identity is not evidence that an executor exited.
+    return None
+
+
+def reconcile_lost_executor(job_dir, result_file, task, lost_after):
+    try:
+        started_at = (job_dir / "args.json").stat().st_mtime
+    except FileNotFoundError:
+        return
+    if executor_loss(job_dir, started_at, lost_after) is None:
+        return
+    lock = acquire_file_lock(job_dir / "process.lock")  # Admission must not wait on cancel or late diff.
+    if lock is None:
+        return
+    with lock:
+        if result_file.exists():
+            return
+        loss = executor_loss(job_dir, started_at, lost_after)
+        if loss is None:
+            return
+        reason, last_activity = loss
+        finished_at = time.time()
+        attempts = runner_activity(job_dir / "events.jsonl")["attempt"] or 0
+        value = {**job_metadata(job_dir, task=task, finished_at=finished_at), "status": "failed",
+                 "error_kind": "executor_lost", "lost_reason": reason, "retryable": False,
+                 "log_dir": str(job_dir), "attempts": attempts, "started_at": started_at,
+                 "finished_at": finished_at, "last_activity_at": last_activity,
+                 "repeat_guard": job_repeat_guard(job_dir, blocking=False)}
+        value.update(review_summary(value))
+        activity = {"phase": "lost", "attempt": attempts, "last_error_kind": "executor_lost", "retry_at": None}
+        write_result(job_dir, value, activity=activity)
+        with suppress(OSError):  # The result is authoritative even if the terminal event cannot be logged.
+            runner_event(job_dir, attempts, "lost", "executor_lost")
+
+
+def job_status(job_id, record=None, *, lost_after=LOST_AFTER):
     try:
         job_dir = job_directory(job_id)
         if not job_dir.exists():
@@ -1998,6 +2076,8 @@ def job_status(job_id, record=None):
             idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": idle,
                                                     "last_activity": last_activity(events) if events.exists() else None}, record)
+        if not result.exists():
+            reconcile_lost_executor(job_dir, result, record["task"] if record is not None else None, lost_after)
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")), record)
         if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
@@ -2010,9 +2090,9 @@ def job_status(job_id, record=None):
                 "verification_status": "invalid", "verification": None}
 
 
-def job_details(job):
+def job_details(job, args):
     if "_details" not in job:
-        job["_details"] = job_status(job["job_id"], job["_record"])
+        job["_details"] = job_status(job["job_id"], job["_record"], lost_after=getattr(args, "lost_after", LOST_AFTER))
     return {**job, **job["_details"]}
 
 
@@ -2096,7 +2176,7 @@ def matching_jobs(args, *, page_dates=None):
                 value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
             except (OSError, ValueError, TypeError):
                 record = None
-                value = job_status(job_dir.name)
+                value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
                 value["_details"] = dict(value)
                 if not matches_metadata(value, job_dir.name):
                     continue
@@ -2108,7 +2188,7 @@ def matching_jobs(args, *, page_dates=None):
             continue
         value.update(job_id=job_dir.name, _record=record)
         if args.status or needs_attention:
-            value = job_details(value)
+            value = job_details(value, args)
         if args.status and value["execution_status"] != args.status:
             continue
         verification = value.get("verification_status", "unreviewed")
@@ -2140,7 +2220,7 @@ def list_jobs(args):
         ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
         total = len(ordered)
         page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
-    page = [job_details(j) for j in page]
+    page = [job_details(j, args) for j in page]
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
@@ -2258,7 +2338,7 @@ def summarize_jobs(args):
     listed = []
     for job in matching_jobs(args):
         if job["_record"] is None or job["_record"]["result"] is None:
-            job = job_details(job)
+            job = job_details(job, args)
         if job.get("error_kind"):
             kind = job["error_kind"]
             error_kinds[kind] = error_kinds.get(kind, 0) + 1
@@ -2273,7 +2353,7 @@ def summarize_jobs(args):
     result = []
     page = list(groups.items())[args.offset:args.offset + args.limit]
     for (kind, identifier), jobs in page:
-        jobs = [job_details(j) for j in jobs]
+        jobs = [job_details(j, args) for j in jobs]
         rounds = list(reversed(jobs))
         latest = jobs[0]
         report = latest.get("structured")
@@ -2609,7 +2689,8 @@ def main():
     parser = Parser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
     sub.add_parser("doctor")
-    add_task_arguments(sub.add_parser("run"))
+    run = sub.add_parser("run")
+    add_task_arguments(run)
     start = sub.add_parser("start")
     add_task_arguments(start)
     start.add_argument("--model-ab", type=parse_model_ab, help="Assign a fresh job by job ID using [models, share]")
@@ -2627,6 +2708,9 @@ def main():
     repeat_guard.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
+    for command in (run, start, status, listing, summary):
+        command.add_argument("--lost-after", type=float, default=LOST_AFTER, metavar="SECONDS",
+                             help="Minimum inactivity before finalizing a job whose recorded processes both exited")
     for command in (listing, summary):
         command.add_argument("--cwd")
         command.add_argument("--owner")
@@ -2658,6 +2742,8 @@ def main():
     rollback.add_argument("job_id", type=job_identifier)
     rollback.add_argument("--check", action="store_true", help="Only test whether the patch still reverses cleanly")
     args = parser.parse_args()
+    if hasattr(args, "lost_after") and not (isfinite(args.lost_after) and args.lost_after >= 0):
+        parser.error("--lost-after requires nonnegative finite seconds")
     if args.command == "doctor":
         emit(doctor())
         return
@@ -2811,7 +2897,7 @@ def main():
         while True:
             with suppress(OSError, ValueError):
                 late_diff(job_directory(args.job_id))
-            current = job_status(args.job_id)
+            current = job_status(args.job_id, lost_after=args.lost_after)
             now = time.monotonic()
             if current["status"] != "running" or now >= deadline:
                 emit(current)

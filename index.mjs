@@ -677,6 +677,11 @@ function failureReceipt(value, cause) {
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open' } = {}) {
   const blocking = blockingState(value);
   if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
+  if (value.error_kind === 'executor_lost') {
+    const resume = value.thread_id ? `，或用 codex_continue ${value.job_id} 在原线程续接（fresh=false）` : '';
+    return `任务 ${value.job_id} 的执行环境中断（${value.lost_reason}：WSL 重启或执行进程退出），没有生成报告。` +
+      `先核对已有产物（codex_output artifact=diff/events），再按原任务重新派单${resume}；不要当作失败结论处理。`;
+  }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers })
@@ -1825,8 +1830,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (blockLine && owner && value.job_id) countCloseout(owner, 'repeat_blocked', 1, value.job_id);
     const [result, notices, parked] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
       value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined]);
+    const next = parked && value.error_kind !== 'executor_lost' ? [parked.line] : [result.next, parked?.line];
     return notices.length || parked || blockLine || standingLine ? { ...result, ...(parked ? { parked_review: parked.parked_review } : {}),
-      next: [parked?.line ?? result.next, blockLine, standingLine, ...notices].filter(Boolean).join('\n') } : result;
+      next: [...next, blockLine, standingLine, ...notices].filter(Boolean).join('\n') } : result;
   }
 
   async function scanAutoVerifications(limit, owner) {
@@ -1876,11 +1882,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function watch(jobId, handle, finish, state, exec) {
     const publish = (value) => {
       const warning = value.status === 'monitor_failed' && state.cancelNotice ? `\n${state.cancelNotice}` : '';
-      const text = render(value)[0].text + warning + outputEntry(jobId, state.logDir);
-      handle.append(`${text}\n`, { channel: 'log' });
       const lookup = value.status === 'monitor_failed'
         ? `codex_status ${JSON.stringify({ job_id: jobId })}`
         : `codex_output ${JSON.stringify({ job_id: jobId, artifact: value.report_status === 'valid' ? 'report' : 'result' })}`;
+      const entry = value.error_kind === 'executor_lost' ? `\n--- 完整结果入口 ---\n${lookup}` : outputEntry(jobId, state.logDir);
+      const text = render(value)[0].text + warning + entry;
+      handle.append(`${text}\n`, { channel: 'log' });
       return { status: JOB_STATUS[value.status] ?? 'failed', detail: `${summaryLine(value)} · ${lookup}`, result: text };
     };
     let bridgeErrors = 0;
@@ -1912,7 +1919,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           progress(value);
           continue;
         }
-        // status 是只读的：一次 wsl.exe 出错（含电脑睡眠唤醒、发行版重启瞬间）不代表任务结束，连续多次才放弃
+        // 一次 wsl.exe 出错（含电脑睡眠唤醒、发行版重启瞬间）不代表任务结束，连续多次才放弃
         if (value.error_kind === 'bridge_error') {
           if (++bridgeErrors < 3) continue;
           throw new Error(value.error);

@@ -1,6 +1,7 @@
 """Fault-injection tests for codex_runner.py. They use a fake Codex, so they spend no model quota."""
 import argparse
 import errno
+import importlib.util
 import io
 import json
 import os
@@ -11,8 +12,10 @@ import tempfile
 import textwrap
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest import mock
 
@@ -3961,6 +3964,163 @@ class RunnerTests(unittest.TestCase):
         (job_dir / "worker.pid").write_text(str(os.getpid()))
         (job_dir / "boot_id").write_text("an-earlier-boot")
         return job_dir
+
+    def lost_job(self, job_id, *, boot="00000000-0000-0000-0000-000000000001:10", age=600):
+        context = {"owner": "S1", "task": "write a file", "acceptance": ["file saved"], "write": True}
+        job = self.stored_job(job_id, None, sandbox="workspace-write", context=context, scope=["src"])
+        if boot is not None:
+            (job / "boot_id").write_text(boot)
+        for name, pid, start in (("worker", "123", "11"), ("codex", "456", "12")):
+            (job / f"{name}.pid").write_text(pid)
+            (job / f"{name}.start").write_text(start)
+        phase = {"type": "runner.phase", "phase": "codex_running", "attempt": 2}
+        (job / "phase.json").write_text(json.dumps(phase), "utf-8")
+        (job / "events.jsonl").write_text('{"type":"thread.started","thread_id":"T-lost"}\n', "utf-8")
+        active_at = time.time() - age
+        for name in ("events.jsonl", "phase.json"):
+            os.utime(job / name, (active_at, active_at))
+        return job
+
+    def lost_proc(self, worker=None, codex=None):
+        read_text = Path.read_text
+        def read(path, *args, **kwargs):
+            if path.as_posix() == "/proc/sys/kernel/random/boot_id":
+                return "00000000-0000-0000-0000-000000000001\n"
+            if path.as_posix() in ("/proc/1/stat", "/proc/123/stat", "/proc/456/stat"):
+                start = {"1": "10", "123": worker, "456": codex}[path.parent.name]
+                if start is None:
+                    raise FileNotFoundError(str(path))
+                if isinstance(start, OSError):
+                    raise start
+                return f"{path.parent.name} (fake process) " + "S " * 19 + start
+            return read_text(path, *args, **kwargs)
+        return mock.patch.object(Path, "read_text", read)
+
+    def test_executor_loss_never_finalizes_a_live_worker_residual_codex_or_proc_error(self):
+        import codex_runner
+
+        cases = [("live-worker", "11", None), ("residual", None, "12"),
+                 ("worker-error", PermissionError("proc denied"), None),
+                 ("codex-error", None, OSError("proc read failed"))]
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            for name, worker, codex in cases:
+                with self.subTest(name=name), self.lost_proc(worker, codex), \
+                        mock.patch.object(codex_runner, "process_start", side_effect=lambda pid: worker if pid == 123 else codex):
+                    job = self.lost_job(name)
+                    value = codex_runner.job_status(name)
+                    self.assertFalse((job / "result.json").exists())
+                    if name == "live-worker":
+                        self.assertEqual(value["status"], "running")
+                    if name == "residual":
+                        self.assertEqual(value["residual_codex_pid"], 456)
+
+    def test_executor_loss_persists_previous_boot_once_and_recovers_metadata(self):
+        import codex_runner
+
+        job = self.lost_job("old-boot", boot="00000000-0000-0000-0000-000000000002:10", age=0)
+        active_at = (job / "phase.json").stat().st_mtime
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), self.lost_proc("11", "12"):
+            first = codex_runner.job_status(job.name)
+            self.assertEqual((first["error_kind"], first.get("lost_reason")), ("executor_lost", "boot_changed"))
+            result = json.loads((job / "result.json").read_text("utf-8"))
+            self.assertEqual(codex_runner.job_status(job.name), first)
+        self.assertEqual((result["status"], result["retryable"], result["attempts"], result["thread_id"], result["phase"]),
+                         ("failed", False, 2, "T-lost", "lost"))
+        self.assertEqual(result["started_at"], (job / "args.json").stat().st_mtime)
+        self.assertEqual(result["last_activity_at"], active_at)
+        self.assertGreaterEqual(result["finished_at"], active_at)
+        self.assertEqual(result["context"], json.loads((job / "args.json").read_text("utf-8"))["context"])
+        self.assertEqual(result["scope"], ["src"])
+        self.assertEqual(result["report_status"], "missing")
+        self.assertEqual(json.loads((job / "phase.json").read_text("utf-8"))["phase"], "lost")
+        self.assertEqual((job / "events.jsonl").read_text("utf-8").count('"phase": "lost"'), 1)
+
+    def test_executor_loss_waits_for_both_activity_mtimes_then_accepts_legacy(self):
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), self.lost_proc(codex="99"):
+            for legacy in (False, True):
+                for name in ("phase.json", "events.jsonl"):
+                    with self.subTest(legacy=legacy, newest=name):
+                        job = self.lost_job(f"threshold-{legacy}-{name.split('.')[0]}")
+                        if legacy:
+                            (job / "boot_id").unlink()
+                        else:
+                            (job / "boot_id").write_text("00000000-0000-0000-0000-000000000001:9")
+                        recent = time.time() - 30
+                        os.utime(job / name, (recent, recent))
+                        codex_runner.job_status(job.name)
+                        self.assertFalse((job / "result.json").exists())
+                        with mock.patch.object(sys, "argv", [str(RUNNER), "status", job.name, "--lost-after", "20"]), \
+                                mock.patch.object(codex_runner, "emit") as emit:
+                            codex_runner.main()
+                        self.assertEqual(emit.call_args.args[0].get("lost_reason"), "worker_exited")
+                        self.assertEqual(json.loads((job / "result.json").read_text("utf-8"))["error_kind"], "executor_lost")
+
+    def test_executor_loss_reconciles_list_summary_and_writer_admission_without_diff(self):
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        home.mkdir()
+        (home / "locks").mkdir()
+        (home / "step-failures.json").write_text("{}", "utf-8")
+        with mock.patch.object(codex_runner, "HOME", home), self.lost_proc(), \
+                mock.patch.object(codex_runner, "acquire_file_lock", wraps=codex_runner.acquire_file_lock) as lock, \
+                mock.patch.object(codex_runner, "diff_end", side_effect=AssertionError("late diff in reconciliation")):
+            for command in ("list", "summary", "admission"):
+                with self.subTest(command=command):
+                    job = self.lost_job(f"via-{command}")
+                    (job / "diff-base.json").touch()
+                    if command == "admission":
+                        waiter = self.stored_job("waiter", None)
+                        roots = codex_runner.write_lock_roots(str(self.cwd), "workspace-write", None)
+                        self.assertFalse(codex_runner.earlier_writer_waiting(waiter, roots))
+                    else:
+                        argv = [str(RUNNER), command, "--job-id", job.name]
+                        if command == "list":
+                            argv += ["--status", "running"]
+                        with mock.patch.object(sys, "argv", argv), mock.patch.object(codex_runner, "emit") as emit:
+                            codex_runner.main()
+                        value = emit.call_args.args[0]
+                        if command == "list":
+                            self.assertEqual(value["total"], 0)
+                        else:
+                            self.assertEqual(value["error_kinds"], {"executor_lost": 1})
+                    self.assertTrue((job / "result.json").exists())
+            self.assertTrue(lock.call_args_list)
+            self.assertFalse(any(call.kwargs.get("blocking") for call in lock.call_args_list))
+
+    def test_executor_loss_racing_reconciler_after_reload_publishes_once(self):
+        import codex_runner
+
+        job = self.lost_job("raced-loss")
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        entered, release = Event(), Event()
+        write = codex_runner.write_result
+
+        def pause_write(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return write(*args, **kwargs)
+
+        with mock.patch.object(codex_runner, "HOME", home), self.lost_proc(), \
+                mock.patch.object(codex_runner, "write_result", side_effect=pause_write) as publish, \
+                ThreadPoolExecutor(2) as pool:
+            first = pool.submit(codex_runner.job_status, job.name)
+            try:
+                self.assertTrue(entered.wait(5), "first reconciler never reached result publication")
+                spec = importlib.util.spec_from_file_location("reloaded_runner", RUNNER)
+                reloaded = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(reloaded)
+                second = pool.submit(reloaded.job_status, job.name).result(2)
+                self.assertEqual(second["error_kind"], "worker_died")
+                self.assertFalse((job / "result.json").exists())
+            finally:
+                release.set()
+            self.assertEqual(first.result(5)["error_kind"], "executor_lost")
+            self.assertEqual(reloaded.job_status(job.name), first.result())
+            publish.assert_called_once()
+        self.assertEqual((job / "events.jsonl").read_text("utf-8").count('"phase": "lost"'), 1)
 
     def test_a_worker_from_before_a_restart_is_dead_keeps_its_thread_and_cancel_kills_nothing(self):
         sys.path.insert(0, str(RUNNER.parent))

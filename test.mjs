@@ -2751,6 +2751,63 @@ test('dispatch with a positive wait still returns a DSH background job without w
   assert.equal(nudges.length, 1);
 });
 
+test('executor_lost nextStep directs the planner to artifacts and the original task', () => {
+  const job = { job_id: 'LOST', status: 'failed', error_kind: 'executor_lost', retryable: false, thread_id: 'T' };
+  for (const lost_reason of ['boot_changed', 'worker_exited']) {
+    const next = nextStep({ ...job, lost_reason }, undefined, undefined, { plannerReads: 'products' });
+    assert.ok(next.includes(`任务 LOST 的执行环境中断（${lost_reason}：WSL 重启或执行进程退出），没有生成报告。`));
+    assert.match(next, /codex_output artifact=diff\/events[\s\S]*按原任务重新派单[\s\S]*codex_continue LOST 在原线程续接[\s\S]*不要当作失败结论处理/);
+  }
+  assert.doesNotMatch(nextStep({ ...job, lost_reason: 'worker_exited', thread_id: null }), /在原线程续接/);
+});
+
+test('executor_lost background failure notifies its owner without a report or close-out obligation', async () => {
+  const jobs = fakeJobs();
+  const lost = { job_id: 'J1', status: 'failed', execution_status: 'failed', error_kind: 'executor_lost',
+    lost_reason: 'boot_changed', retryable: false, thread_id: 'T', report_status: 'missing', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: Date.now() / 1000 + 5, context: { owner: 'S1', task: RUN.task,
+      acceptance: RUN.acceptance, write: true, must_verify: [1] } };
+  let history = [];
+  const { tools, calls, answer } = harness({ jobs, config: { closeoutGuard: true, autoVerify: 'flagged',
+    listResult: (argv) => argv.includes('running') ? { jobs: [], total: 0 } : { jobs: history, total: history.length } } });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  await tools.codex_run.execute({ ...RUN, write: true }, exec);
+  await answer('J1', lost);
+  const done = await jobs.started[0].done;
+  assert.equal(done.status, 'failed');
+  assert.equal(jobs.get('bg1', exec.agent.id).status, 'failed');
+  assert.deepEqual(jobs.unawaited, ['bg1']);
+  assert.match(done.detail, /executor_lost.*codex_output .*"artifact":"result"/);
+  assert.match(done.result, /"report_status": "missing"[\s\S]*任务 J1 的执行环境中断[\s\S]*codex_output artifact=diff\/events/);
+  assert.doesNotMatch(done.result, /"artifact":"report"/);
+  assert.equal(calls.filter(argv => argv[0] === 'start').length, 1);
+  history = [lost];
+  assert.equal((await tools.codex_run.execute({ ...RUN, task: '检查另一份独立文件 b.py' }, exec)).job_id, 'J2');
+  assert.ok(calls.some(argv => argv.includes('--started-between')));
+  await answer('J2', { status: 'cancelled' });
+  await jobs.started[1].done;
+});
+
+test('executor_lost can resume its recovered thread under the original task settings', async () => {
+  const h = harness();
+  const exec = { agent: agentAt('/work/original') };
+  const lost = { job_id: 'LOST', status: 'failed', error_kind: 'executor_lost', lost_reason: 'boot_changed',
+    cwd: '/work/original', sandbox: 'workspace-write', scope: ['a.py'], thread_id: 'T-lost',
+    context: { owner: exec.agent.id, task: RUN.task, acceptance: RUN.acceptance, write: true } };
+  h.finals.ORDINARY = { ...lost, job_id: 'ORDINARY', error_kind: 'worker_died' };
+  assert.equal((await h.tools.codex_continue.execute({ job_id: 'ORDINARY', fresh: false }, exec)).continuation_ready, false);
+  h.finals.LOST = lost;
+  const next = await h.tools.codex_continue.execute({ job_id: 'LOST', fresh: false, wait_seconds: 0 }, exec);
+  assert.equal(next.job_id, 'J1');
+  const [{ argv, stdin }] = h.requests.filter(request => request.argv[0] === 'start');
+  for (const [flag, expected] of Object.entries({ '--resume': lost.thread_id, '--sandbox': lost.sandbox,
+    '--cwd': lost.cwd, '--scope': lost.scope[0] })) assert.equal(argv[argv.indexOf(flag) + 1], expected);
+  const { context, prompt } = JSON.parse(stdin);
+  assert.equal(context.continuation.parent_job_id, 'LOST');
+  assert.deepEqual(context.acceptance, RUN.acceptance);
+  assert.match(prompt, /执行环境中断[\s\S]*未生成报告/);
+});
+
 test('background job maps cancel, failure and lost monitoring', async () => {
   const jobs = fakeJobs();
   const { tools, handlers, calls, answer } = harness({ jobs });
@@ -2771,7 +2828,7 @@ test('background job maps cancel, failure and lost monitoring', async () => {
   assert.match(failed.result, /^failed · timeout · 30 s {2}job_id: J2\n/);
 
   await tools.codex_run.execute(RUN, exec);
-  // status 是只读的：连续 3 次 bridge_error 才放弃（电脑睡眠唤醒、发行版重启瞬间的一两次不算）
+  // 连续 3 次 bridge_error 才放弃（电脑睡眠唤醒、发行版重启瞬间的一两次不算）
   for (let i = 0; i < 3; i++) await answer('J3', { status: 'failed', error_kind: 'bridge_error', error: 'wsl gone' });
   const lost = await jobs.started[2].done;
   assert.equal(lost.status, 'failed');
