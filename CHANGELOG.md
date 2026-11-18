@@ -2,15 +2,7 @@
 
 [English](#english)
 
-### 0.9.NEXT
-
-新增设置 `repeatFailureGuard`。派单回执、完成通知和多轮汇总显示目录内近期反复失败的步骤，运行状态显示本会话和 runner 的拦截统计。外部条件改变后，`codex_run` 和 `codex_continue` 可用 `rerun_after_change` 说明变化并重跑。
-
-新增 `ownerDecisions`。规划端默认按常设授权记录决定并续接，`owner_only` 事项留给所有者，提问跳过自动代答。报告级待答阻塞从接受未完成项的依据中移除。续接派单提示同项环境阻塞，`acceptance_needs` 提示近期失败的依赖步骤，`expect_blocked` 指示执行端按环境受阻汇报指定条目。
-
-runner 会为确认执行环境已中断的任务补写 `executor_lost` 结果，记录原因并恢复可用的线程号。后台完成通知引导先核对已有产物，再重派或续接。
-
-### 已发布版本
+`0.9.129` 新增 `repeatFailureGuard`，默认拦截 24 小时内同目录反复失败且未观察到改动的长步骤，派单回执、完成通知及多轮汇总显示近期失败，运行状态显示拦截统计。外部条件变化后可用 `rerun_after_change` 说明变化并重跑。确认执行环境中断时，runner 补写 `executor_lost` 并恢复可用的线程号。新增 `ownerDecisions`，规划端默认按常设授权记录决定并续接，`owner_only` 提问留给所有者并跳过自动代答。报告级待答阻塞从接受未完成项的依据中移除。续接派单提示未改变的同项环境阻塞，`acceptance_needs` 提示近期失败的依赖步骤，`expect_blocked` 指示执行端按环境受阻汇报指定条目。普通续接在关闭线程大小阈值时复用现有查询。独立核验可运行需要临时文件的检查，沙箱核验只允许在每单的暂存目录写入。主机核验在项目外存放临时文件并比对 Git 状态，受核验范围内的变更使核验失败，范围外或可识别的并行变更出提示。
 
 `0.9.128` 指令档案按消息来源保存所有非空白人工输入，保留以“继续”或 “continue” 开头的原文。交接链接状态缺失或不可读时暂停自动交接，面板手动交接仍可用。仅大小写不同的链首 ID 使用独立档案，小写 UUID 链沿用原路径。
 
@@ -162,15 +154,7 @@ runner 会为确认执行环境已中断的任务补写 `executor_lost` 结果�
 
 ## English
 
-### 0.9.NEXT
-
-Adds the `repeatFailureGuard` setting. Dispatch results, completion notices, and summaries surface standing failures in the task directory. Runtime status reports session and runner block counts. After an external condition changes, `codex_run` and `codex_continue` accept `rerun_after_change` to explain the change and allow a rerun.
-
-Adds `ownerDecisions` for recording decisions under standing authorization and escalating `owner_only` questions without auto-answering them. Report-level questions no longer support accepting individual open items. Dispatch warns about repeated environment blockers and standing failures in declared `acceptance_needs`. `expect_blocked` tells the executor which items to report as environment-blocked.
-
-The runner records an `executor_lost` result when executor loss is confirmed, with the reason and any recoverable thread ID. Background completion notices direct the planner to check existing artifacts before redispatching or resuming.
-
-### Released versions
+`0.9.129` adds `repeatFailureGuard`. By default it blocks long steps that repeatedly fail in the same directory within 24 hours without an observed change. Dispatch, completion and summary receipts show standing failures, and runtime status shows block counts. Use `rerun_after_change` to explain changed external conditions and rerun. When executor loss is confirmed, the runner records `executor_lost` and any recoverable thread ID. `ownerDecisions` defaults to recording decisions under standing authorization before continuing. `owner_only` questions go to the owner and skip auto-answer. Report-level questions no longer support accepting individual open items. Dispatch warns about unchanged environment blockers and standing failures in declared `acceptance_needs`. `expect_blocked` tells the executor which items to report as environment-blocked. Ordinary resumes reuse the existing query when the thread size threshold is disabled. Independent verification can run checks that need temporary files. Sandboxed verification writes to per-job scratch. Host-access verification keeps temporary files outside the project and compares Git state, failing on changes within verified paths and reporting out-of-scope or identifiable concurrent changes.
 
 `0.9.128` Archives every non-blank human message using its source metadata, including messages that start with “继续” or “continue”. Missing or unreadable link state pauses automatic hand-over and leaves panel hand-over available. Chain roots that differ only in case get separate archives, and lowercase UUID chains keep their original paths.
 
