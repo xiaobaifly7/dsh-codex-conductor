@@ -1154,12 +1154,13 @@ test('conductor start only starts; waitJob waits with a bounded status call and 
   };
   const c = createConductor({ waitSeconds: 1, model: 'some-model', effort: 'max', serviceTier: 'fast' }, run);
   const args = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: true, resume: 'T9', wait_seconds: 30 };
+  const repeatFlags = ['--repeat-guard', 'on', '--repeat-min-seconds', '60', '--repeat-failures', '2', '--repeat-window-hours', '24'];
   const first = await c.start(args, 'F:\\proj');
-  assert.deepEqual(calls[0].argv, ['start', '--cwd', 'F:\\proj', '--effort', 'max', '--model', 'some-model',
+  assert.deepEqual(calls[0].argv, ['start', '--cwd', 'F:\\proj', ...repeatFlags, '--effort', 'max', '--model', 'some-model',
     '--service-tier', 'fast', '--sandbox', 'workspace-write', '--resume', 'T9']);
   assert.deepEqual(first, { job_id: 'J1', status: 'running' });
   await c.start({ ...args, effort: 'low', write: false, resume: undefined }, 'F:\\proj');
-  assert.deepEqual(calls.at(-1).argv, ['start', '--cwd', 'F:\\proj', '--effort', 'low', '--model', 'some-model', '--service-tier', 'fast']);
+  assert.deepEqual(calls.at(-1).argv, ['start', '--cwd', 'F:\\proj', ...repeatFlags, '--effort', 'low', '--model', 'some-model', '--service-tier', 'fast']);
   assert.match(calls[0].stdin, /pytest 通过/);
   assert.equal(calls.length, 2);
   const waited = await c.waitJob('J1', 30);
@@ -1259,7 +1260,7 @@ test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissi
 });
 
 // 用假的 runner 和假的 jobs 服务装上插件；后台循环的 `status --wait 20` 由测试逐个应答
-function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGemini } = {}) {
+function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGemini, plugin = apply } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -1271,12 +1272,14 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, listResult, outputResult, reviewResult, statusResult, summaryResult, productsResult, threadSizeResult, ...pluginConfig } = config;
+  const { startResult, cancelResult, listResult, outputResult, reviewResult, statusResult, summaryResult, productsResult, threadSizeResult, repeatGuardResult, ...pluginConfig } = config;
   const run = (_cfg, argv, options = {}) => {
     calls.push(argv);
     requests.push({ argv, ...options });
     // answer() 放弃后让后台循环出错退出，否则进程挂住不结束
     if (closed) return Promise.reject(new Error('harness closed'));
+    if (argv[0] === 'repeat-guard') return Promise.resolve((typeof repeatGuardResult === 'function' ? repeatGuardResult(argv) : repeatGuardResult) ??
+      { status: 'completed', totals: { blocked: 0, seconds_avoided: 0 }, standing: [] });
     if (argv[0] === 'start') return Promise.resolve((typeof startResult === 'function' ? startResult(argv, options) : startResult) ??
       { job_id: `J${++n}`, status: 'running' });
     if (argv[0] === 'list') return Promise.resolve((typeof listResult === 'function' ? listResult(argv) : listResult) ?? { jobs: [], total: 0 });
@@ -1300,7 +1303,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     logger: { warn: (text) => warnings.push(text) },
     ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
   // 收尾护栏会多一次 list 调用；只有专门测它的用例才打开。
-  apply(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, autoVerify: 'off', continueFreshAboveTokens: 0, ...pluginConfig }, run, launchGemini);
+  plugin(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, autoVerify: 'off', continueFreshAboveTokens: 0, ...pluginConfig }, run, launchGemini);
   const answer = async (job, value) => {
     for (let i = 0; !waiters[job]?.length; i++) {
       if (i === 1000) {
@@ -1319,6 +1322,147 @@ const tick = () => new Promise((r) => setImmediate(r));
 const nudges = [];
 const agentAt = (cwd, log = []) => ({ id: 'S1', session: { header: { cwd }, log }, steer: (m) => nudges.push(m) });
 const RUN = { task: '在 a.py 里修好 bug', acceptance: ['pytest 通过'], write: false, wait_seconds: 0 };
+
+const standingFailure = { step: 'ac08ef12', failures: 2, seconds: 1584, last_exit: 1, last_at: 1795050000 };
+const repeatGuardStatus = {
+  blocks: Array.from({ length: 2 }, () => ({ step: 'ac08ef12', prior_failures: 2, prior_seconds: 1584 })),
+  standing: [standingFailure],
+};
+const standingLine = '这个目录有 1 个步骤近期反复失败（共 2 次、约 26 分钟），环境问题未解决前，依赖它们的工作会被拦下。';
+const blockLine = 'runner 拦下了重复运行同一个失败步骤 2 次（此前已失败 2 次、约 26 分钟）；依赖它的验收项应记 blocked（environment 或 user_input），不要再派同样依赖它的任务；外部情况已经改变时，下一单带 rerun_after_change 写明改变了什么。';
+
+test('repeat guard settings validate fields and reach run, continue and verify argv', async (t) => {
+  for (const [name, repeatFailureGuard, expected] of [
+    ['defaults', undefined, ['on', '60', '2', '24']],
+    ['disabled', { enabled: false }, ['off', '60', '2', '24']],
+    ['custom', { enabled: true, minSeconds: 12.5, failures: 3, windowHours: 0.5 }, ['on', '12.5', '3', '0.5']],
+    ['invalid fields', { enabled: 'off', minSeconds: -1, failures: 1.5, windowHours: Infinity }, ['on', '60', '2', '24']],
+    ['partial fallback', { enabled: false, failures: 4, windowHours: Infinity }, ['off', '60', '4', '24']],
+  ]) await t.test(name, async () => {
+    const h = harness({ config: { repeatFailureGuard, startResult: { job_id: 'NEW', status: 'completed' } } });
+    h.finals.PARENT = { ...workflowSource('environment'), log_dir: '/logs/PARENT' };
+    const exec = { agent: agentAt('/work/current') };
+    await h.tools.codex_run.execute(RUN, exec);
+    await h.tools.codex_continue.execute({ job_id: 'PARENT', resolution: '环境已经确认恢复' }, exec);
+    await h.tools.codex_verify.execute({ job_id: 'PARENT' }, exec);
+    const starts = h.calls.filter(([cmd]) => cmd === 'start');
+    assert.equal(starts.length, 3);
+    const flags = ['--repeat-guard', '--repeat-min-seconds', '--repeat-failures', '--repeat-window-hours'];
+    for (const argv of starts) assert.deepEqual(flags.map(flag => argv.includes(flag) && argv[argv.indexOf(flag) + 1]), expected);
+    if (name === 'custom') assert.deepEqual(h.calls.filter(([cmd]) => cmd === 'repeat-guard'),
+      ['/work/current', '/work/original', '/work/original'].map(cwd =>
+        ['repeat-guard', '--cwd', cwd, '--repeat-failures', '3', '--repeat-window-hours', '0.5']));
+    const invalidKeys = name === 'invalid fields' ? Object.keys(repeatFailureGuard) : name === 'partial fallback' ? ['windowHours'] : [];
+    assert.deepEqual(h.warnings.filter(warning => warning.includes('repeatFailureGuard')),
+      invalidKeys.map(key => `[codex-conductor] 忽略无效的配置 repeatFailureGuard.${key}，使用默认值`));
+  });
+});
+
+test('repeat guard override validates, reaches runner and keeps routing scalar', async () => {
+  const h = harness({ config: { startResult: { job_id: 'NEW', status: 'completed' } } });
+  h.finals.PARENT = { ...workflowSource('environment'), log_dir: '/logs/PARENT' };
+  const exec = { agent: agentAt('/work/current') };
+  const change = '用户已修好虚拟机的网络';
+  for (const [tool, args] of [
+    ['codex_run', RUN], ['codex_continue', { job_id: 'PARENT', resolution: '在虚拟机内验证过连接' }],
+  ]) {
+    assert.equal(h.tools[tool].parameters.properties.rerun_after_change?.type, 'string');
+    for (const invalid of ['', '  ', true]) {
+      await assert.rejects(h.tools[tool].execute({ ...args, rerun_after_change: invalid }, exec), /rerun_after_change 必须是非空字符串/);
+    }
+    await h.tools[tool].execute({ ...args, rerun_after_change: change }, exec);
+  }
+  const starts = h.requests.filter(({ argv }) => argv[0] === 'start');
+  assert.equal(starts.length, 2);
+  for (const { argv, stdin } of starts) {
+    assert.ok(argv.includes('--allow-rerun'));
+    const { prompt, context } = JSON.parse(stdin);
+    assert.ok(prompt.includes(`## 规划端说明的变化\n${change}\n`));
+    assert.equal(context.routing.rerun_after_change, true);
+    assert.ok(!JSON.stringify(context).includes(change));
+  }
+  await h.tools.codex_verify.execute({ job_id: 'PARENT' }, exec);
+  assert.ok(!h.requests.findLast(({ argv }) => argv[0] === 'start').argv.includes('--allow-rerun'));
+});
+
+test('repeat guard completion notice and non-retryable receipt guide planner review', async () => {
+  const jobs = fakeJobs();
+  const h = harness({ jobs });
+  const exec = { agent: agentAt('/work/original') };
+  const dispatched = await h.tools.codex_run.execute(RUN, exec);
+  const result = { ...workflowSource('environment'), repeat_guard: repeatGuardStatus };
+  await h.answer(dispatched.job_id, { ...result, job_id: dispatched.job_id });
+  const done = await jobs.started[0].done;
+  for (const line of [blockLine, standingLine]) assert.equal(done.result.split('\n').filter(s => s === line).length, 1);
+  h.finals.STOPPED = { ...result, job_id: 'STOPPED', status: 'failed', error_kind: 'repeated_failure', retryable: false,
+    structured: undefined, attempts: 2, files_changed: [] };
+  const failed = await h.tools.codex_status.execute({ job_id: 'STOPPED' }, exec);
+  assert.equal(failed.retryable, false);
+  assert.match(failed.next, /repeated_failure.*不自动重试.*尝试 2 次.*改动共 0 个.*不要原样重派.*codex_review.*blocked.*先修复环境.*rerun_after_change/);
+  assert.ok(failed.next.split('\n').includes(blockLine));
+});
+
+test('repeat guard dispatch annotates standing failures and skips bridge errors', async (t) => {
+  for (const [name, repeatGuardResult] of [
+    ['standing', { status: 'completed', totals: { blocked: 2, seconds_avoided: 1584 }, standing: [standingFailure] }],
+    ['runner bridge error', { status: 'failed', error_kind: 'bridge_error', retryable: true }],
+    ['thrown bridge error', () => { throw new Error('repeat-guard unavailable'); }],
+  ]) await t.test(name, async () => {
+    const h = harness({ config: { repeatGuardResult } });
+    const result = await h.tools.codex_run.execute(RUN, { agent: agentAt('/work/current') });
+    assert.equal(result.status, 'running');
+    assert.deepEqual(h.calls.map(argv => argv[0]), ['repeat-guard', 'start', 'status']);
+    assert.deepEqual(h.calls[0], ['repeat-guard', '--cwd', '/work/current']);
+    assert.equal(result.next.split('\n').includes(standingLine), name === 'standing');
+    assert.match(result.next, /先后台派齐本批独立且不重叠的任务，再留在本轮并行等待/);
+    assert.deepEqual(h.warnings, []);
+  });
+});
+
+test('repeat guard summary renders the latest group standing for a handover successor', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link('S1', 'S2');
+  t.after(() => aliases.unlink('S1', 'S2'));
+  const groups = [{ group_id: 'job:PARENT', total_rounds: 1, latest_job_id: 'PARENT',
+    latest_job: { status: 'completed', context: { owner: 'S1', task: RUN.task } },
+    repeat_guard: repeatGuardStatus, files_changed: [], open_items: {} }];
+  const h = harness({ config: { summaryResult: { status: 'completed', groups, total: 1, total_jobs: 1 },
+    repeatGuardResult: (argv) => ({ status: 'completed', totals: { blocked: 2, seconds_avoided: 1584 },
+      standing: argv[2] === '/work/original' ? [standingFailure] : [] }) } });
+  const exec = { agent: { ...agentAt('/work/original'), id: 'S2' } };
+  const value = await h.tools.codex_summary.execute({}, exec);
+  assert.ok(h.calls.find(([cmd]) => cmd === 'summary').includes('--also-owner'));
+  assert.deepEqual(value.groups[0].repeat_guard, repeatGuardStatus);
+  assert.ok(h.tools.codex_summary.output.render({}, value)[0].text.split('\n').includes(standingLine));
+  assert.ok((await h.tools.codex_run.execute(RUN, exec)).next.split('\n').includes(standingLine));
+});
+
+test('repeat guard runtime counts a terminal job once across observations and hot reload', async () => {
+  const result = { ...workflowSource('environment'), job_id: 'REPEAT-STATS', context: { owner: 'stats-owner' },
+    repeat_guard: repeatGuardStatus };
+  const exec = { agent: { ...agentAt(result.cwd), id: result.context.owner } };
+  const config = { repeatGuardResult: { status: 'completed', totals: { blocked: 8, seconds_avoided: 720 }, standing: [] } };
+  const load = (plugin) => {
+    const h = harness({ config, plugin });
+    h.finals[result.job_id] = result;
+    return h;
+  };
+  const status = (h, id = result.job_id) => h.tools.codex_status.execute({ job_id: id }, exec);
+  const first = load();
+  first.finals.RUNNING = { ...result, job_id: 'RUNNING', status: 'running' };
+  await status(first, 'RUNNING');
+  await status(first);
+  await status(first);
+  const reloaded = load((await import('./index.mjs?reload=repeat-guard-stats')).apply);
+  await status(reloaded);
+  const runtime = await reloaded.handlers['tools/execute']({ ...exec, name: 'codex_runtime', arguments: {} },
+    async () => ({ value: { status: 'status' } }));
+  assert.equal(runtime.value.closeout_stats?.sessions['stats-owner']?.repeat_blocked, 1);
+  assert.equal(runtime.value.closeout_stats?.total.repeat_blocked >= 1, true);
+  assert.ok(runtime.content.at(-1).text.split('\n').includes('重复失败拦截：本会话 1 次 / 全部 8 次，估计少花 12 分钟（runner 统计）'));
+  assert.deepEqual(reloaded.calls.filter(([cmd]) => cmd === 'repeat-guard'), [['repeat-guard']]);
+});
 
 test('codex_run rejects unknown top-level keys before invoking the runner', async () => {
   for (const allowHostAccess of [false, true]) {
@@ -1345,7 +1489,7 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
         const args = { ...RUN, write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
           cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, model: 'chosen',
-          effort: 'low', effort_reason: 'prior_rework', wait_seconds: 1 };
+          effort: 'low', effort_reason: 'prior_rework', rerun_after_change: '用户已修好虚拟机', wait_seconds: 1 };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
         const ran = await h.tools.codex_run.execute(args, exec);
         assert.equal(ran.job_id, 'J');
@@ -1637,7 +1781,7 @@ test('plannerAnswers skips scope history preflight for a new write task', async 
   const value = await h.tools.codex_run.execute({ ...RUN, cwd: source.cwd, scope: ['src', 'extra.csv'], write: true },
     { agent: agentAt('/work/current') });
   assert.equal(value.job_id, 'NEXT');
-  assert.deepEqual(h.calls.map(argv => argv[0]), ['start']);
+  assert.deepEqual(h.calls.map(argv => argv[0]), ['repeat-guard', 'start']);
 });
 
 test('codex_continue without answers returns the source and pending questions without dispatching', async () => {
@@ -2579,7 +2723,7 @@ test('dispatch with a positive wait still returns a DSH background job without w
   assert.match(first.next, /先后台派齐本批独立且不重叠的任务，再留在本轮并行等待[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*返回报告就直接验收[\s\S]*只有摘要、缺内容或截断[\s\S]*job_output\(\{"job_id":"bg1"\}\)[\s\S]*codex_output/);
   assert.doesNotMatch(first.next, /等 DSH 的完成通知|结束本轮/);
   // 到点仍在执行：经任务表等，不直接等 runner；runner 只收到后台循环的查询
-  assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20', '--follow']]);
+  assert.deepEqual(calls.slice(2), [['status', 'J1', '--wait', '20', '--follow']]);
   assert.equal(jobs.started[0].spec.owner, 'S1');
   assert.equal(jobs.started[0].spec.kind, 'codex');
   const again = await tools.codex_status.execute({ job_id: 'J1' }, exec);
@@ -2649,7 +2793,7 @@ test('without a jobs service, a failing start() or an agent, codex_run keeps pol
     assert.equal(value.background_job_id, undefined);
     assert.match(value.note, /等了 5 秒[\s\S]*codex_status/);
     // 照旧直接等 runner wait_seconds 秒
-    assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '5']]);
+    assert.deepEqual(calls.slice(2), [['status', 'J1', '--wait', '5']]);
     const before = nudges.length;
     const claim = [{ type: 'assistant/message', data: { turn: 4, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } }];
     handlers['agent/turn-stopping']({ agent: agentAt('F:\\work\\项目', claim), turn: 4 });
@@ -2820,7 +2964,7 @@ test('codex_status with an explicit wait returns the stored DSH result', async (
   // 结算时这次等待在等：算作已被等到，DSH 不另发通知；结果只交出这一次
   assert.deepEqual(jobs.unawaited, []);
   assert.equal(jobs.read('bg1', 'S1').result, undefined);
-  assert.ok(calls.slice(1).every((a) => a.join(' ') === 'status J1 --wait 20 --follow'));
+  assert.ok(calls.slice(2).every((a) => a.join(' ') === 'status J1 --wait 20 --follow'));
 });
 
 test('codex_status and codex_cancel on a background job wait through DSH, so no second notice is sent', async () => {
@@ -3218,18 +3362,19 @@ test('a run still starting at the deadline returns no undefined fields (DSH need
 
 test('an abort before or during start never leaves Codex running unattended', async () => {
   const jobs = fakeJobs();
-  const { tools, calls } = harness({ jobs });
+  const late = new AbortController();
+  const { tools, calls } = harness({ jobs, config: { startResult: () => {
+    late.abort();
+    return { job_id: 'J1', status: 'running' };
+  } } });
   const exec = { agent: agentAt('F:\\work\\项目') };
   const early = new AbortController();
   early.abort();
   await assert.rejects(tools.codex_run.execute(RUN, { ...exec, signal: early.signal }));
   assert.equal(calls.length, 0);
   // start 还没返回时中止：拿到 job_id 后取消它，不登记后台任务
-  const late = new AbortController();
-  const pending = tools.codex_run.execute(RUN, { ...exec, signal: late.signal });
-  late.abort();
-  await assert.rejects(pending);
-  assert.deepEqual(calls.map((a) => a[0]), ['start', 'cancel']);
+  await assert.rejects(tools.codex_run.execute(RUN, { ...exec, signal: late.signal }));
+  assert.deepEqual(calls.map((a) => a[0]), ['repeat-guard', 'start', 'cancel']);
   assert.equal(jobs.started.length, 0);
 });
 
@@ -3341,7 +3486,8 @@ test('ignoreChanges keeps Python re syntax and displays skipped patterns reporte
     (_cfg, argv) => { argvs.push(argv); return Promise.resolve({ job_id: 'J', status: 'completed', ignore_warnings }); });
   const value = await tools.codex_run.execute({ ...RUN, write: true, cwd: 'F:\\proj' }, {});
   assert.deepEqual(warnings, []);
-  assert.deepEqual(argvs[0].filter((a, i) => argvs[0][i - 1] === '--ignore'), patterns);
+  const start = argvs.find(([cmd]) => cmd === 'start');
+  assert.deepEqual(start.filter((a, i) => start[i - 1] === '--ignore'), patterns);
   assert.equal(guards[0](call('wsl', { command: 'custom-check' })), undefined);
   assert.deepEqual(value.ignore_warnings, ignore_warnings);
   const text = tools.codex_run.output.render({}, value)[0].text;
@@ -3723,7 +3869,7 @@ test('an aborted start or foreground dispatch wait keeps the job id when cancell
     apply({ tools: { register: (t) => { tools[t.name] = t; }, guard: () => {} }, on: () => {} }, {}, run);
     const pending = tools.codex_run.execute({ ...RUN, cwd: 'F:\\proj' }, { signal: stop.signal });
     await assert.rejects(pending, /J7[^\n]*取消未确认[\s\S]*WSL unavailable[\s\S]*codex_status 查询 J7/);
-    assert.deepEqual(calls, phase === 'start' ? ['start', 'cancel'] : ['start', 'status', 'cancel']);
+    assert.deepEqual(calls, phase === 'start' ? ['repeat-guard', 'start', 'cancel'] : ['repeat-guard', 'start', 'status', 'cancel']);
   }
 });
 
@@ -4202,7 +4348,7 @@ test('an aborted start or foreground dispatch wait preserves its job id for ever
         assert.ok(error.message.includes(cancelResult.error ?? cancelResult.status));
         return true;
       });
-      assert.deepEqual(calls, phase === 'start' ? ['start', 'cancel'] : ['start', 'status', 'cancel']);
+      assert.deepEqual(calls, phase === 'start' ? ['repeat-guard', 'start', 'cancel'] : ['repeat-guard', 'start', 'status', 'cancel']);
     }
   }
   for (const result of [{ status: 'cancelled' }, { status: 'completed' }, { status: 'failed', error_kind: 'idle_timeout' }]) {
@@ -4311,7 +4457,7 @@ test('settings warns and defaults each invalid entry without losing valid config
   }
   const valid = harness({ config: { model: 'retained', waitSeconds: 0, codexRoute: null } });
   await valid.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
-  assert.ok(valid.calls[0].includes('retained'));
+  assert.ok(valid.calls.find(([cmd]) => cmd === 'start').includes('retained'));
   const warnings = [];
   apply({ tools: { register: () => {}, guard: () => {} }, on: () => {},
     logger: { warn: text => warnings.push(text) } },
@@ -4380,7 +4526,7 @@ test('optional timeout, retry and storage settings validate numbers and pass onl
     { timeoutSeconds: 7200.5, idleTimeoutSeconds: 1200, retries: 0, lockTimeoutSeconds: 30.5, maxStorageMb: 64.5 }]) {
     const h = harness({ config });
     await h.tools.codex_run.execute({ ...RUN, cwd: '/work' }, {});
-    const argv = h.calls[0];
+    const argv = h.calls.find(([cmd]) => cmd === 'start');
     for (const [key, flag] of Object.entries(keys)) {
       assert.equal(argv.includes(flag), config[key] != null && config[key] !== '', key);
       if (config[key] != null && config[key] !== '') assert.equal(argv[argv.indexOf(flag) + 1], String(config[key]));
@@ -4484,7 +4630,7 @@ test('pending tasks with explicitly null scope retain unrestricted dispatch sema
     const h = harness({ config: { listResult: { jobs: [prior] }, startResult: { job_id: 'J', status: 'completed' } } });
     const value = await h.tools.codex_run.execute({ ...RUN, scope, write: true }, { agent: agentAt(prior.cwd) });
     assert.equal(value.job_id, 'J');
-    assert.deepEqual(h.calls.map(argv => argv[0]), ['list', 'start']);
+    assert.deepEqual(h.calls.map(argv => argv[0]), ['list', 'repeat-guard', 'start']);
   }
 });
 

@@ -2,6 +2,12 @@
 
 [English](#english)
 
+### 0.9.NEXT
+
+新增设置 `repeatFailureGuard`。派单回执、完成通知和多轮汇总显示目录内近期反复失败的步骤，运行状态显示本会话和 runner 的拦截统计。外部条件改变后，`codex_run` 和 `codex_continue` 可用 `rerun_after_change` 说明变化并重跑。
+
+### 已发布版本
+
 `0.9.128` 指令档案按消息来源保存所有非空白人工输入，保留以“继续”或 “continue” 开头的原文。交接链接状态缺失或不可读时暂停自动交接，面板手动交接仍可用。仅大小写不同的链首 ID 使用独立档案，小写 UUID 链沿用原路径。
 
 `0.9.127` 会话交接按链保存人工用户指令原文和时间。交接单保留近期指令，并给出完整档案的路径、条数和时间范围。继任会话在 `plannerReads: products` 下也可读取这一个档案。交接自检查文件和条数，档案写入失败会报告但仍交接。自动交接新增链深度上限 `maxChainDepth` 和链级间隔 `minHoursBetween`，两者默认 6，均可设为 0 关闭相应限制。面板显示拦截原因，手动交接仍可用。
@@ -151,6 +157,12 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+### 0.9.NEXT
+
+Adds the `repeatFailureGuard` setting. Dispatch results, completion notices, and summaries surface standing failures in the task directory. Runtime status reports session and runner block counts. After an external condition changes, `codex_run` and `codex_continue` accept `rerun_after_change` to explain the change and allow a rerun.
+
+### Released versions
 
 `0.9.128` Archives every non-blank human message using its source metadata, including messages that start with “继续” or “continue”. Missing or unreadable link state pauses automatic hand-over and leaves panel hand-over available. Chain roots that differ only in case get separate archives, and lowercase UUID chains keep their original paths.
 

@@ -21,7 +21,8 @@ import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation, previousRoundBrief } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
-const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
+const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS,
+  REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
@@ -68,6 +69,7 @@ const DEFAULTS = {
   timeoutSeconds: null,
   idleTimeoutSeconds: null,
   retries: null,
+  repeatFailureGuard: REPEAT_FAILURE_DEFAULTS,
   lockTimeoutSeconds: null,
   maxStorageMb: null,
   // 同时运行（含排队等写锁）的 Codex 任务数上限；留空不限制
@@ -344,6 +346,10 @@ export function createConductor(cfg, run = runRunner) {
 
   async function start(args, cwd, signal, context) {
     const argv = ['start', '--cwd', cwd];
+    const repeat = cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS;
+    argv.push('--repeat-guard', repeat.enabled ? 'on' : 'off', '--repeat-min-seconds', String(repeat.minSeconds),
+      '--repeat-failures', String(repeat.failures), '--repeat-window-hours', String(repeat.windowHours));
+    if (args.rerun_after_change) argv.push('--allow-rerun');
     const hostAccess = args.host_access ?? (cfg.defaultHostAccess === true);
     const effort = args.effort ?? (context?.verification_of ? undefined : defaultEffort(cfg, args.write));
     if (effort) argv.push('--effort', effort);
@@ -368,7 +374,8 @@ export function createConductor(cfg, run = runRunner) {
     for (const root of args.writable_roots ?? []) argv.push('--writable-root', root);
     // runner 在截取前 300 条改动之前就过滤，改动数和超出 scope 的检查才准
     for (const pattern of cfg.ignoreChanges ?? []) argv.push('--ignore', pattern);
-    const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
+    const task = args.rerun_after_change ? `${args.task.trim()}\n\n## 规划端说明的变化\n${args.rerun_after_change.trim()}` : args.task;
+    const prompt = composePrompt(task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
       ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
@@ -416,10 +423,21 @@ export function createConductor(cfg, run = runRunner) {
 
   const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
   const threadSize = (threadId, signal) => query(['thread-size', threadId], signal);
+  function repeatGuard(cwd, signal) {
+    const argv = ['repeat-guard'];
+    if (cwd) {
+      argv.push('--cwd', cwd);
+      const repeat = cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS;
+      for (const [key, flag] of [['failures', '--repeat-failures'], ['windowHours', '--repeat-window-hours']]) {
+        if (repeat[key] !== REPEAT_FAILURE_DEFAULTS[key]) argv.push(flag, String(repeat[key]));
+      }
+    }
+    return query(argv, signal).catch(() => undefined);
+  }
   const doctor = (signal) => run(cfg, ['doctor'], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   const rollback = (jobId, { check = false } = {}, signal) =>
     run(cfg, ['rollback', jobId, ...(check ? ['--check'] : [])], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
-  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize };
+  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [] } = {}) {
@@ -542,7 +560,7 @@ export function validateRun(args) {
   if (typeof args.write !== 'boolean') {
     throw new Error('codex_run: write 必须是布尔值 true 或 false（不能省略，也不能写成字符串）：要改文件、做修复或建备份传 true，只读调查传 false');
   }
-  for (const k of ['cwd', 'resume', 'effort']) {
+  for (const k of ['cwd', 'resume', 'effort', 'rerun_after_change']) {
     if (args[k] !== undefined && (typeof args[k] !== 'string' || !args[k].trim())) throw new Error(`codex_run: ${k} 必须是非空字符串`);
   }
   if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
@@ -622,6 +640,24 @@ const WAIT_GUIDANCE = '长等前用 wait_seconds: 0 后台派齐本批独立且 
   '留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600），未完则续等。报告直接验收，仅摘要、缺内容或截断时用 job_output 或 codex_output 补读。';
 const waitForJob = (jobId) => `先后台派齐本批独立且不重叠的任务，再留在本轮并行等待：codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
   '仍在跑则续等，返回报告就直接验收，勿零等待轮询或重派。';
+const RERUN_AFTER_CHANGE = { type: 'string', minLength: 1,
+  description: '外部条件已经改变时填写具体变化（例如用户修好了虚拟机），允许本次重新运行此前反复失败的步骤。' };
+const minutes = seconds => Math.round(seconds / 60);
+function repeatStandingLine(standing) {
+  if (!standing?.length) return '';
+  const failures = standing.reduce((sum, step) => sum + step.failures, 0);
+  const seconds = standing.reduce((sum, step) => sum + step.seconds, 0);
+  return `这个目录有 ${standing.length} 个步骤近期反复失败（共 ${failures} 次、约 ${minutes(seconds)} 分钟），环境问题未解决前，依赖它们的工作会被拦下。`;
+}
+function repeatBlockLine(blocks) {
+  if (!blocks?.length) return '';
+  // 整理报告时同一步骤还可能被拦一次，此前的失败只计一份。
+  const prior = [...new Map(blocks.map(block => [block.step, block])).values()];
+  const failures = prior.reduce((sum, block) => sum + block.prior_failures, 0);
+  const seconds = prior.reduce((sum, block) => sum + block.prior_seconds, 0);
+  return `runner 拦下了重复运行同一个失败步骤 ${blocks.length} 次（此前已失败 ${failures} 次、约 ${minutes(seconds)} 分钟）；` +
+    '依赖它的验收项应记 blocked（environment 或 user_input），不要再派同样依赖它的任务；外部情况已经改变时，下一单带 rerun_after_change 写明改变了什么。';
+}
 const SERVICE_FAILURE = new Map([
   ['reconnect_timeout', 'Codex 重连超时'], ['router_down', 'Codex 本地路由不可达'],
   ['idle_timeout', 'Codex 执行空闲超时'], ['transient', '模型服务或连接暂时异常'],
@@ -657,6 +693,11 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   if (value.job_id && unknownState(value)) {
     return `当前未取得可信状态或报告，Codex 任务 ${value.job_id} 可能仍在运行。` +
       `用 codex_jobs 核对正确 job_id；先用 codex_status 查询，不要直接重派。`;
+  }
+  if (value.status === 'failed' && value.error_kind === 'repeated_failure') {
+    return failureReceipt(value, 'runner 拦下了重复失败的步骤（repeated_failure，不自动重试）') +
+      '不要原样重派。可用 codex_review 验收已有结果，把依赖项记为 blocked（environment 或 user_input）。' +
+      '需要继续时先修复环境，外部条件改变后在下一单用 rerun_after_change 写明变化。';
   }
   if (value.status === 'running') {
     if (value.phase === 'lock_wait') return `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。${waitForJob(value.job_id)}需要退出队列时用 codex_cancel，只取消本任务，不要重复派活。`;
@@ -906,7 +947,7 @@ function settings(config, logger) {
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'mcpWriteAllow' ? Array.isArray(value) && value.every(name => typeof name === 'string' && /^mcp__/i.test(name.trim()))
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
-       : ['autoResume', 'autoHandover', 'autoAnswer', 'modelAB'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
+      : ['autoResume', 'autoHandover', 'autoAnswer', 'modelAB', 'repeatFailureGuard'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
@@ -953,6 +994,18 @@ function settings(config, logger) {
           value[0].trim() !== value[1].trim();
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 modelAB.${key}，使用默认值`);
     return [key, valid ? (key === 'models' ? value.map(model => model.trim()) : value) : fallback];
+  }));
+  const repeat = config.repeatFailureGuard;
+  for (const key of Object.keys(repeat)) {
+    if (Object.hasOwn(REPEAT_FAILURE_DEFAULTS, key)) continue;
+    unknownConfig.push(`repeatFailureGuard.${key}`);
+    logger?.warn?.(`[codex-conductor] 未知配置项 repeatFailureGuard.${key} 已忽略，请核对拼写`);
+  }
+  config.repeatFailureGuard = Object.fromEntries(Object.entries(REPEAT_FAILURE_DEFAULTS).map(([key, fallback]) => {
+    const value = repeat[key];
+    const valid = validRepeatFailureField(key, value);
+    if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 repeatFailureGuard.${key}，使用默认值`);
+    return [key, valid ? value : fallback];
   }));
   if (config.gemini) {
     const gemini = config.gemini;
@@ -1453,12 +1506,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 结案验收的结果分类：all_met（全部 met，自标未满足的有依据）、accepted_open（未满足但接受）、rejected_unsupported（缺独立依据被拒），
   // 按会话和总数累计到 closeout-stats.json，codex_runtime 显示。
   const closeoutStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'closeout-stats.json');
-  const countCloseout = (owner, kind, amount = 1) => {
+  const countCloseout = (owner, kind, amount = 1, repeatJobId) => {
     if (!closeoutStatsFile) return;
     try {
       let stats;
       try { stats = JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
       if (!stats || typeof stats !== 'object') stats = { since: new Date().toISOString(), total: {}, sessions: {} };
+      if (repeatJobId) {
+        // 同一笔写入保存任务号和计数，后台通知与热重载重读共用。
+        const counted = stats.repeat_blocked_jobs ??= [];
+        if (counted.includes(repeatJobId)) return;
+        counted.push(repeatJobId);
+      }
       stats.total[kind] = (stats.total[kind] ?? 0) + amount;
       const mine = stats.sessions[owner] ??= {};
       mine[kind] = (mine[kind] ?? 0) + amount;
@@ -1759,10 +1818,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   async function withCompletionNotices(value, exec) {
+    const terminal = ['completed', 'failed', 'cancelled'].includes(value.status) && !unknownState(value);
+    const blockLine = terminal && repeatBlockLine(value.repeat_guard?.blocks);
+    const standingLine = terminal && repeatStandingLine(value.repeat_guard?.standing);
+    const owner = value.context?.owner ?? exec?.agent?.id;
+    if (blockLine && owner && value.job_id) countCloseout(owner, 'repeat_blocked', 1, value.job_id);
     const [result, notices, parked] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
       value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined]);
-    return notices.length || parked ? { ...result, ...(parked ? { parked_review: parked.parked_review } : {}),
-      next: [parked?.line ?? result.next, ...notices].filter(Boolean).join('\n') } : result;
+    return notices.length || parked || blockLine || standingLine ? { ...result, ...(parked ? { parked_review: parked.parked_review } : {}),
+      next: [parked?.line ?? result.next, blockLine, standingLine, ...notices].filter(Boolean).join('\n') } : result;
   }
 
   async function scanAutoVerifications(limit, owner) {
@@ -2219,6 +2283,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
     exec?.signal?.throwIfAborted();
     let started;
+    let standingLine;
     dispatching++;
     dispatchGeneration++;
     if (writer) startingWrites.add(writer);
@@ -2316,6 +2381,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const { resume: _resumed, ...rest } = args;
         args = { ...rest, task: `${fresh.brief}\n\n## 本轮任务（规划端原文）\n${args.task}` };
       }
+      const repeat = await conductor.repeatGuard(cwd, exec?.signal);
+      exec?.signal?.throwIfAborted();
+      if (cfg.repeatFailureGuard.enabled && repeat?.status === 'completed') standingLine = repeatStandingLine(repeat.standing);
+      if (args.rerun_after_change) routing = { ...routing, rerun_after_change: true };
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         ...(args.must_verify?.length ? { must_verify: [...new Set(args.must_verify)] } : {}),
@@ -2345,9 +2414,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       value = withReport(started);
     }
     const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
-    if (!effortLine) return shown;
-    return shown.rendered ? { ...shown, rendered: `${shown.rendered}\n${effortLine}` }
-      : { ...shown, next: [shown.next, effortLine].filter(Boolean).join('\n') };
+    const key = shown.rendered ? 'rendered' : 'next';
+    const lines = [standingLine, effortLine].filter(line => line && !shown[key]?.includes(line));
+    return { ...shown, ...(shown.rendered && standingLine ? { next: standingLine } : {}),
+      ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
   }
 
   const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
@@ -2399,6 +2469,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           '不传时：会话工作区属于配置里带 cwd 的 workspaces 条目，就用那个 cwd，否则用当前会话工作区。' +
           '只在 task 里写目标目录不会切换任务目录，要处理哪个目录就传哪个 cwd。' },
         resume: { type: 'string', description: '仅在继续已有 Codex 会话时填写工具真实返回的 thread_id；新任务省略，不要生成编号或填写 DSH 会话号、job_id。原任务补答阻塞问题时用 codex_continue(job_id)。' },
+        rerun_after_change: RERUN_AFTER_CHANGE,
         fresh: { type: 'boolean', description: '只配合 resume：不传时原线程很大就开新线程（你的任务原文前附上一轮交接内容），否则沿用原线程；true 强制开新线程，false 强制沿用。' },
         verify_previous: { type: 'string', description: '可选：一个已结束任务的 job_id，派这一单的同时只读核验它；这一单可写且写入范围与它的产物或 scope 重叠时拒绝。' },
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
@@ -2645,6 +2716,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       } else if (done.status === 'cancelled') {
         next = done.phase === 'lock_wait' ? nextStep(done, undefined, undefined, cfg)
           : '已按本次调用取消。可写任务可能已改了一部分且没有改动清单，核验或重派前先用 git status 或对比文件确认现状。';
+      } else if (done.error_kind === 'repeated_failure') {
+        next = nextStep(done, undefined, undefined, cfg);
       } else {
         next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
       }
@@ -2799,6 +2872,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       answers: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
       resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
+      rerun_after_change: RERUN_AFTER_CHANGE,
       fresh: { type: 'boolean', description: '不传时由插件决定：不带 answers 且原线程很大时开新线程（附上轮交接内容），否则沿用原线程。' +
         'true 强制开新线程，false 强制沿用原线程；带 answers 的续接默认沿用原线程。' },
       verify_previous: { type: 'string', description: '可选：另一个已结束任务的 job_id，续接的同时只读核验它；续接可写且写入范围与它的产物或 scope 重叠时拒绝。' },
@@ -2811,6 +2885,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!owner) throw continuationError('codex_continue: 当前调用没有会话 ID');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw continuationError('wait_seconds 必须是非负整数');
       if (args.fresh !== undefined && typeof args.fresh !== 'boolean') throw continuationError('fresh 必须是布尔值');
+      if (args.rerun_after_change !== undefined && (typeof args.rerun_after_change !== 'string' || !args.rerun_after_change.trim())) {
+        throw continuationError('rerun_after_change 必须是非空字符串');
+      }
       const key = `${owner}:${args.job_id}`;
       if (continuations.has(key)) return continuations.get(key);
       const pending = (async () => {
@@ -2837,7 +2914,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const thread = await continuationThread(plan, args, exec?.signal);
         if (thread?.mode === 'fresh') delete plan.args.resume;
         const route = retainThreadModel(plan.args, source, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
-        const value = await dispatch({ ...route.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
+        const value = await dispatch({ ...route.args, rerun_after_change: args.rerun_after_change,
+          ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
           exec, plan.continuation, plan.task, undefined, undefined, route.routing);
         const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
         if (verify) {
@@ -2994,6 +3072,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ...value.groups.map((g) =>
         [`${g.thread_id ?? g.group_id} · ${g.total_rounds} 轮 · 最新 ${g.latest_job_id} · 执行 ${g.latest_job?.execution_status ?? g.latest_job?.status ?? 'unknown'} · 独立核验 ${g.verification_status ?? 'unknown'}`,
           `目标：${taskLine(g.latest_job?.context, 160)}`, `最新结果：${g.summary ?? ''}`,
+          ...(g.repeat_guard?.standing?.length ? [repeatStandingLine(g.repeat_guard.standing)] : []),
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
           `已结束轮次耗时合计：${typeof g.finished_duration_s === 'number' ? `${Math.round(g.finished_duration_s)} 秒` : '未知'}；用量（${g.usage_scope}）：${g.usage == null ? '未知（原始用量不完整）' : JSON.stringify(g.usage)}`,
           ...(g.rounds_truncated ? ['只展示最新轮次明细；总轮数、文件集合与耗时按全部匹配记录计算。'] : []),
@@ -3331,12 +3410,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const result = await next();
       const value = history.observe(exec.agent);
       if (result.isError || !value) return result;
-      const ledger = await acceptedOpenLedger(exec.agent?.id, exec.signal);
+      const [ledger, repeat] = await Promise.all([acceptedOpenLedger(exec.agent?.id, exec.signal), conductor.repeatGuard(undefined, exec.signal)]);
       let acceptance;
       try { acceptance = acceptanceStatsFile && JSON.parse(readFileSync(acceptanceStatsFile, 'utf8')); } catch {}
       let closeouts;
       try { closeouts = closeoutStatsFile && JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
       const mineCloseouts = closeouts?.sessions?.[exec.agent?.id] ?? {};
+      const repeatLine = repeat?.status === 'completed' && repeat.totals
+        ? `\n重复失败拦截：本会话 ${mineCloseouts.repeat_blocked ?? 0} 次 / 全部 ${repeat.totals.blocked} 次，估计少花 ${minutes(repeat.totals.seconds_avoided)} 分钟（runner 统计）`
+        : '';
       const parked = exec.agent?.id ? parkedFor(exec.agent.id).length : 0;
       const closeoutLine = closeouts ? `结案验收（自 ${closeouts.since} 起，本会话 / 全部）：全部满足 ${mineCloseouts.all_met ?? 0} / ${closeouts.total.all_met ?? 0}，` +
         `未满足但接受 ${mineCloseouts.accepted_open ?? 0} / ${closeouts.total.accepted_open ?? 0}（其中按 evidence 推定接受原因 ${mineCloseouts.accepted_inferred ?? 0} / ${closeouts.total.accepted_inferred ?? 0}），` +
@@ -3353,7 +3435,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
-          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}\n挂起复核（本会话含前任）：${parked} 单\n${ledgerLine(ledger)}`;
+          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}${repeatLine}\n挂起复核（本会话含前任）：${parked} 单\n${ledgerLine(ledger)}`;
       return { ...result, ...(result.value && typeof result.value === 'object'
         ? { value: { ...result.value, session_history: value, accepted_open_ledger: ledger, parked_reviews: parked, ...(acceptance ? { acceptance_stats: acceptance } : {}),
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),

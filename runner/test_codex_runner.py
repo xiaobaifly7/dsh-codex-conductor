@@ -469,6 +469,9 @@ class RunnerTests(unittest.TestCase):
         _, seed, _, _ = self.repeat_job("seed", self.repeat_step(1, seconds=2, command=r'& "C:\My Scripts\setup1.ps1"'),
                                         options=options)
         self.assertEqual(seed["repeat_guard"]["standing"][0]["failures"], 1)
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd))["standing"], [])
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd), "--repeat-failures", "1",
+                                      "--repeat-window-hours", "0.5")["standing"], seed["repeat_guard"]["standing"])
         _, blocked, _, kills = self.repeat_job("blocked", self.repeat_step(2, None, command="bash D:/other/setup2.ps1"),
                                               [], options=options)
         self.assertEqual((blocked["repeat_guard"]["blocks"][0]["prior_seconds"], kills), (2, 1))
@@ -3196,6 +3199,17 @@ class RunnerTests(unittest.TestCase):
         os.utime(latest / "args.json", (1004, 1004))
         self.assertIsNone(self.control("summary", "--thread-id", "shared-thread")["groups"][0]["usage"])
         self.assertEqual(self.control("summary", "--job-id", "round-4")["groups"][0]["usage"], {"input_tokens": 50})
+
+    def test_summary_exposes_only_the_latest_rounds_repeat_guard(self):
+        standing = [{"step": "ac08ef12", "failures": 2, "seconds": 1584, "last_exit": 1, "last_at": 1795050000}]
+        repeated = {"blocks": [{"step": "ac08ef12", "prior_failures": 2, "prior_seconds": 1584}], "standing": standing}
+        cleared = {"blocks": [], "standing": []}
+        for i, guard in enumerate((repeated, cleared), 1):
+            job = self.stored_job(f"guard-summary-{i}", {"status": "completed", "thread_id": "shared-thread", "repeat_guard": guard})
+            os.utime(job / "args.json", (1000 + i, 1000 + i))
+        self.assertEqual(self.control("summary")["groups"][0]["repeat_guard"], cleared)
+        summary = self.control("summary", "--job-id", "guard-summary-1")
+        self.assertEqual(summary["groups"][0]["repeat_guard"], repeated)
 
     def test_summary_keeps_a_fresh_thread_continuation_in_its_parent_unit_and_sums_usage_per_thread(self):
         parent = self.stored_job("parent", {"status": "completed", "thread_id": "old-thread", "usage": {"input_tokens": 100},

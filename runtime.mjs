@@ -253,6 +253,13 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
     ...(profile_error ? { profile_error_status } : {}), active_tasks: activeTasks, state, can_reload };
 }
 
+export const REPEAT_FAILURE_DEFAULTS = { enabled: true, minSeconds: 60, failures: 2, windowHours: 24 };
+export function validRepeatFailureField(key, value) {
+  if (!Object.hasOwn(REPEAT_FAILURE_DEFAULTS, key)) return false;
+  if (key === 'enabled') return typeof value === 'boolean';
+  return (key === 'failures' ? Number.isSafeInteger(value) : Number.isFinite(value)) && value > 0;
+}
+
 const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
   maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置',
@@ -262,6 +269,7 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   acceptOpenEvidence: '接受未完成项的依据',
   autoVerify: '完成后自动核验',
   effortOverride: '单次推理强度覆盖',
+  repeatFailureGuard: '重复失败拦截设置',
   plannerReadAllow: '额外允许读取的路径' };
 // null clears a limit and restores the runner default.
 const count = (v) => Number.isInteger(v) && v > 0;
@@ -299,6 +307,9 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     } else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
     else if (key === 'autoResume') {
       valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.enabled === 'boolean';
+    } else if (key === 'repeatFailureGuard') {
+      valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
+        Object.entries(v).every(([field, item]) => validRepeatFailureField(field, item));
     } else if (key === 'gemini') {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
         Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
@@ -357,7 +368,7 @@ function settingsEdits(profile, changes) {
   validatePanelSettings(changes, gemini.length === 1 && new RegExp('^' + fieldPad + 'gemini:[ \\t]*(?:#.*)?$').test(gemini[0].text));
   let additions = '';
   for (const [key, value] of Object.entries(changes)) {
-    if (key === 'gemini' || key === 'autoResume') {
+    if (key === 'gemini' || key === 'autoResume' || key === 'repeatFailureGuard') {
       const parents = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
       if (parents.length > 1) throw new Error(`${key} 配置重复，未保存`);
       if (!parents.length) { additions += fresh(key, value, fieldPad); continue; }

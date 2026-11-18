@@ -215,6 +215,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### 任务生命周期
 
+派单前会查询任务目录的重复失败记录，有积存时在回执里提示，独立任务仍可照常派出。完成通知会说明本单拦截和目录中仍存在的重复失败，`codex_summary` 显示各组最新任务记录的状态。收到 `repeated_failure` 时按已有证据验收，把依赖该步骤的条目标为 `blocked`（`environment` 或 `user_input`）。
+
+外部条件确实改变时，可在 `codex_run` 或 `codex_continue` 传入非空字符串 `rerun_after_change`。runner 启动时清除该目录的重复失败计数，执行端任务书会附上变化说明，`context.routing.rerun_after_change` 记录布尔值。续接仍需满足原有条件，包括环境阻塞时所需的 `resolution`。`codex_runtime` 显示本会话观察到拦截的任务数（每单一次）、runner 拦截总次数和估计节省的分钟数。
+
 从 `0.9.121` 起，`codex_run` 提示规划端一单只派一个可独立验收的结果，验收超过 8 条先按共同前置拆单。交付文件或启动会落盘的程序须按授权传 `write=true`，`scope` 列全必写路径。沙箱模式下，额外可写目录用 `writable_roots` 指定。真机、网络和宿主能力写入前置条件，按配置和授权设置 `host_access`。每条验收写结果、正常观测入口和预期值，证据须能在本轮取得。哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，只在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并注明用途。
 
 计划步骤、工具或路径不可用时，Codex 可在原授权内用等价方法验证同一结果，并在 `deviations` 说明替换及等价理由。副作用无法确认、会越权或破坏数据时，停下该步。实测不符记 `not_met`。缺权限、环境、输入或证据无法补采时记 `blocked`，写明缺失的前置。同一前置导致多条未测时，其余条目引用首条。脚本关键观测、清理或恢复失败须以非零状态退出，未运行的步骤不能报通过。
@@ -412,6 +416,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `maxSessionJobs` | 留空（不限制） | 每个会话累计可派的 Codex 任务数上限，须为正整数；达到后不启动 Codex 并说明原因 |
 | `maxSessionTokens` | 留空（不限制） | 每个会话累计的 Codex 用量上限（token，取 runner 汇总的 `total_tokens`，没有时用输入加输出），须为正整数；用量未知的任务不计入 |
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
+| `repeatFailureGuard` | `{ enabled: true, minSeconds: 60, failures: 2, windowHours: 24 }` | 设置面板可编辑。只计用时达到 `minSeconds` 的失败，按任务目录和步骤累计。距最后一次失败不超过 `windowHours` 且计数达到 `failures` 时，runner 拦截再次执行。秒数和小时数须为正有限数字，次数须为正整数。无效字段分别告警并使用默认值。设 `enabled: false` 关闭拦截。 |
 | `closeoutGuard` | `true` | 本会话存在有问题却未复核的有效报告，或尚未结案的 `needs_changes` 时，拒绝开新工作的 `codex_run` 和规划端的 `update_goal(action=complete)`。续接、带 `resume` 的返工、核验、查询和界面操作照常。第一次加载 0.9.122 起新记的返工欠账指向最新轮次，后继轮执行完成并复核为 `verified` 或 `accepted_deviations` 才清账。旧欠账仍按有无后继轮判断。规划端完成 Goal 时，报告干净但未复核的写入任务只提醒。首次加载 0.9.103 前开始的任务不计入，记录读取失败时告警并放行。设 `false` 关闭拦截。 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
@@ -786,6 +791,10 @@ Explain completed work, check results and remaining gaps in plain language. If e
 
 ### Task lifecycle
 
+Before each dispatch, the plugin checks the task directory for standing repeated failures and adds a note to the dispatch result. Independent work can still start. Completion notices show blocks in the job and failures still standing in the directory. `codex_summary` shows the latest job's record for each group. On `repeated_failure`, review the work against the evidence available and mark dependent criteria `blocked` with an `environment` or `user_input` blocker.
+
+After an external condition changes, pass a non-empty `rerun_after_change` string to `codex_run` or `codex_continue`. The runner clears the directory's failure counts at job start, the executor receives the explanation, and `context.routing.rerun_after_change` records a boolean. The usual continuation requirements still apply, including `resolution` for environment blockers. `codex_runtime` reports the session's jobs observed with a block (one count per job), the runner's total block count, and estimated minutes saved.
+
 From `0.9.121`, `codex_run` asks for one independently verifiable outcome per dispatch. If there are more than eight criteria, split the work by shared prerequisites before dispatching. Set `write=true` with authorization for file deliverables or programs that write on startup. List all required write paths in `scope` and use `writable_roots` for extra writable directories in the sandbox. Record real-machine, network and host requirements as prerequisites, and set `host_access` where needed and authorized. Each criterion specifies the outcome, the normal entry point and the expected value. Require evidence obtainable in the current run. Request hashes, checksums, per-file listings, nanosecond timestamps, progress files, or proof of zero writes or outbound transfers throughout only for data integrity, authenticity, backup and recovery, or a security boundary. State the purpose.
 
 If a planned step, tool or path is unavailable, Codex can verify the same outcome by an equivalent method within the original authorization and explain the substitution in `deviations`. Stop a step if its side effects are uncertain or it would exceed authorization or damage data. Report a measured mismatch as `not_met`. Use `blocked` for missing permissions, environment or inputs, or evidence that cannot be collected after the fact. Name the missing prerequisite once and reference the first criterion from others blocked by it. Scripts must exit nonzero if critical observation, cleanup or recovery fails. Report a step as passed only if it ran.
@@ -817,6 +826,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `maxSessionJobs` | Empty (unlimited) | Positive integer limit on the Codex jobs one session may dispatch in total |
 | `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
+| `repeatFailureGuard` | `{ enabled: true, minSeconds: 60, failures: 2, windowHours: 24 }` | Editable in the settings panel. Failed steps lasting at least `minSeconds` count per directory and step. The runner blocks a repeat once the count reaches `failures` and the last failure is within `windowHours`. Seconds and hours must be positive finite numbers, and the count must be a positive integer. Invalid fields warn and fall back individually. Set `enabled: false` to turn off blocking. |
 | `closeoutGuard` | `true` | Refuse new-work `codex_run` and planner `update_goal(action=complete)` while the session has valid flagged reports awaiting review or open `needs_changes` work. Continue, resume, verify, queries and UI actions stay available. For `needs_changes` reviews recorded since 0.9.122 was first loaded, show the latest rework round and keep the debt until a completed successor is reviewed as `verified` or `accepted_deviations`. Earlier rework reviews still need any follow-up. Goal completion warns about clean unreviewed write jobs. Jobs started before the first 0.9.103 load are excluded, and unreadable records fail open with a warning. Set `false` to disable blocking. |
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
 | `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |

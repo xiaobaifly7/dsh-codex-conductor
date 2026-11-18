@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, readdirSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
-const { validatePanelSettings, writeBackedUpFile, queryWithTimeout } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
+const { validatePanelSettings, writeBackedUpFile, queryWithTimeout, REPEAT_FAILURE_DEFAULTS } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { validateRequest, validateSendRequest, validateGoalRequest } = await import(new URL(`./resume.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { validateHandoverRequest, submitHandoverRequest } = await import(new URL(`./handover.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
@@ -120,6 +120,7 @@ export function panelSettings(cfg) {
       ['acceptOpenEvidence', cfg.acceptOpenEvidence ?? 'strict'],
       ['autoVerify', cfg.autoVerify ?? 'flagged'],
       ['effortOverride', cfg.effortOverride ?? 'planner'],
+      ['repeatFailureGuard', cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS],
       ['closeoutGuard', cfg.closeoutGuard !== false],
       // 受护栏会话里出现过、白名单模式下不会放行的工具名；只读，不是设置项。
       ['seenTools', [...(cfg.seenTools ?? [])].sort()]]));

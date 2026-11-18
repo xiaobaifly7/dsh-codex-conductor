@@ -152,7 +152,7 @@ window.__ModuleLoader__.load({
     }
 
     // 嵌套设置在表单里用“父.子”作键。
-    const NESTED = ['gemini', 'autoResume'];
+    const NESTED = ['gemini', 'autoResume', 'repeatFailureGuard'];
     const nestedKey = (key) => NESTED.includes(key.split('.')[0]) && key.includes('.') ? key.split('.') : null;
     const fieldValue = (settings, key) => nestedKey(key)
       ? settings[nestedKey(key)[0]]?.[nestedKey(key)[1]] : settings[key];
@@ -162,6 +162,9 @@ window.__ModuleLoader__.load({
       timeoutSeconds: [(v) => v > 0, '超时秒数请填大于 0 的数字，或留空。'],
       idleTimeoutSeconds: [(v) => v > 0, '超时秒数请填大于 0 的数字，或留空。'],
       retries: [(v) => Number.isInteger(v) && v >= 0, '自动重试次数请填 0 或正整数，或留空。'],
+      'repeatFailureGuard.minSeconds': [(v) => v > 0, '计入失败的最短秒数请填大于 0 的数字。'],
+      'repeatFailureGuard.failures': [(v) => Number.isSafeInteger(v) && v > 0, '触发拦截的失败次数请填正整数。'],
+      'repeatFailureGuard.windowHours': [(v) => v > 0, '重复失败的统计窗口请填大于 0 的小时数。'],
       maxRunningJobs: [(v) => Number.isInteger(v) && v > 0, '同时运行的任务数上限请填正整数，或留空。'],
       lockTimeoutSeconds: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
       maxStorageMb: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
@@ -207,7 +210,7 @@ window.__ModuleLoader__.load({
         } else if (NUMBERS[key]) {
           const [check, message] = NUMBERS[key];
           value = raw == null || String(raw).trim() === '' ? null : Number(raw);
-          if (value !== null && !(Number.isFinite(value) && check(value))) throw new Error(message);
+          if (value === null ? key.startsWith('repeatFailureGuard.') : !(Number.isFinite(value) && check(value))) throw new Error(message);
           if (value === (old ?? null)) continue;
         }
         const nested = nestedKey(key);
@@ -730,6 +733,9 @@ window.__ModuleLoader__.load({
               field('timeoutSeconds', '每次尝试的总超时秒数', 'Codex 的一次尝试最多跑多久；留空表示沿用默认。'),
               field('idleTimeoutSeconds', '空闲超时秒数', 'Codex 多久没有动静就判定卡住；留空表示沿用默认。'),
               field('retries', '自动重试次数', '连接出问题时最多自动重试几次，可填 0；留空表示沿用默认。'),
+              field('repeatFailureGuard.minSeconds', '计入失败的最短秒数', '用时达到此值的失败步骤才计数。'),
+              field('repeatFailureGuard.failures', '触发拦截的失败次数', '同一步骤达到该次数后，再次运行会被拦下。'),
+              field('repeatFailureGuard.windowHours', '重复失败的统计窗口（小时）', '从最后一次失败起保留计数的时长。'),
               field('maxRunningJobs', '同时运行的任务数上限', '达到上限后不再启动新任务；留空表示不限制。'),
               field('lockTimeoutSeconds', '等待其他任务的秒数', '要修改同一目录时，最多等其他任务多久；留空表示不限制，一直等。'),
               field('maxStorageMb', '任务记录占用空间上限（MiB）', '超过上限时会清理最旧的已结束任务记录；留空表示不限制。'),
@@ -759,6 +765,10 @@ window.__ModuleLoader__.load({
                 checked: (Object.hasOwn(edits, 'autoResume.enabled') ? edits['autoResume.enabled'] : editingSettings.autoResume?.enabled) !== false,
                 disabled: !!busy, onChange: (value) => edit('autoResume.enabled', value) }),
               h('small', null, 'Harness 重启后，自动接着做上次被打断的会话。')),
+            h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '拦截重复失败的步骤',
+                checked: (Object.hasOwn(edits, 'repeatFailureGuard.enabled') ? edits['repeatFailureGuard.enabled'] : editingSettings.repeatFailureGuard?.enabled) !== false,
+                disabled: !!busy, onChange: (value) => edit('repeatFailureGuard.enabled', value) })),
             h('div', { className: 'dcc-actions' },
               h(Checkbox, { label: '记录每单的改动 diff', checked: (Object.hasOwn(edits, 'jobDiff') ? edits.jobDiff : editingSettings.jobDiff) === true,
                 disabled: !!busy, onChange: (value) => edit('jobDiff', value) }),

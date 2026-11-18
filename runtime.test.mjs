@@ -93,6 +93,22 @@ test('planner read scope saves both modes and preserves the uneditable whitelist
   assert.match(readFileSync(f.profileFile, 'utf8'), /plannerReads: products/);
 });
 
+test('repeat guard panel settings validate and save a partial nested edit', (t) => {
+  const f = fixture(t);
+  writeFileSync(f.profileFile, profile(f.moduleUrl));
+  const changes = { repeatFailureGuard: { enabled: false, failures: 3, minSeconds: 30.5, windowHours: 2 } };
+  saveRuntimeSettings({ ...f, changes });
+  const previous = readFileSync(f.profileFile, 'utf8');
+  assert.match(previous, /repeatFailureGuard:\n +enabled: false\n +failures: 3\n +minSeconds: 30\.5\n +windowHours: 2/);
+  saveRuntimeSettings({ ...f, changes: { repeatFailureGuard: { windowHours: 0.5 } } });
+  const edited = previous.replace('windowHours: 2', 'windowHours: 0.5');
+  assert.equal(readFileSync(f.profileFile, 'utf8'), edited);
+  for (const invalid of [{ foo: 1 }, { enabled: 1 }, { failures: 1.5 }, { minSeconds: 0 }, { windowHours: Infinity }]) {
+    assert.throws(() => saveRuntimeSettings({ ...f, changes: { repeatFailureGuard: invalid } }), /重复失败拦截设置无效/);
+    assert.equal(readFileSync(f.profileFile, 'utf8'), edited);
+  }
+});
+
 test('panel settings reject invalid values and unsupported YAML without changing the file', (t) => {
   const f = fixture(t);
   const text = `plugins:\n  - id: ${oldId}\n    name: ${f.moduleUrl}\n    config:\n      model: old\n`;

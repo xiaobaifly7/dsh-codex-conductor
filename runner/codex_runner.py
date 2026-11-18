@@ -2311,6 +2311,7 @@ def summarize_jobs(args):
                        "latest_job_id": latest["job_id"],
                        "latest_job": {k: latest.get(k) for k in ("job_id", "thread_id", "parent_job_id", "status",
                                       "execution_status", "review_status", "report_status", "blocking", "context")},
+                       "repeat_guard": latest.get("repeat_guard", {"blocks": [], "standing": []}),
                        "summary": report.get("summary"), "verification_status": latest.get("verification_status"),
                        "verification": verification, "open_items": open_items, "accepted_open": accepted_open, "files_changed": files,
                        "finished_duration_s": round(sum(durations), 1) if all(type(d) in (int, float) for d in durations) else None,
@@ -2620,7 +2621,10 @@ def main():
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
     sub.add_parser("thread-size").add_argument("thread_id")
-    sub.add_parser("repeat-guard").add_argument("--cwd", default=os.getcwd())
+    repeat_guard = sub.add_parser("repeat-guard")
+    repeat_guard.add_argument("--cwd", default=os.getcwd())
+    repeat_guard.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
+    repeat_guard.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
     for command in (listing, summary):
@@ -2679,7 +2683,7 @@ def main():
         return
     if args.command == "repeat-guard":
         try:
-            totals, standing = RepeatGuard(args.cwd, {}).snapshot()
+            totals, standing = RepeatGuard(args.cwd, vars(args)).snapshot()
             emit({"status": "completed", "totals": totals, "standing": standing})
         except (OSError, ValueError, TypeError, KeyError) as e:
             emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
