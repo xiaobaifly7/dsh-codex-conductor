@@ -5511,7 +5511,7 @@ test('codex_review accepts an open criterion kept under accepted_deviations with
   parent.structured.blockers = [];
   const args = { job_id: 'PARENT', status: 'accepted_deviations', criteria: [{ index: 1, status: 'blocked', evidence: '仍缺权限，本期不做' }] };
   const run = (plannerAnswers) => {
-    const h = harness({ config: { plannerAnswers, listResult: { jobs: [], total: 0 }, reviewResult: {
+    const h = harness({ config: { plannerAnswers, acceptOpenEvidence: 'off', listResult: { jobs: [], total: 0 }, reviewResult: {
       ...parent, verification_status: 'accepted_deviations', verification: { time: now + 101 } } } });
     h.finals.PARENT = parent;
     return { h, call: h.tools.codex_review.execute(args, { agent: agentAt('/work/current') }) };
@@ -5947,8 +5947,8 @@ test('codex_review finds independent support in a later verification, a later ro
   assert.equal((await run({ log: [reply] })).verification_status, 'verified');
   // 未满足但接受：保留 blocked 并写 accepted；plannerAnswers 关闭且没有用户回复时，与接受偏差同一道确认拦下。
   const acceptOpen = { job_id: 'PARENT', status: 'accepted_deviations', criteria: [{ index: 1, status: 'blocked', evidence: '仍缺权限', accepted: '本期不做' }] };
-  assert.equal((await run({ args: acceptOpen })).verification_status, 'accepted_deviations');
-  await assert.rejects(run({ args: acceptOpen, config: { plannerAnswers: false } }), /尚未收到作业结束后的用户确认/);
+  assert.equal((await run({ args: acceptOpen, config: { acceptOpenEvidence: 'off' } })).verification_status, 'accepted_deviations');
+  await assert.rejects(run({ args: acceptOpen, config: { plannerAnswers: false, acceptOpenEvidence: 'off' } }), /尚未收到作业结束后的用户确认/);
   // closeoutEvidence=planner / off：自己的证据即可。
   assert.equal((await run({ config: { closeoutEvidence: 'planner' } })).verification_status, 'verified');
   const after = stats();
@@ -6135,6 +6135,104 @@ const runnerFixture = (name) => JSON.parse(readFileSync(new URL(`./fixtures/${na
 const acceptedFixture = () => runnerFixture('runner-status-c0874f');
 const fixtureReview = ({ job_id, verification: { criteria, status, notes, accepted_deviations } }) =>
   ({ job_id, criteria, status, notes, accepted_deviations });
+
+function acceptedFixtureHarness(t) {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-accepted-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const state = path.join(root, 'dsh-codex-conductor');
+  mkdirSync(state, { recursive: true });
+  const source = acceptedFixture();
+  const cutoff = path.join(state, 'accept-open-evidence-since.json');
+  writeFileSync(cutoff, JSON.stringify({ since: source.finished_at - 1 }));
+  const make = (config) => {
+    const previous = process.env.LOCALAPPDATA;
+    process.env.LOCALAPPDATA = root;
+    try {
+      const h = harness({ config });
+      h.finals[source.job_id] = source;
+      return h;
+    } finally { process.env.LOCALAPPDATA = previous; }
+  };
+  return { source, cutoff, state, make };
+}
+
+test('release A: flagged open entries require support and show any running verification', async (t) => {
+  const { source, make, cutoff, state } = acceptedFixtureHarness(t);
+  const { job_id: id, finished_at } = source;
+  const listed = runnerFixture('runner-list-row-c0874f');
+  const ongoing = { job_id: 'VERIFY', execution_status: 'running', context: { owner: 'S1', verification_of: id } };
+  const review = fixtureReview(source);
+  const exec = { agent: agentAt('/work/current') };
+  const h = make({ plannerAnswers: true, listResult: { jobs: [listed, ongoing] }, reviewResult: source });
+  await assert.rejects(h.tools.codex_review.execute(review, exec), ({ message }) => {
+    assert.equal(message.match(/核验 VERIFY 正在跑，等它结束再记；Codex 报告第 \d 条为 blocked/g)?.length, 4);
+    assert.ok(message.includes(`② codex_continue ${id} 再试一次这一条；③ 作业结束后用户的确认；④ 改记 needs_changes`));
+    assert.ok(message.includes('可直接修改后提交的骨架'));
+    return true;
+  });
+  assert.equal(h.calls.filter(argv => argv[0] === 'list').length, 1);
+  assert.equal(h.calls.filter(argv => argv[0] === 'review').length, 0);
+  assert.equal(JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8')).total.rejected_open_unsupported, 1);
+
+  const run = (config = {}) => {
+    const other = make({ plannerAnswers: true, closeoutEvidence: 'off', reviewResult: source, ...config });
+    return other.tools.codex_review.execute(review, exec);
+  };
+  await assert.rejects(run({ acceptOpenEvidence: 'invalid' }), /接受它未满足需要依据/);
+  assert.equal((await run({ acceptOpenEvidence: 'off' })).verification_status, 'accepted_deviations');
+  writeFileSync(cutoff, JSON.stringify({ since: finished_at + 1 }));
+  assert.equal((await run()).verification_status, 'accepted_deviations');
+  assert.equal(JSON.parse(readFileSync(cutoff, 'utf8')).since, finished_at + 1);
+});
+
+test('release A: strict and relaxed distinguish verification, later rounds, user blockers and user replies', async (t) => {
+  const { source, make } = acceptedFixtureHarness(t);
+  const { job_id: id, finished_at } = source;
+  const review = fixtureReview(source);
+  review.criteria[0] = { ...review.criteria[0], accepted: undefined, status: 'not_met' };
+  source.structured.criteria[0].status = 'not_met';
+  const listed = runnerFixture('runner-list-row-c0874f');
+  const later = { ...listed, job_id: 'LATER', parent_job_id: id, started_at: finished_at + 1, finished_at: finished_at + 2 };
+  const items = source.context.acceptance.slice(0, 4).map((text, i) => `原验收第 ${i + 1} 条（原报告标 blocked）：${text}`);
+  const v = { ...later, job_id: 'VERIFY', parent_job_id: null, context: { owner: 'S1', verification_of: 'LATER' } };
+  const full = (acceptance, criteria, context = {}) => ({ ...source, context: { ...source.context, ...context, acceptance },
+    structured: { ...source.structured, criteria } });
+  const run = ({ jobs = [], config = {}, log = [], reportRows = items } = {}) => {
+    const h = make({ plannerAnswers: true, closeoutEvidence: 'off', listResult: { jobs: [listed, ...jobs] },
+      reviewResult: { ...source, verification: { ...source.verification, time: source.verification.time + 1 } }, ...config });
+    h.finals.LATER = full(source.context.acceptance, source.structured.criteria);
+    h.finals.VERIFY = full(items, reportRows.map(criterion => ({ criterion, status: 'blocked', evidence: '仍未实现' })), v.context);
+    return h.tools.codex_review.execute(review, { agent: agentAt('/work/current', log) });
+  };
+  await assert.rejects(run({ jobs: [later] }), ({ message }) =>
+    message.includes('共 1 处问题') && message.includes('第 1 条为 not_met') && !message.includes('② codex_continue'));
+  assert.equal((await run({ jobs: [later], config: { acceptOpenEvidence: 'relaxed' } })).verification_status, 'accepted_deviations');
+  await assert.rejects(run({ jobs: [later, v], reportRows: items.slice(1) }), /第 1 条为 not_met/);
+  assert.ok((await run({ jobs: [later, v] })).review_fixes.some(line => line.includes('视为接受未满足')));
+  source.structured.blockers[0].kind = 'task_conflict';
+  assert.equal((await run({ config: { acceptOpenEvidence: 'relaxed' } })).verification_status, 'accepted_deviations');
+  await assert.rejects(run(), /第 1 条为 not_met/);
+  const human = { type: 'user/message', time: (finished_at + 60) * 1000,
+    data: { source: { kind: 'user' }, content: [{ type: 'text', text: '确认接受这几项' }] } };
+  assert.equal((await run({ log: [human], config: { plannerAnswers: false } })).verification_status, 'accepted_deviations');
+  // must_verify 上原报告标 met，规划端降级时免查。
+  source.context.must_verify = [1];
+  source.structured.criteria[0].status = 'met';
+  assert.equal((await run()).verification_status, 'accepted_deviations');
+  // 报告省掉必验项，并留了一条对不上清单的报告行，只接受映射到这两项的核验。
+  source.structured.blockers[0].kind = 'implementation';
+  source.structured.criteria.forEach((criterion, i) => { criterion.criterion = source.context.acceptance[i]; });
+  source.structured.criteria.splice(0, 1);
+  source.structured.criteria.push({ criterion: '额外检查', status: 'blocked', evidence: '受阻' });
+  // 条数相等时会按位置对应，所以另加一个可按原文匹配的 met 行。
+  source.structured.criteria.push(source.structured.criteria[7]);
+  review.report_rows = [{ row: 9, status: 'blocked', evidence: '受阻', accepted: '接受未完成' }];
+  await assert.rejects(run(), ({ message }) =>
+    message.includes('报告第 1 条为 not_met') && message.includes('报告第 9 行（对不上验收清单）为 blocked'));
+  items[0] = `原验收第 1 条（必须实测）：${source.context.acceptance[0]}`;
+  items.push('原报告第 9 行（原报告标 blocked，未对上原验收清单）：额外检查');
+  assert.equal((await run({ jobs: [later, v] })).verification_status, 'accepted_deviations');
+});
 
 test('release E: closeout counts only a fresh, successful review of a real runner record', async () => {
   const source = acceptedFixture();

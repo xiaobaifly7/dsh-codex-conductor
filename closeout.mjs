@@ -196,6 +196,31 @@ export function prepareReview(args, source) {
   for (const { index } of missingMeasured) {
     problems.push(`验收第 ${index} 条（must_verify）记 met 缺少独立实测依据。先对 ${source.job_id} 派 codex_verify，回查运行证据或实际观测，核验判 met 后再记`);
   }
+  const acceptedOpen = [];
+  let openUnsupported = 0;
+  if (review.status === 'accepted_deviations') {
+    const flagged = new Map(flaggedCriteria(source).map(f => [f.key, f]));
+    const required = new Set(mustVerifyCriteria(source).map(f => f.key));
+    for (const c of [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]) {
+      if (!c || !['blocked', 'not_met'].includes(c.status) || !nonempty(c.accepted) || placeholder(c.accepted)) continue;
+      const key = c.row ? `row${c.row}` : String(c.index);
+      const kinds = source?.openSupport?.[key] ?? [];
+      acceptedOpen.push({ key, ...(c.row ? { row: c.row } : { index: c.index }), status: c.status, support: kinds });
+      if (!source?.openLevel || source.openLevel === 'off') continue;
+      const flag = flagged.get(key);
+      const original = flag?.status ?? reportRowOf(acceptance, source.structured?.criteria, c.index)?.status;
+      if (original === 'met' || (!flag && !required.has(key))) continue;
+      const strict = source.openLevel === 'strict' && c.status === 'not_met';
+      if (strict ? kinds.some(kind => kind === 'verification' || kind === 'user') : kinds.length) continue;
+      openUnsupported++;
+      const where = c.row ? `报告第 ${c.row} 行（对不上验收清单）` : `报告第 ${c.index} 条`;
+      const running = source.runningVerification ? `核验 ${source.runningVerification} 正在跑，等它结束再记；` : '';
+      problems.push(running + `Codex ${where}为 ${original ?? c.status}，accepted_deviations 接受它未满足需要依据（规划端判断不算）：` +
+        `① ${deferralPath([source.job_id])}，核验看过这一条后再记；` +
+        (strict ? '' : `② codex_continue ${source.job_id} 再试一次这一条；`) +
+        '③ 作业结束后用户的确认；④ 改记 needs_changes');
+    }
+  }
   if (review.status === 'verified') problems.push(...unaddressed(review, source, acceptance));
   // accepted 的占位已在上面单独提示。
   const withoutAccepted = (list) => (Array.isArray(list) ? list.map((c) => (c && typeof c === 'object' ? { ...c, accepted: undefined } : c)) : list);
@@ -207,7 +232,8 @@ export function prepareReview(args, source) {
     problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met' +
       (extraRows.length ? `（对不上验收清单的报告第 ${extraRows.map((f) => f.row).join('、')} 行在 report_rows 标）` : '') + ' 或加 blocker');
   }
-  return { review, fixed, problems, unsupported: (level === 'independent' ? missing.length : 0) + missingMeasured.length, inferred };
+  return { review, fixed, problems, unsupported: (level === 'independent' ? missing.length : 0) + missingMeasured.length,
+    inferred, acceptedOpen, openUnsupported };
 }
 
 // 报告自标 blocked / not_met、结案结论却记成 met 的条目。independent：需要独立依据（source.support[index]：
@@ -423,3 +449,9 @@ export const verifyCriterionItem = ({ index, row, status, criterion, mustVerify 
   '——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。';
 export const VERIFY_ITEM = /^原验收第 (\d+) 条（(?:原报告标 |必须实测）)/;
 export const VERIFY_ROW = /^原报告第 (\d+) 行（原报告标 /;
+export function verificationItemKey(item) {
+  const index = VERIFY_ITEM.exec(item);
+  if (index) return index[1];
+  const row = VERIFY_ROW.exec(item);
+  return row ? `row${row[1]}` : undefined;
+}

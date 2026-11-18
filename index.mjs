@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, VERIFY_ITEM, VERIFY_ROW, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -80,6 +80,7 @@ const DEFAULTS = {
   // 结案（verified / accepted_deviations）时，原报告自标 blocked / not_met 的条目记成 met 需要什么依据：
   // independent 需独立依据（核验任务、后续轮次或用户确认）；planner 规划端自己的非照抄证据即可；off 不查
   closeoutEvidence: 'independent',
+  acceptOpenEvidence: 'strict',
   // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
   continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
@@ -891,6 +892,7 @@ function settings(config, logger) {
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
       : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
+      : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
@@ -1017,63 +1019,86 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     Date.now() / 1000, 'closeout-evidence-since.json');
   const reworkFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     Date.now() / 1000, 'closeout-rework-since.json');
-  const evidenceLevel = (source) => {
-    const level = cfg.closeoutEvidence ?? 'independent';
-    if (level !== 'independent') return level;
-    // runner status 现在带 finished_at（0.9.114 时没有，规则因此一直退成 planner）。
-    if (Number.isFinite(source.finished_at)) return source.finished_at >= evidenceFrom ? 'independent' : 'planner';
+  const acceptOpenFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+    Date.now() / 1000, 'accept-open-evidence-since.json');
+  const beforeCutoff = (source, since) => {
+    if (Number.isFinite(source.finished_at)) return source.finished_at < since;
     // 拿不到结束时间时看任务号里的开始时间（runner 所在系统的本地时间，时区不定，按 ±14 小时取界）：
-    // 只有最晚也早于截止时间的才按旧规则，新任务和说不准的都按 independent。
+    // 只有最晚也早于截止时间的才按旧规则。
     const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/.exec(String(source.job_id ?? ''));
     const started = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000 : undefined;
-    return started !== undefined && started + 14 * 3600 < evidenceFrom ? 'planner' : 'independent';
+    return started !== undefined && started + 14 * 3600 < since;
   };
+  const evidenceLevel = (source) => cfg.closeoutEvidence === 'independent' && beforeCutoff(source, evidenceFrom)
+    ? 'planner' : cfg.closeoutEvidence;
   // 原报告自标未满足的条目各有哪些独立依据：晚于这一轮结束、核验本单元的核验任务判这一条 met；同一单元的后续轮次报告这一条 met；
   // 原会话用户在作业结束后有过真实回复（与 accepted_deviations 的用户确认同一判定，但不因 plannerAnswers 放宽）。
   const openAccepted = (review) => [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]
     .some((c) => typeof c?.accepted === 'string' && c.accepted.trim());
-  async function criterionSupport(source, owner, log, signal) {
+  async function criterionSupport(source, owner, log, signal, checkOpen) {
     const flagged = flaggedCriteria(source);
     const required = mustVerifyCriteria(source);
     const support = {};
-    if (!flagged.length && !required.length) return support;
-    const add = (index, kind) => { (support[index] ??= []).includes(kind) || support[index].push(kind); };
-    if (hasUserReply(log, source, owner, cfg.autoResume.message)) for (const f of flagged) add(f.key, 'user');
+    const openSupport = {};
+    const openTargets = checkOpen ? new Map([...required, ...flagged].map(f => [f.key, f])) : new Map();
+    if (!flagged.length && !required.length) return { support, openSupport };
+    const add = (map, key, kind) => { (map[key] ??= []).includes(kind) || map[key].push(kind); };
+    if (hasUserReply(log, source, owner, cfg.autoResume.message)) {
+      for (const f of flagged) add(support, f.key, 'user');
+      for (const key of openTargets.keys()) add(openSupport, key, 'user');
+    }
+    if (checkOpen && Array.isArray(source.structured?.blockers) &&
+        source.structured.blockers.some(b => ['user_input', 'task_conflict'].includes(b?.kind)) && canAnswer(log, source, owner)) {
+      for (const key of openTargets.keys()) add(openSupport, key, 'user_blocker');
+    }
     const jobs = [];
     const from = Number.isFinite(source.started_at) ? source.started_at : evidenceFrom;
+    const lookup = (request) => request.catch(() => { signal?.throwIfAborted(); });
     for (let offset = 0; offset !== null && offset < 500;) {
-      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [from, Date.now() / 1000 + 86_400], limit: 100, offset }, signal);
-      if (!Array.isArray(page.jobs)) break;
+      const page = await lookup(conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [from, Date.now() / 1000 + 86_400], limit: 100, offset }, signal));
+      if (page?.error_kind || !Array.isArray(page?.jobs)) break;
       jobs.push(...page.jobs);
       offset = page.next_offset ?? null;
     }
     const unit = new Set([source.job_id]);
-    for (const job of [...jobs].sort((a, b) => (a.started_at ?? 0) - (b.started_at ?? 0))) if (unit.has(job.parent_job_id)) unit.add(job.job_id);
+    for (const job of [...jobs].sort((a, b) => (a.started_at ?? 0) - (b.started_at ?? 0))) {
+      if (!job.context?.verification_of && unit.has(job.parent_job_id)) unit.add(job.job_id);
+    }
+    const runningVerification = checkOpen ? jobs.find(job =>
+      job.execution_status === 'running' && job.context?.verification_of === source.job_id)?.job_id : undefined;
     const later = jobs.filter((job) => job.job_id !== source.job_id && job.execution_status === 'completed' &&
-      job.finished_at > (source.finished_at ?? 0) && (unit.has(job.parent_job_id) || unit.has(job.context?.verification_of)));
+      job.finished_at > (source.finished_at ?? 0) &&
+      (job.context?.verification_of ? unit.has(job.context.verification_of) : unit.has(job.job_id)));
     for (const job of later.slice(0, 10)) {
-      const full = await conductor.waitJob(job.job_id, 0, signal);
+      const full = await lookup(conductor.waitJob(job.job_id, 0, signal));
+      if (!full) continue;
       const report = full.structured;
       const acceptance = full.context?.acceptance;
-      if (!validReport(report) || !Array.isArray(acceptance)) continue;
+      if (full.error_kind || !validReport(report) || !Array.isArray(acceptance)) continue;
       // 报告行按条文或（条数相同时）位置对应验收项；对不上的行不当作任何一条的结论。
       if (full.context?.verification_of) {
         acceptance.forEach((item, i) => {
-          const m = VERIFY_ITEM.exec(item) ?? VERIFY_ROW.exec(item);
-          const key = m && (m[0].startsWith('原验收') ? String(m[1]) : `row${m[1]}`);
-          const row = m && reportRowOf(acceptance, report.criteria, i + 1);
+          const key = verificationItemKey(item);
+          const row = key && reportRowOf(acceptance, report.criteria, i + 1);
+          if (row && openTargets.has(key)) add(openSupport, key, 'verification');
           if (row?.status !== 'met') return;
-          if (flagged.some(f => f.key === key)) add(key, 'verification');
-          if (row.evidence.trim() && required.some(f => f.key === key && verifyCriterionItem(f) === item)) add(key, 'must_verify');
+          if (flagged.some(f => f.key === key)) add(support, key, 'verification');
+          if (row.evidence.trim() && required.some(f => f.key === key && verifyCriterionItem(f) === item)) add(support, key, 'must_verify');
         });
       } else {
         for (const f of flagged) {
           const i = acceptance.findIndex((a) => a.trim() === String(f.criterion ?? '').trim());
-          if (i >= 0 && reportRowOf(acceptance, report.criteria, i + 1)?.status === 'met') add(f.key, 'later_round');
+          if (i >= 0 && reportRowOf(acceptance, report.criteria, i + 1)?.status === 'met') add(support, f.key, 'later_round');
+        }
+        for (const f of openTargets.values()) {
+          const i = acceptance.indexOf(f.criterion);
+          if (i >= 0 && ['not_met', 'blocked'].includes(reportRowOf(acceptance, report.criteria, i + 1)?.status)) {
+            add(openSupport, f.key, 'later_round');
+          }
         }
       }
     }
-    return support;
+    return { support, openSupport, runningVerification };
   }
   const statusQueries = new Map();
   function dampenStatus(value, exec, tool, seconds = 0) {
@@ -2240,21 +2265,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
       const level = evidenceLevel(source);
-      let support = {};
-      if ((level === 'independent' || source.context?.must_verify?.length) && ['verified', 'accepted_deviations'].includes(args?.status)) {
-        try { support = await criterionSupport(source, owner, exec.agent.session?.log ?? [], exec?.signal); } catch { exec?.signal?.throwIfAborted(); }
+      const openLevel = beforeCutoff(source, acceptOpenFrom) ? 'off' : cfg.acceptOpenEvidence;
+      const checkOpen = openLevel !== 'off' && args.status === 'accepted_deviations';
+      let supports;
+      if ((checkOpen || level === 'independent' || source.context?.must_verify?.length) && ['verified', 'accepted_deviations'].includes(args.status)) {
+        try { supports = await criterionSupport(source, owner, exec.agent.session?.log ?? [], exec?.signal, checkOpen); } catch { exec?.signal?.throwIfAborted(); }
       }
-      const prepared = prepareReview(args, { ...source, evidenceLevel: level, support });
+      const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, ...supports });
       const { review } = prepared;
       // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
       // “未满足但接受”的条目与接受偏差同一道用户确认。
-      if (((Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0) ||
+      if (!prepared.openUnsupported && ((Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0) ||
           openAccepted(review)) &&
           !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
       if (prepared.problems.length) {
         if (prepared.unsupported) countCloseout(owner, 'rejected_unsupported');
+        if (prepared.openUnsupported) countCloseout(owner, 'rejected_open_unsupported');
         throw new Error(reviewRejection(job_id, source, prepared));
       }
       const result = await conductor.review(job_id, review, owner, exec?.signal);
@@ -2596,9 +2624,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const closeoutLine = closeouts ? `结案验收（自 ${closeouts.since} 起，本会话 / 全部）：全部满足 ${mineCloseouts.all_met ?? 0} / ${closeouts.total.all_met ?? 0}，` +
         `未满足但接受 ${mineCloseouts.accepted_open ?? 0} / ${closeouts.total.accepted_open ?? 0}（其中按 evidence 推定接受原因 ${mineCloseouts.accepted_inferred ?? 0} / ${closeouts.total.accepted_inferred ?? 0}），` +
         `缺独立依据被拒 ${mineCloseouts.rejected_unsupported ?? 0} / ${closeouts.total.rejected_unsupported ?? 0}，` +
+        `接受未完成项缺依据被拒 ${mineCloseouts.rejected_open_unsupported ?? 0} / ${closeouts.total.rejected_open_unsupported ?? 0}，` +
         `自标未满足按 planner 级别记 met ${mineCloseouts.met_planner_level ?? 0} / ${closeouts.total.met_planner_level ?? 0}；` +
         `核验中放行新任务 ${mineCloseouts.deferred_dispatch ?? 0} / ${closeouts.total.deferred_dispatch ?? 0}；` +
-        `closeoutEvidence=${cfg.closeoutEvidence}` : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}`;
+        `closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`
+        : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}，acceptOpenEvidence=${cfg.acceptOpenEvidence}`;
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
