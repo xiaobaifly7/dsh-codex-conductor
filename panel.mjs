@@ -124,7 +124,8 @@ export function panelSettings(cfg) {
 
 // No runner commands come from HTTP input; file names from HTTP are only matched against fixed directory listings.
 export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerInjected = false, executorFile, geminiHistoryFile,
-  history = () => null, handover = () => null, answerHandover, selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
+  history = () => null, handover = () => null, answerHandover, autoAnswer,
+  selftestDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') }) {
   let saving = false;
   const selftests = new Map();
   const promptFile = (kind = 'planner') => {
@@ -142,7 +143,7 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       '/cancel': ['POST'], '/rollback': ['POST'], '/prompt': ['GET', 'POST'], '/prompt/backups': ['GET'], '/prompt/backup': ['GET'], '/reload': ['POST'],
       '/doctor': ['GET'], '/gemini': ['GET'], '/session/send': ['POST'], '/session/resume': ['POST'], '/session/goal': ['POST'],
       '/session/results': ['GET'], '/selftest/request': ['GET'], '/selftest/result': ['POST'],
-      '/handover/request': ['POST'], '/handover/answer': ['POST'] };
+      '/handover/request': ['POST'], '/handover/answer': ['POST'], '/auto-answer/action': ['POST'] };
     if (!pathname.startsWith(PANEL_PATH + '/') || !known[route]) throw bad('找不到这个功能，请刷新面板后重试。', 404);
     if (!known[route].includes(method)) throw bad('打开方式不正确，请使用面板上的按钮重试。', 405);
     const allowedQuery = { '/jobs': ['filter', 'offset', 'q'], '/output': ['job_id', 'offset', 'limit', 'artifact'],
@@ -151,7 +152,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
     if (method === 'POST' && route !== '/settings' && route !== '/selftest/result') object(body, { '/prompt': ['text', 'kind'],
       '/cancel': ['job_id', 'confirm'], '/rollback': ['job_id', 'confirm', 'check'], '/settings/apply': ['changes', 'confirm'], '/session/send': ['sessionId', 'message', 'queue'],
       '/session/resume': ['sessions', 'message'], '/session/goal': ['sessionId', 'objective', 'maxGoalRounds'],
-      '/handover/request': ['sessionId', 'note', 'revert', 'force'], '/handover/answer': ['sessionId', 'accept'] }[route] ?? []);
+      '/handover/request': ['sessionId', 'note', 'revert', 'force'], '/handover/answer': ['sessionId', 'accept'],
+      '/auto-answer/action': ['id', 'action'] }[route] ?? []);
     if (route === '/selftest/request') {
       if (!selftestDirectory) return { request: null };
       const claim = randomUUID();
@@ -185,7 +187,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
       return { saved: true };
     }
     if (route === '/status') {
-      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg), history: history(), handover: handover() };
+      return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg),
+        history: history(), handover: handover(), ...(autoAnswer && { autoAnswer: autoAnswer.snapshot() }) };
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;
@@ -311,6 +314,13 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
         try { return JSON.parse(readFileSync(path.join(selftestDirectory, `${name}-result.json`), 'utf8')); } catch { return null; }
       };
       return Object.fromEntries(['send', 'resume', 'goal', 'autoresume'].map((name) => [name, selftestDirectory ? read(name) : null]));
+    }
+    if (route === '/auto-answer/action') {
+      if (typeof body.id !== 'string' || !/^[a-f0-9-]{36}$/.test(body.id) || !['answer', 'manual'].includes(body.action)) {
+        throw bad('提问编号或操作不正确，请刷新面板后重试。');
+      }
+      if (!await autoAnswer?.act(body.id, body.action)) throw bad('这条提问已处理或需要你亲自回答，请刷新面板。', 409);
+      return { autoAnswer: autoAnswer.snapshot() };
     }
     if (route === '/handover/request' || route === '/handover/answer') {
       if (!selftestDirectory) throw bad('当前环境没有本机请求目录，无法提交交接，请检查 DSH 的本地数据目录后重试。', 409);

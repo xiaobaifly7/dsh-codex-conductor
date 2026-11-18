@@ -5,7 +5,7 @@ import path from 'node:path';
 
 export const validSessionId = (id) => typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
 
-function writeTextAtomic(file, text) {
+export function writeTextAtomic(file, text) {
   const temporary = `${file}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(temporary, text);

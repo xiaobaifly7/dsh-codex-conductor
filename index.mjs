@@ -27,6 +27,7 @@ const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, impor
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
@@ -80,6 +81,7 @@ const DEFAULTS = {
   continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
   autoHandover: AUTO_HANDOVER_DEFAULTS,
+  autoAnswer: AUTO_ANSWER_DEFAULTS,
   maxSessionTokens: null,
   // 可写任务在 git 仓库里记录本单改动的 diff（可回滚）；false 关闭
   jobDiff: true,
@@ -857,7 +859,7 @@ function settings(config, logger) {
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
-      : ['autoResume', 'autoHandover'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
+       : ['autoResume', 'autoHandover', 'autoAnswer'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
@@ -887,6 +889,7 @@ function settings(config, logger) {
     return [key, valid ? value : fallback];
   }));
   if (unknownConfig.some((key) => key.startsWith('autoHandover.'))) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.filter((key) => key.startsWith('autoHandover.')).join(', ')} 已忽略，请核对拼写`);
+  config.autoAnswer = normalizeAutoAnswer(config.autoAnswer, unknownConfig, logger);
   if (config.gemini) {
     const gemini = config.gemini;
     if (typeof gemini.command !== 'string' || !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)/.test(gemini.command.trim())) {
@@ -1042,6 +1045,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
   const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  const autoAnswer = registerAutoAnswer({ ctx, settings: cfg.autoAnswer, directory: stateDirectory });
   // 工作区（侧栏分组）、目标和会话都是可选的宿主服务，取不到时相应步骤降级。
   const workspaces = () => ctx.get?.('workspaceRegistry');
   const autoHandover = createAutoHandover({ directory: stateDirectory, settings: () => cfg.autoHandover, aliases, logger: ctx.logger,
@@ -2229,7 +2233,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
   registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
-    history: () => history.snapshot(), handover: () => autoHandover.snapshot(history.snapshot().sessions),
+    history: () => history.snapshot(), handover: () => autoHandover.snapshot(history.snapshot().sessions), autoAnswer,
     answerHandover: async (id, accept) => {
       const value = autoHandover.answer(id, accept);
       // 会话此刻正停着（没有回合在跑）就不等下一个回合边界，马上按自动交接的流程走。
@@ -2506,6 +2510,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         autoResume: { enabled: cfg.autoResume.enabled, maxAgeHours: cfg.autoResume.maxAgeHours, excludeCount: cfg.autoResume.exclude.length,
           delaySeconds: cfg.autoResume.delaySeconds },
         autoHandover: cfg.autoHandover,
+        autoAnswer: { enabled: cfg.autoAnswer.enabled, afterMinutes: cfg.autoAnswer.afterMinutes, subagents: cfg.autoAnswer.subagents,
+          excludeCount: cfg.autoAnswer.excludeSessions.length, riskyPatternEnabled: cfg.autoAnswer.riskyPattern !== '',
+          customFreeText: cfg.autoAnswer.freeText !== AUTO_ANSWER_DEFAULTS.freeText },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         toolPolicy: cfg.toolPolicy, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),

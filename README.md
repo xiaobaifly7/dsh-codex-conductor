@@ -66,6 +66,16 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.115 自动代答宿主提问
+
+宿主的 `ask_user_question` 等满 10 分钟后，conductor 会逐题选择有推荐标记的选项，找不到标记时选首项。多选题会选中所有带推荐标记的项，自由文本题使用配置的说明。答案会附上代答说明。热重载保留原提出时间，宿主恢复的待答提问也按原时间计时，已超时的再给用户 30 秒。
+
+题目或任一选项触发高风险正则时，整批由用户回答。排除会话、按设置排除的子代理会话、宿主权限审批和计划审核、conductor 的交接确认都留给用户。宿主提供提问服务时，“Codex 指挥 → 自动代答”会显示待答提问和最近 10 条记录。可以现在按推荐提交，或为某条提问取消代答。宿主能恢复的提问会保留人工接管选择。
+
+本机记录在 `%LOCALAPPDATA%\dsh-codex-conductor\auto-answer-history.jsonl`，保留最近 300 行，仅保存提问和所选标签的短摘要与判断依据。已恢复提问的人工接管标记保存在同目录的 `auto-answer-manual.json`。
+
+默认高风险正则（不区分大小写）为 `删除|清空|不可恢复|不可逆|覆盖|格式化|卸载|重置|drop |truncate|rm -rf|force.?push|付款|支付|购买|转账|充值|密码|密钥|口令|凭据|token|secret|发布到|上线到生产|生产环境|对外发送|发邮件|真实目标|授权范围`。
+
 ### 0.9.114：自标未满足的验收项结案要有独立依据
 
 - 结案（`verified` 或 `accepted_deviations`）时，Codex 报告自己标 `blocked` / `not_met` 的验收项若记成 `met`，按 `closeoutEvidence` 的级别要依据。`independent`（默认）：需要至少一项独立依据——晚于这一轮结束、核验本单元的核验任务把这一条判 met（核验任务现在会把每个自标未满足的原验收项单列一条），或同一单元的后续轮次报告这一条 met，或原会话用户在作业结束后有过真实回复（与接受偏差时的用户确认同一判定，但不因 `plannerAnswers` 放宽）。规划端自己写的证据不再够。`planner`：规划端自己写的、不照抄报告原文的证据即可（0.9.103 规则，现在对两种结案结论都适用）。`off`：不查。
@@ -409,6 +419,12 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `allowHostAccess` | `false` | 为 `true` 时 `codex_run` 才提供 `host_access` 参数，允许 Codex 不带沙箱（`danger-full-access`）运行、启动 Windows 程序（见上文） |
 | `defaultHostAccess` | `false` | 与 `allowHostAccess=true` 一起使用，省略 `host_access` 的新任务和 `resume` 默认以 `danger-full-access` 运行；显式传 `host_access=false` 可为单次任务恢复沙箱 |
 | `plannerAnswers` | `false` | 为 `true` 时允许规划端按用户原始目标和已有事实回答阻塞问题、自行登记 `accepted_deviations`（含 `kind: 'scope'`），不再做待答范围冲突的写入范围预检；最新任务仍为 `ask_user` 时须用 `codex_continue`，答案仍须覆盖全部问题 id。在给用户的汇报里说明代做的决定；拿不准、涉及删除数据或改动用户没提过的目录时仍先问用户 |
+| `autoAnswer.enabled` | `true` | 在宿主提问超时后代答 |
+| `autoAnswer.afterMinutes` | `10` | 从提出时间起等待的分钟数，最少 1 分钟 |
+| `autoAnswer.freeText` | `用户暂时不在。请按你认为最合适、最稳妥的方案继续，并在回复里说明你替用户做了哪些决定。` | 自由文本题的固定答复 |
+| `autoAnswer.riskyPattern` | 见“自动代答宿主提问” | 匹配题目和选项，设为 `''` 关闭正则跳过 |
+| `autoAnswer.subagents` | `true` | 也处理宿主允许提问的子代理来源会话。0.2.2-rc.3 会拒绝 `origin: subagent` 的提问和续答 |
+| `autoAnswer.excludeSessions` | `[]` | 由用户亲自回答的会话 ID |
 | `plannerPromptFile` | `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` | 规划要求文件（Markdown，HTML 注释不算内容），注入 agent 的系统提示词（见上文） |
 | `executorPromptFile` | 规划要求文件同目录的 `executor-prompt.md` | 给 Codex 的固定要求（Markdown，HTML 注释不算内容）：附在每一单任务书的执行约束后面，Codex 每单都会看到；不增加权限，与任务、验收或执行约束冲突时以后者为准。保存后下一单生效，也可在设置的“Codex 指挥”面板里编辑 |
 | `runtimeProfileFile` | 空 | 当前 Harness 实例实际使用的 `cordis.patch.yml` 完整 Windows 路径；用于版本匹配与明确请求的热重载，留空时不能自动重载 |
@@ -562,6 +578,12 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 `send-result.json` contains claim time `requestedAt`, completion time `completedAt`, `sessionId`, `status`, `reason`, and `error` on failures. Success is `sent / message_submitted`. Skips are `skipped / running` (busy), `skipped / session_changed` (agent replaced or removed during the read), `skipped / error` (unavailable agent, missing host interface or failed submission), and `skipped / invalid_request` (invalid JSON, fields or length; no submission). `sessionId` is `null` when no valid ID can be obtained. Results and plugin logs omit the message body, including any body quoted by host errors.
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
+
+### 0.9.115 Automatic answers to Host questions
+
+Unanswered `ask_user_question` calls get a reply after 10 minutes by default. Each item uses the marked recommendation, the first option when no option is marked, or a configured reply for text-only questions. Multi-select items use all marked options when available. The reply identifies the automatic selection. Reloads use the original question time and offer 30 seconds of grace for already overdue questions.
+
+The Codex panel lists pending questions and the ten latest history entries. You can answer a safe question immediately or reserve it for yourself. Questions matching the risk pattern, excluded sessions, configured subagent exclusions, permission approvals, plan reviews, and handover confirmations stay with the user. History lives in `%LOCALAPPDATA%\dsh-codex-conductor\auto-answer-history.jsonl` and keeps 300 entries with short previews. `auto-answer-manual.json` preserves manual choices for questions the Host can restore.
 
 ### 0.9.114: Closing a criterion the report marked unmet needs independent support
 
@@ -719,6 +741,12 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `plannerAnswers` | `false` | Allows planner answers and `accepted_deviations` (including `kind: 'scope'`) based on the user's original goal and known facts, and skips pending-conflict write-scope preflight. The latest `ask_user` task still requires `codex_continue`, with answers covering every question ID. Report decisions made for the user; ask first when uncertain or when answers entail data deletion or changes to directories the user did not mention. |
+| `autoAnswer.enabled` | `true` | Enable automatic replies to Host questions |
+| `autoAnswer.afterMinutes` | `10` | Wait from the original question time, with a minimum of one minute |
+| `autoAnswer.freeText` | `用户暂时不在。请按你认为最合适、最稳妥的方案继续，并在回复里说明你替用户做了哪些决定。` | Reply for text-only questions |
+| `autoAnswer.riskyPattern` | See the Chinese section above | Case-insensitive pattern for question and option text. Set to `''` to disable pattern matching |
+| `autoAnswer.subagents` | `true` | Include subagent-origin sessions that can ask questions in the Host. Host 0.2.2-rc.3 rejects `origin: subagent` |
+| `autoAnswer.excludeSessions` | `[]` | Session IDs reserved for human answers |
 | `lockTimeoutSeconds` | Empty (unlimited) | Positive finite seconds waiting for directory write locks; expiry returns retryable `lock_timeout` before Codex starts. Null, empty or omitted passes no flag. |
 | `maxSessionJobs` | Empty (unlimited) | Positive integer limit on the Codex jobs one session may dispatch in total |
 | `maxSessionTokens` | Empty (unlimited) | Positive integer limit on one session's total Codex usage in tokens (`total_tokens`, or input plus output); jobs with unknown usage are not counted |

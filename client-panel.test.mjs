@@ -769,6 +769,37 @@ test('prompt backups expand on demand and load into the draft without saving', a
   assert.ok(text(section('给 Codex 的固定要求')).includes('还没有历史备份。'));
 });
 
+test('the auto-answer section shows waiting time, human-only questions and both actions', async (t) => {
+  const service = panelService();
+  const pendingQuestion = (id, reason = null) => ({ id, sessionId: 'session-' + id, questions: ['请选择'], waitedMinutes: 4, remainingMinutes: 6, reason });
+  const autoAnswer = { enabled: true, available: true, afterMinutes: 10,
+    pending: [pendingQuestion('a'), pendingQuestion('b'), pendingQuestion('c', 'risky')],
+    recent: [{ at: '2026-01-01T00:00:00Z', sessionId: 'session-old', question: '之前的提问', selected: ['推荐项'], reason: 'marked_recommended', waitedMinutes: 10 }] };
+  const host = clientHost((route, body) => {
+    if (route === '/auto-answer/action') {
+      autoAnswer.pending = body.action === 'answer' ? autoAnswer.pending.filter(({ id }) => id !== body.id)
+        : autoAnswer.pending.map((item) => item.id === body.id ? { ...item, reason: 'manual' } : item);
+      return { autoAnswer };
+    }
+    if (route === '/status') return { ...service.status, autoAnswer };
+    return service.handle(route, body);
+  });
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel);
+  await host.flush();
+  for (const label of ['已开启 · 10 分钟', '已等 4 分钟 · 还有 6 分钟自动代答', '需要你亲自回答（高风险）', '之前的提问', '有推荐标记']) {
+    assert.ok(text(host.tree).includes(label), label);
+  }
+  await click(host, '现在就按推荐回答');
+  assert.ok(text(host.tree).includes('已按推荐提交回答。'));
+  await click(host, '这条我自己答');
+  assert.ok(text(host.tree).includes('需要你亲自回答（已选择自己回答）'));
+  assert.deepEqual(host.requests.filter(({ body }) => body), [
+    { path: '/auto-answer/action', body: { id: 'a', action: 'answer' } },
+    { path: '/auto-answer/action', body: { id: 'b', action: 'manual' } },
+  ]);
+});
+
 test('status shows guard scope, host access and unknown keys, and folds secondary rows without hiding their errors', () => {
   const { Status } = clientHost().exports, service = panelService();
   const view = (settings = {}, runtime = {}) => Status({ status: { settings: { ...service.status.settings, ...settings },

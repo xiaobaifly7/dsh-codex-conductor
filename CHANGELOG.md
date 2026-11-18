@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.115` 新增 `autoAnswer`。宿主提问默认等 10 分钟后按推荐代答，支持多选、自由文本和多题。高风险与排除项保留给用户。Codex 指挥面板显示等待和历史，支持立即按推荐回答或取消单条代答。热重载保留提出时间，已超时的恢复提问另等 30 秒。
+
 `0.9.114` 结案质量：Codex 报告自标 `blocked` / `not_met` 的验收项，结案（`verified` 和 `accepted_deviations` 一样）记成 `met` 时，默认（`closeoutEvidence: independent`）要有独立依据——晚于该轮结束、核验本单元并把这一条判 met 的核验任务（核验任务现在把每个自标未满足的原验收项单列一条）、同一单元后续轮次报告这一条 met、或原会话用户在作业结束后的真实回复。这收紧了 0.9.103 的规则：那条只管 `verified`、只拦照抄报告原文，规划端自己写的证据就能过；现在它只在 `closeoutEvidence: planner` 下沿用，`off` 不查。缺依据时一次列出三条路（核验、返工、照实记未满足）。新增“未满足但接受”：`accepted_deviations` 的条目可保留未满足状态并写 `accepted` 原因，与接受偏差同一道用户确认，`summary` 的 `accepted_open` 列出。本机首次加载这一版之前结束的任务按 planner 规则结案（`closeout-evidence-since.json`）。结案结果计入 `closeout-stats.json`、`codex_runtime` 显示；任务 context 记 `routing`，收尾护栏拒绝记入 `closeout-refusals.jsonl`。
 
 `0.9.112` 续接开新线程补到 `codex_run`：带 `resume` 且原线程上次请求超过 `continueFreshAboveTokens` 时开新线程，规划端任务原文完整保留、前面附上一轮交接内容，新任务以 `parent_job_id` 挂到该线程上本会话（含交接前任）最新的任务下；`fresh` 可逐次指定；结果写明新旧线程和新任务号；再 resume 已被接替的线程时改接接替线程上最新的任务。`codex_continue` 带 `answers` 默认仍沿用原线程，`fresh: true` 时开新线程、回答写进交接内容。新增 `verify_previous`：`codex_run` / `codex_continue` 派这一单的同时只读核验一个已结束任务，与 `codex_verify` 相同的归属和链接；可写新单的 scope 与被核验任务的 scope 或产物重叠时拒绝；核验没派出时只在结果里说明。写任务起步：scope 整体遍历超过 5 秒时记下最慢的一项。
@@ -123,6 +125,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.115` adds `autoAnswer` for Host questions. After 10 minutes by default, it submits recommended choices or configured free text, including multi-select questions and batches. Risky and excluded questions stay with the user. The Codex panel shows pending questions and history, with actions to answer now or reserve a question for the user. Reloads retain the original timing and give overdue restored questions 30 extra seconds.
 
 `0.9.114` closing quality: a criterion Codex's own report marked `blocked` / `not_met` and a closing review (`verified` and `accepted_deviations` alike) records as `met` now needs independent support by default (`closeoutEvidence: independent`): a completed verification of the unit, finished after that round, that marks it met (verifications now list each flagged original criterion as its own item), a later round of the unit that reports it met, or a real user reply after the job ended. This tightens the 0.9.103 rule, which only covered `verified` and only refused copied evidence, so any planner-written evidence passed; that rule remains as `closeoutEvidence: planner`, and `off` does not check. Rejections list the three ways forward (verify, continue, record as not met). New "accepted although not met": an `accepted_deviations` entry may keep its unmet status with an `accepted` reason, behind the same user confirmation as accepted deviations, listed in `summary` as `accepted_open`. Jobs finished before this version first loaded close under the planner rule (`closeout-evidence-since.json`). Outcomes are counted in `closeout-stats.json` and shown by `codex_runtime`; job contexts record `routing`, and close-out refusals are logged to `closeout-refusals.jsonl`.
 

@@ -952,6 +952,33 @@ window.__ModuleLoader__.load({
                     ` · ${entry.from || '?'} → ${entry.to || '?'} · ${ORIGIN_TEXT[entry.origin] || entry.origin} · ${entry.status}${entry.reason ? ` / ${entry.reason}` : ''}${entry.workspace ? ` · 分组 ${entry.workspace}` : ''}`)))) : null));
         })(),
 
+        !selftest && status?.autoAnswer ? (() => {
+          const { enabled, available, afterMinutes, pending, recent } = status.autoAnswer;
+          const act = (id, action) => mutate('autoAnswer', '/auto-answer/action', { id, action }, (value) => {
+            setStatus((old) => ({ ...old, autoAnswer: value.autoAnswer }));
+            setMessages((old) => ({ ...old, autoAnswer: action === 'answer' ? '已按推荐提交回答。' : '已取消这条提问的自动代答。' }));
+          });
+          const reasons = { risky: '高风险', excluded: '已排除', manual: '已选择自己回答', failed: '宿主提交失败' };
+          const decisions = { marked_recommended: '有推荐标记', first_option: '首项', free_text: '自由文本',
+            skipped_risky: '跳过高风险', skipped_excluded: '跳过已排除提问' };
+          return h('section', { 'aria-label': '自动代答' }, h('h3', null, '自动代答'),
+            h('small', null, [enabled ? '已开启' : '已关闭', `${afterMinutes} 分钟`, enabled && !available ? '宿主提问服务不可用' : ''].filter(Boolean).join(' · ')),
+            available && !pending.length ? h('p', null, '当前没有待答提问。') : null,
+            pending.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '待答提问' }, ...pending.map((item) =>
+              h('li', { key: item.id, className: 'dcc-job' },
+                h('strong', null, item.sessionId), ...item.questions.map((question, i) => h('div', { key: i }, question)),
+                h('small', null, `已等 ${item.waitedMinutes} 分钟 · ${item.reason
+                  ? '需要你亲自回答（' + reasons[item.reason] + '）' : '还有 ' + item.remainingMinutes + ' 分钟自动代答'}`),
+                !item.reason ? h('div', { className: 'dcc-row' },
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => act(item.id, 'answer') }, '现在就按推荐回答'),
+                  h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => act(item.id, 'manual') }, '这条我自己答')) : null))) : null,
+            h(Message, { text: messages.autoAnswer }), h(Message, { text: errors.autoAnswer, error: true }),
+            recent.length ? h('details', null, h('summary', null, '最近的代答记录'),
+              h('ul', { className: 'dcc-jobs' }, ...recent.map((entry, i) =>
+                h('li', { key: i }, [when(entry.at), entry.sessionId, entry.question, entry.selected.join('、'),
+                  decisions[entry.reason], `等待 ${entry.waitedMinutes} 分钟`].filter(Boolean).join(' · '))))) : null);
+        })() : null,
+
         selftest ? null : h('section', { 'aria-label': '会话操作' },
           h('details', null, h('summary', null, h('h3', { style: { display: 'inline' } }, '会话操作')),
             h('p', { className: 'dcc-muted' }, '通过本机请求文件交给插件处理；提交后不会立刻有结果，请用“查看最近结果”确认。'),

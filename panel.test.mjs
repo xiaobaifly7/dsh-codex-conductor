@@ -19,6 +19,7 @@ const routes = [
   ['POST', '/session/goal', { sessionId: 'session-a', maxGoalRounds: 3 }], ['GET', '/session/results'],
   ['POST', '/rollback', { job_id: 'job-1', confirm: true }],
   ['POST', '/handover/request', { sessionId: 'session-a' }], ['POST', '/handover/answer', { sessionId: 'session-a', accept: false }],
+  ['POST', '/auto-answer/action', { id: 'c8fe4dc0-9678-49f0-8e54-f63941a713b2', action: 'answer' }],
 ];
 
 // Model Cordis injection ownership: only changed dependencies restart a child callback.

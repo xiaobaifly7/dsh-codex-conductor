@@ -24,7 +24,7 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-test-'));
 process.env.LOCALAPPDATA = localAppData;
 after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemini helpers', async () => {
+test('entry reload queries re-evaluate helper modules', async () => {
   const dir = mkdtempSync(path.join(tmpdir(), 'conductor-reload-'));
   const traceKey = `conductor-reload-${path.basename(dir)}`;
   globalThis[traceKey] = [];
@@ -48,6 +48,8 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
         `globalThis[${JSON.stringify(traceKey)}].push('closeout-${version}');\nexport const prepareReview = () => ({}), reviewRejection = () => '';\n`);
       writeFileSync(path.join(dir, 'handover.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('handover-${version}');\nexport const createAliases = () => ({ owners: (id) => [id], predecessors: () => [], successor: () => undefined }), registerHandoverRequests = () => {};\n`);
+      writeFileSync(path.join(dir, 'autoanswer.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('autoanswer-${version}');\nexport const AUTO_ANSWER_DEFAULTS = {};\n`);
       writeFileSync(path.join(dir, 'guard.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
         readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));
@@ -55,7 +57,7 @@ test('entry reload queries re-evaluate workflow, runtime, resume, guard and gemi
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['closeout-new', 'closeout-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
