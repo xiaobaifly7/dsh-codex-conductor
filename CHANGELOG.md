@@ -4,6 +4,8 @@
 
 ## 0.9.NEXT
 
+后续轮次的报告和新写入的成功结案复核都记 `met` 时，可销掉同一交接链内、十跳父链上早于复核入账的旧验收项。清单须等长、同编号原文完全相同且在两份清单中各只出现一次。摘要展示最近 500 条销项记录，统计记入 `ledger_cleared_by_later_round`。运行状态、摘要、目标完成拒绝和写任务完成回执会提示后续报告已满足的开放项。
+
 插件加载或热重载时补派最多两单自动核验，会话调用 `codex_*` 时补派最多一单，每 60 秒最多扫描一次。读取旧的已渲染结果时也检查是否需要自动核验。已有核验或后续轮次的任务跳过，补派次数记入 `auto_verify_catchup`。
 
 `0.9.124` 让“未满足但接受”要有依据、看得见，并让核验自动派出。第四次测量里 17 次结案有 11 次是接受未满足，36 个自标未满足项有 34 个按未满足接受、16 个没有任何核验、后续轮次或用户回复。新增 `acceptOpenEvidence`（默认 `strict`）：接受报告自标未满足或 `must_verify` 的条目为未满足，要有核验看过这一条、后续轮次仍报未完成、作业结束后的用户回复，或报告带待用户处理的阻塞且用户确认关卡通过；报告或复核里为 `not_met` 的条目只认核验或用户回复；缺依据时一行列出可走的路（含并行核验）。截止文件 `accept-open-evidence-since.json` 之前结束的任务沿用旧规则。接受的未完成项记入 `accepted-open.json`（任务号、编号、状态、阻塞类别、依据类别，不存正文），由该任务最新的结案复核替换，或被直接核验该任务并判 met 的结论销掉；`codex_summary` / `codex_runtime` 显示，`update_goal(complete)` 在仍有条目时要传 `acknowledge_open_items: true`（`plannerAnswers` 关闭时还要用户回复），完成记录可见。新增 `autoVerify`（默认 `flagged`）：本版首次加载（`auto-verify-since.json`）之后结束、尚未复核、报告有效且有自标未满足项或 `must_verify` 的写任务，结束时由插件派出一次只读核验，完成通知写明核验在跑、可派不重叠的下一单；手动 `codex_verify` / `verify_previous` 复用正在跑的核验。新增 `effortOverride`（默认 `planner`，不改变行为）和 `codex_run` 的 `effort_reason`。结案统计只计 runner 确实新写入的复核（修正 `all_met` 多计）。
@@ -149,6 +151,8 @@
 ## English
 
 ### 0.9.NEXT
+
+A later round can clear an older acceptance item when its report and newly appended closing review both mark it `met`. The item must predate the review and belong to an ancestor within ten parent links in the same handover chain. The acceptance lists must be the same length, with the same text at the same index appearing once in each list. Summary shows the latest 500 archived items, and `ledger_cleared_by_later_round` counts the clears. Runtime, summary, goal completion refusals, and write-job completion notices flag open items that a later report already marks met.
 
 Automatic verification catches up on eligible jobs at load or hot reload (up to two starts) and on `codex_*` calls (up to one start per scan, with one scan per session every 60 seconds). Collect also checks stored rendered results. Jobs with an existing verification or a later round are skipped. `auto_verify_catchup` counts starts from load and session scans.
 

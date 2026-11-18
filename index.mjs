@@ -1050,10 +1050,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const verificationTargetText = (target, key) => key.startsWith('row')
     ? target?.structured?.criteria?.[Number(key.slice(3)) - 1]?.criterion
     : target?.context?.acceptance?.[Number(key) - 1];
-  const jobStatusLookup = (signal) => {
+  const jobStatusLookup = (signal, limit = Infinity) => {
     const statuses = new Map();
     return (id) => {
-      if (!statuses.has(id)) statuses.set(id, conductor.waitJob(id, 0, signal));
+      if (!statuses.has(id) && statuses.size < limit) statuses.set(id, conductor.waitJob(id, 0, signal));
       return statuses.get(id);
     };
   };
@@ -1194,7 +1194,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try {
       if (ledgerFile) {
         const ledger = JSON.parse(readFileSync(ledgerFile, 'utf8'));
-        if (!Array.isArray(ledger?.items) || !Array.isArray(ledger.completions)) throw new Error('格式无效');
+        if (!Array.isArray(ledger?.items) || !Array.isArray(ledger.completions) ||
+            (ledger.cleared !== undefined && !Array.isArray(ledger.cleared))) throw new Error('格式无效');
         ledger.items = ledger.items.map(({ text_hash, applied_checks, ...item }) => item);
         return ledger;
       }
@@ -1216,12 +1217,64 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
   const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
-  const ledgerLine = (ledger) => {
-    if (!ledger) return unreadableLedgerLine;
-    const { items, completions } = ledger;
-    return `未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
-      `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`;
+  const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
+  const laterRoundHint = (items) => {
+    const marked = items.filter(item => item.later_met_by);
+    const rounds = [...new Set(marked.map(item => item.later_met_by))];
+    return marked.length ? `其中 ${marked.length} 项后续轮次已报告满足（${marked.map(item =>
+      `${item.job_id}#${item.index}←${item.later_met_by}`).join('、')}）：记 ${rounds.join('、')} 的结案复核时把这些条目记 met 即可销项，` +
+      `或用 codex_review 重记 ${ledgerJobIds(marked).join('、')}。` : '';
   };
+  const ledgerLine = (ledger, showCleared = false) => {
+    if (!ledger) return unreadableLedgerLine;
+    const { items, completions, cleared } = ledger;
+    return [`未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
+      `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`, laterRoundHint(items),
+      ...(showCleared ? cleared.map(item => `${item.job_id}#${item.index} cleared by later round ${item.cleared_by}`) : []),
+    ].filter(Boolean).join('\n');
+  };
+
+  function requireJobStatus(job, id) {
+    if (job?.job_id !== id || unknownState(job) || !job.context?.owner) {
+      throw new Error(`${id}：${job?.error ?? job?.error_kind ?? '任务状态不可用'}`);
+    }
+    return job;
+  }
+
+  async function laterRoundItems(round, items, status) {
+    const acceptance = round.context?.acceptance;
+    const report = round.structured ?? round.report;
+    if (!parentOf(round) || round.context?.verification_of || !Array.isArray(acceptance) || !validReport(report)) return [];
+    const owner = round.context.owner;
+    const owners = aliases.owners(lastSuccessor(aliases, owner) ?? owner);
+    const met = new Set();
+    for (const { index } of items) {
+      const text = acceptance[index - 1];
+      if (Number.isInteger(index) && typeof text === 'string' &&
+          acceptance.indexOf(text) === index - 1 && acceptance.lastIndexOf(text) === index - 1 &&
+          reportRowOf(acceptance, report.criteria, index)?.status === 'met') met.add(index);
+    }
+    const candidates = items.filter(item => item.job_id !== round.job_id && met.has(item.index) && owners.includes(item.session));
+    if (!candidates.length) return [];
+    const matches = [];
+    const seen = new Set([round.job_id]);
+    for (let id = parentOf(round), hops = 0; id && hops < 10; hops++) {
+      if (seen.has(id)) throw new Error(`${id}：父任务链形成循环`);
+      const lookup = status(id);
+      if (!lookup) break;
+      const parent = requireJobStatus(await lookup, id);
+      seen.add(id);
+      const previous = parent.context.acceptance;
+      if (owners.includes(parent.context.owner) && Array.isArray(previous) && previous.length === acceptance.length) {
+        matches.push(...candidates.filter(({ job_id, index }) => {
+          const text = acceptance[index - 1];
+          return job_id === id && previous.indexOf(text) === index - 1 && previous.lastIndexOf(text) === index - 1;
+        }));
+      }
+      id = parentOf(parent);
+    }
+    return matches;
+  }
 
   function recordAcceptedOpen(source, acceptedOpen, at) {
     if (!ledgerFile || beforeCutoff(source, acceptOpenFrom)) return;
@@ -1245,11 +1298,42 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
   }
 
+  async function clearLaterRoundItems(source, verification, owner, signal) {
+    if (!ledgerFile || !parentOf(source)) return;
+    try {
+      const { time: at, criteria } = verification;
+      const met = new Set((criteria ?? []).filter(item => item.status === 'met').map(item => item.index));
+      if (!met.size) return;
+      const initial = readLedger();
+      if (!initial || initial.review_times?.[source.job_id] > at) return;
+      const candidates = initial.items.filter(item => item.at < at && met.has(item.index));
+      const matches = await laterRoundItems(source, candidates, jobStatusLookup(signal));
+      if (!matches.length) return;
+      const matched = new Set(matches.map(itemId));
+      // 状态查询期间的重审可能已替换原条目或写入更新的后续轮次复核。
+      const ledger = readLedger();
+      if (!ledger || ledger.review_times?.[source.job_id] > at) return;
+      const cleared = ledger.items.filter(item => matched.has(itemId(item)));
+      if (!cleared.length) return;
+      saveLedger({ ...ledger, items: ledger.items.filter(item => !matched.has(itemId(item))),
+        cleared: [...(ledger.cleared ?? []), ...cleared.map(item =>
+          ({ ...item, cleared_by: source.job_id, cleared_at: at }))].slice(-500) });
+      countCloseout(owner, 'ledger_cleared_by_later_round', cleared.length);
+    } catch (error) {
+      ctx.logger?.warn?.(`[codex-conductor] 未能按后续轮次 ${source.job_id} 销项：${error?.message ?? error}`);
+    }
+  }
+
   async function acceptedOpenLedger(owner, signal) {
     const scope = aliases.owners(owner);
-    const view = ({ since, items, completions }) => ({ since,
-      items: items.filter(item => scope.includes(item.session)),
-      completions: completions.filter(entry => scope.includes(entry.session)) });
+    const laterMet = new Map();
+    const view = ({ since, items, completions, cleared = [] }) => ({ since,
+      items: items.filter(item => scope.includes(item.session)).map(item => {
+        const later = laterMet.get(itemId(item));
+        return later ? { ...item, later_met_by: later } : item;
+      }),
+      completions: completions.filter(entry => scope.includes(entry.session)),
+      cleared: cleared.filter(item => scope.includes(item.session)) });
     const initial = readLedger();
     if (!initial) return null;
     const snapshot = initial.items.filter(item => scope.includes(item.session));
@@ -1257,7 +1341,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const byJob = new Map(ledgerJobIds(snapshot).map(id => [id, []]));
     for (const item of snapshot) byJob.get(item.job_id).push(item);
     const resolved = new Set();
-    const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
     try {
       const jobs = new Map();
       for (let offset = 0; offset !== null;) {
@@ -1280,6 +1363,25 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           return key && reportRowOf(acceptance, full.structured.criteria, i + 1)?.status === 'met' ? [key] : [];
         }));
         for (const item of candidates) if (met.has(item.key)) resolved.add(itemId(item));
+      }
+      const open = snapshot.filter(item => item.index && !resolved.has(itemId(item)));
+      // 后续轮次提示每次读取最多查十个任务状态，父链与候选轮次共用额度。
+      const laterStatus = jobStatusLookup(signal, 10);
+      for (const job of jobs.values()) {
+        if (!open.length || job.execution_status !== 'completed' || job.context?.verification_of || !parentOf(job)) continue;
+        const lookup = laterStatus(job.job_id);
+        if (!lookup) break;
+        try {
+          const full = requireJobStatus(await lookup, job.job_id);
+          if ((full.execution_status ?? full.status) !== 'completed' || !scope.includes(full.context.owner)) continue;
+          for (const item of await laterRoundItems(full, open, laterStatus)) {
+            const key = itemId(item);
+            if (!laterMet.has(key)) laterMet.set(key, job.job_id);
+          }
+        } catch (error) {
+          signal?.throwIfAborted();
+          ctx.logger?.warn?.(`[codex-conductor] 未能核对后续轮次 ${job.job_id}：${error?.message ?? error}`);
+        }
       }
     } catch (error) {
       signal?.throwIfAborted();
@@ -1309,15 +1411,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 结案验收的结果分类：all_met（全部 met，自标未满足的有依据）、accepted_open（未满足但接受）、rejected_unsupported（缺独立依据被拒），
   // 按会话和总数累计到 closeout-stats.json，codex_runtime 显示。
   const closeoutStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'closeout-stats.json');
-  const countCloseout = (owner, kind) => {
+  const countCloseout = (owner, kind, amount = 1) => {
     if (!closeoutStatsFile) return;
     try {
       let stats;
       try { stats = JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
       if (!stats || typeof stats !== 'object') stats = { since: new Date().toISOString(), total: {}, sessions: {} };
-      stats.total[kind] = (stats.total[kind] ?? 0) + 1;
+      stats.total[kind] = (stats.total[kind] ?? 0) + amount;
       const mine = stats.sessions[owner] ??= {};
-      mine[kind] = (mine[kind] ?? 0) + 1;
+      mine[kind] = (mine[kind] ?? 0) + amount;
       stats.updatedAt = new Date().toISOString();
       mkdirSync(path.dirname(closeoutStatsFile), { recursive: true });
       writeJsonAtomic(closeoutStatsFile, stats);
@@ -1507,6 +1609,34 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return { ...value, auto_verify: receipt.auto_verify, next: [value.next, receipt.line].filter(Boolean).join('\n') };
   }
 
+  const completionLedgerItems = (jobId, owner) => {
+    const scope = aliases.owners(owner);
+    return scope.length ? (readLedger()?.items ?? []).filter(item =>
+      item.index && item.job_id !== jobId && scope.includes(item.session)) : [];
+  };
+
+  async function laterRoundNotices(value, exec, items) {
+    if (value.context?.write !== true || (value.execution_status ?? value.status) !== 'completed' ||
+        !parentOf(value) || !owns(exec?.agent?.id, value.context.owner)) return [];
+    const id = value.job_id;
+    try {
+      const matches = await laterRoundItems(value, items ?? completionLedgerItems(id, exec.agent.id), jobStatusLookup(exec?.signal));
+      return ledgerJobIds(matches).map(parent => {
+        const indices = matches.filter(item => item.job_id === parent).map(item => item.index).sort((a, b) => a - b);
+        return `${id} 报告了 ${parent} 第 ${indices.join('、')} 条已满足（${parent} 的这些条目仍记为未完成）；` +
+          `记 ${id} 的结案复核时把它们记 met 即可同时销掉 ${parent} 的未完成项。`;
+      });
+    } catch (error) {
+      ctx.logger?.warn?.(`[codex-conductor] 未能核对后续轮次 ${id} 的完成提示：${error?.message ?? error}`);
+      return [];
+    }
+  }
+
+  async function withCompletionNotices(value, exec) {
+    const [result, notices] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec)]);
+    return notices.length ? { ...result, next: [result.next, ...notices].filter(Boolean).join('\n') } : result;
+  }
+
   async function scanAutoVerifications(limit, owner) {
     const jobs = [];
     // 只看截止时间前两天起开始的任务：跨版本切换时在跑的任务也能覆盖到，不必翻完全部历史。
@@ -1676,21 +1806,28 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function verifyRendered(value, exec, source) {
     const { job_id: id, rendered } = value;
     let receipt = await autoVerifications.get(id);
-    if (!receipt && cfg.autoVerify !== 'off') {
+    const items = value.status === 'completed' ? completionLedgerItems(id, exec?.agent?.id) : [];
+    const auto = !receipt && cfg.autoVerify !== 'off';
+    const lines = [];
+    if (auto || items.length) {
       try {
         const current = source && source.status !== 'running' ? source : await conductor.waitJob(id, 0, exec?.signal);
-        await withAutoVerification(withReport(current), exec, { source: current });
-        receipt = await autoVerifications.get(id);
+        if (items.length) lines.push(...await laterRoundNotices(current, exec, items));
+        if (auto) {
+          await withAutoVerification(withReport(current), exec, { source: current });
+          receipt = await autoVerifications.get(id);
+        }
       } catch (error) { autoVerifyWarning(error); }
     }
-    return receipt ? { ...value, auto_verify: receipt.auto_verify,
-      rendered: rendered.includes(receipt.line) ? rendered : `${rendered}\n${receipt.line}` } : value;
+    if (receipt) lines.push(receipt.line);
+    return { ...value, ...(receipt ? { auto_verify: receipt.auto_verify } : {}),
+      rendered: [rendered, ...lines.filter(line => !rendered.includes(line))].join('\n') };
   }
 
   // 后台监控与本轮长等待共用同一任务；空闲会话仍能收到完成通知。
   const finishStatus = (value, exec) => {
     rememberProducts(value);
-    return withAutoVerification({ ...value, next: nextStep(value, undefined, undefined, cfg) }, exec);
+    return withCompletionNotices({ ...value, next: nextStep(value, undefined, undefined, cfg) }, exec);
   };
 
   function notifyOnDone(value, exec, finish) {
@@ -1934,7 +2071,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       rememberProducts(value, exec?.agent?.id);
       const reminder = value.status === 'completed' && plannerPrompt(plannerFile)
         ? '\n规划下一次派活前，再对照系统提示词里的「派活给 Codex 前的规划要求」。' : '';
-      return withAutoVerification({ ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
+      return withCompletionNotices({ ...value, next: nextStep(value, args.acceptance, Boolean(args.resume),
         { readOnly: args.write !== true, plannerAnswers: cfg.plannerAnswers, plannerReads: cfg.plannerReads }) + reminder }, exec);
     };
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
@@ -2368,7 +2505,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       } else {
         next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
       }
-      return withAutoVerification({ ...done, next }, exec);
+      return withCompletionNotices({ ...done, next }, exec);
     },
   });
 
@@ -2649,6 +2786,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         countCloseout(owner, openAccepted(review) ? 'accepted_open'
           : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
         ledgerWarning = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time);
+        if (!ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, exec?.signal);
       }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
@@ -2687,8 +2825,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           `涉及文件（含历史改动）：${g.files_changed.join('、') || '无'}`, `未闭环事项：${JSON.stringify(g.open_items)}`,
           `已结束轮次耗时合计：${typeof g.finished_duration_s === 'number' ? `${Math.round(g.finished_duration_s)} 秒` : '未知'}；用量（${g.usage_scope}）：${g.usage == null ? '未知（原始用量不完整）' : JSON.stringify(g.usage)}`,
           ...(g.rounds_truncated ? ['只展示最新轮次明细；总轮数、文件集合与耗时按全部匹配记录计算。'] : []),
-        ].join('\n')), ...(value.accepted_open_ledger === undefined ? [] : [ledgerLine(value.accepted_open_ledger)])].join('\n\n')
-      : [JSON.stringify(value, null, 2), value.accepted_open_ledger !== undefined && ledgerLine(value.accepted_open_ledger)].filter(Boolean).join('\n') }] },
+        ].join('\n')), ...(value.accepted_open_ledger === undefined ? [] : [ledgerLine(value.accepted_open_ledger, true)])].join('\n\n')
+      : [JSON.stringify(value, null, 2), value.accepted_open_ledger !== undefined && ledgerLine(value.accepted_open_ledger, true)].filter(Boolean).join('\n') }] },
     async execute(args = {}, exec) {
       const selected = args.cwd !== undefined || args.session_id !== undefined ? args : { session_id: 'current', ...args };
       const { filters } = await historySelection(selected, exec);
@@ -2969,10 +3107,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       const owner = exec.agent?.id;
       let refusal = usedConductor(exec.agent) ? await closeoutCheck(owner, 'update_goal', exec.signal, undefined, goal) : '';
+      const ledger = await acceptedOpenLedger(owner, exec.signal);
+      const items = ledger?.items;
       if (!refusal) {
-        const ledger = await acceptedOpenLedger(owner, exec.signal);
         goal.ledgerUnreadable = ledger === null;
-        const items = ledger?.items;
         if (items?.length) {
           const jobIds = ledgerJobIds(items);
           const listing = jobIds.map(id => `${id}（${[...new Set(items.filter(item => item.job_id === id).map(item => item.status))].join('、')}）`);
@@ -2988,7 +3126,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           }
         }
       }
-      if (refusal) return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
+      if (refusal) {
+        refusal = [refusal, laterRoundHint(items ?? [])].filter(Boolean).join('\n');
+        return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
+      }
     }
     if (inWorkspace(sessionCwd(exec), cfg.roots)) {
       let denied;
@@ -3022,6 +3163,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         `缺独立依据被拒 ${mineCloseouts.rejected_unsupported ?? 0} / ${closeouts.total.rejected_unsupported ?? 0}，` +
         `接受未完成项缺依据被拒 ${mineCloseouts.rejected_open_unsupported ?? 0} / ${closeouts.total.rejected_open_unsupported ?? 0}，` +
         `自标未满足按 planner 级别记 met ${mineCloseouts.met_planner_level ?? 0} / ${closeouts.total.met_planner_level ?? 0}；` +
+        `由后续轮次销项 ${mineCloseouts.ledger_cleared_by_later_round ?? 0} / ${closeouts.total.ledger_cleared_by_later_round ?? 0}；` +
         `核验中放行新任务 ${mineCloseouts.deferred_dispatch ?? 0} / ${closeouts.total.deferred_dispatch ?? 0}；` +
         `自动核验派出 ${mineCloseouts.auto_verify_started ?? 0} / ${closeouts.total.auto_verify_started ?? 0}，` +
         `其中补派 ${mineCloseouts.auto_verify_catchup ?? 0} / ${closeouts.total.auto_verify_catchup ?? 0}，` +
@@ -3033,7 +3175,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
           `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}\n${ledgerLine(ledger)}`;
       return { ...result, ...(result.value && typeof result.value === 'object'
-        ? { value: { ...result.value, session_history: value, ...(acceptance ? { acceptance_stats: acceptance } : {}),
+        ? { value: { ...result.value, session_history: value, accepted_open_ledger: ledger, ...(acceptance ? { acceptance_stats: acceptance } : {}),
           ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }

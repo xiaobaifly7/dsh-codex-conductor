@@ -6479,24 +6479,166 @@ test('ledger prune write failure leaves summary and goal completion usable', asy
   assert.equal(h.warnings.filter(line => line.includes('模拟台账保存失败')).length, 2);
 });
 
-test('a later round review or verification leaves the original job ledger intact', async (t) => {
-  for (const method of ['review', 'verification']) {
-    await t.test(method, async (st) => {
-      const text = '验收内容';
-      const { source, add, submit, stored, summary, verify, at, h } = await openLedgerFixture(st, [text]);
-      const before = stored().items;
-      const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'met')], at, { parent_job_id: source.job_id });
-      add(later);
-      if (method === 'review') {
-        await submit(verifiedReview(later));
-        assert.deepEqual(stored().items, before);
-        assert.equal(h.calls.filter(argv => argv[0] === 'list').length, 0);
-      } else {
-        verify(later, 1);
+test('a verification of a later round leaves the original job ledger intact', async (t) => {
+  const text = '验收内容';
+  const { source, add, stored, summary, verify, at } = await openLedgerFixture(t, [text]);
+  const before = stored().items;
+  const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'blocked')], at, { parent_job_id: source.job_id });
+  add(later);
+  verify(later, 1);
+  assert.deepEqual((await summary()).items, before);
+});
+
+function laterRoundLedgerFixture(t, config = {}) {
+  const { make, state, cutoff } = acceptedFixtureHarness(t);
+  const [first, parent, later] = ['3ba800', '6c8bd2', '98923b'].map(id => ({
+    parent_job_id: null, ...runnerFixture(`runner-status-${id}`),
+  }));
+  const input = runnerFixture('accepted-open-chain');
+  const file = path.join(state, 'accepted-open.json');
+  writeFileSync(file, JSON.stringify(input));
+  writeFileSync(cutoff, JSON.stringify({ since: first.finished_at - 1 }));
+  const review = fixtureReview(later);
+  const at = later.verification.time;
+  later.verification = null;
+  later.verification_status = 'unreviewed';
+  const listed = [later, parent, first].map(job => ({
+    job_id: job.job_id, execution_status: job.execution_status, finished_at: job.finished_at,
+    parent_job_id: job.context.continuation?.parent_job_id ?? null,
+    context: { owner: job.context.owner, write: job.context.write },
+  }));
+  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
+    listResult: () => ({ jobs: listed }),
+    reviewResult: (_argv, { stdin }) => {
+      const saved = JSON.parse(stdin);
+      return { ...later, verification_status: saved.status, verification: { ...saved, time: at } };
+    },
+    ...config,
+  });
+  for (const job of [first, parent, later]) h.finals[job.job_id] = job;
+  const exec = { agent: agentAt(later.cwd) };
+  const stored = () => JSON.parse(readFileSync(file, 'utf8'));
+  const summary = () => h.tools.codex_summary.execute({}, exec);
+  const submit = () => h.tools.codex_review.execute(review, exec);
+  const candidates = input.items.filter(item => item.job_id !== later.job_id && item.index < 7);
+  return { first, parent, later, h, exec, input, file, state, at, review, candidates, stored, summary, submit, listed };
+}
+
+test('later-round ledger archives twelve ancestor items on an appended closing review', async (t) => {
+  const { later, h, state, at, candidates, stored, summary, submit } = laterRoundLedgerFixture(t);
+  const result = await submit();
+  assert.equal(result.verification.time, at);
+  assert.deepEqual(stored().items.map(item => item.index), [7, 7, 7]);
+  assert.ok(!h.calls.some(argv => argv[0] === 'list'));
+  const cleared = candidates.map(item => ({ ...item, cleared_by: later.job_id, cleared_at: at }));
+  assert.deepEqual(stored().cleared, cleared);
+  const view = await summary();
+  assert.deepEqual(view.accepted_open_ledger.cleared, cleared);
+  assert.ok(h.tools.codex_summary.output.render({}, view)[0].text.includes(`#6 cleared by later round ${later.job_id}`));
+  const stats = JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8'));
+  assert.equal(stats.total.ledger_cleared_by_later_round, 12);
+  assert.equal(stats.sessions.S1.ledger_cleared_by_later_round, 12);
+});
+
+test('later-round ledger requires an unambiguous match and refuses partial clearing on lookup failure', async (t) => {
+  const cases = {
+    'different text at the index': ({ later }) => { later.context.acceptance[0] = 'changed'; },
+    'duplicate text in ancestor': ({ parent }) => { parent.context.acceptance[7] = parent.context.acceptance[0]; },
+    'duplicate text in descendant': ({ later }) => { later.context.acceptance[7] = later.context.acceptance[0]; },
+    'different acceptance lengths': ({ parent }) => { parent.context.acceptance.push('extra'); },
+    'same thread without a parent': ({ later }) => { delete later.context.continuation; },
+    'mapped report row not met': ({ later }) => {
+      const [first, second] = later.structured.criteria;
+      [first.criterion, second.criterion] = later.context.acceptance;
+      first.status = 'blocked';
+      later.structured.criteria.splice(0, 2, second, first);
+    },
+    'review keeps the item open': ({ review }) => { review.criteria[0] = { ...review.criteria[6], index: 1 }; },
+    'different owner chains': ({ parent }) => { parent.context.owner = 'OTHER'; },
+    'item recorded at review time': ({ input, parent, at, file }) => {
+      input.items.find(item => item.job_id === parent.job_id && item.index === 1).at = at;
+      writeFileSync(file, JSON.stringify(input));
+    },
+    'grandparent lookup fails': ({ first, h }) => {
+      h.finals[first.job_id] = { status: 'failed', error_kind: 'unknown_job', error: 'fixture lookup failed' };
+    },
+    'runner did not append the review': ({ later, review, at }) => {
+      later.verification_status = review.status;
+      later.verification = { criteria: review.criteria, status: review.status, time: at };
+    },
+  };
+  for (const [name, change] of Object.entries(cases)) {
+    await t.test(name, async (st) => {
+      const f = laterRoundLedgerFixture(st);
+      change(f);
+      const result = await f.submit();
+      assert.equal(result.verification.time, f.at);
+      assert.ok(f.stored().items.some(item => item.job_id === f.parent.job_id && item.index === 1));
+      if (name === 'grandparent lookup fails') {
+        assert.ok(f.h.warnings.some(line => line.includes('fixture lookup failed')));
+        assert.deepEqual(f.stored().items.filter(item => item.job_id !== f.later.job_id),
+          f.input.items.filter(item => item.job_id !== f.later.job_id));
+        assert.notDeepEqual(f.stored().items.find(item => item.job_id === f.later.job_id),
+          f.input.items.find(item => item.job_id === f.later.job_id));
       }
-      assert.deepEqual((await summary()).items, before);
     });
   }
+});
+
+test('later-round ledger shows probably done in summary, runtime and goal refusal', async (t) => {
+  const { later, h, exec, candidates, input, stored, summary, listed } = laterRoundLedgerFixture(t);
+  for (let i = 0; i < 12; i++) {
+    const job_id = `NO-REPORT-${i}`;
+    listed.push({ ...listed[0], job_id });
+    h.finals[job_id] = { ...later, job_id, structured: null };
+  }
+  const expected = candidates.map(item => ({ ...item, later_met_by: later.job_id }));
+  const marked = items => items.filter(item => item.later_met_by);
+  const value = await summary();
+  assert.deepEqual(marked(value.accepted_open_ledger.items), expected);
+  assert.equal(h.calls.filter(argv => argv[0] === 'status').length, 10);
+  const summaryText = h.tools.codex_summary.output.render({}, value)[0].text;
+  const runtime = await h.handlers['tools/execute']({ ...exec, name: 'codex_runtime', arguments: {} },
+    async () => ({ value: {}, content: [] }));
+  assert.deepEqual(marked(runtime.value.accepted_open_ledger.items), expected);
+  const goal = await h.handlers['tools/execute']({ ...exec, name: 'update_goal', arguments: { action: 'complete' } },
+    async () => assert.fail('native completion should be refused'));
+  for (const text of [summaryText, runtime.content.at(-1).text, goal.error.message]) {
+    assert.match(text, /其中 12 项后续轮次已报告满足/);
+    assert.ok(text.includes(`${candidates[0].job_id}#1←${later.job_id}`));
+    assert.match(text, /结案复核时把这些条目记 met 即可销项/);
+  }
+  assert.deepEqual(stored(), input);
+});
+
+test('later-round ledger completion notice names both open ancestors with auto verify off', async (t) => {
+  const { first, parent, later, h, exec, input, stored } = laterRoundLedgerFixture(t, {
+    startResult: () => later,
+  });
+  const results = [
+    await h.tools.codex_status.execute({ job_id: later.job_id, wait_seconds: 0 }, exec),
+    await h.tools.codex_run.execute({ ...RUN, write: true, acceptance: later.context.acceptance }, exec),
+  ];
+  for (const result of results) {
+    for (const job of [first, parent]) {
+      assert.ok(result.next.split('\n').includes(`${later.job_id} 报告了 ${job.job_id} 第 1、2、3、4、5、6 条已满足（${job.job_id} 的这些条目仍记为未完成）；记 ${later.job_id} 的结案复核时把它们记 met 即可同时销掉 ${job.job_id} 的未完成项。`));
+    }
+  }
+  assert.deepEqual(stored(), input);
+});
+
+test('later-round ledger clears across handover and keeps the latest 500 archived items', async (t) => {
+  const { later, exec, input, file, state, stored, summary, submit } = laterRoundLedgerFixture(t);
+  writeFileSync(path.join(state, 'handover.json'), JSON.stringify({ links: { S2: { from: 'S1' } } }));
+  exec.agent.id = later.context.owner = 'S2';
+  input.cleared = Array.from({ length: 500 }, (_, i) => ({ ...input.items[0], cleared_by: `OLD-${i}`, cleared_at: input.items[0].at }));
+  writeFileSync(file, JSON.stringify(input));
+  await submit();
+  const { cleared } = stored();
+  assert.equal(cleared.length, 500);
+  assert.equal(cleared[0].cleared_by, 'OLD-12');
+  assert.ok(cleared.slice(-12).every(item => item.cleared_by === later.job_id));
+  assert.deepEqual((await summary()).accepted_open_ledger.cleared, cleared);
 });
 
 test('ledger prunes direct verification by key and re-review replaces remaining items', async (t) => {
