@@ -66,6 +66,14 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
+### 0.9.114：自标未满足的验收项结案要有独立依据
+
+- 结案（`verified` 或 `accepted_deviations`）时，Codex 报告自己标 `blocked` / `not_met` 的验收项若记成 `met`，按 `closeoutEvidence` 的级别要依据。`independent`（默认）：需要至少一项独立依据——晚于这一轮结束、核验本单元的核验任务把这一条判 met（核验任务现在会把每个自标未满足的原验收项单列一条），或同一单元的后续轮次报告这一条 met，或原会话用户在作业结束后有过真实回复（与接受偏差时的用户确认同一判定，但不因 `plannerAnswers` 放宽）。规划端自己写的证据不再够。`planner`：规划端自己写的、不照抄报告原文的证据即可（0.9.103 规则，现在对两种结案结论都适用）。`off`：不查。
+- 缺依据时整条被拒，按条列出三条路：`codex_verify` 这单（下一单写入范围不重叠时可在下一单带 `verify_previous`），`codex_continue` 返工，或这一条照实记 `blocked` / `not_met`。
+- “未满足但接受”：`accepted_deviations` 里的条目可保留 `blocked` / `not_met` 并写 `accepted`（接受原因）；记录里保留原状态，`codex_summary` 的 `accepted_open` 列出这些条目。它与接受偏差走同一道用户确认（`plannerAnswers` 关闭时要作业结束后的用户回复）。
+- 截止：本机第一次加载这一版之后结束的任务才按 `independent` 要求（`closeout-evidence-since.json`），之前结束的任务按 `planner` 规则，不会因升级变难收尾。
+- 统计：`closeout-stats.json` 按会话和总数记结案结果（`all_met` 全部满足、`accepted_open` 未满足但接受、`rejected_unsupported` 缺独立依据被拒），`codex_runtime` 显示。任务 context 新增 `routing`（续接方式、原线程、父任务、被接替的线程、`verify_previous`），收尾护栏拒绝时把被点名的任务号记进 `closeout-refusals.jsonl`。
+
 ### 0.9.112：codex_run 续接也开新线程、派活时同时核验上一单
 
 - `codex_run` 带 `resume`：原线程上次请求超过 `continueFreshAboveTokens`（默认 100000）时改开新线程，规划端写的任务原文完整保留，前面附上一轮交接内容（上一轮的任务书和验收标准、逐条自报的状态和证据、偏差、未决、阻塞、改动文件、最新验收结论和意见）。“上一轮”是该线程上本会话（含交接前任）最新的任务，新任务以 `parent_job_id` 挂在它下面，所以工作单元、`codex_summary` 分组、收尾护栏的“后续轮次”、交接自检和别名都把它当作这条线程的后续。`fresh: true` / `false` 可逐次指定；线程小、读不到大小时照旧沿用原线程。结果写明开了新线程、原线程、上一轮任务和新任务号，并提示以后对新任务返工、不要再 resume 原线程；之后若仍 resume 已被接替的旧线程，插件自动改接接替它的线程上最新的任务并说明。
@@ -373,6 +381,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
 | `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
+| `closeoutEvidence` | `independent` | 结案时自标未满足的条目记成满足所需的依据：`independent` 独立依据，`planner` 规划端自己的非照抄证据，`off` 不查 |
 | `autoHandover` | 见下 | 标记建议交接之后怎么办，对象，各键可单独省略；无效值告警并回落默认值，未知子键写进 `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` 只标记并保留面板按钮；`notify` 另加面板提醒；`confirm` 会话空闲且没有运行中的 Codex 任务时在面板询问，同意才交接；`auto` 同样条件下直接交接 |
 | `autoHandover.cooldownHours` | `12` | 拒绝、点“知道了”或询问没人理之后多少小时内不再询问或自动交接，非负数 |
@@ -554,6 +563,14 @@ Checks run on load, hot reload and directory notifications, sharing the resume e
 
 After atomically publishing the result, the claimed request is deleted. Only the latest result is retained; check its timestamp and read it before submitting another request. A failed result write preserves the claim, which is never automatically replayed after restart. Each request attempts once; `sent` confirms submission, not completion of the new task. Plugin teardown closes the directory watcher.
 
+### 0.9.114: Closing a criterion the report marked unmet needs independent support
+
+- When a closing review (`verified` or `accepted_deviations`) records as `met` a criterion that Codex's own report marked `blocked` / `not_met`, `closeoutEvidence` decides what supports it. `independent` (default) needs at least one independent source: a completed verification of the unit, finished after that round, that marks the criterion met (verifications now list each flagged original criterion as its own item); a later round of the unit that reports it met; or a real user reply in the session after the job ended (the same check as the user confirmation for accepted deviations, not relaxed by `plannerAnswers`). The planner's own evidence is no longer enough. `planner` accepts the planner's own, non-copied evidence (the 0.9.103 rule, now for both closing verdicts). `off` does not check.
+- Without support the review is rejected, listing per criterion the three ways forward: `codex_verify` the job (or `verify_previous` on the next unit when its writes do not overlap), `codex_continue` it, or record the criterion as `blocked` / `not_met`.
+- "Accepted although not met": an `accepted_deviations` entry may keep `blocked` / `not_met` with `accepted` (the reason); the record keeps the status and `codex_summary` lists such criteria in `accepted_open`. It goes through the same user confirmation as accepted deviations (with `plannerAnswers` off, a user reply after the job ended).
+- Cut-off: only jobs finished after this version first loaded on the machine (`closeout-evidence-since.json`) are held to `independent`; earlier jobs close under the `planner` rule, so upgrading does not make them harder to close.
+- Measurement: `closeout-stats.json` counts closing outcomes per session and overall (`all_met`, `accepted_open`, `rejected_unsupported`), shown by `codex_runtime`. Job contexts gain `routing` (continuation mode, parent thread, parent job, superseded threads, `verify_previous`), and close-out refusals log the named job ids to `closeout-refusals.jsonl`.
+
 ### 0.9.112: Fresh threads for codex_run resumes, and verifying the previous job alongside the next one
 
 - `codex_run` with `resume` starts a new thread when the resumed thread's last request exceeded `continueFreshAboveTokens` (default 100000). The planner's task text is kept in full after a brief of the previous round (its task and acceptance list, the per-criterion self-report with evidence, deviations, unresolved items, blockers, changed files, and the latest review verdict and notes). The previous round is the latest job on that thread owned by the session or its hand-over predecessors; the new job links to it through `parent_job_id`, so units of work, `codex_summary` grouping, the close-out guard's follow-up rule, the hand-over self-check and aliases all treat it as that thread's follow-up. `fresh: true` / `false` overrides per call; small or unknown-size threads still resume. The result names the new thread decision, the old thread, the previous job and the new job and says to continue from the new job; a later resume of a superseded thread is redirected to the superseding thread's latest job and says so.
@@ -710,6 +727,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
 | `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |
 | `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |
+| `closeoutEvidence` | `independent` | What supports recording a criterion the report marked unmet as met when closing: `independent` sources, `planner` own non-copied evidence, `off` no check |
 | `autoHandover` | see below | What happens once a session is flagged; an object whose keys may be omitted one by one. Invalid values warn and fall back to the default; unknown sub-keys go to `unknownConfig` |
 | `autoHandover.mode` | `confirm` | `off` flags only and keeps the panel button; `notify` adds a panel reminder; `confirm` asks in the panel once the session is idle with no running Codex job and hands over on agreement; `auto` hands over directly under the same conditions |
 | `autoHandover.cooldownHours` | `12` | Hours without questions or automatic hand-overs after a decline, a dismissed reminder or an unanswered question; non-negative |
