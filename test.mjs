@@ -7186,6 +7186,25 @@ test('parked evaluation drops a pruned original job and releases the goal guard'
   assert.deepEqual(f.writes, []);
 });
 
+test('parked review: an unreadable parked file blocks the goal, an unreadable review history keeps the entry', async (t) => {
+  const f = parkedReviewFixture(t);
+  let historyUnreadable = false;
+  const h = f.load({ closeoutGuard: false, statusResult: ([, id]) =>
+    historyUnreadable && id === f.id ? { ...f.source, verification_status: 'invalid' } : undefined });
+  assert.equal((await f.submit(h)).status, 'parked');
+  const file = path.join(f.state, 'parked-reviews.json');
+  const saved = readFileSync(file, 'utf8');
+  writeFileSync(file, '{not json');
+  assert.match((await f.goal(h)).error.message, /挂起复核记录（parked-reviews\.json）读不出来/);
+  writeFileSync(file, saved);
+  // 核验结束时原任务的复核历史暂时读不出来：不判定、不消耗条目，下次再判。
+  historyUnreadable = true;
+  f.complete();
+  assert.equal((await f.status(h)).parked_review, undefined);
+  assert.equal(f.parked().length, 1);
+  assert.deepEqual(f.writes, []);
+});
+
 test('auto catch-up starts two on load and one per session scan through handover', async (t) => {
   const f = autoVerifyFixture(t);
   let now = Date.now();
@@ -7408,7 +7427,7 @@ test('release C: overlapping finish observers and manual verification dispatch o
   const result = await first;
   assert.deepEqual(result.auto_verify, { job_id: 'CHECK', status: 'running' });
   assert.deepEqual((await second).auto_verify, result.auto_verify);
-  assert.ok(result.next.endsWith('插件已自动派出对 FLAGGED 的只读核验 CHECK，正在跑。现在就可以记 codex_review FLAGGED：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起，核验结束后通知里给出判定和可直接提交的复核），然后去派与 FLAGGED 写入范围不重叠的下一单；不必等核验。'));
+  assert.ok(result.next.endsWith('插件已自动派出对 FLAGGED 的只读核验 CHECK，正在跑。现在就可以记 codex_review FLAGGED：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起，核验结束后通知里给出判定和可直接提交的复核），然后可以去派与 FLAGGED 写入范围不重叠的下一单（收尾护栏照常核对）；不必等核验。'));
   assert.equal((await manual).next, '对 FLAGGED 的核验已在跑（任务 CHECK），不重复派');
   running.push({ job_id: 'CHECK', execution_status: 'running', context: { verification_of: 'FLAGGED' } });
   assert.equal((await h.tools.codex_verify.execute(args, exec)).job_id, 'CHECK');

@@ -1219,6 +1219,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const parkedFor = (owner) => (readParkedReviews() ?? []).filter(entry => !owner || owns(owner, entry.owner));
   const parkedGoalRefusal = (owner) => {
     if (!owner) return '';
+    if (readParkedReviews() === null) return 'update_goal: 会话目标暂不能标记完成：挂起复核记录（parked-reviews.json）读不出来，稍后重试；一直读不出来请操作员检查该文件。';
     const entry = parkedFor(owner)[0] ?? [...parkedEvaluations.values()].find(e => e.pending && owns(owner, e.owner));
     return entry ? `update_goal: 会话目标暂不能标记完成。${entry.job_id} 有挂起复核，等待核验 ${entry.verification_id} 的复核处理结束。` : '';
   };
@@ -1643,7 +1644,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           countCloseout(owner, 'auto_verify_started');
           if (catchup) countCloseout(owner, 'auto_verify_catchup');
           const line = `插件已自动派出对 ${id} 的只读核验 ${result.job_id}` + (result.status === 'running'
-            ? `，正在跑。现在就可以记 codex_review ${id}：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起，核验结束后通知里给出判定和可直接提交的复核），然后去派与 ${id} 写入范围不重叠的下一单；不必等核验。`
+            ? `，正在跑。现在就可以记 codex_review ${id}：报告标为未满足的条目照实保留并写 accepted（缺依据会挂起，核验结束后通知里给出判定和可直接提交的复核），然后可以去派与 ${id} 写入范围不重叠的下一单（收尾护栏照常核对）；不必等核验。`
             : `，状态 ${result.status}；核验结束后按结论记 codex_review ${id}。`);
           return { auto_verify: { job_id: result.job_id, status: result.status }, line };
         } catch (error) {
@@ -1685,7 +1686,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   async function observeParkedReview(value) {
     const { job_id: verificationId } = value;
-    if (value.error_kind !== 'unknown_job' && cancelUnconfirmed(value)) return;
+    // 核验记录已清理或损坏时也按已结束处理，挂起条目不会一直卡住。
+    if (!['unknown_job', 'invalid_record'].includes(value.error_kind) && cancelUnconfirmed(value)) return;
     const prior = parkedEvaluations.get(verificationId);
     if (prior?.pending) return prior.result;
     const entry = readParkedReviews()?.find(e => e.verification_id === verificationId);
@@ -1706,16 +1708,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     let prepared;
     const outcome = (outcome, line) => ({ parked_review: { job_id, outcome }, line: `${job_id} 的挂起复核${line}` });
     let source = await conductor.waitJob(job_id, 0);
-    const unavailable = value => !value || (value.error_kind !== 'unknown_job' && unknownState(value));
+    // runner 读不到 reviews.json 时 verification_status 为 invalid：暂时状态，留到下次再判。
+    const unavailable = value => (value.error_kind !== 'unknown_job' && unknownState(value)) || value.verification_status === 'invalid';
     if (unavailable(source)) return;
-    if (source.error_kind !== 'unknown_job' && owns(successor(), source.context?.owner) && !(source.verification?.time > at)) {
-      const supports = await criterionSupport(source, successor(), [], undefined, true, true);
+    let owner = successor();
+    let owned = source.error_kind !== 'unknown_job' && owns(owner, source.context?.owner);
+    if (owned && !(source.verification?.time > at)) {
+      const supports = await criterionSupport(source, owner, [], undefined, true, true);
       const openSupport = { ...supports.openSupport };
       for (const [key, kinds] of Object.entries(park_support)) openSupport[key] = [...new Set([...kinds, ...(openSupport[key] ?? [])])];
       prepared = prepareReview(review, { ...source, evidenceLevel: evidenceLevel(source), openLevel: openEvidenceLevel(source), ...supports, openSupport });
       // 依据查询期间可能已有人工复核。读到确定状态之后再认领。
       source = await conductor.waitJob(job_id, 0);
       if (unavailable(source)) return;
+      owner = successor();
+      owned = source.error_kind !== 'unknown_job' && owns(owner, source.context?.owner);
     }
 
     // 准备好结论后同步认领。核验期间重提时改为评估新条目。
@@ -1723,20 +1730,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const current = entries?.find(e => e.job_id === job_id && e.verification_id === verification_id);
     if (!current) return;
     if (JSON.stringify(current) !== JSON.stringify(entry)) return evaluateParkedReview(current);
-    const owner = successor();
-    const pruned = source.error_kind === 'unknown_job';
-    const owned = !pruned && owns(owner, source.context?.owner);
-    const superseded = owned && source.verification?.time > at;
-    // 若读状态期间任务刚回到归属链，留给下一次扫描重新核对依据。
-    if (owned && !superseded && !prepared) return;
     writeJsonAtomic(parkedFile, entries.filter(e => e !== current));
-    if (superseded) return outcome('superseded', '已有更新的复核，已跳过。');
+    if (owned && source.verification?.time > at) return outcome('superseded', '已有更新的复核，已跳过。');
     if (owned && !prepared.problems.length) {
       countCloseout(owner, 'parked_ready');
       return outcome('ready', `按核验结论可以通过，原样提交即可：${JSON.stringify({ job_id, ...prepared.review })}`);
     }
     countCloseout(owner, 'parked_rejected');
-    const reason = pruned ? '原任务已清理或不存在。'
+    const reason = source.error_kind === 'unknown_job' ? '原任务已清理或不存在。'
       : owned ? reviewRejection(job_id, source, prepared) : '无法确认原任务归属。';
     return outcome('rejected', `按核验结论不能通过：${reason}`);
   }
