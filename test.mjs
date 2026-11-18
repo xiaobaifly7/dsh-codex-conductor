@@ -6229,6 +6229,25 @@ test('later verification cannot support a must_verify item with ambiguous text',
   await assert.rejects(h.tools.codex_review.execute(review, { agent: agentAt('/work') }), /第 1 条（must_verify）记 met 缺少独立实测依据/);
 });
 
+test('later verification gives no support when the source repeats the text in an unflagged item', async (t) => {
+  const { source, make } = acceptedFixtureHarness(t);
+  const text = '相同验收内容';
+  source.context.acceptance = [text, text];
+  source.context.must_verify = [1];
+  // 第 2 条报告 met、没被标记：候选只有第 1 条，但原任务里同一条文出现两次，仍对不准。
+  source.structured = { ...source.structured, criteria: [resultRow(text, 'met'), resultRow(text, 'met')],
+    deviations: [], unresolved: [], blockers: [] };
+  const later = finishedRound(source, 'LATER', [text, text], [], source.finished_at, { parent_job_id: source.job_id });
+  later.context.must_verify = [2];
+  const item = `原验收第 2 条（必须实测）：${text}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
+  const check = finishedRound(source, 'CHECK', [item], [resultRow(item, 'met')], later.finished_at);
+  check.context.verification_of = later.job_id;
+  const h = make({ plannerAnswers: true, closeoutEvidence: 'off', acceptOpenEvidence: 'off',
+    listResult: { jobs: [later, check] }, reviewResult: source });
+  Object.assign(h.finals, { LATER: later, CHECK: check });
+  await assert.rejects(h.tools.codex_review.execute(verifiedReview(source), { agent: agentAt('/work') }), /第 1 条（must_verify）记 met 缺少独立实测依据/);
+});
+
 test('same-thread follow-up without a parent provides independent support', async (t) => {
   const { source, make, state } = acceptedFixtureHarness(t);
   writeFileSync(path.join(state, 'closeout-evidence-since.json'), JSON.stringify({ since: source.finished_at - 1 }));

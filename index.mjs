@@ -1119,7 +1119,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             const text = verificationTargetText(target, targetKey);
             if (typeof text !== 'string') return;
             const matches = [...targets.values()].filter(f => Boolean(f.row) === targetKey.startsWith('row') && f.criterion === text);
-            if (matches.length !== 1) return;
+            // 原任务里同一条文出现不止一次（含未标记的条目）时对不准是哪一条，不算依据。
+            const sameText = targetKey.startsWith('row') ? (source.structured?.criteria ?? []).filter(c => c?.criterion === text).length
+              : (source.context?.acceptance ?? []).filter(a => a === text).length;
+            if (matches.length !== 1 || sameText > 1) return;
             key = matches[0].key;
           }
           const row = key && reportRowOf(acceptance, report.criteria, i + 1);
@@ -1204,8 +1207,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return { since: acceptOpenFrom, items: [], completions: [] };
   };
   const saveLedger = (ledger) => {
-    const items = ledger.items.slice(-2000);
-    // 复核时间只为挡住迟到的旧回执：留最近 2000 个任务，仍有条目的任务一律保留。
+    // 未完成项不按条数截断：只有复核或核验能让它离开台账。复核时间只为挡住迟到的旧回执：留最近 2000 个任务，仍有条目的任务一律保留。
+    const { items } = ledger;
     const keep = new Set(items.map(item => item.job_id));
     const times = Object.entries(ledger.review_times ?? {}).sort((a, b) => a[1] - b[1]);
     const review_times = Object.fromEntries(times.filter(([id], i) => keep.has(id) || i >= times.length - 2000));
