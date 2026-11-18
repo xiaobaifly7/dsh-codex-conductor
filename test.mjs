@@ -9,7 +9,7 @@ import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePrompt, createConductor, apply,
-  outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX } from './index.mjs';
+  outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX, hasUserReply } from './index.mjs';
 import { createPanelApi, PANEL_PATH } from './panel.mjs';
 import { wslPath, GEMINI_CHECK_HINT, GEMINI_READ_DENY } from './guard.mjs';
 import './panel.test.mjs';
@@ -1926,6 +1926,7 @@ test('codex_review cannot record accepted deviations before the user replies', a
 
 test('plannerAnswers lets the planner record accepted deviations without a user reply', async () => {
   const source = workflowSource('implementation');
+  source.finished_at = 1000; // 截止时间之前结束的旧任务：按 planner 规则结案，本测试不涉及独立依据
   source.structured.deviations = ['CSV 输出文件名有偏差'];
   const accepted_deviations = [{ kind: 'reported', index: 1, evidence: '按原目标核对，保留现有文件名' }];
   const record = { status: 'accepted_deviations', criteria: [{ index: 1, status: 'met', evidence: 'CSV 测试通过' }],
@@ -1944,6 +1945,7 @@ test('plannerAnswers lets the planner record accepted deviations without a user 
 
 test('plannerAnswers lets the planner accept out-of-scope changes without a user reply', async () => {
   const source = { ...workflowSource('implementation'), out_of_scope: ['extra.csv'] };
+  source.finished_at = 1000; // 截止时间之前结束的旧任务：按 planner 规则结案，本测试不涉及独立依据
   const h = harness({ config: { plannerAnswers: true,
     reviewResult: { ...source, verification_status: 'accepted_deviations' } } });
   h.finals.PARENT = source;
@@ -1982,6 +1984,7 @@ test('codex_review sends every criterion in stdin and returns verification witho
 
 test('codex_review accepts a complete review without empty optional fields', async () => {
   const source = workflowSource('implementation');
+  source.finished_at = 1000; // 截止时间之前结束的旧任务：按 planner 规则结案，本测试不涉及独立依据
   source.structured.blockers = [];
   const review = { status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '只读测试确认已通过' }] };
   const record = { ...review, notes: '', accepted_deviations: [] };
@@ -5439,6 +5442,7 @@ test('a handed-over session owns exactly its predecessors\' jobs, carries the cl
   t.after(() => aliases.unlink('S1', 'S2'));
   const as = (id) => ({ ...agentAt('/work/current'), id });
   const source = workflowSource('implementation');
+  source.finished_at = 1000; // 截止时间之前结束的旧任务：按 planner 规则结案，本测试不涉及独立依据
   source.structured.blockers = [];
   const review = { job_id: 'PARENT', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '只读测试确认已通过' }] };
   const h = harness({ config: { reviewResult: { ...source, verification_status: 'verified' } } });
@@ -5815,7 +5819,7 @@ test('codex_review finds independent support in a later verification, a later ro
   assert.equal((await run({ config: { closeoutEvidence: 'planner' } })).verification_status, 'verified');
   const after = stats();
   const delta = (k) => (after[k] ?? 0) - (before[k] ?? 0);
-  assert.deepEqual([delta('rejected_unsupported'), delta('all_met'), delta('accepted_open')], [2, 4, 1]);
+  assert.deepEqual([delta('rejected_unsupported'), delta('all_met'), delta('accepted_open'), delta('met_planner_level')], [2, 3, 1, 1]);
   // 在这一版首次加载之前结束的任务：按 planner 规则，不会变难收尾。
   const old = { ...parent, finished_at: 1000 };
   const h = harness({ config: { plannerAnswers: true, reviewResult: { ...old, verification_status: 'verified' } } });
@@ -5845,4 +5849,50 @@ test('routing is recorded in the job context and close-out refusals are logged w
   const lines = readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'closeout-refusals.jsonl'), 'utf8').trim().split('\n');
   const last = JSON.parse(lines.at(-1));
   assert.deepEqual([last.session, last.tool, last.unreviewed, last.needs_changes], ['S1', 'codex_run', ['FLAG'], []]);
+});
+
+test('the real runner status shape (no finished_at) keeps the independent rule: the 0.9.114 bypass is closed', async (t) => {
+  // fixtures/runner-status-0ec847.json：从真实 runner status 输出脱敏而来（键和类型照旧，文字换成占位）。
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/runner-status-0ec847.json', import.meta.url), 'utf8'));
+  assert.equal(fixture.finished_at, undefined, 'the captured 0.9.114-era shape carries no finished_at');
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-evidence-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const state = path.join(root, 'dsh-codex-conductor');
+  mkdirSync(state, { recursive: true });
+  // 截止时间早于这个任务（固定值，不随运行日期变化）。
+  writeFileSync(path.join(state, 'closeout-evidence-since.json'), JSON.stringify({ since: Date.UTC(2026, 10, 17) / 1000 }));
+  const previous = process.env.LOCALAPPDATA;
+  const apply = (source, config = {}) => {
+    process.env.LOCALAPPDATA = root;
+    try {
+      const h = harness({ config: { plannerAnswers: true, reviewResult: { ...source, verification_status: 'accepted_deviations' }, ...config } });
+      h.finals[source.job_id] = source;
+      return h;
+    } finally { process.env.LOCALAPPDATA = previous; }
+  };
+  const { status, criteria, notes, accepted_deviations } = fixture.verification;
+  const review = { job_id: fixture.job_id, status, criteria, notes, accepted_deviations };
+  // 0.9.114 的错误：没有 finished_at 时退成 planner，规划端自己的证据就过了。现在按任务号判断为新任务，要独立依据。
+  await assert.rejects(apply(fixture).tools.codex_review.execute(review, { agent: agentAt('/work/current') }),
+    /第 4 条为 blocked，accepted_deviations 记成 met 但没有独立依据/);
+  // runner 修复后 status 带 finished_at：同样按 independent。
+  await assert.rejects(apply({ ...fixture, finished_at: Date.UTC(2026, 10, 18, 5) / 1000 }).tools.codex_review.execute(review, { agent: agentAt('/work/current') }),
+    /没有独立依据/);
+  // 截止时间之前结束的旧任务仍按 planner 规则，记作 met_planner_level 而不是 all_met。
+  const old = { ...fixture, finished_at: Date.UTC(2026, 10, 16) / 1000 };
+  const h = apply(old);
+  assert.equal((await h.tools.codex_review.execute(review, { agent: agentAt('/work/current') })).verification_status, 'accepted_deviations');
+  const stats = JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8'));
+  assert.deepEqual([stats.total.met_planner_level, stats.total.all_met, stats.total.rejected_unsupported], [1, undefined, 2]);
+});
+
+test('watchdog top-ups, plugin-sent messages and auto-answers are not a user reply', () => {
+  const job = { job_id: 'J1', finished_at: 1000 };
+  const at = (data, time = 2_000_000) => ({ type: 'user/message', time, data });
+  const text = (value) => [{ type: 'text', text: value }];
+  assert.equal(hasUserReply([at({ source: { kind: 'user' }, content: text('这条我确认过') })], job, 'S1', '自动续接'), true);
+  for (const data of [{ source: { kind: 'user' }, content: text('继续') }, { source: { kind: 'user', via: 'codex-conductor' }, content: text('请接着做') },
+    { source: { kind: 'user-question-reply', callId: 'c1' }, content: text('自动代答') }, { source: { kind: 'user' }, content: text('自动续接') }]) {
+    assert.equal(hasUserReply([at(data)], job, 'S1', '自动续接'), false, JSON.stringify(data));
+  }
 });

@@ -490,11 +490,14 @@ function widensOverlappingScope(previousCwd, original, cwd, requested) {
     after.some(p => !before.some(r => under(p, r)));
 }
 
+// 外部看门狗通过 send-request 补发的固定话术。
+const AUTOMATIC_TEXTS = new Set(['继续']);
 export function hasUserReply(log, job, owner, autoMessage) {
   const text = (e) => (Array.isArray(e.data?.content) ? e.data.content : []).filter(c => c?.type === 'text').map(c => c.text).join('\n');
   // autoResume submits its restart notice with the user source; nobody answered anything.
+  // 插件自己代发的续接、看门狗补发的“继续”都不是用户回复（宿主提问的自动代答 kind 是 user-question-reply，本来就不算）。
   const user = log.findLastIndex(e => e.type === 'user/message' && e.data?.source?.kind === 'user' &&
-    !(autoMessage && text(e) === autoMessage));
+    e.data.source.via !== 'codex-conductor' && !(autoMessage && text(e) === autoMessage) && !AUTOMATIC_TEXTS.has(text(e).trim()));
   if (user < 0) return false;
   const replyAt = log[user].at ?? log[user].time;
   const review = job.verification;
@@ -968,7 +971,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     Date.now() / 1000, 'closeout-evidence-since.json');
   const evidenceLevel = (source) => {
     const level = cfg.closeoutEvidence ?? 'independent';
-    return level === 'independent' && !(source.finished_at >= evidenceFrom) ? 'planner' : level;
+    if (level !== 'independent') return level;
+    // runner status 现在带 finished_at（0.9.114 时没有，规则因此一直退成 planner）。
+    if (Number.isFinite(source.finished_at)) return source.finished_at >= evidenceFrom ? 'independent' : 'planner';
+    // 拿不到结束时间时看任务号里的开始时间（runner 所在系统的本地时间，时区不定，按 ±14 小时取界）：
+    // 只有最晚也早于截止时间的才按旧规则，新任务和说不准的都按 independent。
+    const m = /^(\d{4})(\d{2})(\d{2})-(\d{2})(\d{2})(\d{2})-/.exec(String(source.job_id ?? ''));
+    const started = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) / 1000 : undefined;
+    return started !== undefined && started + 14 * 3600 < evidenceFrom ? 'planner' : 'independent';
   };
   // 原报告自标未满足的条目各有哪些独立依据：晚于这一轮结束、核验本单元的核验任务判这一条 met；同一单元的后续轮次报告这一条 met；
   // 原会话用户在作业结束后有过真实回复（与 accepted_deviations 的用户确认同一判定，但不因 plannerAnswers 放宽）。
@@ -2129,7 +2139,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       const result = await conductor.review(job_id, review, owner, exec?.signal);
       if (['verified', 'accepted_deviations'].includes(review.status) && result.verification_status === review.status) {
-        countCloseout(owner, review.criteria.some((c) => typeof c?.accepted === 'string' && c.accepted.trim()) ? 'accepted_open' : 'all_met');
+        // 自标未满足的条目在 planner / off 级别下记成 met，单独计数，不混进有依据的 all_met。
+        const flaggedMet = flaggedCriteria(source).some((f) => review.criteria.some((c) => c?.index === f.index && c.status === 'met'));
+        countCloseout(owner, review.criteria.some((c) => typeof c?.accepted === 'string' && c.accepted.trim()) ? 'accepted_open'
+          : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
       }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {

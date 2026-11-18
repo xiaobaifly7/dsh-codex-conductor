@@ -2544,6 +2544,13 @@ class RunnerTests(unittest.TestCase):
         # An older record without the field stays readable.
         self.assertEqual(self.control("status", "accept-open")["verification_status"], "accepted_deviations")
 
+    def test_status_reports_when_the_job_started_and_finished(self):
+        jd = self.stored_job("timed", {"status": "completed", "structured": self.sample_report()}, context=self.sample_context())
+        os.utime(jd / "args.json", (1000, 1000))
+        os.utime(jd / "result.json", (2000, 2000))
+        value = self.control("status", "timed")
+        self.assertEqual((value["started_at"], value["finished_at"]), (1000, 2000))
+
     def test_context_routing_is_optional_and_typed(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner

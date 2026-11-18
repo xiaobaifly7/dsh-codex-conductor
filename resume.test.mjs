@@ -258,7 +258,7 @@ test('resume: missing, armed, completed and exhausted goals submit default/custo
     const sent = f.messages[0].message;
     assert.match(sent.id, new RegExp(`^${uuid}$`));
     assert.deepEqual(sent, { id: sent.id, role: 'user', content: [{ type: 'text', text: message ?? '继续' }],
-      source: { kind: 'user' } });
+      source: { kind: 'user', via: 'codex-conductor' } });
     assert.deepEqual(f.resumes, []);
     assert.deepEqual(f.wakes, []);
   });
@@ -459,7 +459,7 @@ test('send: completed idle sessions receive exact user text and source without e
       const sent = f.messages[0].message;
       assert.match(sent.id, new RegExp(`^${uuid}$`));
       assert.deepEqual(sent, { id: sent.id, role: 'user', content: [{ type: 'text', text: message }],
-        source: { kind: 'user' } });
+        source: { kind: 'user', via: 'codex-conductor' } });
       assert.deepEqual(f.calls, [['resolve', 'A'], ['read', 'A']]);
       assert.deepEqual(f.resumes, []);
       assert.deepEqual(f.wakes, []);
@@ -492,7 +492,7 @@ test('send: whenRunning queue submits once to a running session, including one t
     assert.equal(result.reason, 'message_queued');
     assert.equal(f.messages.length, 1);
     assert.deepEqual(f.messages[0].message.content, [{ type: 'text', text: 'Wrap up' }]);
-    assert.deepEqual(f.messages[0].message.source, { kind: 'user' });
+    assert.deepEqual(f.messages[0].message.source, { kind: 'user', via: 'codex-conductor' });
   });
   const f = fixture(t, 'send'), agent = f.add('A', [start(), end()]);
   agent.status = 'running';

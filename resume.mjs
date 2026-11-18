@@ -157,7 +157,8 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
     }
     const queued = agent.status === 'running';
     reload?.claim();
-    agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
+    // via 标出这是插件代发的消息（续接、send-request），不当作用户回复。
+    agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user', via: 'codex-conductor' } });
     return result(send ? 'sent' : 'resumed', queued ? 'message_queued' : 'message_submitted', method);
   } catch (error) {
     // Host errors may quote the submitted text; never publish them for the send entry.

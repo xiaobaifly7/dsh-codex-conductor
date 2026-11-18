@@ -1688,6 +1688,10 @@ def enriched_status(job_id, job_dir, value, record=None):
     metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
                                                                          thread_id=value.get("thread_id"))
     result = {**metadata, **diff_fields(job_dir), **value, "job_id": job_id}
+    # Same timestamps as the job listing: a review needs to know when this round finished.
+    args_file = job_dir / "args.json"
+    result.setdefault("started_at", args_file.stat().st_mtime if args_file.exists() else None)
+    result.setdefault("finished_at", finished)
     for key in ("model", "service_tier"):
         if key in metadata["task_options"]:
             result["task_options"] = {**result["task_options"], key: metadata["task_options"][key]}
