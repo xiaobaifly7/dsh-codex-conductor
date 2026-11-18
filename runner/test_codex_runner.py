@@ -2524,6 +2524,34 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(value["verification"]["notes"], review["notes"])
                 self.assertEqual((jd / "result.json").read_bytes(), original)
 
+    def test_accepted_deviations_can_accept_an_open_criterion_only_with_a_reason(self):
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "no access"}])
+        jd = self.stored_job("accept-open", {"status": "completed", "structured": report}, context=self.sample_context())
+        base = self.sample_review(status="accepted_deviations")
+        open_entry = {"index": 1, "status": "blocked", "evidence": "still blocked"}
+        # Without a reason a passing review still needs every criterion met.
+        self.assertRegex(self.submit_review(jd.name, {**base, "criteria": [open_entry]})["error"], "Passing review requires all criteria met")
+        # accepted is only for accepted_deviations and only on a criterion that is not met.
+        for status, entry in (("verified", {**open_entry, "accepted": "owner accepts"}),
+                              ("accepted_deviations", {"index": 1, "status": "met", "evidence": "ok", "accepted": "x"}),
+                              ("accepted_deviations", {**open_entry, "accepted": "  "})):
+            self.assertRegex(self.submit_review(jd.name, {**base, "status": status, "criteria": [entry]})["error"], "accepted is only")
+        value = self.submit_review(jd.name, {**base, "criteria": [{**open_entry, "accepted": "owner accepts the gap"}]})
+        self.assertEqual(value["verification_status"], "accepted_deviations")
+        self.assertEqual(value["verification"]["criteria"][0]["accepted"], "owner accepts the gap")
+        groups = self.control("summary", "--job-id", "accept-open")["groups"]
+        self.assertEqual(groups[0]["accepted_open"], [{"index": 1, "status": "blocked"}])
+        # An older record without the field stays readable.
+        self.assertEqual(self.control("status", "accept-open")["verification_status"], "accepted_deviations")
+
+    def test_context_routing_is_optional_and_typed(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+        ok = {**self.sample_context(), "routing": {"continuation_mode": "fresh", "parent_thread_id": "T", "superseded_threads": ["A"], "fresh": True}}
+        self.assertEqual(codex_runner.task_context(ok)["routing"]["continuation_mode"], "fresh")
+        with self.assertRaises(ValueError):
+            codex_runner.task_context({**self.sample_context(), "routing": {"bad": {"nested": 1}}})
+
     def test_stored_all_met_needs_changes_stays_readable_and_appendable(self):
         jd = self.stored_job("legacy-inconsistent-review",
                              {"status": "completed", "structured": self.sample_report()},

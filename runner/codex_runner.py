@@ -1284,7 +1284,7 @@ def last_activity(events):
 
 def task_context(value):
     fields = {"owner", "task", "acceptance", "write"}
-    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of"}:
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of", "routing"}:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -1302,6 +1302,12 @@ def task_context(value):
             job_identifier(value["verification_of"])
         except argparse.ArgumentTypeError as e:
             raise ValueError("context.verification_of: " + str(e)) from e
+    # routing: how the plugin dispatched this job (fresh/resume, parent thread, verify_previous), for later analysis.
+    if "routing" in value and (not isinstance(value["routing"], dict) or any(
+            not isinstance(k, str) or not (v is None or isinstance(v, (str, int, bool)) or
+                                           (isinstance(v, list) and all(isinstance(i, str) for i in v)))
+            for k, v in value["routing"].items())):
+        raise ValueError("context.routing must map names to strings, numbers, booleans or string lists")
     if "dispatcher" in value:
         dispatcher = value["dispatcher"]
         if (not isinstance(dispatcher, dict) or set(dispatcher) != {"version", "revision", "pid"} or
@@ -1530,11 +1536,16 @@ def validate_review(review, value, submitting=False):
         raise ValueError("review.criteria must be an array")
     indexes = []
     for criterion in criteria:
-        if (not isinstance(criterion, dict) or set(criterion) != {"index", "status", "evidence"} or
+        # "accepted" (optional) records an open criterion that accepted_deviations accepts although it is not met.
+        if (not isinstance(criterion, dict) or not {"index", "status", "evidence"} <= set(criterion) or
+                set(criterion) - {"index", "status", "evidence", "accepted"} or
                 type(criterion["index"]) is not int or
                 not isinstance(criterion["status"], str) or criterion["status"] not in ("met", "not_met", "blocked") or
-                not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip()):
-            raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence")
+                not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip() or
+                ("accepted" in criterion and (criterion["status"] == "met" or review["status"] != "accepted_deviations" or
+                                              not isinstance(criterion["accepted"], str) or not criterion["accepted"].strip()))):
+            raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence; "
+                             "accepted is only for a not_met/blocked criterion of an accepted_deviations review")
         indexes.append(criterion["index"])
     if sorted(indexes) != list(range(1, len(acceptance) + 1)):
         counts = Counter(indexes)
@@ -1567,7 +1578,7 @@ def validate_review(review, value, submitting=False):
             raise ValueError("Deviation acknowledgements require real unique indexes and nonempty evidence" + deviation_hint)
         acknowledged.add((deviation["kind"], deviation["index"]))
     if review["status"] != "needs_changes":
-        if (any(c["status"] != "met" for c in criteria) or acknowledged != expected or review.get("blockers")):
+        if (any(c["status"] != "met" and "accepted" not in c for c in criteria) or acknowledged != expected or review.get("blockers")):
             raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers" + deviation_hint)
     # Only new submissions: older stored reviews may already hold this contradiction and must stay readable.
     elif submitting and all(c["status"] == "met" for c in criteria) and not review.get("blockers") and not expected:
@@ -2015,6 +2026,8 @@ def summarize_jobs(args):
                       "blockers": latest["blocking"]["blockers"]}
         if closed:
             open_items = {k: [] for k in open_items}
+        # Criteria a closing review accepted although they are not met stay visible after close-out.
+        accepted_open = [{"index": c["index"], "status": c["status"]} for c in (verification or {}).get("criteria", []) if c.get("accepted")]
         result.append({"group_id": kind + ":" + identifier, "thread_id": latest.get("thread_id"),
                        "job_ids": [j["job_id"] for j in rounds], "total_rounds": len(rounds),
                        "rounds": [{k: j.get(k) for k in ("job_id", "parent_job_id", "status", "execution_status",
@@ -2025,7 +2038,7 @@ def summarize_jobs(args):
                        "latest_job": {k: latest.get(k) for k in ("job_id", "thread_id", "parent_job_id", "status",
                                       "execution_status", "review_status", "report_status", "blocking", "context")},
                        "summary": report.get("summary"), "verification_status": latest.get("verification_status"),
-                       "verification": verification, "open_items": open_items, "files_changed": files,
+                       "verification": verification, "open_items": open_items, "accepted_open": accepted_open, "files_changed": files,
                        "finished_duration_s": round(sum(durations), 1) if all(type(d) in (int, float) for d in durations) else None,
                        "usage": summary_usage(rounds), "usage_scope": "thread_total" if kind == "thread" else "job"})
     usage_total, usage_unknown = {}, 0
