@@ -31,6 +31,10 @@ test('codex_run guides the planner to dispatch authorized, independently verifia
   } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
   const { description, parameters: { properties } } = tools.codex_run;
   assert.match(description, /一单一个可独立验收的结果，超过 8 条先按共同前置拆单/);
+  assert.match(description, /长等前用 wait_seconds: 0 后台派齐本批独立且 scope 和写入目标互不重叠的任务（限只读调查、codex_verify 核验及无冲突的写任务）/);
+  assert.match(description, /写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须串行，完成并核对一单再派下一单/);
+  assert.match(tools.codex_status.description, /可并行等待多个 Codex 任务，每次调用传一个 job_id.*留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600）/);
+  assert.match(tools.codex_status.parameters.properties.wait_seconds.description, /在本轮等待，超时续等仍在跑的任务/);
   assert.match(description, /派单前核对授权。要交文件或启动会落盘的程序就用 write=true/);
   assert.match(description, /scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots/);
   assert.match(description, /真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access/);

@@ -471,7 +471,7 @@ test('open nextStep remains the default; products points mechanical checks to co
     assert.match(result.next, /原任务 SOURCE-1.*独立核验已结束/);
     assert.match(result.next, /先机械核对抽查条数、出处与证据是否齐全.*codex_review/);
     assert.match(result.next, /不把核验结束当作全部通过/);
-    assert.equal(h.tools.codex_run.description.includes('codex_verify'), plannerReads === 'products');
+    assert.equal(h.tools.codex_run.description.includes('内容是否属实用 codex_verify'), plannerReads === 'products');
   }
 });
 

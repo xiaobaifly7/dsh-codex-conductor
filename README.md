@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
+当前版本为 `0.9.126`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 0.9.66：规划端只读产物与独立核验
 
@@ -197,7 +197,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | --- | --- |
 | `codex_run` | 把任务交给 WSL 里的 Codex；登记后台任务后直接返回任务号。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `must_verify`、`model`、`host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
 | `codex_verify` | 独立核验本会话一个已结束的任务：新线程、只读，沿用原目录和主机访问，先核对 `must_verify`，再回到出处抽查其余结论；启用 `modelAB` 时用配置默认模型，否则沿用原模型。可选 `focus`、`samples`（默认 8，1–30）、`wait_seconds`；结束后用 `codex_review` 记录原任务的验收 |
-| `codex_status` | 派单后留在本轮，用 runner `job_id` 与 `wait_seconds: 3600` 长等，仍在运行就继续等同一任务。120 秒内无实质变化的重复查询保留短回执，并引导长等、不结束本轮 |
+| `codex_status` | 先派齐本批独立且不重叠的任务，再留在本轮按 runner `job_id` 并行调用，每次传一个任务号与 `wait_seconds: 3600`。120 秒内无实质变化的重复查询保留短回执，并引导本轮长等 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
 | `codex_output` | 按 Unicode 字符分页、可重复读取完整原始报告、结果 JSON、原任务与验收上下文或 stderr / events 日志；读取不消费结果，也不启动或恢复任务 |
@@ -238,7 +238,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - worker 启动后自行登记 PID 与进程创建时刻，父进程提前断开也可继续查询和取消。worker 死亡时，若已有 Codex PID 仍通过原有身份核对，结果会带 `residual_codex_pid`、`retryable=false` 和明确说明；须处理残留进程后再重派。状态查询只标记，不主动结束该进程。
 - WSL 重启后，runner 按「开机 ID + 本发行版 init 的启动时刻」认出重启前的任务（`wsl --shutdown`、Windows 重启换开机 ID，`wsl --terminate`、发行版自行停止换 init 启动时刻），报 `worker_died`，阶段为 `interrupted`。可写任务先核对原验收和已落盘产物；确认还有缺项时才补做，已开始会话的任务保留原 `thread_id`，状态查询和取消还会核对进程创建时刻，避免把同次启动内复用 PID 的其他进程当成本任务；重试等待期间也不沿用已退出 Codex 的进程记录。升级前未记录创建时刻的旧任务仍按启动批次和存活状态判断。`codex_cancel` 对已经结束的任务直接返回它的结果与对应下一步，不会叫 agent 重派。
 
-- 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，Codex 派单会登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run`、`codex_continue`、`codex_verify` 派单时传 `wait_seconds: 0`；登记成功后立即返回 `background_job_id`，不等待完成。做完独立的规划工作后，留在本轮，用返回的 runner `job_id` 调 `codex_status({"job_id":"runner-job-id","wait_seconds":3600})`；仍为 `running` 就继续长等同一任务，不零等待轮询、不重复派单。3600 秒是单次状态等待预算，与执行超时、排队和重试预算分开。
+- 任务表与结束通知：agent 的 preset 提供 DSH 后台任务（jobs）服务时，Codex 派单会登记为一个后台任务（`Codex <job_id>`），DSH 任务表里立刻出现这一行，进度行约每 20 秒刷新一次，显示距 Codex 上次活动的秒数和它最近的动作。`codex_run`、`codex_continue`、`codex_verify` 派单时传 `wait_seconds: 0`；登记成功后立即返回 `background_job_id`，不等待完成。长等前先派齐本批独立、scope 和写入目标互不重叠的任务，并行限只读调查、`codex_verify` 核验和无冲突的写任务。写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须完成并核对一单再派下一单。留在本轮，按 runner `job_id` 并行调用 `codex_status({"job_id":"runner-job-id","wait_seconds":3600})`，超时续等仍为 `running` 的任务，避免零等待轮询或重派。3600 秒是单次状态等待预算，与执行超时、排队和重试预算分开。
 
 - 等待调用已返回报告就直接验收，不再重复取报告。只有摘要、缺内容或截断时，才把 Harness `background_job_id` 填到 `job_output` 的 `job_id` 中补读；该入口不可用或没有后台编号时，用 runner `job_id` 调 `codex_output(artifact="report")`，按 `next_offset` 补齐至 `eof=true`。调用报错或被中止时先确认原任务状态，不据此重派。完成通知及会话空闲唤醒机制保留；通知附可直接调用的 `codex_output` 参数，监控中断时附 `codex_status` 参数，不作为派单后结束本轮的理由。
 
@@ -246,7 +246,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 - 同一个 runner 任务只登记一个后台任务（按 DSH 任务表判断，插件重载后也不重复）；对已登记任务的状态等待不重复发送同一完成结果。中止 `codex_status`、`job_output`、`codex_watch` 等纯观察，只停止本次观察，不结束后台任务或取消 Codex。显式 `codex_cancel` 和归档会话的取消机制保留；取消未确认时保留任务编号并提示用 `codex_status` 查询，任务仍可能在运行。后台监控本身出错时送回 `monitor_failed`，提示先确认原任务状态。没有 jobs 服务、登记失败或没有 agent 时，`codex_run` / `codex_continue` / `codex_verify` 按 `wait_seconds` 同步等待（默认 `0`）；中止这类未登记后台的派单同步等待仍会取消 Codex。派单返回运行中任务后仍按上述方式在本轮长等。
 
-`codex_status` 每次仍查询实时状态；同一会话、同一工具、同一 job 在上次完整回执后的 120 秒内没有实质变化时，重复查询只返回“仍在执行、无实质变化”的简短成功回执，并引导用同一 runner `job_id` 调 `codex_status(wait_seconds: 3600)` 留在本轮长等；有后台任务时保留自动完成通知，不要求结束本轮。阶段、尝试轮次、错误、实际活动、报告或阻塞信息变化，以及完成、失败或未知状态，均返回完整内容；活动秒数和重试倒计时单独变化不算进展。短回执不延后下一次完整回执的时间，`wait_seconds > 0` 不缩短。
+`codex_status` 每次仍查询实时状态；同一会话、同一工具、同一 job 在上次完整回执后的 120 秒内没有实质变化时，重复查询只返回“仍在执行、无实质变化”的简短成功回执，并引导派齐本批独立且不重叠的任务后，留在本轮用 `codex_status(wait_seconds: 3600)` 并行等待；有后台任务时保留自动完成通知，不要求结束本轮。阶段、尝试轮次、错误、实际活动、报告或阻塞信息变化，以及完成、失败或未知状态，均返回完整内容；活动秒数和重试倒计时单独变化不算进展。短回执不延后下一次完整回执的时间，`wait_seconds > 0` 不缩短。
 
 原生 `job_output` 先照常执行归属校验与消费读取；仅对本插件自己的运行中 Codex job，在没有新模型输出且状态不变时应用同样的短回执，`wait: true` 不缩短；短回执同样引导本轮长等，中止读取只停止观察。`codex_jobs` / `job_list` 的列表和 `codex_output` 的产物分页保持完整。去重记录只在当前插件实例内，重载后首次查询返回完整状态；它减少回执内容量，外部推进提示产生的模型回合仍由宿主控制。
 
@@ -549,7 +549,7 @@ python3 runner/test_codex_runner.py
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The current version is `0.9.126`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 
@@ -732,7 +732,7 @@ For a same-process hot reload, `autoresume-state.json` records running sessions 
 
 Only notices observed during the current plugin lifetime are tracked; historical notices are not replayed. A wake does not guarantee gate admission or restore already-claimed input. `gemini_write` currently returns a foreground result and creates no background job or completion notice, so it does not enter this notification-wake path; successful prose restrictions are restored from existing receipts in the same session.
 
-`codex_status` still reads live state on every call. Repeated unchanged checks for the same owner, tool and job within 120 seconds of the last full receipt return a brief successful running/unchanged receipt directing the planner to stay in the current turn and wait with the same runner `job_id` via `codex_status(wait_seconds: 3600)`. Background completion notices remain available; the receipt does not ask the planner to end the turn. Phases, attempts, errors, actual activity, reports and blocker changes return full details, as do terminal and unknown states. Activity-age and retry-countdown changes alone are ignored. Brief receipts do not extend the full-receipt interval, and positive `wait_seconds` bypasses dampening.
+`codex_status` still reads live state on every call. Repeated unchanged checks for the same owner, tool and job within 120 seconds of the last full receipt return a brief successful running/unchanged receipt directing the planner to dispatch the independent, non-overlapping jobs in the batch before waiting in parallel with `codex_status(wait_seconds: 3600)` in the current turn. Background completion notices remain available; the receipt does not ask the planner to end the turn. Phases, attempts, errors, actual activity, reports and blocker changes return full details, as do terminal and unknown states. Activity-age and retry-countdown changes alone are ignored. Brief receipts do not extend the full-receipt interval, and positive `wait_seconds` bypasses dampening.
 
 Native `job_output` retains the original ownership and consuming-read behavior before shortening only unchanged running conductor jobs with no new model output. `wait: true` bypasses dampening; brief receipts also direct same-turn long waits, and aborting the read only stops observation. `codex_jobs` / `job_list` listings and `codex_output` pages stay complete. Query signatures live only in the current plugin instance, so the first check after reload is complete. This reduces receipt content; external advancement prompts can still cause model turns.
 
@@ -835,7 +835,7 @@ Recovery and pending scope checks reuse paginated task records instead of a sepa
 
 WSL restarts are recognized by boot ID and distro init start time, including shutdown, termination and auto-stop. Earlier tasks become `worker_died` with phase `interrupted`. Check existing artifacts against the original acceptance criteria before filling gaps; writers retain a started thread for resumption. Status/cancellation also check process creation time to avoid same-boot PID reuse; finished Codex identities are not retained during retry waits. Older records without creation times retain boot/liveness checks. Cancellation ends the task's process tree; an already-ended task returns its result and matching next step instead of requesting redispatch.
 
-With DSH background jobs, Codex dispatch immediately registers one row, reused across plugin reloads. Progress refreshes about every 20 seconds with last-activity age and latest action. Dispatch `codex_run`, `codex_continue` and `codex_verify` with `wait_seconds: 0`; successful registration returns `background_job_id` immediately. Finish independent planning work, then stay in the current turn and call `codex_status({"job_id":"runner-job-id","wait_seconds":3600})` using the returned runner `job_id`. If it is still `running`, wait again on the same job; do not poll with zero waits or redispatch. The 3600-second status wait is separate from execution, queue and retry budgets.
+With DSH background jobs, Codex dispatch immediately registers one row, reused across plugin reloads. Progress refreshes about every 20 seconds with last-activity age and latest action. Dispatch `codex_run`, `codex_continue` and `codex_verify` with `wait_seconds: 0`; successful registration returns `background_job_id` immediately. Before a long wait, dispatch the batch of independent jobs with disjoint scopes and write targets. Parallel dispatch is limited to read-only investigations, `codex_verify` checks, and non-conflicting writes. If writes touch the same file, directory, workspace or host, start or stop the same VM or service, or depend on each other, finish and check each before dispatching the next. Stay in the current turn and call `codex_status({"job_id":"runner-job-id","wait_seconds":3600})` in parallel with one runner `job_id` per call. If a wait times out, keep waiting on jobs still `running` and avoid zero-wait polling or redispatch. The 3600-second status wait is separate from execution, queue and retry budgets.
 
 If the wait already returns the report, review it directly. Only a summary, missing content or truncation calls for `job_output`, using the Harness `background_job_id` as its `job_id`. If that entry is unavailable or there is no background ID, use `codex_output(artifact="report")` with the runner `job_id`, following `next_offset` to `eof=true`. On errors or aborted calls, confirm the original job's status before taking further action. Completion notices and idle-session wakes remain available, with exact `codex_output` calls or `codex_status` calls after interrupted monitoring; they do not justify ending the turn after dispatch. Status waits do not redeliver the same completion result.
 

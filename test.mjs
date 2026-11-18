@@ -2550,9 +2550,9 @@ test('dispatch with a positive wait still returns a DSH background job without w
   const first = await tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, exec);
   assert.equal(first.status, 'running');
   assert.equal(first.background_job_id, 'bg1');
-  assert.match(first.note, /留在本轮[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*会话空闲[\s\S]*完成通知/);
+  assert.match(first.note, /先后台派齐本批独立且不重叠的任务，再留在本轮并行等待[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*会话空闲[\s\S]*完成通知/);
   assert.match(first.note, /job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id/);
-  assert.match(first.next, /codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*返回报告就直接验收[\s\S]*只有摘要、缺内容或截断[\s\S]*job_output\(\{"job_id":"bg1"\}\)[\s\S]*codex_output/);
+  assert.match(first.next, /先后台派齐本批独立且不重叠的任务，再留在本轮并行等待[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*返回报告就直接验收[\s\S]*只有摘要、缺内容或截断[\s\S]*job_output\(\{"job_id":"bg1"\}\)[\s\S]*codex_output/);
   assert.doesNotMatch(first.next, /等 DSH 的完成通知|结束本轮/);
   // 到点仍在执行：经任务表等，不直接等 runner；runner 只收到后台循环的查询
   assert.deepEqual(calls.slice(1), [['status', 'J1', '--wait', '20', '--follow']]);
@@ -3040,7 +3040,7 @@ test('native cancellation failures stay visible while stopping and allow another
 
 test('directory lock queue tells the planner to wait and distinguishes cancellation from partial execution', () => {
   const queued = { job_id: 'J1', status: 'running', phase: 'lock_wait', attempt: 0 };
-  assert.match(nextStep(queued), /等待同目录写锁[\s\S]*尚未启动 Codex[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*codex_cancel[\s\S]*只取消本任务[\s\S]*不要重复派活/);
+  assert.match(nextStep(queued), /等待同目录写锁[\s\S]*尚未启动 Codex[\s\S]*先后台派齐本批独立且不重叠的任务，再留在本轮并行等待[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*codex_cancel[\s\S]*只取消本任务[\s\S]*不要重复派活/);
   const cancelled = nextStep({ ...queued, status: 'cancelled' });
   assert.match(cancelled, /已取消排队[\s\S]*尚未启动 Codex[\s\S]*没有取消持锁任务/);
   assert.doesNotMatch(cancelled, /可能已改|git status/);
@@ -3938,8 +3938,8 @@ test('history filters preserve session links and output reads are bounded, repea
 });
 
 test('codex_output explains pending artifacts in execute and rendered output without changing runner fields', async () => {
-  const note = '任务还在运行，报告尚未生成；留在本轮，用 codex_status({"job_id":"J","wait_seconds":3600}) 等它结束；' +
-    '等满仍在运行就继续等同一任务，返回报告后直接验收，不要零等待轮询或重复派单。';
+  const note = '任务还在运行，报告尚未生成；先后台派齐本批独立且不重叠的任务，再留在本轮并行等待：codex_status({"job_id":"J","wait_seconds":3600})。' +
+    '仍在跑则续等，返回报告就直接验收，勿零等待轮询或重派。';
   for (const status of [
     { status: 'pending', error_kind: 'artifact_pending', retryable: true },
     { status: 'pending' },

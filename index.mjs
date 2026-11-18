@@ -617,10 +617,11 @@ function sameCriteria(report, acceptance) {
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
 const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并在给用户的汇报里写明替用户做了哪些决定；拿不准，或回答意味着删除数据、改动用户没提过的目录时，仍然先问用户。';
 const USER_REPORT = '向用户汇报时先用大白话说明完成情况、核对结果和剩余问题，不必带任务号和内部状态名。';
-const WAIT_GUIDANCE = '任务仍在运行时留在本轮，用返回的 runner job_id 调 codex_status 并传 wait_seconds: 3600；等满仍在运行就继续等同一任务。' +
-  '等待已返回报告就直接验收；只有摘要、缺内容或截断时才用 job_output 或 codex_output 补读。';
-const waitForJob = (jobId) => `留在本轮，用 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })}) 等它结束；` +
-  '等满仍在运行就继续等同一任务，返回报告后直接验收，不要零等待轮询或重复派单。';
+const WAIT_GUIDANCE = '长等前用 wait_seconds: 0 后台派齐本批独立且 scope 和写入目标互不重叠的任务（限只读调查、codex_verify 核验及无冲突的写任务），直接拿任务号。' +
+  '写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须串行，完成并核对一单再派下一单。' +
+  '留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600），未完则续等。报告直接验收，仅摘要、缺内容或截断时用 job_output 或 codex_output 补读。';
+const waitForJob = (jobId) => `先后台派齐本批独立且不重叠的任务，再留在本轮并行等待：codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
+  '仍在跑则续等，返回报告就直接验收，勿零等待轮询或重派。';
 const SERVICE_FAILURE = new Map([
   ['reconnect_timeout', 'Codex 重连超时'], ['router_down', 'Codex 本地路由不可达'],
   ['idle_timeout', 'Codex 执行空闲超时'], ['transient', '模型服务或连接暂时异常'],
@@ -1970,8 +1971,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const outputCall = `job_output(${JSON.stringify({ job_id: id })})`;
     return { ...value, background_job_id: id,
       note: `已登记为后台任务 ${id}。${waitForJob(value.job_id)}` +
-        '会话空闲时，DSH 的完成通知仍会唤醒会话。job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id。',
-      next: `${waitForJob(value.job_id)}等待已经返回报告就直接验收；只有摘要、缺内容或截断时才用 ${outputCall} 补读，或用 codex_output 分页。` +
+        '会话空闲时，DSH 完成通知仍会唤醒会话。job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id。',
+      next: `${waitForJob(value.job_id)}只有摘要、缺内容或截断时才用 ${outputCall} 补读，或用 codex_output 分页。` +
         '等待期间不要自己动手补做。' };
   }
 
@@ -2558,14 +2559,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
-    description: '等待 Codex 任务。' + WAIT_GUIDANCE +
-      '中止本工具或 job_output 的纯观察等待只停止观察，不取消 Codex；需要取消任务时用 codex_cancel 或后台任务的显式取消。仍在执行时返回最近活动、距上次活动的秒数、阶段和尝试轮次。' +
-      '用 codex_output 分段读取原任务、验收标准和已回传的报告。',
+    description: '可并行等待多个 Codex 任务，每次调用传一个 job_id。' + WAIT_GUIDANCE +
+      '中止本工具或 job_output 只停止观察。取消用 codex_cancel 或后台任务的显式取消。运行中返回最近活动及距今秒数、阶段和尝试轮次。' +
+      '用 codex_output 分段读取任务、验收标准和报告。',
     parameters: {
       type: 'object',
       properties: {
-        job_id: { type: 'string', description: 'codex_run 返回的 job_id。' },
-        wait_seconds: { type: 'integer', description: '任务运行中传 3600，在本轮等待；等满仍在运行就继续等待同一 job_id。省略或 0 仅即时查询，不用于重复轮询。中止等待不会取消 Codex。' },
+        job_id: { type: 'string', description: '派单返回的 runner job_id。' },
+        wait_seconds: { type: 'integer', description: '传 3600 在本轮等待，超时续等仍在跑的任务。省略或 0 即时查询，勿重复轮询。中止等待不取消 Codex。' },
       },
       required: ['job_id'],
     },
