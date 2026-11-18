@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.123` 的失败回执给出失败原因、尝试次数、记录的改动文件数及下一步。规划端按失败类别处理，避免连续原样重派。模型拒绝保持终态。runner 处理超时前已入队的完成事件，避免把已收到的完成结果误判为超时。
+
 `0.9.122` 的 `runnerAgentsMd: bundled` 可选用随包附带的短版执行指令，默认仍沿用用户文件。派单可用 `must_verify` 标记必须实测的验收项，核验优先覆盖，结案记 `met` 须有独立核验结果。本版首次加载后记录的返工欠账跟踪到后继轮复核通过，Goal 完成时提醒干净但未复核的写入任务。新增默认关闭的 `modelAB`，按新线程的任务号确定模型，续接保留原分配。新增只读对照脚本 `tools/model_ab_stats.py`。
 
 `0.9.121` 改写派单和执行提示。规划端按可独立验收的结果拆单，派单前核对写入权限、运行前置和本轮可取得的证据。执行端遇到方法不可用时，在原授权内换等价方法，区分实测不符的 `not_met` 和缺前置的 `blocked`，并明确关键观测、清理或恢复失败须以非零状态退出。
@@ -139,6 +141,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.123` adds the cause, attempt count, recorded file count and next step to failure receipts. The planner follows the guidance for each failure before dispatching again. Model refusals remain terminal. The runner processes completion events already queued at a deadline so a received result is kept.
 
 `0.9.122` adds the opt-in `runnerAgentsMd: bundled` for the shipped short executor instructions. The default still uses the user's file. Dispatches can mark criteria with `must_verify`. Verification checks them first, and closeout requires an independent verification result to mark them `met`. Rework debt recorded from this version's first load stays open until a successor passes review. Goal completion warns about clean unreviewed write jobs. The opt-in `modelAB` assigns new threads by job ID and keeps the assignment on continuation. The read-only `tools/model_ab_stats.py` summarizes the comparison.
 

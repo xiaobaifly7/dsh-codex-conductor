@@ -492,13 +492,15 @@ def run_attempt(args, prompt, run_dir, thread_id):
             completed_at = None
             stdout_done = False
             active_commands = set()
+            timeout_reason = None
+            timeout_marker = object()
             while True:
                 now = time.monotonic()
                 if stdin_errors:
                     state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
                     kill_tree(proc.pid)
                     break
-                if stdout_done and stdin_done.is_set():
+                if stdout_done and stdin_done.is_set() and (timeout_reason is None or completed_at):
                     # Keep the Linux leader unreaped until group cleanup so its PID cannot be reused.
                     exited = (proc.poll() is not None if IS_WIN else
                               os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None)
@@ -508,23 +510,26 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state["forced_exit"] = True
                     kill_tree(proc.pid)
                     break
-                # With the router down, Codex kept reconnecting for a full 240s test and never failed the turn.
-                if not completed_at and reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
-                    state["end_reason"] = "reconnect_timeout"
-                    kill_tree(proc.pid)
-                    break
-                if not completed_at and now - start > args.timeout:
-                    state["end_reason"] = "timeout"
-                    kill_tree(proc.pid)
-                    break
-                if not completed_at and not active_commands and now - last_event > args.idle_timeout:
-                    state["end_reason"] = "idle_timeout"
-                    kill_tree(proc.pid)
-                    break
+                if not completed_at and timeout_reason is None:
+                    if reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
+                        timeout_reason = "reconnect_timeout"
+                    elif now - start > args.timeout:
+                        timeout_reason = "timeout"
+                    elif not active_commands and now - last_event > args.idle_timeout:
+                        timeout_reason = "idle_timeout"
+                    if timeout_reason:
+                        # Honour a completion already queued without letting later output defer the timeout.
+                        lines.put(timeout_marker)
                 try:
                     raw = lines.get(timeout=0.5)
                 except queue.Empty:
                     continue
+                if raw is timeout_marker:
+                    if completed_at:
+                        continue
+                    state["end_reason"] = timeout_reason
+                    kill_tree(proc.pid)
+                    break
                 if raw is None:
                     stdout_done = True
                     continue

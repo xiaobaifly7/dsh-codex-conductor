@@ -572,7 +572,7 @@ export function reviewState(value) {
 }
 
 // 将 runner 的规范化路径用于范围检查，并把 structured 汇报改名为 report。
-// Codex 没按 JSON 汇报时 runner 记为 schema_invalid 失败，但活已经干完，按完成处理并提示以实际文件为准。
+// schema_invalid 的执行回合已结束，保留原始答复并把报告标为无效，等待独立核验。
 export function withReport(value) {
   const { structured, ...rest } = value;
   if (rest.context?.acceptance) rest.acceptance = rest.context.acceptance;
@@ -615,13 +615,26 @@ const WAIT_GUIDANCE = '任务仍在运行时留在本轮，用返回的 runner j
   '等待已返回报告就直接验收；只有摘要、缺内容或截断时才用 job_output 或 codex_output 补读。';
 const waitForJob = (jobId) => `留在本轮，用 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })}) 等它结束；` +
   '等满仍在运行就继续等同一任务，返回报告后直接验收，不要零等待轮询或重复派单。';
+const SERVICE_FAILURE = new Map([
+  ['reconnect_timeout', 'Codex 重连超时'], ['router_down', 'Codex 本地路由不可达'],
+  ['idle_timeout', 'Codex 执行空闲超时'], ['transient', '模型服务或连接暂时异常'],
+  ['timeout', 'Codex 执行达到总超时，runner 不自动重试'],
+]);
+
+function failureReceipt(value, cause) {
+  const attempts = value.attempts ?? value.attempt;
+  const files = value.files_changed_total ?? value.files_changed?.length;
+  return `${cause}。${attempts == null ? '尝试次数未记录' : `runner 共尝试 ${attempts} 次`}，` +
+    (files == null ? '文件改动数未记录。' : `记录的文件改动共 ${files} 个。`) +
+    (files > 0 ? '先用 git status 或对比文件确认现状。' : '');
+}
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open' } = {}) {
   const blocking = blockingState(value);
   if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
-  if (value.status === 'completed' && value.context?.verification_of) return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
+  if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
@@ -652,6 +665,11 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   const report = value.report ?? {};
   const original = sameCriteria(report, acceptance);
   const list = !original && Array.isArray(acceptance) ? acceptance.map((a, i) => `${i + 1}. ${a}`).join('\n') : '';
+  const reportIssue = value.error_kind === 'incomplete' ? '缺少任务完成报告（incomplete）'
+    : value.error_kind === 'schema_invalid' || (value.status === 'completed' && value.report_status === 'invalid') ? '报告格式不合格（schema_invalid）' : '';
+  if (reportIssue) return failureReceipt(value, reportIssue) +
+    '工作可能已做。缺内容时用 codex_output（artifact=report）补读，再用 codex_verify 按原验收标准核验已有产物，不要原样重派。' +
+    recordReview + (list ? `\n原验收标准：\n${list}` : '');
   if (value.status === 'completed' || blocking.blockers.length || ['verified', 'accepted_deviations', 'needs_changes', 'invalid'].includes(value.verification_status)) {
     if (blocking.next_action === 'ask_user') {
       const environment = blocking.blockers.some((b) => b.kind === 'environment');
@@ -671,35 +689,33 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       (list ? `\n原验收标准：\n${list}` : '');
     if (blocking.next_action === 'resume_fix') return '已有明确实现差距。用 codex_continue 续接原任务，它会保留原目录、验收、write、scope 和主机权限；不得借修正扩大授权。';
   }
-  // 只读任务用 --ephemeral 运行；只有它续跑的写任务线程还能续。
-  const resumable = value.sandbox !== 'read-only' || (resumed ?? Boolean(value.thread_id));
   if (value.status !== 'completed') {
     if (value.error_kind === 'model_refused') {
-      return '执行模型拒绝了这单任务（模型侧安全策略，不是连接或插件故障），原样重派会再次被拒，不要重派同一份任务书。' +
-        '先用大白话告诉用户哪一单被模型拒绝、影响到哪一步；是否改写任务范围后再派由用户决定，不要改为自己动手。';
+      return failureReceipt(value, '执行模型拒绝了这单（model_refused，终态）') +
+        '不要原样重派。可回看任务书有无与目标无关的内容、是否写清目的，或把影响告诉用户，由用户决定下一步。';
     }
     if (value.error_kind === 'upstream_rejected') {
-      return '模型服务拒收了这一轮请求（400 Bad Request，不是连接或插件故障）。同一线程续跑会再次被拒，不要用 resume 续这条线程。' +
-        (readOnly ? '' : '这单退出前可能已改了部分文件：先用 git status 或对比文件核对已有改动。') +
-        '用 codex_run 新开一单（不填 resume），沿用原任务和授权，并在任务书里写明已经做完的部分，只补没做完的。';
+      return failureReceipt(value, '模型服务拒收请求（upstream_rejected，runner 不自动重试）') +
+        '先查明拒收原因并核对完成情况，确认有缺项再按原授权补做。不要用 resume 续这条线程或原样重派。';
     }
-    if (!value.retryable) return '这次失败不可重试：先用大白话说明哪一步没做成和实际影响，必要时附原始错误，不要改为自己动手。';
     if (value.error_kind === 'lock_timeout') {
-      return '等待写锁超时，尚未启动 Codex。先用 codex_jobs 查询同目录正在运行的任务，再决定等待还是用 codex_cancel 取消持锁任务；不要直接重派。';
+      return failureReceipt(value, '等待写锁超时，尚未启动 Codex') +
+        '先用 codex_jobs 查询同目录正在运行的任务，再决定等待还是用 codex_cancel 取消持锁任务；不要直接重派。';
     }
-    if (value.error_kind === 'reconnect_timeout' || value.error_kind === 'router_down') {
-      const attempts = value.attempts ?? value.attempt;
-      const cause = value.error_kind === 'reconnect_timeout' ? 'Codex 重连超时' : 'Codex 本地路由不可达';
-      return `${cause}${attempts ? `（已尝试 ${attempts} 次）` : ''}。先确认 Codex 到模型服务的连接恢复，恢复前不要重派。` +
-        `连接恢复后，用 codex_run 沿用原任务和授权${resumable && value.thread_id ? '，把原 thread_id 填入 resume 续跑。' : '再派。'}`;
+    // 只读任务用 --ephemeral 运行；只有它续跑的持久线程还能续。
+    const thread = (value.sandbox !== 'read-only' || resumed !== false) && value.thread_id;
+    const resume = thread ? '沿用原授权，用 codex_run 的 resume 填原 thread_id，传 fresh=false 续接，只补缺项。' : '按原授权补做缺项。';
+    if (value.error_kind === 'worker_died') {
+      const check = readOnly ? '先按原验收核对已有产物。'
+        : '退出前可能已改了部分文件。先用 codex_output（artifact=context）取回原验收标准，再用 git status 或对比文件核对已有产物。';
+      return failureReceipt(value, '执行进程已中断（worker_died）') + check +
+        (value.residual_codex_pid ? '先确认残留的 Codex 进程已结束，再决定下一步。' : `确认有缺项后，${resume}`);
     }
-    if (value.error_kind === 'worker_died' && !readOnly) {
-      return '执行进程已中断，退出前可能已改了部分文件且没有改动清单。先用 codex_output（artifact=context）取回原任务和验收标准，再用 git status 或对比文件核对已有产物。' +
-        '产物齐全就报告核验结果；只有确认有缺项才按原授权补做。' +
-        (resumable && value.thread_id ? '用 codex_run 的 resume 带上原 thread_id，只补缺项。' : '没有可续接线程时另派，只补缺项。');
-    }
-    return resumable ? '这次失败可重试：稍后用同样的参数再派一次（有 thread_id 时带 resume）。'
-      : '这次失败可重试：稍后用同样的参数再派一次，不要带 resume（只读任务不留会话，不能续跑）。';
+    const cause = SERVICE_FAILURE.get(value.error_kind) ?? `Codex 任务失败（${value.error_kind ?? '原因未记录'}）`;
+    if (value.retryable) return failureReceipt(value, cause) +
+      `先确认故障解除并核对已有产物。确认有缺项后，${resume}不要原样重派。`;
+    return failureReceipt(value, cause) +
+      '先用大白话说明哪一步没做成和实际影响，必要时附原始错误。核对已完成项后再决定下一步，不要原样重派。';
   }
   const alerts = [
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',
@@ -1738,6 +1754,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
     description: '把任务交给 WSL 里的 Codex（它看不到本对话）。登记后台任务后返回两个任务号。' + WAIT_GUIDANCE +
+      '同一任务书连续失败时不要原样重派，先读失败回执，按失败类别处理。' +
       '一单一个可独立验收的结果，超过 8 条先按共同前置拆单。路径、平台和参数适配在原授权内处理。' +
       '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +

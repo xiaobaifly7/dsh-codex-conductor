@@ -1061,8 +1061,9 @@ test('report is surfaced and self-reported problems are flagged first', () => {
     assert.doesNotMatch(n, /resume="/);
     assert.match(n, /先读完整报告和实际状态/);
   }
-  assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], false), /不要带 resume/);
-  assert.match(nextStep({ ...ro, status: 'failed', retryable: true }, [], true), /有 thread_id 时带 resume/);
+  const failed = { ...ro, status: 'failed', error_kind: 'transient', retryable: true };
+  assert.doesNotMatch(nextStep(failed, [], false), /resume/);
+  assert.match(nextStep(failed, [], true), /codex_run 的 resume 填原 thread_id，传 fresh=false/);
   assert.doesNotMatch(nextStep(withReport({ status: 'completed', thread_id: 'T' }), ['A']), /自报/);
   assert.match(nextStep({ status: 'completed', sandbox: 'danger-full-access', thread_id: 'H' }, ['A']), /先读完整报告和实际状态/);
   assert.doesNotMatch(next, /host_access/);
@@ -1075,12 +1076,13 @@ test('report is surfaced and self-reported problems are flagged first', () => {
 test('reports requiring inspection keep original acceptance and tell the planner to record review evidence', () => {
   const acceptance = ['原 CSV 格式仍能解析', '现有数据和文件格式保持不变'];
   const context = { acceptance };
-  const invalid = withReport({ status: 'failed', error_kind: 'schema_invalid', final_message: '原始答复', context,
+  const invalid = withReport({ status: 'failed', error_kind: 'schema_invalid', final_message: '原始答复', context, attempts: 1, files_changed_total: 2,
     error: 'Final message is not valid JSON: Invalid \\escape (line 1, column 17)' });
   assert.match(invalid.report_note, /JSON 解析错误：Invalid \\escape \(line 1, column 17\)/);
   assert.equal(invalid.final_message, '原始答复');
   const first = nextStep(invalid);
-  assert.match(first, /先读完整报告和实际状态[\s\S]*核验后用 codex_review/);
+  assert.match(first, /报告格式不合格（schema_invalid）.*尝试 1 次.*文件改动共 2 个.*确认现状.*工作可能已做/);
+  assert.match(first, /codex_output（artifact=report）.*codex_verify.*不要原样重派.*核验后用 codex_review/);
   assert.match(first, /原验收标准：\n1\. 原 CSV 格式仍能解析\n2\. 现有数据和文件格式保持不变/);
 
   const structured = { summary: '执行结束',
@@ -1362,6 +1364,7 @@ test('tool descriptions guide audit judgement, dispatch scope and context recove
     assert.match(tools.codex_review.description, /全 met、无活动 blocker 且无报告偏差或范围外改动时，拒绝 needs_changes/);
     assert.match(tools.codex_review.description, /Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正/);
     assert.match(tools.codex_run.description, /一单一个可独立验收的结果.*路径、平台和参数适配在原授权内处理/);
+    assert.match(tools.codex_run.description, /同一任务书连续失败时不要原样重派，先读失败回执，按失败类别处理/);
     assert.match(tools.codex_run.description, /教程终检与补目录导航同单，write=true，scope 只含目录页，正文与素材只读/);
     assert.match(tools.codex_run.parameters.properties.write.description, /不得同时要求写入和禁止写入/);
     assert.match(tools.codex_summary.description, /上下文压缩或接手后先调 codex_summary，再按需读具体 job/);
@@ -2943,36 +2946,60 @@ test('reattaches pending owned jobs on reload or agent creation without redispat
 test('terminal connection failures tell the planner to wait for recovery before dispatching again', async () => {
   const { tools, finals } = harness();
   finals.RECONNECT = { job_id: 'RECONNECT', status: 'failed', error_kind: 'reconnect_timeout',
-    retryable: true, attempts: 3, sandbox: 'danger-full-access', thread_id: 'THREAD' };
+    retryable: true, attempts: 3, sandbox: 'danger-full-access', thread_id: 'THREAD', files_changed_total: 500,
+    files_changed: [{ path: 'a', change: 'modified' }] };
   const timeout = await tools.codex_status.execute({ job_id: 'RECONNECT', wait_seconds: 0 });
-  assert.match(timeout.next, /重连超时（已尝试 3 次）[\s\S]*恢复前不要重派[\s\S]*thread_id 填入 resume/);
+  assert.match(timeout.next, /重连超时.*尝试 3 次.*文件改动共 500 个.*确认现状.*确认故障解除.*codex_run 的 resume.*只补缺项.*不要原样重派/);
 
-  finals.ROUTER = { ...finals.RECONNECT, job_id: 'ROUTER', error_kind: 'router_down', thread_id: null };
+  finals.ROUTER = { ...finals.RECONNECT, job_id: 'ROUTER', error_kind: 'router_down', thread_id: null, files_changed_total: 0, files_changed: [] };
   const router = await tools.codex_status.execute({ job_id: 'ROUTER', wait_seconds: 0 });
-  assert.match(router.next, /本地路由不可达[\s\S]*恢复前不要重派[\s\S]*沿用原任务和授权再派/);
-  assert.doesNotMatch(router.next, /resume/);
+  assert.match(router.next, /本地路由不可达.*尝试 3 次.*文件改动共 0 个.*确认故障解除.*按原授权补做缺项.*不要原样重派/);
+  assert.doesNotMatch(router.next, /resume|确认现状/);
 });
 
-test('a model refusal is reported as a refusal instead of a connection failure', async () => {
+test('a model refusal is terminal even with a thread and changes', async () => {
   const { tools, finals } = harness();
   finals.REFUSED = { job_id: 'REFUSED', status: 'failed', error_kind: 'model_refused', retryable: false,
-    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', error: 'Reconnecting... 1/5 (refused this request)' };
+    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', files_changed: [{ path: 'a', change: 'modified' }],
+    error: 'Reconnecting... 1/5 (refused this request)' };
   const refused = await tools.codex_status.execute({ job_id: 'REFUSED', wait_seconds: 0 });
-  assert.match(refused.next, /模型拒绝了这单任务[\s\S]*不是连接或插件故障[\s\S]*不要重派同一份任务书/);
-  assert.doesNotMatch(refused.next, /重连超时|恢复前不要重派/);
+  assert.match(refused.next, /模型拒绝了这单.*终态.*尝试 1 次.*文件改动共 1 个.*确认现状.*不要原样重派.*写清目的.*由用户决定/);
+  assert.doesNotMatch(refused.next, /resume|codex_continue|codex_run|换模型|改写/);
 });
 
-test('an upstream bad request tells the planner to start a new thread instead of resuming', async () => {
+test('an upstream rejection requires inspection before any further dispatch', async () => {
   const { tools, finals } = harness();
   finals.REJECTED = { job_id: 'REJECTED', status: 'failed', error_kind: 'upstream_rejected', retryable: false,
-    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', error: 'Codex: Bad Request' };
+    attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', files_changed_total: 2, error: 'Codex: Bad Request' };
   const rejected = await tools.codex_status.execute({ job_id: 'REJECTED', wait_seconds: 0 });
-  assert.match(rejected.next, /拒收了这一轮请求[\s\S]*不要用 resume[\s\S]*核对已有改动[\s\S]*新开一单/);
+  assert.match(rejected.next, /拒收请求.*不自动重试.*尝试 1 次.*文件改动共 2 个.*确认现状.*查明拒收原因.*不要用 resume.*原样重派/);
 
-  finals.REJECTED_RO = { ...finals.REJECTED, job_id: 'REJECTED_RO', sandbox: 'read-only', thread_id: null };
+  finals.REJECTED_RO = { ...finals.REJECTED, job_id: 'REJECTED_RO', sandbox: 'read-only', thread_id: null, files_changed_total: undefined };
   const readOnly = await tools.codex_status.execute({ job_id: 'REJECTED_RO', wait_seconds: 0 });
-  assert.match(readOnly.next, /不要用 resume[\s\S]*新开一单/);
-  assert.doesNotMatch(readOnly.next, /核对已有改动/);
+  assert.match(readOnly.next, /文件改动数未记录.*查明拒收原因/);
+  assert.doesNotMatch(readOnly.next, /确认现状|新开一单/);
+});
+
+test('service receipts distinguish retryable errors from the total timeout', () => {
+  const failed = { status: 'failed', attempts: 2, thread_id: 'THREAD', files_changed_total: 1 };
+  for (const [error_kind, reason] of [['transient', /模型服务或连接暂时异常/], ['idle_timeout', /执行空闲超时/]]) {
+    const next = nextStep({ ...failed, error_kind, retryable: true }, undefined, undefined, { plannerReads: 'products' });
+    assert.match(next, reason);
+    assert.match(next, /尝试 2 次.*文件改动共 1 个.*git status 核对文件列表.*确认故障解除.*codex_run 的 resume.*不要原样重派/);
+  }
+  const timeout = nextStep({ ...failed, error_kind: 'timeout', retryable: false });
+  assert.match(timeout, /总超时.*不自动重试.*尝试 2 次.*文件改动共 1 个.*确认现状.*不要原样重派/);
+  assert.doesNotMatch(timeout, /resume|再派一次/);
+});
+
+test('an incomplete job directs the planner to recover output and verify existing work', async () => {
+  const { tools, finals } = harness();
+  finals.PARTIAL = { job_id: 'PARTIAL', status: 'failed', error_kind: 'incomplete', attempts: 1,
+    retryable: false, files_changed_total: 1, thread_id: 'THREAD' };
+  const value = await tools.codex_status.execute({ job_id: 'PARTIAL', wait_seconds: 0 });
+  assert.match(value.next, /缺少任务完成报告（incomplete）.*尝试 1 次.*文件改动共 1 个.*确认现状.*工作可能已做/);
+  assert.match(value.next, /codex_output（artifact=report）.*codex_verify.*不要原样重派/);
+  assert.doesNotMatch(value.next, /resume|再派一次/);
 });
 
 test('native cancellation failures stay visible while stopping and allow another cancellation', async () => {
@@ -3628,9 +3655,9 @@ test('codex_cancel on a job that had already ended does not tell the agent to se
 test('a dead writer is told its edits may be partial and unlisted; a read-only dead job is not', () => {
   const dead = (sandbox) => ({ status: 'failed', error_kind: 'worker_died', retryable: true, sandbox, thread_id: sandbox === 'read-only' ? null : 'T' });
   const next = nextStep(dead('workspace-write'));
-  assert.match(next, /可能已改了部分文件且没有改动清单[\s\S]*先用 codex_output[\s\S]*核对已有产物[\s\S]*只有确认有缺项[\s\S]*resume/);
+  assert.match(next, /尝试次数未记录.*文件改动数未记录.*可能已改了部分文件.*先用 codex_output.*核对已有产物.*确认有缺项后.*resume/);
   assert.doesNotMatch(next, /再派一次/);
-  assert.match(nextStep(dead('danger-full-access')), /可能已改了部分文件且没有改动清单/);
+  assert.match(nextStep({ ...dead('danger-full-access'), retryable: false, residual_codex_pid: 123 }), /确认残留的 Codex 进程已结束/);
   assert.doesNotMatch(nextStep(dead('read-only')), /可能已改了部分文件/);
 });
 

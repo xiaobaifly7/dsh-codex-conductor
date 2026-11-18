@@ -407,6 +407,34 @@ class RunnerTests(unittest.TestCase):
         time.sleep(1)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
 
+    def test_reconnect_deadline_keeps_a_completion_already_queued(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--reconnect-timeout", "2"])
+        proc = mock.MagicMock(pid=os.getpid())
+        proc.poll.return_value = 0
+        proc.stdout.__iter__.return_value = iter([
+            b'{"type":"error","message":"Reconnecting..."}\n',
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n',
+            b'{"type":"turn.completed","usage":{"input_tokens":1}}\n',
+        ])
+        # Queue all three events, then cross the deadline after the monitor reads the error.
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [10] * 4 + [13] * 10
+        with mock.patch.object(codex_runner, "time", clock), \
+                mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
+                mock.patch.object(codex_runner.threading, "Thread", side_effect=lambda target, daemon: mock.Mock(start=target)), \
+                mock.patch.object(codex_runner, "kill_tree") as kill:
+            state = codex_runner.run_attempt(args, "do it", Path(self.tmp.name), None)
+        self.assertTrue(state["completed"])
+        self.assertEqual(state["last_text"], "done")
+        self.assertIsNone(state["end_reason"])
+        kill.assert_not_called()
+
     def test_model_refusal_in_a_reconnect_notice_fails_at_once_without_retry(self):
         start = time.time()
         r = self.invoke("--reconnect-timeout", "60", "--idle-timeout", "60", "--retries", "2", mode="reconnect_refused")
