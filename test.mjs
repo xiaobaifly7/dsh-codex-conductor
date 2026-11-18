@@ -6551,13 +6551,19 @@ test('predispatch warns only for the unchanged same-index environment block and 
   const [first, second] = source.context.acceptance;
   source.structured.criteria.slice(1).forEach(item => { item.status = 'met'; });
   const repeat = { status: 'completed', standing: [], _changed_at: source.finished_at - 1 };
-  const h = setup({ repeatGuardResult: () => repeat });
+  const h = setup({ repeatGuardResult: () => repeat, listResult: argv => {
+    if (!argv.includes('--thread-id')) return { jobs: [] };
+    const { job_id, cwd, finished_at, context, structured } = source;
+    return { jobs: [{ job_id, cwd, finished_at, ...(structured.blockers[0].kind === 'environment'
+      ? { predispatch: { acceptance: context.acceptance, criteria: structured.criteria } } : {}) }] };
+  } });
   const run = (acceptance, extra = {}) => h.tools.codex_run.execute({ ...RUN, cwd: source.cwd,
     resume: source.thread_id, acceptance, ...extra }, exec);
   const environment = /第 1 条在本环境上一轮已受阻且之后无改动/;
   assert.match((await run([first, second])).next, environment);
   assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, 1);
-  assert.equal(h.calls.some(argv => argv[0] === 'thread-size' || argv.includes('--parent-job')), false);
+  assert.equal(h.calls.some(argv => argv[0] === 'thread-size' || argv.includes('--parent-job') ||
+    (argv[0] === 'status' && argv[1] === source.job_id)), false);
   assert.doesNotMatch((await run(['新的验收内容', second])).next, environment);
   assert.doesNotMatch((await run([second, first])).next, /上一轮已受阻/);
   assert.doesNotMatch((await run([first, second], { cwd: '/different' })).next, environment);

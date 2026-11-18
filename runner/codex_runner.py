@@ -416,7 +416,7 @@ def replace_user_agents_md(env):
     env["CODEX_HOME"] = str(home)
 
 
-def build_command(args, run_dir, thread_id):
+def build_command(args, run_dir, thread_id, scratch=None):
     prefix, env = launcher()
     cmd = [*prefix, "exec"]
     if thread_id:
@@ -445,8 +445,23 @@ def build_command(args, run_dir, thread_id):
     if getattr(args, "service_tier", None):
         cmd += ["-c", f'service_tier="{args.service_tier}"']
     # `exec resume` has no -s or -C, so the sandbox goes through -c and the directory through the process cwd.
-    cmd += ["-c", f'sandbox_mode="{args.sandbox}"']
-    if args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
+    scratch_only = scratch is not None and args.sandbox == "read-only"
+    sandbox = "workspace-write" if scratch_only else args.sandbox
+    cmd += ["-c", f'sandbox_mode="{sandbox}"']
+    if scratch:
+        tmp = scratch / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        scratch_env = {"TMPDIR": str(tmp), "TMP": str(tmp), "TEMP": str(tmp), "PYTHONDONTWRITEBYTECODE": "1",
+                       "PYTEST_ADDOPTS": "-p no:cacheprovider", "COVERAGE_FILE": str(tmp / ".coverage")}
+        env.update(scratch_env)
+        if scratch_only:
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=[]",
+                    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                    "-c", "sandbox_workspace_write.network_access=false"]
+        for key, value in scratch_env.items():
+            cmd += ["-c", f"shell_environment_policy.set.{key}={json.dumps(value, ensure_ascii=False)}"]
+    elif args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
         cmd += ["-c", "sandbox_workspace_write.writable_roots=" +
                 json.dumps([local_path(p) for p in args.writable_roots], ensure_ascii=False)]
     if args.schema:
@@ -461,7 +476,8 @@ def build_command(args, run_dir, thread_id):
 
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
     """Run one Codex process to a verdict. turn.completed decides success, not the exit code."""
-    cmd, env = build_command(args, run_dir, thread_id)
+    scratch = getattr(args, "verification_scratch", None)
+    cmd, env = build_command(args, run_dir, thread_id, scratch)
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
              "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
              "file_changes": [], "prompt_delivered": False}
@@ -472,7 +488,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
         with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
             state["stderr_offset"] = stderr_log.tell()
             try:
-                proc = subprocess.Popen(cmd, cwd=args.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                cwd = scratch if scratch and args.sandbox == "read-only" else args.cwd
+                proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
             except OSError as e:
                 state["end_reason"] = "spawn_failed"
@@ -1093,13 +1110,79 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
             **({"ignore_warnings": warnings} if warnings else {})}
 
 
-def git(cwd, *argv, deadline, env=None):
-    p = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
+def git(cwd, *argv, deadline, env=None, program="git"):
+    p = subprocess.run([program, "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=max(0.1, deadline - time.monotonic()),
                        creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
     if p.returncode:
         raise ValueError(p.stderr.decode("utf-8", "replace").strip() or f"git exited {p.returncode}")
     return p.stdout
+
+
+def verification_git_digest(cwd, paths):
+    deadline = time.monotonic() + 30
+
+    def digest(directory, program):
+        def query(*argv, at=directory):
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(argv, 30)
+            return git(at, *argv, deadline=deadline, program=program)
+
+        head = query("rev-parse", "--verify", "HEAD")
+        status = ("status", "--porcelain=v1", "-z", "--untracked-files=all")
+        whole = hashlib.sha256(head + b"\0" + query(*status)).digest()
+        if not paths:
+            return whole, None
+        top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
+        root = Path(normalized_path(local_path(top)))
+        relative = sorted({Path(*Path(p).parts[len(root.parts):]).as_posix()
+                           for p in paths if Path(normalized_path(p)).is_relative_to(root)})
+        if not relative:
+            return whole, None
+        if "." in relative:
+            return whole, whole
+        tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
+        scoped = query("--literal-pathspecs", *status, "--", *relative, at=top)
+        return whole, hashlib.sha256(tree + b"\0" + scoped).digest()
+
+    try:
+        return digest(cwd, "git")
+    except (OSError, ValueError):
+        drive = re.fullmatch(r"/mnt/([a-zA-Z])/(.*)", cwd) if not IS_WIN else None
+        windows_git = drive and shutil.which("git.exe")
+        if windows_git and time.monotonic() < deadline:
+            directory = f"{drive[1].upper()}:/" + drive[2]
+            with suppress(OSError, ValueError, subprocess.TimeoutExpired):
+                return digest(directory, windows_git)
+    except subprocess.TimeoutExpired:
+        pass
+    return None
+
+
+def verification_paths(context, cwd):
+    source = job_status(context["verification_of"])
+    if not source.get("cwd") or tree_key(source["cwd"]) != tree_key(cwd):
+        return []
+    files = [entry.get("path") if isinstance(entry, dict) else entry
+             for entry in (source.get("files_changed") or []) + (source.get("write_paths") or [])]
+    return [scope_path(cwd, path) for path in [*(source.get("scope_paths") or source.get("scope") or []), *files]
+            if isinstance(path, str) and path.strip()]
+
+
+def concurrent_job_in_tree(cwd, run_dir, started):
+    root = tree_key(cwd)
+    for job_dir in job_directories():
+        if job_dir == run_dir:
+            continue
+        with suppress(OSError, ValueError, TypeError):
+            dates = job_listing_times(job_dir)
+            if dates["started_at"] is None or (dates["finished_at"] is not None and dates["finished_at"] <= started):
+                continue
+            task = task_record(job_dir)
+            if task.get("cwd") and tree_key(task["cwd"]) == root and (
+                    dates["finished_at"] is not None or job_status(job_dir.name)["status"] == "running"):
+                return True
+    return False
 
 
 def diff_fields(job_dir):
@@ -1286,6 +1369,43 @@ def execute(args, prompt, run_dir):
     if scope_args:
         base.update(scope=getattr(args, "scope", None), scope_paths=scope_args)
     started = time.time()
+    context = getattr(args, "context", None) or {}
+    verification = context.get("verification_of") and context.get("write") is False
+    host_verification = verification and args.sandbox == "danger-full-access"
+    if verification and args.sandbox in ("read-only", "danger-full-access"):
+        scratch = (run_dir / "scratch").resolve()
+        if Path(normalized_path(str(scratch))).is_relative_to(Path(normalized_path(args.cwd))):
+            return {**base, "status": "failed", "error_kind": "verification_scratch_overlap",
+                    "error": "Verification scratch would be inside the project directory.",
+                    "retryable": False, "attempts": 0}
+        args.verification_scratch = scratch
+    if verification and args.sandbox == "read-only":
+        prompt = (f"Verification project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
+                  "当前目录是核验暂存区。先读取上述项目目录中适用的 AGENTS.md。项目目录只读，"
+                  "相对路径均以该项目目录为准。运行检查时先切到项目目录（cd <项目绝对路径> && …），"
+                  "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
+    paths = verification_paths(context, args.cwd) if host_verification else []
+    before_digest = verification_git_digest(args.cwd, paths) if host_verification else None
+
+    def finish(result):
+        if not host_verification:
+            return result
+        after_digest = verification_git_digest(args.cwd, paths) if before_digest is not None else None
+        if after_digest is None:
+            result["verification_integrity"] = "unavailable"
+        elif before_digest != after_digest:
+            before_whole, before_scope = before_digest
+            after_whole, after_scope = after_digest
+            concurrent = (before_scope == after_scope if before_scope is not None else
+                          before_whole != after_whole and concurrent_job_in_tree(args.cwd, run_dir, started))
+            if concurrent:
+                result["verification_integrity"] = "concurrent_changes"
+            else:
+                result.pop("structured", None)
+                result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
+                              error="Git status or HEAD changed within the monitored verification paths.")
+        return result
+
     repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
     locks = []
     before = scope = None
@@ -1385,9 +1505,9 @@ def execute(args, prompt, run_dir):
                          (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
                 runner_event(run_dir, attempt, "finalizing", kind)
-                return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
+                return finish({**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
                         "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
-                        **changes(), **diff(), "repeat_guard": repeat_guard.summary()}
+                        **changes(), **diff(), "repeat_guard": repeat_guard.summary()})
             delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
             time.sleep(delay)
@@ -1418,7 +1538,7 @@ def execute(args, prompt, run_dir):
                 detail = f": {error.msg} (line {error.lineno}, column {error.colno})" if isinstance(error, json.JSONDecodeError) else ""
                 result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON" + detail,
                               retryable=False)
-        return result
+        return finish(result)
     finally:
         for lock in reversed(locks):
             lock.close()
@@ -2255,6 +2375,14 @@ def list_jobs(args):
         total = len(ordered)
         page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
     page = [job_details(j, args) for j in page]
+    predispatch = None
+    if args.owner and getattr(args, "thread_id", None) and args.offset == 0 and page:
+        report = page[0].get("structured")
+        acceptance = (page[0].get("context") or {}).get("acceptance")
+        if (isinstance(acceptance, list) and valid_report(report) and
+                any(blocker["kind"] == "environment" for blocker in report.get("blockers", []))):
+            predispatch = {"acceptance": acceptance, "criteria": [
+                {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]]}
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
@@ -2271,6 +2399,8 @@ def list_jobs(args):
              **{k: j[k] for k in ("diff_status", "diff_files", "rolled_back_at") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
+    if predispatch is not None:
+        page[0]["predispatch"] = predispatch
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
             "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
 

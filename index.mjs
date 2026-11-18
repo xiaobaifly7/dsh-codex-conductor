@@ -378,7 +378,7 @@ export function createConductor(cfg, run = runRunner) {
     const task = args.rerun_after_change ? `${args.task.trim()}\n\n## 规划端说明的变化\n${args.rerun_after_change.trim()}` : args.task;
     const prompt = composePrompt(task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
       ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify,
-      expectBlocked: args.expect_blocked });
+      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of) });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -442,7 +442,7 @@ export function createConductor(cfg, run = runRunner) {
   return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [] } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [], verification = false } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     (mustVerify.length ? `\n验收第 ${mustVerify.join('、')} 条必须实测；在 evidence 写清实际运行或观测的结果及可回查的证据位置。` : '') +
@@ -456,7 +456,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
       '任务或验收标准本身要求查看或修改这些文件时照常处理。\n' : '') +
     (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
       '只做任务需要的事；任务没有点名的虚拟机、文件和网络设置，不要删除、停止、重建或改配置。\n' : '') +
-    (hostAccess && !write ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
+    (hostAccess && !write && !verification ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
     '- 计划步骤、工具或路径不可用时，在原授权内换方法证明同一验收结果。不得扩大写入、主机访问或目标范围。' +
     '在 deviations 写明换了什么、为何等价。完成可做的部分。\n' +
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
@@ -505,7 +505,9 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     `criteria 只按验收标准逐条给出，条数与验收标准相同，不要为每条抽查结论另加一行。抽查的每条结论写在第 ${sampleEvidenceRow} 条验收的 evidence 里，各占一行：` +
     `核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
     `按 report.v2.schema.json 返回；第 ${sampleEvidenceRow} 条在有结论不属实时记 not_met，没有不属实但有无法确认时记 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
-    `这是只读核验，写入范围为空：不要修改产物、源码、日志或系统状态，不要运行会产生写入的测试或命令；files_changed 必须为 []。`;
+    `这是只读核验，项目写入范围为空。预期从原任务目录实际运行验收检查，允许产生临时文件和测试缓存。` +
+    (source.sandbox === 'danger-full-access' ? '将临时文件和测试缓存放到项目外的临时目录。' : '将临时文件和测试缓存放到 TMPDIR。') +
+    `保持项目、产物、日志和系统状态不变；需要在项目内写入或改变系统状态的检查应报告其限制。files_changed 必须为 []。`;
 }
 
 // 不在 scope 内的改动；没给 scope 或 runner 没给出改动清单时返回 undefined
@@ -666,12 +668,12 @@ function predispatchWarnings(args, cwd, parent, repeat) {
   if (repeat?.status !== 'completed') return [];
   const warnings = new Set();
   const report = parent?.report ?? parent?.structured;
-  const previous = parent?.context?.acceptance;
-  if (parent?.cwd && normPath(parent.cwd) === normPath(cwd) && validReport(report) &&
-      report.blockers?.some(blocker => blocker.kind === 'environment') && Number.isFinite(parent.finished_at) &&
+  const previous = parent?.predispatch ?? (validReport(report) && report.blockers?.some(blocker => blocker.kind === 'environment')
+    ? { acceptance: parent.context?.acceptance, criteria: report.criteria } : undefined);
+  if (parent?.cwd && normPath(parent.cwd) === normPath(cwd) && previous && Number.isFinite(parent.finished_at) &&
       Number.isFinite(repeat._changed_at) && repeat._changed_at <= parent.finished_at) {
     args.acceptance.forEach((criterion, i) => {
-      if (criterion === previous?.[i] && reportRowOf(previous, report.criteria, i + 1)?.status === 'blocked') {
+      if (criterion === previous.acceptance?.[i] && reportRowOf(previous.acceptance, previous.criteria, i + 1)?.status === 'blocked') {
         warnings.add(`第 ${i + 1} 条在本环境上一轮已受阻且之后无改动：要么改验收项，要么先解决环境，要么在派单时用 expect_blocked 标出这一条`);
       }
     });
@@ -724,7 +726,12 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     return `任务 ${value.job_id} 的执行环境中断（${value.lost_reason}：WSL 重启或执行进程退出），没有生成报告。` +
       `先核对已有产物（codex_output artifact=diff/events），再按原任务重新派单${resume}；不要当作失败结论处理。`;
   }
+  if (value.error_kind === 'verification_tree_changed') {
+    return '主机核验期间受核验范围的 Git 状态或 HEAD 发生变化，核验失败。请核对仓库改动来源和现状，勿使用本轮核验结论。';
+  }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
+    (value.verification_integrity === 'concurrent_changes' ? '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。'
+      : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
     '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers, ownerDecisions })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
@@ -2003,7 +2010,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (blockLine && owner && value.job_id) countCloseout(owner, 'repeat_blocked', 1, value.job_id);
     const [result, notices, parked] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
       value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined]);
-    const next = parked && value.error_kind !== 'executor_lost' ? [parked.line] : [result.next, parked?.line];
+    const next = parked && !['executor_lost', 'verification_tree_changed'].includes(value.error_kind)
+      ? [parked.line] : [result.next, parked?.line];
     return notices.length || parked || blockLine || standingLine ? { ...result, ...(parked ? { parked_review: parked.parked_review } : {}),
       next: [...next, blockLine, standingLine, ...notices].filter(Boolean).join('\n') } : result;
   }
@@ -2493,8 +2501,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       let latestOnThread;
       if (args.resume && owner) {
         const plannerDecides = cfg.ownerDecisions === 'planner';
+        const also_owners = aliases.predecessors(owner);
         for (let offset = 0; offset !== null;) {
-          const history = await conductor.list({ owner, thread_id: args.resume, limit: 100, offset }, exec?.signal);
+          const history = await conductor.list({ owner, also_owners, thread_id: args.resume, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对待续接线程的任务', history);
           if (offset === 0) latestOnThread = history.jobs[0];
@@ -2592,15 +2601,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const repeat = await conductor.repeatGuard(cwd, exec?.signal);
       exec?.signal?.throwIfAborted();
       if (cfg.repeatFailureGuard.enabled && repeat?.status === 'completed') standingLine = repeatStandingLine(repeat.standing);
-      let parent = guard.parent;
-      if (!parent && !guard.threadLookedUp && args.resume && !verificationOf && !continuation && owner) {
-        const also_owners = aliases.predecessors(owner);
-        const job = also_owners.length ? (await conductor.list({ owner, also_owners, thread_id: args.resume,
-          limit: 1 }, exec?.signal).catch(() => undefined))?.jobs?.[0] ?? latestOnThread : latestOnThread;
-        if (job?.job_id) parent = await previousJob(job.job_id, exec);
-        exec?.signal?.throwIfAborted();
-      }
-      predispatch = predispatchWarnings(args, cwd, parent, repeat);
+      predispatch = predispatchWarnings(args, cwd, guard.parent ?? latestOnThread, repeat);
       if (args.rerun_after_change) routing = { ...routing, rerun_after_change: true };
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
@@ -2726,14 +2727,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         try { thread = await runThread(args, exec); } catch { exec?.signal?.throwIfAborted(); }
       }
       if (thread && thread.parent_thread_id !== args.resume) args = { ...args, resume: thread.parent_thread_id };
-      const parent = thread?.parent_job_id ? await previousJob(thread.parent_job_id, exec) : undefined;
+      const parent = thread?.parent_job_id && (thread.mode === 'fresh' || cfg.modelAB.enabled)
+        ? await previousJob(thread.parent_job_id, exec) : undefined;
       let fresh;
       if (thread?.mode === 'fresh') {
         if (!parent) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
         else fresh = { brief: previousRoundBrief(parent),
           continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: '' } };
       }
-      const guard = { parent, threadLookedUp };
+      const guard = { parent };
       const route = retainThreadModel(args, parent, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
       const value = await dispatch(route.args, exec, undefined, args.task, undefined, fresh, route.routing, guard);
       const deferred = guard.deferred && value.job_id ? guard.deferred : null;
@@ -2844,7 +2846,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       acceptance: [...required.map(verifyCriterionItem), '读取原任务书、验收标准和已产出的文件，明确核验范围。',
         `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
         '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
-        '全程只读，不修改任何文件或系统状态。',
+        '全程保持项目和系统状态只读，测试的临时文件和缓存写入项目外。',
         // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
         ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key)).map(verifyCriterionItem)],
       cwd: source.cwd, write: false, scope: [], writable_roots: [],

@@ -61,6 +61,26 @@ FAKE_CODEX = textwrap.dedent(r"""
                '"files_changed":[],"deviations":[],"unresolved":[]}')
     elif mode == "fixture_report":
         finish(Path(os.environ["FAKE_REPORT"]).read_text(encoding="utf-8"))
+    elif mode == "verification_temp_test":
+        status = "blocked"
+        if 'sandbox_mode="workspace-write"' in sys.argv:
+            line = prompt.decode("utf-8").splitlines()[0]
+            assert line.startswith("Verification project directory (absolute): ")
+            project = Path(json.loads(line.split(": ", 1)[1]))
+            assert project.is_absolute() and (project / "temp_check.py").is_file()
+            scratch = Path.cwd().resolve()
+            assert not scratch.is_relative_to(project)
+            assert "sandbox_workspace_write.writable_roots=[]" in sys.argv
+            assert "sandbox_workspace_write.exclude_slash_tmp=true" in sys.argv
+            assert Path(os.environ["TMPDIR"]).resolve().is_relative_to(scratch)
+            assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1"
+            assert os.environ["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+            assert Path(os.environ["COVERAGE_FILE"]).parent == Path(os.environ["TMPDIR"])
+            checked = subprocess.run([sys.executable, "-m", "unittest", "temp_check"], cwd=project)
+            status = "met" if checked.returncode == 0 else "not_met"
+        finish(json.dumps({"summary": status, "criteria": [
+            {"criterion": "run the check", "status": status, "evidence": status}
+        ], "files_changed": [], "deviations": [], "unresolved": []}))
     elif mode == "repeat_guard_start":
         if "resume" not in sys.argv:
             say(type="item.started", item={"id": "step", "type": "command_execution",
@@ -407,6 +427,17 @@ class RunnerTests(unittest.TestCase):
         query = self.control("repeat-guard", "--cwd", str(self.cwd))
         self.assertGreater(query["_changed_at"], 0)
         self.assertEqual(query["standing"], [])
+
+    def test_predispatch_thread_listing_includes_previous_environment_criteria_without_evidence(self):
+        context = self.sample_context()
+        report = self.sample_report(blockers=[self.blocker("environment")])
+        report["criteria"][0]["status"] = "blocked"
+        self.stored_job("previous", {"status": "completed", "thread_id": "thread", "structured": report}, context=context)
+        listing = self.control("list", "--owner", context["owner"], "--thread-id", "thread")
+        self.assertEqual(listing["jobs"][0]["predispatch"], {"acceptance": context["acceptance"], "criteria": [
+            {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]
+        ]})
+        self.assertNotIn("predispatch", self.control("list")["jobs"][0])
 
     def test_repeat_guard_persists_and_new_worker_blocks_first_run(self):
         self.repeat_job("seed", [*self.repeat_step(1), *self.repeat_step(2, 2)])
@@ -2645,7 +2676,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(listing["task_options"], result["task_options"])
         self.assertEqual(self.control("list", "--parent-job", "original-1")["total"], 0)
         self.assertNotIn("resume", self.calls()[0]["argv"])
-        self.assertIn('sandbox_mode="read-only"', self.calls()[0]["argv"])
+        self.assertEqual(result["sandbox"], "read-only")
+        self.assertIn('sandbox_mode="workspace-write"', self.calls()[0]["argv"])
+        self.assertIn("--ephemeral", self.calls()[0]["argv"])
 
     def test_verification_context_rejects_invalid_identifiers_without_spawning(self):
         for value in (None, True, 1, [], {}, "", "../job", "has space", "job/name"):
@@ -4625,6 +4658,69 @@ class RunnerTests(unittest.TestCase):
             git("add", "-A")
             git("commit", "-q", "-m", "base")
         return root, sub, git
+
+    def test_verification_runs_temp_file_suite_with_project_outside_write_roots(self):
+        (self.cwd / "temp_check.py").write_text(textwrap.dedent("""
+            import os, tempfile, unittest
+            from pathlib import Path
+
+            class TempCheck(unittest.TestCase):
+                def test_temp_round_trip(self):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        self.assertEqual(Path(tmp).parent, Path(os.environ["TMPDIR"]))
+                        record = Path(tmp) / "check.txt"
+                        record.write_text("test data")
+                        self.assertEqual(record.read_text(), "test data")
+        """), encoding="utf-8")
+        prompt = json.dumps({"prompt": "Run the project test", "context": {"owner": "S1", "task": "Verify the temp test",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        result = self.invoke("--context-json", "--sandbox", "read-only", "--schema",
+                             str(RUNNER.parents[1] / "report.v2.schema.json"), mode="verification_temp_test",
+                             prompt=prompt)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["structured"]["criteria"][0]["status"], "met")
+        self.assertEqual(result["cwd"], str(self.cwd.resolve()))
+        self.assertEqual(result["sandbox"], "read-only")
+        self.assertIn("--ephemeral", self.calls()[0]["argv"])
+        self.assertEqual(sorted(entry.name for entry in self.cwd.iterdir()), ["temp_check.py"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_fails_if_git_status_changes(self):
+        _, project, git = self.git_repo("verification")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        args = ("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access")
+        clean = self.invoke(*args, prompt=prompt)
+        self.assertEqual(clean["status"], "completed", clean)
+        scratch = Path(clean["log_dir"]) / "scratch" / "tmp"
+        self.assertTrue({"shell_environment_policy.set.PYTHONDONTWRITEBYTECODE=" + json.dumps("1"),
+                         'shell_environment_policy.set.PYTEST_ADDOPTS="-p no:cacheprovider"',
+                         "shell_environment_policy.set.TMPDIR=" + json.dumps(str(scratch)),
+                         "shell_environment_policy.set.COVERAGE_FILE=" + json.dumps(str(scratch / ".coverage"))
+                         } <= set(self.calls()[-1]["argv"]))
+        changed = self.invoke(*args, mode="repo_edit", prompt=prompt)
+        self.assertIn('sandbox_mode="danger-full-access"', self.calls()[-1]["argv"])
+        self.assertEqual((changed["status"], changed.get("error_kind"), changed.get("retryable")),
+                         ("failed", "verification_tree_changed", False))
+        self.assertTrue(git("status", "--porcelain"))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_reports_concurrent_changes_without_failing(self):
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for kind in ("scope", "products", "running"):
+            with self.subTest(kind=kind):
+                _, project, _ = self.git_repo(f"verification-{kind}")
+                source = {"status": "completed", **({"files_changed": [{"path": "elsewhere.txt"}]} if kind == "products" else {})}
+                self.stored_job("SOURCE", source, cwd=str(project), scope=["elsewhere.txt"] if kind == "scope" else [])
+                if kind == "running":
+                    self.stored_job("WRITER", None, cwd=str(project), sandbox="workspace-write")
+                result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                     mode="repo_edit", prompt=prompt)
+                self.assertEqual((result["status"], result.get("verification_integrity")),
+                                 ("completed", "concurrent_changes"), result)
+                shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_writer_changes_become_a_patch_without_touching_the_repository(self):

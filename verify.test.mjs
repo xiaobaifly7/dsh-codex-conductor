@@ -291,7 +291,9 @@ test('verification inherits original cwd and model options, never original write
     assert.equal(result.context.verification_of, source.job_id);
     assert.match(h.payload().prompt, /新线程，不续接原作者的思路/);
     assert.match(h.payload().prompt, /写入范围为空/);
-    if (sandbox === 'danger-full-access') assert.match(h.payload().prompt, /这是只读调查：不要修改任何文件/);
+    assert.match(h.payload().prompt, /预期从原任务目录实际运行验收检查/);
+    if (sandbox === 'danger-full-access') assert.match(h.payload().prompt, /放到项目外的临时目录/);
+    else assert.match(h.payload().prompt, /放到 TMPDIR/);
     assert.deepEqual(source, original);
   }
 });
@@ -392,7 +394,7 @@ test('generated task embeds original task, acceptance, all products and report.v
   }
   for (const text of ['逐条回到原始出处', '原文、上下文、数字与计算', '核对的结论', '出处（文件与行号或可定位的来源）',
     '是否属实（属实/不属实/无法确认）', '不属实时实际是什么', '有结论不属实时记 not_met', '有无法确认时记 blocked', '条数与验收标准相同，不要为每条抽查结论另加一行',
-    'summary 汇总抽查数和结果', '不要只复述原报告', '不要运行会产生写入的测试或命令', 'files_changed 必须为 []']) {
+    'summary 汇总抽查数和结果', '不要只复述原报告', '预期从原任务目录实际运行验收检查', 'files_changed 必须为 []']) {
     assert.ok(prompt.includes(text), text);
   }
   assert.match(h.start().argv[h.start().argv.indexOf('--schema') + 1], /\/report\.v2\.schema\.json$/);
@@ -403,7 +405,7 @@ test('generated task embeds original task, acceptance, all products and report.v
   assert.match(context.acceptance[0], /任务书、验收标准.*产出/);
   assert.match(context.acceptance[1], /8 条/);
   assert.match(context.acceptance[2], /不属实时.*无法确认/);
-  assert.match(context.acceptance[3], /全程只读/);
+  assert.match(context.acceptance[3], /全程保持项目和系统状态只读/);
   assert.equal(result.report_status, 'valid');
   assert.deepEqual(result.acceptance, context.acceptance);
   assert.deepEqual(result.report.files_changed, []);
@@ -435,7 +437,7 @@ test('verification reuses background registration, result processing and status/
   assert.equal(job.result, done.result);
   assert.match(done.result, /独立核验任务；核验对象：SOURCE-1/);
   assert.match(done.result, /完整结果入口/);
-  assert.match(done.result, /全程只读/);
+  assert.match(done.result, /全程保持项目和系统状态只读/);
   const status = await h.tools.codex_status.execute({ job_id: 'VERIFY-1' }, exec);
   assert.equal(status.context.verification_of, 'SOURCE-1');
   assert.equal(status.report_status, 'valid');
