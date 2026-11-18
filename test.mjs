@@ -1813,7 +1813,8 @@ test('codex_continue dispatches 22 original criteria with original context, perm
     const { dispatcher, ...taskContext } = envelope.context;
     assert.equal(dispatcher.pid, process.pid);
     assert.deepEqual(taskContext, { owner: 'S1', task: source.context.task, acceptance: source.context.acceptance,
-      write: source.context.write, continuation: { parent_job_id: 'PARENT', answers, resolution } });
+      write: source.context.write, continuation: { parent_job_id: 'PARENT', answers, resolution },
+      routing: { continuation_mode: 'resume', continuation_reason: 'answers', parent_thread_id: source.thread_id } });
     assert.match(envelope.prompt, /保留旧 CSV 格式/);
     assert.ok(envelope.prompt.includes(source.context.acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
     assert.doesNotMatch(envelope.prompt, /WHOLE-HISTORY-MUST-NOT-BE-COPIED|历史处理记录/);
@@ -5814,4 +5815,28 @@ test('codex_review finds independent support in a later verification, a later ro
   const h = harness({ config: { plannerAnswers: true, reviewResult: { ...old, verification_status: 'verified' } } });
   h.finals.PARENT = old;
   assert.equal((await h.tools.codex_review.execute(review, { agent: agentAt('/work/current') })).verification_status, 'verified');
+});
+
+test('routing is recorded in the job context and close-out refusals are logged with job ids only', async () => {
+  const thread = { THREAD: [{ job_id: 'PARENT', thread_id: 'THREAD' }] };
+  const h = harness({ config: { continueFreshAboveTokens: 100000, threadSizeResult: { status: 'completed', last_input_tokens: 250000 },
+    startResult: { job_id: 'J', status: 'completed' },
+    listResult: (argv) => argv.includes('--thread-id') ? { jobs: thread[argv[argv.indexOf('--thread-id') + 1]] ?? [], total: 1 } : { jobs: [], total: 0 } } });
+  h.finals.PARENT = workflowSource('implementation');
+  await h.tools.codex_run.execute({ ...RUN, write: true, scope: ['src'], resume: 'THREAD' }, { agent: agentAt('/work/current') });
+  const context = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin).context;
+  assert.deepEqual(context.routing, { continuation_mode: 'fresh', continuation_reason: 'size', parent_thread_id: 'THREAD', parent_job_id: 'PARENT',
+    parent_last_input_tokens: 250000 });
+  // 新任务（无 resume、无 verify_previous）不带 routing。
+  const plain = harness({ config: { startResult: { job_id: 'J', status: 'completed' } } });
+  await plain.tools.codex_run.execute(RUN, { agent: agentAt('/work/current') });
+  assert.equal(JSON.parse(plain.requests.find(({ argv }) => argv[0] === 'start').stdin).context.routing, undefined);
+  // 收尾护栏拒绝：closeout-refusals.jsonl 记下会话、工具和被点名的任务号。
+  const pending = { job_id: 'FLAG', execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
+    verification_status: 'unreviewed', finished_at: Date.now() / 1000 + 60, started_at: Date.now() / 1000 };
+  const guarded = harness({ config: { closeoutGuard: true, listResult: { jobs: [pending], total: 1 } } });
+  await assert.rejects(guarded.tools.codex_run.execute(RUN, { agent: agentAt('/work/current') }), /FLAG/);
+  const lines = readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'closeout-refusals.jsonl'), 'utf8').trim().split('\n');
+  const last = JSON.parse(lines.at(-1));
+  assert.deepEqual([last.session, last.tool, last.unreviewed, last.needs_changes], ['S1', 'codex_run', ['FLAG'], []]);
 });

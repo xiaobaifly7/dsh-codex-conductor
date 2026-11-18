@@ -1453,7 +1453,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function closeoutCheck(owner, tool, signal) {
     if (cfg.closeoutGuard === false || !owner) return '';
     try {
-      return closeoutRefusal(tool, pendingCloseout(await sessionJobs(owner, signal), closeoutFrom));
+      const pending = pendingCloseout(await sessionJobs(owner, signal), closeoutFrom);
+      const refusal = closeoutRefusal(tool, pending);
+      if (refusal) logRefusal({ session: owner, tool, unreviewed: pending.unreviewed, needs_changes: pending.needsChanges });
+      return refusal;
     } catch (error) {
       // 从不抛出：派单可能先于这里的结果结束；中止由调用方在等待后处理。
       if (!signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
@@ -1461,7 +1464,32 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
   }
 
-  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh) {
+  // 收尾护栏拒绝时没有任务记录可写：把被点名的任务号（只有 ID）追加到 closeout-refusals.jsonl，供日后分析。保留最近 500 行。
+  const refusalsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'closeout-refusals.jsonl');
+  function logRefusal(entry) {
+    if (!refusalsFile) return;
+    try {
+      let lines = [];
+      try { lines = readFileSync(refusalsFile, 'utf8').split('\n').filter(Boolean); } catch {}
+      lines.push(JSON.stringify({ at: new Date().toISOString(), ...entry }));
+      mkdirSync(path.dirname(refusalsFile), { recursive: true });
+      writeFileSync(refusalsFile, lines.slice(-500).join('\n') + '\n');
+    } catch {}
+  }
+
+  // routing：插件怎样派出这一单（续接方式、原线程、被接替的线程、同时核验的任务），写进任务 context 供日后从 runner 记录分析。
+  const routingOf = (thread, verifyPrevious) => {
+    const routing = {
+      ...(thread ? { continuation_mode: thread.mode, continuation_reason: thread.reason, parent_thread_id: thread.parent_thread_id,
+        ...(thread.parent_job_id ? { parent_job_id: thread.parent_job_id } : {}),
+        ...(Number.isSafeInteger(thread.parent_last_input_tokens) ? { parent_last_input_tokens: thread.parent_last_input_tokens } : {}),
+        ...(thread.superseded_threads ? { superseded_threads: thread.superseded_threads } : {}) } : {}),
+      ...(verifyPrevious ? { verify_previous: verifyPrevious } : {}),
+    };
+    return Object.keys(routing).length ? routing : undefined;
+  };
+
+  async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
@@ -1583,6 +1611,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
         ...(continuation ?? fresh?.continuation ? { continuation: continuation ?? fresh.continuation } : {}),
         ...(verificationOf ? { verification_of: verificationOf } : {}),
+        ...(routing ? { routing } : {}),
       });
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
     } finally { dispatching--; if (writer) startingWrites.delete(writer); }
@@ -1684,7 +1713,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         else fresh = { brief: previousRoundBrief(parent),
           continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: `codex_run 以新线程接续线程 ${thread.parent_thread_id}` } };
       }
-      const value = await dispatch(args, exec, undefined, args.task, undefined, fresh);
+      const value = await dispatch(args, exec, undefined, args.task, undefined, fresh, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
       const threadLine = !thread ? '' : thread.mode === 'fresh'
         ? `已开新线程（原线程 ${thread.parent_thread_id}，上一轮任务 ${thread.parent_job_id}${thread.parent_last_input_tokens ? `，原线程上次请求约 ${thread.parent_last_input_tokens} 输入 token` : ''}），` +
           `新任务 ${value.job_id ?? '（见上）'}；任务里附了上一轮交接内容。之后的返工请对新任务 ${value.job_id ?? ''} 调 codex_continue，不要再 resume 原线程。`
@@ -2019,7 +2048,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const thread = await continuationThread(plan, args, exec?.signal);
         if (thread?.mode === 'fresh') delete plan.args.resume;
         const value = await dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
-          exec, plan.continuation, plan.task);
+          exec, plan.continuation, plan.task, undefined, undefined, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
         const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
         if (verify) {
           const { line: verifyLine, ...verifyResult } = verify;
