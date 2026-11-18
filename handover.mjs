@@ -19,6 +19,7 @@ export const writeJsonAtomic = (file, value) => writeTextAtomic(file, JSON.strin
 
 // 交接请求的发起来源；外部直接写请求文件、没带来源时记为 file。
 export const ORIGINS = ['panel', 'auto', 'confirm', 'tool', 'file'];
+const LINKS_UNREADABLE = '交接链接状态不可读，暂停自动交接。';
 
 // 发布一份 handover-request.json；上一份还没被认领时拒绝，不覆盖。面板和自动交接共用。
 export function submitHandoverRequest(directory, request) {
@@ -59,29 +60,31 @@ export function logCounts(log) {
 export function createAliases(directory) {
   const file = directory && path.join(directory, 'handover.json');
   const read = () => {
-    if (!file) return {};
+    if (!file) return null;
     try {
       const links = JSON.parse(fs.readFileSync(file, 'utf8')).links;
-      return links && typeof links === 'object' && !Array.isArray(links) ? links : {};
-    } catch { return {}; }
+      return links && typeof links === 'object' && !Array.isArray(links) ? links : null;
+    } catch { return null; }
   };
-  const predecessors = (id, links = read()) => {
+  const predecessors = (id, links = read() ?? {}) => {
     const chain = [];
     for (let current = id; links[current] && validSessionId(links[current].from) && !chain.includes(links[current].from) &&
       links[current].from !== id;) chain.push(current = links[current].from);
     return chain;
   };
-  const successor = (id, links = read()) => Object.keys(links).find((to) => links[to]?.from === id);
+  const successor = (id, links = read() ?? {}) => Object.keys(links).find((to) => links[to]?.from === id);
   return {
     file,
     predecessors: (id, links) => (validSessionId(id) ? predecessors(id, links) : []),
     owners: (id) => (validSessionId(id) ? [id, ...predecessors(id)] : []),
     successor: (id, links) => (validSessionId(id) ? successor(id, links) : undefined),
-    links: () => read(),
+    links: (fallback = {}) => read() ?? fallback,
     link(from, to, extra = {}) {
       if (!file) throw new Error('no local state directory');
       if (!validSessionId(from) || !validSessionId(to) || from === to) throw new Error('invalid session ids');
-      const links = read();
+      const storedLinks = read();
+      if (storedLinks === null && extra.origin === 'auto') throw new Error(LINKS_UNREADABLE);
+      const links = storedLinks ?? {};
       if (links[to]) throw new Error(`${to} already took over ${links[to].from}`);
       const taken = successor(from, links);
       if (taken) throw new Error(`${from} was already handed over to ${taken}`);
@@ -91,13 +94,13 @@ export function createAliases(directory) {
     },
     // 交接完成后补记投递和自动续接的结果。
     annotate(to, fields) {
-      const links = read();
+      const links = read() ?? {};
       if (!links[to]) return;
       links[to] = { ...links[to], ...fields };
       writeJsonAtomic(file, { links });
     },
     unlink(from, to) {
-      const links = read();
+      const links = read() ?? {};
       if (links[to]?.from !== from) throw new Error(`${to} did not take over ${from}`);
       const removed = links[to];
       delete links[to];
@@ -137,14 +140,14 @@ const timeOf = (event) => { const t = event?.time ?? event?.at; return Number.is
 
 // 整张交接单的字符上限；超出时先把任务表缩成要紧的几单，再按优先级从低到高整节省略（下一步、待收尾永不省略）。
 export const BRIEF_LIMIT = 16_000;
-// 宿主、自动续接和本插件以“用户”身份发出的固定话术：不是人工输入。
+// 近期摘要沿用对自动续接等固定话术的筛选，完整档案以来源标记为准。
 const AUTOMATED_USER_TEXT = /^\s*(?:\[codex-conductor|(?:继续|continue|продолжай)(?:[\s。.!！,，;；:：]|$)|[（(](?:上一步工具|检测到你可能陷入循环))/i;
 
-function humanInstruction(event, autoMessage) {
+function humanInstruction(event) {
   if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return;
+  if (event.data.source.via === 'codex-conductor') return;
   const text = textOf(event.data.content);
-  const trimmed = text.trim();
-  if (trimmed && trimmed !== autoMessage && !AUTOMATED_USER_TEXT.test(trimmed)) return { text, at: timeOf(event) };
+  if (text.trim()) return { text, at: timeOf(event) };
 }
 
 // 从旧会话的内存日志里倒着找最近的人工指令和最后一个正常结束回合的小结；超过 deadlineMs 就放弃这两节。
@@ -163,15 +166,21 @@ export function sessionContext(log, { autoMessage, now = Date.now, deadlineMs = 
       const text = textOf(event.data?.message?.content).trim();
       if (text) progress = { text: clip(text, 1500), at: timeOf(event) };
     } else if (instructions.length < 12) {
-      const item = humanInstruction(event, autoMessage);
-      if (item) instructions.push({ ...item, text: clip(item.text, 600) });
+      const item = humanInstruction(event);
+      if (item && item.text.trim() !== autoMessage && !AUTOMATED_USER_TEXT.test(item.text)) {
+        instructions.push({ ...item, text: clip(item.text, 600) });
+      }
     }
     if (instructions.length >= 12 && lastTurn && progress) break;
   }
   return { instructions, lastTurn, progress };
 }
 
-export const instructionArchivePath = (directory, root) => path.resolve(directory, 'handovers', `instructions-${root}.json`);
+export function instructionArchivePath(directory, root) {
+  // 保留小写 UUID 的旧路径，其他 ID 用独立的文件名空间，避免 Windows 折叠大小写。
+  const id = /^(?:session-)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(root) ? root : `id-${hash(root)}`;
+  return path.resolve(directory, 'handovers', `instructions-${id}.json`);
+}
 
 function readInstructions(file) {
   const entries = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -179,25 +188,25 @@ function readInstructions(file) {
   return entries;
 }
 
-async function archiveInstructions({ directory, aliases, from, agentA, agentOf, autoMessage }) {
+async function archiveInstructions({ directory, aliases, from, agentA, agentOf }) {
   const links = aliases.links();
   const predecessors = aliases.predecessors(from, links);
   const root = predecessors.at(-1) ?? from;
   const file = instructionArchivePath(directory, root);
   const previous = links[from]?.instructions;
-  let entries = [];
+  let entries;
   if (previous?.root === root) {
     try { entries = readInstructions(file); } catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   const append = (agent) => {
     if (!Array.isArray(agent.session?.log)) throw new Error(`session log unavailable: ${agent.id}`);
     for (const event of agent.session.log) {
-      const item = humanInstruction(event, autoMessage);
+      const item = humanInstruction(event);
       if (item) entries.push(item);
     }
   };
   // 旧链接、写入失败或撤回后，从仍相连的前任回填，避免重复追加同一来源。
-  if (previous?.root !== root || previous.count !== entries.length) {
+  if (!entries || previous.count !== entries.length) {
     entries = [];
     for (const id of predecessors.reverse()) append(await agentOf(id));
   }
@@ -622,6 +631,7 @@ export async function handOver(ctx, deps, request) {
     return result;
   }
   const { from, note, force } = request;
+  if (request.origin === 'auto' && aliases.links(null) === null) return refuse('links_unreadable', { error: LINKS_UNREADABLE });
   let agentA;
   try { agentA = await agentOf(from); } catch (error) { return refuse(error.code === 'session/not-found' ? 'session_not_found' : 'session_unavailable', { error: error.message }); }
   const taken = aliases.successor(from);
@@ -668,7 +678,7 @@ export async function handOver(ctx, deps, request) {
   const at = new Date().toISOString();
   const existingGoal = goals?.get(agentB);
   try {
-    const archive = await archiveInstructions({ directory, aliases, from, agentA, agentOf, autoMessage });
+    const archive = await archiveInstructions({ directory, aliases, from, agentA, agentOf });
     aliases.annotate(to, { instructions: { root: archive.root, count: archive.count } });
     result.instructions = archive;
     result.steps.instructions = 'written';
@@ -836,7 +846,8 @@ export const AUTO_HANDOVER_DEFAULTS = { mode: 'confirm', cooldownHours: 12, remi
 
 // 纯判定：会话标了建议交接之后这一次要做什么。remind 是面板提醒；act 为 ask（confirm 模式询问）或 auto（执行交接，
 // 来源 origin 为 auto，或用户在面板同意过的 confirm / panel）。名下是否还有运行中的 Codex 任务由调用方最后再查。
-export function autoHandoverStep({ settings, record = {}, messages, threshold, suggest, idle, retired, link, now, uptimeMs, depth = 0, lastAutoAt = -Infinity }) {
+export function autoHandoverStep({ settings, record = {}, messages, threshold, suggest, idle, retired, link, now, uptimeMs,
+  linksReadable = true, depth = 0, lastAutoAt = -Infinity }) {
   const step = { remind: false, act: null };
   if (settings.mode === 'off' || !suggest || retired) return step;
   // 继任会话从交接时起再涨满一个阈值才算（自动交接出的新会话不会马上再触发）。
@@ -847,6 +858,7 @@ export function autoHandoverStep({ settings, record = {}, messages, threshold, s
   if (record.approved) return Object.assign(step, { act: 'auto', origin: record.approved.origin ?? 'confirm' });
   if (settings.mode === 'notify') return step;
   if (settings.mode === 'auto') {
+    if (!linksReadable) return { ...step, blocked: LINKS_UNREADABLE };
     if (settings.maxChainDepth > 0 && depth >= settings.maxChainDepth) {
       return { ...step, blocked: `会话链已交接 ${depth} 次，达到自动交接上限 ${settings.maxChainDepth} 次。` };
     }
@@ -919,7 +931,8 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     delete record.pending;
     logger?.info?.(`[codex-conductor] 会话 ${agent?.id} 本次没有自动交接（${why}）${resumed ? '，已恢复目标' : ''}，${wait / 60_000} 分钟后再试。`);
   };
-  const decision = (id, value, sessions, idle, links = aliases.links()) => {
+  const decision = (id, value, sessions, idle, storedLinks = aliases.links(null)) => {
+    const links = storedLinks ?? {};
     const predecessors = aliases.predecessors(id, links);
     let lastAutoAt = -Infinity;
     for (const owner of [id, ...predecessors]) {
@@ -928,7 +941,8 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       if (link?.origin === 'auto') lastAutoAt = Math.max(lastAutoAt, Date.parse(link.at) || 0);
     }
     return autoHandoverStep({ settings: settings(), record: sessions[id], messages: value.messages, threshold: value.threshold, suggest: value.suggest,
-      idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(), depth: predecessors.length, lastAutoAt });
+      idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(),
+      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt });
   };
   return {
     // value 是 history.observe(agent) 的结果；会话每次转为空闲时同步调用（第一个 await 之前的部分与 goal 排下一轮同属这次事件）。
@@ -1000,7 +1014,8 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     },
     snapshot(suggestions = [], threshold) {
       const sessions = read();
-      const links = aliases.links();
+      const storedLinks = aliases.links(null);
+      const links = storedLinks ?? {};
       let result = null;
       try { result = JSON.parse(fs.readFileSync(path.join(directory, 'handover-result.json'), 'utf8')); } catch {}
       // 继任会话所在工作区的名字；取不到就不显示。
@@ -1009,7 +1024,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       const group = (sid) => (groups.has(sid) ? { workspace: groups.get(sid) } : {});
       return { mode: settings().mode,
         suggestions: suggestions.filter((s) => s.suggest && !aliases.successor(s.sessionId, links)).map((s) => {
-          const { blocked } = decision(s.sessionId, { threshold, ...s }, sessions, true, links);
+          const { blocked } = decision(s.sessionId, { threshold, ...s }, sessions, true, storedLinks);
           return blocked ? { ...s, blocked } : s;
         }),
         prompts: Object.entries(sessions).filter(([id, r]) => openPrompt(r) && !aliases.successor(id))

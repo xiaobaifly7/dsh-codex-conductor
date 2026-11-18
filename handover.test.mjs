@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { createAliases } from './handover.mjs';
+import { createAliases, instructionArchivePath } from './handover.mjs';
 
 const dir = (t) => {
   const root = mkdtempSync(path.join(tmpdir(), 'conductor-handover-'));
@@ -149,9 +149,8 @@ test('history tracker counts messages incrementally, flags sessions over the thr
 });
 
 // 交接用的最小宿主：会话、目标、sessionController；log 里放 turn/start 模拟回合。
-function host(t, hooks = {}) {
+function host(t, hooks = {}, root = dir(t)) {
   const renames = [];
-  const root = dir(t);
   const agents = new Map();
   const goalsByAgent = new Map();
   const prompts = [];
@@ -190,22 +189,61 @@ const entriesAt = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
 test('the first archive preserves all original human instructions and the brief points to it', async (t) => {
   const h = host(t);
-  const source = h.agent('session-A');
-  const original = ['  第一条长期指令\n' + '长'.repeat(800) + '\n ', ...Array.from({ length: 13 }, (_, i) => `要求 ${i}`)];
+  const source = h.agent('session-12345678-1234-4321-8765-123456789abc');
+  const original = ['  第一条长期指令\n' + '长'.repeat(800) + '\n ', ...Array.from({ length: 13 }, (_, i) => `要求 ${i}`),
+    '继续，禁止删除旧文件', 'continue keeping all backups', '继续。', '重启后的固定提示'];
+  const autoResume = userEvent('重启后的固定提示', 21);
+  autoResume.data.source.via = 'codex-conductor';
   source.session.log.push(...original.map((text, i) => userEvent(text, i + 1)),
-    userEvent('继续。', 20), userEvent('重启后的固定提示', 21), userEvent('[codex-conductor 交接] 自动交接单', 22),
+    userEvent(' \n ', 20), autoResume, userEvent('[codex-conductor 交接] 自动交接单', 22, 'plugin:codex-conductor'),
     userEvent('插件消息', 23, 'plugin:example'), userEvent('系统消息', 24, 'system'), userEvent('工具通知', 25, 'tool-jobs'),
     userEvent('来源不明', 26, null), { ...userEvent('工具结果', 27), type: 'tool/result' });
   const result = await h.request({ sessionId: source.id }, { autoMessage: '重启后的固定提示' });
-  const file = path.join(h.root, 'handovers', 'instructions-session-A.json');
+  const file = path.join(h.root, 'handovers', `instructions-${source.id}.json`);
   assert.equal(result.instructions.file, file);
   assert.deepEqual(entriesAt(file), original.map((text, i) => ({ text, at: new Date(i + 1).toISOString() })));
   assert.equal(result.checks.instructions, 'ok');
   const brief = readFileSync(result.briefPath, 'utf8');
   assert.ok(brief.includes(file));
-  assert.match(brief, /共 14 条，时间范围 1970-01-01T00:00:00.001Z 至 1970-01-01T00:00:00.014Z。早于最近 12 条的指令仍然有效/);
+  assert.match(brief, /共 18 条，时间范围 1970-01-01T00:00:00.001Z 至 1970-01-01T00:00:00.018Z。早于最近 12 条的指令仍然有效/);
   assert.match(brief, /最近的用户指令[\s\S]*要求 12/);
-  assert.doesNotMatch(brief, /第一条长期指令/);
+  assert.doesNotMatch(brief, /第一条长期指令|禁止删除旧文件|continue keeping all backups/);
+});
+
+test('case-variant chain roots get separate archives and successor read permissions', async (t) => {
+  const appData = dir(t);
+  const root = path.join(appData, 'dsh-codex-conductor');
+  mkdirSync(root);
+  const h = host(t, {}, root);
+  const { apply } = await import('./index.mjs');
+  const previous = process.env.LOCALAPPDATA;
+  let execute;
+  try {
+    process.env.LOCALAPPDATA = appData;
+    apply({ tools: { register() {}, guard() {} }, on(name, handler) { if (name === 'tools/execute') execute = handler; } },
+      { workspaces: ['*'], plannerReads: 'products', autoVerify: 'off' },
+      async (_cfg, argv) => ({ status: 'completed', owner: argv[2], paths: [] }));
+  } finally {
+    if (previous === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previous;
+  }
+  const archive = async (id, text) => {
+    h.agent(id).session.log.push(userEvent(text, 1));
+    const result = await h.request({ sessionId: id });
+    assert.equal(result.checks.instructions, 'ok');
+    return result;
+  };
+  const a = await archive('ChainA', '大写链指令');
+  const b = await archive('chaina', '小写链指令');
+  const read = (owner, file) => execute({ name: 'read', arguments: { path: file }, agent: h.agents.get(owner) },
+    async () => ({ value: 'read' }));
+  assert.equal((await read(a.to, a.instructions.file)).value, 'read');
+  assert.equal((await read(b.to, b.instructions.file)).value, 'read');
+  assert.equal((await read(a.to, b.instructions.file)).isError, true);
+  assert.equal((await read(b.to, a.instructions.file)).isError, true);
+  assert.notEqual(a.instructions.file.toLowerCase(), b.instructions.file.toLowerCase());
+  assert.deepEqual(entriesAt(a.instructions.file).map(({ text }) => text), ['大写链指令']);
+  assert.deepEqual(entriesAt(b.instructions.file).map(({ text }) => text), ['小写链指令']);
 });
 
 test('a successor appends its instructions to the same archive without duplicating its predecessors, including after a revert', async (t) => {
@@ -229,7 +267,7 @@ test('an existing chain without an archive backfills its linked predecessors in 
   h.agent('session-A').session.log.push(userEvent('原会话较晚的指令', 2));
   const b = h.agent('session-B');
   b.session.log.push(userEvent('被接管会话里较早的指令', 1));
-  h.aliases.link('session-A', b.id);
+  h.aliases.link('session-A', b.id, { instructions: { root: 'session-A', count: 0 } });
   const result = await h.request({ sessionId: b.id });
   assert.equal(result.instructions.root, 'session-A');
   assert.deepEqual(entriesAt(result.instructions.file).map(({ text }) => text), ['被接管会话里较早的指令', '原会话较晚的指令']);
@@ -239,7 +277,7 @@ test('an archive write failure is reported by the hand-over and self-check witho
   const h = host(t);
   const a = h.agent('session-A');
   a.session.log.push(userEvent('需要在下一次补齐的指令', 1));
-  const file = path.join(h.root, 'handovers', 'instructions-session-A.json');
+  const file = instructionArchivePath(h.root, a.id);
   mkdirSync(file, { recursive: true });
   const result = await h.request({ sessionId: a.id });
   assert.equal(result.status, 'handed_over_with_issues');
@@ -254,7 +292,7 @@ test('an archive write failure is reported by the hand-over and self-check witho
 });
 
 test('the self-check detects an archive shortened after the brief is built', async (t) => {
-  const h = host(t, { prompt: () => writeFileSync(path.join(h.root, 'handovers', 'instructions-session-A.json'), '[]') });
+  const h = host(t, { prompt: () => writeFileSync(instructionArchivePath(h.root, 'session-A'), '[]') });
   h.agent('session-A').session.log.push(userEvent('保留', 1));
   const result = await h.request({ sessionId: 'session-A' });
   assert.equal(result.status, 'handed_over_with_issues');
@@ -593,10 +631,42 @@ test('the depth limit blocks automatic hand-over, appears in state and the panel
   assert.equal((await h.request({ sessionId: successor.id, origin: 'panel' })).status, 'handed_over');
 });
 
+test('automatic hand-over waits for readable links while panel hand-over remains available', async (t) => {
+  const { createAutoHandover, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
+  for (const [label, broken] of [['missing', undefined], ['malformed JSON', '{'], ['invalid link map', '{"links":[]}']]) {
+    await t.test(label, async (t) => {
+      const h = host(t);
+      const agent = h.agent('session-A');
+      const suggestion = { sessionId: agent.id, messages: 20, threshold: 10, suggest: true };
+      const settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' };
+      const submitted = [];
+      const auto = createAutoHandover({ directory: h.root, settings: () => settings, aliases: h.aliases, uptime: () => 3_600_000,
+        submit: (request) => submitted.push(request) });
+      if (broken !== undefined) writeFileSync(h.aliases.file, broken);
+      for (let i = 0; i < 2; i++) {
+        const step = await auto.observe(agent, suggestion);
+        assert.equal(step.act, null);
+        assert.match(step.blocked, /交接链接状态不可读/);
+        assert.equal(auto.snapshot([suggestion]).suggestions[0].blocked, step.blocked);
+      }
+      assert.deepEqual(submitted, []);
+      assert.equal((await h.request({ sessionId: agent.id, origin: 'auto' })).reason, 'links_unreadable');
+      assert.equal((await h.request({ sessionId: agent.id, origin: 'panel' })).status, 'handed_over');
+      const fresh = h.agent('session-B');
+      assert.deepEqual(h.aliases.predecessors(fresh.id), []);
+      const step = await auto.observe(fresh, { ...suggestion, sessionId: fresh.id });
+      assert.equal(step.origin, 'auto');
+      assert.equal(step.blocked, undefined);
+      assert.deepEqual(submitted.map(({ sessionId }) => sessionId), [fresh.id]);
+    });
+  }
+});
+
 test('the automatic interval follows a chain even through a manual hand-over and a new controller instance', async (t) => {
   const { createAutoHandover, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
   const h = host(t);
   const a = h.agent('session-A');
+  writeFileSync(h.aliases.file, '{"links":{}}');
   const settings = { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' };
   let now = Date.now() - 5 * 3_600_000; // 请求可能在宿主处理前已等待了数小时。
   const options = { directory: h.root, settings: () => settings, aliases: h.aliases, now: () => now, uptime: () => 3_600_000 };
@@ -662,6 +732,7 @@ test('auto hand-over asks in the panel or submits a request only when the sessio
   assert.deepEqual(auto.snapshot().prompts, [], 'an unanswered question expires after the cooldown');
   // auto：直接提交来源为 auto 的请求；查任务失败时跳过。
   settings = { ...settings, mode: 'auto' };
+  writeFileSync(aliases.file, '{"links":{}}');
   const c = { id: 'session-C', status: 'idle' };
   await auto.observe(c, big);
   assert.deepEqual(submitted.at(-1), { sessionId: 'session-C', origin: 'auto', requestedAt: new Date(clock).toISOString() });
@@ -798,6 +869,7 @@ test('in a goal loop auto hand-over pauses the goal at the idle edge, hands over
   const { createAutoHandover, AUTO_HANDOVER_DEFAULTS, RETRY_COOLDOWN_MS } = await import('./handover.mjs');
   const root = dir(t);
   const aliases = createAliases(root);
+  writeFileSync(aliases.file, '{"links":{}}');
   const goals = goalLoop();
   const agents = new Map();
   let clock = Date.parse('2026-11-17T12:00:00Z');
@@ -881,6 +953,7 @@ test('a hand-over with running Codex jobs carries them to the successor and list
     { job_id: 'J-done', execution_status: 'completed' }];
   const deps = { sessionJobs: async (owner) => (owner === 'session-A' || h.aliases.predecessors(owner).includes('session-A') ? jobs : []) };
   assert.equal((await h.request({ sessionId: 'session-A' }, deps)).reason, 'jobs_running', 'withRunningJobs off keeps the refusal');
+  writeFileSync(h.aliases.file, '{"links":{}}');
   const carried = await h.request({ sessionId: 'session-A', origin: 'auto' }, { ...deps, withRunningJobs: true });
   assert.deepEqual([carried.status, carried.running, carried.checks.jobs], ['handed_over', ['J-run'], 'ok']);
   const brief = readFileSync(carried.briefPath, 'utf8');
@@ -921,6 +994,7 @@ test('a goal-loop session with running jobs is handed over at the idle edge; a n
   const { createAutoHandover, AUTO_HANDOVER_DEFAULTS, TURN_RETRY_COOLDOWN_MS, RETRY_COOLDOWN_MS } = await import('./handover.mjs');
   const root = dir(t);
   const aliases = createAliases(root);
+  writeFileSync(aliases.file, '{"links":{}}');
   const goals = goalLoop();
   let clock = Date.parse('2026-11-18T03:34:46Z');
   const submitted = [];

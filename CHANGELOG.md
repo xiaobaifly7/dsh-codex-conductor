@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.128` 指令档案按消息来源保存所有非空白人工输入，保留以“继续”或 “continue” 开头的原文。交接链接状态缺失或不可读时暂停自动交接，面板手动交接仍可用。仅大小写不同的链首 ID 使用独立档案，小写 UUID 链沿用原路径。
+
 `0.9.127` 会话交接按链保存人工用户指令原文和时间。交接单保留近期指令，并给出完整档案的路径、条数和时间范围。继任会话在 `plannerReads: products` 下也可读取这一个档案。交接自检查文件和条数，档案写入失败会报告但仍交接。自动交接新增链深度上限 `maxChainDepth` 和链级间隔 `minHoursBetween`，两者默认 6，均可设为 0 关闭相应限制。面板显示拦截原因，手动交接仍可用。
 
 `0.9.126` 统一规划端的派单与等待提示。长等前先后台派齐独立且 scope 和写入目标互不重叠的只读调查、核验或写任务，再并行等待多单。写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须逐单完成并核对。
@@ -149,6 +151,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.128` Archives every non-blank human message using its source metadata, including messages that start with “继续” or “continue”. Missing or unreadable link state pauses automatic hand-over and leaves panel hand-over available. Chain roots that differ only in case get separate archives, and lowercase UUID chains keep their original paths.
 
 `0.9.127` Archives the original text and timestamps of human user instructions per hand-over chain. The brief keeps its recent-instructions section and gives the archive path, count and time range. Linked successors can read that exact archive under `plannerReads: products`. The self-check verifies that the file exists and still has enough entries. A write failure is reported and hand-over proceeds. Automatic hand-over now has a chain depth limit (`maxChainDepth`) and a chain-wide interval in hours (`minHoursBetween`), both defaulting to 6. Set either to 0 to disable that limit. The panel shows why an automatic hand-over was blocked and keeps manual hand-over available.
 

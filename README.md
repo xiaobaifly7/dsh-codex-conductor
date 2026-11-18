@@ -103,10 +103,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
-### 0.9.127：完整用户指令档案与自动交接限制
+### 0.9.128：完整用户指令档案与自动交接限制
 
-- 每条会话链在状态目录的 `handovers/instructions-<链首会话 ID>.json` 保存人工输入指令的原文和时间。再次交接补入新增指令。交接单给出路径、条数和时间范围，并保留最近指令小节。早期指令仍然有效，需要时可读取完整档案。`plannerReads: products` 下，当前链接所授权的继任会话可读取这个文件。自检核对文件存在且条数不少于交接单所列。档案失败时仍交接，并在结果和自检中报告。
-- `auto` 模式按 `handover.json` 的前任链接计算已交接次数，按同链的自动交接记录计算间隔。面板和 `auto-handover.json` 记录链级拦截原因。用户仍可在面板手动提交交接。
+- 每条会话链在状态目录的 `handovers/` 保存所有非空白人工消息的原文和时间，按来源排除自动续接、系统和插件消息。再次交接补入新增指令。小写 UUID 链沿用 `instructions-<链首会话 ID>.json`，其他 ID 使用含原始 ID 哈希的文件名，区分仅大小写不同的链。交接单给出路径、条数和时间范围，并保留最近指令小节。`plannerReads: products` 下，当前链接所授权的继任会话可读取本链档案。自检核对文件存在且条数不少于交接单所列。档案失败时仍交接，并在结果和自检中报告。
+- `auto` 模式按 `handover.json` 的前任链接计算已交接次数，按同链的自动交接记录计算间隔。链接状态缺失或无法读取时暂停自动交接，面板和 `auto-handover.json` 记录拦截原因。用户仍可在面板手动提交交接。
 
 ### 0.9.111：带着运行中的任务交接、重启后的兜底续接、自动生成的交接标题也改名
 
@@ -653,10 +653,10 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
 
-### 0.9.127: Full user instruction archives and automatic hand-over limits
+### 0.9.128: Full user instruction archives and automatic hand-over limits
 
-- Each hand-over chain keeps the original text and timestamps of human user instructions in `handovers/instructions-<root session ID>.json` under the state directory. Later hand-overs add new instructions. The brief keeps its recent-instructions section and gives the archive path, entry count and time range. Earlier instructions still apply and can be retrieved from the archive. Under `plannerReads: products`, a linked successor can read that exact file. The self-check verifies that the archive exists and has at least the number of entries cited in the brief. Hand-over proceeds and reports any archive failure in the result and self-check.
-- In `auto` mode, depth is counted from predecessor links in `handover.json`, and the minimum interval uses automatic hand-over records across the chain. The panel and `auto-handover.json` show the chain-level reason for blocking a hand-over. Users can still submit a manual hand-over from the panel.
+- Each hand-over chain keeps the original text and timestamps of all non-blank human messages under the state directory's `handovers/` directory. Source metadata identifies automatic resume, system and plugin messages to exclude. Later hand-overs add new instructions. Lowercase UUID chains keep `instructions-<root session ID>.json`. Other IDs use a hash of the original ID in the filename to distinguish IDs that differ only in case. The brief keeps its recent-instructions section and gives the archive path, entry count and time range. Under `plannerReads: products`, a linked successor can read its chain's archive. The self-check verifies that the file exists and has at least the number of entries cited in the brief. Hand-over proceeds and reports any archive failure in the result and self-check.
+- In `auto` mode, depth is counted from predecessor links in `handover.json`, and the minimum interval uses automatic hand-over records across the chain. Missing or unreadable link state pauses automatic hand-over. The panel and `auto-handover.json` show the reason. Users can still submit a manual hand-over from the panel.
 
 ### 0.9.111: Hand over with running jobs, fallback resume after a restart, and retitle auto-generated hand-over titles
 
