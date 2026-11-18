@@ -5,13 +5,14 @@
     python codex_runner.py status JOB_ID [--wait SECONDS]
     python codex_runner.py cancel JOB_ID
     python codex_runner.py rollback JOB_ID [--check]
+    python codex_runner.py repeat-guard [--cwd DIR]
     python codex_runner.py doctor
 
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
 """
 import argparse
 from collections import Counter
-from contextlib import closing, suppress
+from contextlib import closing, contextmanager, suppress
 import errno
 from functools import cache
 import hashlib
@@ -57,6 +58,20 @@ HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
              else Path.home() / ".local/state/codex-runner"))
 EXIT_GRACE_SECONDS = 20
+REPEAT_MIN_SECONDS = 60
+REPEAT_FAILURES = 2
+REPEAT_WINDOW_HOURS = 24
+REPEAT_TOTALS = {"blocked": 0, "seconds_avoided": 0}
+POWERSHELL_BUILTINS = frozenset("""
+    Write-Host Write-Output Get-Content Set-Content Out-File Select-Object Where-Object ForEach-Object
+    Test-Path Join-Path Get-Date Start-Sleep Out-Null Format-List Format-Table Get-ChildItem New-Item
+    Remove-Item Get-Item Copy-Item Split-Path Resolve-Path ConvertTo-Json ConvertFrom-Json Get-Location Set-Location
+""".split())
+SCRIPT_SUFFIX = r"\.(?:ps1|psm1|py|sh)"
+SCRIPT_DELIMITERS = r"""\s'"\\/|&;<>()=,"""
+SCRIPT_NAMES = re.compile(
+    rf"""(?P<quote>["'])(?:[^"'\r\n|&;<>]*[/\\])?(?P<quoted>[^"'\\/\r\n|&;<>]+{SCRIPT_SUFFIX})(?P=quote)"""
+    rf"|(?<![^{SCRIPT_DELIMITERS}])(?P<bare>[^{SCRIPT_DELIMITERS}]+{SCRIPT_SUFFIX})(?=$|[{SCRIPT_DELIMITERS}])", re.I)
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -435,7 +450,7 @@ def build_command(args, run_dir, thread_id):
     return cmd, env
 
 
-def run_attempt(args, prompt, run_dir, thread_id):
+def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
     """Run one Codex process to a verdict. turn.completed decides success, not the exit code."""
     cmd, env = build_command(args, run_dir, thread_id)
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
@@ -478,7 +493,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
             def pump():
                 try:
                     for raw in proc.stdout:
-                        lines.put(raw)
+                        lines.put((raw, time.monotonic() if repeat_guard else None))
                 finally:
                     proc.stdout.close()
                     lines.put(None)
@@ -492,6 +507,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
             completed_at = None
             stdout_done = False
             active_commands = set()
+            command_starts = {}  # scoped to this attempt: Codex may reuse item IDs on resume
             timeout_reason = None
             timeout_marker = object()
             while True:
@@ -521,18 +537,19 @@ def run_attempt(args, prompt, run_dir, thread_id):
                         # Honour a completion already queued without letting later output defer the timeout.
                         lines.put(timeout_marker)
                 try:
-                    raw = lines.get(timeout=0.5)
+                    line = lines.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if raw is timeout_marker:
+                if line is timeout_marker:
                     if completed_at:
                         continue
                     state["end_reason"] = timeout_reason
                     kill_tree(proc.pid)
                     break
-                if raw is None:
+                if line is None:
                     stdout_done = True
                     continue
+                raw, received = line
                 event_log.write(raw)
                 event_log.flush()
                 try:
@@ -546,10 +563,26 @@ def run_attempt(args, prompt, run_dir, thread_id):
                         "command_execution", "file_change", "agent_message"):
                     state["prompt_delivered"] = True
                 if item.get("type") == "command_execution":
-                    if kind == "item.started" and item.get("status") == "in_progress":
-                        active_commands.add(item.get("id"))
+                    if kind == "item.started":
+                        if item.get("status") == "in_progress":
+                            active_commands.add(item.get("id"))
+                        if repeat_guard:
+                            step = repeat_guard.step(item)
+                            if step:
+                                block = repeat_guard.check_start(step)
+                                if block:
+                                    state.update(completed=False, end_reason="repeated_failure", repeat_block=block,
+                                                 error="A command started again after repeated long failures.")
+                                    kill_tree(proc.pid)
+                                    repeat_guard.record_block(block, event_log)
+                                    break
+                                if item.get("id") is not None:
+                                    command_starts[item["id"]] = (step, received)
                     elif kind == "item.completed":
                         active_commands.discard(item.get("id"))
+                        if repeat_guard:
+                            started_command = command_starts.pop(item.get("id"), None)
+                            repeat_guard.complete(item, started_command, received)
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
                 if kind == "error":
                     if REFUSED.search(str(ev.get("message") or "")):
@@ -578,6 +611,9 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state["commands"] += 1
                 elif kind == "item.completed" and item.get("type") == "file_change":
                     state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
+                    if repeat_guard:
+                        # Only Codex file-change events are observable here, including during a report turn.
+                        repeat_guard.clear()
             with acquire_file_lock(run_dir / "process.lock", blocking=True):
                 # Failed launchers can leave children behind after closing their standard streams.
                 if not IS_WIN and state["end_reason"] is None and (not state["completed"] or state["failed"]):
@@ -619,6 +655,8 @@ def classify(state, run_dir):
         return "spawn_failed", False
     if state["end_reason"] == "model_refused":
         return "model_refused", False
+    if state["end_reason"] == "repeated_failure":
+        return "repeated_failure", False
     text = state["error"] or ""
     if not state["failed"] and not text:
         try:
@@ -719,6 +757,153 @@ def too_big_trees():
 
 def tree_key(cwd, *, resolve=None):
     return normalized_path((resolve or os.path.realpath)(local_path(cwd)))
+
+
+def read_step_failures(path):
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+class RepeatGuard:
+    def __init__(self, cwd, options, job_dir=None):
+        self.cwd_key = tree_key(cwd)
+        self.cwd_hash = hashlib.sha1(self.cwd_key.encode("utf-8")).hexdigest()[:16]
+        self.enabled = options.get("repeat_guard", "on") == "on"
+        self.min_seconds = options.get("repeat_min_seconds", REPEAT_MIN_SECONDS)
+        self.threshold = options.get("repeat_failures", REPEAT_FAILURES)
+        self.window_hours = options.get("repeat_window_hours", REPEAT_WINDOW_HOURS)
+        self.path = HOME / "step-failures.json"
+        self.lock = HOME / "locks" / "step-failures.lock"
+        self.job_dir = job_dir
+        self.blocked = None
+
+    def step(self, item):
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        names = set(re.findall(r"\b[A-Z][a-z]+-[A-Z][A-Za-z]+\b", command)) - POWERSHELL_BUILTINS
+        for match in SCRIPT_NAMES.finditer(command):
+            name = match["quoted"] or match["bare"]
+            if not re.search(r"tmp|temp|run_|wrap", name, re.I):
+                names.add(re.sub(r"\d", "#", name))
+        signature = self.cwd_key + "\0" + json.dumps(sorted(names)) if names else re.sub(r"\d+", "#", command)
+        return hashlib.sha1(signature.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def recent(self, data, now):
+        steps = data.get(self.cwd_hash, {})
+        # The window applies to the aggregate's last failure. Other cwd entries may use different windows.
+        cutoff = now - 3600 * self.window_hours
+        recent = {key: value for key, value in steps.items() if key != "_changed_at" and value["last_at"] >= cutoff}
+        changed_at = steps.get("_changed_at", 0)
+        if recent or changed_at >= cutoff:
+            recent["_changed_at"] = changed_at
+        return recent
+
+    @contextmanager
+    def edit(self):
+        self.lock.parent.mkdir(parents=True, exist_ok=True)
+        with acquire_file_lock(self.lock, blocking=True):
+            data = read_step_failures(self.path)
+            now = time.time()
+            steps = self.recent(data, now)
+            totals = {**REPEAT_TOTALS, **data.get("_totals", {})}
+            yield steps, totals, now
+            if steps != data.get(self.cwd_hash, {}) or totals != data.get("_totals", REPEAT_TOTALS):
+                if steps:
+                    data[self.cwd_hash] = steps
+                else:
+                    data.pop(self.cwd_hash, None)
+                data["_totals"] = totals
+                tmp = self.path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data), "utf-8")
+                os.replace(tmp, self.path)
+
+    def standing(self, steps):
+        return [{"step": key[:8], **{k: record[k] for k in ("failures", "seconds", "last_exit", "last_at")}}
+                for key, record in sorted(steps.items()) if key != "_changed_at" and record["failures"] >= self.threshold]
+
+    def snapshot(self):
+        if not self.enabled or not self.path.exists():
+            return REPEAT_TOTALS.copy(), []
+        with acquire_file_lock(self.lock, blocking=True):
+            data = read_step_failures(self.path)
+        return {**REPEAT_TOTALS, **data.get("_totals", {})}, self.standing(self.recent(data, time.time()))
+
+    def clear(self):
+        with self.edit() as (steps, _, now):
+            steps.clear()
+            steps["_changed_at"] = now
+
+    def prepare_prompt(self, prompt, allow_rerun):
+        if allow_rerun:
+            self.clear()
+        if not self.enabled:
+            return prompt
+        with self.edit() as (steps, _, _):
+            standing = self.standing(steps)
+        if standing:
+            minutes = round(sum(step["seconds"] for step in standing) / 60)
+            prompt += (f"\n\n## 本目录近期反复失败的步骤\n- 有 {len(standing)} 个步骤在最近 {self.window_hours:g} 小时里"
+                       f"各失败了 {self.threshold} 次以上（共约 {minutes} 分钟），期间没有文件改动；runner 会拦下再次运行它们。"
+                       "先修改相关文件或换掉依赖它的做法；做不到时把依赖它的验收项标 blocked 并写 environment blocker。")
+        return prompt
+
+    def check_start(self, step):
+        with self.edit() as (steps, totals, _):
+            prior = steps.get(step)
+            if prior is None or prior["failures"] < self.threshold:
+                if not self.blocked or self.blocked[0] != step:
+                    return None
+                prior = self.blocked[1]  # the report-only prompt forbids this step even after a patch
+            if self.blocked is None:
+                self.blocked = (step, prior)
+            totals["blocked"] += 1
+            totals["seconds_avoided"] += prior["seconds"] / prior["failures"]
+            return {"step": step[:8], "prior_failures": prior["failures"], "prior_seconds": prior["seconds"]}
+
+    def complete(self, item, started, received):
+        exit_code = item.get("exit_code")
+        if type(exit_code) is not int:
+            return
+        if started:
+            step, at = started
+            seconds = received - at
+        elif exit_code == 0:
+            step, seconds = self.step(item), 0
+        else:
+            return
+        if not step or (exit_code != 0 and seconds < self.min_seconds):
+            return
+        with self.edit() as (steps, _, now):
+            if exit_code == 0:
+                steps.pop(step, None)
+            else:
+                prior = steps.get(step, {})
+                jobs = prior.get("jobs", [])
+                job_id = self.job_dir.name
+                jobs = [job for job in jobs if job != job_id] + [job_id]
+                steps.setdefault("_changed_at", 0)
+                steps[step] = {"failures": prior.get("failures", 0) + 1, "seconds": prior.get("seconds", 0) + seconds,
+                               "last_exit": exit_code, "last_at": now, "jobs": jobs[-10:]}
+
+    def blocks(self):
+        try:
+            return [json.loads(line) for line in (self.job_dir / "repeat-blocks.jsonl").read_bytes().splitlines(keepends=True)
+                    if line.endswith(b"\n")]
+        except FileNotFoundError:
+            return []
+
+    def record_block(self, block, event_log):
+        # The short journal lets status show blocks without scanning the potentially large Codex event stream.
+        with open(self.job_dir / "repeat-blocks.jsonl", "ab") as journal:
+            journal.write((json.dumps(block) + "\n").encode("utf-8"))
+        event_log.write((json.dumps({"type": "runner.repeat_block", **block}) + "\n").encode("utf-8"))
+        event_log.flush()
+
+    def summary(self):
+        return {"blocks": self.blocks(), "standing": self.snapshot()[1]}
 
 
 def remember_too_big(cwd, prefix=""):
@@ -1072,6 +1257,7 @@ def execute(args, prompt, run_dir):
     if scope_args:
         base.update(scope=getattr(args, "scope", None), scope_paths=scope_args)
     started = time.time()
+    repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
     locks = []
     before = scope = None
     event_changes = []
@@ -1130,9 +1316,11 @@ def execute(args, prompt, run_dir):
 
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
+        prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
         thread_id = args.resume
         attempt = 0
         last_error_kind = None
+        report_only = False
         while True:
             attempt += 1
             runner_event(run_dir, attempt, "router_check", last_error_kind)
@@ -1142,20 +1330,35 @@ def execute(args, prompt, run_dir):
             else:
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
                 runner_event(run_dir, attempt, "codex_running", last_error_kind)
-                state = run_attempt(args, prompt, run_dir, thread_id)
+                state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard if repeat_guard.enabled else None)
+                followup_thread = thread_id if args.sandbox == "read-only" else state["thread_id"]
                 thread_id = state["thread_id"]
                 event_changes += state["file_changes"]
+                if state.get("repeat_block") and not report_only and followup_thread:
+                    block = state["repeat_block"]
+                    failures = block["prior_failures"]
+                    prompt = (f"runner 拦下了第 {failures + 1} 次运行同一个失败步骤（前 {failures} 次都失败，"
+                              f"共 {round(block['prior_seconds'])} 秒，期间没有观察到文件改动）。"
+                              "不要再运行这个步骤，也不要换个写法运行它。现在只整理并输出最终报告："
+                              "依赖这一步的验收项标 blocked，blockers 写一条 environment（需要用户处理时用 user_input），"
+                              "说明失败现象和已经尝试过的做法；其余已完成的验收照常汇报。")
+                    thread_id = followup_thread
+                    report_only = True
+                    last_error_kind = "repeat_block"
+                    (run_dir / "last_message.txt").unlink(missing_ok=True)
+                    continue
                 if state["completed"] and not state["failed"]:
                     break
                 kind, retryable = classify(state, run_dir)
             last_error_kind = kind
             # Read-only runs are ephemeral and safe to restart. A writer that started a thread must resume it.
-            can_retry = retryable and attempt <= args.retries and (args.sandbox == "read-only" or thread_id or kind == "router_down")
+            can_retry = (not report_only and retryable and attempt <= args.retries and
+                         (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
                 runner_event(run_dir, attempt, "finalizing", kind)
                 return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
                         "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
-                        **changes(), **diff()}
+                        **changes(), **diff(), "repeat_guard": repeat_guard.summary()}
             delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
             time.sleep(delay)
@@ -1172,7 +1375,8 @@ def execute(args, prompt, run_dir):
         result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
                   "final_message": final[:8000],
                   "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
-                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes(), **diff()}
+                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes(), **diff(),
+                  "repeat_guard": repeat_guard.summary()}
         if resumed:
             result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
         if args.schema:
@@ -1195,6 +1399,13 @@ def positive_float(value):
     number = float(value)
     if not 0 < number < float("inf"):
         raise argparse.ArgumentTypeError("must be a positive finite number")
+    return number
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
     return number
 
 
@@ -1242,6 +1453,12 @@ def add_task_arguments(p):
     p.add_argument("--exit-grace", type=float, default=EXIT_GRACE_SECONDS)
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--backoff", type=float, default=5)
+    p.add_argument("--repeat-min-seconds", type=positive_float, default=REPEAT_MIN_SECONDS)
+    p.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
+    p.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
+    p.add_argument("--repeat-guard", choices=("off", "on"), default="on",
+                   help="Block repeated long failures; completed file_change events reset counts (shell edits are invisible)")
+    p.add_argument("--allow-rerun", action="store_true", help="Clear this cwd's repeated failures at job start")
 
 
 def read_prompt(strict=False):
@@ -1259,6 +1476,8 @@ def read_prompt(strict=False):
 def write_result(job_dir, result):
     tmp = job_dir / "result.json.tmp"
     value = {**result, **runner_activity(job_dir / "events.jsonl")}
+    if "repeat_guard" not in value:
+        value["repeat_guard"] = job_repeat_guard(job_dir)
     try:
         data = json.dumps(value, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
@@ -1404,6 +1623,15 @@ def task_record(job_dir):
     if task.get("context") is not None:
         task_context(task["context"])
     return task
+
+
+def job_repeat_guard(job_dir):
+    # A damaged ledger must not prevent publishing another result, such as a cancellation or runner error.
+    with suppress(OSError, ValueError, TypeError, KeyError):
+        task = task_record(job_dir)
+        if task.get("cwd"):
+            return RepeatGuard(task["cwd"], task, job_dir).summary()
+    return {"blocks": [], "standing": []}
 
 
 def job_metadata(job_dir, task=None, finished_at=None, thread_id=None, *, resolve=None):
@@ -1727,6 +1955,8 @@ def enriched_status(job_id, job_dir, value, record=None):
     metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
                                                                          thread_id=value.get("thread_id"))
     result = {**metadata, **diff_fields(job_dir), **value, "job_id": job_id}
+    if finished is None and "repeat_guard" not in result:
+        result["repeat_guard"] = job_repeat_guard(job_dir)
     # Same timestamps as the job listing: a review needs to know when this round finished.
     args_file = job_dir / "args.json"
     result.setdefault("started_at", args_file.stat().st_mtime if args_file.exists() else None)
@@ -2390,6 +2620,7 @@ def main():
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
     sub.add_parser("thread-size").add_argument("thread_id")
+    sub.add_parser("repeat-guard").add_argument("--cwd", default=os.getcwd())
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
     for command in (listing, summary):
@@ -2445,6 +2676,13 @@ def main():
             emit({"status": "failed", "error_kind": "bad_arguments", "error": "thread_id is invalid", "retryable": False})
         else:
             emit({"status": "completed", "thread_id": args.thread_id, "last_input_tokens": thread_last_input_tokens(args.thread_id)})
+        return
+    if args.command == "repeat-guard":
+        try:
+            totals, standing = RepeatGuard(args.cwd, {}).snapshot()
+            emit({"status": "completed", "totals": totals, "standing": standing})
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
         return
     if args.command == "forget-too-big":
         try:

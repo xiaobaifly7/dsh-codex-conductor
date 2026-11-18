@@ -58,6 +58,11 @@ FAKE_CODEX = textwrap.dedent(r"""
                '"files_changed":[],"deviations":[],"unresolved":[]}')
     elif mode == "fixture_report":
         finish(Path(os.environ["FAKE_REPORT"]).read_text(encoding="utf-8"))
+    elif mode == "repeat_guard_start":
+        if "resume" not in sys.argv:
+            say(type="item.started", item={"id": "step", "type": "command_execution",
+                                           "command": "Invoke-StepE -Log latest.log", "status": "in_progress"})
+        finish()
     elif mode == "nonzero_after_completed":
         finish()
         sys.exit(1)
@@ -281,6 +286,212 @@ class RunnerTests(unittest.TestCase):
                 return
             time.sleep(.01)
         self.fail(f"test condition did not become ready within {timeout}s")
+
+    def repeat_step(self, number, exit_code=1, seconds=60, command=None):
+        command = command or f"Write-Host retry; & C:/tmp/run_{number}.ps1; Invoke-StepE -Log {number}.log"
+        item = {"id": f"item_{number}", "type": "command_execution", "command": command}
+        start = {"type": "item.started", "item": {**item, "status": "in_progress", "exit_code": None}}
+        if exit_code is None:
+            return [start]
+        return [start, {"type": "item.completed", "_seconds": seconds,
+                        "item": {**item, "status": "completed" if exit_code == 0 else "failed", "exit_code": exit_code}}]
+
+    def repeat_patch(self):
+        return {"type": "item.completed", "item": {"id": "patch", "type": "file_change",
+                                                   "changes": [{"path": "setup.ps1", "kind": "update"}]}}
+
+    def repeat_job(self, job_id, *turns, options=(), cwd=None, report=None):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(cwd or self.cwd), "--sandbox", "workspace-write", "--no-diff",
+                                  "--timeout", "100000", "--retries", "0", "--backoff", "0", *options])
+        if report is not None:
+            args.schema = str(RUNNER.parents[1] / "report.v2.schema.json")
+        job_dir = self.stored_job(job_id, None, **vars(args))
+        (job_dir / "prompt.txt").write_text("original task", "utf-8")
+        calls = []
+        elapsed = 100.0
+
+        def stream(events):
+            nonlocal elapsed
+            for event in events:
+                elapsed += event.get("_seconds", 0)
+                yield (json.dumps({k: v for k, v in event.items() if k != "_seconds"}) + "\n").encode()
+
+        def spawn(argv, **kwargs):
+            events = turns[len(calls)]
+            if isinstance(events, BaseException):
+                raise events
+            if events is not None:
+                events = [{"type": "thread.started", "thread_id": "test-thread"}, *events]
+            else:
+                events = self.repeat_step(3, None)
+            if not events or events[-1]["type"] != "turn.failed":
+                events += [{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(report)}},
+                           {"type": "turn.completed"}]
+            proc = mock.MagicMock(pid=42)
+            proc.stdout.__iter__.return_value = stream(events)
+            calls.append((argv, proc))
+            return proc
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed), \
+                mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
+                mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
+                mock.patch.object(codex_runner.threading, "Thread", side_effect=lambda target, daemon: mock.Mock(start=target)), \
+                mock.patch.object(codex_runner, "record_pid"), mock.patch.object(codex_runner, "kill_tree") as kill:
+            result = codex_runner.execute(args, "original task", job_dir)
+            codex_runner.write_result(job_dir, result)
+        prompts = [(argv, proc.stdin.write.call_args.args[0].decode()) for argv, proc in calls]
+        return job_dir, result, prompts, kill.call_count
+
+    def test_repeat_guard_fixture_blocks_third_bootstrap_and_resumes_for_report(self):
+        fixture = RUNNER.parents[1] / "fixtures" / "codex-events-4bcdb1.json"
+        events = json.loads(fixture.read_text("utf-8"))["events"]
+        report = self.sample_report(criteria=[{"criterion": "Bootstrap", "status": "blocked", "evidence": "StepE failed"}],
+                                    blockers=[self.blocker("environment", question="")])
+        job, result, calls, kills = self.repeat_job("fixture", events, [], report=report)
+        self.assertEqual((result["status"], result["attempts"], kills), ("completed", 2, 1))
+        self.assertEqual(result["structured"], report)
+        self.assertIn("resume", calls[1][0])
+        self.assertIn("test-thread", calls[1][0])
+        self.assertEqual(calls[1][1], "runner 拦下了第 3 次运行同一个失败步骤（前 2 次都失败，共 1584 秒，期间没有观察到文件改动）。"
+                         "不要再运行这个步骤，也不要换个写法运行它。现在只整理并输出最终报告：依赖这一步的验收项标 blocked，"
+                         "blockers 写一条 environment（需要用户处理时用 user_input），说明失败现象和已经尝试过的做法；其余已完成的验收照常汇报。")
+        block, = result["repeat_guard"]["blocks"]
+        self.assertEqual({k: v for k, v in block.items() if k != "step"}, {"prior_failures": 2, "prior_seconds": 1584})
+        self.assertRegex(block["step"], r"^[a-f0-9]{8}$")
+        stored = json.loads((job / "result.json").read_text("utf-8"))
+        shown = self.control("status", job.name)
+        self.assertEqual(stored["repeat_guard"], result["repeat_guard"])
+        self.assertEqual(shown["repeat_guard"], stored["repeat_guard"])
+        self.assertIn('"type": "runner.repeat_block"', (job / "events.jsonl").read_text("utf-8"))
+        self.assertNotIn('"id": "item_25"', (job / "events.jsonl").read_text("utf-8"))
+
+    def test_repeat_guard_success_and_file_change_clear_failures(self):
+        _, result, _, kills = self.repeat_job("flaky", [
+            *self.repeat_step(1), *self.repeat_step(2, 0, 0),
+            *self.repeat_step(3), *self.repeat_step(4),
+            self.repeat_patch(), *self.repeat_step(5, 0, 0),
+        ])
+        self.assertEqual((result["status"], kills), ("completed", 0))
+        self.assertEqual(result["repeat_guard"], {"blocks": [], "standing": []})
+
+    def test_repeat_guard_cwd_isolation_and_observable_change_across_jobs(self):
+        self.repeat_job("failures", [*self.repeat_step(1), *self.repeat_step(2, 2)])
+        other = self.cwd / "other"
+        other.mkdir()
+        _, isolated, calls, kills = self.repeat_job("other", self.repeat_step(3), cwd=other)
+        self.assertEqual((isolated["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        _, changed, calls, kills = self.repeat_job("changed", [self.repeat_patch(), *self.repeat_step(3)])
+        self.assertIn("## 本目录近期反复失败的步骤", calls[0][1])
+        self.assertEqual((changed["repeat_guard"]["standing"], kills), ([], 0))
+
+    def test_repeat_guard_persists_and_new_worker_blocks_first_run(self):
+        self.repeat_job("seed", [*self.repeat_step(1), *self.repeat_step(2, 2)])
+        job = self.invoke("--sandbox", "workspace-write", "--no-diff", "--retries", "0",
+                          command="start", mode="repeat_guard_start")
+        done = self.control("status", job["job_id"], "--wait", "30")
+        self.assertEqual((done["status"], done["attempts"]), ("completed", 2))
+        first, second = self.calls()
+        self.assertIn("## 本目录近期反复失败的步骤", first["prompt"])
+        self.assertIn("runner 拦下了第 3 次运行", second["prompt"])
+        self.assertIn("resume", second["argv"])
+        job_dir = Path(done["log_dir"])
+        self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), "do it")
+        query = self.control("repeat-guard", "--cwd", str(self.cwd))
+        self.assertEqual(query, {"status": "completed", "totals": {"blocked": 1, "seconds_avoided": 60},
+                                 "standing": done["repeat_guard"]["standing"]})
+        record = json.loads((Path(self.env["CODEX_RUNNER_HOME"]) / "step-failures.json").read_text("utf-8"))
+        cwd_key, = set(record) - {"_totals"}
+        self.assertRegex(cwd_key, r"^[a-f0-9]{16}$")
+        key, = set(record[cwd_key]) - {"_changed_at"}
+        self.assertRegex(key, r"^[a-f0-9]{40}$")
+        self.assertEqual(record[cwd_key][key]["jobs"], ["seed"])
+        self.assertEqual(set(record[cwd_key][key]), {"jobs", "failures", "seconds", "last_exit", "last_at"})
+
+    def test_repeat_guard_worker_restart_before_job_finalization(self):
+        dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
+        with self.assertRaisesRegex(KeyboardInterrupt, "worker stopped"):
+            self.repeat_job("interrupted", [*self.repeat_step(1), *self.repeat_step(2), dropped],
+                            KeyboardInterrupt("worker stopped"), options=("--retries", "1"))
+        job = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "interrupted"
+        self.assertFalse((job / "result.json").exists())
+        with mock.patch.dict(self.env, {"FAKE_MODE": "repeat_guard_start"}):
+            # _worker writes the receipt to disk and emits no stdout.
+            worker = subprocess.run([sys.executable, "-B", str(RUNNER), "_worker", job.name],
+                                    capture_output=True, timeout=30, env=self.env)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        result = json.loads((job / "result.json").read_text("utf-8"))
+        self.assertEqual((result["status"], result["attempts"]), ("completed", 2))
+        self.assertEqual(result["repeat_guard"]["blocks"][0]["prior_failures"], 2)
+
+    def test_repeat_guard_single_report_turn_and_terminal_repetition(self):
+        _, result, calls, kills = self.repeat_job("blocked-twice",
+            [*self.repeat_step(1), *self.repeat_step(2), *self.repeat_step(3, None)],
+            [self.repeat_patch(), *self.repeat_step(4, None)], options=("--retries", "5"))
+        self.assertEqual((result["status"], result["error_kind"], result["retryable"]),
+                         ("failed", "repeated_failure", False))
+        self.assertEqual((result["attempts"], len(calls), kills), (2, 2, 2))
+        self.assertEqual(result["repeat_guard"]["blocks"][0], result["repeat_guard"]["blocks"][1])
+
+    def test_repeat_guard_counts_across_attempts_and_handles_missing_thread(self):
+        dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
+        _, result, _, kills = self.repeat_job("retried", [*self.repeat_step(1), dropped],
+            [*self.repeat_step(2), *self.repeat_step(3, None)], [], options=("--retries", "1"))
+        self.assertEqual((result["status"], result["attempts"], kills), ("completed", 3, 1))
+        _, result, _, kills = self.repeat_job("no-thread", None)
+        self.assertEqual((result["error_kind"], result["attempts"], kills), ("repeated_failure", 1, 1))
+
+    def test_repeat_guard_start_off_and_allow_rerun(self):
+        self.repeat_job("seed", [*self.repeat_step(1), *self.repeat_step(2)])
+        for options in (("--repeat-guard", "off"), ("--allow-rerun",)):
+            with self.subTest(options=options):
+                job = self.invoke(*options, command="start", mode="repeat_guard_start")
+                self.assertEqual(job["status"], "running")
+                done = self.control("status", job["job_id"], "--wait", "30")
+                self.assertEqual(done["status"], "completed")
+                self.assertEqual(done["repeat_guard"], {"blocks": [], "standing": []})
+                self.assertEqual(self.calls()[-1]["prompt"], "do it")
+                query = self.control("repeat-guard", "--cwd", str(self.cwd))
+                self.assertEqual(len(query["standing"]), int(options[0] == "--repeat-guard"))
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd))["standing"], [])
+
+    def test_repeat_guard_settings_expiry_and_key_variants(self):
+        for flag, value in (("--repeat-min-seconds", "nan"), ("--repeat-failures", "0"),
+                            ("--repeat-window-hours", "-1"), ("--repeat-guard", "yes")):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.invoke(flag, value, command="start")["error_kind"], "bad_arguments")
+        options = ("--repeat-min-seconds", "2", "--repeat-failures", "1", "--repeat-window-hours", "0.5")
+        _, seed, _, _ = self.repeat_job("seed", self.repeat_step(1, seconds=2, command=r'& "C:\My Scripts\setup1.ps1"'),
+                                        options=options)
+        self.assertEqual(seed["repeat_guard"]["standing"][0]["failures"], 1)
+        _, blocked, _, kills = self.repeat_job("blocked", self.repeat_step(2, None, command="bash D:/other/setup2.ps1"),
+                                              [], options=options)
+        self.assertEqual((blocked["repeat_guard"]["blocks"][0]["prior_seconds"], kills), (2, 1))
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        ledger = home / "step-failures.json"
+        data = json.loads(ledger.read_text("utf-8"))
+        for cwd_key in set(data) - {"_totals"}:
+            for step in set(data[cwd_key]) - {"_changed_at"}:
+                data[cwd_key][step]["last_at"] -= 3600
+        ledger.write_text(json.dumps(data), "utf-8")
+        _, result, calls, kills = self.repeat_job("expired", self.repeat_step(3, None, command="setup3.ps1"), options=options)
+        self.assertEqual((result["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        self.assertNotEqual(json.loads(ledger.read_text("utf-8")), data)
+
+    def test_repeat_guard_fallback_masks_digit_runs_and_requires_completed_timing(self):
+        unmatched = self.repeat_step(1, command="echo 123")[1]
+        _, result, _, kills = self.repeat_job("fallback",
+            [unmatched, *self.repeat_step(2, seconds=59, command="echo 9"), *self.repeat_step(3, command="echo 123"),
+             *self.repeat_step(4, command="echo 4567"), *self.repeat_step(5, None, command="echo 1 extra"),
+             *self.repeat_step(6, None, command="echo 42")], [])
+        self.assertEqual(kills, 1)
+        block, = result["repeat_guard"]["blocks"]
+        self.assertEqual((block["prior_failures"], block["prior_seconds"]), (2, 120))
 
     def test_failed_start_reports_diagnostics_and_tracks_the_worker_for_cleanup(self):
         run = subprocess.run
