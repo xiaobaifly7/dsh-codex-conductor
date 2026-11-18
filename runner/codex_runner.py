@@ -1284,7 +1284,7 @@ def last_activity(events):
 
 def task_context(value):
     fields = {"owner", "task", "acceptance", "write"}
-    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of", "routing"}:
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of", "routing", "must_verify"}:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -1295,6 +1295,9 @@ def task_context(value):
         raise ValueError("context.acceptance must be a nonempty array of nonempty strings")
     if not isinstance(value["write"], bool):
         raise ValueError("context.write must be a boolean")
+    if "must_verify" in value and (not isinstance(value["must_verify"], list) or any(
+            type(index) is not int or not 1 <= index <= len(value["acceptance"]) for index in value["must_verify"])):
+        raise ValueError("context.must_verify must be a list of 1-based acceptance indices")
     if "verification_of" in value:
         if not isinstance(value["verification_of"], str):
             raise ValueError("context.verification_of must be a job identifier")

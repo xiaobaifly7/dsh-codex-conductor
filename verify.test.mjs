@@ -32,7 +32,7 @@ function sourceJob() {
     structured: { ...report(), files_changed: ['docs/result.md'] } };
 }
 
-function harness({ source = sourceJob(), config = {}, running = false, jobs } = {}) {
+function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {} } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -42,7 +42,8 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
   let backgroundFinished = false;
   const final = () => ({ job_id: 'VERIFY-1', status: 'completed', cwd: source.cwd,
     log_dir: '/runner/jobs/VERIFY-1', sandbox: source.sandbox === 'danger-full-access' ? source.sandbox : 'read-only',
-    context: payload.context, structured: report(payload.context.acceptance), files_changed: [] });
+    context: payload.context, structured: report(payload.context.acceptance), files_changed: [],
+    ...verificationResult });
   const run = async (_config, argv, options = {}) => {
     calls.push({ argv, ...options });
     if (argv[0] === 'start') {
@@ -58,6 +59,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
       return { job_id: 'VERIFY-1', status: 'running' };
     }
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
+    if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
   };
@@ -79,6 +81,47 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
     start: () => calls.find(call => call.argv[0] === 'start'), payload: () => payload,
     finishBackground: () => { assert.ok(finishBackground, 'background watcher must be running'); finishBackground(); } };
 }
+
+test('codex_run validates, stores and prompts for must_verify indices', async () => {
+  const input = { task: 'Inspect the project layout.', acceptance, write: false };
+  for (const must_verify of [[0], [3], [1.5], ['1'], '1']) {
+    const h = harness();
+    await assert.rejects(h.tools.codex_run.execute({ ...input, must_verify }, exec), /must_verify.*1–2/);
+    assert.equal(h.start(), undefined);
+  }
+  for (const must_verify of [undefined, [2]]) {
+    const h = harness();
+    await h.tools.codex_run.execute({ ...input, must_verify }, exec);
+    assert.deepEqual(h.payload().context.must_verify, must_verify);
+    assert.equal(h.payload().prompt.includes('验收第 2 条必须实测'), must_verify !== undefined);
+  }
+});
+
+test('must_verify is checked before sampling and needs a matching independent result at closeout', async () => {
+  const source = { ...sourceJob(), started_at: 10, finished_at: 20 };
+  source.context.must_verify = [2, 1];
+  const h = harness({ source, config: { closeoutEvidence: 'off' },
+    verificationResult: { execution_status: 'completed', started_at: 21, finished_at: 23 } });
+  const criteria = acceptance.map((_, i) => ({ index: i + 1, status: 'met', evidence: 'Reviewed the original report.' }));
+  for (const status of ['verified', 'accepted_deviations']) {
+    await assert.rejects(h.tools.codex_review.execute({ job_id: source.job_id, status, criteria }, exec),
+      /验收第 2 条.*codex_verify[\s\S]*验收第 1 条/);
+  }
+  assert.ok(!h.calls.some(call => call.argv[0] === 'review'));
+  await h.verify({ samples: 1 });
+  const { context, prompt } = h.payload();
+  assert.match(context.acceptance[0], /^原验收第 2 条（必须实测）/);
+  assert.match(context.acceptance[1], /^原验收第 1 条（必须实测）/);
+  assert.match(context.acceptance[3], /抽查 1 条/);
+  assert.match(prompt, /第 5 条验收的 evidence/);
+  for (const status of ['verified', 'accepted_deviations']) {
+    const result = await h.tools.codex_review.execute({ job_id: source.job_id, status, criteria }, exec);
+    assert.equal(result.verification_status, status);
+  }
+  delete source.context.must_verify;
+  const legacy = harness({ source });
+  assert.equal((await legacy.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria }, exec)).verification_status, 'verified');
+});
 
 function backgroundJobs() {
   const entries = [];

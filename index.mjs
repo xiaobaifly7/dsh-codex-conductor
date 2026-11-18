@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM, VERIFY_ROW, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, VERIFY_ITEM, VERIFY_ROW, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -364,7 +364,7 @@ export function createConductor(cfg, run = runRunner) {
     // runner 在截取前 300 条改动之前就过滤，改动数和超出 scope 的检查才准
     for (const pattern of cfg.ignoreChanges ?? []) argv.push('--ignore', pattern);
     const prompt = composePrompt(args.task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
-      ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '' });
+      ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -417,9 +417,10 @@ export function createConductor(cfg, run = runRunner) {
   return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '' } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [] } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
+    (mustVerify.length ? `\n验收第 ${mustVerify.join('、')} 条必须实测；在 evidence 写清实际运行或观测的结果及可回查的证据位置。` : '') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
@@ -461,7 +462,8 @@ function productPaths(value) {
   return result;
 }
 
-function verificationTask(source, { focus = '', samples = 8 } = {}) {
+function verificationTask(source, { focus = '', samples = 8 } = {}, required = []) {
+  const sampleEvidenceRow = required.length + 3;
   return `你是独立核验员。这是新线程，不续接原作者的思路，也不把原报告当作事实。\n` +
     `核验对象 job_id：${source.job_id}\n` +
     `原任务目录：${source.cwd}\n` +
@@ -471,11 +473,12 @@ function verificationTask(source, { focus = '', samples = 8 } = {}) {
     `原验收标准：${JSON.stringify(source.context.acceptance)}\n` +
     `已记录的产物路径：${JSON.stringify(productPaths(source))}\n` +
     `重点：${focus || '优先核对关键结论、数字和引用。'}\n` +
+    (required.length ? `先核对必验的原验收第 ${required.map(item => item.index).join('、')} 条，再抽查其余结论。逐条运行允许的只读检查或回查原始运行记录；evidence 写观测结果和可定位的来源，只有自报或静态推断时记 blocked。\n` : '') +
     `独立抽查 ${samples} 条带出处的结论；不足 ${samples} 条则全部核对，并说明实际条数。不要只复述原报告。\n` +
     `逐条回到原始出处，检查原文、上下文、数字与计算；找不到出处、出处不支持结论时明确说无法确认，不要猜测。\n` +
-    `criteria 只按验收标准逐条给出，条数与验收标准相同，不要为每条抽查结论另加一行。抽查的每条结论写在第 3 条验收的 evidence 里，各占一行：` +
+    `criteria 只按验收标准逐条给出，条数与验收标准相同，不要为每条抽查结论另加一行。抽查的每条结论写在第 ${sampleEvidenceRow} 条验收的 evidence 里，各占一行：` +
     `核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
-    `按 report.v2.schema.json 返回；第 3 条在有结论不属实时记 not_met，没有不属实但有无法确认时记 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
+    `按 report.v2.schema.json 返回；第 ${sampleEvidenceRow} 条在有结论不属实时记 not_met，没有不属实但有无法确认时记 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
     `这是只读核验，写入范围为空：不要修改产物、源码、日志或系统状态，不要运行会产生写入的测试或命令；files_changed 必须为 []。`;
 }
 
@@ -521,6 +524,10 @@ export function validateRun(args) {
   if (!Array.isArray(args.acceptance) || args.acceptance.length === 0 ||
     args.acceptance.some((a) => typeof a !== 'string' || a.trim().length < 4)) {
     throw new Error('codex_run: acceptance 必须是至少 1 条可核验的验收标准（每条至少 4 个字符，条数不限）');
+  }
+  if (args.must_verify !== undefined && (!Array.isArray(args.must_verify) ||
+    args.must_verify.some(i => !Number.isInteger(i) || i < 1 || i > args.acceptance.length))) {
+    throw new Error(`codex_run: must_verify 必须是验收条目编号数组，编号为 1–${args.acceptance.length} 的整数`);
   }
   // 不传就默认只读时，实际常因此白跑一整轮（只读任务又不能 resume），所以必须明说
   if (typeof args.write !== 'boolean') {
@@ -991,8 +998,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     .some((c) => typeof c?.accepted === 'string' && c.accepted.trim());
   async function criterionSupport(source, owner, log, signal) {
     const flagged = flaggedCriteria(source);
+    const required = mustVerifyCriteria(source);
     const support = {};
-    if (!flagged.length) return support;
+    if (!flagged.length && !required.length) return support;
     const add = (index, kind) => { (support[index] ??= []).includes(kind) || support[index].push(kind); };
     if (hasUserReply(log, source, owner, cfg.autoResume.message)) for (const f of flagged) add(f.key, 'user');
     const jobs = [];
@@ -1017,7 +1025,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         acceptance.forEach((item, i) => {
           const m = VERIFY_ITEM.exec(item) ?? VERIFY_ROW.exec(item);
           const key = m && (m[0].startsWith('原验收') ? String(m[1]) : `row${m[1]}`);
-          if (m && reportRowOf(acceptance, report.criteria, i + 1)?.status === 'met' && flagged.some((f) => f.key === key)) add(key, 'verification');
+          const row = m && reportRowOf(acceptance, report.criteria, i + 1);
+          if (row?.status !== 'met') return;
+          if (flagged.some(f => f.key === key)) add(key, 'verification');
+          if (row.evidence.trim() && required.some(f => f.key === key && verifyCriterionItem(f) === item)) add(key, 'must_verify');
         });
       } else {
         for (const f of flagged) {
@@ -1656,6 +1667,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
+        ...(args.must_verify?.length ? { must_verify: [...new Set(args.must_verify)] } : {}),
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
         ...(continuation ?? fresh?.continuation ? { continuation: continuation ?? fresh.continuation } : {}),
         ...(verificationOf ? { verification_of: verificationOf } : {}),
@@ -1691,6 +1703,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     name: 'codex_run',
     description: '把任务交给 WSL 里的 Codex（它看不到本对话）。登记后台任务后返回两个任务号。' + WAIT_GUIDANCE +
       '一单一个可独立验收的结果，超过 8 条先按共同前置拆单。路径、平台和参数适配在原授权内处理。' +
+      '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
       '教程终检与补目录导航同单，write=true，scope 只含目录页，正文与素材只读。Codex 逐条回报验收，列出偏差和范围外改动。' +
@@ -1712,6 +1725,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
         acceptance: { type: 'array', minItems: 1, items: { type: 'string' }, description: '至少 1 条，每条去除首尾空白后至少 4 个字符。只写结果、正常观测入口和预期值，只要求本轮可取得的证据。' +
           '哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，仅在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并写明用途。' },
+        must_verify: { type: 'array', items: { type: 'integer', minimum: 1 }, description: '必须实测的验收条目编号（从 1 起）；记 met 前用 codex_verify 独立核验。' },
         write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（使用沙箱时为 workspace-write）；' +
           'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
           `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。生成或删除文件、改变远端状态也需 true，按授权在 scope/task 写明目标。不得同时要求写入和禁止写入。` },
@@ -1810,13 +1824,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       source = withReport(source);
       rememberProducts(source);
       const samples = args.samples ?? 8;
-      return dispatch({ task: verificationTask(source, { ...args, samples }),
-        acceptance: ['读取原任务书、验收标准和已产出的文件，明确核验范围。',
+      const required = mustVerifyCriteria(source);
+      return dispatch({ task: verificationTask(source, { ...args, samples }, required),
+        acceptance: [...required.map(verifyCriterionItem), '读取原任务书、验收标准和已产出的文件，明确核验范围。',
           `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
           '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
           '全程只读，不修改任何文件或系统状态。',
           // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
-          ...flaggedCriteria(source).map(verifyCriterionItem)],
+          ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key)).map(verifyCriterionItem)],
         cwd: source.cwd, write: false, scope: [], writable_roots: [],
         host_access: source.sandbox === 'danger-full-access',
         use_user_config: source.task_options?.use_user_config === true,
@@ -2164,7 +2179,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const { job_id } = args;
       const level = evidenceLevel(source);
       let support = {};
-      if (level === 'independent' && ['verified', 'accepted_deviations'].includes(args?.status)) {
+      if ((level === 'independent' || source.context?.must_verify?.length) && ['verified', 'accepted_deviations'].includes(args?.status)) {
         try { support = await criterionSupport(source, owner, exec.agent.session?.log ?? [], exec?.signal); } catch { exec?.signal?.throwIfAborted(); }
       }
       const prepared = prepareReview(args, { ...source, evidenceLevel: level, support });

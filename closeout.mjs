@@ -189,6 +189,13 @@ export function prepareReview(args, source) {
   const level = source?.evidenceLevel ?? 'planner';
   const missing = review.status !== 'needs_changes' && STATUSES.includes(review.status) && level !== 'off' ? flaggedMet(review, source, level) : [];
   problems.push(...missing);
+  const missingMeasured = ['verified', 'accepted_deviations'].includes(review.status)
+    ? mustVerifyCriteria(source).filter(({ index, key }) => Array.isArray(review.criteria) &&
+      review.criteria.some(c => c?.index === index && c.status === 'met') && !source.support?.[key]?.includes('must_verify'))
+    : [];
+  for (const { index } of missingMeasured) {
+    problems.push(`验收第 ${index} 条（must_verify）记 met 缺少独立实测依据。先对 ${source.job_id} 派 codex_verify，回查运行证据或实际观测，核验判 met 后再记`);
+  }
   if (review.status === 'verified') problems.push(...unaddressed(review, source, acceptance));
   // accepted 的占位已在上面单独提示。
   const withoutAccepted = (list) => (Array.isArray(list) ? list.map((c) => (c && typeof c === 'object' ? { ...c, accepted: undefined } : c)) : list);
@@ -200,7 +207,7 @@ export function prepareReview(args, source) {
     problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met' +
       (extraRows.length ? `（对不上验收清单的报告第 ${extraRows.map((f) => f.row).join('、')} 行在 report_rows 标）` : '') + ' 或加 blocker');
   }
-  return { review, fixed, problems, unsupported: level === 'independent' ? missing.length : 0, inferred };
+  return { review, fixed, problems, unsupported: (level === 'independent' ? missing.length : 0) + missingMeasured.length, inferred };
 }
 
 // 报告自标 blocked / not_met、结案结论却记成 met 的条目。independent：需要独立依据（source.support[index]：
@@ -386,8 +393,12 @@ export function flaggedCriteria(source) {
 }
 
 // 核验任务为每个自标未满足的原验收项（或对不上验收清单的报告行）单列一条验收，核验报告的这一条就是该项的独立结论。
-export const verifyCriterionItem = ({ index, row, status, criterion }) =>
-  `${row ? `原报告第 ${row} 行（原报告标 ${status}，未对上原验收清单）` : `原验收第 ${index} 条（原报告标 ${status}）`}：${String(criterion ?? '').trim()}` +
+export const mustVerifyCriteria = ({ context } = {}) => [...new Set(context?.must_verify ?? [])].map(index =>
+  ({ index, key: String(index), criterion: context.acceptance[index - 1], mustVerify: true }));
+
+export const verifyCriterionItem = ({ index, row, status, criterion, mustVerify }) =>
+  `${row ? `原报告第 ${row} 行（原报告标 ${status}，未对上原验收清单）`
+    : `原验收第 ${index} 条（${mustVerify ? '必须实测' : `原报告标 ${status}`}）`}：${String(criterion ?? '').trim()}` +
   '——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。';
-export const VERIFY_ITEM = /^原验收第 (\d+) 条（原报告标 /;
+export const VERIFY_ITEM = /^原验收第 (\d+) 条（(?:原报告标 |必须实测）)/;
 export const VERIFY_ROW = /^原报告第 (\d+) 行（原报告标 /;

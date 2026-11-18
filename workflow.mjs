@@ -141,6 +141,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   const args = { task: `${task}\n\n## 上轮结果与本次修正\n${notes.join('\n')}`, cwd: value.cwd,
     acceptance: [...context.acceptance], write: context.write, host_access: value.sandbox === 'danger-full-access',
     use_user_config: options.use_user_config ?? false };
+  if (context.must_verify?.length) args.must_verify = context.must_verify;
   if (scope != null) args.scope = [...scope];
   if (options.writable_roots != null) args.writable_roots = [...options.writable_roots];
   if (options.effort != null) args.effort = options.effort;

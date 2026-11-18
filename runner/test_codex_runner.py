@@ -2291,6 +2291,17 @@ class RunnerTests(unittest.TestCase):
         (job / "result.json").symlink_to(target)
         self.assertEqual(self.control("products", "--owner", "owner-a")["status"], "failed")
 
+    def test_must_verify_is_preserved_and_validated_in_task_context(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        from codex_runner import task_context
+
+        context = {"owner": "owner", "task": "Test required criterion", "acceptance": ["Observed result"], "write": False}
+        self.assertEqual(task_context({**context, "must_verify": [1]})["must_verify"], [1])
+        self.assertNotIn("must_verify", task_context(context))
+        for value in ([0], [2], [True], "1"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "must_verify"):
+                task_context({**context, "must_verify": value})
+
     def test_verification_context_round_trips_without_becoming_a_continuation(self):
         context = {**self.sample_context(), "write": False, "verification_of": "original-1"}
         result = self.invoke("--context-json", "--model", "test-model", "--service-tier", "fast",

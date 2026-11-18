@@ -186,7 +186,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | 工具 | 作用 |
 | --- | --- |
 | `codex_run` | 把任务交给 WSL 里的 Codex；登记后台任务后直接返回任务号。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
-| `codex_verify` | 独立核验本会话一个已结束的任务：新线程、只读，沿用原目录、主机访问和模型设置，回到出处抽查产物中的结论；可选 `focus`、`samples`（默认 8，1–30）、`wait_seconds`；结束后用 `codex_review` 记录原任务的验收 |
+| `codex_verify` | 独立核验本会话一个已结束的任务：新线程、只读，沿用原目录、主机访问和模型设置，先核对 `must_verify`，再回到出处抽查其余结论；可选 `focus`、`samples`（默认 8，1–30）、`wait_seconds`；结束后用 `codex_review` 记录原任务的验收 |
 | `codex_status` | 派单后留在本轮，用 runner `job_id` 与 `wait_seconds: 3600` 长等，仍在运行就继续等同一任务。120 秒内无实质变化的重复查询保留短回执，并引导长等、不结束本轮 |
 | `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
@@ -523,7 +523,11 @@ python3 runner/test_codex_runner.py
 
 [`.github/workflows/test.yml`](.github/workflows/test.yml) 在 push 和 pull request 时，于 `ubuntu-latest` 与 `windows-latest` 上（Node 22、Python 3.12）运行这两组测试。
 
+`codex_run` 可选 `must_verify: [1, 3]`，编号从 1 起，通常选最关键的 1–3 项。用 `codex_continue` 返工时会保留这些编号。`codex_verify` 先逐条实测或回查原始运行记录，再抽查其余结论。结案将这些项记为 `met` 时，要有对应的独立核验结果。
+
 ## English
+
+`codex_run` accepts optional 1-based `must_verify` indices such as `[1, 3]`. Use it for the one to three most important criteria. `codex_continue` keeps the indices. `codex_verify` checks each marked criterion against actual observations or original run records before sampling other claims. Closing a marked criterion as `met` requires a matching independent verification result.
 
 Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 

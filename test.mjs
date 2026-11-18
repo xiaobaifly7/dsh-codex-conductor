@@ -1337,7 +1337,7 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
     for (const write of [false, true]) {
       assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
-        const args = { ...RUN, write, ...access, scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
+        const args = { ...RUN, write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
           cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, effort: 'low', wait_seconds: 1 };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
         const ran = await h.tools.codex_run.execute(args, exec);
@@ -1347,6 +1347,7 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
           .findLast((item) => !item.verification_of);
         assert.equal(context.task, RUN.task);
         assert.deepEqual(context.acceptance, RUN.acceptance);
+        assert.deepEqual(context.must_verify, args.must_verify);
         assert.equal(context.write, write);
       }
     }
