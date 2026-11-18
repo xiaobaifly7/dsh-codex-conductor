@@ -122,3 +122,36 @@ test('a rejection carries a pre-filled review skeleton that only leaves the miss
   const nc = reviewSkeleton('J1', src, { status: 'needs_changes', criteria: [met(1)] });
   assert.deepEqual(Object.keys(nc), ['job_id', 'status', 'criteria']);
 });
+
+test('closing verdicts need independent support for criteria the report marked blocked, at the chosen level', () => {
+  const src = (level, support) => ({ ...source({}, { criteria: [{ criterion: '第一条', status: 'met', evidence: 'e1' }, { criterion: '第二条', status: 'blocked', evidence: '没权限' }] }),
+    evidenceLevel: level, ...(support ? { support } : {}) });
+  const met2 = { index: 2, status: 'met', evidence: '我看了一下应该没问题' };
+  for (const status of ['verified', 'accepted_deviations']) {
+    const bare = prepareReview({ status, criteria: [met(1), met2] }, src('independent'));
+    assert.equal(bare.unsupported, 1, status);
+    assert.ok(bare.problems.some((p) => p.includes('第 2 条为 blocked') && p.includes('没有独立依据') && p.includes('codex_verify J1') &&
+      p.includes('verify_previous: "J1"') && p.includes('codex_continue J1') && p.includes('accepted')), status);
+    for (const kind of ['verification', 'later_round', 'user']) {
+      assert.deepEqual(prepareReview({ status, criteria: [met(1), met2] }, src('independent', { 2: [kind] })).problems, [], `${status} ${kind}`);
+    }
+    // planner：自己写的（非照抄）证据即可，照抄报告原文不行；off：不查。
+    assert.deepEqual(prepareReview({ status, criteria: [met(1), met2] }, src('planner')).problems.filter((p) => p.includes('第 2 条')), []);
+    assert.ok(prepareReview({ status, criteria: [met(1), { ...met2, evidence: '没权限' }] }, src('planner')).problems.some((p) => p.includes('不能照抄')));
+    assert.deepEqual(prepareReview({ status, criteria: [met(1), { ...met2, evidence: '没权限' }] }, src('off')).problems.filter((p) => p.includes('第 2 条')), []);
+  }
+});
+
+test('accepted_deviations can record an open criterion as accepted although not met, and nothing else can', () => {
+  const src = { ...source({}, { criteria: [{ criterion: '第一条', status: 'met', evidence: 'e1' }, { criterion: '第二条', status: 'blocked', evidence: '没权限' }] }), evidenceLevel: 'independent' };
+  const open = { index: 2, status: 'blocked', evidence: '仍无权限', accepted: '用户已同意本期不做' };
+  const ok = prepareReview({ status: 'accepted_deviations', criteria: [met(1), open] }, src);
+  assert.deepEqual([ok.problems, ok.unsupported], [[], 0]);
+  assert.equal(ok.review.criteria[1].accepted, '用户已同意本期不做');
+  assert.ok(prepareReview({ status: 'accepted_deviations', criteria: [met(1), { ...open, accepted: undefined }] }, src).problems
+    .some((p) => p.includes('2=blocked') && p.includes('写 accepted')));
+  assert.ok(prepareReview({ status: 'verified', criteria: [met(1), open] }, src).problems.some((p) => p.includes('accepted 只用于')));
+  assert.ok(prepareReview({ status: 'accepted_deviations', criteria: [{ ...met(1), accepted: 'x' }, open] }, src).problems.some((p) => p.includes('accepted 只用于')));
+  // needs_changes 照常可用。
+  assert.deepEqual(prepareReview({ status: 'needs_changes', criteria: [met(1), { index: 2, status: 'blocked', evidence: '仍无权限' }] }, src).problems, []);
+});

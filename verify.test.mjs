@@ -519,3 +519,16 @@ test('two verifications can be in flight: verify_previous on two units starts on
   assert.equal(contexts.filter((context) => context.verification_of === 'SOURCE-1').length, 2);
   assert.equal(contexts.filter((context) => !context.verification_of).length, 2);
 });
+
+test('a verification lists every criterion the original report marked blocked or not met as its own acceptance item', async () => {
+  const source = sourceJob();
+  source.structured.criteria[1] = { ...source.structured.criteria[1], status: 'blocked' };
+  const h = harness({ source });
+  await h.verify();
+  const items = h.payload().context.acceptance;
+  assert.equal(items.filter((item) => item.startsWith('原验收第 ')).length, 1);
+  assert.match(items.at(-1), /^原验收第 2 条（原报告标 blocked）：逐条核实结论的原始出处——独立核实现在是否满足/);
+  const clean = harness();
+  await clean.verify();
+  assert.ok(!clean.payload().context.acceptance.some((item) => item.startsWith('原验收第 ')));
+});

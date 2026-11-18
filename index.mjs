@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutSince, flaggedCriteria, verifyCriterionItem, VERIFY_ITEM } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -73,6 +73,9 @@ const DEFAULTS = {
   handoverSuggestMessages: 5000,
   // 新派活的验收标准超过这么多条时，在派活回执里提醒一句（不拦截）；0 关闭
   acceptanceWarnAbove: 8,
+  // 结案（verified / accepted_deviations）时，原报告自标 blocked / not_met 的条目记成 met 需要什么依据：
+  // independent 需独立依据（核验任务、后续轮次或用户确认）；planner 规划端自己的非照抄证据即可；off 不查
+  closeoutEvidence: 'independent',
   // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
   continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
@@ -849,6 +852,7 @@ function settings(config, logger) {
         : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
+      : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (value === 'none' || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
@@ -951,6 +955,52 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const geminiWrites = new Set();
   const startingWrites = new Set();
   const closeoutFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
+  // 独立依据规则从本机第一次加载这一版起生效；之前结束的任务按 planner 规则（0.9.103）结案，不会因升级变难收尾。
+  const evidenceFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+    Date.now() / 1000, 'closeout-evidence-since.json');
+  const evidenceLevel = (source) => {
+    const level = cfg.closeoutEvidence ?? 'independent';
+    return level === 'independent' && !(source.finished_at >= evidenceFrom) ? 'planner' : level;
+  };
+  // 原报告自标未满足的条目各有哪些独立依据：晚于这一轮结束、核验本单元的核验任务判这一条 met；同一单元的后续轮次报告这一条 met；
+  // 原会话用户在作业结束后有过真实回复（与 accepted_deviations 的用户确认同一判定，但不因 plannerAnswers 放宽）。
+  async function criterionSupport(source, owner, log, signal) {
+    const flagged = flaggedCriteria(source);
+    const support = {};
+    if (!flagged.length) return support;
+    const add = (index, kind) => { (support[index] ??= []).includes(kind) || support[index].push(kind); };
+    if (hasUserReply(log, source, owner, cfg.autoResume.message)) for (const f of flagged) add(f.index, 'user');
+    const jobs = [];
+    const from = Number.isFinite(source.started_at) ? source.started_at : evidenceFrom;
+    for (let offset = 0; offset !== null && offset < 500;) {
+      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [from, Date.now() / 1000 + 86_400], limit: 100, offset }, signal);
+      if (!Array.isArray(page.jobs)) break;
+      jobs.push(...page.jobs);
+      offset = page.next_offset ?? null;
+    }
+    const unit = new Set([source.job_id]);
+    for (const job of [...jobs].sort((a, b) => (a.started_at ?? 0) - (b.started_at ?? 0))) if (unit.has(job.parent_job_id)) unit.add(job.job_id);
+    const later = jobs.filter((job) => job.job_id !== source.job_id && job.execution_status === 'completed' &&
+      job.finished_at > (source.finished_at ?? 0) && (unit.has(job.parent_job_id) || unit.has(job.context?.verification_of)));
+    for (const job of later.slice(0, 10)) {
+      const full = await conductor.waitJob(job.job_id, 0, signal);
+      const report = full.structured;
+      const acceptance = full.context?.acceptance;
+      if (!validReport(report) || !Array.isArray(acceptance)) continue;
+      if (full.context?.verification_of) {
+        acceptance.forEach((item, i) => {
+          const m = VERIFY_ITEM.exec(item);
+          if (m && report.criteria[i]?.status === 'met' && flagged.some((f) => f.index === Number(m[1]))) add(Number(m[1]), 'verification');
+        });
+      } else {
+        for (const f of flagged) {
+          const i = acceptance.findIndex((a) => a.trim() === String(f.criterion ?? '').trim());
+          if (i >= 0 && report.criteria[i]?.status === 'met') add(f.index, 'later_round');
+        }
+      }
+    }
+    return support;
+  }
   const statusQueries = new Map();
   function dampenStatus(value, exec, tool, seconds = 0) {
     const owner = exec?.agent?.id;
@@ -1001,6 +1051,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!Number.isSafeInteger(page?.total)) throw new Error(page?.error ?? page?.error_kind ?? '任务列表不可用');
       return page.total;
     } });
+  // 结案验收的结果分类：all_met（全部 met，自标未满足的有依据）、accepted_open（未满足但接受）、rejected_unsupported（缺独立依据被拒），
+  // 按会话和总数累计到 closeout-stats.json，codex_runtime 显示。
+  const closeoutStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'closeout-stats.json');
+  const countCloseout = (owner, kind) => {
+    if (!closeoutStatsFile) return;
+    try {
+      let stats;
+      try { stats = JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
+      if (!stats || typeof stats !== 'object') stats = { since: new Date().toISOString(), total: {}, sessions: {} };
+      stats.total[kind] = (stats.total[kind] ?? 0) + 1;
+      const mine = stats.sessions[owner] ??= {};
+      mine[kind] = (mine[kind] ?? 0) + 1;
+      stats.updatedAt = new Date().toISOString();
+      mkdirSync(path.dirname(closeoutStatsFile), { recursive: true });
+      writeJsonAtomic(closeoutStatsFile, stats);
+    } catch {}
+  };
   // 新派活的验收标准条数：超过 acceptanceWarnAbove 时提醒一句（不拦截），并累计到 acceptance-stats.json 供日后对比。
   const acceptanceStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'acceptance-stats.json');
   const acceptanceHint = (args) => {
@@ -1662,7 +1729,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         acceptance: ['读取原任务书、验收标准和已产出的文件，明确核验范围。',
           `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
           '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
-          '全程只读，不修改任何文件或系统状态。'],
+          '全程只读，不修改任何文件或系统状态。',
+          // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
+          ...flaggedCriteria(source).map(verifyCriterionItem)],
         cwd: source.cwd, write: false, scope: [], writable_roots: [],
         host_access: source.sandbox === 'danger-full-access',
         use_user_config: source.task_options?.use_user_config === true,
@@ -2002,15 +2071,28 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!owns(owner, source.context?.owner)) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
-      const prepared = prepareReview(args, source);
+      const level = evidenceLevel(source);
+      let support = {};
+      if (level === 'independent' && ['verified', 'accepted_deviations'].includes(args?.status)) {
+        try { support = await criterionSupport(source, owner, exec.agent.session?.log ?? [], exec?.signal); } catch { exec?.signal?.throwIfAborted(); }
+      }
+      const prepared = prepareReview(args, { ...source, evidenceLevel: level, support });
       const { review } = prepared;
       // 仓库所有者于 2026-11-10 明确决定：plannerAnswers 开启时不做此检查；要恢复硬拦截请关闭开关，不要在开启时加回。
-      if (Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0 &&
+      // “未满足但接受”的条目与接受偏差同一道用户确认。
+      if (((Array.isArray(review.accepted_deviations) && review.accepted_deviations.length > 0) ||
+          (Array.isArray(review.criteria) && review.criteria.some((c) => typeof c?.accepted === 'string' && c.accepted.trim()))) &&
           !canAnswer(exec.agent.session?.log ?? [], source, owner)) {
         throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
       }
-      if (prepared.problems.length) throw new Error(reviewRejection(job_id, source, prepared));
+      if (prepared.problems.length) {
+        if (prepared.unsupported) countCloseout(owner, 'rejected_unsupported');
+        throw new Error(reviewRejection(job_id, source, prepared));
+      }
       const result = await conductor.review(job_id, review, owner, exec?.signal);
+      if (['verified', 'accepted_deviations'].includes(review.status) && result.verification_status === review.status) {
+        countCloseout(owner, review.criteria.some((c) => typeof c?.accepted === 'string' && c.accepted.trim()) ? 'accepted_open' : 'all_met');
+      }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
         throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
@@ -2329,12 +2411,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (result.isError || !value) return result;
       let acceptance;
       try { acceptance = acceptanceStatsFile && JSON.parse(readFileSync(acceptanceStatsFile, 'utf8')); } catch {}
+      let closeouts;
+      try { closeouts = closeoutStatsFile && JSON.parse(readFileSync(closeoutStatsFile, 'utf8')); } catch {}
+      const mineCloseouts = closeouts?.sessions?.[exec.agent?.id] ?? {};
+      const closeoutLine = closeouts ? `结案验收（自 ${closeouts.since} 起，本会话 / 全部）：全部满足 ${mineCloseouts.all_met ?? 0} / ${closeouts.total.all_met ?? 0}，` +
+        `未满足但接受 ${mineCloseouts.accepted_open ?? 0} / ${closeouts.total.accepted_open ?? 0}，缺独立依据被拒 ${mineCloseouts.rejected_unsupported ?? 0} / ${closeouts.total.rejected_unsupported ?? 0}；` +
+        `closeoutEvidence=${cfg.closeoutEvidence}` : `结案验收：尚无记录；closeoutEvidence=${cfg.closeoutEvidence}`;
       const line = `本会话消息数 ${value.messages}（建议交接阈值 ${value.threshold || '已关闭'}）` +
         (value.suggest ? '：建议由操作员交接到新会话。' : '') +
         (acceptance?.dispatches ? `\n新派活验收标准：${acceptance.dispatches} 单，平均 ${(acceptance.items / acceptance.dispatches).toFixed(1)} 条，` +
-          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '');
+          `${acceptance.over} 单超过提醒阈值（自 ${acceptance.since} 起）` : '') + `\n${closeoutLine}`;
       return { ...result, ...(result.value && typeof result.value === 'object'
-        ? { value: { ...result.value, session_history: value, ...(acceptance ? { acceptance_stats: acceptance } : {}) } } : {}),
+        ? { value: { ...result.value, session_history: value, ...(acceptance ? { acceptance_stats: acceptance } : {}),
+          ...(closeouts ? { closeout_stats: closeouts } : {}) } } : {}),
         content: [...(result.content ?? []), { type: 'text', text: line }] };
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。

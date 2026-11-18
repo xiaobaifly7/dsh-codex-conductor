@@ -5765,3 +5765,53 @@ test('codex_continue with verify_previous refuses an overlapping verification be
     }
   }
 });
+
+test('codex_review finds independent support in a later verification, a later round or a user reply, and counts outcomes', async () => {
+  const now = Date.now() / 1000;
+  const parent = { ...workflowSource('implementation'), finished_at: now + 100, started_at: now + 50 };
+  parent.structured.blockers = [];
+  const review = { job_id: 'PARENT', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '我自己看过了' }] };
+  const verifyJob = (status) => ({ job_id: 'V1', status: 'completed', execution_status: 'completed', finished_at: now + 200, started_at: now + 150,
+    context: { owner: 'S1', verification_of: 'PARENT', task: '核验', acceptance: ['读取原任务书', '原验收第 1 条（原报告标 blocked）：CSV 解析测试通过——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。'], write: false },
+    structured: { summary: 's', criteria: [{ criterion: '读取原任务书', status: 'met', evidence: 'x' }, { criterion: '原验收第 1 条', status, evidence: 'y' }],
+      files_changed: [], deviations: [], unresolved: [], blockers: [] } });
+  const statsFile = path.join(localAppData, 'dsh-codex-conductor', 'closeout-stats.json');
+  const stats = () => { try { return JSON.parse(readFileSync(statsFile, 'utf8')).total; } catch { return {}; } };
+  const run = async ({ jobs = [], finals = {}, log = [], config = {}, args = review } = {}) => {
+    const h = harness({ config: { plannerAnswers: true, listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
+      reviewResult: { ...parent, verification_status: args.status }, ...config } });
+    h.finals.PARENT = parent;
+    Object.assign(h.finals, finals);
+    return h.tools.codex_review.execute(args, { agent: agentAt('/work/current', log) });
+  };
+  const before = stats();
+  // 没有任何独立依据：拒绝，计入 rejected_unsupported。
+  await assert.rejects(run(), /第 1 条为 blocked.*没有独立依据[\s\S]*codex_verify PARENT[\s\S]*verify_previous/);
+  // 晚于这一轮结束的核验判这一条 met：通过，计入 all_met。
+  const listed = { job_id: 'V1', execution_status: 'completed', finished_at: now + 200, started_at: now + 150, context: { owner: 'S1', verification_of: 'PARENT' } };
+  assert.equal((await run({ jobs: [listed], finals: { V1: verifyJob('met') } })).verification_status, 'verified');
+  // 核验自己 blocked：没有依据。
+  await assert.rejects(run({ jobs: [listed], finals: { V1: verifyJob('blocked') } }), /没有独立依据/);
+  // 同一单元的后续轮次报告这一条 met。
+  const child = { job_id: 'C1', execution_status: 'completed', finished_at: now + 300, started_at: now + 250, parent_job_id: 'PARENT' };
+  const childFull = { ...workflowSource('implementation'), job_id: 'C1', status: 'completed', context: { ...parent.context },
+    structured: { summary: 's', criteria: [{ criterion: 'CSV 解析测试通过', status: 'met', evidence: 'ok' }], files_changed: [], deviations: [], unresolved: [], blockers: [] } };
+  assert.equal((await run({ jobs: [child], finals: { C1: childFull } })).verification_status, 'verified');
+  // 作业结束后原会话用户有真实回复。
+  const reply = { type: 'user/message', time: (now + 500) * 1000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '这条我确认过了' }] } };
+  assert.equal((await run({ log: [reply] })).verification_status, 'verified');
+  // 未满足但接受：保留 blocked 并写 accepted；plannerAnswers 关闭且没有用户回复时，与接受偏差同一道确认拦下。
+  const acceptOpen = { job_id: 'PARENT', status: 'accepted_deviations', criteria: [{ index: 1, status: 'blocked', evidence: '仍缺权限', accepted: '本期不做' }] };
+  assert.equal((await run({ args: acceptOpen })).verification_status, 'accepted_deviations');
+  await assert.rejects(run({ args: acceptOpen, config: { plannerAnswers: false } }), /尚未收到作业结束后的用户确认/);
+  // closeoutEvidence=planner / off：自己的证据即可。
+  assert.equal((await run({ config: { closeoutEvidence: 'planner' } })).verification_status, 'verified');
+  const after = stats();
+  const delta = (k) => (after[k] ?? 0) - (before[k] ?? 0);
+  assert.deepEqual([delta('rejected_unsupported'), delta('all_met'), delta('accepted_open')], [2, 4, 1]);
+  // 在这一版首次加载之前结束的任务：按 planner 规则，不会变难收尾。
+  const old = { ...parent, finished_at: 1000 };
+  const h = harness({ config: { plannerAnswers: true, reviewResult: { ...old, verification_status: 'verified' } } });
+  h.finals.PARENT = old;
+  assert.equal((await h.tools.codex_review.execute(review, { agent: agentAt('/work/current') })).verification_status, 'verified');
+});
