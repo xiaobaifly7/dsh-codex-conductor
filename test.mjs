@@ -1338,7 +1338,7 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
       assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
         const args = { ...RUN, write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
-          cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, effort: 'low', wait_seconds: 1 };
+          cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, model: 'chosen', effort: 'low', wait_seconds: 1 };
         assert.deepEqual(Object.keys(args).sort(), Object.keys(h.tools.codex_run.parameters.properties).sort());
         const ran = await h.tools.codex_run.execute(args, exec);
         assert.equal(ran.job_id, 'J');
@@ -5998,6 +5998,73 @@ test('routing is recorded in the job context and close-out refusals are logged w
   const lines = readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'closeout-refusals.jsonl'), 'utf8').trim().split('\n');
   const last = JSON.parse(lines.at(-1));
   assert.deepEqual([last.session, last.tool, last.unreviewed, last.needs_changes], ['S1', 'codex_run', ['FLAG'], []]);
+});
+
+test('model A/B dispatch uses the thread model for rework and the configured model for verification', async () => {
+  const models = ['model-A', 'model-B'];
+  const parent = workflowSource('implementation');
+  parent.log_dir = '/runner/jobs/PARENT';
+  parent.task_options.model = models[1];
+  parent.context.routing = { ab: true, model: models[1] };
+  const exec = { agent: agentAt('/work/current') };
+  const startResult = { job_id: 'J', status: 'completed' };
+  const h = harness({ config: { model: 'configured', modelAB: { enabled: true, models, share: 0.3 }, startResult,
+    listResult: argv => ({ jobs: argv.includes('--thread-id') ? [parent] : [] }) } });
+  h.finals.PARENT = parent;
+  const last = () => {
+    const { argv, stdin } = h.requests.findLast(call => call.argv[0] === 'start');
+    return { model: argv.includes('--model') ? argv[argv.indexOf('--model') + 1] : undefined,
+      assignment: argv.includes('--model-ab') ? JSON.parse(argv[argv.indexOf('--model-ab') + 1]) : undefined,
+      routing: JSON.parse(stdin).context.routing };
+  };
+  await h.tools.codex_run.execute(RUN, exec);
+  assert.deepEqual(last(), { model: undefined, assignment: [models, 0.3], routing: undefined });
+  await h.tools.codex_run.execute({ ...RUN, model: 'explicit' }, exec);
+  assert.deepEqual(last(), { model: 'explicit', assignment: undefined, routing: undefined });
+  for (const fresh of [false, true]) {
+    for (const dispatch of [
+      () => h.tools.codex_run.execute({ ...RUN, resume: parent.thread_id, fresh }, exec),
+      () => h.tools.codex_continue.execute({ job_id: parent.job_id, fresh }, exec),
+    ]) {
+      await dispatch();
+      assert.equal(last().model, models[1]);
+      assert.equal(last().assignment, undefined);
+      assert.equal(last().routing.ab, true);
+      assert.equal(last().routing.model, models[1]);
+    }
+  }
+  await h.tools.codex_verify.execute({ job_id: parent.job_id }, exec);
+  assert.deepEqual(last(), { model: 'configured', assignment: undefined, routing: undefined });
+
+  await h.tools.codex_run.execute({ ...RUN, resume: parent.thread_id, model: 'override' }, exec);
+  const override = last();
+  assert.equal(override.model, 'override');
+  assert.equal(override.routing.ab, undefined);
+  parent.context.routing = override.routing;
+  parent.task_options.model = 'override';
+  await h.tools.codex_run.execute({ ...RUN, resume: parent.thread_id }, exec);
+  assert.equal(last().model, models[1]);
+  assert.equal(last().routing.ab, true);
+
+  const off = harness({ config: { model: 'configured', startResult } });
+  await off.tools.codex_run.execute(RUN, exec);
+  const [{ argv, stdin }] = off.requests.filter(call => call.argv[0] === 'start');
+  assert.equal(argv[argv.indexOf('--model') + 1], 'configured');
+  assert.ok(!argv.includes('--model-ab'));
+  assert.equal(JSON.parse(stdin).context.routing, undefined);
+});
+
+test('modelAB configuration warns, keeps valid values and exposes unknown keys', async () => {
+  const h = harness({ config: { modelAB: { enabled: true, models: ['duplicate', 'duplicate'], share: 2, extra: true },
+    startResult: { job_id: 'J', status: 'completed' } } });
+  await h.tools.codex_run.execute(RUN, { agent: agentAt('/work/current') });
+  const argv = h.calls.find(args => args[0] === 'start');
+  assert.deepEqual(JSON.parse(argv[argv.indexOf('--model-ab') + 1]), [['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], 0.5]);
+  assert.match(h.warnings.join('\n'), /未知配置项 modelAB.extra/);
+  assert.match(h.warnings.join('\n'), /无效的配置 modelAB.models/);
+  assert.match(h.warnings.join('\n'), /无效的配置 modelAB.share/);
+  const loaded = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
+  assert.deepEqual(loaded.unknownConfig, ['modelAB.extra']);
 });
 
 test('the real runner status shape (no finished_at) keeps the independent rule: the 0.9.114 bypass is closed', async (t) => {

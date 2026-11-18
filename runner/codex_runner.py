@@ -1193,6 +1193,23 @@ def positive_float(value):
     return number
 
 
+def parse_model_ab(value):
+    try:
+        models, share = json.loads(value)
+        if (isinstance(models, list) and len(models) == 2 and
+                all(isinstance(model, str) and model.strip() for model in models) and models[0] != models[1] and
+                type(share) in (int, float) and 0 <= share <= 1):
+            return models, share
+    except (TypeError, ValueError):
+        pass
+    raise argparse.ArgumentTypeError("model A/B requires [two distinct models, share from 0 to 1]")
+
+
+def select_ab_model(job_id, models, share):
+    bucket = int.from_bytes(hashlib.sha256(job_id.encode("utf-8")).digest()[:4], "big") / (1 << 32)
+    return models[0] if bucket < share else models[1]
+
+
 def add_task_arguments(p):
     p.add_argument("--context-json", action="store_true", help="Read a prompt/context JSON envelope from stdin")
     p.add_argument("--cwd", required=True)
@@ -2357,7 +2374,9 @@ def main():
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
     sub.add_parser("doctor")
     add_task_arguments(sub.add_parser("run"))
-    add_task_arguments(sub.add_parser("start"))
+    start = sub.add_parser("start")
+    add_task_arguments(start)
+    start.add_argument("--model-ab", type=parse_model_ab, help="Assign a fresh job by job ID using [models, share]")
     status = sub.add_parser("status")
     status.add_argument("job_id", type=job_identifier)
     status.add_argument("--wait", type=float, default=0)
@@ -2464,6 +2483,10 @@ def main():
     if args.command in ("run", "start"):
         args.cwd = os.path.realpath(local_path(args.cwd))
         prompt = read_task_input(args, parser)
+        if getattr(args, "model_ab", None) is not None:
+            context = getattr(args, "context", None)
+            if not context or args.model is not None or args.resume or context.get("continuation") or context.get("verification_of"):
+                parser.error("--model-ab requires a new contextual task without a model override")
         if args.command == "start" or args.max_storage_mb is not None:
             prune_old("jobs")
             prune_old("runs")
@@ -2491,10 +2514,13 @@ def main():
 
     if args.command == "start":
         job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        if args.model_ab is not None:
+            args.model = select_ab_model(job_id, *args.model_ab)
+            args.context["routing"] = {**args.context.get("routing", {}), "ab": True, "model": args.model}
         job_dir = HOME / "jobs" / job_id
         job_dir.mkdir(parents=True)
         (job_dir / "prompt.txt").write_text(prompt, "utf-8")
-        task = {k: v for k, v in vars(args).items() if k != "command"}
+        task = {k: v for k, v in vars(args).items() if k not in ("command", "model_ab")}
         (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
         # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
         boot = boot_id()

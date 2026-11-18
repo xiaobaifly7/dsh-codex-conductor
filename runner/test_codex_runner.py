@@ -2302,6 +2302,74 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "must_verify"):
                 task_context({**context, "must_verify": value})
 
+    def test_model_ab_is_deterministic_and_reaches_the_fake_codex(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        from codex_runner import select_ab_model
+
+        models, share = ["model-A", "model-B"], 0.3
+        ids = [f"20261118-120000-{i:06x}" for i in range(2000)]
+        assigned = [select_ab_model(job_id, models, share) for job_id in ids]
+        self.assertEqual(assigned, [select_ab_model(job_id, models, share) for job_id in ids])
+        self.assertAlmostEqual(assigned.count(models[0]) / len(ids), share, delta=0.03)
+        self.assertEqual(select_ab_model(ids[0], models, 0), models[1])
+        self.assertEqual(select_ab_model(ids[0], models, 1), models[0])
+
+        prompt = json.dumps({"prompt": "dispatch with A/B", "context": self.sample_context()})
+        started = self.invoke("--context-json", "--model-ab", json.dumps([models, share]), prompt=prompt, command="start")
+        result = self.control("status", started["job_id"], "--wait", "30")
+        model = select_ab_model(started["job_id"], models, share)
+        self.assertEqual(result["context"]["routing"], {"ab": True, "model": model})
+        self.assertEqual(result["task_options"]["model"], model)
+        argv = self.calls()[0]["argv"]
+        self.assertEqual(argv[argv.index("-m") + 1], model)
+
+    def test_model_ab_stats_summarize_marked_jobs_and_latest_thread_outcomes(self):
+        script = RUNNER.parent.parent / "tools" / "model_ab_stats.py"
+        root = Path(self.tmp.name) / "stats-jobs"
+
+        def job(number, model="A", ab=True, thread=None, parent=None, result=None, review=None, day="20261118"):
+            job_dir = root / f"{day}-120000-{number:06x}"
+            job_dir.mkdir(parents=True)
+            args = job_dir / "args.json"
+            context = {**self.sample_context(), "routing": {"ab": ab, "model": model}}
+            if parent:
+                context["continuation"] = {"parent_job_id": parent}
+            args.write_text(json.dumps({"context": context}), encoding="utf-8")
+            os.utime(args, (100 + number, 100 + number))
+            if result is not None:
+                result = {**result, "thread_id": thread, "structured": {"summary": "private report body"}}
+                (job_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+            if review:
+                (job_dir / "reviews.json").write_text(json.dumps({"latest": {"status": review}}), encoding="utf-8")
+            return job_dir.name
+
+        done = {"status": "completed", "duration_s": 10, "criteria_counts": {"met": 1}}
+        first = job(1, thread="T1", result={**done, "criteria_counts": {"not_met": 1, "blocked": 1}}, review="needs_changes")
+        job(2, thread="T2", parent=first, result={"status": "failed", "error_kind": "model_refused", "duration_s": 20})
+        job(3, thread="T3", result={**done, "duration_s": 30}, review="verified")
+        job(4, thread="T3", result={**done, "duration_s": 40}, review="accepted_deviations")
+        job(5)
+        job(6, model="B", result=done, review="verified")
+        job(7, model="excluded", ab=False, result=done)
+        job(8, model="older", day="20261117", result=done)
+        command = [sys.executable, "-B", str(script), "--jobs-dir", str(root), "--since", "20261118"]
+        output = subprocess.check_output([*command, "--json"], encoding="utf-8")
+        stats = json.loads(output)
+        self.assertEqual(set(stats), {"A", "B"})
+        self.assertEqual(stats["A"], {
+            "tasks": 5, "execution_completion_rate": 0.6, "failure_reasons": {"model_refused": 1},
+            "self_report_shares": {"met": 0.5, "blocked": 0.25, "not_met": 0.25},
+            "review_shares": {"verified": 0.2, "accepted_deviations": 0.2, "needs_changes": 0.2},
+            "threads": 3, "final_outcome_shares": {
+                "verified": 0.0, "accepted_deviations": 1 / 3, "needs_changes": 1 / 3, "unreviewed": 1 / 3},
+            "mean_rework_rounds": 2 / 3, "median_duration_s": 25.0, "model_refusals": 1,
+        })
+        self.assertEqual(stats["B"]["final_outcome_shares"]["verified"], 1)
+        self.assertNotIn("private", output)
+        text = subprocess.check_output(command, encoding="utf-8")
+        self.assertIn("execution_completion_rate: 60.0%", text)
+        self.assertNotIn("private", text)
+
     def test_verification_context_round_trips_without_becoming_a_continuation(self):
         context = {**self.sample_context(), "write": False, "verification_of": "original-1"}
         result = self.invoke("--context-json", "--model", "test-model", "--service-tier", "fast",

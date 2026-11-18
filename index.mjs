@@ -54,6 +54,7 @@ const DEFAULTS = {
   routerCheckUrl: '',
   codexRoute: null,
   model: '',
+  modelAB: { enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 },
   effort: '',
   // 只读任务的推理强度，留空与 effort 相同
   readOnlyEffort: '',
@@ -346,7 +347,9 @@ export function createConductor(cfg, run = runRunner) {
     if (effort) argv.push('--effort', effort);
     const model = args.model ?? cfg.model;
     const serviceTier = args.service_tier ?? cfg.serviceTier;
-    if (model) argv.push('--model', model);
+    if (cfg.modelAB?.enabled && args.model === undefined && !args.resume && context && !context.continuation && !context.verification_of) {
+      argv.push('--model-ab', JSON.stringify([cfg.modelAB.models, cfg.modelAB.share]));
+    } else if (model) argv.push('--model', model);
     if (serviceTier) argv.push('--service-tier', serviceTier);
     for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries'],
       ['lockTimeoutSeconds', '--lock-timeout'], ['maxStorageMb', '--max-storage-mb']]) {
@@ -877,7 +880,7 @@ function settings(config, logger) {
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'mcpWriteAllow' ? Array.isArray(value) && value.every(name => typeof name === 'string' && /^mcp__/i.test(name.trim()))
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
-       : ['autoResume', 'autoHandover', 'autoAnswer'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
+       : ['autoResume', 'autoHandover', 'autoAnswer', 'modelAB'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
@@ -909,6 +912,21 @@ function settings(config, logger) {
   }));
   if (unknownConfig.some((key) => key.startsWith('autoHandover.'))) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.filter((key) => key.startsWith('autoHandover.')).join(', ')} 已忽略，请核对拼写`);
   config.autoAnswer = normalizeAutoAnswer(config.autoAnswer, unknownConfig, logger);
+  const modelAB = config.modelAB;
+  for (const key of Object.keys(modelAB)) {
+    if (Object.hasOwn(DEFAULTS.modelAB, key)) continue;
+    unknownConfig.push(`modelAB.${key}`);
+    logger?.warn?.(`[codex-conductor] 未知配置项 modelAB.${key} 已忽略，请核对拼写`);
+  }
+  config.modelAB = Object.fromEntries(Object.entries(DEFAULTS.modelAB).map(([key, fallback]) => {
+    const value = modelAB[key];
+    const valid = key === 'enabled' ? typeof value === 'boolean'
+      : key === 'share' ? Number.isFinite(value) && value >= 0 && value <= 1
+        : Array.isArray(value) && value.length === 2 && value.every(model => typeof model === 'string' && model.trim()) &&
+          value[0].trim() !== value[1].trim();
+    if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 modelAB.${key}，使用默认值`);
+    return [key, valid ? (key === 'models' ? value.map(model => model.trim()) : value) : fallback];
+  }));
   if (config.gemini) {
     const gemini = config.gemini;
     if (typeof gemini.command !== 'string' || !/^(?:[A-Za-z]:[\\/]|\\\\[^\\]+\\[^\\]+\\)/.test(gemini.command.trim())) {
@@ -1547,6 +1565,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return Object.keys(routing).length ? routing : undefined;
   };
 
+  function retainThreadModel(args, source, routing) {
+    if (!cfg.modelAB.enabled || !source) return { args, routing };
+    const previous = source.context?.routing;
+    const model = previous?.thread_model ?? source.task_options?.model ?? '';
+    const ab = previous?.thread_model !== undefined ? previous.thread_ab === true : previous?.ab === true;
+    if (args.model !== undefined && args.model !== model) {
+      // A one-off override does not change the thread's assignment or enter the comparison.
+      return { args, routing: { ...routing, thread_model: model, thread_ab: ab } };
+    }
+    return { args: { ...args, model }, routing: ab ? { ...routing, ab: true, model } : routing };
+  }
+
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing, guard = {}) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
@@ -1752,6 +1782,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         fresh: { type: 'boolean', description: '只配合 resume：不传时原线程很大就开新线程（你的任务原文前附上一轮交接内容），否则沿用原线程；true 强制开新线程，false 强制沿用。' },
         verify_previous: { type: 'string', description: '可选：一个已结束任务的 job_id，派这一单的同时只读核验它；这一单可写且写入范围与它的产物或 scope 重叠时拒绝。' },
         use_user_config: { type: 'boolean', description: '加载 WSL Codex 自己配置的 MCP 和 hooks（任务要用到这些工具时），启动更慢。' },
+        model: { type: 'string', description: '可选，显式指定本次任务的模型。' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: `推理强度。默认：write=true 时 ${cfg.effort || 'Codex 配置里的值'}，只读时 ` +
           `${cfg.readOnlyEffort || cfg.effort || 'Codex 配置里的值'}${cfg.model ? `（模型 ${cfg.model}）` : ''}。简单任务可调低以加快速度。` },
         wait_seconds: { type: 'integer', description: waitSecondsDescription },
@@ -1766,23 +1797,28 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const unknown = Object.keys(args ?? {}).filter(key => !Object.hasOwn(runTool.parameters.properties, key));
       if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
       if (args.fresh !== undefined && typeof args.fresh !== 'boolean') throw new Error('codex_run: fresh 必须是布尔值');
+      if (args.model !== undefined && (typeof args.model !== 'string' || !args.model.trim())) throw new Error('codex_run: model 必须是非空字符串');
       const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, args, exec, 'codex_run');
       // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
       let thread = null;
-      // 没有 resume，或阈值为 0 且没指定 fresh 时不查询，调用时序与以前一样。
-      if (args.resume && (args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0)) {
+      if (args.resume && (cfg.modelAB.enabled || args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0)) {
         try { thread = await runThread(args, exec); } catch { exec?.signal?.throwIfAborted(); }
       }
       if (thread && thread.parent_thread_id !== args.resume) args = { ...args, resume: thread.parent_thread_id };
+      let parent;
+      if (thread?.mode === 'fresh' || (cfg.modelAB.enabled && thread?.parent_job_id)) {
+        const value = withReport(await conductor.waitJob(thread.parent_job_id, 0, exec?.signal));
+        if (!unknownState(value) && owns(exec?.agent?.id, value.context?.owner)) parent = value;
+      }
       let fresh;
       if (thread?.mode === 'fresh') {
-        const parent = withReport(await conductor.waitJob(thread.parent_job_id, 0, exec?.signal));
-        if (unknownState(parent) || !owns(exec?.agent?.id, parent.context?.owner)) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
+        if (!parent) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
         else fresh = { brief: previousRoundBrief(parent),
           continuation: { parent_job_id: thread.parent_job_id, answers: [], resolution: `codex_run 以新线程接续线程 ${thread.parent_thread_id}` } };
       }
       const guard = {};
-      const value = await dispatch(args, exec, undefined, args.task, undefined, fresh, routingOf(thread, verifyPrevious ? args.verify_previous : undefined), guard);
+      const route = retainThreadModel(args, parent, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
+      const value = await dispatch(route.args, exec, undefined, args.task, undefined, fresh, route.routing, guard);
       const deferred = guard.deferred && value.job_id ? guard.deferred : null;
       if (deferred) countCloseout(exec?.agent?.id, 'deferred_dispatch');
       const threadLine = !thread ? '' : thread.mode === 'fresh'
@@ -1805,7 +1841,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   const verifyTool = {
     name: 'codex_verify',
-    description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录、主机访问和模型设置，回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
+    description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录和主机访问，' +
+      (cfg.modelAB.enabled ? '使用配置的默认模型，' : '沿用原任务模型设置，') +
+      '回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `独立核验 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string', description: '本会话已结束的 runner job_id。' },
@@ -1843,7 +1881,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         use_user_config: source.task_options?.use_user_config === true,
         // 核验只读：配置了 readOnlyEffort 时按它，否则沿用原任务的思考程度。
         ...((cfg.readOnlyEffort || source.task_options?.effort) ? { effort: cfg.readOnlyEffort || source.task_options.effort } : {}),
-        model: source.task_options?.model ?? '',
+        model: cfg.modelAB.enabled ? cfg.model : source.task_options?.model ?? '',
         service_tier: source.task_options?.service_tier ?? '',
         ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
       }, exec, undefined, undefined, source.job_id);
@@ -2124,8 +2162,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, plan.args, exec, 'codex_continue');
         const thread = await continuationThread(plan, args, exec?.signal);
         if (thread?.mode === 'fresh') delete plan.args.resume;
-        const value = await dispatch({ ...plan.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
-          exec, plan.continuation, plan.task, undefined, undefined, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
+        const route = retainThreadModel(plan.args, source, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
+        const value = await dispatch({ ...route.args, ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
+          exec, plan.continuation, plan.task, undefined, undefined, route.routing);
         const verify = verifyPrevious && value.job_id ? await startVerifyPrevious(args.verify_previous, exec) : null;
         if (verify) {
           const { line: verifyLine, ...verifyResult } = verify;
