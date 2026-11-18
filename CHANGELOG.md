@@ -7,7 +7,7 @@
 
 - 结案统计只计 runner 确认新写入的验收，旧记录和错误回执不再重复计数。
 - 新增 `acceptOpenEvidence`，默认要求为接受仍未完成的条目提供依据，`not_met` 须经核验或用户确认。
-- 已接受的未完成项进入跨交接台账，后续确认满足时销项。带开放项完成目标须显式确认。
+- 已接受的未完成项进入跨交接台账，由原任务最新的结案复核替换。读取台账时，条目记录之后完成的直接核验按原验收编号或报告行号销掉判为 `met` 的条目。后续轮次确认满足时，须用 `codex_review` 重记原任务才能销项。带开放项完成目标须显式确认。
 - 默认对本版首次加载（`auto-verify-since.json`）时或之后结束的未复核写任务自动核验，须有有效报告及未完成项或 `must_verify`。手动核验复用正在启动或运行的任务。
 - 新增 `effortOverride`，可要求提高单次推理强度时填写 `effort_reason`，或统一使用配置强度。
 
@@ -156,7 +156,7 @@
 
 - Closeout statistics count only newly appended reviews confirmed by the runner. Stale and error replies do not add counts.
 - `acceptOpenEvidence` defaults to requiring support when accepting open items. `not_met` needs verification or a user reply by default.
-- Accepted open items stay visible across handovers and clear when later evidence shows they are met. Goal completion with open items requires acknowledgement.
+- Accepted open items stay visible across handovers. The latest closing review replaces the job's entries. On read, a direct verification finished after an item was recorded clears it by criterion number or report row when it reports `met`. Evidence from a later round clears an item through `codex_review` of the original job. Goal completion with open items requires acknowledgement.
 - By default, unreviewed write jobs finished at or after the first-load cutoff (`auto-verify-since.json`) get automatic verification when a valid report has flagged items or the task has `must_verify` items. Manual requests reuse starting or running verifications.
 - `effortOverride` can require an `effort_reason` for increases or enforce the configured reasoning effort.
 

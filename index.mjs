@@ -13,7 +13,7 @@
 // 护栏 fail-closed：范围内判定出错就拒绝并给出原因；范围外的会话完全不受影响。
 
 import { spawn } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -25,7 +25,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, reviewItemText, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, forwardRetiredNotices } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -1118,7 +1118,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (targetId !== source.job_id) {
             const text = verificationTargetText(target, targetKey);
             if (typeof text !== 'string') return;
-            key = [...targets.values()].find(f => Boolean(f.row) === targetKey.startsWith('row') && f.criterion === text)?.key;
+            const matches = [...targets.values()].filter(f => Boolean(f.row) === targetKey.startsWith('row') && f.criterion === text);
+            if (matches.length !== 1) return;
+            key = matches[0].key;
           }
           const row = key && reportRowOf(acceptance, report.criteria, i + 1);
           if (row && openTargets.has(key)) add(openSupport, key, 'verification');
@@ -1190,6 +1192,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (ledgerFile) {
         const ledger = JSON.parse(readFileSync(ledgerFile, 'utf8'));
         if (!Array.isArray(ledger?.items) || !Array.isArray(ledger.completions)) throw new Error('格式无效');
+        ledger.items = ledger.items.map(({ text_hash, applied_checks, ...item }) => item);
         return ledger;
       }
     } catch (error) {
@@ -1201,25 +1204,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return { since: acceptOpenFrom, items: [], completions: [] };
   };
   const saveLedger = (ledger) => {
-    if (ledgerFile) writeJsonAtomic(ledgerFile, { ...ledger, items: ledger.items.slice(-2000), completions: ledger.completions.slice(-500) });
+    const items = ledger.items.slice(-2000);
+    // 复核时间只为挡住迟到的旧回执：留最近 2000 个任务，仍有条目的任务一律保留。
+    const keep = new Set(items.map(item => item.job_id));
+    const times = Object.entries(ledger.review_times ?? {}).sort((a, b) => a[1] - b[1]);
+    const review_times = Object.fromEntries(times.filter(([id], i) => keep.has(id) || i >= times.length - 2000));
+    if (ledgerFile) writeJsonAtomic(ledgerFile, { ...ledger, items, completions: ledger.completions.slice(-500), review_times });
   };
-  const textHash = (text) => typeof text === 'string' ? createHash('sha1').update(text).digest('hex').slice(0, 12) : undefined;
   const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
-  const earlierThreadRounds = (job, jobs) => job?.thread_id ? [...jobs].filter(round =>
-    round.thread_id === job.thread_id && round.context?.owner === job.context?.owner &&
-    !round.context?.verification_of && round.started_at < job.started_at)
-    .sort((a, b) => b.started_at - a.started_at).map(round => round.job_id) : [];
-  const matchingLedgerItems = (items, met, keyOf) => {
-    const counts = new Map();
-    for (const key of met) if (key !== undefined) counts.set(key, (counts.get(key) ?? 0) + 1);
-    return [...items].sort((a, b) => Boolean(a.row) - Boolean(b.row) || (a.index ?? a.row) - (b.index ?? b.row)).filter(item => {
-      const key = keyOf(item);
-      const count = counts.get(key);
-      if (!count) return false;
-      counts.set(key, count - 1);
-      return true;
-    });
-  };
   const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
   const ledgerLine = (ledger) => {
     if (!ledger) return unreadableLedgerLine;
@@ -1228,49 +1220,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`;
   };
 
-  async function recordAcceptedOpen(source, { review, acceptedOpen }, owner, at) {
+  function recordAcceptedOpen(source, acceptedOpen, at) {
     if (!ledgerFile || beforeCutoff(source, acceptOpenFrom)) return;
     const warning = '本次复核已写入，未能更新未完成项台账。';
     try {
-      let ledger = readLedger();
+      const ledger = readLedger();
       if (!ledger) return warning;
       const jobId = source.job_id;
+      const reviewTimes = ledger.review_times ?? {};
+      if (reviewTimes[jobId] > at || ledger.items.some(item => item.job_id === jobId && item.at > at)) return;
       const session = source.context.owner;
       const blockers = source.structured?.blockers;
       const blocker_kinds = Array.isArray(blockers) ? [...new Set(blockers.map(blocker => blocker?.kind).filter(Boolean))] : [];
-      const items = acceptedOpen.map(entry => ({
-        session, job_id: jobId, ...entry, text_hash: textHash(reviewItemText(source, entry)), blocker_kinds, at,
-      }));
-      const met = [...review.criteria, ...(review.report_rows ?? [])].filter(c => c.status === 'met')
-        .map(c => textHash(reviewItemText(source, c)));
-      const ancestors = new Set();
-      if ((parentOf(source) || source.thread_id) && met.length && !source.context.verification_of && ledger.items.length) {
-        const thread = source.thread_id && Number.isFinite(source.started_at) ? await conductor.list({
-          owner: session, thread_id: source.thread_id, started_between: [0, source.started_at], limit: 100,
-        }) : { jobs: [] };
-        if (thread.error_kind || !Array.isArray(thread.jobs)) throw new Error(thread.error ?? thread.error_kind ?? '任务列表不可用');
-        const pending = [parentOf(source), ...earlierThreadRounds(source, thread.jobs)];
-        const listed = new Map(thread.jobs.map(job => [job.job_id, job]));
-        while (ancestors.size < 10 && pending.length) {
-          const id = pending.shift();
-          if (!id || id === jobId || ancestors.has(id)) continue;
-          const round = listed.get(id) ?? await conductor.waitJob(id, 0);
-          if (unknownState(round)) throw new Error(round.error ?? round.error_kind ?? round.status);
-          if (!owns(owner, round.context?.owner) || round.context?.verification_of) continue;
-          ancestors.add(id);
-          if (parentOf(round)) pending.unshift(parentOf(round));
-        }
-        // 查上轮期间可能已有别的复核写入台账。
-        ledger = readLedger();
-        if (!ledger) return warning;
-      }
-      const resolved = new Set();
-      for (const id of ancestors) {
-        const candidates = ledger.items.filter(item => item.job_id === id && item.at <= at);
-        for (const item of matchingLedgerItems(candidates, met, item => item.text_hash)) resolved.add(item);
-      }
-      const remaining = ledger.items.filter(item => item.job_id !== jobId && !resolved.has(item));
-      if (items.length || remaining.length !== ledger.items.length) saveLedger({ ...ledger, items: [...remaining, ...items] });
+      const items = acceptedOpen.map(entry => ({ session, job_id: jobId, ...entry, blocker_kinds, at }));
+      const remaining = ledger.items.filter(item => item.job_id !== jobId);
+      // 即使没有未完成项，也保留这次复核时间，防止迟到的旧回执恢复旧条目。
+      saveLedger({ ...ledger, review_times: { ...reviewTimes, [jobId]: at }, items: [...remaining, ...items] });
     } catch (error) {
       ctx.logger?.warn?.(`[codex-conductor] ${warning} ${error?.message ?? error}`);
       return warning;
@@ -1280,7 +1245,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function acceptedOpenLedger(owner, signal) {
     const scope = aliases.owners(owner);
     const view = ({ since, items, completions }) => ({ since,
-      items: items.filter(item => scope.includes(item.session)).map(({ applied_checks, ...item }) => item),
+      items: items.filter(item => scope.includes(item.session)),
       completions: completions.filter(entry => scope.includes(entry.session)) });
     const initial = readLedger();
     if (!initial) return null;
@@ -1289,10 +1254,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const byJob = new Map(ledgerJobIds(snapshot).map(id => [id, []]));
     for (const item of snapshot) byJob.get(item.job_id).push(item);
     const resolved = new Set();
-    const appliedChecks = new Map();
     const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
-    const hashKey = (key, hash) => hash === undefined ? undefined : (key.startsWith('row') ? `row:${hash}` : hash);
-    const itemHashKey = item => hashKey(item.key, item.text_hash);
     try {
       const jobs = new Map();
       for (let offset = 0; offset !== null;) {
@@ -1305,20 +1267,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       for (const job of jobs.values()) {
         const target = job.context?.verification_of;
         if (!target || job.execution_status !== 'completed') continue;
-        const candidates = new Map();
-        const visited = new Set();
-        const pending = [target, ...earlierThreadRounds(jobs.get(target), jobs.values())];
-        while (visited.size <= 10 && pending.length) {
-          const id = pending.shift();
-          if (!id || visited.has(id)) continue;
-          visited.add(id);
-          const items = (byJob.get(id) ?? []).filter(item => job.finished_at > item.at &&
-            !resolved.has(itemId(item)) && !item.applied_checks?.includes(job.job_id));
-          if (items.length) candidates.set(id, items);
-          const parent = parentOf(jobs.get(id));
-          if (parent) pending.unshift(parent);
-        }
-        if (!candidates.size) continue;
+        const candidates = (byJob.get(target) ?? []).filter(item => job.finished_at > item.at && !resolved.has(itemId(item)));
+        if (!candidates.length) continue;
         const full = await status(job.job_id);
         const acceptance = full.context?.acceptance;
         if (full.error_kind || !Array.isArray(acceptance) || !validReport(full.structured)) continue;
@@ -1326,26 +1276,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           const key = verificationItemKey(text);
           return key && reportRowOf(acceptance, full.structured.criteria, i + 1)?.status === 'met' ? [key] : [];
         }));
-        if (!met.size) continue;
-        const direct = candidates.get(target) ?? [];
-        for (const item of direct) if (met.has(item.key)) resolved.add(itemId(item));
-        candidates.delete(target);
-        if (!candidates.size) continue;
-        const round = await status(target);
-        const hashes = [...met].map(key => hashKey(key, textHash(verificationTargetText(round, key))));
-        for (const items of candidates.values()) {
-          const matched = matchingLedgerItems(items, hashes, itemHashKey);
-          for (const item of matched) resolved.add(itemId(item));
-          const used = new Set(matched.map(itemHashKey));
-          // 保留同文余项的抵扣记录，避免下次读取再次使用同一核验。
-          for (const item of items) {
-            const id = itemId(item);
-            if (used.has(itemHashKey(item)) && !resolved.has(id)) {
-              if (!appliedChecks.has(id)) appliedChecks.set(id, []);
-              appliedChecks.get(id).push(job.job_id);
-            }
-          }
-        }
+        for (const item of candidates) if (met.has(item.key)) resolved.add(itemId(item));
       }
     } catch (error) {
       signal?.throwIfAborted();
@@ -1354,10 +1285,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     // runner 查询期间可能有新的复核，只移除刚才核实的那一条记录。
     const ledger = readLedger();
     if (!ledger) return null;
-    const items = ledger.items.filter(item => !resolved.has(itemId(item))).map(item => {
-      const checks = appliedChecks.get(itemId(item));
-      return checks ? { ...item, applied_checks: [...new Set([...(item.applied_checks ?? []), ...checks])] } : item;
-    });
+    const items = ledger.items.filter(item => !resolved.has(itemId(item)));
     const next = { ...ledger, items };
     if (items.length !== ledger.items.length) {
       try { saveLedger(next); }
@@ -2643,7 +2571,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           .some((c) => (f.row ? c?.row === f.row : c?.index === f.index) && c.status === 'met'));
         countCloseout(owner, openAccepted(review) ? 'accepted_open'
           : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
-        ledgerWarning = await recordAcceptedOpen(source, prepared, owner, result.verification.time);
+        ledgerWarning = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time);
       }
       // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
       if (result.error_kind === 'bad_arguments' && !result.job_id) {
@@ -2976,7 +2904,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (!userConfirmed || acknowledge_open_items !== true) {
             refusal = `update_goal: 本会话含前任仍有 ${items.length} 项未完成但接受的条目：${listing.join('、')}。` +
               (userConfirmed ? '' : '请先由用户确认这些未完成项，收到用户回复后再继续。') +
-              '接受这些未完成项并结束目标时，请在 update_goal(action=complete) 中传 acknowledge_open_items: true。';
+              '原任务的核验或后续轮次确认条目已满足时，用 codex_review 重记原任务即可销项；否则请在 update_goal(action=complete) 中传 acknowledge_open_items: true。';
           } else {
             goal.completion = { session: owner, open_count: items.length, job_ids: jobIds,
               acknowledged_by: cfg.plannerAnswers ? 'planner' : 'user' };

@@ -3,7 +3,6 @@ import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter, getEventListeners } from 'node:events';
 import { spawnSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import { linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -6208,6 +6207,28 @@ test('later verification follows criterion text for met and open support', async
   }
 });
 
+test('later verification cannot support a must_verify item with ambiguous text', async (t) => {
+  const { source, make } = acceptedFixtureHarness(t);
+  const text = '相同验收内容';
+  source.context.acceptance = [text, text];
+  source.context.must_verify = [1];
+  // 第 2 行措辞不同，按位置对上第 2 条并将其列为 flagged。
+  source.structured = { ...source.structured, criteria: [resultRow(text, 'met'), resultRow('第 2 项未完成', 'blocked')],
+    deviations: [], unresolved: [], blockers: [] };
+  const later = finishedRound(source, 'LATER', [text, text], [], source.finished_at, { parent_job_id: source.job_id });
+  later.context.must_verify = [2];
+  const item = `原验收第 2 条（必须实测）：${text}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
+  const check = finishedRound(source, 'CHECK', [item], [resultRow(item, 'met')], later.finished_at);
+  check.context.verification_of = later.job_id;
+  const h = make({ plannerAnswers: true, closeoutEvidence: 'off', acceptOpenEvidence: 'off',
+    listResult: { jobs: [later, check] }, reviewResult: source });
+  Object.assign(h.finals, { LATER: later, CHECK: check });
+  const review = verifiedReview(source);
+  review.status = 'accepted_deviations';
+  review.criteria[1] = { index: 2, status: 'blocked', evidence: '仍未完成', accepted: '接受未完成' };
+  await assert.rejects(h.tools.codex_review.execute(review, { agent: agentAt('/work') }), /第 1 条（must_verify）记 met 缺少独立实测依据/);
+});
+
 test('same-thread follow-up without a parent provides independent support', async (t) => {
   const { source, make, state } = acceptedFixtureHarness(t);
   writeFileSync(path.join(state, 'closeout-evidence-since.json'), JSON.stringify({ since: source.finished_at - 1 }));
@@ -6342,7 +6363,6 @@ test('release B: accepted items stay visible across handover and require acknowl
   assert.equal(since, source.finished_at - 1);
   assert.equal(items.length, 4);
   assert.deepEqual(items[0], { session: 'S1', job_id: listed.job_id, key: '1', index: 1, status: 'blocked',
-    text_hash: createHash('sha1').update(source.context.acceptance[0]).digest('hex').slice(0, 12),
     blocker_kinds: ['implementation'], support: ['user'], at });
   assert.ok(!JSON.stringify(persisted()).includes('<text-'));
   const stale = make({ plannerAnswers: true, acceptOpenEvidence: 'off', listResult, reviewResult: source });
@@ -6374,6 +6394,7 @@ test('release B: accepted items stay visible across handover and require acknowl
   };
   const refused = await goal(planner, false);
   assert.match(refused.error.message, /4 项.*c0874f（blocked）.*acknowledge_open_items: true/);
+  assert.match(refused.error.message, /原任务的核验或后续轮次确认条目已满足时，用 codex_review 重记原任务/);
   assert.match((await goal(h, true, [reply(at - 0.5)])).error.message, /由用户确认这些未完成项/);
   assert.equal(calls, 0);
   assert.equal((await goal(planner, true, [], true)).isError, true);
@@ -6388,91 +6409,19 @@ test('release B: accepted items stay visible across handover and require acknowl
   assert.equal(value.status, 'running');
 });
 
-test('release B: a later closing review or a mapped verification clears only resolved ledger items', async (t) => {
-  const { source, make, state } = acceptedFixtureHarness(t);
-  const listed = runnerFixture('runner-list-row-c0874f');
-  const at = source.verification.time + 1;
-  const id = source.job_id;
-  const jobs = [listed];
-  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
-    listResult: () => ({ jobs }),
-    reviewResult: ([, job_id], { stdin }) => {
-      const value = h.finals[job_id];
-      const review = JSON.parse(stdin);
-      return { ...value, verification_status: review.status, verification: { ...review, time: at + (job_id === id ? 0 : 3) } };
-    },
-  });
-  const exec = { agent: agentAt('/work') };
-  const submit = args => h.tools.codex_review.execute(args, exec);
-  const ledger = async () => (await h.tools.codex_summary.execute({}, exec)).accepted_open_ledger;
-  await submit(fixtureReview(source));
-  assert.equal((await ledger()).items.length, 4);
-
-  // 名义上是后续轮，但只有第 4 项的原文确实相同。
-  const later = { ...source, job_id: 'LATER', finished_at: at + 1, verification: null,
-    context: { ...source.context, continuation: { parent_job_id: id }, acceptance: [source.context.acceptance[3]] },
-    structured: { ...source.structured, deviations: [], criteria: [{ criterion: source.context.acceptance[3], status: 'met', evidence: '已实测' }] } };
-  h.finals.LATER = later;
-  jobs.push({ ...listed, job_id: 'LATER', parent_job_id: id, finished_at: later.finished_at });
-  await submit({ job_id: 'LATER', status: 'accepted_deviations', criteria: [{ index: 1, status: 'met', evidence: '已实测' }] });
-  assert.deepEqual((await ledger()).items.map(item => item.index), [1, 2, 3]);
-
-  const verification = (job_id, target, finished_at, keys) => {
-    const context = { owner: 'S1', verification_of: target,
-      acceptance: keys.map(key => `原验收第 ${key} 条（原报告标 blocked）：核实原验收`) };
-    const structured = { ...source.structured, criteria: context.acceptance.map(criterion => ({ criterion, status: 'met', evidence: '已复核' })) };
-    jobs.push({ job_id, context, execution_status: 'completed', finished_at });
-    h.finals[job_id] = { status: 'completed', context, structured };
-  };
-  verification('OLD', id, at - 1, [1]);
-  verification('CHECK', id, at + 1, [2]);
-  // 下一轮把原来的第 3 项重排为第 1 项，须按条文销项。
-  later.context.acceptance = [source.context.acceptance[2]];
-  verification('CHECK-LATER', 'LATER', at + 2, [1]);
-  assert.deepEqual((await ledger()).items.map(item => item.index), [1]);
-  assert.deepEqual(JSON.parse(readFileSync(path.join(state, 'accepted-open.json'), 'utf8')).items.map(item => item.index), [1]);
-  const closed = fixtureReview(source);
-  closed.criteria = closed.criteria.map(({ index, evidence }) => ({ index, status: 'met', evidence }));
-  await submit(closed);
-  assert.deepEqual((await ledger()).items, []);
-});
-
-test('rework 3: ancestor lookup failure preserves the saved review result', async (t) => {
-  const { source, make, state } = acceptedFixtureHarness(t);
-  const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
-    reviewResult: ([, id], { stdin }) => {
-      const review = JSON.parse(stdin);
-      return { ...h.finals[id], verification_status: review.status, verification: { ...review, time: source.verification.time + 1 } };
-    },
-  });
-  const exec = { agent: agentAt('/work') };
-  const review = fixtureReview(source);
-  await h.tools.codex_review.execute(review, exec);
-  const file = path.join(state, 'accepted-open.json');
-  const before = readFileSync(file, 'utf8');
-  h.finals.CHILD = { ...source, job_id: 'CHILD', verification: null, verification_status: 'unreviewed',
-    context: { ...source.context, continuation: { parent_job_id: source.job_id } } };
-  Object.defineProperty(h.finals, source.job_id, { get() { throw new Error('上轮状态查询失败'); } });
-  const criteria = review.criteria.map(({ index, evidence }) => ({ index, status: 'met', evidence }));
-  const value = await h.tools.codex_review.execute({ ...review, job_id: 'CHILD', criteria }, exec);
-  assert.equal(value.verification_status, 'accepted_deviations');
-  assert.match(value.next, /本次复核已写入，未能更新未完成项台账/);
-  assert.ok(h.warnings.some(line => line.includes('上轮状态查询失败')));
-  assert.equal(h.calls.filter(argv => argv[0] === 'review' && argv[1] === 'CHILD').length, 1);
-  assert.equal(readFileSync(file, 'utf8'), before);
-});
-
 async function openLedgerFixture(t, acceptance) {
   const { source, make, state } = acceptedFixtureHarness(t);
   const at = source.verification.time + 1;
+  let time = source.verification.time;
   source.context.acceptance = acceptance;
-  source.structured = { ...source.structured, criteria: acceptance.map(text => resultRow(text, 'blocked')), deviations: [] };
+  source.structured = { ...source.structured, criteria: acceptance.map(text => resultRow(text, 'blocked')),
+    deviations: [], unresolved: [], blockers: [] };
   const jobs = [source];
   const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
     listResult: () => ({ jobs }),
     reviewResult: ([, id], { stdin }) => {
       const review = JSON.parse(stdin);
-      return { ...h.finals[id], verification_status: review.status, verification: { ...review, time: id === source.job_id ? at : at + 5 } };
+      return { ...h.finals[id], verification_status: review.status, verification: { ...review, time: ++time } };
     },
   });
   const exec = { agent: agentAt('/work') };
@@ -6483,11 +6432,12 @@ async function openLedgerFixture(t, acceptance) {
   const stored = () => JSON.parse(readFileSync(file, 'utf8'));
   const summary = async () => (await h.tools.codex_summary.execute({}, exec)).accepted_open_ledger;
   const add = round => { jobs.push(round); h.finals[round.job_id] = round; };
-  const verify = (target, i) => {
+  const verify = (target, i, jobId = 'CHECK') => {
     const item = `原验收第 ${i} 条（原报告标 blocked）：${target.context.acceptance[i - 1]}`;
-    const check = finishedRound(source, 'CHECK', [item], [resultRow(item, 'met')], Math.max(target.finished_at, at));
+    const check = finishedRound(source, jobId, [item], [resultRow(item, 'met')], Math.max(target.finished_at, at));
     check.context.verification_of = target.job_id;
     add(check);
+    return check;
   };
   return { source, h, exec, file, stored, summary, submit, add, verify, at };
 }
@@ -6509,39 +6459,69 @@ test('ledger prune write failure leaves summary and goal completion usable', asy
   assert.equal(h.warnings.filter(line => line.includes('模拟台账保存失败')).length, 2);
 });
 
-test('ledger finds same-thread ancestors without parent links in one list call', async (t) => {
-  const [text, other] = ['验收内容', '另一项内容'];
-  const { source, add, submit, stored, h, at, verify, summary } = await openLedgerFixture(t, [text, other]);
-  const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'met')], at, { thread_id: source.thread_id });
-  add(later);
-  await submit(verifiedReview(later));
-  assert.deepEqual(stored().items.map(item => item.index), [2]);
-  assert.equal(h.calls.filter(argv => argv[0] === 'list').length, 1);
-  const next = finishedRound(source, 'NEXT', [other], [resultRow(other, 'blocked')], later.finished_at,
-    { thread_id: source.thread_id });
-  add(next);
-  verify(next, 1);
-  assert.deepEqual((await summary()).items, []);
-});
-
-test('one met item in a later review or verification removes only one duplicate ledger item', async (t) => {
+test('a later round review or verification leaves the original job ledger intact', async (t) => {
   for (const method of ['review', 'verification']) {
     await t.test(method, async (st) => {
-      const text = '相同验收内容';
-      const { source, add, submit, stored, summary, verify, at, file } = await openLedgerFixture(st, [text, text]);
-      const before = stored();
-      assert.deepEqual(before.items.map(item => item.index), [1, 2]);
-      writeFileSync(file, JSON.stringify({ ...before, items: before.items.reverse() }));
-      const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'blocked')], at, { parent_job_id: source.job_id });
+      const text = '验收内容';
+      const { source, add, submit, stored, summary, verify, at, h } = await openLedgerFixture(st, [text]);
+      const before = stored().items;
+      const later = finishedRound(source, 'LATER', [text], [resultRow(text, 'met')], at, { parent_job_id: source.job_id });
       add(later);
       if (method === 'review') {
         await submit(verifiedReview(later));
+        assert.deepEqual(stored().items, before);
+        assert.equal(h.calls.filter(argv => argv[0] === 'list').length, 0);
       } else {
         verify(later, 1);
-        assert.deepEqual((await summary()).items.map(item => item.index), [2]);
-        assert.deepEqual((await summary()).items.map(item => item.index), [2]);
       }
-      assert.deepEqual(stored().items.map(item => item.index), [2]);
+      assert.deepEqual((await summary()).items, before);
+    });
+  }
+});
+
+test('ledger prunes direct verification by key and re-review replaces remaining items', async (t) => {
+  const text = '相同验收内容';
+  const { source, stored, summary, verify, submit, at } = await openLedgerFixture(t, [text, text]);
+  const indices = items => items.map(item => item.index);
+  assert.deepEqual(indices(stored().items), [1, 2]);
+  verify(source, 1, 'OLD').finished_at = at;
+  verify(source, 2);
+  assert.deepEqual(indices((await summary()).items), [1]);
+  assert.deepEqual(indices(stored().items), [1]);
+  await submit(verifiedReview(source));
+  assert.deepEqual(stored().items, []);
+});
+
+test('ledger ignores an older review received after a newer review of the same job', async (t) => {
+  for (const remaining of [[2], []]) {
+    await t.test(remaining.length ? 'newer review keeps an item open' : 'newer review clears all items', async (st) => {
+      const { source, make, state } = acceptedFixtureHarness(st);
+      const review = fixtureReview(source);
+      const updated = { ...review, criteria: review.criteria.map(c => remaining.includes(c.index)
+        ? c : { index: c.index, status: 'met', evidence: '已完成' }) };
+      const started = Promise.withResolvers();
+      const delayed = Promise.withResolvers();
+      const at = source.verification.time + 1;
+      const h = make({ plannerAnswers: true, acceptOpenEvidence: 'off', closeoutEvidence: 'off',
+        reviewResult: (_argv, { stdin }) => {
+          const submitted = JSON.parse(stdin);
+          const older = submitted.criteria[0].status === 'blocked';
+          const result = { ...source, verification_status: submitted.status,
+            verification: { ...submitted, time: older ? at : at + 1 } };
+          if (!older) return result;
+          started.resolve();
+          return delayed.promise.then(() => result);
+        },
+      });
+      const submit = args => h.tools.codex_review.execute(args, { agent: agentAt('/work') });
+      const older = submit(review);
+      await Promise.race([started.promise, older]);
+      const newer = await submit(updated);
+      delayed.resolve();
+      assert.equal(newer.verification.time, at + 1);
+      assert.equal((await older).verification.time, at);
+      const ledger = JSON.parse(readFileSync(path.join(state, 'accepted-open.json'), 'utf8'));
+      assert.deepEqual(ledger.items.map(item => item.index), remaining);
     });
   }
 });

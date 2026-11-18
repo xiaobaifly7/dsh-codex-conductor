@@ -86,7 +86,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - 截止：本机第一次加载这一版之后结束的任务才按 `independent` 要求（`closeout-evidence-since.json`），之前结束的任务按 `planner` 规则，不会因升级变难收尾。
 - 统计：`closeout-stats.json` 按会话和总数记结案结果（`all_met` 全部满足、`accepted_open` 未满足但接受、`rejected_unsupported` 缺独立依据被拒），`codex_runtime` 显示。任务 context 新增 `routing`（续接方式、原线程、父任务、被接替的线程、`verify_previous`），收尾护栏拒绝时把被点名的任务号记进 `closeout-refusals.jsonl`。
 
-从首次加载本版起结束的任务，成功结案后会把接受的未完成项记入 `accepted-open.json`，保存编号、状态、条文哈希、阻塞与依据类型等元数据。后续轮次结案或独立核验确认满足后销项。`codex_runtime` 和 `codex_summary` 显示本会话及交接前任的条目与完成记录。有开放项时，规划端完成目标须传 `update_goal(action=complete, acknowledge_open_items=true)`。关闭 `plannerAnswers` 时还须有晚于最近一项的真实用户回复。
+从首次加载本版起结束的任务，成功结案后会把接受的未完成项记入 `accepted-open.json`，保存编号、状态、阻塞与依据类型及时间。最新的成功结案复核会替换该任务的条目。读取台账时，晚于条目记录时间完成、且直接核验该任务的结果，会按验收编号或报告行号销掉判为 `met` 的条目。后续轮次确认满足时，用 `codex_review` 重新结案原任务即可销项。`codex_runtime` 和 `codex_summary` 显示本会话及交接前任的条目与完成记录。有开放项时，规划端完成目标须传 `update_goal(action=complete, acknowledge_open_items=true)`。关闭 `plannerAnswers` 时还须有晚于最近一项的真实用户回复。
 
 ### 0.9.112：codex_run 续接也开新线程、派活时同时核验上一单
 
@@ -621,7 +621,7 @@ The Codex panel lists pending questions and the ten latest history entries. You 
 - Cut-off: only jobs finished after this version first loaded on the machine (`closeout-evidence-since.json`) are held to `independent`; earlier jobs close under the `planner` rule, so upgrading does not make them harder to close.
 - Measurement: `closeout-stats.json` counts closing outcomes per session and overall (`all_met`, `accepted_open`, `rejected_unsupported`), shown by `codex_runtime`. Job contexts gain `routing` (continuation mode, parent thread, parent job, superseded threads, `verify_previous`), and close-out refusals log the named job ids to `closeout-refusals.jsonl`.
 
-Successful closing reviews for jobs finished since first load record accepted open items in `accepted-open.json`. The ledger stores item identifiers, statuses, text hashes, blocker and support kinds, and timestamps. A later closing review or independent verification can clear items it confirms as met. `codex_runtime` and `codex_summary` show items and completions for this session and its handover predecessors. To complete a goal with open items, pass `update_goal(action=complete, acknowledge_open_items=true)`. With `plannerAnswers` off, a real user reply after the latest item is also required.
+Successful closing reviews for jobs finished since first load record accepted open items in `accepted-open.json`. The ledger stores item identifiers, statuses, blocker and support kinds, and timestamps. The latest successful closing review replaces that job's entries. On read, a verification of the same job that finished after an item was recorded clears the item if it marked the matching criterion number or report row `met`. When a later round shows that an item is met, re-review the original job with `codex_review` to clear it. `codex_runtime` and `codex_summary` show items and completions for this session and its handover predecessors. To complete a goal with open items, pass `update_goal(action=complete, acknowledge_open_items=true)`. With `plannerAnswers` off, a real user reply after the latest item is also required.
 
 ### 0.9.112: Fresh threads for codex_run resumes, and verifying the previous job alongside the next one
 
