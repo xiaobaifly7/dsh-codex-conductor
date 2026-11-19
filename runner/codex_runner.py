@@ -1313,8 +1313,8 @@ def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
     return hashes, unchecked
 
 
-def verification_git_digest(cwd, paths):
-    deadline = time.monotonic() + 30
+def verification_git_digest(cwd, paths, *, budget=30, strict=False):
+    deadline = time.monotonic() + budget
 
     def digest(query):
         head = query("rev-parse", "--verify", "HEAD")
@@ -1330,7 +1330,9 @@ def verification_git_digest(cwd, paths):
         index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
                       "HEAD", "--", *relative, at=top)
         scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
-        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=True)
+        if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
+            return whole, None, set()
+        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)
         checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
         return whole, (checksum, hashes), unchecked
 
@@ -1345,6 +1347,27 @@ def verification_paths(context, cwd):
              for entry in (source.get("files_changed") or []) + (source.get("write_paths") or [])]
     return [scope_path(cwd, path) for path in [*(source.get("scope_paths") or source.get("scope") or []), *files]
             if isinstance(path, str) and path.strip()]
+
+
+def verification_version(source):
+    cwd = source.get("cwd")
+    if not cwd:
+        return None
+    report = source.get("structured") or {}
+    files = [entry.get("path") if isinstance(entry, dict) else entry for entry in
+             [*(source.get("files_changed") or []), *(source.get("write_paths") or []), *report.get("files_changed", [])]]
+    paths = [*(source.get("scope_paths") or source.get("scope") or []), *files, source.get("output")]
+    root = Path(tree_key(cwd))
+    if any(not Path(tree_key(scope_path(cwd, file))).is_relative_to(root) for file in paths if isinstance(file, str) and file):
+        return None
+    try:
+        _, digest, unchecked = verification_git_digest(cwd, [cwd], budget=3, strict=True)
+        if digest is not None and not unchecked:
+            tree, changes = digest
+            return hashlib.sha256(repr((tree, sorted(changes.items()))).encode("utf-8")).hexdigest()
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        pass
+    return None
 
 
 def concurrent_writer_in_scope(paths, run_dir, started):
@@ -1590,8 +1613,13 @@ def execute(args, prompt, run_dir):
         return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
 
     before_digest, before_reason = take_snapshot("before") if host_verification else (None, None)
+    verification_scope = (context.get("routing") or {}).get("verification_scope") if verification else None
+    version_source = job_status(context["verification_of"]) if isinstance(verification_scope, str) else None
+    before_version = verification_version(version_source) if version_source else None
 
     def finish(result):
+        if before_version and result["status"] == "completed" and before_version == verification_version(version_source):
+            result.update(verification_version=before_version, verification_scope=verification_scope)
         if not host_verification:
             return result
         after_digest, reason = take_snapshot("after") if before_digest is not None else (None, before_reason)
@@ -2157,6 +2185,12 @@ def validate_review(review, value, submitting=False):
     def valid_owner_only(entry):
         return "owner_only" not in entry or ("accepted" in entry and entry["owner_only"] in OWNER_ONLY_REASONS)
 
+    def valid_historical_gap(entry):
+        return "historical_gap" not in entry or (
+            entry["historical_gap"] in ("missing_snapshot", "historical_redaction", "historical_runtime_record") and
+            "accepted" in entry and "owner_only" not in entry and
+            entry.get("index") not in (context or {}).get("must_verify", []))
+
     criteria = review["criteria"]
     if not isinstance(criteria, list):
         raise ValueError("review.criteria must be an array")
@@ -2164,11 +2198,13 @@ def validate_review(review, value, submitting=False):
     for criterion in criteria:
         # "accepted" (optional) records an open criterion that accepted_deviations accepts although it is not met.
         if (not isinstance(criterion, dict) or not {"index", "status", "evidence"} <= set(criterion) or
-                set(criterion) - {"index", "status", "evidence", "accepted", "owner_only"} or not valid_owner_only(criterion) or
+                set(criterion) - {"index", "status", "evidence", "accepted", "owner_only", "historical_gap"} or
+                not valid_owner_only(criterion) or not valid_historical_gap(criterion) or
                 type(criterion["index"]) is not int or
                 not isinstance(criterion["status"], str) or criterion["status"] not in ("met", "not_met", "blocked") or
                 not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip() or
-                ("accepted" in criterion and (criterion["status"] == "met" or review["status"] != "accepted_deviations" or
+                ("accepted" in criterion and (criterion["status"] == "met" or
+                                              (review["status"] != "accepted_deviations" and "historical_gap" not in criterion) or
                                               not isinstance(criterion["accepted"], str) or not criterion["accepted"].strip()))):
             raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence; "
                              "accepted is only for a not_met/blocked criterion of an accepted_deviations review; owner_only requires valid reason and accepted")
@@ -2179,11 +2215,12 @@ def validate_review(review, value, submitting=False):
     row_count = len(report["criteria"]) if valid_report(report) else 0
     if (not isinstance(rows, list) or any(
             not isinstance(r, dict) or not {"row", "status", "evidence"} <= set(r) or
-            set(r) - {"row", "status", "evidence", "accepted", "owner_only"} or not valid_owner_only(r) or
+            set(r) - {"row", "status", "evidence", "accepted", "owner_only", "historical_gap"} or
+            not valid_owner_only(r) or not valid_historical_gap(r) or
             type(r["row"]) is not int or not 1 <= r["row"] <= row_count or
             not isinstance(r["status"], str) or r["status"] not in ("met", "not_met", "blocked") or
             not isinstance(r["evidence"], str) or not r["evidence"].strip() or
-            ("accepted" in r and (r["status"] == "met" or review["status"] != "accepted_deviations" or
+            ("accepted" in r and (r["status"] == "met" or (review["status"] != "accepted_deviations" and "historical_gap" not in r) or
                                   not isinstance(r["accepted"], str) or not r["accepted"].strip()))
             for r in rows) or len({r["row"] for r in rows}) != len(rows)):
         raise ValueError("report_rows entries require a unique report row number, status and nonempty evidence; "
@@ -2222,7 +2259,7 @@ def validate_review(review, value, submitting=False):
         if (any(c["status"] != "met" and "accepted" not in c for c in criteria + rows) or acknowledged != expected or review.get("blockers")):
             raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers" + deviation_hint)
     # Only new submissions: older stored reviews may already hold this contradiction and must stay readable.
-    elif submitting and all(c["status"] == "met" for c in criteria + rows) and not review.get("blockers") and not expected:
+    elif submitting and all(c["status"] == "met" or c.get("historical_gap") for c in criteria + rows) and not review.get("blockers") and not expected:
         raise ValueError("所有验收项都 met 且无阻塞/偏差时不能记 needs_changes；"
                          "被审对象（正文、产品）的缺陷写进 notes 或结论，审计任务本身记 verified；"
                          "若确有执行缺口，把对应 criterion 标 not_met 或加 blocker 并给出证据。")
@@ -2501,6 +2538,12 @@ def matching_jobs(args, *, page_dates=None):
         if args.owner and not ((isinstance(context, dict) and context.get("owner") in owners) or
                                job_id in (args.job_id or [])):
             return False
+        verification_of = getattr(args, "verification_of", None)
+        if verification_of and (context or {}).get("verification_of") != verification_of:
+            return False
+        task_key = getattr(args, "task_key", None)
+        if task_key and hashlib.sha256((context or {}).get("task", "").strip().encode("utf-8", "surrogatepass")).hexdigest() != task_key:
+            return False
         return not args.cwd or bool(value.get("cwd") and
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
 
@@ -2542,7 +2585,8 @@ def matching_jobs(args, *, page_dates=None):
                 if not matches_metadata(value, job_dir.name):
                     continue
         context = value.get("context")
-        parent = (context or {}).get("continuation", {}).get("parent_job_id")
+        parent = ((context or {}).get("continuation", {}).get("parent_job_id") or
+                  (context or {}).get("routing", {}).get("parent_job_id"))
         if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
             continue
         if getattr(args, "parent_job", None) and parent != args.parent_job:
@@ -2570,7 +2614,7 @@ def matching_jobs(args, *, page_dates=None):
 def list_jobs(args):
     requested = slice(args.offset, args.offset + args.limit)
     filters = ("cwd", "owner", "status", "job_id", "thread_id", "parent_job", "needs_attention",
-               "scope_conflicts", "started_between")
+               "scope_conflicts", "started_between", "verification_of", "task_key")
     if any(getattr(args, key, None) for key in filters):
         jobs = matching_jobs(args)
         total = len(jobs)
@@ -2603,7 +2647,7 @@ def list_jobs(args):
              if j.get("context") else None,
              **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
              **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
-             **{k: j[k] for k in ("diff_status", "diff_files", "rolled_back_at") if k in j},
+             **{k: j[k] for k in ("diff_status", "diff_files", "rolled_back_at", "verification_version", "verification_scope") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     if predispatch is not None:
@@ -2744,7 +2788,7 @@ def summarize_jobs(args):
             for path in structured.get("files_changed", []) if valid_report(structured) else []:
                 if path not in files:
                     files.append(path)
-        open_items = {"criteria": [c for c in criteria if c["status"] != "met"],
+        open_items = {"criteria": [c for c in criteria if c["status"] != "met" and not c.get("historical_gap")],
                       "unresolved": report.get("unresolved", []), "deviations": report.get("deviations", []),
                       "out_of_scope": out_of_scope_paths(latest),
                       "blockers": latest["blocking"]["blockers"]}
@@ -3073,6 +3117,7 @@ def main():
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
     sub.add_parser("thread-size").add_argument("thread_id")
+    sub.add_parser("verification-version").add_argument("job_id", type=job_identifier)
     repeat_guard = sub.add_parser("repeat-guard")
     repeat_guard.add_argument("--cwd", default=os.getcwd())
     repeat_guard.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
@@ -3094,6 +3139,8 @@ def main():
         command.add_argument("--offset", type=int, default=0)
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--scope-conflicts", action="store_true")
+    listing.add_argument("--verification-of", type=job_identifier)
+    listing.add_argument("--task-key")
     listing.add_argument("--started-between", nargs=2, type=float, metavar=("START", "END"))
     summary.add_argument("--limit", type=int, default=10)
     summary.add_argument("--round-limit", type=int, default=20)
@@ -3137,6 +3184,9 @@ def main():
             emit({"status": "failed", "error_kind": "bad_arguments", "error": "thread_id is invalid", "retryable": False})
         else:
             emit({"status": "completed", "thread_id": args.thread_id, "last_input_tokens": thread_last_input_tokens(args.thread_id)})
+        return
+    if args.command == "verification-version":
+        emit({"status": "completed", "verification_version": verification_version(job_status(args.job_id))})
         return
     if args.command == "repeat-guard":
         try:

@@ -428,6 +428,11 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
 | `repeatFailureGuard` | `{ enabled: true, minSeconds: 60, failures: 2, windowHours: 24 }` | 设置面板可编辑。只计用时达到 `minSeconds` 的失败，按任务目录和步骤累计。距最后一次失败不超过 `windowHours` 且计数达到 `failures` 时，runner 拦截再次执行。秒数和小时数须为正有限数字，次数须为正整数。无效字段分别告警并使用默认值。设 `enabled: false` 关闭拦截。 |
 | `closeoutGuard` | `true` | 本会话存在有问题却未复核的有效报告，或尚未结案的 `needs_changes` 时，拒绝开新工作的 `codex_run` 和规划端的 `update_goal(action=complete)`。续接、带 `resume` 的返工、核验、查询和界面操作照常。第一次加载 0.9.122 起新记的返工欠账指向最新轮次，后继轮执行完成并复核为 `verified` 或 `accepted_deviations` 才清账。旧欠账仍按有无后继轮判断。规划端完成 Goal 时，报告干净但未复核的写入任务只提醒。首次加载 0.9.103 前开始的任务不计入，记录读取失败时告警并放行。设 `false` 关闭拦截。 |
+| `convergenceGuard` | `true` | 用同归属任务的结构化验收和阻塞记录拦截连续两轮未收敛的返工。派单参数不变时，`rerun_after_change` 最多换取一次重试。 |
+| `historicalGapReview` | `true` | 允许逐条记录无法补回的历史记录。填写 `historical_gap` 和 `accepted`，保留未满足状态。必验、安全、权限及数据完整性项按原复核规则处理。 |
+| `dispatchConsistency` | `true` | 用 `required_writes` 和可确定的书面交付路径查派单读写及 scope 矛盾。 |
+| `actionableReceipts` | `true` | 收尾、复核参数和待答问题出错时，附上本会话可确认的任务和条目编号以及提交骨架。 |
+| `verificationReuse` | `true` | 跳过全部条目均未满足且无产出的受阻任务。同一任务的文件版本与核验范围均可确认未变时复用已有核验。 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
 | `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
@@ -848,6 +853,11 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
 | `repeatFailureGuard` | `{ enabled: true, minSeconds: 60, failures: 2, windowHours: 24 }` | Editable in the settings panel. Failed steps lasting at least `minSeconds` count per directory and step. The runner blocks a repeat once the count reaches `failures` and the last failure is within `windowHours`. Seconds and hours must be positive finite numbers, and the count must be a positive integer. Invalid fields warn and fall back individually. Set `enabled: false` to turn off blocking. |
 | `closeoutGuard` | `true` | Refuse new-work `codex_run` and planner `update_goal(action=complete)` while the session has valid flagged reports awaiting review or open `needs_changes` work. Continue, resume, verify, queries and UI actions stay available. For `needs_changes` reviews recorded since 0.9.122 was first loaded, show the latest rework round and keep the debt until a completed successor is reviewed as `verified` or `accepted_deviations`. Earlier rework reviews still need any follow-up. Goal completion warns about clean unreviewed write jobs. Jobs started before the first 0.9.103 load are excluded, and unreadable records fail open with a warning. Set `false` to disable blocking. |
+| `convergenceGuard` | `true` | Stop repeated rework after two rounds with the same criteria and blockers. With unchanged dispatch parameters, `rerun_after_change` permits one further attempt. |
+| `historicalGapReview` | `true` | Record unrecoverable historical evidence using `historical_gap` and an `accepted` reason. Required measurements, security, authorization and integrity retain their review requirements. |
+| `dispatchConsistency` | `true` | Check `required_writes` and explicit deliverable paths against the write flag, read-only constraints and scope. |
+| `actionableReceipts` | `true` | Include owned job and item IDs and submission templates in closeout, review and answer errors. |
+| `verificationReuse` | `true` | Skip blocked jobs that report no met criteria and have no products. Reuse verification when the same job's observable file version and verification scope match. |
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
 | `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |
 | `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |

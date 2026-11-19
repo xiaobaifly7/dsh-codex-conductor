@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.132-converge.0`（候选，待定）同一交付链连续两轮卡在同一处时阻止原样重派，参数未变时仅凭变化说明最多再试一轮。新增不可补回历史证据标记、必写路径自检和带真实编号的收尾回执。跳过无产出的受阻任务核验，拒绝文件和核验范围均未变的重复核验。
+
 `0.9.131` `codex_continue` 和带 `resume` 的 `codex_run` 启动写任务前，比对同线程及续接链上仍在运行的核验范围。范围重叠时复查核验状态，再提示规划端等待。查询失败会记录警告，已结束的核验、只读续接和范围不重叠的续接可照常启动。
 
 `0.9.130` 主机核验比对常规文件的大小、纳秒级修改时间和类型，两次快照均取得内容哈希时也比对哈希。脏文件较多时并行读取元数据。快照不可用时（包括线程启动失败），保留核验结果并记录失败阶段和原因类型。
@@ -157,6 +159,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.132-converge.0` (unreleased candidate) stops unchanged rework after two rounds with the same outcome. One further attempt may rely on an explanation alone. Reviews can close out unrecoverable historical evidence. Dispatch checks required write paths, recovery receipts include exact identifiers and submission templates, and verification skips blocked rounds without products and rejects duplicates with the same observed files and scope.
 
 `0.9.131` checks running verifications in the same thread or continuation chain before starting write continuations in `codex_continue` and `codex_run` with `resume`. It rechecks an overlapping verification before asking the planner to wait. Query failures log a warning. Completed verifications, read-only continuations and disjoint write scopes do not block dispatch.
 

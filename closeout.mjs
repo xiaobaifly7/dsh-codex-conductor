@@ -6,6 +6,13 @@ const STATUSES = ['verified', 'needs_changes', 'accepted_deviations'];
 const MARKS = ['met', 'not_met', 'blocked'];
 const BLOCKER_KINDS = ['user_input', 'task_conflict', 'environment', 'implementation'];
 export const OWNER_ONLY_REASONS = ['irreversible_data', 'outward_action', 'spending', 'credentials', 'security_boundary'];
+const HISTORICAL_WORDING = {
+  missing_snapshot: /(?:开工前|事前|操作前|变更前|pre[- ](?:work|change)|before (?:the )?(?:change|run)).{0,32}(?:快照|snapshot)/iu,
+  historical_redaction: /(?:历史|当时|上轮|historical|previous).{0,32}(?:脱敏|redact)/iu,
+  historical_runtime_record: /(?:历史|当时|上轮|historical|previous).{0,32}(?:PID|时间|timestamp)/iu,
+};
+export const HISTORICAL_GAP_KINDS = Object.keys(HISTORICAL_WORDING);
+const PROTECTED_EVIDENCE = /安全|权限|授权|凭据|密钥|令牌|漏洞|隐私|敏感|数据完整性|备份|恢复|回滚|校验和|哈希|security|credential|secret|permission|authori[sz]|privacy|integrity|backup|restore|rollback|checksum|hash/iu;
 const clip = (value, size = 60) => { const s = String(value ?? '').replace(/\s+/g, ' ').trim(); return s.length > size ? `${s.slice(0, size)}…` : s; };
 const label = (a) => (typeof a === 'string' ? a : a?.criterion ?? '');
 const nonempty = (s) => typeof s === 'string' && s.trim() !== '';
@@ -49,7 +56,19 @@ export function prepareReview(args, source) {
   let inferred = 0;
   // accepted 的检查（criteria 与 report_rows 共用）；骨架留下的占位在用不上时直接去掉，用得上时给出带结构示例的提示。
   const checkAccepted = (c, n, field) => {
-    const open = review.status === 'accepted_deviations' && c.status !== 'met';
+    const open = c.status !== 'met' && (review.status === 'accepted_deviations' ||
+      (source.historicalGapReview && c.historical_gap && review.status === 'needs_changes'));
+    if (Object.hasOwn(c, 'historical_gap')) {
+      const text = label(c.row ? source.structured?.criteria?.[c.row - 1] : acceptance?.[c.index - 1]);
+      const original = c.row ? source.structured?.criteria?.[c.row - 1] : reportRowOf(acceptance, source.structured?.criteria, c.index);
+      if (source.historicalGapReview !== true || !open || !['not_met', 'blocked'].includes(c.status) ||
+          !nonempty(c.accepted) || placeholder(c.accepted) || c.owner_only || source.context?.must_verify?.includes(c.index) ||
+          !Object.hasOwn(HISTORICAL_WORDING, c.historical_gap) || !HISTORICAL_WORDING[c.historical_gap].test(text) ||
+          PROTECTED_EVIDENCE.test(text) || !['not_met', 'blocked'].includes(original?.status) ||
+          (c.index && acceptance.indexOf(text) !== acceptance.lastIndexOf(text))) {
+        problems.push(`${field} 第 ${n + 1} 项不能标记 historical_gap：只用于原报告未满足的历史记录项，须写 accepted 原因；must_verify、安全、权限与数据完整性项按原规则处理`);
+      }
+    }
     if (Object.hasOwn(c, 'owner_only') && (!open || !MARKS.includes(c.status) ||
         !nonempty(c.accepted) || placeholder(c.accepted) || !OWNER_ONLY_REASONS.includes(c.owner_only))) {
       problems.push(`${field} 第 ${n + 1} 项的 owner_only 只用于有 accepted 的未满足条目，原因须为 ${OWNER_ONLY_REASONS.join('、')}`);
@@ -85,7 +104,7 @@ export function prepareReview(args, source) {
         // 带条文却对不上时不按位置猜，避免把结论记到别的验收项上。
         else if (byOrder && !nonempty(criterion)) { c.index = n + 1; fixed.push(`criteria 第 ${n + 1} 项按顺序补 index ${n + 1}`); }
       }
-      const extra = Object.keys(c).filter((k) => !['index', 'status', 'evidence', 'accepted', 'owner_only'].includes(k));
+      const extra = Object.keys(c).filter((k) => !['index', 'status', 'evidence', 'accepted', 'owner_only', 'historical_gap'].includes(k));
       checkAccepted(c, n, 'criteria');
       if (extra.length) problems.push(`criteria 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
       if (!Number.isInteger(c.index)) problems.push(`criteria 第 ${n + 1} 项缺少整数 index（从 1 开始，对应验收标准序号）` +
@@ -112,7 +131,7 @@ export function prepareReview(args, source) {
       review.report_rows = review.report_rows.map((raw, n) => {
         if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { problems.push(`report_rows 第 ${n + 1} 项不是对象`); return raw; }
         const r = { ...raw, row: asInt(raw.row) };
-        const extra = Object.keys(r).filter((k) => !['row', 'status', 'evidence', 'accepted', 'owner_only'].includes(k));
+        const extra = Object.keys(r).filter((k) => !['row', 'status', 'evidence', 'accepted', 'owner_only', 'historical_gap'].includes(k));
         if (extra.length) problems.push(`report_rows 第 ${n + 1} 项有多余字段：${extra.join('、')}`);
         checkAccepted(r, n, 'report_rows');
         if (!extraRows.some((f) => f.row === r.row)) problems.push(`report_rows 第 ${n + 1} 项的 row ${JSON.stringify(r.row) ?? '未填'} 不需要单独处理；` +
@@ -203,7 +222,7 @@ export function prepareReview(args, source) {
   }
   const acceptedOpen = [];
   let openUnsupported = 0;
-  if (review.status === 'accepted_deviations') {
+  if (review.status === 'accepted_deviations' || review.status === 'needs_changes') {
     const flagged = new Map();
     for (const f of flaggedCriteria(source)) {
       if (flagged.get(f.key)?.status !== 'not_met') flagged.set(f.key, f);
@@ -211,10 +230,13 @@ export function prepareReview(args, source) {
     const required = new Set(mustVerifyCriteria(source).map(f => f.key));
     for (const c of [...(Array.isArray(review.criteria) ? review.criteria : []), ...(Array.isArray(review.report_rows) ? review.report_rows : [])]) {
       if (!c || !['blocked', 'not_met'].includes(c.status) || !nonempty(c.accepted) || placeholder(c.accepted)) continue;
+      if (review.status === 'needs_changes' && !c.historical_gap) continue;
       const key = c.row ? `row${c.row}` : String(c.index);
       const kinds = (source?.openSupport?.[key] ?? []).filter(kind => kind !== 'user_blocker');
       acceptedOpen.push({ key, ...(c.row ? { row: c.row } : { index: c.index }), status: c.status, support: kinds,
-        ...(OWNER_ONLY_REASONS.includes(c.owner_only) ? { owner_only: c.owner_only } : {}) });
+        ...(OWNER_ONLY_REASONS.includes(c.owner_only) ? { owner_only: c.owner_only } : {}),
+        ...(c.historical_gap ? { historical_gap: c.historical_gap, reason: c.accepted } : {}) });
+      if (c.historical_gap) continue;
       if (!source?.openLevel || source.openLevel === 'off') continue;
       const flag = flagged.get(key);
       const original = flag?.status ?? reportRowOf(acceptance, source.structured?.criteria, c.index)?.status;
@@ -237,7 +259,7 @@ export function prepareReview(args, source) {
     problems.push(`骨架里还有 ${TODO} 占位没有换成你的结论或依据`);
   }
   if (review.status === 'needs_changes' && !deviations.length && Array.isArray(review.criteria) && review.criteria.length &&
-      [...review.criteria, ...(Array.isArray(review.report_rows) ? review.report_rows : [])].every((c) => c?.status === 'met') && !(review.blockers ?? []).length) {
+      [...review.criteria, ...(Array.isArray(review.report_rows) ? review.report_rows : [])].every((c) => c?.status === 'met' || c?.historical_gap) && !(review.blockers ?? []).length) {
     problems.push('所有验收项都 met 且无阻塞、无偏差时不能记 needs_changes：被审对象的缺陷写进 notes 并记 verified；确有执行缺口就把对应条目标 not_met' +
       (extraRows.length ? `（对不上验收清单的报告第 ${extraRows.map((f) => f.row).join('、')} 行在 report_rows 标）` : '') + ' 或加 blocker');
   }
@@ -295,9 +317,10 @@ export function reviewSkeleton(jobId, source, review = {}) {
   const given = new Map((Array.isArray(review.criteria) ? review.criteria : [])
     .filter((c) => c && Number.isInteger(c.index)).map((c) => [c.index, c]));
   // accepted_deviations 里保留 not_met/blocked 的条目带上 accepted：沿用已填的原因，没有就留占位。
-  const withAccepted = (entry, c) => (status === 'accepted_deviations' && ['not_met', 'blocked'].includes(entry.status)
+  const withAccepted = (entry, c) => ((status === 'accepted_deviations' || c?.historical_gap) && ['not_met', 'blocked'].includes(entry.status)
     ? { ...entry, accepted: nonempty(c?.accepted) && !placeholder(c.accepted) ? c.accepted : TODO,
-      ...(OWNER_ONLY_REASONS.includes(c?.owner_only) ? { owner_only: c.owner_only } : {}) } : entry);
+      ...(OWNER_ONLY_REASONS.includes(c?.owner_only) ? { owner_only: c.owner_only } : {}),
+      ...(HISTORICAL_GAP_KINDS.includes(c?.historical_gap) ? { historical_gap: c.historical_gap } : {}) } : entry);
   const criteria = acceptance ? acceptance.map((_a, i) => {
     const c = given.get(i + 1);
     return withAccepted({ index: i + 1, status: MARKS.includes(c?.status) ? c.status : TODO, evidence: nonempty(c?.evidence) ? c.evidence : TODO }, c);
@@ -453,6 +476,14 @@ export function flaggedCriteria(source) {
     if (!index) return [{ key: `row${i + 1}`, row: i + 1, status: c.status, criterion: c.criterion, evidence: c.evidence }];
     return [{ key: String(index), index, status: c.status, criterion: acceptance ? label(acceptance[index - 1]) : c.criterion, evidence: c.evidence }];
   });
+}
+
+export function historicalCriteria(source) {
+  const inherited = source?.context?.routing?.historical_criteria ?? [];
+  const review = source?.verification;
+  if (!['accepted_deviations', 'needs_changes'].includes(review?.status)) return inherited;
+  return [...new Set([...inherited, ...(review.criteria ?? []).filter(item => HISTORICAL_GAP_KINDS.includes(item.historical_gap))
+    .map(item => source.context?.acceptance?.[item.index - 1]).filter(Boolean)])];
 }
 
 // 核验任务为每个自标未满足的原验收项（或对不上验收清单的报告行）单列一条验收，核验报告的这一条就是该项的独立结论。

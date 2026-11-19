@@ -4785,6 +4785,23 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(sorted(entry.name for entry in self.cwd.iterdir()), ["temp_check.py"])
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_verification_version_tracks_stable_scoped_git_bytes(self):
+        _, project, _ = self.git_repo("verification-version")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Read the source file", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["read source file"], "write": False, "verification_of": "SOURCE",
+            "routing": {"verification_scope": '["",8,[],[]]'}}})
+        result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "read-only", prompt=prompt)
+        version = self.control("verification-version", "SOURCE")["verification_version"]
+        self.assertRegex(version, r"^[a-f0-9]{64}$")
+        self.assertEqual(result["verification_version"], version)
+        file = project / "a.txt"
+        file.write_bytes(b"new version\n")
+        self.assertNotEqual(self.control("verification-version", "SOURCE")["verification_version"], version)
+        (project / "hidden.log").write_bytes(b"ignored evidence\n")
+        self.assertIsNone(self.control("verification-version", "SOURCE")["verification_version"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_host_verification_fails_if_git_status_changes(self):
         _, project, git = self.git_repo("verification")
         self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
