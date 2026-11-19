@@ -6183,6 +6183,53 @@ test('codex_continue with verify_previous refuses an overlapping verification be
   }
 });
 
+test('codex_continue and codex_run resume wait for an overlapping running verification', async (t) => {
+  const exec = { agent: agentAt('/work/original') };
+  const setup = (write = true) => {
+    const parent = workflowSource('implementation');
+    if (!write) {
+      parent.context.write = false;
+      parent.sandbox = 'read-only';
+      parent.task_options = {};
+    }
+    const verification = { job_id: 'CHECK', execution_status: 'running', context: { owner: 'S1', verification_of: 'PARENT' } };
+    const h = harness({ config: { startResult: { job_id: 'CHILD', status: 'completed' }, listResult: (argv) => {
+      const rows = argv.includes('--thread-id') ? [parent]
+        : argv.includes('--status') && verification.execution_status === 'running' ? [verification] : [];
+      return { jobs: rows, total: rows.length };
+    } } });
+    h.finals.PARENT = parent;
+    return { h, verification };
+  };
+  const resume = (h, scope, options = {}) => h.tools.codex_run.execute({
+    ...RUN, write: true, scope, resume: 'THREAD', ...options,
+  }, exec);
+  const continueJob = (h, options = {}) => h.tools.codex_continue.execute({ job_id: 'PARENT', wait_seconds: 0, ...options }, exec);
+
+  for (const [name, call] of [
+    ['codex_continue', continueJob],
+    ['codex_continue on a fresh thread', h => continueJob(h, { fresh: true })],
+    ['codex_run resume', h => resume(h, ['src/new.js'])],
+    ['codex_run resume on a fresh thread', h => resume(h, ['src/new.js'], { fresh: true })],
+  ]) {
+    await t.test(name, async () => {
+      const { h, verification } = setup();
+      await assert.rejects(call(h), /与任务 PARENT 的产物或 scope 重叠.*未派出这一单.*核验还在跑.*等它结束/);
+      assert.equal(h.calls.some(argv => argv[0] === 'start'), false);
+      verification.execution_status = 'completed';
+      assert.equal((await call(h)).job_id, 'CHILD');
+    });
+  }
+  await t.test('disjoint resume in the same directory', async () => {
+    const { h } = setup();
+    assert.equal((await resume(h, ['docs'])).job_id, 'CHILD');
+  });
+  await t.test('read-only continuation with overlap', async () => {
+    const { h } = setup(false);
+    assert.equal((await continueJob(h)).job_id, 'CHILD');
+  });
+});
+
 test('codex_review finds independent support in a later verification, a later round or a user reply, and counts outcomes', async () => {
   const now = Date.now() / 1000;
   const parent = { ...workflowSource('implementation'), finished_at: now + 100, started_at: now + 50 };

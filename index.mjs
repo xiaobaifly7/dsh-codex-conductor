@@ -2313,7 +2313,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const overlap = mine.filter((a) => theirs.some((b) => under(a, b) || under(b, a)));
     if (overlap.length) {
       throw new Error(`${tool}: 这一单的写入范围（${overlap.slice(0, 3).join('、')}）与任务 ${jobId} 的产物或 scope 重叠，不能边改边核验，未派出这一单。` +
-        (running ? `任务 ${jobId} 的核验还在跑，等它结束、记完 codex_review 再派这一单；或把这一单的写入范围改到不重叠的路径。`
+        (running ? `任务 ${jobId} 的核验还在跑，等它结束、记完 codex_review 再派这一单` +
+            (tool === 'codex_continue' ? '。' : '；或把这一单的写入范围改到不重叠的路径。')
           : `请先 codex_verify ${jobId} 并等它结束、记完 codex_review，再派这一单；或去掉 verify_previous。`));
     }
     return { source, overlap };
@@ -2496,7 +2497,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const tool = continuation ? 'codex_continue' : 'codex_run';
       const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
         (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
-      // 收尾护栏只拦开新工作的 codex_run；续接、返工（resume）和核验照常放行。读不到记录或判定出错时放行并记警告。
+      // 收尾护栏只拦开新工作的 codex_run。读不到记录或判定出错时放行并记警告。
       // 与其余预检查询并行，启动前再取结果；只多等最慢的一个查询，判定仍以本次派单时的记录为准。
       const closeout = cfg.closeoutGuard !== false && owner && !continuation && !args.resume && !verificationOf
         ? closeoutCheck(owner, tool, exec?.signal, { args, exec, guard }) : null;
@@ -2605,6 +2606,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (cfg.repeatFailureGuard.enabled && repeat?.status === 'completed') standingLine = repeatStandingLine(repeat.standing);
       predispatch = predispatchWarnings(args, cwd, guard.parent ?? latestOnThread, repeat);
       if (args.rerun_after_change) routing = { ...routing, rerun_after_change: true };
+      const parentJobId = continuation?.parent_job_id ?? fresh?.continuation?.parent_job_id ?? latestOnThread?.job_id;
+      if (owner && args.write === true && parentJobId) {
+        const check = await findVerification(parentJobId, owner, false, exec?.signal).catch(error => {
+          if (!exec?.signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] ${tool} 核验查询失败，已放行：${error?.message ?? error}`);
+        });
+        if (check) {
+          try { await verifyPreviousCheck(parentJobId, args, exec, tool, true); }
+          catch (error) { throw reject(error.message); }
+        }
+        exec?.signal?.throwIfAborted();
+      }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         ...(args.must_verify?.length ? { must_verify: [...new Set(args.must_verify)] } : {}),
