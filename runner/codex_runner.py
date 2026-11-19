@@ -1227,6 +1227,16 @@ def observations_changed(before, after):
     return any(key in before and before[key] != value for key, value in after.items())
 
 
+def verification_observations_changed(before, after):
+    for name in before.keys() & after.keys():
+        previous_stat, previous_hash = before[name]
+        current_stat, current_hash = after[name]
+        if previous_stat != current_stat or (
+                previous_hash is not None and current_hash is not None and previous_hash != current_hash):
+            return True
+    return False
+
+
 def stat_fingerprint(info):
     return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
 
@@ -1241,10 +1251,11 @@ def dirty_file_stats(directory, names, deadline):
             try:
                 info = path.lstat()
                 if stat.S_ISREG(info.st_mode):
-                    fingerprints[name] = stat_fingerprint(info)
+                    fingerprints[name] = (stat_fingerprint(info), None)
                     continue
                 if stat.S_ISLNK(info.st_mode):
-                    fingerprints[name] = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+                    content_hash = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+                    fingerprints[name] = (stat_fingerprint(info), content_hash)
                     continue
             except (OSError, ValueError):
                 pass
@@ -1275,15 +1286,17 @@ def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
         limit = min(remaining, VERIFY_FILE_LIMIT)
         try:
             info = path.lstat()
+            metadata = stat_fingerprint(info) if stat_fallback else None
             if stat.S_ISLNK(info.st_mode):
                 content = os.fsencode(os.readlink(path))
             elif stat.S_ISREG(info.st_mode):
+                if stat_fallback:
+                    hashes[name] = (metadata, None)
                 if info.st_size <= limit:
                     with os.fdopen(os.open(path, flags), "rb") as file:
                         opened = os.fstat(file.fileno())
                         content = file.read(limit + 1) if stat.S_ISREG(opened.st_mode) and opened.st_size <= limit else None
                 elif stat_fallback:
-                    hashes[name] = stat_fingerprint(info)
                     continue
                 else:
                     content = None
@@ -1295,7 +1308,8 @@ def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
             unchecked.add(name)
         else:
             remaining -= len(content)
-            hashes[name] = hashlib.sha256(content).hexdigest()
+            content_hash = hashlib.sha256(content).hexdigest()
+            hashes[name] = (metadata, content_hash) if stat_fallback else content_hash
     return hashes, unchecked
 
 
@@ -1571,6 +1585,8 @@ def execute(args, prompt, run_dir):
             return None, f"{stage}_timeout"
         except (OSError, ValueError):
             return None, f"{stage}_git_error"
+        except RuntimeError:
+            return None, f"{stage}_error"
         return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
 
     before_digest, before_reason = take_snapshot("before") if host_verification else (None, None)
@@ -1584,7 +1600,8 @@ def execute(args, prompt, run_dir):
         else:
             before_whole, before_scope, before_unchecked = before_digest
             after_whole, after_scope, after_unchecked = after_digest
-            scope_changed = before_scope[0] != after_scope[0] or observations_changed(before_scope[1], after_scope[1])
+            scope_changed = before_scope[0] != after_scope[0] or verification_observations_changed(
+                before_scope[1], after_scope[1])
             unchecked = before_unchecked | after_unchecked
             if unchecked:
                 result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))

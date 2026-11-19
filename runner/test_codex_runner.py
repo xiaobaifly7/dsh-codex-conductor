@@ -4882,7 +4882,7 @@ class RunnerTests(unittest.TestCase):
             after = codex_runner.verification_git_digest(str(project), [str(project)])
         self.assertEqual(before[2] | after[2], set())
         self.assertEqual(before[1][0], after[1][0])
-        self.assertTrue(codex_runner.observations_changed(before[1][1], after[1][1]))
+        self.assertTrue(codex_runner.verification_observations_changed(before[1][1], after[1][1]))
 
     def test_host_verification_saves_unavailable_reason(self):
         self.stored_job("SOURCE", {"status": "completed"})
@@ -4893,6 +4893,83 @@ class RunnerTests(unittest.TestCase):
         saved = json.loads((Path(result["log_dir"]) / "result.json").read_text(encoding="utf-8"))
         self.assertEqual((saved["status"], saved.get("verification_integrity"), saved.get("verification_integrity_reason")),
                          ("completed", "unavailable", "before_git_error"))
+
+    def execute_host_verification(self, project, run_dir, edit=None):
+        import codex_runner
+
+        args = SimpleNamespace(cwd=str(project), sandbox="danger-full-access", resume=None, schema=True,
+                               repeat_guard="off", context={"write": False, "verification_of": "SOURCE"})
+
+        def attempt(*args):
+            if edit is not None:
+                edit()
+            return {"completed": True, "failed": False, "thread_id": "thread-1", "file_changes": [],
+                    "last_text": json.dumps(self.sample_report()), "usage": {}, "commands": [], "forced_exit": False}
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "router_reachable", return_value=True), \
+                mock.patch.object(codex_runner, "run_attempt", side_effect=attempt):
+            result = codex_runner.execute(args, "Verify the task", run_dir)
+            codex_runner.write_result(run_dir, result)
+        return json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_ignores_budget_shift_after_transient_read_failure(self):
+        _, project, _ = self.git_repo("verification-budget-shift")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        content = b"x" * (1024 * 1024)
+        for number in range(33):
+            (project / f"f{number:02}").write_bytes(content)
+        original_open = os.open
+        fail_once = True
+
+        def open_with_transient_failure(path, *args, **kwargs):
+            nonlocal fail_once
+            if fail_once and os.fspath(path) == str(project / "f00"):
+                fail_once = False
+                raise PermissionError("injected transient read failure")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(os, "open", side_effect=open_with_transient_failure):
+            result = self.execute_host_verification(project, Path(self.tmp.name) / "budget-shift-run")
+        self.assertEqual((result["status"], result.get("error_kind"), result.get("verification_integrity"),
+                          result.get("verification_unchecked_files")), ("completed", None, "unchecked", 1))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_detects_small_content_change_with_unchanged_stat(self):
+        _, project, _ = self.git_repo("verification-unchanged-stat")
+        target = project / "dirty.txt"
+        target.write_bytes(b"before")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["dirty.txt"])
+
+        def edit():
+            before = target.stat()
+            target.write_bytes(b"change")
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = target.stat()
+            self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "unchanged-stat-run", edit=edit)
+        self.assertEqual((result["status"], result.get("error_kind")), ("failed", "verification_tree_changed"))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_preserves_result_when_snapshot_threads_fail(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-thread-failure")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        for number in range(codex_runner.VERIFY_CONTENT_FILES + 1):
+            (project / f"f{number:03}").write_bytes(b"x")
+        for stage in ("before", "after"):
+            outcomes = [RuntimeError("injected thread startup failure")]
+            if stage == "after":
+                outcomes.insert(0, codex_runner.ThreadPoolExecutor(max_workers=2))
+            with self.subTest(stage=stage), \
+                    mock.patch.object(codex_runner, "ThreadPoolExecutor", side_effect=outcomes):
+                result = self.execute_host_verification(project, Path(self.tmp.name) / f"thread-failure-{stage}")
+                self.assertEqual((result["status"], result.get("verification_integrity"),
+                                  result.get("verification_integrity_reason"), result.get("structured")),
+                                 ("completed", "unavailable", f"{stage}_error", self.sample_report()))
 
     @unittest.skipUnless(hasattr(os, "mkfifo") and shutil.which("git"), "needs POSIX FIFOs and git")
     def test_review_r2_host_verification_does_not_wait_on_fifo_replacing_dirty_file(self):

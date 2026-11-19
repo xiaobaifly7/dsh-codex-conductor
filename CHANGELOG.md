@@ -2,7 +2,7 @@
 
 [English](#english)
 
-`0.9.130` 主机核验在内容读取预算外用文件大小、纳秒级修改时间和类型比对常规文件，脏文件较多时并行读取元数据。快照不可用时，结果记录失败阶段和原因类型。
+`0.9.130` 主机核验比对常规文件的大小、纳秒级修改时间和类型，两次快照均取得内容哈希时也比对哈希。脏文件较多时并行读取元数据。快照不可用时（包括线程启动失败），保留核验结果并记录失败阶段和原因类型。
 
 `0.9.129` 新增 `repeatFailureGuard`，默认拦截 24 小时内同目录反复失败且未观察到改动的长步骤，派单回执、完成通知及多轮汇总显示近期失败，运行状态显示拦截统计。外部条件变化后可用 `rerun_after_change` 说明变化并重跑。确认执行环境中断时，runner 补写 `executor_lost` 并恢复可用的线程号。新增 `ownerDecisions`，规划端默认按常设授权记录决定并续接，`owner_only` 提问留给所有者并跳过自动代答。报告级待答阻塞从接受未完成项的依据中移除。续接派单提示未改变的同项环境阻塞，`acceptance_needs` 提示近期失败的依赖步骤，`expect_blocked` 指示执行端按环境受阻汇报指定条目。普通续接在关闭线程大小阈值时复用现有查询。独立核验可运行需要临时文件的检查，沙箱核验只允许在每单的暂存目录写入。主机核验在项目外存放临时文件，比较受核验路径的 Git 状态、索引和可比对的文件内容，报告范围外变更和未比对文件。无明确路径时以原任务目录为范围，只有重叠写任务可将范围内变更标为并行。失败记录逐次过期，重跑判断也检查 Git 和脚本状态。新线程续接保留规划端决定，宿主打开问题后才标记已问，依赖匹配忽略脚本扩展名。
 
@@ -156,7 +156,7 @@
 
 ## English
 
-`0.9.130` uses size, nanosecond modification time and file type to compare regular files outside the host verification content budget. Large dirty scopes read file metadata in parallel. Unavailable snapshots record the stage and reason category in the result.
+`0.9.130` compares regular files by size, nanosecond modification time and file type during host verification. It also compares content hashes when both snapshots have them. Large dirty scopes read file metadata in parallel. Unavailable snapshots, including thread startup failures, preserve the verification result and record the stage and reason category.
 
 `0.9.129` adds `repeatFailureGuard`. By default it blocks long steps that repeatedly fail in the same directory within 24 hours without an observed change. Dispatch, completion and summary receipts show standing failures, and runtime status shows block counts. Use `rerun_after_change` to explain changed external conditions and rerun. When executor loss is confirmed, the runner records `executor_lost` and any recoverable thread ID. `ownerDecisions` defaults to recording decisions under standing authorization before continuing. `owner_only` questions go to the owner and skip auto-answer. Report-level questions no longer support accepting individual open items. Dispatch warns about unchanged environment blockers and standing failures in declared `acceptance_needs`. `expect_blocked` tells the executor which items to report as environment-blocked. Ordinary resumes reuse the existing query when the thread size threshold is disabled. Independent verification can run checks that need temporary files. Sandboxed verification writes to per-job scratch. Host-access verification compares Git status, index and bounded file contents, and reports out-of-scope changes and unchecked files. Without declared paths, it monitors the source directory and discounts in-scope changes only for overlapping writers. Failures expire individually, and the guard checks Git and script state before blocking a rerun. Fresh repairs retain planner decisions, owner questions count after the host opens them, and dependency matching ignores script extensions.
 
