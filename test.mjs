@@ -6230,6 +6230,98 @@ test('codex_continue and codex_run resume wait for an overlapping running verifi
   });
 });
 
+test('resume verification preflight tracks the continuation chain and current status', async (t) => {
+  const setup = (options = {}) => {
+    const parent = workflowSource('implementation');
+    const read = { ...parent, job_id: 'READ', context: { ...parent.context, write: false } };
+    const verification = { job_id: 'CHECK', execution_status: 'running', context: { owner: 'S1', verification_of: 'PARENT' } };
+    const threads = { THREAD: [parent] };
+    const running = [verification];
+    const h = harness({ config: {
+      startResult: { job_id: 'CHILD', status: 'completed' },
+      listResult(argv) {
+        const thread = argv.includes('--thread-id') ? argv[argv.indexOf('--thread-id') + 1] : undefined;
+        const jobs = thread ? threads[thread] ?? [] : argv.includes('--status') ? running : [];
+        return { jobs: structuredClone(jobs), total: jobs.length };
+      },
+      ...options,
+    } });
+    Object.assign(h.finals, { PARENT: parent, READ: read, CHECK: verification });
+    return { h, parent, read, threads, running, verification };
+  };
+  const resume = (h, args = {}, signal) => h.tools.codex_run.execute({
+    ...RUN, write: true, scope: ['src/new.js'], resume: 'THREAD', ...args,
+  }, { agent: agentAt('/work/original'), signal });
+  const starts = (h) => h.calls.filter(argv => argv[0] === 'start').length;
+  const overlap = /与任务 PARENT 的产物或 scope 重叠.*核验还在跑/;
+
+  await t.test('an older same-thread job is still protected after a read-only resume', async () => {
+    const { h, parent, read, threads } = setup({
+      startResult: (_argv, { stdin }) => ({ job_id: JSON.parse(stdin).context.write ? 'WRITE' : 'READ', status: 'completed' }),
+    });
+    assert.equal((await resume(h, { write: false })).job_id, 'READ');
+    threads.THREAD = [read, parent];
+    await assert.rejects(resume(h), overlap);
+    assert.equal(starts(h), 1);
+  });
+  await t.test('an earlier thread linked through a parent remains protected', async () => {
+    const { h, parent, read, threads } = setup();
+    threads.THREAD = [read, parent];
+    threads.NEW = [{ ...parent, job_id: 'NEW-HEAD', thread_id: 'NEW', parent_job_id: 'READ' }];
+    await assert.rejects(resume(h, { resume: 'NEW' }), overlap);
+    assert.equal(starts(h), 0);
+  });
+  await t.test('first disjoint verification does not hide another overlapping check', async () => {
+    const { h, parent, read, threads, running } = setup();
+    const disjoint = { ...read, scope: ['docs'], scope_paths: ['/work/original/docs'] };
+    threads.THREAD = [disjoint, parent];
+    h.finals.READ = disjoint;
+    running.unshift({ job_id: 'CHECK-DOCS', execution_status: 'running', context: { owner: 'S1', verification_of: 'READ' } });
+    await assert.rejects(resume(h), overlap);
+    assert.equal(starts(h), 0);
+  });
+  await t.test('an unrelated thread in the same directory is not protected by this check', async () => {
+    const { h, parent, threads } = setup();
+    threads.NEW = [{ ...parent, job_id: 'UNRELATED', thread_id: 'NEW' }];
+    assert.equal((await resume(h, { resume: 'NEW' })).job_id, 'CHILD');
+    assert.equal(h.calls.some(argv => argv[0] === 'status' && argv[1] === 'PARENT'), false);
+  });
+  for (const mode of ['bridge_error', 'exception']) {
+    await t.test(`source query ${mode} warns and allows disjoint resume`, async () => {
+      const { h } = setup({ statusResult(argv) {
+        if (argv[1] !== 'PARENT') return;
+        if (mode === 'exception') throw new Error('source query unavailable');
+        return { status: 'failed', error_kind: mode };
+      } });
+      assert.equal((await resume(h, { scope: ['docs'] })).job_id, 'CHILD');
+      assert.ok(h.warnings.some(warning => /核验查询失败.*已放行/.test(warning)));
+    });
+  }
+  await t.test('a confirmed ownership mismatch rejects the resume', async () => {
+    const { h, parent } = setup();
+    h.finals.PARENT = { ...parent, context: { ...parent.context, owner: 'OTHER' } };
+    await assert.rejects(resume(h, { scope: ['docs'] }), /归属未知或不属于当前会话/);
+    assert.equal(starts(h), 0);
+  });
+  await t.test('cancellation during the source query propagates without dispatch', async () => {
+    const controller = new AbortController();
+    const reason = new Error('cancelled during preflight');
+    const { h } = setup({ statusResult(argv) {
+      if (argv[1] === 'PARENT') controller.abort(reason);
+    } });
+    await assert.rejects(resume(h, {}, controller.signal), error => error === reason);
+    assert.equal(starts(h), 0);
+    assert.equal(h.warnings.some(warning => /核验查询失败/.test(warning)), false);
+  });
+  await t.test('a verification ending after the running list is released on the same dispatch', async () => {
+    const { h, verification } = setup({ statusResult(argv) {
+      if (argv[1] === 'PARENT') verification.execution_status = 'completed';
+    } });
+    assert.equal((await resume(h)).job_id, 'CHILD');
+    assert.ok(h.calls.some(argv => argv[0] === 'status' && argv[1] === 'CHECK'));
+  });
+});
+
 test('codex_review finds independent support in a later verification, a later round or a user reply, and counts outcomes', async () => {
   const now = Date.now() / 1000;
   const parent = { ...workflowSource('implementation'), finished_at: now + 100, started_at: now + 50 };

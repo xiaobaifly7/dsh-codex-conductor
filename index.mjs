@@ -2296,6 +2296,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // verify_previous：派这一单的同时核验一个已结束的任务。核验只读、不加锁；新单只读，或写入范围与被核验任务的产物和 scope
   // 互不包含时才允许，否则核验可能读到新单改到一半的文件。路径按 normPath 比较（/mnt 下不分大小写），任一方向包含即算重叠。
+  function verificationWriteOverlap(source, args, exec) {
+    const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces) ?? '';
+    const mine = [...(args.scope?.length ? args.scope : ['.']), ...(args.writable_roots ?? [])].map((p) => taskScopePath(cwd, p));
+    const scoped = source.scope_paths ?? source.scope;
+    const theirs = [...(Array.isArray(scoped) && scoped.length ? scoped : ['.']), ...[...source.files_changed ?? [], ...source.write_paths ?? []]
+      .map((file) => typeof file === 'string' ? file : file?.path).filter((file) => typeof file === 'string' && file.trim())]
+      .map((p) => taskScopePath(source.cwd ?? '', p));
+    return mine.filter((a) => theirs.some((b) => under(a, b) || under(b, a)));
+  }
+  function verificationOverlapRefusal(jobId, overlap, tool, running) {
+    return `${tool}: 这一单的写入范围（${overlap.slice(0, 3).join('、')}）与任务 ${jobId} 的产物或 scope 重叠，不能边改边核验，未派出这一单。` +
+      (running ? `任务 ${jobId} 的核验还在跑，等它结束、记完 codex_review 再派这一单` +
+          (tool === 'codex_continue' ? '。' : '；或把这一单的写入范围改到不重叠的路径。')
+        : `请先 codex_verify ${jobId} 并等它结束、记完 codex_review，再派这一单；或去掉 verify_previous。`);
+  }
   async function verifyPreviousCheck(jobId, args, exec, tool, running = false) {
     if (jobId === undefined) return null;
     if (typeof jobId !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(jobId)) throw new Error(`${tool}: verify_previous 必须是 runner job_id`);
@@ -2303,20 +2318,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (unknownState(source) || !owns(exec?.agent?.id, source.context?.owner)) {
       throw new Error(`${tool}: verify_previous 的任务 ${jobId} 归属未知或不属于当前会话，未派出这一单。`);
     }
-    if (args.write !== true) return { source, overlap: [] };
-    const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces) ?? '';
-    const mine = [...(args.scope?.length ? args.scope : ['.']), ...(args.writable_roots ?? [])].map((p) => taskScopePath(cwd, p));
-    const scoped = source.scope_paths ?? source.scope;
-    const theirs = [...(Array.isArray(scoped) && scoped.length ? scoped : ['.']), ...[...source.files_changed ?? [], ...source.write_paths ?? []]
-      .map((file) => typeof file === 'string' ? file : file?.path).filter((file) => typeof file === 'string' && file.trim())]
-      .map((p) => taskScopePath(source.cwd ?? '', p));
-    const overlap = mine.filter((a) => theirs.some((b) => under(a, b) || under(b, a)));
-    if (overlap.length) {
-      throw new Error(`${tool}: 这一单的写入范围（${overlap.slice(0, 3).join('、')}）与任务 ${jobId} 的产物或 scope 重叠，不能边改边核验，未派出这一单。` +
-        (running ? `任务 ${jobId} 的核验还在跑，等它结束、记完 codex_review 再派这一单` +
-            (tool === 'codex_continue' ? '。' : '；或把这一单的写入范围改到不重叠的路径。')
-          : `请先 codex_verify ${jobId} 并等它结束、记完 codex_review，再派这一单；或去掉 verify_previous。`));
-    }
+    const overlap = args.write === true ? verificationWriteOverlap(source, args, exec) : [];
+    if (overlap.length) throw new Error(verificationOverlapRefusal(jobId, overlap, tool, running));
     return { source, overlap };
   }
   async function startVerifyPrevious(jobId, exec) {
@@ -2502,16 +2505,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const closeout = cfg.closeoutGuard !== false && owner && !continuation && !args.resume && !verificationOf
         ? closeoutCheck(owner, tool, exec?.signal, { args, exec, guard }) : null;
       let latestOnThread;
-      if (args.resume && owner) {
+      const resumeThread = args.resume;
+      const resumeJobs = new Map();
+      if (resumeThread && owner) {
         const plannerDecides = cfg.ownerDecisions === 'planner';
         const also_owners = aliases.predecessors(owner);
         for (let offset = 0; offset !== null;) {
-          const history = await conductor.list({ owner, also_owners, thread_id: args.resume, limit: 100, offset }, exec?.signal);
+          const history = await conductor.list({ owner, also_owners, thread_id: resumeThread, limit: 100, offset }, exec?.signal);
           exec?.signal?.throwIfAborted();
           if (!Array.isArray(history.jobs)) throw preflightUnavailable('无法核对待续接线程的任务', history);
           if (offset === 0) latestOnThread = history.jobs[0];
           let pending;
           for (const [index, job] of history.jobs.entries()) {
+            if (args.write === true && job.job_id) resumeJobs.set(job.job_id, job);
             if (job.blocking?.next_action !== 'ask_user') continue;
             const latestRun = !continuation && offset === 0 && index === 0;
             if (!latestRun) {
@@ -2606,16 +2612,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (cfg.repeatFailureGuard.enabled && repeat?.status === 'completed') standingLine = repeatStandingLine(repeat.standing);
       predispatch = predispatchWarnings(args, cwd, guard.parent ?? latestOnThread, repeat);
       if (args.rerun_after_change) routing = { ...routing, rerun_after_change: true };
-      const parentJobId = continuation?.parent_job_id ?? fresh?.continuation?.parent_job_id ?? latestOnThread?.job_id;
-      if (owner && args.write === true && parentJobId) {
-        const check = await findVerification(parentJobId, owner, false, exec?.signal).catch(error => {
-          if (!exec?.signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] ${tool} 核验查询失败，已放行：${error?.message ?? error}`);
-        });
-        if (check) {
-          try { await verifyPreviousCheck(parentJobId, args, exec, tool, true); }
-          catch (error) { throw reject(error.message); }
-        }
+      if (owner && args.write === true && (resumeJobs.size || guard.parent)) {
+        if (guard.parent) resumeJobs.set(guard.parent.job_id, guard.parent);
+        const refusal = await runningVerificationRefusal(args, exec, tool, resumeJobs, resumeThread);
         exec?.signal?.throwIfAborted();
+        if (refusal) throw reject(refusal);
       }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
@@ -2773,17 +2774,88 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   ctx.tools.register(runTool);
 
-  async function findVerification(jobId, owner, automatic, signal) {
+  async function* verificationJobs(owner, automatic, signal) {
     const filters = automatic ? {} : { owner, also_owners: aliases.predecessors(owner), status: 'running' };
     for (let offset = 0; offset !== null;) {
       const page = await conductor.list({ ...filters, limit: 100, offset }, signal);
       if (page.error_kind || !Array.isArray(page.jobs)) {
         throw new Error(`codex_verify: 无法核对已有核验：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
       }
-      const existing = page.jobs.find(job => job.context?.verification_of === jobId &&
-        (automatic || (job.execution_status ?? job.status) === 'running'));
-      if (existing) return { job_id: existing.job_id, status: existing.execution_status ?? existing.status };
+      for (const job of page.jobs) {
+        if (job.context?.verification_of && (automatic || (job.execution_status ?? job.status) === 'running')) yield job;
+      }
       offset = page.next_offset ?? null;
+    }
+  }
+  async function findVerification(jobId, owner, automatic, signal) {
+    for await (const job of verificationJobs(owner, automatic, signal)) {
+      if (job.context.verification_of === jobId) return { job_id: job.job_id, status: job.execution_status ?? job.status };
+    }
+  }
+  async function runningVerificationRefusal(args, exec, tool, chain, resumeThread) {
+    const { signal, agent: { id: owner } } = exec;
+    const warn = (error) => {
+      signal?.throwIfAborted();
+      ctx.logger?.warn?.(`[codex-conductor] ${tool} 核验查询失败，已放行：${error?.message ?? error}`);
+    };
+    const readStatus = async (id) => {
+      try {
+        const value = await conductor.waitJob(id, 0, signal);
+        if (unknownState(value) || !['running', 'completed', 'failed', 'cancelled'].includes(value.execution_status ?? value.status)) {
+          throw new Error(value.error ?? value.error_kind ?? `任务 ${id} 状态不可用`);
+        }
+        return value;
+      } catch (error) { warn(error); }
+    };
+    const checks = new Map();
+    try {
+      for await (const job of verificationJobs(owner, false, signal)) {
+        const id = job.context.verification_of;
+        if (!checks.has(id)) checks.set(id, []);
+        checks.get(id).push(job.job_id);
+      }
+    } catch (error) { warn(error); }
+    const unmatched = new Set([...checks.keys()].filter(id => !chain.has(id)));
+    const threads = new Set(resumeThread ? [resumeThread] : []);
+    const ancestors = new Map();
+    const also_owners = aliases.predecessors(owner);
+    for (const [id, known] of chain) {
+      if (!unmatched.size) break;
+      const job = known ?? await readStatus(id);
+      if (!known) ancestors.set(id, job);
+      if (!job || (!known && !owns(owner, job.context?.owner))) continue;
+      const parentId = parentOf(job);
+      if (parentId && !chain.has(parentId)) {
+        chain.set(parentId, null);
+        unmatched.delete(parentId);
+      }
+      const thread = job.thread_id;
+      if (!thread || threads.has(thread) || !unmatched.size) continue;
+      threads.add(thread);
+      try {
+        for (let offset = 0; offset !== null && unmatched.size;) {
+          const page = await conductor.list({ owner, also_owners, thread_id: thread, limit: 100, offset }, signal);
+          signal?.throwIfAborted();
+          if (page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
+          for (const related of page.jobs) {
+            if (related.job_id && !chain.get(related.job_id)) chain.set(related.job_id, related);
+            unmatched.delete(related.job_id);
+          }
+          offset = page.next_offset ?? null;
+        }
+      } catch (error) { warn(error); }
+    }
+    for (const [id, verificationIds] of checks) {
+      if (!chain.has(id)) continue;
+      const source = ancestors.has(id) ? ancestors.get(id) : await readStatus(id);
+      if (!source) continue;
+      if (!owns(owner, source.context?.owner)) return `${tool}: 被核验任务 ${id} 归属未知或不属于当前会话，未派出这一单。`;
+      const overlap = verificationWriteOverlap(source, args, exec);
+      if (!overlap.length) continue;
+      for (const verificationId of verificationIds) {
+        const value = await readStatus(verificationId);
+        if ((value?.execution_status ?? value?.status) === 'running') return verificationOverlapRefusal(id, overlap, tool, true);
+      }
     }
   }
   const reuseVerification = (id, value) => {

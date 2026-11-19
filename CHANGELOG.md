@@ -2,7 +2,7 @@
 
 [English](#english)
 
-`0.9.131` 原任务仍在核验且范围重叠时，`codex_continue` 和带 `resume` 的 `codex_run` 会拒绝启动写任务，并提示规划端等待核验结束。只读续接和范围不重叠的续接可照常启动。
+`0.9.131` `codex_continue` 和带 `resume` 的 `codex_run` 启动写任务前，比对同线程及续接链上仍在运行的核验范围。范围重叠时复查核验状态，再提示规划端等待。查询失败会记录警告，已结束的核验、只读续接和范围不重叠的续接可照常启动。
 
 `0.9.130` 主机核验比对常规文件的大小、纳秒级修改时间和类型，两次快照均取得内容哈希时也比对哈希。脏文件较多时并行读取元数据。快照不可用时（包括线程启动失败），保留核验结果并记录失败阶段和原因类型。
 
@@ -158,7 +158,7 @@
 
 ## English
 
-`0.9.131` blocks write continuations in `codex_continue` and `codex_run` with `resume` while an overlapping verification of the original job is running, and tells the planner to wait for it. Read-only and non-overlapping continuations can still start.
+`0.9.131` checks running verifications in the same thread or continuation chain before starting write continuations in `codex_continue` and `codex_run` with `resume`. It rechecks an overlapping verification before asking the planner to wait. Query failures log a warning. Completed verifications, read-only continuations and disjoint write scopes do not block dispatch.
 
 `0.9.130` compares regular files by size, nanosecond modification time and file type during host verification. It also compares content hashes when both snapshots have them. Large dirty scopes read file metadata in parallel. Unavailable snapshots, including thread startup failures, preserve the verification result and record the stage and reason category.
 
