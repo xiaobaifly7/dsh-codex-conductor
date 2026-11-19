@@ -2079,7 +2079,8 @@ class RunnerTests(unittest.TestCase):
         real = Path(self.tmp.name) / "codex-home"
         real.mkdir()
         (real / "AGENTS.md").write_text("long user instructions", encoding="utf-8")
-        short = RUNNER.parent.parent / "executor-agents.md"
+        short = Path(self.tmp.name) / "executor-agents.md"
+        shutil.copyfile(RUNNER.parent.parent / "executor-agents.md", short)
         args = SimpleNamespace(use_user_config=False, model=None, effort=None, sandbox="read-only", schema=None)
         # Use a file hard link as a test double where Windows symlinks require extra privileges.
         links = mock.patch.object(Path, "symlink_to", Path.hardlink_to) if os.name == "nt" else nullcontext()
@@ -4742,7 +4743,7 @@ class RunnerTests(unittest.TestCase):
 
     def git_repo(self, name, commit=True):
         """A repository whose sub/ is the task directory; the fake's repo_edit changes three files there."""
-        root = Path(self.tmp.name) / name
+        root = Path(self.tmp.name).resolve() / name
         sub = root / "sub"
         sub.mkdir(parents=True)
         (sub / "a.txt").write_bytes(b"original\n")
@@ -4792,7 +4793,7 @@ class RunnerTests(unittest.TestCase):
         args = ("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access")
         clean = self.invoke(*args, prompt=prompt)
         self.assertEqual(clean["status"], "completed", clean)
-        scratch = Path(clean["log_dir"]) / "scratch" / "tmp"
+        scratch = (Path(clean["log_dir"]) / "scratch" / "tmp").resolve()
         self.assertTrue({"shell_environment_policy.set.PYTHONDONTWRITEBYTECODE=" + json.dumps("1"),
                          'shell_environment_policy.set.PYTEST_ADDOPTS="-p no:cacheprovider"',
                          "shell_environment_policy.set.TMPDIR=" + json.dumps(str(scratch)),
