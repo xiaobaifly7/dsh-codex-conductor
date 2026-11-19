@@ -1,0 +1,290 @@
+{
+ "context": {
+  "owner": "S1",
+  "task": "<text-1>",
+  "acceptance": [
+   "<text-2>",
+   "<text-3>",
+   "<text-4>",
+   "<text-5>",
+   "<text-6>",
+   "<text-7>",
+   "<text-8>",
+   "<text-9>"
+  ],
+  "write": true,
+  "dispatcher": {
+   "version": "<text-10>",
+   "revision": "<text-11>",
+   "pid": 74220
+  },
+  "continuation": {
+   "parent_job_id": "20261118-215821-3ba800",
+   "answers": [
+    {
+     "id": "<text-46>",
+     "answer": "<text-94>"
+    }
+   ],
+   "resolution": "<text-95>"
+  },
+  "routing": {
+   "continuation_mode": "<text-96>",
+   "continuation_reason": "<text-97>",
+   "parent_thread_id": "<text-98>",
+   "ab": true,
+   "model": "<text-12>"
+  }
+ },
+ "sandbox": "danger-full-access",
+ "scope": [
+  "<text-23>",
+  "<text-24>",
+  "<text-25>",
+  "<text-26>",
+  "<text-27>",
+  "<text-18>",
+  "<text-28>"
+ ],
+ "task_options": {
+  "writable_roots": null,
+  "use_user_config": false,
+  "effort": "<text-20>",
+  "model": "<text-12>",
+  "service_tier": "<text-21>"
+ },
+ "cwd": "<text-22>",
+ "scope_paths": [
+  "<text-23>",
+  "<text-24>",
+  "<text-25>",
+  "<text-26>",
+  "<text-27>",
+  "<text-18>",
+  "<text-28>"
+ ],
+ "thread_id": "01a1e970-0000-4000-8000-000000000000",
+ "duration_s": 52.0,
+ "diff_status": "skipped",
+ "diff_reason": "<text-29>",
+ "log_dir": "<text-99>",
+ "status": "completed",
+ "attempts": 1,
+ "final_message": "<text-100>",
+ "truncated": false,
+ "usage": {
+  "input_tokens": 845357,
+  "cached_input_tokens": 789248,
+  "cache_write_input_tokens": 0,
+  "output_tokens": 9175,
+  "reasoning_output_tokens": 950
+ },
+ "commands_run": 3,
+ "forced_exit": false,
+ "files_changed": [
+  {
+   "path": "<text-16>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-102>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-35>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-36>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-41>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-42>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-103>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-15>",
+   "change": "<text-101>"
+  }
+ ],
+ "files_changed_total": 8,
+ "files_changed_source": "scope_snapshot+codex_events",
+ "usage_scope": "<text-104>",
+ "structured": {
+  "blockers": [
+   {
+    "id": "<text-46>",
+    "kind": "user_input",
+    "message": "<text-105>",
+    "question": "<text-106>",
+    "resolution": "<text-107>"
+   }
+  ],
+  "criteria": [
+   {
+    "criterion": "<text-50>",
+    "evidence": "<text-108>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-52>",
+    "evidence": "<text-109>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-54>",
+    "evidence": "<text-110>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-56>",
+    "evidence": "<text-111>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-58>",
+    "evidence": "<text-112>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-60>",
+    "evidence": "<text-113>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-62>",
+    "evidence": "<text-114>",
+    "status": "not_met"
+   },
+   {
+    "criterion": "<text-64>",
+    "evidence": "<text-115>",
+    "status": "met"
+   }
+  ],
+  "deviations": [
+   "<text-116>",
+   "<text-117>",
+   "<text-118>"
+  ],
+  "files_changed": [
+   "<text-15>",
+   "<text-16>",
+   "<text-35>",
+   "<text-102>",
+   "<text-103>",
+   "<text-41>",
+   "<text-36>",
+   "<text-42>"
+  ],
+  "summary": "<text-119>",
+  "unresolved": [
+   "<text-120>",
+   "<text-121>",
+   "<text-122>"
+  ]
+ },
+ "execution_status": "completed",
+ "report_status": "valid",
+ "review_status": "needs_attention",
+ "criteria_counts": {
+  "met": 1,
+  "not_met": 1,
+  "blocked": 6
+ },
+ "phase": "finalizing",
+ "attempt": 1,
+ "last_error_kind": null,
+ "retry_at": null,
+ "job_id": "20261118-220305-6c8bd2",
+ "started_at": 1795010585.2390385,
+ "finished_at": 1795010637.5302029,
+ "verification_status": "accepted_deviations",
+ "verification": {
+  "accepted_deviations": [
+   {
+    "evidence": "<text-123>",
+    "index": 1,
+    "kind": "reported"
+   },
+   {
+    "evidence": "<text-124>",
+    "index": 2,
+    "kind": "reported"
+   },
+   {
+    "evidence": "<text-125>",
+    "index": 3,
+    "kind": "reported"
+   }
+  ],
+  "criteria": [
+   {
+    "accepted": "<text-126>",
+    "evidence": "<text-127>",
+    "index": 1,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-128>",
+    "evidence": "<text-129>",
+    "index": 2,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-130>",
+    "evidence": "<text-131>",
+    "index": 3,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-132>",
+    "evidence": "<text-133>",
+    "index": 4,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-134>",
+    "evidence": "<text-135>",
+    "index": 5,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-136>",
+    "evidence": "<text-137>",
+    "index": 6,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-138>",
+    "evidence": "<text-139>",
+    "index": 7,
+    "status": "not_met"
+   },
+   {
+    "evidence": "<text-140>",
+    "index": 8,
+    "status": "met"
+   }
+  ],
+  "notes": "<text-141>",
+  "status": "accepted_deviations",
+  "reviewer": "S1",
+  "time": 1795011204.999381
+ },
+ "blocking": {
+  "state": "clear",
+  "blockers": [],
+  "questions": [],
+  "next_action": "done"
+ },
+ "out_of_scope": []
+}

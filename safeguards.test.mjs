@@ -10,7 +10,10 @@ const localAppData = mkdtempSync(path.join(tmpdir(), 'conductor-safeguards-'));
 process.env.LOCALAPPDATA = localAppData;
 test.after(() => rmSync(localAppData, { recursive: true, force: true }));
 
-const { apply, composePrompt, hasUserReply } = await import('./index.mjs');
+const { apply: applyPlugin, composePrompt, hasUserReply, runnerArgv } = await import('./index.mjs');
+const apply = (ctx, config, ...rest) => applyPlugin(ctx, { autoVerify: 'off', ...config }, ...rest);
+const { wslPath } = await import('./guard.mjs');
+const { fileURLToPath } = await import('node:url');
 const { pidReused, saveRuntimeSettings, validatePanelSettings } = await import('./runtime.mjs');
 
 const exec = (id = 'S1', cwd = '/repo', log = []) => ({ agent: { id, session: { header: { cwd }, log } } });
@@ -35,6 +38,46 @@ test('unknown configuration keys are reported in the log and the load marker', (
   assert.ok(warnings.some(text => /未知配置项 workspace/.test(text)));
   const marker = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
   assert.deepEqual(marker.unknownConfig, ['workspace']);
+});
+
+test('bundled executor instructions reach the runner only when configured', async () => {
+  const file = wslPath(fileURLToPath(new URL('./executor-agents.md', import.meta.url)));
+  for (const [config, expected] of [
+    [{}, []],
+    [{ runnerAgentsMd: 'bundled' }, [`CODEX_RUNNER_AGENTS_MD=${file}`]],
+    [{ runnerAgentsMd: 'none' }, ['CODEX_RUNNER_AGENTS_MD=none']],
+  ]) {
+    let argv;
+    const tools = {};
+    apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {} },
+      config, async (cfg, args) => {
+        if (args[0] === 'start') {
+          argv = runnerArgv(cfg, args);
+          return { job_id: 'J1', status: 'completed' };
+        }
+        return { jobs: [] };
+      });
+    await tools.codex_run.execute({ task: 'Inspect project files.', acceptance: ['Layout is reported'], write: false }, exec());
+    assert.deepEqual(argv.filter(arg => arg.startsWith('CODEX_RUNNER_AGENTS_MD=')), expected);
+  }
+});
+
+test('mcpWriteAllow defaults, warns on invalid values and reports the effective list', () => {
+  const pattern = 'MCP__DrawIO__*';
+  const tool = { ...exec(), name: 'mcp__drawio__create_new_diagram', arguments: {} };
+  const marker = path.join(localAppData, 'dsh-codex-conductor', 'loaded.json');
+  for (const value of [undefined, [` ${pattern} `], pattern, [pattern, 'write'], [pattern, 1]]) {
+    const warnings = [];
+    let guard;
+    apply({ tools: { register() {}, guard: fn => { guard = fn; } }, on() {}, logger: { warn: text => warnings.push(text) } },
+      { workspaces: ['/repo'], mcpWriteAllow: value });
+    const allowed = Array.isArray(value) && value.length === 1;
+    assert.deepEqual(JSON.parse(readFileSync(marker, 'utf8')).mcpWriteAllow, allowed ? [pattern] : []);
+    if (allowed) assert.equal(guard(tool), undefined);
+    else assert.match(guard(tool), /会改动文件或执行命令，已拒绝/);
+    if (value === undefined || allowed) assert.deepEqual(warnings, []);
+    else assert.deepEqual(warnings, ['[codex-conductor] 忽略无效的配置 mcpWriteAllow，使用默认值']);
+  }
 });
 
 test('maxRunningJobs refuses a dispatch at the limit without starting Codex', async () => {
@@ -218,7 +261,8 @@ test('gemini_write can run as a background job and still leaves its receipt and 
   apply({ tools: { register: tool => tools[tool.name] = tool, guard() {} }, on() {}, get: name => name === 'jobs' ? jobs : undefined },
     { gemini: { command: 'C:\\agy\\agy.exe' } }, async () => ({ jobs: [], total: 0 }), () => { throw new Error('spawn unavailable'); });
   const call = { prompt: '根据素材写第一章入门说明。', sources: ['notes.md'], output: 'chapter.md' };
-  const value = await tools.gemini_write.execute({ ...call, background: true }, exec('S1', root));
+  // 不传 background 即后台。
+  const value = await tools.gemini_write.execute(call, exec('S1', root));
   assert.deepEqual([value.status, value.background_job_id], ['running', 'BG7']);
   assert.match(started[0].spec.label, new RegExp(`^Gemini ${value.write_id} · chapter\\.md$`));
   const settled = await started[0].done;
@@ -226,9 +270,14 @@ test('gemini_write can run as a background job and still leaves its receipt and 
   assert.match(settled.result, /spawn unavailable/);
   const last = JSON.parse(readFileSync(path.join(localAppData, 'dsh-codex-conductor', 'gemini-history.jsonl'), 'utf8').trim().split('\n').at(-1));
   assert.deepEqual([last.id, last.background, last.status], [value.write_id, true, 'failed']);
-  // Without the flag, and without a jobs service, the call stays in the foreground.
-  assert.equal((await tools.gemini_write.execute(call, exec('S1', root))).status, 'failed');
+  // background:false still forces the foreground.
+  assert.equal((await tools.gemini_write.execute({ ...call, overwrite: true, background: false }, exec('S1', root))).status, 'failed');
   assert.equal(started.length, 1);
+  // Without a jobs service the default stays in the foreground.
+  const bare = {};
+  apply({ tools: { register: tool => bare[tool.name] = tool, guard() {} }, on() {}, get: () => undefined },
+    { gemini: { command: 'C:\\agy\\agy.exe' } }, async () => ({ jobs: [], total: 0 }), () => { throw new Error('spawn unavailable'); });
+  assert.equal((await bare.gemini_write.execute({ ...call, overwrite: true }, exec('S1', root))).status, 'failed');
 });
 
 test('allowlist mode refuses unlisted tools only when it is switched on', () => {

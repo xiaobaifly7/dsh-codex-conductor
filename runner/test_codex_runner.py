@@ -1,5 +1,7 @@
 """Fault-injection tests for codex_runner.py. They use a fake Codex, so they spend no model quota."""
+import argparse
 import errno
+import importlib.util
 import io
 import json
 import os
@@ -10,7 +12,10 @@ import tempfile
 import textwrap
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 from unittest import mock
 
@@ -56,6 +61,31 @@ FAKE_CODEX = textwrap.dedent(r"""
                '"files_changed":[],"deviations":[],"unresolved":[]}')
     elif mode == "fixture_report":
         finish(Path(os.environ["FAKE_REPORT"]).read_text(encoding="utf-8"))
+    elif mode == "verification_temp_test":
+        status = "blocked"
+        if 'sandbox_mode="workspace-write"' in sys.argv:
+            line = prompt.decode("utf-8").splitlines()[0]
+            assert line.startswith("Verification project directory (absolute): ")
+            project = Path(json.loads(line.split(": ", 1)[1]))
+            assert project.is_absolute() and (project / "temp_check.py").is_file()
+            scratch = Path.cwd().resolve()
+            assert not scratch.is_relative_to(project)
+            assert "sandbox_workspace_write.writable_roots=[]" in sys.argv
+            assert "sandbox_workspace_write.exclude_slash_tmp=true" in sys.argv
+            assert Path(os.environ["TMPDIR"]).resolve().is_relative_to(scratch)
+            assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1"
+            assert os.environ["PYTEST_ADDOPTS"] == "-p no:cacheprovider"
+            assert Path(os.environ["COVERAGE_FILE"]).parent == Path(os.environ["TMPDIR"])
+            checked = subprocess.run([sys.executable, "-m", "unittest", "temp_check"], cwd=project)
+            status = "met" if checked.returncode == 0 else "not_met"
+        finish(json.dumps({"summary": status, "criteria": [
+            {"criterion": "run the check", "status": status, "evidence": status}
+        ], "files_changed": [], "deviations": [], "unresolved": []}))
+    elif mode == "repeat_guard_start":
+        if "resume" not in sys.argv:
+            say(type="item.started", item={"id": "step", "type": "command_execution",
+                                           "command": "Invoke-StepE -Log latest.log", "status": "in_progress"})
+        finish()
     elif mode == "nonzero_after_completed":
         finish()
         sys.exit(1)
@@ -79,6 +109,17 @@ FAKE_CODEX = textwrap.dedent(r"""
         if mode == "repo_edit_hang":
             (state / "edited").touch()
             time.sleep(300)
+        finish()
+    elif mode in ("verification_overwrite", "verification_sibling"):
+        target = Path("a.txt") if mode == "verification_overwrite" else Path("../outside.txt")
+        target.write_bytes(b"changed by verifier\n")
+        finish()
+    elif mode == "verification_overwrite_large":
+        target = Path("a.txt")
+        info = target.stat()
+        with target.open("r+b") as file:
+            file.write(b"y")
+        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
         finish()
     elif mode == "hang_with_detached_child":
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True,
@@ -280,6 +321,329 @@ class RunnerTests(unittest.TestCase):
             time.sleep(.01)
         self.fail(f"test condition did not become ready within {timeout}s")
 
+    def repeat_step(self, number, exit_code=1, seconds=60, command=None):
+        command = command or f"Write-Host retry; & C:/tmp/run_{number}.ps1; Invoke-StepE -Log {number}.log"
+        item = {"id": f"item_{number}", "type": "command_execution", "command": command}
+        start = {"type": "item.started", "item": {**item, "status": "in_progress", "exit_code": None}}
+        if exit_code is None:
+            return [start]
+        return [start, {"type": "item.completed", "_seconds": seconds,
+                        "item": {**item, "status": "completed" if exit_code == 0 else "failed", "exit_code": exit_code}}]
+
+    def repeat_patch(self):
+        return {"type": "item.completed", "item": {"id": "patch", "type": "file_change",
+                                                   "changes": [{"path": "setup.ps1", "kind": "update"}]}}
+
+    def repeat_job(self, job_id, *turns, options=(), cwd=None, report=None):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(cwd or self.cwd), "--sandbox", "workspace-write", "--no-diff",
+                                  "--timeout", "100000", "--retries", "0", "--backoff", "0", *options])
+        if report is not None:
+            args.schema = str(RUNNER.parents[1] / "report.v2.schema.json")
+        job_dir = self.stored_job(job_id, None, **vars(args))
+        (job_dir / "prompt.txt").write_text("original task", "utf-8")
+        calls = []
+        elapsed = 100.0
+        popen = subprocess.Popen
+        thread = codex_runner.threading.Thread
+
+        def stream(events):
+            nonlocal elapsed
+            for event in events:
+                elapsed += event.get("_seconds", 0)
+                yield (json.dumps({k: v for k, v in event.items() if k != "_seconds"}) + "\n").encode()
+
+        def spawn(argv, **kwargs):
+            if argv[0] in ("git", "git.exe"):
+                return popen(argv, **kwargs)
+            events = turns[len(calls)]
+            if isinstance(events, BaseException):
+                raise events
+            if events is not None:
+                events = [{"type": "thread.started", "thread_id": "test-thread"}, *events]
+            else:
+                events = self.repeat_step(3, None)
+            if not events or events[-1]["type"] != "turn.failed":
+                events += [{"type": "item.completed", "item": {"type": "agent_message", "text": json.dumps(report)}},
+                           {"type": "turn.completed"}]
+            proc = mock.MagicMock(pid=42)
+            proc.stdout.__iter__.return_value = stream(events)
+            calls.append((argv, proc))
+            return proc
+
+        def spawn_thread(target, daemon=None, **kwargs):
+            if kwargs:
+                return thread(target=target, daemon=daemon, **kwargs)
+            return mock.Mock(start=target)
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed), \
+                mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
+                mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
+                mock.patch.object(codex_runner.threading, "Thread", side_effect=spawn_thread), \
+                mock.patch.object(codex_runner, "record_pid"), mock.patch.object(codex_runner, "kill_tree") as kill:
+            result = codex_runner.execute(args, "original task", job_dir)
+            codex_runner.write_result(job_dir, result)
+        prompts = [(argv, proc.stdin.write.call_args.args[0].decode()) for argv, proc in calls]
+        return job_dir, result, prompts, kill.call_count
+
+    def test_repeat_guard_fixture_blocks_third_bootstrap_and_resumes_for_report(self):
+        fixture = RUNNER.parents[1] / "fixtures" / "codex-events-4bcdb1.json"
+        events = json.loads(fixture.read_text("utf-8"))["events"]
+        report = self.sample_report(criteria=[{"criterion": "Bootstrap", "status": "blocked", "evidence": "StepE failed"}],
+                                    blockers=[self.blocker("environment", question="")])
+        job, result, calls, kills = self.repeat_job("fixture", events, [], report=report)
+        self.assertEqual((result["status"], result["attempts"], kills), ("completed", 2, 1))
+        self.assertEqual(result["structured"], report)
+        self.assertIn("resume", calls[1][0])
+        self.assertIn("test-thread", calls[1][0])
+        self.assertEqual(calls[1][1], "runner 拦下了第 3 次运行同一个失败步骤（前 2 次都失败，共 1584 秒，期间没有观察到文件改动）。"
+                         "不要再运行这个步骤，也不要换个写法运行它。现在只整理并输出最终报告：依赖这一步的验收项标 blocked，"
+                         "blockers 写一条 environment（需要用户处理时用 user_input），说明失败现象和已经尝试过的做法；其余已完成的验收照常汇报。")
+        block, = result["repeat_guard"]["blocks"]
+        self.assertEqual({k: v for k, v in block.items() if k != "step"}, {"prior_failures": 2, "prior_seconds": 1584})
+        self.assertRegex(block["step"], r"^[a-f0-9]{8}$")
+        stored = json.loads((job / "result.json").read_text("utf-8"))
+        shown = self.control("status", job.name)
+        self.assertEqual(stored["repeat_guard"], result["repeat_guard"])
+        self.assertEqual(shown["repeat_guard"], stored["repeat_guard"])
+        self.assertIn('"type": "runner.repeat_block"', (job / "events.jsonl").read_text("utf-8"))
+        self.assertNotIn('"id": "item_25"', (job / "events.jsonl").read_text("utf-8"))
+
+    def test_repeat_guard_success_and_file_change_clear_failures(self):
+        _, result, _, kills = self.repeat_job("flaky", [
+            *self.repeat_step(1), *self.repeat_step(2, 0, 0),
+            *self.repeat_step(3), *self.repeat_step(4),
+            self.repeat_patch(), *self.repeat_step(5, 0, 0),
+        ])
+        self.assertEqual((result["status"], kills), ("completed", 0))
+        self.assertEqual(result["repeat_guard"], {"blocks": [], "standing": []})
+
+    def test_repeat_guard_cwd_isolation_and_observable_change_across_jobs(self):
+        self.repeat_job("failures", [*self.repeat_step(1), *self.repeat_step(2, 2)])
+        other = self.cwd / "other"
+        other.mkdir()
+        _, isolated, calls, kills = self.repeat_job("other", self.repeat_step(3), cwd=other)
+        self.assertEqual((isolated["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        _, changed, calls, kills = self.repeat_job("changed", [self.repeat_patch(), *self.repeat_step(3)])
+        self.assertIn("## 本目录近期反复失败的步骤", calls[0][1])
+        self.assertEqual((changed["repeat_guard"]["standing"], kills), ([], 0))
+
+    def test_predispatch_repeat_guard_exposes_step_words_and_file_change(self):
+        import hashlib
+
+        command = "Invoke-BuildWidget; ./check_setup.py"
+        self.repeat_job("seed-words", [*self.repeat_step(1, command=command), *self.repeat_step(2, command=command)])
+        query = self.control("repeat-guard", "--cwd", str(self.cwd))
+        self.assertEqual(query["_changed_at"], 0)
+        words = ("invoke", "build", "widget", "check", "setup")
+        self.assertEqual(set(query["standing"][0]["words"]),
+                         {hashlib.sha1(word.encode()).hexdigest()[:8] for word in words})
+        self.repeat_job("changed-words", [self.repeat_patch()])
+        query = self.control("repeat-guard", "--cwd", str(self.cwd))
+        self.assertGreater(query["_changed_at"], 0)
+        self.assertEqual(query["standing"], [])
+
+    def test_review_fix_repeat_guard_allows_edit_to_named_script_between_jobs(self):
+        script = self.cwd / "setup.py"
+        script.write_text("raise RuntimeError('broken')\n", encoding="utf-8")
+        step = lambda number, code=1: self.repeat_step(number, code, command="python ./setup.py")
+        self.repeat_job("failed-script", [*step(1), *step(2)])
+        script.write_text("print('fixed')\n", encoding="utf-8")
+        _, result, _, kills = self.repeat_job("fixed-script", step(3, 0), [])
+        self.assertEqual((result["status"], result["repeat_guard"]["blocks"], kills), ("completed", [], 0))
+        self.assertGreater(self.control("repeat-guard", "--cwd", str(self.cwd))["_changed_at"], 0)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_fix_repeat_guard_allows_changed_git_status_between_jobs(self):
+        _, cwd, _ = self.git_repo("repeat-git")
+        self.repeat_job("failed-in-git", [*self.repeat_step(1), *self.repeat_step(2)], cwd=cwd)
+        (cwd / "a.txt").write_bytes(b"edited by the owner\n")
+        _, result, _, kills = self.repeat_job("edited-in-git", self.repeat_step(3, 0), [], cwd=cwd)
+        self.assertEqual((result["status"], result["repeat_guard"]["blocks"], kills), ("completed", [], 0))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_r2_repeat_guard_detects_edited_dirty_and_untracked_configuration(self):
+        for kind, filename in (("dirty", "a.txt"), ("untracked", "local-settings.json"), ("oversize", "a.txt")):
+            with self.subTest(kind=kind):
+                _, cwd, git = self.git_repo(kind)
+                config = cwd / filename
+                config.write_bytes(b"before\n")
+                status = git("status", "--porcelain", "--", f"sub/{filename}")
+                self.assertTrue(status.strip())
+                self.repeat_job(f"{kind}-failed", [*self.repeat_step(1), *self.repeat_step(2)], cwd=cwd)
+                if kind == "oversize":
+                    config.write_bytes(b"x" * (2 * 1024 * 1024))
+                    _, result, _, kills = self.repeat_job("over-budget", self.repeat_step(3, None), [], cwd=cwd)
+                    self.assertEqual(([block["prior_failures"] for block in result["repeat_guard"]["blocks"]], kills), ([2], 1))
+                    self.assertEqual(self.control("repeat-guard", "--cwd", str(cwd))["_changed_at"], 0)
+                config.write_bytes(b"after\n")
+                self.assertEqual(git("status", "--porcelain", "--", f"sub/{filename}"), status)
+                _, result, _, kills = self.repeat_job(f"{kind}-edited", self.repeat_step(3, 0), [], cwd=cwd)
+                self.assertEqual((result["repeat_guard"]["blocks"], kills), ([], 0))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_r2_unavailable_git_keeps_failures_and_observes_script_edits(self):
+        import codex_runner
+
+        _, cwd, _ = self.git_repo("git-availability")
+        script = cwd / "setup.py"
+        script.write_bytes(b"before\n")
+        step = lambda number, exit_code: self.repeat_step(number, exit_code, command="python ./setup.py")
+        self.repeat_job("known", [*step(1, 1), *step(2, 1)], cwd=cwd)
+        with mock.patch.object(codex_runner, "git_on_tree", return_value=None):
+            _, result, _, kills = self.repeat_job("git-unavailable", step(3, None), [], cwd=cwd)
+        self.assertEqual(([block["prior_failures"] for block in result["repeat_guard"]["blocks"]], kills), ([2], 1))
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(cwd))["_changed_at"], 0)
+        script.write_bytes(b"owner edited this script\n")
+        with mock.patch.object(codex_runner, "git_on_tree", return_value=None):
+            _, result, _, kills = self.repeat_job("script-edited", step(4, 0), [], cwd=cwd)
+        self.assertEqual((result["repeat_guard"]["blocks"], kills), ([], 0))
+
+    def test_review_fix_repeat_guard_ignores_patch_outside_guarded_cwd(self):
+        self.repeat_job("failed-elsewhere", [*self.repeat_step(1), *self.repeat_step(2)])
+        patch = self.repeat_patch()
+        patch["item"]["changes"][0]["path"] = str(self.cwd.parent / "outside" / "setup.ps1")
+        _, result, _, kills = self.repeat_job("patched-elsewhere", [patch, *self.repeat_step(3, None)], [])
+        self.assertEqual(kills, 1)
+        self.assertEqual(result["repeat_guard"]["blocks"][0]["prior_failures"], 2)
+
+    def test_review_fix_repeat_guard_expires_each_failure_individually(self):
+        import codex_runner
+
+        epoch = time.time()
+        with mock.patch.object(codex_runner.time, "time", return_value=epoch):
+            self.repeat_job("first-failure", self.repeat_step(1))
+        with mock.patch.object(codex_runner.time, "time", return_value=epoch + 23 * 3600):
+            self.repeat_job("second-failure", self.repeat_step(2))
+        with mock.patch.object(codex_runner.time, "time", return_value=epoch + 25 * 3600):
+            _, result, _, kills = self.repeat_job("after-first-expired", self.repeat_step(3), [])
+        self.assertEqual(kills, 0)
+        self.assertEqual(result["repeat_guard"]["standing"][0]["failures"], 2)
+        self.assertEqual(result["repeat_guard"]["standing"][0]["seconds"], 120)
+
+    def test_predispatch_thread_listing_includes_previous_environment_criteria_without_evidence(self):
+        context = self.sample_context()
+        report = self.sample_report(blockers=[self.blocker("environment")])
+        report["criteria"][0]["status"] = "blocked"
+        self.stored_job("previous", {"status": "completed", "thread_id": "thread", "structured": report}, context=context)
+        listing = self.control("list", "--owner", context["owner"], "--thread-id", "thread")
+        self.assertEqual(listing["jobs"][0]["predispatch"], {"acceptance": context["acceptance"], "criteria": [
+            {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]
+        ]})
+        self.assertNotIn("predispatch", self.control("list")["jobs"][0])
+
+    def test_repeat_guard_persists_and_new_worker_blocks_first_run(self):
+        self.repeat_job("seed", [*self.repeat_step(1), *self.repeat_step(2, 2)])
+        job = self.invoke("--sandbox", "workspace-write", "--no-diff", "--retries", "0",
+                          command="start", mode="repeat_guard_start")
+        done = self.control("status", job["job_id"], "--wait", "30")
+        self.assertEqual((done["status"], done["attempts"]), ("completed", 2))
+        first, second = self.calls()
+        self.assertIn("## 本目录近期反复失败的步骤", first["prompt"])
+        self.assertIn("runner 拦下了第 3 次运行", second["prompt"])
+        self.assertIn("resume", second["argv"])
+        job_dir = Path(done["log_dir"])
+        self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), "do it")
+        query = self.control("repeat-guard", "--cwd", str(self.cwd))
+        self.assertEqual(query, {"status": "completed", "totals": {"blocked": 1, "seconds_avoided": 60},
+                                 "standing": done["repeat_guard"]["standing"], "_changed_at": 0})
+        record = json.loads((Path(self.env["CODEX_RUNNER_HOME"]) / "step-failures.json").read_text("utf-8"))
+        cwd_key, = set(record) - {"_totals"}
+        self.assertRegex(cwd_key, r"^[a-f0-9]{16}$")
+        key, = set(record[cwd_key]) - {"_changed_at"}
+        self.assertRegex(key, r"^[a-f0-9]{40}$")
+        self.assertEqual([event[1:] for event in record[cwd_key][key]["events"]], [[60, 1], [60, 2]])
+        self.assertEqual(set(record[cwd_key][key]), {"events", "fingerprint", "words"})
+
+    def test_repeat_guard_worker_restart_before_job_finalization(self):
+        dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
+        with self.assertRaisesRegex(KeyboardInterrupt, "worker stopped"):
+            self.repeat_job("interrupted", [*self.repeat_step(1), *self.repeat_step(2), dropped],
+                            KeyboardInterrupt("worker stopped"), options=("--retries", "1"))
+        job = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "interrupted"
+        self.assertFalse((job / "result.json").exists())
+        with mock.patch.dict(self.env, {"FAKE_MODE": "repeat_guard_start"}):
+            # _worker writes the receipt to disk and emits no stdout.
+            worker = subprocess.run([sys.executable, "-B", str(RUNNER), "_worker", job.name],
+                                    capture_output=True, timeout=30, env=self.env)
+        self.assertEqual(worker.returncode, 0, worker.stderr)
+        result = json.loads((job / "result.json").read_text("utf-8"))
+        self.assertEqual((result["status"], result["attempts"]), ("completed", 2))
+        self.assertEqual(result["repeat_guard"]["blocks"][0]["prior_failures"], 2)
+
+    def test_repeat_guard_single_report_turn_and_terminal_repetition(self):
+        _, result, calls, kills = self.repeat_job("blocked-twice",
+            [*self.repeat_step(1), *self.repeat_step(2), *self.repeat_step(3, None)],
+            [self.repeat_patch(), *self.repeat_step(4, None)], options=("--retries", "5"))
+        self.assertEqual((result["status"], result["error_kind"], result["retryable"]),
+                         ("failed", "repeated_failure", False))
+        self.assertEqual((result["attempts"], len(calls), kills), (2, 2, 2))
+        self.assertEqual(result["repeat_guard"]["blocks"][0], result["repeat_guard"]["blocks"][1])
+
+    def test_repeat_guard_counts_across_attempts_and_handles_missing_thread(self):
+        dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
+        _, result, _, kills = self.repeat_job("retried", [*self.repeat_step(1), dropped],
+            [*self.repeat_step(2), *self.repeat_step(3, None)], [], options=("--retries", "1"))
+        self.assertEqual((result["status"], result["attempts"], kills), ("completed", 3, 1 if os.name == "nt" else 2))
+        _, result, _, kills = self.repeat_job("no-thread", None)
+        self.assertEqual((result["error_kind"], result["attempts"], kills), ("repeated_failure", 1, 1))
+
+    def test_repeat_guard_start_off_and_allow_rerun(self):
+        self.repeat_job("seed", [*self.repeat_step(1), *self.repeat_step(2)])
+        for options in (("--repeat-guard", "off"), ("--allow-rerun",)):
+            with self.subTest(options=options):
+                job = self.invoke(*options, command="start", mode="repeat_guard_start")
+                self.assertEqual(job["status"], "running")
+                done = self.control("status", job["job_id"], "--wait", "30")
+                self.assertEqual(done["status"], "completed")
+                self.assertEqual(done["repeat_guard"], {"blocks": [], "standing": []})
+                self.assertEqual(self.calls()[-1]["prompt"], "do it")
+                query = self.control("repeat-guard", "--cwd", str(self.cwd))
+                self.assertEqual(len(query["standing"]), int(options[0] == "--repeat-guard"))
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd))["standing"], [])
+
+    def test_repeat_guard_settings_expiry_and_key_variants(self):
+        for flag, value in (("--repeat-min-seconds", "nan"), ("--repeat-failures", "0"),
+                            ("--repeat-window-hours", "-1"), ("--repeat-guard", "yes")):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.invoke(flag, value, command="start")["error_kind"], "bad_arguments")
+        options = ("--repeat-min-seconds", "2", "--repeat-failures", "1", "--repeat-window-hours", "0.5")
+        _, seed, _, _ = self.repeat_job("seed", self.repeat_step(1, seconds=2, command=r'& "C:\My Scripts\setup1.ps1"'),
+                                        options=options)
+        self.assertEqual(seed["repeat_guard"]["standing"][0]["failures"], 1)
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd))["standing"], [])
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd), "--repeat-failures", "1",
+                                      "--repeat-window-hours", "0.5")["standing"], seed["repeat_guard"]["standing"])
+        _, blocked, _, kills = self.repeat_job("blocked", self.repeat_step(2, None, command="bash D:/other/setup2.ps1"),
+                                              [], options=options)
+        self.assertEqual((blocked["repeat_guard"]["blocks"][0]["prior_seconds"], kills), (2, 1))
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        ledger = home / "step-failures.json"
+        data = json.loads(ledger.read_text("utf-8"))
+        for cwd_key in set(data) - {"_totals"}:
+            for step in set(data[cwd_key]) - {"_changed_at"}:
+                for event in data[cwd_key][step]["events"]:
+                    event[0] -= 3600
+        ledger.write_text(json.dumps(data), "utf-8")
+        _, result, calls, kills = self.repeat_job("expired", self.repeat_step(3, None, command="setup3.ps1"), options=options)
+        self.assertEqual((result["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        self.assertNotEqual(json.loads(ledger.read_text("utf-8")), data)
+
+    def test_repeat_guard_fallback_masks_digit_runs_and_requires_completed_timing(self):
+        unmatched = self.repeat_step(1, command="echo 123")[1]
+        _, result, _, kills = self.repeat_job("fallback",
+            [unmatched, *self.repeat_step(2, seconds=59, command="echo 9"), *self.repeat_step(3, command="echo 123"),
+             *self.repeat_step(4, command="echo 4567"), *self.repeat_step(5, None, command="echo 1 extra"),
+             *self.repeat_step(6, None, command="echo 42")], [])
+        self.assertEqual(kills, 1)
+        block, = result["repeat_guard"]["blocks"]
+        self.assertEqual((block["prior_failures"], block["prior_seconds"]), (2, 120))
+
     def test_failed_start_reports_diagnostics_and_tracks_the_worker_for_cleanup(self):
         run = subprocess.run
 
@@ -405,6 +769,34 @@ class RunnerTests(unittest.TestCase):
         self.assertLess(time.time() - start, 20)
         time.sleep(1)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
+
+    def test_reconnect_deadline_keeps_a_completion_already_queued(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--reconnect-timeout", "2"])
+        proc = mock.MagicMock(pid=os.getpid())
+        proc.poll.return_value = 0
+        proc.stdout.__iter__.return_value = iter([
+            b'{"type":"error","message":"Reconnecting..."}\n',
+            b'{"type":"item.completed","item":{"type":"agent_message","text":"done"}}\n',
+            b'{"type":"turn.completed","usage":{"input_tokens":1}}\n',
+        ])
+        # Queue all three events, then cross the deadline after the monitor reads the error.
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [10] * 4 + [13] * 10
+        with mock.patch.object(codex_runner, "time", clock), \
+                mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
+                mock.patch.object(codex_runner.threading, "Thread", side_effect=lambda target, daemon: mock.Mock(start=target)), \
+                mock.patch.object(codex_runner, "kill_tree") as kill:
+            state = codex_runner.run_attempt(args, "do it", Path(self.tmp.name), None)
+        self.assertTrue(state["completed"])
+        self.assertEqual(state["last_text"], "done")
+        self.assertIsNone(state["end_reason"])
+        kill.assert_not_called()
 
     def test_model_refusal_in_a_reconnect_notice_fails_at_once_without_retry(self):
         start = time.time()
@@ -1154,6 +1546,35 @@ class RunnerTests(unittest.TestCase):
             router.assert_not_called()
             attempt.assert_not_called()
 
+    def test_full_access_read_only_job_takes_no_write_lock_or_snapshot(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        context = {"owner": "a", "task": "t", "acceptance": ["x"], "write": False}
+        self.assertEqual(codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None, context), {})
+        self.assertTrue(codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None, {**context, "write": True}))
+        self.assertTrue(codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None))
+        self.assertTrue(codex_runner.write_lock_roots(str(self.cwd), "workspace-write", None, context))
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        for write, expect_lock in ((False, False), (True, True)):
+            args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "danger-full-access", "--lock-timeout", "1"])
+            args.context = {**context, "write": write}
+            elapsed = [0]
+            def advance(delay):
+                elapsed[0] += delay
+            with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])),                     codex_runner.acquire_write_lock(str(self.cwd)),                     mock.patch.object(codex_runner, "time", wraps=time) as clock,                     mock.patch.object(codex_runner, "snapshot_before", return_value=(None, None)) as snapshot,                     mock.patch.object(codex_runner, "diff_begin") as diff,                     mock.patch.object(codex_runner, "router_reachable", side_effect=RuntimeError("stop")):
+                clock.monotonic.side_effect = lambda: elapsed[0]
+                clock.sleep.side_effect = advance
+                try:
+                    result = codex_runner.execute(args, "look", Path(self.tmp.name) / f"run-{write}")
+                except RuntimeError:
+                    result = {}
+                # A writer still waits for the held lock; a read-only full-access job goes straight to Codex.
+                self.assertEqual(result.get("error_kind") == "lock_timeout", expect_lock)
+                self.assertEqual(snapshot.called, False)
+                self.assertEqual(diff.called, False)
+
     def test_lock_timeout_does_not_acquire_a_lock_released_after_the_deadline(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -1641,13 +2062,69 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(mcp, ["mcp_servers.alpha.enabled=false", "mcp_servers.a b.enabled=false"])
             self.assertEqual(cmd[cmd.index(mcp[0]) - 1], "-c")
             self.assertIn("hooks", cmd)
+            self.assertIn("skills.include_instructions=false", cmd)
             args.use_user_config = True
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
             self.assertFalse(any("mcp_servers" in part for part in cmd))
+            self.assertNotIn("skills.include_instructions=false", cmd)
             args.use_user_config = False
             (home / "config.toml").write_text("not = [valid toml")
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
             self.assertFalse(any("mcp_servers" in part for part in cmd))
+
+    def test_bundled_user_agents_md_is_visible_to_fresh_and_resumed_invocations(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        real = Path(self.tmp.name) / "codex-home"
+        real.mkdir()
+        (real / "AGENTS.md").write_text("long user instructions", encoding="utf-8")
+        short = Path(self.tmp.name) / "executor-agents.md"
+        shutil.copyfile(RUNNER.parent.parent / "executor-agents.md", short)
+        args = SimpleNamespace(use_user_config=False, model=None, effort=None, sandbox="read-only", schema=None)
+        # Use a file hard link as a test double where Windows symlinks require extra privileges.
+        links = mock.patch.object(Path, "symlink_to", Path.hardlink_to) if os.name == "nt" else nullcontext()
+        with links, mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "runner"), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(real), "CODEX_RUNNER_AGENTS_MD": str(short)}):
+            for thread in (None, "thread-1"):
+                cmd, env = codex_runner.build_command(args, real, thread)
+                self.assertEqual("resume" in cmd, thread is not None)
+                self.assertEqual((Path(env["CODEX_HOME"]) / "AGENTS.md").read_bytes(), short.read_bytes())
+            os.environ.pop("CODEX_RUNNER_AGENTS_MD")
+            _, env = codex_runner.build_command(args, real, None)
+            self.assertEqual(Path(env["CODEX_HOME"]), real)
+            self.assertEqual((real / "AGENTS.md").read_text(encoding="utf-8"), "long user instructions")
+
+    @unittest.skipIf(os.name == "nt", "symlinks need Developer Mode on Windows")
+    def test_user_agents_md_can_be_left_out_or_replaced(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import argparse
+        import codex_runner
+
+        real = Path(self.tmp.name) / "codex-home"
+        (real / "sessions").mkdir(parents=True)
+        (real / "config.toml").write_text("")
+        (real / "AGENTS.md").write_text("long user instructions")
+        short = Path(self.tmp.name) / "short.md"
+        short.write_text("short")
+        args = argparse.Namespace(use_user_config=False, model=None, effort=None, sandbox="read-only", schema=None)
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "runner"), \
+                mock.patch.dict(os.environ, {"CODEX_HOME": str(real)}):
+            _, env = codex_runner.build_command(args, Path(self.tmp.name), None)
+            self.assertEqual(env["CODEX_HOME"], str(real))
+            for choice, expected in (("none", None), (str(short), "short"), ("none", None)):
+                with self.subTest(choice=choice), mock.patch.dict(os.environ, {"CODEX_RUNNER_AGENTS_MD": choice}):
+                    _, env = codex_runner.build_command(args, Path(self.tmp.name), "thread-1")
+                    home = Path(env["CODEX_HOME"])
+                    self.assertNotEqual(home, real)
+                    self.assertEqual((home / "sessions").resolve(), (real / "sessions").resolve())
+                    self.assertTrue((home / "config.toml").is_symlink())
+                    agents = home / "AGENTS.md"
+                    self.assertEqual(agents.read_text() if agents.exists() else None, expected)
+            args.use_user_config = True
+            with mock.patch.dict(os.environ, {"CODEX_RUNNER_AGENTS_MD": "none"}):
+                _, env = codex_runner.build_command(args, Path(self.tmp.name), None)
+                self.assertEqual(env["CODEX_HOME"], str(real))
 
     def test_writer_changes_come_from_a_snapshot_diff_or_codex_events(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -1782,6 +2259,66 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(codex_runner.snapshot_before(str(root), None), (None, None))
         with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered tree")):
             self.assertEqual(codex_runner.snapshot_before(str(root), None), (None, None))
+
+    def test_scope_entry_that_runs_out_of_budget_is_remembered_and_skipped(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        real_snapshot, real_walk = codex_runner.snapshot, codex_runner.os.walk
+
+        def slow_walk(top, *args, **kwargs):
+            for entry in real_walk(top, *args, **kwargs):
+                time.sleep(0.2)
+                yield entry
+
+        with mock.patch.object(codex_runner, "snapshot", side_effect=lambda *a, **k: real_snapshot(*a, **{**k, "budget": 0.1})),                 mock.patch.object(codex_runner.os, "walk", side_effect=slow_walk):
+            self.assertIsNone(codex_runner.snapshot_before(str(root), ["keep", "single.txt"])[0])
+        self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), codex_runner.too_big_trees())
+        # The slow directory is skipped from now on; the other scope entries are still snapshotted.
+        with mock.patch.object(codex_runner.os, "walk", side_effect=AssertionError("walked a remembered scope entry")):
+            before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
+        self.assertEqual(scope, [os.path.realpath(root / "single.txt")])
+        self.assertEqual(list(before), ["single.txt"])
+        # Only that scope entry is skipped, and forget-too-big on the task directory clears it too.
+        self.assertEqual(codex_runner.snapshot_before(str(root), ["other.txt"])[1], [os.path.realpath(root / "other.txt")])
+        self.assertEqual(self.control("forget-too-big", "--cwd", str(root)), {"status": "completed", "removed": True})
+        self.assertEqual(codex_runner.too_big_trees(), {})
+
+    def test_slow_scope_entry_within_budget_is_used_now_and_skipped_later(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        real_walk = codex_runner.os.walk
+
+        def slow_walk(top, *args, **kwargs):
+            for entry in real_walk(top, *args, **kwargs):
+                time.sleep(0.2)
+                yield entry
+
+        with mock.patch.object(codex_runner, "SCOPE_SLOW_S", 0.1), mock.patch.object(codex_runner.os, "walk", side_effect=slow_walk):
+            before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
+        self.assertEqual(sorted(before), ["keep/a.txt", "single.txt"])
+        self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), codex_runner.too_big_trees())
+        before, scope = codex_runner.snapshot_before(str(root), ["keep", "single.txt"])
+        self.assertEqual(list(before), ["single.txt"])
+
+    def test_scoped_walk_over_the_slow_limit_in_total_remembers_its_slowest_entry(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        (root / "more").mkdir()
+        (root / "more" / "b.txt").write_text("b")
+        real_walk = codex_runner.os.walk
+
+        def walk(top, *args, **kwargs):
+            for entry in real_walk(top, *args, **kwargs):
+                time.sleep(0.15 if str(top).endswith("keep") else 0.05)
+                yield entry
+
+        # Neither entry alone exceeds the limit, the two together do: the slower one is skipped from now on.
+        with mock.patch.object(codex_runner, "SCOPE_SLOW_S", 0.18), mock.patch.object(codex_runner.os, "walk", side_effect=walk):
+            before, _ = codex_runner.snapshot_before(str(root), ["keep", "more"])
+        self.assertEqual(sorted(before), ["keep/a.txt", "more/b.txt"])
+        known = codex_runner.too_big_trees()
+        self.assertIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "keep")), known)
+        self.assertNotIn(codex_runner.SCOPE_TOO_BIG + codex_runner.tree_key(str(root / "more")), known)
 
     def test_forget_too_big_removes_only_the_normalized_key_and_is_idempotent(self):
         codex_runner, root = self.big_tree()
@@ -2146,6 +2683,85 @@ class RunnerTests(unittest.TestCase):
         (job / "result.json").symlink_to(target)
         self.assertEqual(self.control("products", "--owner", "owner-a")["status"], "failed")
 
+    def test_must_verify_is_preserved_and_validated_in_task_context(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        from codex_runner import task_context
+
+        context = {"owner": "owner", "task": "Test required criterion", "acceptance": ["Observed result"], "write": False}
+        self.assertEqual(task_context({**context, "must_verify": [1]})["must_verify"], [1])
+        self.assertNotIn("must_verify", task_context(context))
+        for value in ([0], [2], [True], "1"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "must_verify"):
+                task_context({**context, "must_verify": value})
+
+    def test_model_ab_is_deterministic_and_reaches_the_fake_codex(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        from codex_runner import select_ab_model
+
+        models, share = ["model-A", "model-B"], 0.3
+        ids = [f"20261118-120000-{i:06x}" for i in range(2000)]
+        assigned = [select_ab_model(job_id, models, share) for job_id in ids]
+        self.assertEqual(assigned, [select_ab_model(job_id, models, share) for job_id in ids])
+        self.assertAlmostEqual(assigned.count(models[0]) / len(ids), share, delta=0.03)
+        self.assertEqual(select_ab_model(ids[0], models, 0), models[1])
+        self.assertEqual(select_ab_model(ids[0], models, 1), models[0])
+
+        prompt = json.dumps({"prompt": "dispatch with A/B", "context": self.sample_context()})
+        started = self.invoke("--context-json", "--model-ab", json.dumps([models, share]), prompt=prompt, command="start")
+        result = self.control("status", started["job_id"], "--wait", "30")
+        model = select_ab_model(started["job_id"], models, share)
+        self.assertEqual(result["context"]["routing"], {"ab": True, "model": model})
+        self.assertEqual(result["task_options"]["model"], model)
+        argv = self.calls()[0]["argv"]
+        self.assertEqual(argv[argv.index("-m") + 1], model)
+
+    def test_model_ab_stats_summarize_marked_jobs_and_latest_thread_outcomes(self):
+        script = RUNNER.parent.parent / "tools" / "model_ab_stats.py"
+        root = Path(self.tmp.name) / "stats-jobs"
+
+        def job(number, model="A", ab=True, thread=None, parent=None, result=None, review=None, day="20261118"):
+            job_dir = root / f"{day}-120000-{number:06x}"
+            job_dir.mkdir(parents=True)
+            args = job_dir / "args.json"
+            context = {**self.sample_context(), "routing": {"ab": ab, "model": model}}
+            if parent:
+                context["continuation"] = {"parent_job_id": parent}
+            args.write_text(json.dumps({"context": context}), encoding="utf-8")
+            os.utime(args, (100 + number, 100 + number))
+            if result is not None:
+                result = {**result, "thread_id": thread, "structured": {"summary": "private report body"}}
+                (job_dir / "result.json").write_text(json.dumps(result), encoding="utf-8")
+            if review:
+                (job_dir / "reviews.json").write_text(json.dumps({"latest": {"status": review}}), encoding="utf-8")
+            return job_dir.name
+
+        done = {"status": "completed", "duration_s": 10, "criteria_counts": {"met": 1}}
+        first = job(1, thread="T1", result={**done, "criteria_counts": {"not_met": 1, "blocked": 1}}, review="needs_changes")
+        job(2, thread="T2", parent=first, result={"status": "failed", "error_kind": "model_refused", "duration_s": 20})
+        job(3, thread="T3", result={**done, "duration_s": 30}, review="verified")
+        job(4, thread="T3", result={**done, "duration_s": 40}, review="accepted_deviations")
+        job(5)
+        job(6, model="B", result=done, review="verified")
+        job(7, model="excluded", ab=False, result=done)
+        job(8, model="older", day="20261117", result=done)
+        command = [sys.executable, "-B", str(script), "--jobs-dir", str(root), "--since", "20261118"]
+        output = subprocess.check_output([*command, "--json"], encoding="utf-8")
+        stats = json.loads(output)
+        self.assertEqual(set(stats), {"A", "B"})
+        self.assertEqual(stats["A"], {
+            "tasks": 5, "execution_completion_rate": 0.6, "failure_reasons": {"model_refused": 1},
+            "self_report_shares": {"met": 0.5, "blocked": 0.25, "not_met": 0.25},
+            "review_shares": {"verified": 0.2, "accepted_deviations": 0.2, "needs_changes": 0.2},
+            "threads": 3, "final_outcome_shares": {
+                "verified": 0.0, "accepted_deviations": 1 / 3, "needs_changes": 1 / 3, "unreviewed": 1 / 3},
+            "mean_rework_rounds": 2 / 3, "median_duration_s": 25.0, "model_refusals": 1,
+        })
+        self.assertEqual(stats["B"]["final_outcome_shares"]["verified"], 1)
+        self.assertNotIn("private", output)
+        text = subprocess.check_output(command, encoding="utf-8")
+        self.assertIn("execution_completion_rate: 60.0%", text)
+        self.assertNotIn("private", text)
+
     def test_verification_context_round_trips_without_becoming_a_continuation(self):
         context = {**self.sample_context(), "write": False, "verification_of": "original-1"}
         result = self.invoke("--context-json", "--model", "test-model", "--service-tier", "fast",
@@ -2160,7 +2776,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(listing["task_options"], result["task_options"])
         self.assertEqual(self.control("list", "--parent-job", "original-1")["total"], 0)
         self.assertNotIn("resume", self.calls()[0]["argv"])
-        self.assertIn('sandbox_mode="read-only"', self.calls()[0]["argv"])
+        self.assertEqual(result["sandbox"], "read-only")
+        self.assertIn('sandbox_mode="workspace-write"', self.calls()[0]["argv"])
+        self.assertIn("--ephemeral", self.calls()[0]["argv"])
 
     def test_verification_context_rejects_invalid_identifiers_without_spawning(self):
         for value in (None, True, 1, [], {}, "", "../job", "has space", "job/name"):
@@ -2401,6 +3019,124 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual(value["verification_status"], status)
                     self.assertEqual(value["verification"]["notes"], review["notes"])
                 self.assertEqual((jd / "result.json").read_bytes(), original)
+
+    def test_accepted_deviations_can_accept_an_open_criterion_only_with_a_reason(self):
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "no access"}])
+        jd = self.stored_job("accept-open", {"status": "completed", "structured": report}, context=self.sample_context())
+        base = self.sample_review(status="accepted_deviations")
+        open_entry = {"index": 1, "status": "blocked", "evidence": "still blocked"}
+        # Without a reason a passing review still needs every criterion met.
+        self.assertRegex(self.submit_review(jd.name, {**base, "criteria": [open_entry]})["error"], "Passing review requires all criteria met")
+        # accepted is only for accepted_deviations and only on a criterion that is not met.
+        for status, entry in (("verified", {**open_entry, "accepted": "owner accepts"}),
+                              ("accepted_deviations", {"index": 1, "status": "met", "evidence": "ok", "accepted": "x"}),
+                              ("accepted_deviations", {**open_entry, "accepted": "  "})):
+            self.assertRegex(self.submit_review(jd.name, {**base, "status": status, "criteria": [entry]})["error"], "accepted is only")
+        value = self.submit_review(jd.name, {**base, "criteria": [{**open_entry, "accepted": "owner accepts the gap"}]})
+        self.assertEqual(value["verification_status"], "accepted_deviations")
+        self.assertEqual(value["verification"]["criteria"][0]["accepted"], "owner accepts the gap")
+        groups = self.control("summary", "--job-id", "accept-open")["groups"]
+        self.assertEqual(groups[0]["accepted_open"], [{"index": 1, "status": "blocked"}])
+        # An older record without the field stays readable.
+        self.assertEqual(self.control("status", "accept-open")["verification_status"], "accepted_deviations")
+
+    def test_review_report_rows_follow_the_criteria_rules(self):
+        # A report with more rows than acceptance criteria: row 3 is flagged and matches no criterion.
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "met", "evidence": "ok"},
+                                              {"criterion": "sample a", "status": "met", "evidence": "ok"},
+                                              {"criterion": "sample b", "status": "not_met", "evidence": "wrong"}])
+        jd = self.stored_job("extra-rows", {"status": "completed", "structured": report}, context=self.sample_context())
+        base = self.sample_review(status="accepted_deviations")
+        row = {"row": 3, "status": "not_met", "evidence": "still wrong"}
+        for rows in ([{**row, "row": 4}], [row, row], [{**row, "evidence": " "}], [{**row, "extra": 1}]):
+            self.assertRegex(self.submit_review(jd.name, {**base, "report_rows": rows})["error"], "report_rows entries")
+        self.assertRegex(self.submit_review(jd.name, {**base, "report_rows": [row]})["error"], "Passing review requires all criteria met")
+        # needs_changes with every criterion met is legitimate when a report row stays open.
+        self.assertEqual(self.submit_review(jd.name, {**base, "status": "needs_changes", "report_rows": [row]})["verification_status"], "needs_changes")
+        value = self.submit_review(jd.name, {**base, "report_rows": [{**row, "accepted": "owner accepts"}]})
+        self.assertEqual(value["verification_status"], "accepted_deviations")
+        self.assertEqual(self.control("summary", "--job-id", "extra-rows")["groups"][0]["accepted_open"], [{"row": 3, "status": "not_met"}])
+
+    def test_status_reports_when_the_job_started_and_finished(self):
+        jd = self.stored_job("timed", {"status": "completed", "structured": self.sample_report()}, context=self.sample_context())
+        os.utime(jd / "args.json", (1000, 1000))
+        os.utime(jd / "result.json", (2000, 2000))
+        value = self.control("status", "timed")
+        self.assertEqual((value["started_at"], value["finished_at"]), (1000, 2000))
+
+    def test_context_routing_is_optional_and_typed(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+        ok = {**self.sample_context(), "routing": {"continuation_mode": "fresh", "parent_thread_id": "T", "superseded_threads": ["A"], "fresh": True}}
+        self.assertEqual(codex_runner.task_context(ok)["routing"]["continuation_mode"], "fresh")
+        with self.assertRaises(ValueError):
+            codex_runner.task_context({**self.sample_context(), "routing": {"bad": {"nested": 1}}})
+
+    def test_owner_decision_context_requires_complete_typed_metadata(self):
+        import codex_runner
+
+        base = {"parent_job_id": "parent", "answers": [], "resolution": "use option A"}
+        decision = {"decided_by": "planner", "decision_basis": "standing_authorization",
+                    "decided_at": 1795050000.5, "resolves": ["choice-1"]}
+        validate = lambda continuation: codex_runner.task_context({**self.sample_context(), "continuation": continuation})
+        self.assertEqual(validate({**base, **decision})["continuation"], {**base, **decision})
+        for invalid in ({"decided_by": "planner"}, {**decision, "decided_by": "owner"},
+                        {**decision, "decided_at": True}, {**decision, "decided_at": float("nan")},
+                        {**decision, "resolves": [""]}, {**decision, "resolves": ["choice-1", "choice-1"]},
+                        {**decision, "extra": "invalid"}):
+            with self.assertRaises(ValueError):
+                validate({**base, **invalid})
+        with self.assertRaises(ValueError):
+            validate({**base, **decision, "resolution": ""})
+
+    def test_owner_only_review_requires_an_accepted_open_entry(self):
+        import codex_runner
+
+        source = {"context": self.sample_context(), "structured": self.sample_report()}
+        review = self.sample_review(status="accepted_deviations")
+        blocked = {"index": 1, "status": "blocked", "evidence": "pending", "accepted": "accepted",
+                   "owner_only": "spending"}
+        codex_runner.validate_review({**review, "criteria": [blocked]}, source, submitting=True)
+        for invalid in ({**blocked, "accepted": ""}, {**blocked, "owner_only": []},
+                        {**blocked, "owner_only": "unknown"}, {**blocked, "status": "met"},
+                        {key: value for key, value in blocked.items() if key != "accepted"}):
+            with self.assertRaises(ValueError):
+                codex_runner.validate_review({**review, "criteria": [invalid]}, source, submitting=True)
+        row = {**blocked, "row": 2}
+        del row["index"]
+        source["structured"]["criteria"].append({"criterion": "Extra check", "status": "blocked", "evidence": "pending"})
+        codex_runner.validate_review({**review, "report_rows": [row]}, source, submitting=True)
+        with self.assertRaises(ValueError):
+            codex_runner.validate_review({**review, "report_rows": [{**row, "owner_only": "unknown"}]}, source, submitting=True)
+
+    @unittest.skipUnless(shutil.which("node"), "requires Node to capture the plugin envelope")
+    def test_context_envelope_from_plugin_with_explicit_effort(self):
+        import codex_runner
+
+        plugin = """
+            import { apply } from './index.mjs';
+            let runTool;
+            apply({
+              tools: { register(tool) { if (tool.name === 'codex_run') runTool = tool; }, guard() {} },
+              on() {},
+            }, { closeoutGuard: false, autoVerify: 'off' }, async (_config, argv, { stdin }) => {
+              if (argv[0] !== 'start') throw new Error(argv[0]);
+              process.stdout.write(stdin);
+              return { status: 'completed', job_id: 'J1' };
+            });
+            await runTool.execute({
+              task: 'Check the result', acceptance: ['Result is valid'], write: false,
+              effort: 'high', effort_reason: 'prior_rework',
+            }, { agent: { id: 'S1', session: { header: { cwd: process.cwd() }, log: [] } } });
+        """
+        captured = subprocess.run(["node", "--input-type=module", "-e", plugin], cwd=RUNNER.parent.parent,
+                                  env={**self.env, "LOCALAPPDATA": self.tmp.name}, capture_output=True, check=True, timeout=15)
+        args = argparse.Namespace(context_json=True)
+        with mock.patch.object(sys, "stdin", io.TextIOWrapper(io.BytesIO(captured.stdout), encoding="utf-8")):
+            self.assertTrue(codex_runner.read_task_input(args, argparse.ArgumentParser()))
+        self.assertEqual(args.context["routing"], {
+            "effort_requested": "high", "effort_reason": "prior_rework", "effort_applied": "high",
+        })
 
     def test_stored_all_met_needs_changes_stays_readable_and_appendable(self):
         jd = self.stored_job("legacy-inconsistent-review",
@@ -2651,6 +3387,47 @@ class RunnerTests(unittest.TestCase):
         os.utime(latest / "args.json", (1004, 1004))
         self.assertIsNone(self.control("summary", "--thread-id", "shared-thread")["groups"][0]["usage"])
         self.assertEqual(self.control("summary", "--job-id", "round-4")["groups"][0]["usage"], {"input_tokens": 50})
+
+    def test_summary_exposes_only_the_latest_rounds_repeat_guard(self):
+        standing = [{"step": "ac08ef12", "failures": 2, "seconds": 1584, "last_exit": 1, "last_at": 1795050000}]
+        repeated = {"blocks": [{"step": "ac08ef12", "prior_failures": 2, "prior_seconds": 1584}], "standing": standing}
+        cleared = {"blocks": [], "standing": []}
+        for i, guard in enumerate((repeated, cleared), 1):
+            job = self.stored_job(f"guard-summary-{i}", {"status": "completed", "thread_id": "shared-thread", "repeat_guard": guard})
+            os.utime(job / "args.json", (1000 + i, 1000 + i))
+        self.assertEqual(self.control("summary")["groups"][0]["repeat_guard"], cleared)
+        summary = self.control("summary", "--job-id", "guard-summary-1")
+        self.assertEqual(summary["groups"][0]["repeat_guard"], repeated)
+
+    def test_summary_keeps_a_fresh_thread_continuation_in_its_parent_unit_and_sums_usage_per_thread(self):
+        parent = self.stored_job("parent", {"status": "completed", "thread_id": "old-thread", "usage": {"input_tokens": 100},
+                                            "structured": self.sample_report()}, context=self.sample_context())
+        os.utime(parent / "args.json", (1001, 1001))
+        child_context = {**self.sample_context(), "continuation": {"parent_job_id": "parent", "answers": [], "resolution": ""}}
+        child = self.stored_job("child", {"status": "completed", "thread_id": "fresh-thread", "usage": {"input_tokens": 30},
+                                          "structured": self.sample_report()}, context=child_context)
+        os.utime(child / "args.json", (1002, 1002))
+        self.stored_job("other", {"status": "completed", "thread_id": "other-thread", "usage": {"input_tokens": 5},
+                                  "structured": self.sample_report()}, context=self.sample_context())
+        groups = self.control("summary")["groups"]
+        unit = next(g for g in groups if "parent" in g["job_ids"])
+        self.assertEqual((unit["group_id"], unit["job_ids"], unit["latest_job_id"]), ("thread:old-thread", ["parent", "child"], "child"))
+        self.assertEqual(unit["usage"], {"input_tokens": 130})
+        self.assertEqual(len(groups), 2)
+
+    def test_thread_size_reads_the_last_token_count_of_the_rollout(self):
+        home = Path(self.tmp.name) / "codex-home"
+        day = home / "sessions" / "2026" / "11" / "18"
+        day.mkdir(parents=True)
+        lines = [json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": n}}}})
+                 for n in (1000, 207000)]
+        (day / "rollout-2026-11-18T01-33-04-01a1ea91-c621-7612-8d92-e5414f0ad6ea.jsonl").write_text("".join(line + chr(10) for line in lines))
+        env = {**self.env, "CODEX_HOME": str(home)}
+        run = lambda thread: json.loads(subprocess.run([sys.executable, "-B", str(RUNNER), "thread-size", thread], env=env,
+                                                       capture_output=True, text=True, check=True).stdout.splitlines()[-1])
+        self.assertEqual(run("01a1ea91-c621-7612-8d92-e5414f0ad6ea")["last_input_tokens"], 207000)
+        self.assertIsNone(run("01a1ea91-c621-7612-8d92-e5414f0a0000")["last_input_tokens"])
+        self.assertEqual(run("../x")["error_kind"], "bad_arguments")
 
     def test_summary_pages_threads_without_losing_totals_or_rounds(self):
         for i in range(12):
@@ -2912,7 +3689,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(exact["total"], 1)
         self.assertEqual([j["job_id"] for j in exact["jobs"]], ["legacy"])
         owned = next(j for j in result["jobs"] if j["job_id"] == "owned")
-        self.assertEqual(owned["context"], {"owner": "owner-a", "task": "Task title"})
+        self.assertEqual(owned["context"], {"owner": "owner-a", "write": True, "task": "Task title"})
         self.assertEqual(owned["scope"], ["src"])
         self.assertEqual(owned["scope_paths"], [os.path.realpath(self.cwd / "src")])
         self.assertEqual(owned["criteria_counts"], {"met": 1, "not_met": 0, "blocked": 0})
@@ -2934,6 +3711,17 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNone(last["next_offset"])
         for extra in (("--limit", "101"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
+
+    def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
+        for job_id, owner in (("mine", "owner-b"), ("predecessor", "owner-a"), ("unrelated", "owner-c")):
+            self.stored_job(job_id, {"status": "completed", "structured": self.sample_report()}, context=self.sample_context(owner))
+        listed = self.control("list", "--owner", "owner-b", "--also-owner", "owner-a")
+        self.assertEqual({j["job_id"] for j in listed["jobs"]}, {"mine", "predecessor"})
+        self.assertEqual({j["job_id"] for j in self.control("list", "--owner", "owner-b")["jobs"]}, {"mine"})
+        # Without --owner it is not a filter at all.
+        self.assertEqual(self.control("list", "--also-owner", "owner-a")["total"], 3)
+        summary = self.control("summary", "--owner", "owner-b", "--also-owner", "owner-a")
+        self.assertEqual(summary["total_jobs"], 2)
 
     def test_list_filters_metadata_before_reading_job_events(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -3361,6 +4149,163 @@ class RunnerTests(unittest.TestCase):
         (job_dir / "worker.pid").write_text(str(os.getpid()))
         (job_dir / "boot_id").write_text("an-earlier-boot")
         return job_dir
+
+    def lost_job(self, job_id, *, boot="00000000-0000-0000-0000-000000000001:10", age=600):
+        context = {"owner": "S1", "task": "write a file", "acceptance": ["file saved"], "write": True}
+        job = self.stored_job(job_id, None, sandbox="workspace-write", context=context, scope=["src"])
+        if boot is not None:
+            (job / "boot_id").write_text(boot)
+        for name, pid, start in (("worker", "123", "11"), ("codex", "456", "12")):
+            (job / f"{name}.pid").write_text(pid)
+            (job / f"{name}.start").write_text(start)
+        phase = {"type": "runner.phase", "phase": "codex_running", "attempt": 2}
+        (job / "phase.json").write_text(json.dumps(phase), "utf-8")
+        (job / "events.jsonl").write_text('{"type":"thread.started","thread_id":"T-lost"}\n', "utf-8")
+        active_at = time.time() - age
+        for name in ("events.jsonl", "phase.json"):
+            os.utime(job / name, (active_at, active_at))
+        return job
+
+    def lost_proc(self, worker=None, codex=None):
+        read_text = Path.read_text
+        def read(path, *args, **kwargs):
+            if path.as_posix() == "/proc/sys/kernel/random/boot_id":
+                return "00000000-0000-0000-0000-000000000001\n"
+            if path.as_posix() in ("/proc/1/stat", "/proc/123/stat", "/proc/456/stat"):
+                start = {"1": "10", "123": worker, "456": codex}[path.parent.name]
+                if start is None:
+                    raise FileNotFoundError(str(path))
+                if isinstance(start, OSError):
+                    raise start
+                return f"{path.parent.name} (fake process) " + "S " * 19 + start
+            return read_text(path, *args, **kwargs)
+        return mock.patch.object(Path, "read_text", read)
+
+    def test_executor_loss_never_finalizes_a_live_worker_residual_codex_or_proc_error(self):
+        import codex_runner
+
+        cases = [("live-worker", "11", None), ("residual", None, "12"),
+                 ("worker-error", PermissionError("proc denied"), None),
+                 ("codex-error", None, OSError("proc read failed"))]
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            for name, worker, codex in cases:
+                with self.subTest(name=name), self.lost_proc(worker, codex), \
+                        mock.patch.object(codex_runner, "process_start", side_effect=lambda pid: worker if pid == 123 else codex):
+                    job = self.lost_job(name)
+                    value = codex_runner.job_status(name)
+                    self.assertFalse((job / "result.json").exists())
+                    if name == "live-worker":
+                        self.assertEqual(value["status"], "running")
+                    if name == "residual":
+                        self.assertEqual(value["residual_codex_pid"], 456)
+
+    def test_executor_loss_persists_previous_boot_once_and_recovers_metadata(self):
+        import codex_runner
+
+        job = self.lost_job("old-boot", boot="00000000-0000-0000-0000-000000000002:10", age=0)
+        active_at = (job / "phase.json").stat().st_mtime
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), self.lost_proc("11", "12"):
+            first = codex_runner.job_status(job.name)
+            self.assertEqual((first["error_kind"], first.get("lost_reason")), ("executor_lost", "boot_changed"))
+            result = json.loads((job / "result.json").read_text("utf-8"))
+            self.assertEqual(codex_runner.job_status(job.name), first)
+        self.assertEqual((result["status"], result["retryable"], result["attempts"], result["thread_id"], result["phase"]),
+                         ("failed", False, 2, "T-lost", "lost"))
+        self.assertEqual(result["started_at"], (job / "args.json").stat().st_mtime)
+        self.assertEqual(result["last_activity_at"], active_at)
+        self.assertGreaterEqual(result["finished_at"], active_at)
+        self.assertEqual(result["context"], json.loads((job / "args.json").read_text("utf-8"))["context"])
+        self.assertEqual(result["scope"], ["src"])
+        self.assertEqual(result["report_status"], "missing")
+        self.assertEqual(json.loads((job / "phase.json").read_text("utf-8"))["phase"], "lost")
+        self.assertEqual((job / "events.jsonl").read_text("utf-8").count('"phase": "lost"'), 1)
+
+    def test_executor_loss_waits_for_both_activity_mtimes_then_accepts_legacy(self):
+        import codex_runner
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), self.lost_proc(codex="99"):
+            for legacy in (False, True):
+                for name in ("phase.json", "events.jsonl"):
+                    with self.subTest(legacy=legacy, newest=name):
+                        job = self.lost_job(f"threshold-{legacy}-{name.split('.')[0]}")
+                        if legacy:
+                            (job / "boot_id").unlink()
+                        else:
+                            (job / "boot_id").write_text("00000000-0000-0000-0000-000000000001:9")
+                        recent = time.time() - 30
+                        os.utime(job / name, (recent, recent))
+                        codex_runner.job_status(job.name)
+                        self.assertFalse((job / "result.json").exists())
+                        with mock.patch.object(sys, "argv", [str(RUNNER), "status", job.name, "--lost-after", "20"]), \
+                                mock.patch.object(codex_runner, "emit") as emit:
+                            codex_runner.main()
+                        self.assertEqual(emit.call_args.args[0].get("lost_reason"), "worker_exited")
+                        self.assertEqual(json.loads((job / "result.json").read_text("utf-8"))["error_kind"], "executor_lost")
+
+    def test_executor_loss_reconciles_list_summary_and_writer_admission_without_diff(self):
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        home.mkdir()
+        (home / "locks").mkdir()
+        (home / "step-failures.json").write_text("{}", "utf-8")
+        with mock.patch.object(codex_runner, "HOME", home), self.lost_proc(), \
+                mock.patch.object(codex_runner, "acquire_file_lock", wraps=codex_runner.acquire_file_lock) as lock, \
+                mock.patch.object(codex_runner, "diff_end", side_effect=AssertionError("late diff in reconciliation")):
+            for command in ("list", "summary", "admission"):
+                with self.subTest(command=command):
+                    job = self.lost_job(f"via-{command}")
+                    (job / "diff-base.json").touch()
+                    if command == "admission":
+                        waiter = self.stored_job("waiter", None)
+                        roots = codex_runner.write_lock_roots(str(self.cwd), "workspace-write", None)
+                        self.assertFalse(codex_runner.earlier_writer_waiting(waiter, roots))
+                    else:
+                        argv = [str(RUNNER), command, "--job-id", job.name]
+                        if command == "list":
+                            argv += ["--status", "running"]
+                        with mock.patch.object(sys, "argv", argv), mock.patch.object(codex_runner, "emit") as emit:
+                            codex_runner.main()
+                        value = emit.call_args.args[0]
+                        if command == "list":
+                            self.assertEqual(value["total"], 0)
+                        else:
+                            self.assertEqual(value["error_kinds"], {"executor_lost": 1})
+                    self.assertTrue((job / "result.json").exists())
+            self.assertTrue(lock.call_args_list)
+            self.assertFalse(any(call.kwargs.get("blocking") for call in lock.call_args_list))
+
+    def test_executor_loss_racing_reconciler_after_reload_publishes_once(self):
+        import codex_runner
+
+        job = self.lost_job("raced-loss")
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        entered, release = Event(), Event()
+        write = codex_runner.write_result
+
+        def pause_write(*args, **kwargs):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return write(*args, **kwargs)
+
+        with mock.patch.object(codex_runner, "HOME", home), self.lost_proc(), \
+                mock.patch.object(codex_runner, "write_result", side_effect=pause_write) as publish, \
+                ThreadPoolExecutor(2) as pool:
+            first = pool.submit(codex_runner.job_status, job.name)
+            try:
+                self.assertTrue(entered.wait(5), "first reconciler never reached result publication")
+                spec = importlib.util.spec_from_file_location("reloaded_runner", RUNNER)
+                reloaded = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(reloaded)
+                second = pool.submit(reloaded.job_status, job.name).result(2)
+                self.assertEqual(second["error_kind"], "worker_died")
+                self.assertFalse((job / "result.json").exists())
+            finally:
+                release.set()
+            self.assertEqual(first.result(5)["error_kind"], "executor_lost")
+            self.assertEqual(reloaded.job_status(job.name), first.result())
+            publish.assert_called_once()
+        self.assertEqual((job / "events.jsonl").read_text("utf-8").count('"phase": "lost"'), 1)
 
     def test_a_worker_from_before_a_restart_is_dead_keeps_its_thread_and_cancel_kills_nothing(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -3798,7 +4743,7 @@ class RunnerTests(unittest.TestCase):
 
     def git_repo(self, name, commit=True):
         """A repository whose sub/ is the task directory; the fake's repo_edit changes three files there."""
-        root = Path(self.tmp.name) / name
+        root = Path(self.tmp.name).resolve() / name
         sub = root / "sub"
         sub.mkdir(parents=True)
         (sub / "a.txt").write_bytes(b"original\n")
@@ -3813,6 +4758,305 @@ class RunnerTests(unittest.TestCase):
             git("add", "-A")
             git("commit", "-q", "-m", "base")
         return root, sub, git
+
+    def test_verification_runs_temp_file_suite_with_project_outside_write_roots(self):
+        (self.cwd / "temp_check.py").write_text(textwrap.dedent("""
+            import os, tempfile, unittest
+            from pathlib import Path
+
+            class TempCheck(unittest.TestCase):
+                def test_temp_round_trip(self):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        self.assertEqual(Path(tmp).parent, Path(os.environ["TMPDIR"]))
+                        record = Path(tmp) / "check.txt"
+                        record.write_text("test data")
+                        self.assertEqual(record.read_text(), "test data")
+        """), encoding="utf-8")
+        prompt = json.dumps({"prompt": "Run the project test", "context": {"owner": "S1", "task": "Verify the temp test",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        result = self.invoke("--context-json", "--sandbox", "read-only", "--schema",
+                             str(RUNNER.parents[1] / "report.v2.schema.json"), mode="verification_temp_test",
+                             prompt=prompt)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["structured"]["criteria"][0]["status"], "met")
+        self.assertEqual(result["cwd"], str(self.cwd.resolve()))
+        self.assertEqual(result["sandbox"], "read-only")
+        self.assertIn("--ephemeral", self.calls()[0]["argv"])
+        self.assertEqual(sorted(entry.name for entry in self.cwd.iterdir()), ["temp_check.py"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_fails_if_git_status_changes(self):
+        _, project, git = self.git_repo("verification")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        args = ("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access")
+        clean = self.invoke(*args, prompt=prompt)
+        self.assertEqual(clean["status"], "completed", clean)
+        scratch = (Path(clean["log_dir"]) / "scratch" / "tmp").resolve()
+        self.assertTrue({"shell_environment_policy.set.PYTHONDONTWRITEBYTECODE=" + json.dumps("1"),
+                         'shell_environment_policy.set.PYTEST_ADDOPTS="-p no:cacheprovider"',
+                         "shell_environment_policy.set.TMPDIR=" + json.dumps(str(scratch)),
+                         "shell_environment_policy.set.COVERAGE_FILE=" + json.dumps(str(scratch / ".coverage"))
+                         } <= set(self.calls()[-1]["argv"]))
+        changed = self.invoke(*args, mode="repo_edit", prompt=prompt)
+        self.assertIn('sandbox_mode="danger-full-access"', self.calls()[-1]["argv"])
+        self.assertEqual((changed["status"], changed.get("error_kind"), changed.get("retryable")),
+                         ("failed", "verification_tree_changed", False))
+        self.assertTrue(git("status", "--porcelain"))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_reports_concurrent_changes_without_failing(self):
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for kind in ("scope", "products", "running"):
+            with self.subTest(kind=kind):
+                _, project, _ = self.git_repo(f"verification-{kind}")
+                source = {"status": "completed", **({"files_changed": [{"path": "elsewhere.txt"}]} if kind == "products" else {})}
+                self.stored_job("SOURCE", source, cwd=str(project), scope=["elsewhere.txt"] if kind == "scope" else [])
+                if kind == "running":
+                    writer = self.stored_job("WRITER", None, cwd=str(project), sandbox="workspace-write")
+                    (writer / "stderr.log").touch()
+                result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                     mode="repo_edit", prompt=prompt)
+                self.assertEqual((result["status"], result.get("verification_integrity")),
+                                 ("completed", "concurrent_changes"), result)
+                shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_fix_host_verification_checks_dirty_bytes(self):
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for kind in ("dirty", "untracked"):
+            with self.subTest(kind=kind):
+                _, project, git = self.git_repo(f"verification-{kind}")
+                if kind == "untracked":
+                    git("rm", "-q", "sub/a.txt")
+                    git("commit", "-qm", "untrack a.txt")
+                (project / "a.txt").write_bytes(b"already dirty\n")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode="verification_overwrite", prompt=prompt)
+                    self.assertEqual((result["status"], result.get("error_kind"), result.get("retryable")),
+                                     ("failed", "verification_tree_changed", False))
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_detects_large_dirty_file_change(self):
+        _, project, _ = self.git_repo("verification-large")
+        target = project / "a.txt"
+        target.write_bytes(b"x" * (2 * 1024 * 1024))
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                             mode="verification_overwrite_large", prompt=prompt)
+        self.assertEqual((result["status"], result.get("error_kind"), target.stat().st_size),
+                         ("failed", "verification_tree_changed", 2 * 1024 * 1024))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_accepts_unchanged_large_dirty_file(self):
+        _, project, _ = self.git_repo("verification-large-unchanged")
+        (project / "a.txt").write_bytes(b"x" * (2 * 1024 * 1024))
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access", prompt=prompt)
+        self.assertEqual((result["status"], result.get("verification_integrity"),
+                          result.get("verification_unchecked_files")), ("completed", None, None))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_compares_dirty_files_beyond_total_content_budget(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-budget")
+        (project / "a.txt").write_bytes(b"abcd")
+        target = project / "gone.txt"
+        target.write_bytes(b"abcd")
+        with mock.patch.object(codex_runner, "VERIFY_TOTAL_LIMIT", 4):
+            before = codex_runner.verification_git_digest(str(project), [str(project)])
+            info = target.stat()
+            target.write_bytes(b"efgh")
+            os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+            after = codex_runner.verification_git_digest(str(project), [str(project)])
+        self.assertEqual(before[2] | after[2], set())
+        self.assertEqual(before[1][0], after[1][0])
+        self.assertTrue(codex_runner.verification_observations_changed(before[1][1], after[1][1]))
+
+    def test_host_verification_saves_unavailable_reason(self):
+        self.stored_job("SOURCE", {"status": "completed"})
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        job = self.invoke("--context-json", "--sandbox", "danger-full-access", command="start", prompt=prompt)
+        result = self.control("status", job["job_id"], "--wait", "30")
+        saved = json.loads((Path(result["log_dir"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual((saved["status"], saved.get("verification_integrity"), saved.get("verification_integrity_reason")),
+                         ("completed", "unavailable", "before_git_error"))
+
+    def execute_host_verification(self, project, run_dir, edit=None):
+        import codex_runner
+
+        args = SimpleNamespace(cwd=str(project), sandbox="danger-full-access", resume=None, schema=True,
+                               repeat_guard="off", context={"write": False, "verification_of": "SOURCE"})
+
+        def attempt(*args):
+            if edit is not None:
+                edit()
+            return {"completed": True, "failed": False, "thread_id": "thread-1", "file_changes": [],
+                    "last_text": json.dumps(self.sample_report()), "usage": {}, "commands": [], "forced_exit": False}
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "router_reachable", return_value=True), \
+                mock.patch.object(codex_runner, "run_attempt", side_effect=attempt):
+            result = codex_runner.execute(args, "Verify the task", run_dir)
+            codex_runner.write_result(run_dir, result)
+        return json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_ignores_budget_shift_after_transient_read_failure(self):
+        _, project, _ = self.git_repo("verification-budget-shift")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        content = b"x" * (1024 * 1024)
+        for number in range(33):
+            (project / f"f{number:02}").write_bytes(content)
+        original_open = os.open
+        fail_once = True
+
+        def open_with_transient_failure(path, *args, **kwargs):
+            nonlocal fail_once
+            if fail_once and os.fspath(path) == str(project / "f00"):
+                fail_once = False
+                raise PermissionError("injected transient read failure")
+            return original_open(path, *args, **kwargs)
+
+        with mock.patch.object(os, "open", side_effect=open_with_transient_failure):
+            result = self.execute_host_verification(project, Path(self.tmp.name) / "budget-shift-run")
+        self.assertEqual((result["status"], result.get("error_kind"), result.get("verification_integrity"),
+                          result.get("verification_unchecked_files")), ("completed", None, "unchecked", 1))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_detects_small_content_change_with_unchanged_stat(self):
+        _, project, _ = self.git_repo("verification-unchanged-stat")
+        target = project / "dirty.txt"
+        target.write_bytes(b"before")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["dirty.txt"])
+
+        def edit():
+            before = target.stat()
+            target.write_bytes(b"change")
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+            after = target.stat()
+            self.assertEqual((after.st_size, after.st_mtime_ns), (before.st_size, before.st_mtime_ns))
+
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "unchanged-stat-run", edit=edit)
+        self.assertEqual((result["status"], result.get("error_kind")), ("failed", "verification_tree_changed"))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_preserves_result_when_snapshot_threads_fail(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-thread-failure")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        for number in range(codex_runner.VERIFY_CONTENT_FILES + 1):
+            (project / f"f{number:03}").write_bytes(b"x")
+        for stage in ("before", "after"):
+            outcomes = [RuntimeError("injected thread startup failure")]
+            if stage == "after":
+                outcomes.insert(0, codex_runner.ThreadPoolExecutor(max_workers=2))
+            with self.subTest(stage=stage), \
+                    mock.patch.object(codex_runner, "ThreadPoolExecutor", side_effect=outcomes):
+                result = self.execute_host_verification(project, Path(self.tmp.name) / f"thread-failure-{stage}")
+                self.assertEqual((result["status"], result.get("verification_integrity"),
+                                  result.get("verification_integrity_reason"), result.get("structured")),
+                                 ("completed", "unavailable", f"{stage}_error", self.sample_report()))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and shutil.which("git"), "needs POSIX FIFOs and git")
+    def test_review_r2_host_verification_does_not_wait_on_fifo_replacing_dirty_file(self):
+        _, cwd, _ = self.git_repo("verification-fifo")
+        target = cwd / "a.txt"
+        target.write_bytes(b"dirty\n")
+        code = textwrap.dedent("""
+            import os, sys
+            from pathlib import Path
+            from unittest import mock
+
+            sys.path.insert(0, sys.argv[1])
+            import codex_runner
+
+            target = Path(sys.argv[2])
+            lstat = Path.lstat
+
+            def replace_with_fifo(path, *args, **kwargs):
+                info = lstat(path, *args, **kwargs)
+                if path == target:
+                    path.unlink()
+                    os.mkfifo(path)
+                return info
+
+            with mock.patch.object(Path, "lstat", replace_with_fifo):
+                result = codex_runner.verification_git_digest(str(target.parent), [str(target)])
+            assert target.is_fifo()
+            assert result is not None and result[2] == {b"sub/a.txt"}, result
+        """)
+        try:
+            subprocess.run([sys.executable, "-B", "-c", code, str(RUNNER.parent), str(target)], check=True,
+                           timeout=8, env=self.env)
+        except subprocess.TimeoutExpired:
+            self.fail("verification waited on a FIFO substituted for a dirty file")
+
+    def test_review_r2_host_verification_discards_a_snapshot_past_its_deadline(self):
+        import codex_runner
+
+        target = self.cwd / "dirty.txt"
+        target.write_bytes(b"changed\n")
+        lstat = Path.lstat
+        elapsed = 0
+
+        def git(cwd, *argv, **kwargs):
+            if "--show-toplevel" in argv:
+                return os.fsencode(self.cwd) + b"\n"
+            return b" M dirty.txt\0" if "status" in argv else b""
+
+        def slow_lstat(path):
+            nonlocal elapsed
+            elapsed = 31
+            return lstat(path)
+
+        with mock.patch.object(codex_runner, "git", side_effect=git), \
+                mock.patch.object(Path, "lstat", slow_lstat), \
+                mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            codex_runner.verification_git_digest(str(self.cwd), [str(target)])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_fix_host_verification_defaults_to_source_cwd_and_requires_overlapping_writer(self):
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for kind in ("sibling", "reader", "disjoint-writer", "overlapping-writer"):
+            with self.subTest(kind=kind):
+                root, project, _ = self.git_repo(f"verification-{kind}")
+                source = self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project))
+                if kind != "sibling":
+                    other = self.stored_job("OTHER", None, cwd=str(root if kind != "reader" else project),
+                                            sandbox="read-only" if kind == "reader" else "workspace-write",
+                                            scope=["outside.txt"] if kind == "disjoint-writer" else [])
+                    (other / "stderr.log").touch()
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode="verification_sibling" if kind == "sibling" else "verification_overwrite",
+                                         prompt=prompt)
+                    if kind in ("sibling", "overlapping-writer"):
+                        self.assertEqual((result["status"], result.get("verification_integrity")),
+                                         ("completed", "concurrent_changes"))
+                    else:
+                        self.assertEqual((result["status"], result.get("error_kind")),
+                                         ("failed", "verification_tree_changed"))
+                finally:
+                    shutil.rmtree(source)
+                    if kind != "sibling":
+                        shutil.rmtree(other)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_writer_changes_become_a_patch_without_touching_the_repository(self):

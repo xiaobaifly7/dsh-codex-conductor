@@ -89,12 +89,20 @@ async function noCodexWriters(conductor, cwd, signal) {
           !['read-only', 'workspace-write', 'danger-full-access'].includes(job.sandbox)) {
         throw new Error(`无法确认 Codex 任务 ${job.job_id ?? ''} 的写入状态`);
       }
-      if (job.sandbox !== 'read-only') throw new Error(`同一任务目录的可写 Codex 任务 ${job.job_id} 正在运行或排队，请先等它结束`);
+      // 主机模式的只读任务（write=false）不加写锁，也不挡 gemini_write。
+      if (job.sandbox !== 'read-only' && !(job.sandbox === 'danger-full-access' && job.context?.write === false)) throw new Error(`同一任务目录的可写 Codex 任务 ${job.job_id} 正在运行或排队，请先等它结束`);
     }
     offset += page.jobs.length;
     if (offset === total) return;
   }
 }
+
+// NTFS file IDs exceed 2^53, so the Number ino of two files created back to back can compare equal.
+const sameFile = (a, b) => {
+  const x = statSync(a, { bigint: true });
+  const y = statSync(b, { bigint: true });
+  return x.dev === y.dev && x.ino === y.ino;
+};
 
 export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now() + cfg.timeoutSeconds * 1000 } = {}, launch = spawn) {
   if (signal?.aborted) return Promise.resolve({ error: 'Gemini 调用前已被中止', write_paths: [] });
@@ -224,7 +232,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
       const source = resolve(file);
       const info = statSync(source);
       if (!info.isFile()) throw new Error(`素材必须是已有文件：${file}`);
-      if (normPath(source) === outputKey || (outputInfo && info.dev === outputInfo.dev && info.ino === outputInfo.ino)) {
+      if (normPath(source) === outputKey || (outputInfo && sameFile(source, value.output))) {
         throw new Error('output 不能与 sources 相同');
       }
       bytes += info.size;
@@ -245,10 +253,9 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
       if (!under(normPath(file), normPath(directory)) || path.extname(file).toLowerCase() !== '.md' || !info.isFile()) {
         throw new Error('reuse_draft 只接受插件草稿目录内的 .md 文件');
       }
-      if (normPath(file) === outputKey || (outputInfo && info.dev === outputInfo.dev && info.ino === outputInfo.ino) ||
+      if (normPath(file) === outputKey || (outputInfo && sameFile(file, value.output)) ||
           sources.some(source => {
-            const sourceInfo = statSync(source.path);
-            return normPath(source.path) === normPath(file) || (info.dev === sourceInfo.dev && info.ino === sourceInfo.ino);
+            return normPath(source.path) === normPath(file) || sameFile(source.path, file);
           })) throw new Error('reuse_draft 不能与 output 或 sources 相同');
       reused = file;
     }

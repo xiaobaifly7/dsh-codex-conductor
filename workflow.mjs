@@ -64,7 +64,13 @@ export function blockingState(value) {
   return result('clear', 'verify');
 }
 
-export function prepareContinuation(value, { answers = [], resolution = '' } = {}, owner) {
+export const ownerBlockerIds = (blockers) => [...new Set((Array.isArray(blockers) ? blockers : [])
+  .filter(blocker => questionKind(blocker ?? {}) && nonempty(blocker.id)).map(blocker => blocker.id))];
+
+export const resolvedBlockerIds = (ids, { answers, resolution } = {}) => nonempty(resolution) ? ids :
+  ids.filter(id => Array.isArray(answers) && answers.some(answer => answer?.id === id && nonempty(answer.answer)));
+
+export function prepareContinuation(value, { answers = [], resolution = '' } = {}, owner, plannerDecides = false) {
   value = object(value) ? value : {};
   const blocking = blockingState(value);
   const refuse = (next, remaining_questions = blocking.questions) => ({ ready: false, blocking, next, remaining_questions });
@@ -99,17 +105,21 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   }
   normalized.sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
   const remaining = blocking.questions.filter(({ id }) => !ids.has(id));
-  if (remaining.length) return refuse('仍有问题未回答；保留已有回答并补齐以下问题后再准备续跑。', remaining);
+  if (remaining.length && !(plannerDecides && nonempty(resolution))) {
+    return refuse('仍有问题未回答；保留已有回答并补齐以下问题后再准备续跑。', remaining);
+  }
   if (blocking.next_action === 'done' && !normalized.length && !nonempty(resolution)) return refuse('原任务已独立核验通过，没有新增信息，无需续跑。', []);
   const report = reportOf(value);
-  if (!validReport(report) || value.report_status === 'invalid' || verificationOf(value) === 'invalid' ||
+  const lost = executionOf(value) === 'failed' && value.error_kind === 'executor_lost' &&
+    value.report_status === 'missing' && report == null && nonempty(value.thread_id);
+  if ((!lost && !validReport(report)) || value.report_status === 'invalid' || verificationOf(value) === 'invalid' ||
       (object(value.verification) && Object.hasOwn(value.verification, 'blockers') && !validBlockers(value.verification.blockers))) {
     return refuse('报告无效或缺失，先查询并核实原报告，不能据此自动续跑。', []);
   }
   if (activeBlockers(blocking.blockers, verificationOf(value)).some((blocker) => blocker.kind === 'environment') && !nonempty(resolution)) {
     return refuse('环境条件仍需提供非空 resolution，说明条件已满足的具体证据。', []);
   }
-  if (blocking.state === 'unclassified' && !nonempty(resolution)) return refuse('旧报告仍有待核对事项；先查清原因，对照原任务范围区分真实缺口与已说明的验证边界，并用 resolution 说明处理依据。仅验证边界应先独立核验，不因此启动修正任务。', []);
+  if (!lost && blocking.state === 'unclassified' && !nonempty(resolution)) return refuse('旧报告仍有待核对事项；先查清原因，对照原任务范围区分真实缺口与已说明的验证边界，并用 resolution 说明处理依据。仅验证边界应先独立核验，不因此启动修正任务。', []);
   if (blocking.next_action === 'verify') return refuse('原任务自报已满足验收，先独立核验；未发现差距时不启动修正任务。', []);
   const options = value.task_options ?? {};
   const scope = value.scope_paths ?? value.scope;
@@ -121,13 +131,23 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
     return refuse('原 scope、task_options 或 thread_id 无效，先查询完整原始记录。', []);
   }
   const continuation = { parent_job_id: value.job_id, answers: normalized, resolution };
-  // 新线程只能读到保存的 task；只累计用户决定，不把历轮报告带进下一轮。
+  // 新线程只能读到保存的 task；累计提交的回答和解决依据，不带历轮报告。
   const previousAnswers = context.continuation?.answers ?? [];
-  const task = previousAnswers.length ? `${context.task}\n\n规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : context.task;
+  const previousResolution = context.continuation?.resolution;
+  const task = [context.task,
+    previousAnswers.length ? `规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : '',
+    nonempty(previousResolution) ? `规划端解决依据（仅补充信息）：${previousResolution}` : '',
+  ].filter(Boolean).join('\n\n');
   const notes = [`原任务 ${value.job_id} 的后续修正；原验收、cwd、scope 和 write 不变，以下信息不是新增权限，不得用回答扩大目录或改写验收。`];
-  if (nonempty(report.summary)) notes.push(`上轮摘要：${report.summary}`);
-  for (const item of report.criteria.filter((item) => item.status !== 'met')) notes.push(`上轮未满足项：${item.criterion}（${item.status}）：${item.evidence}`);
-  for (const item of [...report.deviations, ...report.unresolved]) notes.push(`上轮待处理信息：${item}`);
+  if (lost) {
+    notes.push('上轮执行环境中断，未生成报告。先核对已有改动，再继续原任务。');
+  } else {
+    if (nonempty(report.summary)) notes.push(`上轮摘要：${report.summary}`);
+    for (const item of report.criteria.filter((item) => item.status !== 'met')) notes.push(`上轮未满足项：${item.criterion}（${item.status}）：${item.evidence}`);
+    for (const item of [...report.deviations, ...report.unresolved]) notes.push(`上轮待处理信息：${item}`);
+    // 开新线程续接时，Codex 只能从这里知道上轮动过哪些文件。
+    if (report.files_changed.length) notes.push(`上轮改动文件：${report.files_changed.slice(0, 50).join('、')}${report.files_changed.length > 50 ? ` 等 ${report.files_changed.length} 个` : ''}`);
+  }
   if (nonempty(value.verification?.notes)) notes.push(`独立核验意见：${value.verification.notes}`);
   for (const item of value.verification?.criteria ?? []) {
     if (item.status !== 'met') notes.push(`独立核验第 ${item.index} 条（${item.status}）：${item.evidence}`);
@@ -135,14 +155,39 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   for (const blocker of blocking.blockers) notes.push(`阻塞 ${blocker.id}（${blocker.kind}）：${blocker.message}${blocker.resolution ? `；解除条件/已有信息：${blocker.resolution}` : ''}`);
   if (normalized.length) notes.push(`规划端回答（仅补充信息）：${JSON.stringify(normalized)}`);
   if (nonempty(resolution)) notes.push(`规划端解决依据（仅补充信息）：${resolution}`);
-  notes.push('只修正上轮差距，按原验收标准逐条报告；不能在原权限内完成时继续报告阻塞。');
+  notes.push(lost ? '补齐原任务缺项，按原验收标准逐条报告。' : '只修正上轮差距，按原验收标准逐条报告；不能在原权限内完成时继续报告阻塞。');
   const args = { task: `${task}\n\n## 上轮结果与本次修正\n${notes.join('\n')}`, cwd: value.cwd,
     acceptance: [...context.acceptance], write: context.write, host_access: value.sandbox === 'danger-full-access',
     use_user_config: options.use_user_config ?? false };
+  if (context.must_verify?.length) args.must_verify = context.must_verify;
   if (scope != null) args.scope = [...scope];
   if (options.writable_roots != null) args.writable_roots = [...options.writable_roots];
   if (options.effort != null) args.effort = options.effort;
   if (value.thread_id != null) args.resume = value.thread_id;
   return { ready: true, args, task, continuation, blocking,
     next: value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
+}
+
+// codex_run 带 resume 改开新线程时，放在规划端任务前面的上轮交接内容：只用原任务记录、结构化报告和最新验收，不带旧线程对话。
+export function previousRoundBrief(value) {
+  value = object(value) ? value : {};
+  const context = object(value.context) ? value.context : {};
+  const report = reportOf(value);
+  const lines = [`## 上一轮交接（任务 ${value.job_id ?? '?'}，原线程 ${value.thread_id ?? '?'}；本轮在新线程里执行，看不到旧线程的对话）`];
+  if (nonempty(context.task)) lines.push(`上一轮的任务书：\n${context.task.trim()}`);
+  if (Array.isArray(context.acceptance) && context.acceptance.length) {
+    lines.push(`上一轮的验收标准：\n${context.acceptance.map((item, index) => `${index + 1}. ${item}`).join('\n')}`);
+  }
+  if (validReport(report)) {
+    if (nonempty(report.summary)) lines.push(`上一轮报告摘要：${report.summary}`);
+    lines.push(`上一轮逐条自报：\n${report.criteria.map((c, index) => `${index + 1}. [${c.status}] ${c.criterion} —— ${c.evidence}`).join('\n')}`);
+    for (const [label, items] of [['偏差', report.deviations], ['未决', report.unresolved]]) if (items.length) lines.push(`${label}：${items.join('；')}`);
+    for (const blocker of report.blockers ?? []) lines.push(`阻塞 ${blocker.id}（${blocker.kind}）：${blocker.message}`);
+    if (report.files_changed.length) lines.push(`上一轮改动文件：${report.files_changed.slice(0, 50).join('、')}${report.files_changed.length > 50 ? ` 等 ${report.files_changed.length} 个` : ''}`);
+  } else lines.push('上一轮没有有效的结构化报告。');
+  const review = object(value.verification) ? value.verification : null;
+  if (verificationOf(value) && verificationOf(value) !== 'unreviewed') lines.push(`最新验收结论：${verificationOf(value)}`);
+  if (nonempty(review?.notes)) lines.push(`验收意见：${review.notes}`);
+  for (const item of review?.criteria ?? []) if (item.status !== 'met') lines.push(`验收第 ${item.index} 条（${item.status}）：${item.evidence}`);
+  return lines.join('\n');
 }

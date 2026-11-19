@@ -152,7 +152,7 @@ window.__ModuleLoader__.load({
     }
 
     // 嵌套设置在表单里用“父.子”作键。
-    const NESTED = ['gemini', 'autoResume'];
+    const NESTED = ['gemini', 'autoResume', 'repeatFailureGuard'];
     const nestedKey = (key) => NESTED.includes(key.split('.')[0]) && key.includes('.') ? key.split('.') : null;
     const fieldValue = (settings, key) => nestedKey(key)
       ? settings[nestedKey(key)[0]]?.[nestedKey(key)[1]] : settings[key];
@@ -162,11 +162,17 @@ window.__ModuleLoader__.load({
       timeoutSeconds: [(v) => v > 0, '超时秒数请填大于 0 的数字，或留空。'],
       idleTimeoutSeconds: [(v) => v > 0, '超时秒数请填大于 0 的数字，或留空。'],
       retries: [(v) => Number.isInteger(v) && v >= 0, '自动重试次数请填 0 或正整数，或留空。'],
+      'repeatFailureGuard.minSeconds': [(v) => v > 0, '计入失败的最短秒数请填大于 0 的数字。'],
+      'repeatFailureGuard.failures': [(v) => Number.isSafeInteger(v) && v > 0, '触发拦截的失败次数请填正整数。'],
+      'repeatFailureGuard.windowHours': [(v) => v > 0, '重复失败的统计窗口请填大于 0 的小时数。'],
       maxRunningJobs: [(v) => Number.isInteger(v) && v > 0, '同时运行的任务数上限请填正整数，或留空。'],
       lockTimeoutSeconds: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
       maxStorageMb: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
       maxSessionJobs: [(v) => Number.isInteger(v) && v > 0, '每个会话最多派几单请填正整数，或留空。'],
       maxSessionTokens: [(v) => Number.isInteger(v) && v > 0, '每个会话的用量上限请填正整数，或留空。'],
+      handoverSuggestMessages: [(v) => Number.isInteger(v) && v >= 0, '建议交接的消息数请填 0 或正整数（0 表示关闭），或留空恢复默认 5000。'],
+      acceptanceWarnAbove: [(v) => Number.isInteger(v) && v >= 0, '验收标准条数提醒请填 0 或正整数（0 表示关闭），或留空恢复默认 8。'],
+      continueFreshAboveTokens: [(v) => Number.isInteger(v) && v >= 0, '续接开新线程的阈值请填 0 或正整数（0 表示总是沿用原线程），或留空恢复默认 100000。'],
     };
     // 多行文本框一行一个，空行忽略；提交时整体替换数组。[最多几项, 单项检查, 提示]
     const LISTS = {
@@ -204,7 +210,7 @@ window.__ModuleLoader__.load({
         } else if (NUMBERS[key]) {
           const [check, message] = NUMBERS[key];
           value = raw == null || String(raw).trim() === '' ? null : Number(raw);
-          if (value !== null && !(Number.isFinite(value) && check(value))) throw new Error(message);
+          if (value === null ? key.startsWith('repeatFailureGuard.') : !(Number.isFinite(value) && check(value))) throw new Error(message);
           if (value === (old ?? null)) continue;
         }
         const nested = nestedKey(key);
@@ -242,6 +248,43 @@ window.__ModuleLoader__.load({
       return `等${reasons.length ? ` ${reasons.join('，并等 ')}` : '待确认 Codex 任务和 DeepSeek 会话均空闲'}后${action}。最长等 10 分钟${countdown == null ? '' : `，剩余 ${countdown} 秒`}；超时停止自动重载，保留待生效设置。`;
     }
 
+    const HANDOVER_MODES = { off: '关闭（只标记建议交接）', notify: '只提醒', confirm: '空闲时询问，同意后交接', auto: '空闲时自动交接' };
+    const QUEUED_HINT = '旧会话输入框里还有排队未发的消息的话，请先发出或清空——它们不会跟到新会话。';
+    const CHECK_TEXT = { goal: '目标逐字接上', settings: '预设、模型、权限和工作目录一致', jobs: '新会话能查到待处理的任务', delivered: '交接单已送达',
+      instructions: '完整用户指令档案', predecessorFrozen: '旧会话已冻结', workspace: '新会话在原会话的分组里' };
+    const ORIGIN_TEXT = { panel: '面板', auto: '自动交接', confirm: '询问后同意', tool: '工具', file: '请求文件', startup: '启动修复' };
+    // 交接被拒或撤回被拦时，把结果里的原因说成人话。
+    function handoverReason(result) {
+      const reason = result?.reason;
+      return {
+        turn_running: '当前有回合在运行，结束后再交接。',
+        jobs_running: `当前有 ${result?.running?.length ?? '若干'} 个 Codex 任务在运行，结束后再交接。`,
+        successor_active: `继任会话已有 ${result?.newTurns ?? '若干'} 个新回合${result?.successorRunning ? '且正在运行' : ''}，撤回会造成两个会话并行。`,
+        successor_turn_running: '要接手的会话正在运行，结束后再交接。',
+        already_handed_over: `这个会话已经交接给 ${result?.successor ?? '其他会话'}。`,
+        session_not_found: '找不到这个会话。', session_unavailable: '暂时打不开这个会话。',
+        jobs_unreadable: '暂时读不到这个会话的 Codex 任务，没有交接。', successor_unavailable: '没能建立或打开新会话，没有交接。',
+        alias_failed: '没能记下交接关系，没有交接。', not_linked: '这两个会话之间没有交接记录。', invalid_request: '请求格式不正确。',
+      }[reason] || (reason ? `没有执行（${reason}）。` : '');
+    }
+    function handoverResultText(result) {
+      if (!result) return '还没有交接记录。';
+      const from = ORIGIN_TEXT[result.origin] ? `，来自${ORIGIN_TEXT[result.origin]}` : '';
+      if (result.status === 'handed_over' || result.status === 'handed_over_with_issues') {
+        return `已交接：${result.from} → ${result.to}${from}。` + (result.status === 'handed_over_with_issues' ? '交接后自检有问题，见下方各项。' : '') +
+          (result.steps?.autoContinue === 'manual_required' ? `请在界面把旧会话 ${result.from} 的“自动继续”开关关掉。` : '');
+      }
+      if (result.status === 'rolled_back') {
+        return `交接已自动撤回：${{ delivery_failed: '交接单没能送到新会话', successor_goal_failed: '新会话的目标没能建立' }[result.rollback?.reason] || '交接没有完成'}，` +
+          `${result.from} 恢复原状，${result.to} 不再作为继任会话${from}。`;
+      }
+      if (result.status === 'reverted') {
+        return `已撤回：${result.from} 恢复派活，${result.to} 的目标已暂停${from}。` +
+          (result.warning === 'parallel_sessions' ? '两个会话都已开工，请决定保留哪一个，另一个停下。' : '');
+      }
+      return `${result.from || '会话'}${result.to ? ` → ${result.to}` : ''} 没有执行：${handoverReason(result)}`;
+    }
+
     function Status({ status, attention, errors = {}, messages = {}, busy = '', doctor, onRefresh, onReload, onCancel, onDoctor }) {
       const runtime = status?.runtime;
       const pending = runtime?.pending_settings;
@@ -275,6 +318,9 @@ window.__ModuleLoader__.load({
             statusRow('规划端读取范围', activeSettings ? activeSettings.plannerReads === 'products' ? '只读 Codex 的产物' : '不限制读取' : '未读到', '这是当前正在生效的读取范围。'),
             statusRow('额外允许读取的路径', activeSettings ? `${activeSettings.plannerReadAllowCount ?? 0} 条` : '未读到', '这里只显示数量，需要修改时请编辑插件配置。'),
             statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
+            statusRow('建议交接的会话', !status.history ? '未读到' : !status.history.threshold ? '提示已关闭'
+              : status.history.sessions.filter((s) => s.suggest).map((s) => `${s.sessionId}（${s.messages} 条消息）`).join('、') || '暂无',
+              `消息数超过 ${status.history?.threshold || '设定值'} 条的会话每一步都会变慢，可以在下方“会话交接”里交接到新会话。`),
             statusRow('护栏工作区', !activeSettings ? '未读到' : roots.includes('*') ? '所有会话' : roots.length ? roots.join('、') : '未启用护栏',
               '在这些目录里的会话，规划端不能直接改文件，改动交给 Codex。'),
             statusRow('主机访问', !activeSettings ? '未读到' : !activeSettings.allowHostAccess ? '未开启'
@@ -682,15 +728,26 @@ window.__ModuleLoader__.load({
               field('model', 'Codex 模型', '填写要使用的模型名；留空则沿用 Codex 配置。'),
               field('effort', '执行时的思考程度', '越高通常想得越久，也可能花更多时间。', [['', '跟随 Codex 配置'], ...EFFORTS]),
               field('readOnlyEffort', '只读任务的思考程度', '用于查看代码、分析和复核。', [['', '跟随执行设置'], ...EFFORTS]),
+              field('effortOverride', '单次推理强度覆盖', '控制 codex_run 能否覆盖写入或只读任务的默认强度。', [['planner', '由规划端指定（默认）'], ['raise-only-listed', '提高强度须填写列明的原因'], ['config', '使用配置强度']]),
               field('serviceTier', '速度档', '跟随 Codex 配置，或使用账号支持的加速档位。', [['', '跟随 Codex 配置'], ['fast', 'fast'], ['ultrafast', 'ultrafast']]),
               field('timeoutSeconds', '每次尝试的总超时秒数', 'Codex 的一次尝试最多跑多久；留空表示沿用默认。'),
               field('idleTimeoutSeconds', '空闲超时秒数', 'Codex 多久没有动静就判定卡住；留空表示沿用默认。'),
               field('retries', '自动重试次数', '连接出问题时最多自动重试几次，可填 0；留空表示沿用默认。'),
+              field('repeatFailureGuard.minSeconds', '计入失败的最短秒数', '用时达到此值的失败步骤才计数。'),
+              field('repeatFailureGuard.failures', '触发拦截的失败次数', '同一步骤达到该次数后，再次运行会被拦下。'),
+              field('repeatFailureGuard.windowHours', '重复失败的统计窗口（小时）', '从最后一次失败起保留计数的时长。'),
               field('maxRunningJobs', '同时运行的任务数上限', '达到上限后不再启动新任务；留空表示不限制。'),
               field('lockTimeoutSeconds', '等待其他任务的秒数', '要修改同一目录时，最多等其他任务多久；留空表示不限制，一直等。'),
               field('maxStorageMb', '任务记录占用空间上限（MiB）', '超过上限时会清理最旧的已结束任务记录；留空表示不限制。'),
               field('maxSessionJobs', '每个会话最多派几单', '一个会话累计派出的任务数上限；留空表示不限制。'),
               field('maxSessionTokens', '每个会话的用量上限（token）', '一个会话里 Codex 任务累计用量的上限；留空表示不限制。'),
+              field('handoverSuggestMessages', '建议交接的消息数', '会话消息数超过这个值时提示可以交接到新会话（只提示）；0 表示关闭，留空恢复默认 5000。'),
+              field('acceptanceWarnAbove', '验收标准条数提醒', '新派活的验收标准超过这么多条时，提醒 DeepSeek 把偏好写进任务正文（不拦截）；0 表示关闭，留空恢复默认 8。'),
+              field('continueFreshAboveTokens', '续接开新线程的阈值（token）', '不带回答的续接，原线程上次请求超过这么多输入 token 时改开新线程，只带上轮交接内容；0 表示总是沿用原线程，留空恢复默认 100000。'),
+              field('closeoutEvidence', '结案依据要求', '原报告自标未满足的条目要记成满足时需要什么依据。', [['independent', '需要独立依据（默认）'], ['planner', '规划端自己的证据即可'], ['off', '不检查']]),
+              field('acceptOpenEvidence', '接受未完成项的依据', '保留原报告标出的未完成项时需要什么依据。', [['strict', '未满足须核验或用户确认（默认）'], ['relaxed', '也接受后续轮次仍未完成的结果'], ['off', '不检查']]),
+              field('ownerDecisions', '待所有者事项由谁决定', '不可逆数据变更、对外动作、花钱、账号凭据及扩大安全边界由所有者决定。', [['planner', '规划端按常设授权决定（默认）'], ['owner', '沿用原有确认流程']]),
+              field('autoVerify', '完成后自动核验', '写任务完成且报告有未完成项或任务有 must_verify 时，自动派出只读核验。', [['flagged', '自动核验（默认）'], ['off', '关闭']]),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
               settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,
@@ -710,9 +767,17 @@ window.__ModuleLoader__.load({
                 disabled: !!busy, onChange: (value) => edit('autoResume.enabled', value) }),
               h('small', null, 'Harness 重启后，自动接着做上次被打断的会话。')),
             h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '拦截重复失败的步骤',
+                checked: (Object.hasOwn(edits, 'repeatFailureGuard.enabled') ? edits['repeatFailureGuard.enabled'] : editingSettings.repeatFailureGuard?.enabled) !== false,
+                disabled: !!busy, onChange: (value) => edit('repeatFailureGuard.enabled', value) })),
+            h('div', { className: 'dcc-actions' },
               h(Checkbox, { label: '记录每单的改动 diff', checked: (Object.hasOwn(edits, 'jobDiff') ? edits.jobDiff : editingSettings.jobDiff) === true,
                 disabled: !!busy, onChange: (value) => edit('jobDiff', value) }),
               h('small', null, '记录后可以在任务报告里查看这一单改了什么，也可以回滚这一单的改动。')),
+            h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '未收尾时拒绝开新任务', checked: (Object.hasOwn(edits, 'closeoutGuard') ? edits.closeoutGuard : editingSettings.closeoutGuard) !== false,
+                disabled: !!busy, onChange: (value) => edit('closeoutGuard', value) }),
+              h('small', null, '还有报告标出问题却没验收、或判为需修改却没返工的任务时，DeepSeek 不能开新任务，要先收尾。')),
             (Object.hasOwn(edits, 'toolPolicy') ? edits.toolPolicy : editingSettings.toolPolicy) === 'allowlist' ? h('p', { className: 'dcc-warn', role: 'status' },
               '白名单模式下，未列入白名单的工具在受护栏会话里会被拒绝。') : null,
             h('div', { className: 'dcc-grid dcc-actions' },
@@ -837,6 +902,97 @@ window.__ModuleLoader__.load({
           '给 DeepSeek 的具体要求', '这段内容每个会话每一步都会带上，超过 4000 字会明显占用上下文，建议精简。'),
         selftest ? null : promptSection('executor', '给 Codex 的固定要求', '这里的内容会附在每一单交给 Codex 的任务书后面，Codex 每单都会看到；不增加权限。',
           '附在每一单任务书后面的内容', '这段内容每一单任务书都会带上，超过 4000 字建议精简。'),
+
+        selftest ? null : (() => {
+          const handover = status?.handover;
+          const submitted = () => { setConfirmSession(null); setMessages((old) => ({ ...old, handover: '交接请求已提交，几秒后在下面的“最近结果”查看。' })); };
+          const answer = (sessionId, accept) => mutate('handover', '/handover/answer', { sessionId, accept }, (value) => setMessages((old) => ({ ...old, handover: value.declined
+            ? '已记下，冷却期内不再询问。' : '已同意：会话停在两个回合之间时自动交接（目标循环会先暂停，交接没成会恢复）。' })));
+          const result = handover?.result;
+          return h('section', { 'aria-label': '会话交接' }, h('h3', null, '会话交接'),
+            h('p', { className: 'dcc-muted' }, '交接把目标和 Codex 任务转到一个新会话，原会话只读保留。提交后由插件在几秒内处理；有回合或 Codex 任务在跑时会被拒绝。'),
+            !handover ? h('p', null, errors.status ? '暂时读不到交接状态。' : '正在读取交接状态…') : h('div', null,
+              h('small', null, `自动交接：${HANDOVER_MODES[handover.mode] || handover.mode}`),
+              handover.prompts.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '需要处理的交接提醒' }, ...handover.prompts.map((prompt) =>
+                h('li', { key: prompt.sessionId, className: 'dcc-job' },
+                  h('strong', null, `会话 ${prompt.sessionId} 已有 ${prompt.messages} 条消息，${prompt.kind === 'ask' ? '建议现在交接到新会话' : '可以交接到新会话'}`),
+                  h('small', null, QUEUED_HINT),
+                  h('div', { className: 'dcc-row' },
+                    h(Button, { size: 'sm', disabled: !!busy, onClick: () => answer(prompt.sessionId, true) }, prompt.kind === 'ask' ? '同意交接' : '现在交接'),
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => answer(prompt.sessionId, false) }, prompt.kind === 'ask' ? '暂不交接' : '知道了'))))) : null,
+              h('h4', null, '建议交接的会话'),
+              handover.suggestions.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '建议交接的会话' }, ...handover.suggestions.map((item) =>
+                h('li', { key: item.sessionId, className: 'dcc-job' },
+                  h('strong', null, item.sessionId), h('small', null, `${item.cwd || '工作目录未知'} · ${item.messages} 条消息`),
+                  item.blocked ? h('small', { className: 'dcc-warn' }, item.blocked) : null,
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(`handover:${item.sessionId}`) }, '交接到新会话'),
+                  confirmSession === `handover:${item.sessionId}` ? h('div', { className: 'dcc-confirm' },
+                    h('label', { className: 'dcc-field' }, h('span', null, '给新会话的下一步（可空）'),
+                      h(Input, { value: session.handoverNote || '', disabled: !!busy, maxLength: 4000,
+                        onChange: (event) => setSession((old) => ({ ...old, handoverNote: event.target.value })) })),
+                    h('p', null, '确定交接吗？插件会新建会话、发去交接单，并暂停这个会话的目标；之后这个会话只能查看。'),
+                    h('p', null, QUEUED_HINT),
+                    h('div', { className: 'dcc-row' },
+                      h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => mutate('handover', '/handover/request',
+                        { sessionId: item.sessionId, ...((session.handoverNote || '').trim() ? { note: session.handoverNote } : {}) }, submitted) }, '确认交接'),
+                      h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不交接'))) : null))) : h('p', null, '暂无。'),
+              h('h4', null, '当前交接'),
+              handover.links.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '当前交接' }, ...handover.links.map((link) => {
+                const blocked = result?.reason === 'successor_active' && result.from === link.from && result.to === link.to;
+                const revert = (force) => mutate('handover', '/handover/request', { revert: { from: link.from, to: link.to }, ...(force ? { force: true } : {}) }, submitted);
+                return h('li', { key: link.to, className: 'dcc-job' },
+                  h('strong', null, `${link.from} → ${link.to}`),
+                  h('small', null, `${link.at ? when(link.at) : '时间未知'} · ${ORIGIN_TEXT[link.origin] || '来源未记录'}${link.workspace ? ` · 分组 ${link.workspace}` : ''}`),
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(`revert:${link.to}`) }, '撤回'),
+                  confirmSession === `revert:${link.to}` ? h('div', { className: 'dcc-confirm' },
+                    h('p', null, '确定撤回吗？原会话恢复派活和目标，继任会话的目标暂停。继任会话已经开工时插件会拒绝，并在这里说明。'),
+                    h('div', { className: 'dcc-row' },
+                      h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => revert(false) }, '确认撤回'),
+                      h(Button, { size: 'sm', disabled: !!busy, onClick: () => setConfirmSession(null) }, '先不撤回'))) : null,
+                  blocked ? h('div', { className: 'dcc-confirm' },
+                    h('p', { className: 'dcc-warn' }, `${handoverReason(result)}仍要撤回的话，请确认之后只保留一个会话继续工作。`),
+                    h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => revert(true) }, '仍然撤回（两个会话会并行）')) : null);
+              })) : h('p', null, '暂无。'),
+              h(Message, { text: messages.handover }), h(Message, { text: errors.handover, error: true }),
+              h('p', { className: ['handed_over_with_issues', 'rolled_back'].includes(result?.status) ? 'dcc-warn' : undefined },
+                h('strong', null, '最近结果：'), handoverResultText(result)),
+              result?.checks ? h('ul', { className: 'dcc-jobs', 'aria-label': '交接自检' }, ...Object.entries(result.checks).map(([key, value]) =>
+                h('li', { key, className: value.startsWith('failed') ? 'dcc-warn' : 'dcc-muted' },
+                  `${CHECK_TEXT[key] || key}：${value === 'ok' ? '通过' : value.startsWith('skipped') ? `跳过（${value.slice(8)}）` : `有问题（${value.slice(7)}）`}`))) : null,
+              result?.rollback && result.status !== 'rolled_back' ? h('p', { className: 'dcc-warn' },
+                `自动撤回没有成功（${result.rollback.refused || result.rollback.status}），请在“当前交接”里手动处理。`) : null,
+              handover.recent.length ? h('details', null, h('summary', null, '最近的交接记录'),
+                h('ul', { className: 'dcc-jobs', 'aria-label': '最近的交接记录' }, ...handover.recent.slice().reverse().map((entry, index) =>
+                  h('li', { key: `${entry.at}-${index}` }, `${entry.at ? when(entry.at) : '时间未知'} · ${{ handover: '交接', adopt: '认领', revert: '撤回' }[entry.action] || entry.action}` +
+                    ` · ${entry.from || '?'} → ${entry.to || '?'} · ${ORIGIN_TEXT[entry.origin] || entry.origin} · ${entry.status}${entry.reason ? ` / ${entry.reason}` : ''}${entry.workspace ? ` · 分组 ${entry.workspace}` : ''}`)))) : null));
+        })(),
+
+        !selftest && status?.autoAnswer ? (() => {
+          const { enabled, available, afterMinutes, pending, recent } = status.autoAnswer;
+          const act = (id, action) => mutate('autoAnswer', '/auto-answer/action', { id, action }, (value) => {
+            setStatus((old) => ({ ...old, autoAnswer: value.autoAnswer }));
+            setMessages((old) => ({ ...old, autoAnswer: action === 'answer' ? '已按推荐提交回答。' : '已取消这条提问的自动代答。' }));
+          });
+          const reasons = { risky: '高风险', excluded: '已排除', owner_only: '须由所有者决定', manual: '已选择自己回答', failed: '宿主提交失败' };
+          const decisions = { marked_recommended: '有推荐标记', first_option: '首项', free_text: '自由文本',
+            skipped_risky: '跳过高风险', skipped_excluded: '跳过已排除提问', skipped_owner_only: '留给所有者回答' };
+          return h('section', { 'aria-label': '自动代答' }, h('h3', null, '自动代答'),
+            h('small', null, [enabled ? '已开启' : '已关闭', `${afterMinutes} 分钟`, enabled && !available ? '宿主提问服务不可用' : ''].filter(Boolean).join(' · ')),
+            available && !pending.length ? h('p', null, '当前没有待答提问。') : null,
+            pending.length ? h('ul', { className: 'dcc-jobs', 'aria-label': '待答提问' }, ...pending.map((item) =>
+              h('li', { key: item.id, className: 'dcc-job' },
+                h('strong', null, item.sessionId), ...item.questions.map((question, i) => h('div', { key: i }, question)),
+                h('small', null, `已等 ${item.waitedMinutes} 分钟 · ${item.reason
+                  ? '需要你亲自回答（' + reasons[item.reason] + '）' : '还有 ' + item.remainingMinutes + ' 分钟自动代答'}`),
+                !item.reason ? h('div', { className: 'dcc-row' },
+                  h(Button, { size: 'sm', disabled: !!busy, onClick: () => act(item.id, 'answer') }, '现在就按推荐回答'),
+                  h(Button, { size: 'sm', variant: 'outline', disabled: !!busy, onClick: () => act(item.id, 'manual') }, '这条我自己答')) : null))) : null,
+            h(Message, { text: messages.autoAnswer }), h(Message, { text: errors.autoAnswer, error: true }),
+            recent.length ? h('details', null, h('summary', null, '最近的代答记录'),
+              h('ul', { className: 'dcc-jobs' }, ...recent.map((entry, i) =>
+                h('li', { key: i }, [when(entry.at), entry.sessionId, entry.question, entry.selected.join('、'),
+                  decisions[entry.reason], `等待 ${entry.waitedMinutes} 分钟`].filter(Boolean).join(' · '))))) : null);
+        })() : null,
 
         selftest ? null : h('section', { 'aria-label': '会话操作' },
           h('details', null, h('summary', null, h('h3', { style: { display: 'inline' } }, '会话操作')),

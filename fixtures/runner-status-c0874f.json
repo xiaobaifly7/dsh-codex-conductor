@@ -1,0 +1,240 @@
+{
+ "context": {
+  "owner": "S1",
+  "task": "<text-1>",
+  "acceptance": [
+   "<text-2>",
+   "<text-3>",
+   "<text-4>",
+   "<text-5>",
+   "<text-6>",
+   "<text-7>",
+   "<text-8>",
+   "<text-9>",
+   "<text-10>"
+  ],
+  "write": true,
+  "dispatcher": {
+   "version": "<text-11>",
+   "revision": "<text-12>",
+   "pid": 75604
+  }
+ },
+ "sandbox": "danger-full-access",
+ "scope": [
+  "<text-13>",
+  "<text-14>",
+  "<text-15>"
+ ],
+ "task_options": {
+  "writable_roots": null,
+  "use_user_config": false,
+  "effort": "<text-16>",
+  "model": "<text-17>",
+  "service_tier": "<text-18>"
+ },
+ "cwd": "<text-19>",
+ "scope_paths": [
+  "<text-20>",
+  "<text-21>",
+  "<text-15>"
+ ],
+ "thread_id": "01a1e970-0000-4000-8000-000000000000",
+ "duration_s": 179.4,
+ "diff_status": "skipped",
+ "diff_reason": "<text-22>",
+ "log_dir": "<text-23>",
+ "status": "completed",
+ "attempts": 1,
+ "final_message": "<text-24>",
+ "truncated": false,
+ "usage": {
+  "input_tokens": 2114210,
+  "cached_input_tokens": 2022272,
+  "cache_write_input_tokens": 0,
+  "output_tokens": 23922,
+  "reasoning_output_tokens": 7551
+ },
+ "commands_run": 9,
+ "forced_exit": false,
+ "files_changed": [
+  {
+   "path": "<text-25>",
+   "change": "<text-26>"
+  }
+ ],
+ "files_changed_total": 1,
+ "files_changed_source": "scope_snapshot+codex_events",
+ "usage_scope": "<text-27>",
+ "structured": {
+  "blockers": [
+   {
+    "id": "<text-28>",
+    "kind": "implementation",
+    "message": "<text-29>",
+    "question": "<text-30>",
+    "resolution": "<text-31>"
+   }
+  ],
+  "criteria": [
+   {
+    "criterion": "<text-32>",
+    "evidence": "<text-33>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-34>",
+    "evidence": "<text-35>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-36>",
+    "evidence": "<text-37>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-38>",
+    "evidence": "<text-39>",
+    "status": "blocked"
+   },
+   {
+    "criterion": "<text-40>",
+    "evidence": "<text-41>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-42>",
+    "evidence": "<text-43>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-44>",
+    "evidence": "<text-45>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-46>",
+    "evidence": "<text-47>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-48>",
+    "evidence": "<text-49>",
+    "status": "met"
+   }
+  ],
+  "deviations": [
+   "<text-50>"
+  ],
+  "files_changed": [
+   "<text-51>",
+   "<text-52>",
+   "<text-53>",
+   "<text-54>",
+   "<text-55>",
+   "<text-56>",
+   "<text-57>",
+   "<text-58>",
+   "<text-59>",
+   "<text-60>",
+   "<text-61>",
+   "<text-62>",
+   "<text-63>",
+   "<text-64>",
+   "<text-65>",
+   "<text-66>",
+   "<text-67>"
+  ],
+  "summary": "<text-68>",
+  "unresolved": [
+   "<text-69>"
+  ]
+ },
+ "execution_status": "completed",
+ "report_status": "valid",
+ "review_status": "needs_attention",
+ "criteria_counts": {
+  "met": 5,
+  "not_met": 0,
+  "blocked": 4
+ },
+ "phase": "finalizing",
+ "attempt": 1,
+ "last_error_kind": null,
+ "retry_at": null,
+ "job_id": "20261118-155724-c0874f",
+ "started_at": 1794988644.7388175,
+ "finished_at": 1794988824.6870146,
+ "verification_status": "accepted_deviations",
+ "verification": {
+  "accepted_deviations": [
+   {
+    "evidence": "<text-70>",
+    "index": 1,
+    "kind": "reported"
+   }
+  ],
+  "criteria": [
+   {
+    "accepted": "<text-71>",
+    "evidence": "<text-72>",
+    "index": 1,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-73>",
+    "evidence": "<text-74>",
+    "index": 2,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-75>",
+    "evidence": "<text-76>",
+    "index": 3,
+    "status": "blocked"
+   },
+   {
+    "accepted": "<text-77>",
+    "evidence": "<text-78>",
+    "index": 4,
+    "status": "blocked"
+   },
+   {
+    "evidence": "<text-79>",
+    "index": 5,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-80>",
+    "index": 6,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-81>",
+    "index": 7,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-82>",
+    "index": 8,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-83>",
+    "index": 9,
+    "status": "met"
+   }
+  ],
+  "notes": "<text-84>",
+  "status": "accepted_deviations",
+  "reviewer": "S1",
+  "time": 1794989147.400885
+ },
+ "blocking": {
+  "state": "clear",
+  "blockers": [],
+  "questions": [],
+  "next_action": "done"
+ },
+ "out_of_scope": []
+}

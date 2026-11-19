@@ -1,0 +1,518 @@
+{
+ "context": {
+  "owner": "S1",
+  "task": "<text-142>",
+  "acceptance": [
+   "<text-2>",
+   "<text-3>",
+   "<text-4>",
+   "<text-5>",
+   "<text-6>",
+   "<text-7>",
+   "<text-8>",
+   "<text-9>"
+  ],
+  "write": true,
+  "dispatcher": {
+   "version": "<text-10>",
+   "revision": "<text-11>",
+   "pid": 74220
+  },
+  "continuation": {
+   "parent_job_id": "20261118-220305-6c8bd2",
+   "answers": [
+    {
+     "id": "<text-46>",
+     "answer": "<text-143>"
+    }
+   ],
+   "resolution": "<text-95>"
+  },
+  "routing": {
+   "continuation_mode": "<text-96>",
+   "continuation_reason": "<text-97>",
+   "parent_thread_id": "<text-98>",
+   "ab": true,
+   "model": "<text-12>"
+  }
+ },
+ "sandbox": "danger-full-access",
+ "scope": [
+  "<text-23>",
+  "<text-24>",
+  "<text-25>",
+  "<text-26>",
+  "<text-27>",
+  "<text-18>",
+  "<text-28>"
+ ],
+ "task_options": {
+  "writable_roots": null,
+  "use_user_config": false,
+  "effort": "<text-20>",
+  "model": "<text-12>",
+  "service_tier": "<text-21>"
+ },
+ "cwd": "<text-22>",
+ "scope_paths": [
+  "<text-23>",
+  "<text-24>",
+  "<text-25>",
+  "<text-26>",
+  "<text-27>",
+  "<text-18>",
+  "<text-28>"
+ ],
+ "thread_id": "01a1e970-0000-4000-8000-000000000000",
+ "duration_s": 406.2,
+ "diff_status": "skipped",
+ "diff_reason": "<text-29>",
+ "log_dir": "<text-144>",
+ "status": "completed",
+ "attempts": 1,
+ "final_message": "<text-145>",
+ "truncated": false,
+ "usage": {
+  "input_tokens": 3057238,
+  "cached_input_tokens": 2954624,
+  "cache_write_input_tokens": 0,
+  "output_tokens": 31373,
+  "reasoning_output_tokens": 6866
+ },
+ "commands_run": 22,
+ "forced_exit": false,
+ "files_changed": [
+  {
+   "path": "<text-146>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-16>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-147>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-148>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-149>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-150>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-151>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-152>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-33>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-153>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-154>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-155>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-156>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-157>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-158>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-159>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-34>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-160>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-161>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-35>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-36>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-162>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-163>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-164>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-38>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-165>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-166>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-167>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-168>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-39>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-169>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-40>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-170>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-171>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-41>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-172>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-173>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-174>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-42>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-175>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-176>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-177>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-178>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-179>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-43>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-180>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-181>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-182>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-183>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-44>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-103>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-184>",
+   "change": "<text-32>"
+  },
+  {
+   "path": "<text-45>",
+   "change": "<text-101>"
+  },
+  {
+   "path": "<text-15>",
+   "change": "<text-101>"
+  }
+ ],
+ "files_changed_total": 54,
+ "files_changed_source": "scope_snapshot+codex_events",
+ "usage_scope": "<text-104>",
+ "structured": {
+  "blockers": [],
+  "criteria": [
+   {
+    "criterion": "<text-50>",
+    "evidence": "<text-185>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-52>",
+    "evidence": "<text-186>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-54>",
+    "evidence": "<text-187>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-56>",
+    "evidence": "<text-188>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-58>",
+    "evidence": "<text-189>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-60>",
+    "evidence": "<text-190>",
+    "status": "met"
+   },
+   {
+    "criterion": "<text-62>",
+    "evidence": "<text-191>",
+    "status": "not_met"
+   },
+   {
+    "criterion": "<text-64>",
+    "evidence": "<text-192>",
+    "status": "met"
+   }
+  ],
+  "deviations": [
+   "<text-193>",
+   "<text-194>",
+   "<text-195>",
+   "<text-196>"
+  ],
+  "files_changed": [
+   "<text-15>",
+   "<text-16>",
+   "<text-146>",
+   "<text-33>",
+   "<text-182>",
+   "<text-103>",
+   "<text-164>",
+   "<text-162>",
+   "<text-163>",
+   "<text-169>",
+   "<text-170>",
+   "<text-160>",
+   "<text-161>",
+   "<text-179>",
+   "<text-177>",
+   "<text-178>",
+   "<text-176>",
+   "<text-155>",
+   "<text-156>",
+   "<text-157>",
+   "<text-158>",
+   "<text-159>",
+   "<text-166>",
+   "<text-167>",
+   "<text-168>",
+   "<text-153>",
+   "<text-154>",
+   "<text-184>",
+   "<text-172>",
+   "<text-173>",
+   "<text-174>",
+   "<text-180>",
+   "<text-181>",
+   "<text-175>",
+   "<text-165>",
+   "<text-38>",
+   "<text-183>",
+   "<text-44>",
+   "<text-34>",
+   "<text-171>",
+   "<text-39>",
+   "<text-40>",
+   "<text-41>",
+   "<text-35>",
+   "<text-45>",
+   "<text-43>",
+   "<text-36>",
+   "<text-42>",
+   "<text-147>",
+   "<text-148>",
+   "<text-149>",
+   "<text-150>",
+   "<text-151>",
+   "<text-152>",
+   "<text-197>",
+   "<text-198>",
+   "<text-199>",
+   "<text-200>",
+   "<text-201>",
+   "<text-202>"
+  ],
+  "summary": "<text-203>",
+  "unresolved": [
+   "<text-204>",
+   "<text-205>",
+   "<text-206>"
+  ]
+ },
+ "execution_status": "completed",
+ "report_status": "valid",
+ "review_status": "needs_attention",
+ "criteria_counts": {
+  "met": 7,
+  "not_met": 1,
+  "blocked": 0
+ },
+ "phase": "finalizing",
+ "attempt": 1,
+ "last_error_kind": null,
+ "retry_at": null,
+ "job_id": "20261118-220434-98923b",
+ "started_at": 1795010674.4937925,
+ "finished_at": 1795011081.2366133,
+ "verification_status": "accepted_deviations",
+ "verification": {
+  "accepted_deviations": [
+   {
+    "evidence": "<text-207>",
+    "index": 1,
+    "kind": "reported"
+   },
+   {
+    "evidence": "<text-208>",
+    "index": 2,
+    "kind": "reported"
+   },
+   {
+    "evidence": "<text-209>",
+    "index": 3,
+    "kind": "reported"
+   },
+   {
+    "evidence": "<text-210>",
+    "index": 4,
+    "kind": "reported"
+   }
+  ],
+  "criteria": [
+   {
+    "evidence": "<text-211>",
+    "index": 1,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-212>",
+    "index": 2,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-213>",
+    "index": 3,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-214>",
+    "index": 4,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-215>",
+    "index": 5,
+    "status": "met"
+   },
+   {
+    "evidence": "<text-216>",
+    "index": 6,
+    "status": "met"
+   },
+   {
+    "accepted": "<text-217>",
+    "evidence": "<text-218>",
+    "index": 7,
+    "status": "not_met"
+   },
+   {
+    "evidence": "<text-219>",
+    "index": 8,
+    "status": "met"
+   }
+  ],
+  "notes": "<text-220>",
+  "status": "accepted_deviations",
+  "reviewer": "S1",
+  "time": 1795011304.2435582
+ },
+ "blocking": {
+  "state": "clear",
+  "blockers": [],
+  "questions": [],
+  "next_action": "done"
+ },
+ "out_of_scope": []
+}

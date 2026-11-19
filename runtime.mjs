@@ -253,18 +253,31 @@ export function runtimeStatus({ moduleUrl, loadedIdentity = null, loadedFile, pr
     ...(profile_error ? { profile_error_status } : {}), active_tasks: activeTasks, state, can_reload };
 }
 
+export const REPEAT_FAILURE_DEFAULTS = { enabled: true, minSeconds: 60, failures: 2, windowHours: 24 };
+export function validRepeatFailureField(key, value) {
+  if (!Object.hasOwn(REPEAT_FAILURE_DEFAULTS, key)) return false;
+  if (key === 'enabled') return typeof value === 'boolean';
+  return (key === 'failures' ? Number.isSafeInteger(value) : Number.isFinite(value)) && value > 0;
+}
+
 const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度', readOnlyEffort: '只读任务的思考程度',
   serviceTier: '速度档', plannerAnswers: '自动回答 Codex 的问题', lockTimeoutSeconds: '等待其他任务写完的秒数',
   maxStorageMb: '任务记录上限', plannerReads: '规划端读取范围', gemini: 'Gemini 设置',
   timeoutSeconds: '每次尝试的总超时秒数', idleTimeoutSeconds: '空闲超时秒数', retries: '自动重试次数',
-  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接', maxSessionJobs: '每个会话的任务数上限',
-  maxSessionTokens: '每个会话的用量上限', jobDiff: '记录每单的改动', toolPolicy: '工具放行方式', allowTools: '白名单工具',
+  maxRunningJobs: '同时运行的任务数上限', autoResume: '重启后自动续接', maxSessionJobs: '每个会话的任务数上限', handoverSuggestMessages: '建议交接的消息数', acceptanceWarnAbove: '验收标准条数提醒', continueFreshAboveTokens: '续接开新线程的阈值', closeoutEvidence: '结案依据要求',
+  maxSessionTokens: '每个会话的用量上限', jobDiff: '记录每单的改动', closeoutGuard: '未收尾时拒绝开新任务', toolPolicy: '工具放行方式', allowTools: '白名单工具',
+  acceptOpenEvidence: '接受未完成项的依据',
+  ownerDecisions: '待所有者事项由谁决定',
+  autoVerify: '完成后自动核验',
+  effortOverride: '单次推理强度覆盖',
+  repeatFailureGuard: '重复失败拦截设置',
   plannerReadAllow: '额外允许读取的路径' };
 // null clears a limit and restores the runner default.
 const count = (v) => Number.isInteger(v) && v > 0;
 const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) => v > 0, timeoutSeconds: (v) => v > 0,
   idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: count,
-  maxSessionJobs: count, maxSessionTokens: count };
+  maxSessionJobs: count, maxSessionTokens: count, handoverSuggestMessages: (v) => Number.isInteger(v) && v >= 0,
+  acceptanceWarnAbove: (v) => Number.isInteger(v) && v >= 0, continueFreshAboveTokens: (v) => Number.isInteger(v) && v >= 0 };
 // Lists are replaced as a whole; an entry is one line of plain text.
 const listSettings = { allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v)],
   plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\/|\\\\)[^\r\n]*$/.test(v)] };
@@ -285,12 +298,20 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
     else if (key === 'plannerReads') valid = ['open', 'products'].includes(v);
     else if (key === 'toolPolicy') valid = ['denylist', 'allowlist'].includes(v);
-    else if (key === 'jobDiff') valid = typeof v === 'boolean';
+    else if (key === 'closeoutEvidence') valid = ['independent', 'planner', 'off'].includes(v);
+    else if (key === 'acceptOpenEvidence') valid = ['strict', 'relaxed', 'off'].includes(v);
+    else if (key === 'ownerDecisions') valid = ['planner', 'owner'].includes(v);
+    else if (key === 'autoVerify') valid = ['off', 'flagged'].includes(v);
+    else if (key === 'effortOverride') valid = ['planner', 'raise-only-listed', 'config'].includes(v);
+    else if (key === 'jobDiff' || key === 'closeoutGuard') valid = typeof v === 'boolean';
     else if (Object.hasOwn(listSettings, key)) {
       valid = Array.isArray(v) && v.length <= listSettings[key][0] && v.every((item) => typeof item === 'string' && listSettings[key][1](item));
     } else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
     else if (key === 'autoResume') {
       valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length === 1 && typeof v.enabled === 'boolean';
+    } else if (key === 'repeatFailureGuard') {
+      valid = v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
+        Object.entries(v).every(([field, item]) => validRepeatFailureField(field, item));
     } else if (key === 'gemini') {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
         Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
@@ -349,7 +370,7 @@ function settingsEdits(profile, changes) {
   validatePanelSettings(changes, gemini.length === 1 && new RegExp('^' + fieldPad + 'gemini:[ \\t]*(?:#.*)?$').test(gemini[0].text));
   let additions = '';
   for (const [key, value] of Object.entries(changes)) {
-    if (key === 'gemini' || key === 'autoResume') {
+    if (key === 'gemini' || key === 'autoResume' || key === 'repeatFailureGuard') {
       const parents = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
       if (parents.length > 1) throw new Error(`${key} 配置重复，未保存`);
       if (!parents.length) { additions += fresh(key, value, fieldPad); continue; }

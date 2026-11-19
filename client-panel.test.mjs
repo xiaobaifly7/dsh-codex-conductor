@@ -769,6 +769,37 @@ test('prompt backups expand on demand and load into the draft without saving', a
   assert.ok(text(section('给 Codex 的固定要求')).includes('还没有历史备份。'));
 });
 
+test('the auto-answer section shows waiting time, human-only questions and both actions', async (t) => {
+  const service = panelService();
+  const pendingQuestion = (id, reason = null) => ({ id, sessionId: 'session-' + id, questions: ['请选择'], waitedMinutes: 4, remainingMinutes: 6, reason });
+  const autoAnswer = { enabled: true, available: true, afterMinutes: 10,
+    pending: [pendingQuestion('a'), pendingQuestion('b'), pendingQuestion('c', 'risky')],
+    recent: [{ at: '2026-01-01T00:00:00Z', sessionId: 'session-old', question: '之前的提问', selected: ['推荐项'], reason: 'marked_recommended', waitedMinutes: 10 }] };
+  const host = clientHost((route, body) => {
+    if (route === '/auto-answer/action') {
+      autoAnswer.pending = body.action === 'answer' ? autoAnswer.pending.filter(({ id }) => id !== body.id)
+        : autoAnswer.pending.map((item) => item.id === body.id ? { ...item, reason: 'manual' } : item);
+      return { autoAnswer };
+    }
+    if (route === '/status') return { ...service.status, autoAnswer };
+    return service.handle(route, body);
+  });
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel);
+  await host.flush();
+  for (const label of ['已开启 · 10 分钟', '已等 4 分钟 · 还有 6 分钟自动代答', '需要你亲自回答（高风险）', '之前的提问', '有推荐标记']) {
+    assert.ok(text(host.tree).includes(label), label);
+  }
+  await click(host, '现在就按推荐回答');
+  assert.ok(text(host.tree).includes('已按推荐提交回答。'));
+  await click(host, '这条我自己答');
+  assert.ok(text(host.tree).includes('需要你亲自回答（已选择自己回答）'));
+  assert.deepEqual(host.requests.filter(({ body }) => body), [
+    { path: '/auto-answer/action', body: { id: 'a', action: 'answer' } },
+    { path: '/auto-answer/action', body: { id: 'b', action: 'manual' } },
+  ]);
+});
+
 test('status shows guard scope, host access and unknown keys, and folds secondary rows without hiding their errors', () => {
   const { Status } = clientHost().exports, service = panelService();
   const view = (settings = {}, runtime = {}) => Status({ status: { settings: { ...service.status.settings, ...settings },
@@ -1167,4 +1198,92 @@ test('a background Gemini record is labelled', async (t) => {
   const row = (name) => text(nodes(host.tree).find((node) => node.type === 'li' && text(node).includes(name)));
   assert.ok(row('后台.md').includes(' · 后台'));
   assert.ok(!row('前台.md').includes(' · 后台'));
+});
+
+test('the hand-over section submits from suggestions, prompts and links, and explains refusals in plain words', async (t) => {
+  const service = panelService();
+  service.status.handover = { mode: 'confirm',
+    suggestions: [{ sessionId: 'session-big', cwd: 'D:\\work', messages: 6200, suggest: true, blocked: '会话链已交接 6 次，达到自动交接上限 6 次。' }],
+    prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }],
+    links: [{ from: 'session-old', to: 'session-new', at: '2026-11-17T02:00:00.000Z', origin: 'auto', autoContinue: 'manual_required' }],
+    result: { status: 'refused', reason: 'jobs_running', from: 'session-big', running: ['J1', 'J2'], origin: 'panel' },
+    recent: [{ at: '2026-11-17T02:00:00.000Z', action: 'handover', from: 'session-old', to: 'session-new', origin: 'auto', status: 'handed_over' }] };
+  const host = clientHost((path, body) => path.startsWith('/handover/') ? (body.accept === false ? { declined: true } : { submitted: true }) : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = () => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接');
+  const shown = () => text(section());
+  for (const value of ['空闲时询问，同意后交接', 'session-big', 'D:\\work · 6200 条消息', 'session-old → session-new', '自动交接',
+    '达到自动交接上限 6 次', '当前有 2 个 Codex 任务在运行，结束后再交接。', '最近的交接记录']) assert.ok(shown().includes(value), value);
+  const posts = () => host.requests.filter((request) => request.body);
+  // 建议列表：点开填一句下一步，确认后才提交。
+  await click(host, '交接到新会话');
+  assert.equal(posts().length, 0, 'nothing is sent before the confirmation');
+  await change(host, '给新会话的下一步（可空）', '先收尾 J1');
+  await click(host, '确认交接');
+  assert.deepEqual(posts().at(-1), { path: '/handover/request', body: { sessionId: 'session-big', note: '先收尾 J1' } });
+  assert.ok(shown().includes('交接请求已提交'));
+  // 询问：同意 / 暂不交接。
+  await click(host, '同意交接');
+  assert.deepEqual(posts().at(-1), { path: '/handover/answer', body: { sessionId: 'session-big', accept: true } });
+  await click(host, '暂不交接');
+  assert.deepEqual(posts().at(-1), { path: '/handover/answer', body: { sessionId: 'session-big', accept: false } });
+  assert.ok(shown().includes('冷却期内不再询问'));
+  // 撤回先确认；被继任会话已开工拦下后，显示原因并给出带 force 的二次确认。
+  await click(host, '撤回');
+  await click(host, '确认撤回');
+  assert.deepEqual(posts().at(-1), { path: '/handover/request', body: { revert: { from: 'session-old', to: 'session-new' } } });
+  assert.equal(nodes(section()).some((node) => node.type === 'button' && text(node) === '仍然撤回（两个会话会并行）'), false);
+  service.status.handover = { ...service.status.handover, result: { status: 'rejected', reason: 'successor_active', from: 'session-old', to: 'session-new', newTurns: 3 } };
+  host.poll(); await host.flush();
+  assert.ok(shown().includes('继任会话已有 3 个新回合，撤回会造成两个会话并行。'));
+  await click(host, '仍然撤回（两个会话会并行）');
+  assert.deepEqual(posts().at(-1), { path: '/handover/request', body: { revert: { from: 'session-old', to: 'session-new' }, force: true } });
+  service.status.handover = { ...service.status.handover, result: { status: 'handed_over', from: 'session-big', to: 'session-n2', origin: 'confirm', steps: { autoContinue: 'manual_required' } } };
+  host.poll(); await host.flush();
+  assert.ok(shown().includes('已交接：session-big → session-n2，来自询问后同意。请在界面把旧会话 session-big 的“自动继续”开关关掉。'));
+});
+
+test('the hand-over section warns about queued input and shows self-check problems and automatic rollbacks prominently', async (t) => {
+  const service = panelService();
+  service.status.handover = { mode: 'confirm', suggestions: [{ sessionId: 'session-big', messages: 6200, suggest: true }],
+    prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }], links: [], recent: [],
+    result: { status: 'handed_over_with_issues', from: 'session-big', to: 'session-n', origin: 'panel', steps: {},
+      checks: { goal: 'ok', settings: 'failed:differs:model', jobs: 'skipped:no_open_jobs', delivered: 'ok', predecessorFrozen: 'ok' } } };
+  const host = clientHost((path, body) => service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = () => nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接');
+  const hint = '旧会话输入框里还有排队未发的消息的话，请先发出或清空——它们不会跟到新会话。';
+  assert.equal(text(section()).split(hint).length - 1, 1, 'the question carries the hint');
+  await click(host, '交接到新会话');
+  assert.equal(text(section()).split(hint).length - 1, 2, 'the confirmation carries it too');
+  const checks = nodes(section()).find((node) => node.type === 'ul' && node.props['aria-label'] === '交接自检');
+  assert.ok(text(checks).includes('预设、模型、权限和工作目录一致：有问题（differs:model）'));
+  assert.ok(text(checks).includes('新会话能查到待处理的任务：跳过（no_open_jobs）'));
+  assert.ok(nodes(section()).some((node) => node.props?.className === 'dcc-warn' && text(node).includes('交接后自检有问题')));
+  service.status.handover = { ...service.status.handover, result: { status: 'rolled_back', from: 'session-big', to: 'session-n', origin: 'auto',
+    rollback: { reason: 'delivery_failed', status: 'reverted' } } };
+  host.poll(); await host.flush();
+  assert.ok(text(section()).includes('交接已自动撤回：交接单没能送到新会话，session-big 恢复原状，session-n 不再作为继任会话，来自自动交接。'));
+});
+
+test('the hand-over section names the workspace of each successor and explains an approved hand-over waits for the next turn boundary', async (t) => {
+  const service = panelService();
+  service.status.handover = { mode: 'confirm', suggestions: [], scheduled: [],
+    prompts: [{ sessionId: 'session-big', kind: 'ask', at: '2026-11-17T01:00:00.000Z', messages: 6200 }],
+    links: [{ from: 'session-old', to: 'session-new', at: '2026-11-17T02:00:00.000Z', origin: 'auto', workspace: 'Seep-Reverse-Lab' },
+      { from: 'session-x', to: 'session-y', at: '2026-11-17T02:00:00.000Z', origin: 'panel' }],
+    recent: [{ at: '2026-11-17T03:00:00.000Z', action: 'repair', from: 'session-old', to: 'session-new', origin: 'startup', status: 'repaired', workspace: 'Seep-Reverse-Lab' }],
+    result: { status: 'handed_over', from: 'session-old', to: 'session-new', steps: {}, checks: { workspace: 'ok' } } };
+  const host = clientHost((path, body) => path === '/handover/answer' ? { scheduled: true } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  const section = () => text(nodes(host.tree).find((node) => node.type === 'section' && node.props['aria-label'] === '会话交接'));
+  assert.ok(section().includes('自动交接 · 分组 Seep-Reverse-Lab'));
+  assert.ok(!section().includes('面板 · 分组'), 'no workspace name when it is unknown');
+  assert.ok(section().includes('启动修复 · repaired · 分组 Seep-Reverse-Lab'));
+  assert.ok(section().includes('新会话在原会话的分组里：通过'));
+  await click(host, '同意交接');
+  assert.ok(section().includes('已同意：会话停在两个回合之间时自动交接'));
 });

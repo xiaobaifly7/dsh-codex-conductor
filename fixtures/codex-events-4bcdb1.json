@@ -1,0 +1,1991 @@
+{
+ "source": "thread 4bcdb1 rollout (sanitised): commands synthetic, step-key equality, exit codes and durations real",
+ "events": [
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_0",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_8.py && pwsh.exe -NoProfile -Command \"Invoke-StepA -Log C:/tmp/StepA-100008.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_0",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_8.py && pwsh.exe -NoProfile -Command \"Invoke-StepA -Log C:/tmp/StepA-100008.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_1",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_19.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100019.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_1",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_19.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100019.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 23
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_2",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_43.py && pwsh.exe -NoProfile -Command \"Invoke-StepC -Log C:/tmp/StepC-100043.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_2",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_43.py && pwsh.exe -NoProfile -Command \"Invoke-StepC -Log C:/tmp/StepC-100043.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 8
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_3",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_54.py && pwsh.exe -NoProfile -Command \"Invoke-StepC -Log C:/tmp/StepC-100054.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_3",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_54.py && pwsh.exe -NoProfile -Command \"Invoke-StepC -Log C:/tmp/StepC-100054.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 51
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_4",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_82.py && pwsh.exe -NoProfile -Command \"Invoke-StepD -Log C:/tmp/StepD-100082.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_4",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_82.py && pwsh.exe -NoProfile -Command \"Invoke-StepD -Log C:/tmp/StepD-100082.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_5",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_87.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100087.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_5",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_87.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100087.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 647
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_6",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_90.py && pwsh.exe -NoProfile -Command \"Invoke-StepD -Log C:/tmp/StepD-100090.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_6",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_90.py && pwsh.exe -NoProfile -Command \"Invoke-StepD -Log C:/tmp/StepD-100090.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_7",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_93.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100093.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_7",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_93.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100093.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 22
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_8",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_114.py && pwsh.exe -NoProfile -Command \"Invoke-StepF -Log C:/tmp/StepF-100114.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_8",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_114.py && pwsh.exe -NoProfile -Command \"Invoke-StepF -Log C:/tmp/StepF-100114.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 255,
+    "status": "failed"
+   },
+   "_seconds": 15
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_9",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_120.py && pwsh.exe -NoProfile -Command \"Invoke-StepG -Log C:/tmp/StepG-100120.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_9",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_120.py && pwsh.exe -NoProfile -Command \"Invoke-StepG -Log C:/tmp/StepG-100120.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 255,
+    "status": "failed"
+   },
+   "_seconds": 14
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_10",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_125.py && pwsh.exe -NoProfile -Command \"Invoke-StepH -Log C:/tmp/StepH-100125.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_10",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_125.py && pwsh.exe -NoProfile -Command \"Invoke-StepH -Log C:/tmp/StepH-100125.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 1
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_11",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_126.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100126.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_11",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_126.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100126.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 25
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_12",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_128.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100128.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_12",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_128.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100128.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_13",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_132.py && pwsh.exe -NoProfile -Command \"Invoke-StepJ -Log C:/tmp/StepJ-100132.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_13",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_132.py && pwsh.exe -NoProfile -Command \"Invoke-StepJ -Log C:/tmp/StepJ-100132.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 19
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_14",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_150.py && pwsh.exe -NoProfile -Command \"Invoke-StepBA -Log C:/tmp/StepBA-100150.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_14",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_150.py && pwsh.exe -NoProfile -Command \"Invoke-StepBA -Log C:/tmp/StepBA-100150.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 63
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_15",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_151.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100151.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_15",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_151.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100151.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_16",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_188.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100188.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_16",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_188.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100188.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 937
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_17",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_195.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100195.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_17",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_195.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100195.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 23
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_18",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_196.py && pwsh.exe -NoProfile -Command \"Invoke-StepBB -Log C:/tmp/StepBB-100196.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_18",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_196.py && pwsh.exe -NoProfile -Command \"Invoke-StepBB -Log C:/tmp/StepBB-100196.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_19",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_206.py && pwsh.exe -NoProfile -Command \"Invoke-StepBC -Log C:/tmp/StepBC-100206.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_19",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_206.py && pwsh.exe -NoProfile -Command \"Invoke-StepBC -Log C:/tmp/StepBC-100206.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_20",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_225.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100225.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_20",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_225.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100225.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_21",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_226.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100226.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_21",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_226.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100226.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 25
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_22",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_234.py && pwsh.exe -NoProfile -Command \"Invoke-StepBD -Log C:/tmp/StepBD-100234.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_22",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_234.py && pwsh.exe -NoProfile -Command \"Invoke-StepBD -Log C:/tmp/StepBD-100234.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_23",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_242.py && pwsh.exe -NoProfile -Command \"Invoke-StepBA -Log C:/tmp/StepBA-100242.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_23",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_242.py && pwsh.exe -NoProfile -Command \"Invoke-StepBA -Log C:/tmp/StepBA-100242.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 63
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_24",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_271.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100271.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_24",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_271.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100271.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 1193
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_25",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_275.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100275.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_25",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_275.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100275.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 25
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_26",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_294.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100294.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_26",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_294.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100294.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 26
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_27",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_302.py && pwsh.exe -NoProfile -Command \"Invoke-StepBE -Log C:/tmp/StepBE-100302.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_27",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_302.py && pwsh.exe -NoProfile -Command \"Invoke-StepBE -Log C:/tmp/StepBE-100302.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_28",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_306.py && pwsh.exe -NoProfile -Command \"Invoke-StepBF -Log C:/tmp/StepBF-100306.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_28",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_306.py && pwsh.exe -NoProfile -Command \"Invoke-StepBF -Log C:/tmp/StepBF-100306.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 19
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_29",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_307.py && pwsh.exe -NoProfile -Command \"Invoke-StepBG -Log C:/tmp/StepBG-100307.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_29",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_307.py && pwsh.exe -NoProfile -Command \"Invoke-StepBG -Log C:/tmp/StepBG-100307.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_30",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_310.py && pwsh.exe -NoProfile -Command \"Invoke-StepBH -Log C:/tmp/StepBH-100310.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_30",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_310.py && pwsh.exe -NoProfile -Command \"Invoke-StepBH -Log C:/tmp/StepBH-100310.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_31",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_314.py && pwsh.exe -NoProfile -Command \"Invoke-StepBI -Log C:/tmp/StepBI-100314.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_31",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_314.py && pwsh.exe -NoProfile -Command \"Invoke-StepBI -Log C:/tmp/StepBI-100314.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_32",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_316.py && pwsh.exe -NoProfile -Command \"Invoke-StepBJ -Log C:/tmp/StepBJ-100316.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_32",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_316.py && pwsh.exe -NoProfile -Command \"Invoke-StepBJ -Log C:/tmp/StepBJ-100316.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 63
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_33",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_345.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100345.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_33",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_345.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100345.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 1033
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_34",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-346'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_34",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-346'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_35",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_350.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100350.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_35",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_350.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100350.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 25
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_36",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_364.py && pwsh.exe -NoProfile -Command \"Invoke-StepCA -Log C:/tmp/StepCA-100364.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_36",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_364.py && pwsh.exe -NoProfile -Command \"Invoke-StepCA -Log C:/tmp/StepCA-100364.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 26
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_37",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_372.py && pwsh.exe -NoProfile -Command \"Invoke-StepCB -Log C:/tmp/StepCB-100372.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_37",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_372.py && pwsh.exe -NoProfile -Command \"Invoke-StepCB -Log C:/tmp/StepCB-100372.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_38",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_374.py && pwsh.exe -NoProfile -Command \"Invoke-StepCC -Log C:/tmp/StepCC-100374.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_38",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_374.py && pwsh.exe -NoProfile -Command \"Invoke-StepCC -Log C:/tmp/StepCC-100374.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_39",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_377.py && pwsh.exe -NoProfile -Command \"Invoke-StepCC -Log C:/tmp/StepCC-100377.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_39",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_377.py && pwsh.exe -NoProfile -Command \"Invoke-StepCC -Log C:/tmp/StepCC-100377.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 1
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_40",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_379.py && pwsh.exe -NoProfile -Command \"Invoke-StepCD -Log C:/tmp/StepCD-100379.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_40",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_379.py && pwsh.exe -NoProfile -Command \"Invoke-StepCD -Log C:/tmp/StepCD-100379.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_41",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_383.py && pwsh.exe -NoProfile -Command \"Invoke-StepCE -Log C:/tmp/StepCE-100383.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_41",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_383.py && pwsh.exe -NoProfile -Command \"Invoke-StepCE -Log C:/tmp/StepCE-100383.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_42",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_386.py && pwsh.exe -NoProfile -Command \"Invoke-StepCF -Log C:/tmp/StepCF-100386.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_42",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_386.py && pwsh.exe -NoProfile -Command \"Invoke-StepCF -Log C:/tmp/StepCF-100386.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_43",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_387.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100387.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_43",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_387.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100387.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 62
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_44",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-388'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_44",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-388'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_45",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_407.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100407.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_45",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_407.py && pwsh.exe -NoProfile -Command \"Invoke-StepE -Log C:/tmp/StepE-100407.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 1040
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_46",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_409.py && pwsh.exe -NoProfile -Command \"Invoke-StepCH -Log C:/tmp/StepCH-100409.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_46",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_409.py && pwsh.exe -NoProfile -Command \"Invoke-StepCH -Log C:/tmp/StepCH-100409.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 27
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_47",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_418.py && pwsh.exe -NoProfile -Command \"Invoke-StepCI -Log C:/tmp/StepCI-100418.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_47",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_418.py && pwsh.exe -NoProfile -Command \"Invoke-StepCI -Log C:/tmp/StepCI-100418.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 27
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_48",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_420.py && pwsh.exe -NoProfile -Command \"Invoke-StepCJ -Log C:/tmp/StepCJ-100420.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_48",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_420.py && pwsh.exe -NoProfile -Command \"Invoke-StepCJ -Log C:/tmp/StepCJ-100420.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 20
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_49",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-421'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_49",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-421'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_50",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_423.py && pwsh.exe -NoProfile -Command \"Invoke-StepDA -Log C:/tmp/StepDA-100423.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_50",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_423.py && pwsh.exe -NoProfile -Command \"Invoke-StepDA -Log C:/tmp/StepDA-100423.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 26
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_51",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_425.py && pwsh.exe -NoProfile -Command \"Invoke-StepDB -Log C:/tmp/StepDB-100425.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_51",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_425.py && pwsh.exe -NoProfile -Command \"Invoke-StepDB -Log C:/tmp/StepDB-100425.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 6
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_52",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_427.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100427.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_52",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_427.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100427.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 74
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_53",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_430.py && pwsh.exe -NoProfile -Command \"Invoke-StepDC -Log C:/tmp/StepDC-100430.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_53",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_430.py && pwsh.exe -NoProfile -Command \"Invoke-StepDC -Log C:/tmp/StepDC-100430.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 33
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_54",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_441.py && pwsh.exe -NoProfile -Command \"Invoke-StepDD -Log C:/tmp/StepDD-100441.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_54",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_441.py && pwsh.exe -NoProfile -Command \"Invoke-StepDD -Log C:/tmp/StepDD-100441.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 28
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_55",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_445.py && pwsh.exe -NoProfile -Command \"Invoke-StepDE -Log C:/tmp/StepDE-100445.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_55",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_445.py && pwsh.exe -NoProfile -Command \"Invoke-StepDE -Log C:/tmp/StepDE-100445.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 6
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_56",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_448.py && pwsh.exe -NoProfile -Command \"Invoke-StepDF -Log C:/tmp/StepDF-100448.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_56",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_448.py && pwsh.exe -NoProfile -Command \"Invoke-StepDF -Log C:/tmp/StepDF-100448.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 7
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_57",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_452.py && pwsh.exe -NoProfile -Command \"Invoke-StepDG -Log C:/tmp/StepDG-100452.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_57",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_452.py && pwsh.exe -NoProfile -Command \"Invoke-StepDG -Log C:/tmp/StepDG-100452.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 6
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_58",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_454.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100454.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_58",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_454.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100454.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 70
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_59",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_455.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100455.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_59",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_455.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100455.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_60",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_459.py && pwsh.exe -NoProfile -Command \"Invoke-StepDH -Log C:/tmp/StepDH-100459.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_60",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_459.py && pwsh.exe -NoProfile -Command \"Invoke-StepDH -Log C:/tmp/StepDH-100459.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_61",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_463.py && pwsh.exe -NoProfile -Command \"Invoke-StepDI -Log C:/tmp/StepDI-100463.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_61",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_463.py && pwsh.exe -NoProfile -Command \"Invoke-StepDI -Log C:/tmp/StepDI-100463.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 7
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_62",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_467.py && pwsh.exe -NoProfile -Command \"Invoke-StepDJ -Log C:/tmp/StepDJ-100467.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_62",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_467.py && pwsh.exe -NoProfile -Command \"Invoke-StepDJ -Log C:/tmp/StepDJ-100467.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_63",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_468.py && pwsh.exe -NoProfile -Command \"Invoke-StepEA -Log C:/tmp/StepEA-100468.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_63",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_468.py && pwsh.exe -NoProfile -Command \"Invoke-StepEA -Log C:/tmp/StepEA-100468.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_64",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_470.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100470.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_64",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_470.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100470.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 27
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_65",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-481'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_65",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'echo adhoc-481'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_66",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_66",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_67",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_67",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_68",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_497.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100497.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_68",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_497.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100497.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 6
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_69",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_498.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100498.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_69",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_498.py && pwsh.exe -NoProfile -Command \"Invoke-StepB -Log C:/tmp/StepB-100498.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 27
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_70",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file1.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file2.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_70",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file1.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file2.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_71",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file1.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_71",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file1.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_72",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_506.py && pwsh.exe -NoProfile -Command \"Invoke-StepEB -Log C:/tmp/StepEB-100506.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_72",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_506.py && pwsh.exe -NoProfile -Command \"Invoke-StepEB -Log C:/tmp/StepEB-100506.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 7,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_73",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_73",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_74",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_509.py && pwsh.exe -NoProfile -Command \"Invoke-StepEC -Log C:/tmp/StepEC-100509.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_74",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_509.py && pwsh.exe -NoProfile -Command \"Invoke-StepEC -Log C:/tmp/StepEC-100509.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_75",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_516.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100516.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_75",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_516.py && pwsh.exe -NoProfile -Command \"Invoke-StepCG -Log C:/tmp/StepCG-100516.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 1,
+    "status": "failed"
+   },
+   "_seconds": 72
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_76",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_520.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100520.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_76",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_520.py && pwsh.exe -NoProfile -Command \"Invoke-StepI -Log C:/tmp/StepI-100520.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 5
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_77",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_522.py && pwsh.exe -NoProfile -Command \"Invoke-StepEB -Log C:/tmp/StepEB-100522.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_77",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_522.py && pwsh.exe -NoProfile -Command \"Invoke-StepEB -Log C:/tmp/StepEB-100522.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 2,
+    "status": "failed"
+   },
+   "_seconds": 0
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_78",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_525.py && pwsh.exe -NoProfile -Command \"Invoke-StepED -Log C:/tmp/StepED-100525.log\"'",
+    "aggregated_output": "",
+    "exit_code": null,
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_78",
+    "type": "command_execution",
+    "command": "/bin/bash -lc 'python3 /tmp/run_525.py && pwsh.exe -NoProfile -Command \"Invoke-StepED -Log C:/tmp/StepED-100525.log\"'",
+    "aggregated_output": "<output>",
+    "exit_code": 0,
+    "status": "completed"
+   },
+   "_seconds": 10
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_79",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file1.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_79",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     },
+     {
+      "path": "src/file1.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_80",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_80",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_81",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_81",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  },
+  {
+   "type": "item.started",
+   "item": {
+    "id": "item_82",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "in_progress"
+   }
+  },
+  {
+   "type": "item.completed",
+   "item": {
+    "id": "item_82",
+    "type": "file_change",
+    "changes": [
+     {
+      "path": "src/file0.ps1",
+      "kind": "update"
+     }
+    ],
+    "status": "completed"
+   }
+  }
+ ]
+}

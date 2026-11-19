@@ -5,6 +5,14 @@ import { performance } from 'node:perf_hooks';
 
 // Stable across module reloads; timeOrigin distinguishes reused PIDs.
 const HOST_PROCESS = `${process.pid}:${performance.timeOrigin}`;
+// 兜底或热重载续接读一个会话的原始日志最多等这么久，宿主没有只读尾部的接口。
+const FALLBACK_READ_LIMIT_MS = 60_000;
+const RELOAD_WINDOW_MS = 60_000;
+const RECENT_ACTIVITY_MS = 600_000;
+
+const lastTurnEvent = (events) => events?.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
+const userStopped = (event) => event?.type === 'turn/end' && event.data?.reason?.kind === 'aborted' && event.data.reason.reason?.kind === 'user';
+const turnKey = (event) => `${event.data?.turn}:${event.time}`;
 
 function validSessionId(id) {
   return typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
@@ -79,7 +87,7 @@ function resumePendingInbox(agent, sessionId) {
   }
 }
 
-async function resumeSession(ctx, sessionId, message, { send = false, queue = false, automatic, signal } = {}) {
+async function resumeSession(ctx, sessionId, message, { send = false, queue = false, automatic, reload, signal } = {}) {
   let method = null;
   const basis = {};
   const result = (status, reason, method = null) => ({ sessionId, status, reason,
@@ -101,14 +109,20 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
     // queue: a running agent's followup lands in next-turn, the same path as the UI's Queue mode.
     if (agent.status === 'running' && !queue) return skipped('running');
     // Resolve first: the host closes a crashed, unterminated turn as interrupted.
-    const { events } = await query.readSession(sessionId);
+    const events = (reload && agent.session?.log) || (await query.readSession(sessionId)).events;
     if (signal?.aborted) return skipped('unloaded');
     if (agents.get(sessionId) !== agent) return skipped('session_changed');
     if (automatic) basis.agentStatus = agent.status;
     if (agent.status === 'running' && !queue) return skipped('running');
     if (!send) {
-      const lastTurn = events.findLast((event) => event.type === 'turn/start' || event.type === 'turn/end');
+      const lastTurn = lastTurnEvent(reload ? agent.session?.log ?? events : events);
       const ended = lastTurn?.type === 'turn/end' ? lastTurn.data?.reason?.kind : undefined;
+      if (reload) {
+        const reason = reload.skip();
+        if (reason) return skipped(reason);
+        if (userStopped(lastTurn)) return skipped('user_stopped');
+        if (ended !== 'interrupted' || turnKey(lastTurn) !== reload.turn) return skipped('resumed_after_reload');
+      }
       // After a restart another plugin may try to advance the disarmed goal; the host rejects that turn as "blocked"
       // before any step runs, so the session is still waiting to be resumed.
       if (!automatic && ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
@@ -124,7 +138,7 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
         if (goal?.phase === 'active' && goal.activation === 'armed') return skipped('native_goal_driver');
         if (goal?.phase === 'active' && goal.roundsStarted >= goal.maxGoalRounds) return skipped('goal_round_limit');
         if (goal?.phase !== 'active' && automatic.lastTurn !== 'unterminated' && automatic.lastTurn !== 'error' &&
-            !(automatic.shutdownPending && (automatic.lastTurn === 'interrupted' ||
+            !reload && !(automatic.shutdownPending && (automatic.lastTurn === 'interrupted' ||
               (automatic.lastTurn === 'aborted' && ['disposed', 'parent'].includes(automatic.cancelCause))))) {
           return skipped(['interrupted', 'aborted'].includes(automatic.lastTurn) ? 'interrupted_without_shutdown_marker' : 'not_interrupted');
         }
@@ -133,6 +147,7 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
           (goal.phase !== 'active' || goal.activation === 'disarmed') && goal.roundsStarted < goal.maxGoalRounds) {
         method = 'goal';
         // The native goal driver submits the next round; a user prompt here would duplicate it.
+        reload?.claim();
         goals.resume(agent, { id: goal.id, revision: goal.revision });
         return result('resumed', 'goal_resumed', method);
       }
@@ -141,11 +156,14 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
       method = 'message';
     }
     const queued = agent.status === 'running';
-    agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user' } });
+    reload?.claim();
+    // via 标出这是插件代发的消息（续接、send-request），不当作用户回复。
+    agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user', via: 'codex-conductor' } });
     return result(send ? 'sent' : 'resumed', queued ? 'message_queued' : 'message_submitted', method);
   } catch (error) {
     // Host errors may quote the submitted text; never publish them for the send entry.
     if (send) return { ...skipped('error'), error: 'Session message submission failed or required host interfaces are unavailable' };
+    if (reload) return result('skipped', 'error', method);
     return { ...result('skipped', 'error', method), error: String(error?.message ?? error) };
   }
 }
@@ -158,6 +176,17 @@ function writeJson(directory, name, value) {
   } finally {
     fs.rmSync(temporary, { force: true });
   }
+}
+
+function readAutoState(directory) {
+  try { return JSON.parse(fs.readFileSync(path.join(directory, 'autoresume-state.json'), 'utf8')); }
+  catch (error) { if (error.code !== 'ENOENT') throw error; }
+}
+
+async function readRawSession(persistence, sessionId, signal) {
+  const handle = await persistence.open(sessionId, 'read', { signal });
+  try { return (await handle.read(0, undefined, { signal })).events; }
+  finally { await handle.close(); }
 }
 
 async function processRequest({ ctx, directory }, kind) {
@@ -212,18 +241,17 @@ export function processGoalRequest(options) {
   return processRequest(options, 'goal');
 }
 
-export async function processAutoResume({ ctx, directory, autoResume, signal }) {
+// delayed（兜底）：宿主启动 delaySeconds 秒后才扫，按会话此刻的实际状态重新判断，只补仍没被续上的会话。
+export async function processAutoResume({ ctx, directory, autoResume, signal, delayed = false, retired = () => false, archived = () => false,
+  hostStart = performance.timeOrigin, readLimitMs = FALLBACK_READ_LIMIT_MS }) {
   if (!autoResume.enabled || signal?.aborted) return;
-  const stateFile = path.join(directory, 'autoresume-state.json');
-  const readState = () => {
-    try { return JSON.parse(fs.readFileSync(stateFile, 'utf8')); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; }
-  };
+  const readState = () => readAutoState(directory);
   const previous = readState();
   const continuing = previous?.hostProcess === HOST_PROCESS;
   // A scan cut short by a hot reload is finished by the next plugin instance in the same process.
   if (continuing && !previous.interrupted) return;
   const state = { hostProcess: HOST_PROCESS, resumed: continuing ? previous.resumed : [] };
+  if (previous?.reload?.hostProcess === HOST_PROCESS) state.reload = previous.reload;
   // The previous process's shutdown list must outlive an interrupted scan; root shutdown reuses `pending`.
   const shutdownPending = continuing ? previous.previousPending : previous?.pending;
   if (shutdownPending) state.previousPending = shutdownPending;
@@ -243,8 +271,13 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
   };
   signal?.addEventListener('abort', interrupt, { once: true });
   const requestedAt = new Date().toISOString();
-  const result = { requestedAt, status: 'processed', sessions: [] };
+  const result = { requestedAt, status: 'processed', ...(delayed ? { trigger: 'fallback', delaySeconds: autoResume.delaySeconds } : {}), sessions: [] };
   const cutoff = Date.now() - autoResume.maxAgeHours * 3600_000;
+  // 宿主启动之后开过的回合说明别的机制（auto-continue、目标循环、用户）已经续上了。
+  const startedAfterBoot = (events) => events?.some((event) => event?.type === 'turn/start' && Number(event.time) >= hostStart);
+  // If a reload arrived before the startup scan finished, let the reload path handle new turns.
+  const checkNewTurns = delayed || (autoResume.reloadDelaySeconds > 0 &&
+    (state.reload?.fallback || Object.keys(state.reload?.pending ?? {}).length > 0));
   try {
     const query = ctx.get('sessionQuery');
     const persistence = ctx.get('sessionPersistence');
@@ -259,17 +292,30 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
         else if (autoResume.exclude.includes(sessionId)) entry = skipped('excluded', { excluded: true });
         else if (!sessionId.startsWith('session-')) entry = skipped('fork', { mainSession: false });
         else if (ctx.get('agents').get(sessionId)?.status === 'running') entry = skipped('running', { agentStatus: 'running' });
+        else if (delayed && retired(sessionId)) entry = skipped('handed_over', { handedOver: true });
+        else if (delayed && archived(sessionId)) entry = skipped('archived', { archived: true });
+        else if (checkNewTurns && startedAfterBoot(ctx.get('agents').get(sessionId)?.session?.log)) entry = skipped('resumed_after_start', { live: true });
         else {
           // listSessions has no update time; stat avoids decompressing old JSONL logs.
           const { mtimeMs: updatedAt } = await fs.promises.stat(persistence.locate(header).path);
           if (updatedAt < cutoff) entry = skipped('too_old', { updatedAt, cutoff });
           else {
             // query.readSession also synthesizes interrupted endings, so inspect the raw read handle first.
-            const handle = await persistence.open(sessionId, 'read', { signal });
+            const readSignal = delayed ? AbortSignal.any([signal ?? new AbortController().signal, AbortSignal.timeout(readLimitMs)]) : signal;
             let events;
-            try { ({ events } = await handle.read(0, undefined, { signal })); }
-            finally { await handle.close(); }
-            const lastTurn = events.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
+            try { events = await readRawSession(persistence, sessionId, readSignal); }
+            catch (error) {
+              if (!delayed || signal?.aborted || !readSignal.aborted) throw error;
+            }
+            if (delayed && !events) {
+              result.sessions.push({ ...skipped('read_timeout', { updatedAt, readLimitMs }) });
+              continue;
+            }
+            if (checkNewTurns && startedAfterBoot(events)) {
+              result.sessions.push(skipped('resumed_after_start', { updatedAt }));
+              continue;
+            }
+            const lastTurn = lastTurnEvent(events);
             const automatic = { lastTurn: lastTurn?.type === 'turn/start' ? 'unterminated' : lastTurn?.data?.reason?.kind ?? 'none',
               cancelCause: lastTurn?.data?.reason?.reason?.kind ?? null,
               shutdownPending: shutdownPending?.includes(sessionId) ?? false };
@@ -297,22 +343,127 @@ export async function processAutoResume({ ctx, directory, autoResume, signal }) 
   return result;
 }
 
-export function registerResumeRequests({ ctx, directory, autoResume }) {
+function updateReloadState(directory, change) {
+  const state = readAutoState(directory) ?? {};
+  const reload = state.reload?.hostProcess === HOST_PROCESS ? state.reload : { hostProcess: HOST_PROCESS, pending: {}, submitted: {} };
+  change(reload, state);
+  writeJson(directory, 'autoresume-state', { ...state, reload });
+  return reload;
+}
+
+async function processReloadResume({ ctx, directory, autoResume, plan, signal, retired = () => false, archived = () => false }) {
+  if (signal.aborted) return;
+  const result = { requestedAt: new Date().toISOString(), status: 'processed', trigger: 'reload',
+    delaySeconds: autoResume.reloadDelaySeconds, sessions: [] };
+  const agents = ctx.get('agents');
+  const persistence = ctx.get('sessionPersistence');
+  const candidates = new Map(Object.entries(plan.pending));
+  try {
+    if (plan.fallback) {
+      for (const { header } of await ctx.get('sessionQuery').listSessions(signal)) {
+        if (validSessionId(header.id) && header.id.startsWith('session-') && !candidates.has(header.id)) {
+          candidates.set(header.id, { at: plan.fallback.at, header });
+        }
+      }
+    }
+    for (const [sessionId, candidate] of candidates) {
+      if (signal.aborted) return;
+      const skipped = (reason) => ({ sessionId, status: 'skipped', reason, method: null });
+      const skip = () => !validSessionId(sessionId) || !sessionId.startsWith('session-') ? 'fork'
+        : autoResume.exclude.includes(sessionId) ? 'excluded'
+          : retired(sessionId) ? 'handed_over' : archived(sessionId) ? 'archived' : null;
+      let entry, readSignal;
+      try {
+        const reason = skip();
+        if (reason) entry = skipped(reason);
+        else if (agents.get(sessionId)?.status === 'running') entry = skipped('running');
+        else {
+          const from = candidate.header ? plan.fallback.from : candidate.at - RELOAD_WINDOW_MS;
+          const liveLog = agents.get(sessionId)?.session?.log;
+          if (candidate.header && !liveLog && (await fs.promises.stat(persistence.locate(candidate.header).path)).mtimeMs < from) continue;
+          if (signal.aborted) return;
+          readSignal = liveLog ? undefined : AbortSignal.any([signal, AbortSignal.timeout(FALLBACK_READ_LIMIT_MS)]);
+          const events = liveLog ?? await readRawSession(persistence, sessionId, readSignal);
+          if (signal.aborted) return;
+          const end = lastTurnEvent(events);
+          const start = events.findLast(event => event.type === 'turn/start');
+          const newerTurn = start?.time > candidate.at || (candidate.header && start?.time === candidate.at);
+          if (userStopped(end)) entry = skipped('user_stopped');
+          else if (newerTurn || (candidate.turn !== undefined && end?.data?.turn !== candidate.turn)) {
+            entry = skipped('resumed_after_reload');
+          } else if (end?.type !== 'turn/end' || end.data?.reason?.kind !== 'interrupted') entry = skipped('not_interrupted');
+          else if (!Number.isFinite(end.time) || end.time < from || end.time > candidate.at + RELOAD_WINDOW_MS ||
+              (candidate.header && !(start?.time >= performance.timeOrigin))) {
+            entry = skipped('interruption_outside_reload_window');
+          } else {
+            const turn = turnKey(end);
+            if (plan.submitted[sessionId] === turn) entry = skipped('already_resumed');
+            else entry = await resumeSession(ctx, sessionId, autoResume.message, {
+              signal, automatic: { lastTurn: 'interrupted', cancelCause: null, shutdownPending: false },
+              reload: { skip, turn, claim: () => {
+                // Record before submission so another reload can never send the same turn twice.
+                updateReloadState(directory, state => { state.submitted[sessionId] = turn; });
+              } },
+            });
+          }
+        }
+      } catch (error) {
+        entry = skipped(readSignal?.aborted ? 'read_timeout' : error?.code === 'ENOENT' || error?.code === 'session/not-found' ? 'not_found' : 'error');
+      }
+      if (signal.aborted) return;
+      result.sessions.push(entry);
+    }
+  } catch {
+    result.status = 'error';
+  }
+  if (signal.aborted) return;
+  result.completedAt = new Date().toISOString();
+  writeJson(directory, 'autoresume-result', result);
+  if (result.status === 'processed') updateReloadState(directory, state => {
+    state.pending = {};
+    delete state.fallback;
+  });
+}
+
+export function registerResumeRequests({ ctx, directory, autoResume, retired, archived, pluginFiber, previousLoad }) {
   let stopped = false;
   let pending = Promise.resolve();
   const controller = new AbortController();
   const warn = (error) => ctx.logger?.warn?.(`[codex-conductor] local request: ${error?.message ?? error}`);
+  const reloadEnabled = autoResume?.enabled && autoResume.reloadDelaySeconds > 0;
+  const rootFiber = autoResume?.enabled ? ctx.root.fiber : undefined;
+  let snapshotTaken = false;
+  const snapshotReload = () => {
+    if (!reloadEnabled || snapshotTaken || rootFiber.state === 5) return;
+    try {
+      const at = Date.now();
+      updateReloadState(directory, reload => {
+        reload.unloadedAt = at;
+        for (const agent of ctx.get('agents').list()) {
+          if (agent.status !== 'running' || !validSessionId(agent.id) || !agent.id.startsWith('session-')) continue;
+          const turn = lastTurnEvent(agent.session?.log)?.data?.turn;
+          const prior = reload.pending[agent.id];
+          if (!prior || (turn !== undefined && turn !== prior.turn)) reload.pending[agent.id] = { at, turn };
+        }
+      });
+      snapshotTaken = true;
+    } catch (error) { warn(error); }
+  };
   if (autoResume?.enabled) {
-    // Root unloading precedes agent cancellation; plugin hot reload changes a different fiber.
-    const rootFiber = ctx.root.fiber;
     const agents = ctx.get('agents');
     ctx.on('internal/status', fiber => {
-      if (stopped || fiber !== rootFiber || fiber.state !== 5) return;
+      if (stopped || fiber.state !== 5) return;
+      if (fiber !== rootFiber) {
+        if (reloadEnabled && fiber === pluginFiber) {
+          snapshotReload();
+          controller.abort();
+        }
+        return;
+      }
+      // Root unloading precedes agent cancellation; keep the shutdown list separate.
       controller.abort();
       try {
-        let state;
-        try { state = JSON.parse(fs.readFileSync(path.join(directory, 'autoresume-state.json'), 'utf8')); }
-        catch (error) { if (error.code !== 'ENOENT') throw error; }
+        let state = readAutoState(directory);
         if (state?.hostProcess !== HOST_PROCESS) state = { hostProcess: HOST_PROCESS, resumed: [] };
         state.pending = agents.list().filter(agent => agent.status === 'running').map(agent => agent.id);
         writeJson(directory, 'autoresume-state', state);
@@ -326,24 +477,61 @@ export function registerResumeRequests({ ctx, directory, autoResume }) {
     return pending;
   };
   ctx.effect(() => {
+    const loadedAt = Date.now();
+    let plan;
     let watcher;
     try {
       fs.mkdirSync(directory, { recursive: true });
+      if (reloadEnabled) plan = updateReloadState(directory, (reload, state) => {
+        // Upgrades from older plugins may only have the startup scan or loaded.json marker.
+        const sameProcess = state.reload?.hostProcess === HOST_PROCESS || state.hostProcess === HOST_PROCESS ||
+          (previousLoad?.pid === process.pid && previousLoad.at >= performance.timeOrigin && previousLoad.at <= loadedAt);
+        if (sameProcess && !Number.isFinite(reload.unloadedAt)) {
+          reload.fallback = { at: loadedAt, from: reload.fallback?.from ?? Math.max(performance.timeOrigin, loadedAt - RECENT_ACTIVITY_MS) };
+        }
+        delete reload.unloadedAt;
+      });
+    } catch (error) { warn(error); }
+    try {
       watcher = fs.watch(directory, { persistent: false }, (_event, filename) => {
         if (filename == null || ['resume-request.json', 'send-request.json', 'goal-request.json'].includes(filename.toString())) return check();
       });
       watcher.on('error', (error) => { warn(error); watcher.close(); });
     } catch (error) { warn(error); }
     void check();
+    let timer, reloadTimer;
     const cancelReady = autoResume?.enabled ? ctx.get('appReady').onReady(() => {
-      pending = pending.then(() => stopped ? undefined : processAutoResume({ ctx, directory, autoResume, signal: controller.signal })).catch(warn);
+      if (!reloadTimer && plan && (plan.fallback || Object.keys(plan.pending).length)) {
+        reloadTimer = setTimeout(() => {
+          pending = pending.then(() => processReloadResume({ ctx, directory, autoResume, plan, signal: controller.signal,
+            retired, archived })).catch(warn);
+        }, Math.max(0, autoResume.reloadDelaySeconds * 1000 - (Date.now() - loadedAt)));
+        reloadTimer.unref?.();
+      }
+      const delayed = autoResume.delaySeconds > 0;
+      const run = () => {
+        pending = pending.then(() => stopped ? undefined : processAutoResume({ ctx, directory, autoResume, signal: controller.signal,
+          delayed, retired, archived })).catch(warn);
+      };
+      if (!delayed) return run();
+      // 从宿主进程启动算起（插件热重载不重新计时）；每个宿主进程仍只扫一次。
+      timer = setTimeout(run, Math.max(0, autoResume.delaySeconds * 1000 - (Date.now() - performance.timeOrigin)));
+      timer.unref?.();
     }) : undefined;
-    return () => { stopped = true; controller.abort(); cancelReady?.(); watcher?.close(); };
+    return () => {
+      snapshotReload();
+      stopped = true;
+      controller.abort();
+      cancelReady?.();
+      clearTimeout(timer);
+      clearTimeout(reloadTimer);
+      watcher?.close();
+    };
   });
   return check;
 }
 
-export function registerAutoWake({ ctx, enabled = true }) {
+export function registerAutoWake({ ctx, enabled = true, retired = () => false }) {
   if (!enabled) return;
   const batches = new Map();
   const delays = [1000, 5000];
@@ -390,7 +578,7 @@ export function registerAutoWake({ ctx, enabled = true }) {
   // tool-jobs emits this only after inserting its notice; a settled job alone may have been awaited.
   listen('agent/inbox/inserted', ({ agent, message }) => {
     if (message.source?.kind !== 'tool-jobs' || message.source.form !== 'notice' ||
-        ctx.get?.('agents')?.get(agent.id) !== agent) return;
+        ctx.get?.('agents')?.get(agent.id) !== agent || retired(agent.id)) return;
     const text = message.content?.find(block => block.type === 'text')?.text;
     const id = /^background job (\S+)(?:\s|$)/.exec(text ?? '')?.[1];
     const job = id && ctx.get?.('jobs')?.list(agent.id).find(job => job.id === id && job.owner === agent.id &&

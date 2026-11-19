@@ -32,7 +32,7 @@ function sourceJob() {
     structured: { ...report(), files_changed: ['docs/result.md'] } };
 }
 
-function harness({ source = sourceJob(), config = {}, running = false, jobs } = {}) {
+function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {} } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -42,7 +42,8 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
   let backgroundFinished = false;
   const final = () => ({ job_id: 'VERIFY-1', status: 'completed', cwd: source.cwd,
     log_dir: '/runner/jobs/VERIFY-1', sandbox: source.sandbox === 'danger-full-access' ? source.sandbox : 'read-only',
-    context: payload.context, structured: report(payload.context.acceptance), files_changed: [] });
+    context: payload.context, structured: report(payload.context.acceptance), files_changed: [],
+    ...verificationResult });
   const run = async (_config, argv, options = {}) => {
     calls.push({ argv, ...options });
     if (argv[0] === 'start') {
@@ -58,6 +59,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
       return { job_id: 'VERIFY-1', status: 'running' };
     }
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
+    if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
   };
@@ -67,7 +69,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
     apply({ tools: { register(tool) { tools[tool.name] = tool; }, guard(value) { guard = value; } },
       on(name, handler) { handlers[name] = handler; },
       get(key) { return key === 'jobs' ? jobs : undefined; } },
-    { workspaces: ['/work'], allowHostAccess: true, waitSeconds: 0, model: 'new-default-model',
+    { workspaces: ['/work'], allowHostAccess: true, autoVerify: 'off', waitSeconds: 0, model: 'new-default-model',
       effort: 'high', readOnlyEffort: 'medium', serviceTier: 'new-default-tier', ...config }, run);
   } finally {
     if (previousLocalAppData === undefined) delete process.env.LOCALAPPDATA;
@@ -79,6 +81,47 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs } = 
     start: () => calls.find(call => call.argv[0] === 'start'), payload: () => payload,
     finishBackground: () => { assert.ok(finishBackground, 'background watcher must be running'); finishBackground(); } };
 }
+
+test('codex_run validates, stores and prompts for must_verify indices', async () => {
+  const input = { task: 'Inspect the project layout.', acceptance, write: false };
+  for (const must_verify of [[0], [3], [1.5], ['1'], '1']) {
+    const h = harness();
+    await assert.rejects(h.tools.codex_run.execute({ ...input, must_verify }, exec), /must_verify.*1–2/);
+    assert.equal(h.start(), undefined);
+  }
+  for (const must_verify of [undefined, [2]]) {
+    const h = harness();
+    await h.tools.codex_run.execute({ ...input, must_verify }, exec);
+    assert.deepEqual(h.payload().context.must_verify, must_verify);
+    assert.equal(h.payload().prompt.includes('验收第 2 条必须实测'), must_verify !== undefined);
+  }
+});
+
+test('must_verify is checked before sampling and needs a matching independent result at closeout', async () => {
+  const source = { ...sourceJob(), started_at: 10, finished_at: 20 };
+  source.context.must_verify = [2, 1];
+  const h = harness({ source, config: { closeoutEvidence: 'off' },
+    verificationResult: { execution_status: 'completed', started_at: 21, finished_at: 23 } });
+  const criteria = acceptance.map((_, i) => ({ index: i + 1, status: 'met', evidence: 'Reviewed the original report.' }));
+  for (const status of ['verified', 'accepted_deviations']) {
+    await assert.rejects(h.tools.codex_review.execute({ job_id: source.job_id, status, criteria }, exec),
+      /验收第 2 条.*codex_verify[\s\S]*验收第 1 条/);
+  }
+  assert.ok(!h.calls.some(call => call.argv[0] === 'review'));
+  await h.verify({ samples: 1 });
+  const { context, prompt } = h.payload();
+  assert.match(context.acceptance[0], /^原验收第 2 条（必须实测）/);
+  assert.match(context.acceptance[1], /^原验收第 1 条（必须实测）/);
+  assert.match(context.acceptance[3], /抽查 1 条/);
+  assert.match(prompt, /第 5 条验收的 evidence/);
+  for (const status of ['verified', 'accepted_deviations']) {
+    const result = await h.tools.codex_review.execute({ job_id: source.job_id, status, criteria }, exec);
+    assert.equal(result.verification_status, status);
+  }
+  delete source.context.must_verify;
+  const legacy = harness({ source });
+  assert.equal((await legacy.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria }, exec)).verification_status, 'verified');
+});
 
 function backgroundJobs() {
   const entries = [];
@@ -235,7 +278,7 @@ test('verification inherits original cwd and model options, never original write
     const flag = name => argv[argv.indexOf(name) + 1];
     assert.equal(flag('--cwd'), source.cwd);
     assert.equal(flag('--model'), source.task_options.model);
-    assert.equal(flag('--effort'), source.task_options.effort);
+    assert.equal(flag('--effort'), 'medium');
     assert.equal(flag('--service-tier'), source.task_options.service_tier);
     assert.ok(argv.includes('--use-user-config'));
     if (sandbox === 'danger-full-access') assert.equal(flag('--sandbox'), sandbox);
@@ -248,7 +291,9 @@ test('verification inherits original cwd and model options, never original write
     assert.equal(result.context.verification_of, source.job_id);
     assert.match(h.payload().prompt, /新线程，不续接原作者的思路/);
     assert.match(h.payload().prompt, /写入范围为空/);
-    if (sandbox === 'danger-full-access') assert.match(h.payload().prompt, /这是只读调查：不要修改任何文件/);
+    assert.match(h.payload().prompt, /预期从原任务目录实际运行验收检查/);
+    if (sandbox === 'danger-full-access') assert.match(h.payload().prompt, /放到项目外的临时目录/);
+    else assert.match(h.payload().prompt, /放到 TMPDIR/);
     assert.deepEqual(source, original);
   }
 });
@@ -261,11 +306,20 @@ test('original false user-config and explicit empty model/tier do not use curren
   for (const flag of ['--use-user-config', '--model', '--service-tier']) assert.equal(h.start().argv.includes(flag), false, flag);
 });
 
+test('verification uses readOnlyEffort when set and the original effort otherwise', async () => {
+  for (const [readOnlyEffort, expected] of [['medium', 'medium'], ['', 'low']]) {
+    const h = harness({ config: { readOnlyEffort } });
+    await h.verify();
+    const argv = h.start().argv;
+    assert.equal(argv[argv.indexOf('--effort') + 1], expected, readOnlyEffort);
+  }
+});
+
 test('unspecified original model options keep Codex defaults instead of changed plugin defaults', async () => {
   for (const options of [undefined, { effort: null, use_user_config: false }]) {
     const source = sourceJob();
     source.task_options = options;
-    const h = harness({ source });
+    const h = harness({ source, config: { readOnlyEffort: '' } });
     await h.verify();
     for (const flag of ['--use-user-config', '--model', '--service-tier', '--effort']) {
       assert.equal(h.start().argv.includes(flag), false, flag);
@@ -339,8 +393,8 @@ test('generated task embeds original task, acceptance, all products and report.v
     assert.ok(prompt.includes(normPath(`${source.cwd}/${file}`)), file);
   }
   for (const text of ['逐条回到原始出处', '原文、上下文、数字与计算', '核对的结论', '出处（文件与行号或可定位的来源）',
-    '是否属实（属实/不属实/无法确认）', '不属实时实际是什么', '不属实用 not_met', '无法确认用 blocked',
-    'summary 汇总抽查数和结果', '不要只复述原报告', '不要运行会产生写入的测试或命令', 'files_changed 必须为 []']) {
+    '是否属实（属实/不属实/无法确认）', '不属实时实际是什么', '有结论不属实时记 not_met', '有无法确认时记 blocked', '条数与验收标准相同，不要为每条抽查结论另加一行',
+    'summary 汇总抽查数和结果', '不要只复述原报告', '预期从原任务目录实际运行验收检查', 'files_changed 必须为 []']) {
     assert.ok(prompt.includes(text), text);
   }
   assert.match(h.start().argv[h.start().argv.indexOf('--schema') + 1], /\/report\.v2\.schema\.json$/);
@@ -351,7 +405,7 @@ test('generated task embeds original task, acceptance, all products and report.v
   assert.match(context.acceptance[0], /任务书、验收标准.*产出/);
   assert.match(context.acceptance[1], /8 条/);
   assert.match(context.acceptance[2], /不属实时.*无法确认/);
-  assert.match(context.acceptance[3], /全程只读/);
+  assert.match(context.acceptance[3], /全程保持项目和系统状态只读/);
   assert.equal(result.report_status, 'valid');
   assert.deepEqual(result.acceptance, context.acceptance);
   assert.deepEqual(result.report.files_changed, []);
@@ -383,7 +437,7 @@ test('verification reuses background registration, result processing and status/
   assert.equal(job.result, done.result);
   assert.match(done.result, /独立核验任务；核验对象：SOURCE-1/);
   assert.match(done.result, /完整结果入口/);
-  assert.match(done.result, /全程只读/);
+  assert.match(done.result, /全程保持项目和系统状态只读/);
   const status = await h.tools.codex_status.execute({ job_id: 'VERIFY-1' }, exec);
   assert.equal(status.context.verification_of, 'SOURCE-1');
   assert.equal(status.report_status, 'valid');
@@ -419,7 +473,7 @@ test('open nextStep remains the default; products points mechanical checks to co
     assert.match(result.next, /原任务 SOURCE-1.*独立核验已结束/);
     assert.match(result.next, /先机械核对抽查条数、出处与证据是否齐全.*codex_review/);
     assert.match(result.next, /不把核验结束当作全部通过/);
-    assert.equal(h.tools.codex_run.description.includes('codex_verify'), plannerReads === 'products');
+    assert.equal(h.tools.codex_run.description.includes('内容是否属实用 codex_verify'), plannerReads === 'products');
   }
 });
 
@@ -437,4 +491,95 @@ test('nextStep closes verified and accepted_deviations jobs before products or v
       }
     }
   }
+});
+
+test('codex_verify is never subject to the close-out guard', async () => {
+  // 收尾护栏默认开启；核验原任务正是收尾的一步，不查也不拦。
+  const h = harness();
+  await h.verify();
+  assert.ok(h.calls.some(({ argv }) => argv[0] === 'start'));
+  assert.ok(!h.calls.some(({ argv }) => argv[0] === 'list' && argv.includes('--started-between')));
+});
+
+test('a successor session may verify its predecessor\'s job; an unrelated session may not', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link(exec.agent.id, 'successor-session');
+  t.after(() => aliases.unlink(exec.agent.id, 'successor-session'));
+  const h = harness();
+  const caller = (id) => ({ agent: { ...exec.agent, id } });
+  await h.verify({}, caller('successor-session'));
+  assert.equal(h.payload().context.owner, 'successor-session');
+  assert.equal(h.payload().context.verification_of, 'SOURCE-1');
+  await assert.rejects(harness().verify({}, caller('stranger-session')), /不属于当前会话/);
+});
+
+test('verify_previous starts the verification with the new unit, only when their files cannot overlap', async () => {
+  const unit = { task: '在另一个子目录整理测试夹具并补说明', acceptance: ['夹具说明已补全'], wait_seconds: 0 };
+  const starts = (h) => h.calls.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin).context);
+  // 只读新单：总是允许；核验任务与 codex_verify 派出的一样（原任务、归属、只读）。
+  const readOnly = harness();
+  const value = await readOnly.tools.codex_run.execute({ ...unit, write: false, verify_previous: 'SOURCE-1' }, exec);
+  const [main, verification] = starts(readOnly);
+  assert.equal(main.verification_of, undefined);
+  assert.deepEqual([verification.verification_of, verification.owner, verification.write], ['SOURCE-1', exec.agent.id, false]);
+  assert.equal(value.verify_previous.job_id, 'VERIFY-1');
+  assert.match(value.next, /已同时派出对 SOURCE-1 的只读核验[\s\S]*codex_continue 返工原任务/);
+  // 可写新单与被核验任务的 scope 或产物重叠（任一方向包含）：拒绝，什么都不派。
+  for (const args of [{ cwd: '/work/original', scope: ['docs/sub'] }, { cwd: '/work/original' }, { cwd: '/work', scope: ['original'] }]) {
+    const h = harness();
+    await assert.rejects(h.tools.codex_run.execute({ ...unit, write: true, ...args, verify_previous: 'SOURCE-1' }, exec),
+      /与任务 SOURCE-1 的产物或 scope 重叠，不能边改边核验[\s\S]*先 codex_verify SOURCE-1/, JSON.stringify(args));
+    assert.equal(starts(h).length, 0);
+  }
+  // /mnt 下不分大小写。
+  const mnt = { ...sourceJob(), cwd: '/mnt/E/Work', scope: ['docs'], scope_paths: ['/mnt/E/Work/docs'], files_changed: [], write_paths: [] };
+  await assert.rejects(harness({ source: mnt }).tools.codex_run.execute({ ...unit, write: true, cwd: '/mnt/e/work', scope: ['DOCS/a.md'], verify_previous: 'SOURCE-1' }, exec),
+    /重叠/);
+  // 不重叠的可写新单：两单都派出。
+  const apart = harness();
+  await apart.tools.codex_run.execute({ ...unit, write: true, cwd: '/work/original', scope: ['fixtures'], verify_previous: 'SOURCE-1' }, exec);
+  assert.equal(starts(apart).length, 2);
+  // 不属于本会话的任务：拒绝。
+  await assert.rejects(harness().tools.codex_run.execute({ ...unit, write: false, verify_previous: 'SOURCE-1' },
+    { agent: { ...exec.agent, id: 'stranger-session' } }), /归属未知或不属于当前会话/);
+});
+
+test('verify_previous reports a verification that could not start without undoing the new unit', async () => {
+  // 运行数上限只够一单：新单派出，核验被上限挡住，结果里说明，规划端之后再 codex_verify。
+  const h = harness({ config: { maxRunningJobs: 1 } });
+  const value = await h.tools.codex_run.execute({ task: '在另一个子目录整理测试夹具并补说明', acceptance: ['夹具说明已补全'], write: false,
+    wait_seconds: 0, verify_previous: 'SOURCE-1' }, exec);
+  assert.ok(value.job_id);
+  assert.match(value.verify_previous.error, /maxRunningJobs/);
+  assert.match(value.next, /对 SOURCE-1 的核验没有派出[\s\S]*之后再用 codex_verify SOURCE-1/);
+});
+
+test('two verifications can be in flight: verify_previous on two units starts one verification each', async () => {
+  const h = harness();
+  for (const task of ['在另一个子目录整理测试夹具并补说明', '再核对一遍发布说明的链接与版本号']) {
+    await h.tools.codex_run.execute({ task, acceptance: ['结果已写清楚'], write: false, wait_seconds: 0, verify_previous: 'SOURCE-1' }, exec);
+  }
+  const contexts = h.calls.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin).context);
+  assert.equal(contexts.filter((context) => context.verification_of === 'SOURCE-1').length, 2);
+  assert.equal(contexts.filter((context) => !context.verification_of).length, 2);
+});
+
+test('a verification lists every criterion the original report marked blocked or not met as its own acceptance item', async () => {
+  const source = sourceJob();
+  source.structured.criteria[1] = { ...source.structured.criteria[1], status: 'blocked' };
+  const h = harness({ source });
+  await h.verify();
+  const items = h.payload().context.acceptance;
+  assert.equal(items.filter((item) => item.startsWith('原验收第 ')).length, 1);
+  assert.match(items.at(-1), /^原验收第 2 条（原报告标 blocked）：逐条核实结论的原始出处——独立核实现在是否满足/);
+  const clean = harness();
+  await clean.verify();
+  assert.ok(!clean.payload().context.acceptance.some((item) => item.startsWith('原验收第 ')));
+  // 报告比验收多出一行且这一行对不上验收原文：按报告行号单列。
+  const extra = sourceJob();
+  extra.structured.criteria.push({ criterion: '额外抽查的一条', status: 'not_met', evidence: '不属实' });
+  const hx = harness({ source: extra });
+  await hx.verify();
+  assert.equal(hx.payload().context.acceptance.at(-1), '原报告第 3 行（原报告标 not_met，未对上原验收清单）：额外抽查的一条——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。');
 });

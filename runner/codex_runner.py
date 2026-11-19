@@ -5,17 +5,20 @@
     python codex_runner.py status JOB_ID [--wait SECONDS]
     python codex_runner.py cancel JOB_ID
     python codex_runner.py rollback JOB_ID [--check]
+    python codex_runner.py repeat-guard [--cwd DIR]
     python codex_runner.py doctor
 
 Every command prints exactly one JSON object on stdout. Raw events go to a log file.
 """
 import argparse
 from collections import Counter
-from contextlib import closing, suppress
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager, suppress
 import errno
 from functools import cache
 import hashlib
 import http.client
+import glob
 import json
 from math import isfinite
 import os
@@ -24,6 +27,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -46,12 +50,38 @@ else:
 
 # Codex keeps its own provider config and credentials, so only sandbox and approval are pinned;
 # its MCP servers and hooks stay off unless --use-user-config.
-STRIP_USER_EXTRAS = ["--disable", "hooks"]
+# Also off: the skills listing (39.7k characters every request; in a week of jobs it mostly led to reading
+# using-superpowers and verification-before-completion as the first tool call), and the goal and image tools
+# described inside the exec tool (one job in a week used goals, none used images).
+STRIP_USER_EXTRAS = ["--disable", "hooks", "-c", "skills.include_instructions=false",
+                     "--disable", "goals", "--disable", "image_generation"]
 
 HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
              else Path.home() / ".local/state/codex-runner"))
 EXIT_GRACE_SECONDS = 20
+LOST_AFTER = 300
+REPEAT_MIN_SECONDS = 60
+REPEAT_FAILURES = 2
+REPEAT_WINDOW_HOURS = 24
+REPEAT_TOTALS = {"blocked": 0, "seconds_avoided": 0}
+OWNER_ONLY_REASONS = ("irreversible_data", "outward_action", "spending", "credentials", "security_boundary")
+POWERSHELL_BUILTINS = frozenset("""
+    Write-Host Write-Output Get-Content Set-Content Out-File Select-Object Where-Object ForEach-Object
+    Test-Path Join-Path Get-Date Start-Sleep Out-Null Format-List Format-Table Get-ChildItem New-Item
+    Remove-Item Get-Item Copy-Item Split-Path Resolve-Path ConvertTo-Json ConvertFrom-Json Get-Location Set-Location
+""".split())
+SCRIPT_EXTENSIONS = frozenset("ps1 psm1 psd1 py pyi sh bash zsh fish js mjs cjs ts jsx tsx bat cmd rb pl php lua".split())
+SCRIPT_SUFFIX = r"\.(?:" + "|".join(sorted(SCRIPT_EXTENSIONS)) + ")"
+SCRIPT_DELIMITERS = r"""\s'"\\/|&;<>()=,"""
+SCRIPT_NAMES = re.compile(
+    rf"""(?P<quote>["'])(?P<quoted_dir>[^"'\r\n|&;<>]*[/\\])?(?P<quoted>[^"'\\/\r\n|&;<>]+{SCRIPT_SUFFIX})(?P=quote)"""
+    rf"|(?<![^{SCRIPT_DELIMITERS}])(?P<bare_dir>(?:[^{SCRIPT_DELIMITERS}]*[/\\])*)(?P<bare>[^{SCRIPT_DELIMITERS}]+{SCRIPT_SUFFIX})(?=$|[{SCRIPT_DELIMITERS}])", re.I)
+VERIFY_FILE_LIMIT = 1024 * 1024
+VERIFY_TOTAL_LIMIT = 32 * 1024 * 1024
+VERIFY_CONTENT_FILES = 256
+VERIFY_STAT_WORKERS = 16
+GIT_DIRTY_STATUS = ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -155,10 +185,14 @@ def pid_alive(pid):
     return f'"{pid}"' in out
 
 
+def proc_start(pid):
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+
+
 def process_start(pid):
     if not IS_WIN:
         try:
-            return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            return proc_start(pid)
         except (OSError, IndexError):
             return None
     import ctypes
@@ -197,14 +231,17 @@ def recorded_pid(path):
     return pid if pid_alive(pid) else None
 
 
+def kernel_boot_id():
+    return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+
+
 def boot_id():
     """Identifies this distro instance: the kernel boot id plus when this PID namespace's init (pid 1) started.
     The kernel boot id alone misses `wsl --terminate <distro>` or a distro auto-stop while the VM stays up — the
     kernel does not reboot but pids start over, so a bare pid could then name an unrelated process. init's start
     time (field 22 of /proc/1/stat, ticks since kernel boot) changes on every distro restart. None where no /proc."""
     try:
-        init_start = Path("/proc/1/stat").read_text().rsplit(")", 1)[1].split()[19]
-        return Path("/proc/sys/kernel/random/boot_id").read_text().strip() + ":" + init_start
+        return kernel_boot_id() + ":" + proc_start(1)
     except (OSError, IndexError):
         return None
 
@@ -269,8 +306,15 @@ def acquire_write_lock(cwd):
     return acquire_file_lock(locks / f"{write_lock_key(cwd)}.lock")
 
 
-def write_lock_roots(cwd, sandbox, writable_roots):
-    if sandbox == "read-only":
+def writer(sandbox, context=None):
+    # A full-access job dispatched with write=false keeps its sandbox (it may launch Windows programs)
+    # but is trusted not to write: no directory write lock, snapshot or diff.
+    return sandbox != "read-only" and not (
+        sandbox == "danger-full-access" and isinstance(context, dict) and context.get("write") is False)
+
+
+def write_lock_roots(cwd, sandbox, writable_roots, context=None):
+    if not writer(sandbox, context):
         return {}
     roots = [cwd]
     if sandbox == "workspace-write":
@@ -278,7 +322,7 @@ def write_lock_roots(cwd, sandbox, writable_roots):
     return {write_lock_key(p): p for p in roots}
 
 
-def earlier_writer_waiting(run_dir, roots):
+def earlier_writer_waiting(run_dir, roots, lost_after=LOST_AFTER):
     position = ((run_dir / "args.json").stat().st_mtime_ns, run_dir.name) \
         if run_dir.parent == HOME / "jobs" else None
     paths = [Path(tree_key(p)) for p in roots.values()]
@@ -297,7 +341,7 @@ def earlier_writer_waiting(run_dir, roots):
             task = task_record(job_dir)
             if not task.get("cwd"):
                 continue
-            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"))
+            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"), task.get("context"))
             other_paths = [Path(tree_key(p)) for p in other_roots.values()]
             overlapping_roots = [root for root, path in zip(other_roots.values(), other_paths)
                                  if any(path.is_relative_to(p) or p.is_relative_to(path) for p in paths)]
@@ -324,7 +368,7 @@ def earlier_writer_waiting(run_dir, roots):
             other = ((job_dir / "args.json").stat().st_mtime_ns, job_dir.name)
         except FileNotFoundError:
             continue
-        if other < position and job_status(job_dir.name)["status"] == "running":
+        if other < position and job_status(job_dir.name, lost_after=lost_after)["status"] == "running":
             return True
     return False
 
@@ -352,7 +396,35 @@ def disable_user_mcp_servers():
     return out
 
 
-def build_command(args, run_dir, thread_id):
+def replace_user_agents_md(env):
+    """Opt-in CODEX_RUNNER_AGENTS_MD: "none" leaves the user-level AGENTS.md out of jobs, a file path puts that file
+    in its place. Codex reads it only from CODEX_HOME, so jobs get a home of symlinks to every other entry of the
+    real one (same config, sessions and state databases, so resume still finds the thread)."""
+    choice = env.get("CODEX_RUNNER_AGENTS_MD")
+    if not choice:
+        return
+    real = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
+    home = HOME / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    # shortcut: symlinks need Linux/WSL (Windows needs Developer Mode); a failure here fails the job visibly.
+    for entry in real.iterdir():
+        if entry.name != "AGENTS.md":
+            try:
+                (home / entry.name).symlink_to(entry)
+            except FileExistsError:  # another job linked it first
+                pass
+    link = home / "AGENTS.md"
+    if choice == "none":
+        link.unlink(missing_ok=True)
+    else:
+        temp = home / f".AGENTS.md.{os.getpid()}"
+        temp.unlink(missing_ok=True)
+        temp.symlink_to(Path(local_path(choice)))
+        os.replace(temp, link)  # atomic, so a job starting at the same time never sees it missing
+    env["CODEX_HOME"] = str(home)
+
+
+def build_command(args, run_dir, thread_id, scratch=None):
     prefix, env = launcher()
     cmd = [*prefix, "exec"]
     if thread_id:
@@ -360,6 +432,7 @@ def build_command(args, run_dir, thread_id):
     cmd += ["--json", "--skip-git-repo-check", "-o", str(run_dir / "last_message.txt")]
     if not args.use_user_config:
         cmd += STRIP_USER_EXTRAS + disable_user_mcp_servers()
+        replace_user_agents_md(env)
     cmd += ["-c", 'approval_policy="never"']
     route = env.get("CODEX_RUNNER_ROUTE_URL")
     if route:
@@ -380,8 +453,23 @@ def build_command(args, run_dir, thread_id):
     if getattr(args, "service_tier", None):
         cmd += ["-c", f'service_tier="{args.service_tier}"']
     # `exec resume` has no -s or -C, so the sandbox goes through -c and the directory through the process cwd.
-    cmd += ["-c", f'sandbox_mode="{args.sandbox}"']
-    if args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
+    scratch_only = scratch is not None and args.sandbox == "read-only"
+    sandbox = "workspace-write" if scratch_only else args.sandbox
+    cmd += ["-c", f'sandbox_mode="{sandbox}"']
+    if scratch:
+        tmp = scratch / "tmp"
+        tmp.mkdir(parents=True, exist_ok=True)
+        scratch_env = {"TMPDIR": str(tmp), "TMP": str(tmp), "TEMP": str(tmp), "PYTHONDONTWRITEBYTECODE": "1",
+                       "PYTEST_ADDOPTS": "-p no:cacheprovider", "COVERAGE_FILE": str(tmp / ".coverage")}
+        env.update(scratch_env)
+        if scratch_only:
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=[]",
+                    "-c", "sandbox_workspace_write.exclude_slash_tmp=true",
+                    "-c", "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+                    "-c", "sandbox_workspace_write.network_access=false"]
+        for key, value in scratch_env.items():
+            cmd += ["-c", f"shell_environment_policy.set.{key}={json.dumps(value, ensure_ascii=False)}"]
+    elif args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
         cmd += ["-c", "sandbox_workspace_write.writable_roots=" +
                 json.dumps([local_path(p) for p in args.writable_roots], ensure_ascii=False)]
     if args.schema:
@@ -394,9 +482,10 @@ def build_command(args, run_dir, thread_id):
     return cmd, env
 
 
-def run_attempt(args, prompt, run_dir, thread_id):
+def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
     """Run one Codex process to a verdict. turn.completed decides success, not the exit code."""
-    cmd, env = build_command(args, run_dir, thread_id)
+    scratch = getattr(args, "verification_scratch", None)
+    cmd, env = build_command(args, run_dir, thread_id, scratch)
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
              "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
              "file_changes": [], "prompt_delivered": False}
@@ -407,7 +496,8 @@ def run_attempt(args, prompt, run_dir, thread_id):
         with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
             state["stderr_offset"] = stderr_log.tell()
             try:
-                proc = subprocess.Popen(cmd, cwd=args.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                cwd = scratch if scratch and args.sandbox == "read-only" else args.cwd
+                proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
             except OSError as e:
                 state["end_reason"] = "spawn_failed"
@@ -437,7 +527,7 @@ def run_attempt(args, prompt, run_dir, thread_id):
             def pump():
                 try:
                     for raw in proc.stdout:
-                        lines.put(raw)
+                        lines.put((raw, time.monotonic() if repeat_guard else None))
                 finally:
                     proc.stdout.close()
                     lines.put(None)
@@ -451,13 +541,16 @@ def run_attempt(args, prompt, run_dir, thread_id):
             completed_at = None
             stdout_done = False
             active_commands = set()
+            command_starts = {}  # scoped to this attempt: Codex may reuse item IDs on resume
+            timeout_reason = None
+            timeout_marker = object()
             while True:
                 now = time.monotonic()
                 if stdin_errors:
                     state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
                     kill_tree(proc.pid)
                     break
-                if stdout_done and stdin_done.is_set():
+                if stdout_done and stdin_done.is_set() and (timeout_reason is None or completed_at):
                     # Keep the Linux leader unreaped until group cleanup so its PID cannot be reused.
                     exited = (proc.poll() is not None if IS_WIN else
                               os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None)
@@ -467,26 +560,30 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state["forced_exit"] = True
                     kill_tree(proc.pid)
                     break
-                # With the router down, Codex kept reconnecting for a full 240s test and never failed the turn.
-                if not completed_at and reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
-                    state["end_reason"] = "reconnect_timeout"
-                    kill_tree(proc.pid)
-                    break
-                if not completed_at and now - start > args.timeout:
-                    state["end_reason"] = "timeout"
-                    kill_tree(proc.pid)
-                    break
-                if not completed_at and not active_commands and now - last_event > args.idle_timeout:
-                    state["end_reason"] = "idle_timeout"
-                    kill_tree(proc.pid)
-                    break
+                if not completed_at and timeout_reason is None:
+                    if reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
+                        timeout_reason = "reconnect_timeout"
+                    elif now - start > args.timeout:
+                        timeout_reason = "timeout"
+                    elif not active_commands and now - last_event > args.idle_timeout:
+                        timeout_reason = "idle_timeout"
+                    if timeout_reason:
+                        # Honour a completion already queued without letting later output defer the timeout.
+                        lines.put(timeout_marker)
                 try:
-                    raw = lines.get(timeout=0.5)
+                    line = lines.get(timeout=0.5)
                 except queue.Empty:
                     continue
-                if raw is None:
+                if line is timeout_marker:
+                    if completed_at:
+                        continue
+                    state["end_reason"] = timeout_reason
+                    kill_tree(proc.pid)
+                    break
+                if line is None:
                     stdout_done = True
                     continue
+                raw, received = line
                 event_log.write(raw)
                 event_log.flush()
                 try:
@@ -500,10 +597,26 @@ def run_attempt(args, prompt, run_dir, thread_id):
                         "command_execution", "file_change", "agent_message"):
                     state["prompt_delivered"] = True
                 if item.get("type") == "command_execution":
-                    if kind == "item.started" and item.get("status") == "in_progress":
-                        active_commands.add(item.get("id"))
+                    if kind == "item.started":
+                        if item.get("status") == "in_progress":
+                            active_commands.add(item.get("id"))
+                        if repeat_guard and repeat_guard.enabled:
+                            step = repeat_guard.step(item)
+                            if step:
+                                block = repeat_guard.check_start(step, item["command"])
+                                if block:
+                                    state.update(completed=False, end_reason="repeated_failure", repeat_block=block,
+                                                 error="A command started again after repeated long failures.")
+                                    kill_tree(proc.pid)
+                                    repeat_guard.record_block(block, event_log)
+                                    break
+                                if item.get("id") is not None:
+                                    command_starts[item["id"]] = (step, received)
                     elif kind == "item.completed":
                         active_commands.discard(item.get("id"))
+                        if repeat_guard and repeat_guard.enabled:
+                            started_command = command_starts.pop(item.get("id"), None)
+                            repeat_guard.complete(item, started_command, received)
                 # Reconnect notices are not progress, so they must not refresh the idle timer.
                 if kind == "error":
                     if REFUSED.search(str(ev.get("message") or "")):
@@ -532,6 +645,8 @@ def run_attempt(args, prompt, run_dir, thread_id):
                     state["commands"] += 1
                 elif kind == "item.completed" and item.get("type") == "file_change":
                     state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
+                    if repeat_guard and item.get("changes"):
+                        repeat_guard.clear_changes(c.get("path") for c in item["changes"])
             with acquire_file_lock(run_dir / "process.lock", blocking=True):
                 # Failed launchers can leave children behind after closing their standard streams.
                 if not IS_WIN and state["end_reason"] is None and (not state["completed"] or state["failed"]):
@@ -573,6 +688,8 @@ def classify(state, run_dir):
         return "spawn_failed", False
     if state["end_reason"] == "model_refused":
         return "model_refused", False
+    if state["end_reason"] == "repeated_failure":
+        return "repeated_failure", False
     text = state["error"] or ""
     if not state["failed"] and not text:
         try:
@@ -601,6 +718,8 @@ TOO_BIG_FILE = "snapshot-too-big.json"
 TOO_BIG_TTL = 7 * 86400
 # Hashing a tree for a diff can exceed its budget where the stat-only snapshot does not, so it has its own entry.
 DIFF_TOO_BIG = "diff:"
+SCOPE_TOO_BIG = "scope:"
+SCOPE_SLOW_S = 5  # a scope entry that alone takes longer than this to walk is skipped on later jobs
 DIFF_BUDGET = 20
 LATE_DIFF_BUDGET = 4  # per step, twice per late diff: a status query must stay quick
 DIFF_MAX_BYTES = 5 * 1024 ** 2
@@ -611,9 +730,13 @@ GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c"
             "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--submodule=short")
 
 
-def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
+def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
-    None when the walk exceeds the budget."""
+    None when the walk exceeds the budget. With scope, entries that took over SCOPE_SLOW_S to walk, or that were being
+    walked when the budget ran out, are appended to slow; when only the whole scoped walk took over SCOPE_SLOW_S, its
+    slowest entry is."""
+    began = time.monotonic()
+    durations = {}
     deadline = time.monotonic() + budget
     files = {}
 
@@ -634,14 +757,24 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None):
         if not os.path.isdir(top):
             add(top)  # a scoped file, or one that does not exist yet
             continue
+        started = time.monotonic()
         for dirpath, dirnames, filenames in os.walk(top, onerror=onerror):
             if time.monotonic() > deadline:
+                if slow is not None and scope:
+                    slow.append(top)
                 return None
             dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
             for name in filenames:
                 if time.monotonic() > deadline:
+                    if slow is not None and scope:
+                        slow.append(top)
                     return None
                 add(os.path.join(dirpath, name))
+        durations[top] = time.monotonic() - started
+        if slow is not None and scope and durations[top] > SCOPE_SLOW_S:
+            slow.append(top)
+    if slow is not None and scope and not slow and durations and time.monotonic() - began > SCOPE_SLOW_S:
+        slow.append(max(durations, key=durations.get))
     return files if time.monotonic() <= deadline else None
 
 
@@ -657,6 +790,243 @@ def too_big_trees():
 
 def tree_key(cwd, *, resolve=None):
     return normalized_path((resolve or os.path.realpath)(local_path(cwd)))
+
+
+def read_step_failures(path):
+    try:
+        return json.loads(path.read_text("utf-8"))
+    except FileNotFoundError:
+        return {}
+
+
+class RepeatGuard:
+    def __init__(self, cwd, options, job_dir=None):
+        self.cwd = os.path.realpath(local_path(cwd))
+        self.cwd_key = tree_key(cwd)
+        self.cwd_hash = hashlib.sha1(self.cwd_key.encode("utf-8")).hexdigest()[:16]
+        self.enabled = options.get("repeat_guard", "on") == "on"
+        self.min_seconds = options.get("repeat_min_seconds", REPEAT_MIN_SECONDS)
+        self.threshold = options.get("repeat_failures", REPEAT_FAILURES)
+        self.window_hours = options.get("repeat_window_hours", REPEAT_WINDOW_HOURS)
+        self.path = HOME / "step-failures.json"
+        self.lock = HOME / "locks" / "step-failures.lock"
+        self.job_dir = job_dir
+        self.blocked = None
+
+    def fingerprint(self, command):
+        deadline = time.monotonic() + 2
+
+        def git_state(query):
+            status = query(*GIT_DIRTY_STATUS, "--", ".")
+            state = {"git:status": hashlib.sha256(status).hexdigest()}
+            with suppress(ValueError):
+                state["git:head"] = query("rev-parse", "--verify", "HEAD").decode("ascii").strip()
+            if status:
+                top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
+                hashes, _ = dirty_file_hashes(Path(local_path(top)), status, deadline)
+                state.update({"file:" + hashlib.sha256(name).hexdigest(): digest for name, digest in hashes.items()})
+            return state
+
+        cwd = Path(self.cwd)
+        state = {}
+        if os.environ.get("GIT_DIR") or any((parent / ".git").exists() for parent in (cwd, *cwd.parents)):
+            state = git_on_tree(self.cwd, deadline, git_state) or {}
+        for match in SCRIPT_NAMES.finditer(command):
+            script = (match["quoted_dir"] or match["bare_dir"] or "") + (match["quoted"] or match["bare"])
+            path = scope_path(self.cwd, script)
+            key = "script:" + hashlib.sha256(os.fsencode(normalized_path(path))).hexdigest()
+            try:
+                info = os.stat(path)
+                state[key] = [info.st_size, info.st_mtime_ns]
+            except FileNotFoundError:
+                state[key] = "missing"
+            except (OSError, ValueError):
+                pass
+        return state
+
+    @staticmethod
+    def step_names(command):
+        if not isinstance(command, str):
+            return set()
+        names = set(re.findall(r"\b[A-Z][a-z]+-[A-Z][A-Za-z]+\b", command)) - POWERSHELL_BUILTINS
+        for match in SCRIPT_NAMES.finditer(command):
+            name = match["quoted"] or match["bare"]
+            if not re.search(r"tmp|temp|run_|wrap", name, re.I):
+                names.add(name)
+        return names
+
+    def step(self, item):
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            return None
+        names = {re.sub(r"\d", "#", name) for name in self.step_names(command)}
+        signature = self.cwd_key + "\0" + json.dumps(sorted(names)) if names else re.sub(r"\d+", "#", command)
+        return hashlib.sha1(signature.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def recent(self, data, now):
+        steps = data.get(self.cwd_hash, {})
+        cutoff = now - 3600 * self.window_hours
+        recent = {}
+        for key, value in steps.items():
+            if key != "_changed_at":
+                events = [event for event in value.get("events", []) if event[0] >= cutoff]
+                if events:
+                    fingerprint = value.get("fingerprint")
+                    recent[key] = {**value, "events": events,
+                                   "fingerprint": fingerprint if isinstance(fingerprint, dict) else {}}
+        changed_at = steps.get("_changed_at", 0)
+        if recent or changed_at:
+            recent["_changed_at"] = changed_at
+        return recent
+
+    @contextmanager
+    def edit(self, clear_keys=()):
+        self.lock.parent.mkdir(parents=True, exist_ok=True)
+        with acquire_file_lock(self.lock, blocking=True):
+            data = read_step_failures(self.path)
+            now = time.time()
+            steps = self.recent(data, now)
+            totals = {**REPEAT_TOTALS, **data.get("_totals", {})}
+            cleared = False
+            for key in clear_keys:
+                if key == self.cwd_hash:
+                    steps = {"_changed_at": now}
+                elif key in data:
+                    data[key] = {"_changed_at": now}
+                    cleared = True
+            yield steps, totals, now
+            if cleared or steps != data.get(self.cwd_hash, {}) or totals != data.get("_totals", REPEAT_TOTALS):
+                if steps:
+                    data[self.cwd_hash] = steps
+                else:
+                    data.pop(self.cwd_hash, None)
+                data["_totals"] = totals
+                tmp = self.path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data), "utf-8")
+                os.replace(tmp, self.path)
+
+    @staticmethod
+    def failure_stats(record):
+        events = record["events"]
+        return {"failures": len(events), "seconds": sum(event[1] for event in events),
+                "last_exit": events[-1][2], "last_at": events[-1][0]}
+
+    def standing(self, steps):
+        return [{"step": key[:8], "words": record.get("words", []),
+                 **self.failure_stats(record)}
+                for key, record in sorted(steps.items()) if key != "_changed_at" and len(record["events"]) >= self.threshold]
+
+    def snapshot(self, *, blocking=True):
+        if not self.path.exists():
+            return REPEAT_TOTALS.copy(), [], 0
+        lock = acquire_file_lock(self.lock, blocking=blocking)
+        if lock is None:
+            return REPEAT_TOTALS.copy(), [], 0
+        with lock:
+            data = read_step_failures(self.path)
+        return ({**REPEAT_TOTALS, **data.get("_totals", {})},
+                self.standing(self.recent(data, time.time())) if self.enabled else [],
+                data.get(self.cwd_hash, {}).get("_changed_at", 0))
+
+    def clear(self, *, file_changed=True):
+        with self.edit() as (steps, _, now):
+            changed_at = now if file_changed else steps.get("_changed_at", 0)
+            steps.clear()
+            steps["_changed_at"] = changed_at
+
+    def clear_changes(self, paths):
+        keys = set()
+        for path in paths:
+            if isinstance(path, str) and path:
+                changed = Path(normalized_path(scope_path(self.cwd, path)))
+                keys.update(hashlib.sha1(str(directory).encode("utf-8")).hexdigest()[:16]
+                            for directory in (changed, *changed.parents))
+        if keys:
+            with self.edit(keys):
+                pass
+
+    def prepare_prompt(self, prompt, allow_rerun):
+        if allow_rerun:
+            self.clear(file_changed=False)
+        if not self.enabled:
+            return prompt
+        with self.edit() as (steps, _, _):
+            standing = self.standing(steps)
+        if standing:
+            minutes = round(sum(step["seconds"] for step in standing) / 60)
+            prompt += (f"\n\n## 本目录近期反复失败的步骤\n- 有 {len(standing)} 个步骤在最近 {self.window_hours:g} 小时里"
+                       f"各失败了 {self.threshold} 次以上（共约 {minutes} 分钟），期间没有文件改动；runner 会拦下再次运行它们。"
+                       "先修改相关文件或换掉依赖它的做法；做不到时把依赖它的验收项标 blocked 并写 environment blocker。")
+        return prompt
+
+    def check_start(self, step, command):
+        with self.edit() as (steps, totals, now):
+            record = steps.get(step)
+            if record and observations_changed(record["fingerprint"], self.fingerprint(command)):
+                steps.pop(step)
+                steps["_changed_at"] = now
+                record = None
+            if record and len(record["events"]) >= self.threshold:
+                prior = self.failure_stats(record)
+            else:
+                if not self.blocked or self.blocked[0] != step:
+                    return None
+                prior = self.blocked[1]  # the report-only prompt forbids this step even after a patch
+            if self.blocked is None:
+                self.blocked = (step, prior)
+            totals["blocked"] += 1
+            totals["seconds_avoided"] += prior["seconds"] / prior["failures"]
+            return {"step": step[:8], "prior_failures": prior["failures"], "prior_seconds": prior["seconds"]}
+
+    def complete(self, item, started, received):
+        exit_code = item.get("exit_code")
+        if type(exit_code) is not int:
+            return
+        if started:
+            step, at = started
+            seconds = received - at
+        elif exit_code == 0:
+            step, seconds = self.step(item), 0
+        else:
+            return
+        if not step or (exit_code != 0 and seconds < self.min_seconds):
+            return
+        with self.edit() as (steps, _, now):
+            if exit_code == 0:
+                steps.pop(step, None)
+            else:
+                prior = steps.get(step, {})
+                fingerprint = self.fingerprint(item["command"])
+                if prior and observations_changed(prior["fingerprint"], fingerprint):
+                    prior = {}
+                    steps["_changed_at"] = now
+                words = set(prior.get("words", []))
+                for name in self.step_names(item.get("command")):
+                    separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
+                    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", separated)
+                    words.update(hashlib.sha1(word.encode("utf-8")).hexdigest()[:8]
+                                 for word in re.findall(r"[a-z0-9]+", separated.lower())
+                                 if word not in SCRIPT_EXTENSIONS)
+                steps.setdefault("_changed_at", 0)
+                steps[step] = {"events": [*prior.get("events", []), [now, seconds, exit_code]],
+                               "fingerprint": {**prior.get("fingerprint", {}), **fingerprint}, "words": sorted(words)}
+
+    def blocks(self):
+        try:
+            return [json.loads(line) for line in (self.job_dir / "repeat-blocks.jsonl").read_bytes().splitlines(keepends=True)
+                    if line.endswith(b"\n")]
+        except FileNotFoundError:
+            return []
+
+    def record_block(self, block, event_log):
+        # The short journal lets status show blocks without scanning the potentially large Codex event stream.
+        with open(self.job_dir / "repeat-blocks.jsonl", "ab") as journal:
+            journal.write((json.dumps(block) + "\n").encode("utf-8"))
+        event_log.write((json.dumps({"type": "runner.repeat_block", **block}) + "\n").encode("utf-8"))
+        event_log.flush()
+
+    def summary(self, *, blocking=True):
+        return {"blocks": self.blocks(), "standing": self.snapshot(blocking=blocking)[1]}
 
 
 def remember_too_big(cwd, prefix=""):
@@ -695,7 +1065,9 @@ def forget_too_big(cwd):
         return had_index
     if not isinstance(data, dict):
         raise ValueError("Snapshot size cache must be a JSON object")
-    keys = [k for k in (tree_key(cwd), DIFF_TOO_BIG + tree_key(cwd)) if k in data]
+    root = tree_key(cwd)
+    keys = [k for k in data if k in (root, DIFF_TOO_BIG + root) or
+            (k.startswith(SCOPE_TOO_BIG) and (k[len(SCOPE_TOO_BIG):] == root or k[len(SCOPE_TOO_BIG):].startswith(root.rstrip(os.sep) + os.sep)))]
     if not keys:
         return had_index
     for key in keys:
@@ -704,6 +1076,23 @@ def forget_too_big(cwd):
     tmp.write_text(json.dumps(data), "utf-8")
     os.replace(tmp, HOME / TOO_BIG_FILE)
     return True
+
+
+def thread_last_input_tokens(thread_id, tail=512 * 1024):
+    """Input tokens of the thread's last model request, from its rollout's last token count; None if unknown.
+    Read-only: a continuation decides from this whether resuming would re-send a large history."""
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    files = sorted(glob.glob(str(home / "sessions" / "*" / "*" / "*" / f"rollout-*-{glob.escape(thread_id)}.jsonl")))
+    if not files:
+        return None
+    try:
+        with open(files[-1], "rb") as f:
+            f.seek(max(0, f.seek(0, os.SEEK_END) - tail))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    found = re.findall(r'"last_token_usage":\s*\{[^}]*"input_tokens":\s*(\d+)', text)
+    return int(found[-1]) if found else None
 
 
 def scope_path(cwd, scope, *, resolve=None):
@@ -734,11 +1123,18 @@ def snapshot_before(cwd, scope_args):
         if before is not None:
             return before, None
         remember_too_big(cwd)
-    scope = [scope_path(cwd, s) for s in scope_args or []]
+    # A scope directory that once ran the walk out of budget is skipped for the too-big TTL; the other scope entries
+    # are still snapshotted, and changes inside the skipped directory come from Codex's events, as when the walk fails.
+    known = too_big_trees()
+    scope = [p for p in (scope_path(cwd, s) for s in scope_args or []) if SCOPE_TOO_BIG + tree_key(p) not in known]
+    slow = []
     try:
-        return (snapshot(cwd, scope=scope), scope) if scope else (None, None)
+        before = snapshot(cwd, scope=scope, slow=slow) if scope else None
     except OSError:
         return None, scope
+    for path in slow:
+        remember_too_big(path, SCOPE_TOO_BIG)
+    return (before, scope) if scope else (None, None)
 
 
 def ignore_patterns(ignore):
@@ -791,13 +1187,193 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
             **({"ignore_warnings": warnings} if warnings else {})}
 
 
-def git(cwd, *argv, deadline, env=None):
-    p = subprocess.run(["git", "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
+def git(cwd, *argv, deadline, env=None, program="git"):
+    p = subprocess.run([program, "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=max(0.1, deadline - time.monotonic()),
                        creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
     if p.returncode:
         raise ValueError(p.stderr.decode("utf-8", "replace").strip() or f"git exited {p.returncode}")
     return p.stdout
+
+
+def git_on_tree(cwd, deadline, operation, *, raise_errors=False):
+    def run(directory, program):
+        def query(*argv, at=directory):
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(argv, 0)
+            return git(at, *argv, deadline=deadline, program=program)
+        result = operation(query)
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(program, 0)
+        return result
+
+    try:
+        try:
+            return run(cwd, "git")
+        except (OSError, ValueError):
+            drive = re.fullmatch(r"/mnt/([a-zA-Z])/(.*)", cwd) if not IS_WIN else None
+            windows_git = drive and shutil.which("git.exe")
+            if not windows_git or time.monotonic() >= deadline:
+                raise
+            directory = f"{drive[1].upper()}:/" + drive[2]
+            return run(directory, windows_git)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        if raise_errors:
+            raise
+        return None
+
+
+def observations_changed(before, after):
+    return any(key in before and before[key] != value for key, value in after.items())
+
+
+def verification_observations_changed(before, after):
+    for name in before.keys() & after.keys():
+        previous_stat, previous_hash = before[name]
+        current_stat, current_hash = after[name]
+        if previous_stat != current_stat or (
+                previous_hash is not None and current_hash is not None and previous_hash != current_hash):
+            return True
+    return False
+
+
+def stat_fingerprint(info):
+    return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
+
+
+def dirty_file_stats(directory, names, deadline):
+    def scan(batch):
+        fingerprints, unchecked = {}, set()
+        for name in batch:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("dirty file checks", 0)
+            path = directory / os.fsdecode(name)
+            try:
+                info = path.lstat()
+                if stat.S_ISREG(info.st_mode):
+                    fingerprints[name] = (stat_fingerprint(info), None)
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    content_hash = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+                    fingerprints[name] = (stat_fingerprint(info), content_hash)
+                    continue
+            except (OSError, ValueError):
+                pass
+            unchecked.add(name)
+        return fingerprints, unchecked
+
+    fingerprints, unchecked = {}, set()
+    batches = (names[offset::VERIFY_STAT_WORKERS] for offset in range(VERIFY_STAT_WORKERS))
+    with ThreadPoolExecutor(max_workers=VERIFY_STAT_WORKERS) as workers:
+        for batch, skipped in workers.map(scan, batches):
+            fingerprints.update(batch)
+            unchecked.update(skipped)
+    return fingerprints, unchecked
+
+
+def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
+    names = [entry[3:] for entry in status.split(b"\0") if entry and entry[1:2] != b"D"]
+    if stat_fallback and len(names) > VERIFY_CONTENT_FILES:
+        return dirty_file_stats(directory, names, deadline)
+
+    hashes, unchecked = {}, set()
+    remaining = VERIFY_TOTAL_LIMIT
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    for name in names:
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("dirty file checks", 0)
+        path = directory / os.fsdecode(name)
+        limit = min(remaining, VERIFY_FILE_LIMIT)
+        try:
+            info = path.lstat()
+            metadata = stat_fingerprint(info) if stat_fallback else None
+            if stat.S_ISLNK(info.st_mode):
+                content = os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(info.st_mode):
+                if stat_fallback:
+                    hashes[name] = (metadata, None)
+                if info.st_size <= limit:
+                    with os.fdopen(os.open(path, flags), "rb") as file:
+                        opened = os.fstat(file.fileno())
+                        content = file.read(limit + 1) if stat.S_ISREG(opened.st_mode) and opened.st_size <= limit else None
+                elif stat_fallback:
+                    continue
+                else:
+                    content = None
+            else:
+                content = None
+        except (OSError, ValueError):
+            content = None
+        if content is None or len(content) > limit:
+            unchecked.add(name)
+        else:
+            remaining -= len(content)
+            content_hash = hashlib.sha256(content).hexdigest()
+            hashes[name] = (metadata, content_hash) if stat_fallback else content_hash
+    return hashes, unchecked
+
+
+def verification_git_digest(cwd, paths):
+    deadline = time.monotonic() + 30
+
+    def digest(query):
+        head = query("rev-parse", "--verify", "HEAD")
+        whole = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS)).digest()
+        top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
+        directory = Path(local_path(top))
+        root = Path(normalized_path(str(directory)))
+        relative = sorted({Path(*Path(path).parts[len(root.parts):]).as_posix()
+                           for path in paths if Path(normalized_path(path)).is_relative_to(root)})
+        if not relative:
+            return whole, None, set()
+        tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
+        index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
+                      "HEAD", "--", *relative, at=top)
+        scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
+        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=True)
+        checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
+        return whole, (checksum, hashes), unchecked
+
+    return git_on_tree(cwd, deadline, digest, raise_errors=True)
+
+
+def verification_paths(context, cwd):
+    source = job_status(context["verification_of"])
+    if not source.get("cwd") or tree_key(source["cwd"]) != tree_key(cwd):
+        return []
+    files = [entry.get("path") if isinstance(entry, dict) else entry
+             for entry in (source.get("files_changed") or []) + (source.get("write_paths") or [])]
+    return [scope_path(cwd, path) for path in [*(source.get("scope_paths") or source.get("scope") or []), *files]
+            if isinstance(path, str) and path.strip()]
+
+
+def concurrent_writer_in_scope(paths, run_dir, started):
+    roots = [Path(tree_key(path)) for path in paths]
+    runs = HOME / "runs"
+    for job_dir in [*job_directories(), *(runs.iterdir() if runs.exists() else ())]:
+        if job_dir == run_dir:
+            continue
+        with suppress(OSError, ValueError, TypeError):
+            if not (job_dir / "stderr.log").exists():
+                continue
+            task = task_record(job_dir)
+            cwd, sandbox = task.get("cwd"), task.get("sandbox")
+            if not cwd or not sandbox or not writer(sandbox, task.get("context")):
+                continue
+            scopes = [scope_path(cwd, path) for path in task.get("scope") or []]
+            writable = scopes or write_lock_roots(cwd, sandbox, task.get("writable_roots"), task.get("context")).values()
+            other = [Path(tree_key(path)) for path in writable]
+            if not any(path.is_relative_to(root) or root.is_relative_to(path) for path in other for root in roots):
+                continue
+            result_file = job_dir / "result.json"
+            if result_file.exists():
+                if result_file.stat().st_mtime > started:
+                    return True
+            elif job_dir.parent == runs and recorded_pid(job_dir / "worker.pid") is not None:
+                return True
+            elif job_dir.parent != runs and job_status(job_dir.name)["status"] == "running":
+                return True
+    return False
 
 
 def diff_fields(job_dir):
@@ -984,13 +1560,69 @@ def execute(args, prompt, run_dir):
     if scope_args:
         base.update(scope=getattr(args, "scope", None), scope_paths=scope_args)
     started = time.time()
+    context = getattr(args, "context", None) or {}
+    verification = context.get("verification_of") and context.get("write") is False
+    host_verification = verification and args.sandbox == "danger-full-access"
+    if verification and args.sandbox in ("read-only", "danger-full-access"):
+        scratch = (run_dir / "scratch").resolve()
+        if Path(normalized_path(str(scratch))).is_relative_to(Path(normalized_path(args.cwd))):
+            return {**base, "status": "failed", "error_kind": "verification_scratch_overlap",
+                    "error": "Verification scratch would be inside the project directory.",
+                    "retryable": False, "attempts": 0}
+        args.verification_scratch = scratch
+    if verification and args.sandbox == "read-only":
+        prompt = (f"Verification project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
+                  "当前目录是核验暂存区。先读取上述项目目录中适用的 AGENTS.md。项目目录只读，"
+                  "相对路径均以该项目目录为准。运行检查时先切到项目目录（cd <项目绝对路径> && …），"
+                  "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
+    declared_paths = verification_paths(context, args.cwd) if host_verification else []
+    paths = declared_paths or [args.cwd]
+
+    def take_snapshot(stage):
+        try:
+            digest = verification_git_digest(args.cwd, paths)
+        except subprocess.TimeoutExpired:
+            return None, f"{stage}_timeout"
+        except (OSError, ValueError):
+            return None, f"{stage}_git_error"
+        except RuntimeError:
+            return None, f"{stage}_error"
+        return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
+
+    before_digest, before_reason = take_snapshot("before") if host_verification else (None, None)
+
+    def finish(result):
+        if not host_verification:
+            return result
+        after_digest, reason = take_snapshot("after") if before_digest is not None else (None, before_reason)
+        if reason:
+            result.update(verification_integrity="unavailable", verification_integrity_reason=reason)
+        else:
+            before_whole, before_scope, before_unchecked = before_digest
+            after_whole, after_scope, after_unchecked = after_digest
+            scope_changed = before_scope[0] != after_scope[0] or verification_observations_changed(
+                before_scope[1], after_scope[1])
+            unchecked = before_unchecked | after_unchecked
+            if unchecked:
+                result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
+            if scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
+                result.pop("structured", None)
+                result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
+                              error="Git status, index or file contents changed within the monitored verification paths.")
+            elif before_whole != after_whole or scope_changed:
+                result["verification_integrity"] = "concurrent_changes"
+        return result
+
+    repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
     locks = []
     before = scope = None
     event_changes = []
+    writes = writer(args.sandbox, getattr(args, "context", None))
     try:
-        if args.sandbox != "read-only":
+        if writes:
             try:
-                roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None))
+                roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None),
+                                         getattr(args, "context", None))
                 lock_timeout = getattr(args, "lock_timeout", None)
                 deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
@@ -1004,7 +1636,7 @@ def execute(args, prompt, run_dir):
                     if admission is not None:
                         with admission:
                             # Keep overlap checks and all directory claims in one critical section.
-                            if not earlier_writer_waiting(run_dir, roots):
+                            if not earlier_writer_waiting(run_dir, roots, getattr(args, "lost_after", LOST_AFTER)):
                                 for key in sorted(roots):
                                     lock = acquire_write_lock(roots[key])
                                     if lock is None:
@@ -1029,20 +1661,22 @@ def execute(args, prompt, run_dir):
                 diff_begin(run_dir, args.cwd, not getattr(args, "no_diff", False))
 
         def changes():
-            return files_changed(args.cwd, before, event_changes, scope, ignore) \
-                if args.sandbox != "read-only" else {}
+            # Without a snapshot (read-only full-access jobs) this still reports Codex's own patch events.
+            return files_changed(args.cwd, before, event_changes, scope, ignore) if args.sandbox != "read-only" else {}
 
         def diff():
             try:
-                return diff_end(run_dir) if args.sandbox != "read-only" else {}
+                return diff_end(run_dir) if writes else {}
             except OSError as error:
                 return {"diff_status": "skipped", "diff_reason": str(error)[:300]}
 
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
+        prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
         thread_id = args.resume
         attempt = 0
         last_error_kind = None
+        report_only = False
         while True:
             attempt += 1
             runner_event(run_dir, attempt, "router_check", last_error_kind)
@@ -1052,20 +1686,35 @@ def execute(args, prompt, run_dir):
             else:
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
                 runner_event(run_dir, attempt, "codex_running", last_error_kind)
-                state = run_attempt(args, prompt, run_dir, thread_id)
+                state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard)
+                followup_thread = thread_id if args.sandbox == "read-only" else state["thread_id"]
                 thread_id = state["thread_id"]
                 event_changes += state["file_changes"]
+                if state.get("repeat_block") and not report_only and followup_thread:
+                    block = state["repeat_block"]
+                    failures = block["prior_failures"]
+                    prompt = (f"runner 拦下了第 {failures + 1} 次运行同一个失败步骤（前 {failures} 次都失败，"
+                              f"共 {round(block['prior_seconds'])} 秒，期间没有观察到文件改动）。"
+                              "不要再运行这个步骤，也不要换个写法运行它。现在只整理并输出最终报告："
+                              "依赖这一步的验收项标 blocked，blockers 写一条 environment（需要用户处理时用 user_input），"
+                              "说明失败现象和已经尝试过的做法；其余已完成的验收照常汇报。")
+                    thread_id = followup_thread
+                    report_only = True
+                    last_error_kind = "repeat_block"
+                    (run_dir / "last_message.txt").unlink(missing_ok=True)
+                    continue
                 if state["completed"] and not state["failed"]:
                     break
                 kind, retryable = classify(state, run_dir)
             last_error_kind = kind
             # Read-only runs are ephemeral and safe to restart. A writer that started a thread must resume it.
-            can_retry = retryable and attempt <= args.retries and (args.sandbox == "read-only" or thread_id or kind == "router_down")
+            can_retry = (not report_only and retryable and attempt <= args.retries and
+                         (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
                 runner_event(run_dir, attempt, "finalizing", kind)
-                return {**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
+                return finish({**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
                         "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
-                        **changes(), **diff()}
+                        **changes(), **diff(), "repeat_guard": repeat_guard.summary()})
             delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
             time.sleep(delay)
@@ -1082,7 +1731,8 @@ def execute(args, prompt, run_dir):
         result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
                   "final_message": final[:8000],
                   "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
-                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes(), **diff()}
+                  "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes(), **diff(),
+                  "repeat_guard": repeat_guard.summary()}
         if resumed:
             result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
         if args.schema:
@@ -1095,7 +1745,7 @@ def execute(args, prompt, run_dir):
                 detail = f": {error.msg} (line {error.lineno}, column {error.colno})" if isinstance(error, json.JSONDecodeError) else ""
                 result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON" + detail,
                               retryable=False)
-        return result
+        return finish(result)
     finally:
         for lock in reversed(locks):
             lock.close()
@@ -1106,6 +1756,30 @@ def positive_float(value):
     if not 0 < number < float("inf"):
         raise argparse.ArgumentTypeError("must be a positive finite number")
     return number
+
+
+def positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def parse_model_ab(value):
+    try:
+        models, share = json.loads(value)
+        if (isinstance(models, list) and len(models) == 2 and
+                all(isinstance(model, str) and model.strip() for model in models) and models[0] != models[1] and
+                type(share) in (int, float) and 0 <= share <= 1):
+            return models, share
+    except (TypeError, ValueError):
+        pass
+    raise argparse.ArgumentTypeError("model A/B requires [two distinct models, share from 0 to 1]")
+
+
+def select_ab_model(job_id, models, share):
+    bucket = int.from_bytes(hashlib.sha256(job_id.encode("utf-8")).digest()[:4], "big") / (1 << 32)
+    return models[0] if bucket < share else models[1]
 
 
 def add_task_arguments(p):
@@ -1135,6 +1809,12 @@ def add_task_arguments(p):
     p.add_argument("--exit-grace", type=float, default=EXIT_GRACE_SECONDS)
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--backoff", type=float, default=5)
+    p.add_argument("--repeat-min-seconds", type=positive_float, default=REPEAT_MIN_SECONDS)
+    p.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
+    p.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
+    p.add_argument("--repeat-guard", choices=("off", "on"), default="on",
+                   help="Block repeated long failures; completed file_change events reset counts (shell edits are invisible)")
+    p.add_argument("--allow-rerun", action="store_true", help="Clear this cwd's repeated failures at job start")
 
 
 def read_prompt(strict=False):
@@ -1149,9 +1829,13 @@ def read_prompt(strict=False):
     return prompt
 
 
-def write_result(job_dir, result):
+def write_result(job_dir, result, *, activity=None):
     tmp = job_dir / "result.json.tmp"
-    value = {**result, **runner_activity(job_dir / "events.jsonl")}
+    if activity is None:
+        activity = runner_activity(job_dir / "events.jsonl")
+    value = {**result, **activity}
+    if "repeat_guard" not in value:
+        value["repeat_guard"] = job_repeat_guard(job_dir)
     try:
         data = json.dumps(value, ensure_ascii=False).encode("utf-8")
     except UnicodeEncodeError:
@@ -1199,7 +1883,7 @@ def last_activity(events):
 
 def task_context(value):
     fields = {"owner", "task", "acceptance", "write"}
-    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of"}:
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of", "routing", "must_verify"}:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -1210,6 +1894,9 @@ def task_context(value):
         raise ValueError("context.acceptance must be a nonempty array of nonempty strings")
     if not isinstance(value["write"], bool):
         raise ValueError("context.write must be a boolean")
+    if "must_verify" in value and (not isinstance(value["must_verify"], list) or any(
+            type(index) is not int or not 1 <= index <= len(value["acceptance"]) for index in value["must_verify"])):
+        raise ValueError("context.must_verify must be a list of 1-based acceptance indices")
     if "verification_of" in value:
         if not isinstance(value["verification_of"], str):
             raise ValueError("context.verification_of must be a job identifier")
@@ -1217,6 +1904,12 @@ def task_context(value):
             job_identifier(value["verification_of"])
         except argparse.ArgumentTypeError as e:
             raise ValueError("context.verification_of: " + str(e)) from e
+    # routing: how the plugin dispatched this job (fresh/resume, parent thread, verify_previous), for later analysis.
+    if "routing" in value and (not isinstance(value["routing"], dict) or any(
+            not isinstance(k, str) or not (v is None or isinstance(v, (str, int, bool)) or
+                                           (isinstance(v, list) and all(isinstance(i, str) for i in v)))
+            for k, v in value["routing"].items())):
+        raise ValueError("context.routing must map names to strings, numbers, booleans or string lists")
     if "dispatcher" in value:
         dispatcher = value["dispatcher"]
         if (not isinstance(dispatcher, dict) or set(dispatcher) != {"version", "revision", "pid"} or
@@ -1226,7 +1919,9 @@ def task_context(value):
             raise ValueError("context.dispatcher requires a positive pid and version/revision strings or null")
     if "continuation" in value:
         continuation = value["continuation"]
-        if not isinstance(continuation, dict) or set(continuation) != {"parent_job_id", "answers", "resolution"}:
+        required = {"parent_job_id", "answers", "resolution"}
+        metadata = {"decided_by", "decision_basis", "decided_at", "resolves"}
+        if not isinstance(continuation, dict) or set(continuation) not in (required, required | metadata):
             raise ValueError("continuation must contain parent_job_id, answers and resolution")
         if not isinstance(continuation["parent_job_id"], str):
             raise ValueError("continuation.parent_job_id must be a job identifier")
@@ -1243,6 +1938,15 @@ def task_context(value):
                     answer["id"] in ids):
                 raise ValueError("continuation answers require unique nonempty id and answer strings")
             ids.add(answer["id"])
+        if "decided_by" in continuation:
+            decided_at, resolves = continuation["decided_at"], continuation["resolves"]
+            if (continuation["decided_by"] != "planner" or continuation["decision_basis"] != "standing_authorization" or
+                    type(decided_at) not in (int, float) or not 0 < decided_at < float("inf") or
+                    not isinstance(resolves, list) or not resolves or
+                    any(not isinstance(blocker, str) or not blocker.strip() for blocker in resolves) or
+                    len(set(resolves)) != len(resolves) or
+                    (not continuation["resolution"].strip() and not set(resolves) <= ids)):
+                raise ValueError("continuation has invalid planner decision metadata")
     return value
 
 
@@ -1288,6 +1992,15 @@ def task_record(job_dir):
     if task.get("context") is not None:
         task_context(task["context"])
     return task
+
+
+def job_repeat_guard(job_dir, *, blocking=True):
+    # A damaged ledger must not prevent publishing another result, such as a cancellation or runner error.
+    with suppress(OSError, ValueError, TypeError, KeyError):
+        task = task_record(job_dir)
+        if task.get("cwd"):
+            return RepeatGuard(task["cwd"], task, job_dir).summary(blocking=blocking)
+    return {"blocks": [], "standing": []}
 
 
 def job_metadata(job_dir, task=None, finished_at=None, thread_id=None, *, resolve=None):
@@ -1429,7 +2142,7 @@ def blocking_summary(value):
 
 def validate_review(review, value, submitting=False):
     fields = {"status", "criteria", "notes", "accepted_deviations"}
-    if (not isinstance(review, dict) or not fields <= set(review) or set(review) - fields - {"blockers"} or
+    if (not isinstance(review, dict) or not fields <= set(review) or set(review) - fields - {"blockers", "report_rows"} or
             not isinstance(review["status"], str) or
             review["status"] not in ("verified", "needs_changes", "accepted_deviations") or
             not isinstance(review["notes"], str) or not valid_blockers(review.get("blockers", []))):
@@ -1440,17 +2153,41 @@ def validate_review(review, value, submitting=False):
         report["criteria"] if valid_report(report) else None)
     if acceptance is None:
         raise ValueError("Review requires context acceptance or a valid legacy report")
+
+    def valid_owner_only(entry):
+        return "owner_only" not in entry or ("accepted" in entry and entry["owner_only"] in OWNER_ONLY_REASONS)
+
     criteria = review["criteria"]
     if not isinstance(criteria, list):
         raise ValueError("review.criteria must be an array")
     indexes = []
     for criterion in criteria:
-        if (not isinstance(criterion, dict) or set(criterion) != {"index", "status", "evidence"} or
+        # "accepted" (optional) records an open criterion that accepted_deviations accepts although it is not met.
+        if (not isinstance(criterion, dict) or not {"index", "status", "evidence"} <= set(criterion) or
+                set(criterion) - {"index", "status", "evidence", "accepted", "owner_only"} or not valid_owner_only(criterion) or
                 type(criterion["index"]) is not int or
                 not isinstance(criterion["status"], str) or criterion["status"] not in ("met", "not_met", "blocked") or
-                not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip()):
-            raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence")
+                not isinstance(criterion["evidence"], str) or not criterion["evidence"].strip() or
+                ("accepted" in criterion and (criterion["status"] == "met" or review["status"] != "accepted_deviations" or
+                                              not isinstance(criterion["accepted"], str) or not criterion["accepted"].strip()))):
+            raise ValueError("Review criteria require valid 1-based indexes, status and nonempty evidence; "
+                             "accepted is only for a not_met/blocked criterion of an accepted_deviations review; owner_only requires valid reason and accepted")
         indexes.append(criterion["index"])
+    # "report_rows" (optional): report rows flagged not_met/blocked that match no acceptance criterion
+    # (the report has a different number of rows); same status, evidence and "accepted" rules as criteria.
+    rows = review.get("report_rows", [])
+    row_count = len(report["criteria"]) if valid_report(report) else 0
+    if (not isinstance(rows, list) or any(
+            not isinstance(r, dict) or not {"row", "status", "evidence"} <= set(r) or
+            set(r) - {"row", "status", "evidence", "accepted", "owner_only"} or not valid_owner_only(r) or
+            type(r["row"]) is not int or not 1 <= r["row"] <= row_count or
+            not isinstance(r["status"], str) or r["status"] not in ("met", "not_met", "blocked") or
+            not isinstance(r["evidence"], str) or not r["evidence"].strip() or
+            ("accepted" in r and (r["status"] == "met" or review["status"] != "accepted_deviations" or
+                                  not isinstance(r["accepted"], str) or not r["accepted"].strip()))
+            for r in rows) or len({r["row"] for r in rows}) != len(rows)):
+        raise ValueError("report_rows entries require a unique report row number, status and nonempty evidence; "
+                         "accepted is only for a not_met/blocked row of an accepted_deviations review; owner_only requires valid reason and accepted")
     if sorted(indexes) != list(range(1, len(acceptance) + 1)):
         counts = Counter(indexes)
         expected = set(range(1, len(acceptance) + 1))
@@ -1482,10 +2219,10 @@ def validate_review(review, value, submitting=False):
             raise ValueError("Deviation acknowledgements require real unique indexes and nonempty evidence" + deviation_hint)
         acknowledged.add((deviation["kind"], deviation["index"]))
     if review["status"] != "needs_changes":
-        if (any(c["status"] != "met" for c in criteria) or acknowledged != expected or review.get("blockers")):
+        if (any(c["status"] != "met" and "accepted" not in c for c in criteria + rows) or acknowledged != expected or review.get("blockers")):
             raise ValueError("Passing review requires all criteria met, all deviations acknowledged and no active blockers" + deviation_hint)
     # Only new submissions: older stored reviews may already hold this contradiction and must stay readable.
-    elif submitting and all(c["status"] == "met" for c in criteria) and not review.get("blockers") and not expected:
+    elif submitting and all(c["status"] == "met" for c in criteria + rows) and not review.get("blockers") and not expected:
         raise ValueError("所有验收项都 met 且无阻塞/偏差时不能记 needs_changes；"
                          "被审对象（正文、产品）的缺陷写进 notes 或结论，审计任务本身记 verified；"
                          "若确有执行缺口，把对应 criterion 标 not_met 或加 blocker 并给出证据。")
@@ -1592,6 +2329,12 @@ def enriched_status(job_id, job_dir, value, record=None):
     metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
                                                                          thread_id=value.get("thread_id"))
     result = {**metadata, **diff_fields(job_dir), **value, "job_id": job_id}
+    if finished is None and "repeat_guard" not in result:
+        result["repeat_guard"] = job_repeat_guard(job_dir)
+    # Same timestamps as the job listing: a review needs to know when this round finished.
+    args_file = job_dir / "args.json"
+    result.setdefault("started_at", args_file.stat().st_mtime if args_file.exists() else None)
+    result.setdefault("finished_at", finished)
     for key in ("model", "service_tier"):
         if key in metadata["task_options"]:
             result["task_options"] = {**result["task_options"], key: metadata["task_options"][key]}
@@ -1612,7 +2355,72 @@ def enriched_status(job_id, job_dir, value, record=None):
     return {**result, **activity}
 
 
-def job_status(job_id, record=None):
+def recorded_process_exited(pid_file):
+    pid = int(pid_file.read_text())
+    if pid <= 0:
+        return False
+    try:
+        actual = proc_start(pid)
+    except FileNotFoundError:
+        return True
+    expected = pid_file.with_suffix(".start").read_text().strip()
+    return actual.isdecimal() and expected.isdecimal() and int(actual) != int(expected)
+
+
+def executor_loss(job_dir, started_at, lost_after):
+    try:
+        current = uuid.UUID(kernel_boot_id())
+        try:
+            previous = uuid.UUID((job_dir / "boot_id").read_text().partition(":")[0].strip())
+        except FileNotFoundError:
+            previous = current
+        mtimes = []
+        for name in ("events.jsonl", "phase.json"):
+            with suppress(FileNotFoundError):
+                mtimes.append((job_dir / name).stat().st_mtime)
+        last_activity = max(mtimes) if mtimes else None
+        if previous != current:
+            return "boot_changed", started_at if last_activity is None else last_activity
+        if last_activity is not None and time.time() - last_activity >= lost_after and all(
+                recorded_process_exited(job_dir / name) for name in ("worker.pid", "codex.pid")):
+            return "worker_exited", last_activity
+    except (OSError, ValueError, IndexError):
+        pass  # A failed read or malformed identity is not evidence that an executor exited.
+    return None
+
+
+def reconcile_lost_executor(job_dir, result_file, task, lost_after):
+    try:
+        started_at = (job_dir / "args.json").stat().st_mtime
+    except FileNotFoundError:
+        return
+    if executor_loss(job_dir, started_at, lost_after) is None:
+        return
+    lock = acquire_file_lock(job_dir / "process.lock")  # Admission must not wait on cancel or late diff.
+    if lock is None:
+        return
+    with lock:
+        if result_file.exists():
+            return
+        loss = executor_loss(job_dir, started_at, lost_after)
+        if loss is None:
+            return
+        reason, last_activity = loss
+        finished_at = time.time()
+        attempts = runner_activity(job_dir / "events.jsonl")["attempt"] or 0
+        value = {**job_metadata(job_dir, task=task, finished_at=finished_at), "status": "failed",
+                 "error_kind": "executor_lost", "lost_reason": reason, "retryable": False,
+                 "log_dir": str(job_dir), "attempts": attempts, "started_at": started_at,
+                 "finished_at": finished_at, "last_activity_at": last_activity,
+                 "repeat_guard": job_repeat_guard(job_dir, blocking=False)}
+        value.update(review_summary(value))
+        activity = {"phase": "lost", "attempt": attempts, "last_error_kind": "executor_lost", "retry_at": None}
+        write_result(job_dir, value, activity=activity)
+        with suppress(OSError):  # The result is authoritative even if the terminal event cannot be logged.
+            runner_event(job_dir, attempts, "lost", "executor_lost")
+
+
+def job_status(job_id, record=None, *, lost_after=LOST_AFTER):
     try:
         job_dir = job_directory(job_id)
         if not job_dir.exists():
@@ -1629,6 +2437,8 @@ def job_status(job_id, record=None):
             idle = round(time.time() - events.stat().st_mtime, 1) if events.exists() else None
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": idle,
                                                     "last_activity": last_activity(events) if events.exists() else None}, record)
+        if not result.exists():
+            reconcile_lost_executor(job_dir, result, record["task"] if record is not None else None, lost_after)
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")), record)
         if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
@@ -1641,9 +2451,9 @@ def job_status(job_id, record=None):
                 "verification_status": "invalid", "verification": None}
 
 
-def job_details(job):
+def job_details(job, args):
     if "_details" not in job:
-        job["_details"] = job_status(job["job_id"], job["_record"])
+        job["_details"] = job_status(job["job_id"], job["_record"], lost_after=getattr(args, "lost_after", LOST_AFTER))
     return {**job, **job["_details"]}
 
 
@@ -1686,7 +2496,9 @@ def matching_jobs(args, *, page_dates=None):
 
     def matches_metadata(value, job_id):
         context = value.get("context")
-        if args.owner and not ((isinstance(context, dict) and context.get("owner") == args.owner) or
+        # --also-owner adds predecessor sessions handed over to --owner; it never applies without --owner.
+        owners = {args.owner, *(getattr(args, "also_owner", None) or [])}
+        if args.owner and not ((isinstance(context, dict) and context.get("owner") in owners) or
                                job_id in (args.job_id or [])):
             return False
         return not args.cwd or bool(value.get("cwd") and
@@ -1725,7 +2537,7 @@ def matching_jobs(args, *, page_dates=None):
                 value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
             except (OSError, ValueError, TypeError):
                 record = None
-                value = job_status(job_dir.name)
+                value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
                 value["_details"] = dict(value)
                 if not matches_metadata(value, job_dir.name):
                     continue
@@ -1737,7 +2549,7 @@ def matching_jobs(args, *, page_dates=None):
             continue
         value.update(job_id=job_dir.name, _record=record)
         if args.status or needs_attention:
-            value = job_details(value)
+            value = job_details(value, args)
         if args.status and value["execution_status"] != args.status:
             continue
         verification = value.get("verification_status", "unreviewed")
@@ -1769,13 +2581,22 @@ def list_jobs(args):
         ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
         total = len(ordered)
         page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
-    page = [job_details(j) for j in page]
+    page = [job_details(j, args) for j in page]
+    predispatch = None
+    if args.owner and getattr(args, "thread_id", None) and args.offset == 0 and page:
+        report = page[0].get("structured")
+        acceptance = (page[0].get("context") or {}).get("acceptance")
+        if (isinstance(acceptance, list) and valid_report(report) and
+                any(blocker["kind"] == "environment" for blocker in report.get("blockers", []))):
+            predispatch = {"acceptance": acceptance, "criteria": [
+                {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]]}
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
               "last_error_kind", "retry_at")
     page = [{**{k: j.get(k) for k in fields},
              "context": {"owner": j["context"].get("owner"),
+                         **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
                          "task": j["context"]["task"].strip().splitlines()[0][:160],
                          **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
                          **({"verification_of": j["context"]["verification_of"]} if "verification_of" in j["context"] else {})}
@@ -1785,6 +2606,8 @@ def list_jobs(args):
              **{k: j[k] for k in ("diff_status", "diff_files", "rolled_back_at") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
+    if predispatch is not None:
+        page[0]["predispatch"] = predispatch
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
             "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
 
@@ -1865,27 +2688,43 @@ def products(args):
 
 
 def summary_usage(rounds):
-    if not rounds or (len(rounds) > 1 and rounds[-1].get("usage_scope") != "thread_total"):
-        return None
-    usage = rounds[-1].get("usage")
-    return usage if isinstance(usage, dict) and usage and all(type(v) in (int, float) for v in usage.values()) else None
+    """Each thread's latest thread_total, summed: a group can span threads when a continuation started a fresh one."""
+    threads = {}
+    for job in rounds:
+        threads.setdefault(job.get("thread_id") or job.get("job_id"), []).append(job)
+    total = {}
+    for part in threads.values():
+        usage = part[-1].get("usage")
+        if (len(part) > 1 and part[-1].get("usage_scope") != "thread_total") or not (
+                isinstance(usage, dict) and usage and all(type(v) in (int, float) for v in usage.values())):
+            return None
+        for key, amount in usage.items():
+            total[key] = total.get(key, 0) + amount
+    return total or None
 
 
 def summarize_jobs(args):
     groups = {}
     error_kinds = {}
+    listed = []
     for job in matching_jobs(args):
         if job["_record"] is None or job["_record"]["result"] is None:
-            job = job_details(job)
+            job = job_details(job, args)
         if job.get("error_kind"):
             kind = job["error_kind"]
             error_kinds[kind] = error_kinds.get(kind, 0) + 1
-        key = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
-        groups.setdefault(key, []).append(job)
+        listed.append(job)
+    # A continuation that started a fresh thread stays in its parent's unit of work.
+    key_of = {}
+    for job in reversed(listed):
+        own = ("thread", job["thread_id"]) if job.get("thread_id") else ("job", job["job_id"])
+        key_of[job["job_id"]] = key_of.get(job.get("parent_job_id"), own)
+    for job in listed:
+        groups.setdefault(key_of[job["job_id"]], []).append(job)
     result = []
     page = list(groups.items())[args.offset:args.offset + args.limit]
     for (kind, identifier), jobs in page:
-        jobs = [job_details(j) for j in jobs]
+        jobs = [job_details(j, args) for j in jobs]
         rounds = list(reversed(jobs))
         latest = jobs[0]
         report = latest.get("structured")
@@ -1911,6 +2750,9 @@ def summarize_jobs(args):
                       "blockers": latest["blocking"]["blockers"]}
         if closed:
             open_items = {k: [] for k in open_items}
+        # Criteria a closing review accepted although they are not met stay visible after close-out.
+        accepted_open = ([{"index": c["index"], "status": c["status"]} for c in (verification or {}).get("criteria", []) if c.get("accepted")] +
+                         [{"row": r["row"], "status": r["status"]} for r in (verification or {}).get("report_rows", []) if r.get("accepted")])
         result.append({"group_id": kind + ":" + identifier, "thread_id": latest.get("thread_id"),
                        "job_ids": [j["job_id"] for j in rounds], "total_rounds": len(rounds),
                        "rounds": [{k: j.get(k) for k in ("job_id", "parent_job_id", "status", "execution_status",
@@ -1920,8 +2762,9 @@ def summarize_jobs(args):
                        "latest_job_id": latest["job_id"],
                        "latest_job": {k: latest.get(k) for k in ("job_id", "thread_id", "parent_job_id", "status",
                                       "execution_status", "review_status", "report_status", "blocking", "context")},
+                       "repeat_guard": latest.get("repeat_guard", {"blocks": [], "standing": []}),
                        "summary": report.get("summary"), "verification_status": latest.get("verification_status"),
-                       "verification": verification, "open_items": open_items, "files_changed": files,
+                       "verification": verification, "open_items": open_items, "accepted_open": accepted_open, "files_changed": files,
                        "finished_duration_s": round(sum(durations), 1) if all(type(d) in (int, float) for d in durations) else None,
                        "usage": summary_usage(rounds), "usage_scope": "thread_total" if kind == "thread" else "job"})
     usage_total, usage_unknown = {}, 0
@@ -2217,8 +3060,11 @@ def main():
     parser = Parser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
     sub.add_parser("doctor")
-    add_task_arguments(sub.add_parser("run"))
-    add_task_arguments(sub.add_parser("start"))
+    run = sub.add_parser("run")
+    add_task_arguments(run)
+    start = sub.add_parser("start")
+    add_task_arguments(start)
+    start.add_argument("--model-ab", type=parse_model_ab, help="Assign a fresh job by job ID using [models, share]")
     status = sub.add_parser("status")
     status.add_argument("job_id", type=job_identifier)
     status.add_argument("--wait", type=float, default=0)
@@ -2226,11 +3072,20 @@ def main():
     sub.add_parser("cancel").add_argument("job_id", type=job_identifier)
     sub.add_parser("_worker").add_argument("job_id", type=job_identifier)
     sub.add_parser("forget-too-big").add_argument("--cwd", required=True)
+    sub.add_parser("thread-size").add_argument("thread_id")
+    repeat_guard = sub.add_parser("repeat-guard")
+    repeat_guard.add_argument("--cwd", default=os.getcwd())
+    repeat_guard.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
+    repeat_guard.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
+    for command in (run, start, status, listing, summary):
+        command.add_argument("--lost-after", type=float, default=LOST_AFTER, metavar="SECONDS",
+                             help="Minimum inactivity before finalizing a job whose recorded processes both exited")
     for command in (listing, summary):
         command.add_argument("--cwd")
         command.add_argument("--owner")
+        command.add_argument("--also-owner", action="append")
         command.add_argument("--status", choices=["running", "completed", "failed", "cancelled", "unknown"])
         command.add_argument("--needs-attention", action="store_true")
         command.add_argument("--job-id", action="append", type=job_identifier)
@@ -2258,6 +3113,8 @@ def main():
     rollback.add_argument("job_id", type=job_identifier)
     rollback.add_argument("--check", action="store_true", help="Only test whether the patch still reverses cleanly")
     args = parser.parse_args()
+    if hasattr(args, "lost_after") and not (isfinite(args.lost_after) and args.lost_after >= 0):
+        parser.error("--lost-after requires nonnegative finite seconds")
     if args.command == "doctor":
         emit(doctor())
         return
@@ -2275,6 +3132,19 @@ def main():
         start, end = args.started_between
         if not (isfinite(start) and isfinite(end) and start <= end):
             parser.error("--started-between requires finite epoch seconds in order")
+    if args.command == "thread-size":
+        if not re.fullmatch(r"[0-9A-Za-z-]{8,80}", args.thread_id):
+            emit({"status": "failed", "error_kind": "bad_arguments", "error": "thread_id is invalid", "retryable": False})
+        else:
+            emit({"status": "completed", "thread_id": args.thread_id, "last_input_tokens": thread_last_input_tokens(args.thread_id)})
+        return
+    if args.command == "repeat-guard":
+        try:
+            totals, standing, changed_at = RepeatGuard(args.cwd, vars(args)).snapshot()
+            emit({"status": "completed", "totals": totals, "standing": standing, "_changed_at": changed_at})
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            emit({"status": "failed", "error_kind": "invalid_record", "error": str(e), "retryable": False})
+        return
     if args.command == "forget-too-big":
         try:
             emit({"status": "completed", "removed": forget_too_big(args.cwd)})
@@ -2317,6 +3187,10 @@ def main():
     if args.command in ("run", "start"):
         args.cwd = os.path.realpath(local_path(args.cwd))
         prompt = read_task_input(args, parser)
+        if getattr(args, "model_ab", None) is not None:
+            context = getattr(args, "context", None)
+            if not context or args.model is not None or args.resume or context.get("continuation") or context.get("verification_of"):
+                parser.error("--model-ab requires a new contextual task without a model override")
         if args.command == "start" or args.max_storage_mb is not None:
             prune_old("jobs")
             prune_old("runs")
@@ -2329,8 +3203,10 @@ def main():
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         run_dir.mkdir(parents=True)
-        if args.sandbox != "read-only":
+        if writer(args.sandbox, getattr(args, "context", None)):
             task = {k: getattr(args, k) for k in ("cwd", "sandbox", "writable_roots")}
+            if args.scope:
+                task["scope"] = args.scope
             (run_dir / "write-lock.json").write_text(json.dumps(task), "utf-8")
         boot = boot_id()
         if boot:
@@ -2344,10 +3220,13 @@ def main():
 
     if args.command == "start":
         job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        if args.model_ab is not None:
+            args.model = select_ab_model(job_id, *args.model_ab)
+            args.context["routing"] = {**args.context.get("routing", {}), "ab": True, "model": args.model}
         job_dir = HOME / "jobs" / job_id
         job_dir.mkdir(parents=True)
         (job_dir / "prompt.txt").write_text(prompt, "utf-8")
-        task = {k: v for k, v in vars(args).items() if k != "command"}
+        task = {k: v for k, v in vars(args).items() if k not in ("command", "model_ab")}
         (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
         # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
         boot = boot_id()
@@ -2391,7 +3270,7 @@ def main():
         while True:
             with suppress(OSError, ValueError):
                 late_diff(job_directory(args.job_id))
-            current = job_status(args.job_id)
+            current = job_status(args.job_id, lost_after=args.lost_after)
             now = time.monotonic()
             if current["status"] != "running" or now >= deadline:
                 emit(current)

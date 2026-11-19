@@ -607,6 +607,44 @@ test('toolPolicy allowlist refuses tools the guard does not know unless allowToo
   assert.equal(knownTool('anything'), false);
 });
 
+test('mcpWriteAllow applies to direct tools and host-dispatched tool_call children', () => {
+  const diagram = 'mcp__drawio__create_new_diagram';
+  const other = 'mcp__foo__delete_file';
+  const base = config('products');
+  const cfg = { ...base, mcpWriteAllow: ['MCP__DrawIO__*'] };
+  const strict = { ...cfg, toolPolicy: 'allowlist' };
+  const exact = { ...base, mcpWriteAllow: [diagram.toUpperCase()] };
+  for (const parent of [undefined, Symbol('tool_call')]) {
+    const guard = (name, settings) => {
+      // The host guards the wrapper, then dispatches the child with its own name.
+      if (parent) {
+        const denied = decide(call('tool_call', {}), settings);
+        if (denied) return denied;
+      }
+      return decide({ ...call(name, {}), parent }, settings);
+    };
+    assert.equal(guard(diagram, base), shortDenial);
+    assert.equal(guard(diagram, { ...base, allowTools: [diagram] }), shortDenial);
+    assert.equal(guard(diagram, cfg), undefined);
+    assert.equal(guard(diagram, strict), undefined);
+    assert.equal(guard(diagram, exact), undefined);
+    assert.equal(guard('mcp__drawio__delete_diagram', exact), shortDenial);
+    assert.equal(guard(other, cfg), shortDenial);
+    assert.equal(guard(other, strict), shortDenial);
+    assert.match(guard('mcp__foo__query', strict), /白名单模式下未放行/);
+  }
+});
+
+test('mcpWriteAllow leaves the other denials in force', () => {
+  const diagram = 'mcp__drawio__create_new_diagram';
+  const cfg = { ...config('products'), mcpWriteAllow: ['mcp__*'], denyTools: new Set([diagram.toUpperCase()]) };
+  for (const name of ['write', 'run_code', diagram]) {
+    assert.equal(decide(call(name, {}), cfg), shortDenial, name);
+  }
+  assert.equal(decide(call('mcp__notes__obsidian_frontmatter', { action: 'set' }), cfg), shortDenial);
+  assert.equal(decide(call('wsl', { command: 'rm x' }), cfg), shortDenial);
+});
+
 test('tools the read boundary does not know stay unchecked in the default policy, with or without path arguments', () => {
   // 线上有带 path 参数的未知工具（Seep 结构化查询读工作区二进制、接口类工具的 path: '/v1/x'）；收紧走白名单模式。
   const calls = [['mcp__seep__seep_r2_strings', { path: '/repo/bin/app' }], ['mcp__api__request', { path: '/v1/x' }],

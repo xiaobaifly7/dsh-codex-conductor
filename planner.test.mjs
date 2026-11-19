@@ -4,8 +4,9 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, shellReadTargets, wslPath } from './guard.mjs';
-import { apply, nextStep } from './index.mjs';
+import { apply as applyPlugin, nextStep } from './index.mjs';
 
+const apply = (ctx, config, ...rest) => applyPlugin(ctx, { autoVerify: 'off', ...config }, ...rest);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
 const call = (name, args = {}, owner = 'S1', cwd = '/repo') => ({ name, arguments: args, agent: { id: owner, session: { header: { cwd } } } });
@@ -18,6 +19,30 @@ async function executionDenial(guard, execute, exec) {
   assert.deepEqual(JSON.parse(JSON.stringify(result)), result);
   return result.isError ? result.error.message : undefined;
 }
+
+test('codex_run guides the planner to dispatch authorized, independently verifiable work', (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-planner-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const tools = {};
+  const previous = process.env.LOCALAPPDATA;
+  process.env.LOCALAPPDATA = root;
+  try {
+    apply({ tools: { register: tool => { tools[tool.name] = tool; }, guard() {} }, on() {} }, { allowHostAccess: true });
+  } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
+  const { description, parameters: { properties } } = tools.codex_run;
+  assert.match(description, /一单一个可独立验收的结果，超过 8 条先按共同前置拆单/);
+  assert.match(description, /长等前用 wait_seconds: 0 后台派齐本批独立且 scope 和写入目标互不重叠的任务（限只读调查、codex_verify 核验及无冲突的写任务）/);
+  assert.match(description, /写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须串行，完成并核对一单再派下一单/);
+  assert.match(tools.codex_status.description, /可并行等待多个 Codex 任务，每次调用传一个 job_id.*留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600）/);
+  assert.match(tools.codex_status.parameters.properties.wait_seconds.description, /在本轮等待，超时续等仍在跑的任务/);
+  assert.match(description, /派单前核对授权。要交文件或启动会落盘的程序就用 write=true/);
+  assert.match(description, /scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots/);
+  assert.match(description, /真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access/);
+  assert.match(properties.scope.description, /覆盖获准的启动必写路径.*必需写入超出授权时，先澄清再派单/);
+  assert.match(properties.writable_roots.description, /cwd 以外需要写入的已有目录.*需要 write=true/);
+  assert.match(properties.acceptance.description, /结果、正常观测入口和预期值，只要求本轮可取得的证据/);
+  assert.match(properties.acceptance.description, /哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，仅在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并写明用途/);
+});
 
 test('products blocks file/search readers including MCP aliases and every mixed target', async () => {
   const scope = createProductReads({ plannerReadAllow: [] }, async owner => ({ status: 'completed', owner, paths: [] }));
