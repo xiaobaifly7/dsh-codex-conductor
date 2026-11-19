@@ -2,7 +2,7 @@
 
 [English](#english)
 
-`0.9.132-converge.0`（候选，待定）同一交付链连续两轮卡在同一处时阻止原样重派，参数未变时仅凭变化说明最多再试一轮。新增不可补回历史证据标记、必写路径自检和带真实编号的收尾回执。跳过无产出的受阻任务核验，拒绝文件和核验范围均未变的重复核验。
+`0.9.132-rc.0`（候选，待定）规划端先派齐已就绪、互不冲突且护栏允许的只读调查和核验，再留在本轮逐单等待并验收已收到的报告。提示词明确同目录写锁和收尾欠账的派单条件。同一交付链连续两轮卡在相同条目且参数未变时拦截重派，提交具体变化说明最多放行一次。支持归档不可补回的历史证据、派单前检查必写路径、按回执中的编号和提交结构收尾。受阻且无可核验产出的任务先解除阻塞，同一任务的文件版本及核验范围未变时复用已有核验。
 
 `0.9.131` `codex_continue` 和带 `resume` 的 `codex_run` 启动写任务前，比对同线程及续接链上仍在运行的核验范围。范围重叠时复查核验状态，再提示规划端等待。查询失败会记录警告，已结束的核验、只读续接和范围不重叠的续接可照常启动。
 
@@ -160,7 +160,7 @@
 
 ## English
 
-`0.9.132-converge.0` (unreleased candidate) stops unchanged rework after two rounds with the same outcome. One further attempt may rely on an explanation alone. Reviews can close out unrecoverable historical evidence. Dispatch checks required write paths, recovery receipts include exact identifiers and submission templates, and verification skips blocked rounds without products and rejects duplicates with the same observed files and scope.
+`0.9.132-rc.0` (unreleased candidate) asks the planner to dispatch all ready, independent read-only investigations and verifications permitted by the guards, then wait for one job at a time and review reports in the same turn. The prompts clarify the directory write lock and closeout requirements. The same delivery chain stops after two rounds with unchanged inputs and outcomes, with at most one extra attempt based on a concrete explanation of what changed. Reviews can archive unrecoverable historical evidence, dispatch checks required write paths, and closeout receipts include exact IDs and submission templates. Verification skips blocked rounds with no verifiable output and reuses results for the same job when the observed file version and verification scope match.
 
 `0.9.131` checks running verifications in the same thread or continuation chain before starting write continuations in `codex_continue` and `codex_run` with `resume`. It rechecks an overlapping verification before asking the planner to wait. Query failures log a warning. Completed verifications, read-only continuations and disjoint write scopes do not block dispatch.
 

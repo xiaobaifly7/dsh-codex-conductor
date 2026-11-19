@@ -30,10 +30,11 @@ test('codex_run guides the planner to dispatch authorized, independently verifia
     apply({ tools: { register: tool => { tools[tool.name] = tool; }, guard() {} }, on() {} }, { allowHostAccess: true });
   } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
   const { description, parameters: { properties } } = tools.codex_run;
-  assert.match(description, /一单一个可独立验收的结果，超过 8 条先按共同前置拆单/);
-  assert.match(description, /长等前用 wait_seconds: 0 后台派齐本批独立且 scope 和写入目标互不重叠的任务（限只读调查、codex_verify 核验及无冲突的写任务）/);
-  assert.match(description, /写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须串行，完成并核对一单再派下一单/);
-  assert.match(tools.codex_status.description, /可并行等待多个 Codex 任务，每次调用传一个 job_id.*留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600）/);
+  assert.match(description, /一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单/);
+  assert.match(description, /① 派齐本批.*同一回合用 wait_seconds: 0.*独立只读调查（write=false）和 codex_verify.*② 等待与验收/);
+  assert.match(description, /有依赖、写同目录或改变同一真机、虚拟机、服务状态的任务须串行/);
+  assert.match(description, /待收尾事项会挡住新开 codex_run，含只读单；可核验或续接/);
+  assert.match(tools.codex_status.description, /每次只等待传入 job_id 对应的 Codex 任务.*先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑/);
   assert.match(tools.codex_status.parameters.properties.wait_seconds.description, /在本轮等待，超时续等仍在跑的任务/);
   assert.match(description, /派单前核对授权。要交文件或启动会落盘的程序就用 write=true/);
   assert.match(description, /scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots/);

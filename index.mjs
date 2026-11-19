@@ -660,11 +660,11 @@ function sameCriteria(report, acceptance) {
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
 const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并在给用户的汇报里写明替用户做了哪些决定；拿不准，或回答意味着删除数据、改动用户没提过的目录时，仍然先问用户。';
 const USER_REPORT = '向用户汇报时先用大白话说明完成情况、核对结果和剩余问题，不必带任务号和内部状态名。';
-const WAIT_GUIDANCE = '长等前用 wait_seconds: 0 后台派齐本批独立且 scope 和写入目标互不重叠的任务（限只读调查、codex_verify 核验及无冲突的写任务），直接拿任务号。' +
-  '写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须串行，完成并核对一单再派下一单。' +
-  '留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600），未完则续等。报告直接验收，仅摘要、缺内容或截断时用 job_output 或 codex_output 补读。';
-const waitForJob = (jobId) => `先后台派齐本批独立且不重叠的任务，再留在本轮并行等待：codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
-  '仍在跑则续等，返回报告就直接验收，勿零等待轮询或重派。';
+const WAIT_GUIDANCE = '① 派齐本批：同一回合用 wait_seconds: 0 派出已就绪且护栏允许的独立只读调查（write=false）和 codex_verify，记 runner job_id，能并列调用就并列。' +
+  '有依赖、写同目录或改变同一真机、虚拟机、服务状态的任务须串行。' +
+  '② 等待与验收：留在本轮，先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑。报告有缺才用 job_output 或 codex_output 补读。';
+const waitForJob = (jobId) => `先派齐本批获准的独立只读调查和核验，再留在本轮一次等一单，例如 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
+  '其余单继续跑。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
 const RERUN_AFTER_CHANGE = { type: 'string', minLength: 1,
   description: '外部条件已经改变时填写具体变化（例如用户修好了虚拟机），允许本次重新运行此前反复失败的步骤。' };
 const minutes = seconds => Math.round(seconds / 60);
@@ -2859,7 +2859,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '把任务交给 WSL 里的 Codex（它看不到本对话）。登记后台任务后返回两个任务号。' + WAIT_GUIDANCE +
       '同一任务书连续失败时不要原样重派，先读失败回执，按失败类别处理。' +
       (cfg.convergenceGuard ? '同一交付链连续两轮卡在相同条目且参数未变时，仅凭 rerun_after_change 最多再试一次。' : '') +
-      '一单一个可独立验收的结果，超过 8 条先按共同前置拆单。路径、平台和参数适配在原授权内处理。' +
+      '一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单。路径、平台和参数适配在原授权内处理。' +
       '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
@@ -2868,7 +2868,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       (cfg.ownerDecisions === 'planner' ? '原任务有待决定阻塞时按常设授权用 codex_continue 提交 answers 或 resolution；'
         : cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
-      (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝；唯一一个待验收任务的核验在跑（或本单带 verify_previous 核验它）时，可以派写入范围不重叠的新任务。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      (cfg.closeoutGuard !== false ? '待收尾事项会挡住新开 codex_run，含只读单；可核验或续接。仅一单待验收、无其他返工欠账且首次核验在跑或由本单 verify_previous 发起时，容量足够且写入不重叠才放行。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       'verify_previous 可在派这一单的同时只读核验上一单（写入范围重叠时拒绝）。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
@@ -3184,7 +3184,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
-    description: '可并行等待多个 Codex 任务，每次调用传一个 job_id。' + WAIT_GUIDANCE +
+    description: '每次只等待传入 job_id 对应的 Codex 任务。' + WAIT_GUIDANCE +
       '中止本工具或 job_output 只停止观察。取消用 codex_cancel 或后台任务的显式取消。运行中返回最近活动及距今秒数、阶段和尝试轮次。' +
       '用 codex_output 分段读取任务、验收标准和报告。',
     parameters: {

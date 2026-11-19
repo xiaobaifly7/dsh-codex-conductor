@@ -172,7 +172,7 @@ test('dispatch descriptions keep waiting on the current runner job and accept th
       }
       assert.match(text, /wait_seconds\s*:\s*3600/, name);
       assert.match(text, /留在本轮/, name);
-      assert.match(text, /报告.*直接验收/, name);
+      assert.match(text, /先验收已收到的报告，再选一单/, name);
     }
   }
 });
