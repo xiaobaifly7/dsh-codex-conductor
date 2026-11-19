@@ -1625,7 +1625,11 @@ test('fallback auto resume after a delay only resumes sessions still interrupted
   f.add('session-huge');
   const open = f.services.sessionPersistence.open;
   f.services.sessionPersistence.open = async (id, mode, options) => id !== 'session-huge' ? open(id, mode, options) : {
-    read: (_offset, _limit, readOptions) => new Promise((_resolve, reject) => readOptions.signal.addEventListener('abort', () => reject(readOptions.signal.reason))),
+    read: (_offset, _limit, readOptions) => {
+      const keepAliveWhileReading = setTimeout(() => {}, 1000);
+      t.after(() => clearTimeout(keepAliveWhileReading));
+      return new Promise((_resolve, reject) => readOptions.signal.addEventListener('abort', () => reject(readOptions.signal.reason)));
+    },
     close: async () => {} };
   const result = await processAutoResume({ ...f, autoResume: { ...f.autoResume, delaySeconds: 180 }, delayed: true, hostStart, readLimitMs: 20,
     retired: (id) => id === 'session-retired', archived: (id) => id === 'session-archived' });
