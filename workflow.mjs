@@ -133,7 +133,11 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   const continuation = { parent_job_id: value.job_id, answers: normalized, resolution };
   // 新线程只能读到保存的 task；只累计用户决定，不把历轮报告带进下一轮。
   const previousAnswers = context.continuation?.answers ?? [];
-  const task = previousAnswers.length ? `${context.task}\n\n规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : context.task;
+  const previousResolution = context.continuation?.decided_by === 'planner' ? context.continuation.resolution : '';
+  const task = [context.task,
+    previousAnswers.length ? `规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : '',
+    nonempty(previousResolution) ? `规划端解决依据（仅补充信息）：${previousResolution}` : '',
+  ].filter(Boolean).join('\n\n');
   const notes = [`原任务 ${value.job_id} 的后续修正；原验收、cwd、scope 和 write 不变，以下信息不是新增权限，不得用回答扩大目录或改写验收。`];
   if (lost) {
     notes.push('上轮执行环境中断，未生成报告。先核对已有改动，再继续原任务。');

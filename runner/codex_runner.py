@@ -26,6 +26,7 @@ import random
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -69,11 +70,14 @@ POWERSHELL_BUILTINS = frozenset("""
     Test-Path Join-Path Get-Date Start-Sleep Out-Null Format-List Format-Table Get-ChildItem New-Item
     Remove-Item Get-Item Copy-Item Split-Path Resolve-Path ConvertTo-Json ConvertFrom-Json Get-Location Set-Location
 """.split())
-SCRIPT_SUFFIX = r"\.(?:ps1|psm1|py|sh)"
+SCRIPT_EXTENSIONS = frozenset("ps1 psm1 psd1 py pyi sh bash zsh fish js mjs cjs ts jsx tsx bat cmd rb pl php lua".split())
+SCRIPT_SUFFIX = r"\.(?:" + "|".join(sorted(SCRIPT_EXTENSIONS)) + ")"
 SCRIPT_DELIMITERS = r"""\s'"\\/|&;<>()=,"""
 SCRIPT_NAMES = re.compile(
-    rf"""(?P<quote>["'])(?:[^"'\r\n|&;<>]*[/\\])?(?P<quoted>[^"'\\/\r\n|&;<>]+{SCRIPT_SUFFIX})(?P=quote)"""
-    rf"|(?<![^{SCRIPT_DELIMITERS}])(?P<bare>[^{SCRIPT_DELIMITERS}]+{SCRIPT_SUFFIX})(?=$|[{SCRIPT_DELIMITERS}])", re.I)
+    rf"""(?P<quote>["'])(?P<quoted_dir>[^"'\r\n|&;<>]*[/\\])?(?P<quoted>[^"'\\/\r\n|&;<>]+{SCRIPT_SUFFIX})(?P=quote)"""
+    rf"|(?<![^{SCRIPT_DELIMITERS}])(?P<bare_dir>(?:[^{SCRIPT_DELIMITERS}]*[/\\])*)(?P<bare>[^{SCRIPT_DELIMITERS}]+{SCRIPT_SUFFIX})(?=$|[{SCRIPT_DELIMITERS}])", re.I)
+VERIFY_FILE_LIMIT = 1024 * 1024
+VERIFY_TOTAL_LIMIT = 32 * 1024 * 1024
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -595,7 +599,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                         if repeat_guard and repeat_guard.enabled:
                             step = repeat_guard.step(item)
                             if step:
-                                block = repeat_guard.check_start(step)
+                                block = repeat_guard.check_start(step, item["command"])
                                 if block:
                                     state.update(completed=False, end_reason="repeated_failure", repeat_block=block,
                                                  error="A command started again after repeated long failures.")
@@ -638,8 +642,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                 elif kind == "item.completed" and item.get("type") == "file_change":
                     state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
                     if repeat_guard and item.get("changes"):
-                        # Only Codex file-change events are observable here, including during a report turn.
-                        repeat_guard.clear()
+                        repeat_guard.clear_changes(c.get("path") for c in item["changes"])
             with acquire_file_lock(run_dir / "process.lock", blocking=True):
                 # Failed launchers can leave children behind after closing their standard streams.
                 if not IS_WIN and state["end_reason"] is None and (not state["completed"] or state["failed"]):
@@ -794,6 +797,7 @@ def read_step_failures(path):
 
 class RepeatGuard:
     def __init__(self, cwd, options, job_dir=None):
+        self.cwd = os.path.realpath(local_path(cwd))
         self.cwd_key = tree_key(cwd)
         self.cwd_hash = hashlib.sha1(self.cwd_key.encode("utf-8")).hexdigest()[:16]
         self.enabled = options.get("repeat_guard", "on") == "on"
@@ -804,6 +808,29 @@ class RepeatGuard:
         self.lock = HOME / "locks" / "step-failures.lock"
         self.job_dir = job_dir
         self.blocked = None
+
+    def fingerprint(self, command):
+        def git_state(query):
+            status = query("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
+            head = b""
+            with suppress(ValueError):
+                head = query("rev-parse", "--verify", "HEAD")
+            return hashlib.sha256(head + b"\0" + status).hexdigest()
+
+        cwd = Path(self.cwd)
+        state = None
+        if os.environ.get("GIT_DIR") or any((parent / ".git").exists() for parent in (cwd, *cwd.parents)):
+            state = git_on_tree(self.cwd, time.monotonic() + 2, git_state)
+        scripts = {}
+        for match in SCRIPT_NAMES.finditer(command):
+            script = (match["quoted_dir"] or match["bare_dir"] or "") + (match["quoted"] or match["bare"])
+            path = scope_path(self.cwd, script)
+            with suppress(OSError, ValueError):
+                info = os.stat(path)
+                scripts[normalized_path(path)] = (info.st_size, info.st_mtime_ns)
+        if state is None and not scripts:
+            return None
+        return hashlib.sha256(json.dumps([state, scripts], sort_keys=True).encode("utf-8")).hexdigest()
 
     @staticmethod
     def step_names(command):
@@ -826,24 +853,35 @@ class RepeatGuard:
 
     def recent(self, data, now):
         steps = data.get(self.cwd_hash, {})
-        # The window applies to the aggregate's last failure. Other cwd entries may use different windows.
         cutoff = now - 3600 * self.window_hours
-        recent = {key: value for key, value in steps.items() if key != "_changed_at" and value["last_at"] >= cutoff}
+        recent = {}
+        for key, value in steps.items():
+            if key != "_changed_at":
+                events = [event for event in value.get("events", []) if event[0] >= cutoff]
+                if events:
+                    recent[key] = {**value, "events": events}
         changed_at = steps.get("_changed_at", 0)
         if recent or changed_at:
             recent["_changed_at"] = changed_at
         return recent
 
     @contextmanager
-    def edit(self):
+    def edit(self, clear_keys=()):
         self.lock.parent.mkdir(parents=True, exist_ok=True)
         with acquire_file_lock(self.lock, blocking=True):
             data = read_step_failures(self.path)
             now = time.time()
             steps = self.recent(data, now)
             totals = {**REPEAT_TOTALS, **data.get("_totals", {})}
+            cleared = False
+            for key in clear_keys:
+                if key == self.cwd_hash:
+                    steps = {"_changed_at": now}
+                elif key in data:
+                    data[key] = {"_changed_at": now}
+                    cleared = True
             yield steps, totals, now
-            if steps != data.get(self.cwd_hash, {}) or totals != data.get("_totals", REPEAT_TOTALS):
+            if cleared or steps != data.get(self.cwd_hash, {}) or totals != data.get("_totals", REPEAT_TOTALS):
                 if steps:
                     data[self.cwd_hash] = steps
                 else:
@@ -853,10 +891,16 @@ class RepeatGuard:
                 tmp.write_text(json.dumps(data), "utf-8")
                 os.replace(tmp, self.path)
 
+    @staticmethod
+    def failure_stats(record):
+        events = record["events"]
+        return {"failures": len(events), "seconds": sum(event[1] for event in events),
+                "last_exit": events[-1][2], "last_at": events[-1][0]}
+
     def standing(self, steps):
         return [{"step": key[:8], "words": record.get("words", []),
-                 **{k: record[k] for k in ("failures", "seconds", "last_exit", "last_at")}}
-                for key, record in sorted(steps.items()) if key != "_changed_at" and record["failures"] >= self.threshold]
+                 **self.failure_stats(record)}
+                for key, record in sorted(steps.items()) if key != "_changed_at" and len(record["events"]) >= self.threshold]
 
     def snapshot(self, *, blocking=True):
         if not self.path.exists():
@@ -876,6 +920,17 @@ class RepeatGuard:
             steps.clear()
             steps["_changed_at"] = changed_at
 
+    def clear_changes(self, paths):
+        keys = set()
+        for path in paths:
+            if isinstance(path, str) and path:
+                changed = Path(normalized_path(scope_path(self.cwd, path)))
+                keys.update(hashlib.sha1(str(directory).encode("utf-8")).hexdigest()[:16]
+                            for directory in (changed, *changed.parents))
+        if keys:
+            with self.edit(keys):
+                pass
+
     def prepare_prompt(self, prompt, allow_rerun):
         if allow_rerun:
             self.clear(file_changed=False)
@@ -890,10 +945,16 @@ class RepeatGuard:
                        "先修改相关文件或换掉依赖它的做法；做不到时把依赖它的验收项标 blocked 并写 environment blocker。")
         return prompt
 
-    def check_start(self, step):
-        with self.edit() as (steps, totals, _):
-            prior = steps.get(step)
-            if prior is None or prior["failures"] < self.threshold:
+    def check_start(self, step, command):
+        with self.edit() as (steps, totals, now):
+            record = steps.get(step)
+            if record and record["fingerprint"] != self.fingerprint(command):
+                steps.pop(step)
+                steps["_changed_at"] = now
+                record = None
+            if record and len(record["events"]) >= self.threshold:
+                prior = self.failure_stats(record)
+            else:
                 if not self.blocked or self.blocked[0] != step:
                     return None
                 prior = self.blocked[1]  # the report-only prompt forbids this step even after a patch
@@ -921,18 +982,20 @@ class RepeatGuard:
                 steps.pop(step, None)
             else:
                 prior = steps.get(step, {})
-                jobs = prior.get("jobs", [])
-                job_id = self.job_dir.name
-                jobs = [job for job in jobs if job != job_id] + [job_id]
+                fingerprint = self.fingerprint(item["command"])
+                if prior and prior["fingerprint"] != fingerprint:
+                    prior = {}
+                    steps["_changed_at"] = now
                 words = set(prior.get("words", []))
                 for name in self.step_names(item.get("command")):
                     separated = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", name)
                     separated = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", separated)
                     words.update(hashlib.sha1(word.encode("utf-8")).hexdigest()[:8]
-                                 for word in re.findall(r"[a-z0-9]+", separated.lower()))
+                                 for word in re.findall(r"[a-z0-9]+", separated.lower())
+                                 if word not in SCRIPT_EXTENSIONS)
                 steps.setdefault("_changed_at", 0)
-                steps[step] = {"failures": prior.get("failures", 0) + 1, "seconds": prior.get("seconds", 0) + seconds,
-                               "last_exit": exit_code, "last_at": now, "jobs": jobs[-10:], "words": sorted(words)}
+                steps[step] = {"events": [*prior.get("events", []), [now, seconds, exit_code]],
+                               "fingerprint": fingerprint, "words": sorted(words)}
 
     def blocks(self):
         try:
@@ -1119,44 +1182,79 @@ def git(cwd, *argv, deadline, env=None, program="git"):
     return p.stdout
 
 
-def verification_git_digest(cwd, paths):
-    deadline = time.monotonic() + 30
-
-    def digest(directory, program):
+def git_on_tree(cwd, deadline, operation):
+    def run(directory, program):
         def query(*argv, at=directory):
             if time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired(argv, 30)
+                raise subprocess.TimeoutExpired(argv, 0)
             return git(at, *argv, deadline=deadline, program=program)
-
-        head = query("rev-parse", "--verify", "HEAD")
-        status = ("status", "--porcelain=v1", "-z", "--untracked-files=all")
-        whole = hashlib.sha256(head + b"\0" + query(*status)).digest()
-        if not paths:
-            return whole, None
-        top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
-        root = Path(normalized_path(local_path(top)))
-        relative = sorted({Path(*Path(p).parts[len(root.parts):]).as_posix()
-                           for p in paths if Path(normalized_path(p)).is_relative_to(root)})
-        if not relative:
-            return whole, None
-        if "." in relative:
-            return whole, whole
-        tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
-        scoped = query("--literal-pathspecs", *status, "--", *relative, at=top)
-        return whole, hashlib.sha256(tree + b"\0" + scoped).digest()
+        return operation(query)
 
     try:
-        return digest(cwd, "git")
+        return run(cwd, "git")
     except (OSError, ValueError):
         drive = re.fullmatch(r"/mnt/([a-zA-Z])/(.*)", cwd) if not IS_WIN else None
         windows_git = drive and shutil.which("git.exe")
         if windows_git and time.monotonic() < deadline:
             directory = f"{drive[1].upper()}:/" + drive[2]
             with suppress(OSError, ValueError, subprocess.TimeoutExpired):
-                return digest(directory, windows_git)
+                return run(directory, windows_git)
     except subprocess.TimeoutExpired:
         pass
     return None
+
+
+def verification_git_digest(cwd, paths):
+    deadline = time.monotonic() + 30
+
+    def digest(query):
+        head = query("rev-parse", "--verify", "HEAD")
+        status = ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
+        whole = hashlib.sha256(head + b"\0" + query(*status)).digest()
+        top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
+        directory = Path(local_path(top))
+        root = Path(normalized_path(str(directory)))
+        relative = sorted({Path(*Path(path).parts[len(root.parts):]).as_posix()
+                           for path in paths if Path(normalized_path(path)).is_relative_to(root)})
+        if not relative:
+            return whole, None, set()
+        tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
+        index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
+                      "HEAD", "--", *relative, at=top)
+        scoped = query("--literal-pathspecs", *status, "--", *relative, at=top)
+        checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped)
+        unchecked = set()
+        remaining = VERIFY_TOTAL_LIMIT
+        for entry in scoped.split(b"\0"):
+            if not entry:
+                continue
+            name = entry[3:]
+            path = directory / os.fsdecode(name)
+            try:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired("verification file checks", 30)
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode):
+                    content = os.fsencode(os.readlink(path))
+                elif stat.S_ISREG(info.st_mode) and info.st_size <= min(remaining, VERIFY_FILE_LIMIT):
+                    limit = min(remaining, VERIFY_FILE_LIMIT)
+                    with path.open("rb") as file:
+                        content = file.read(limit + 1)
+                    if len(content) > limit:
+                        unchecked.add(name)
+                        continue
+                else:
+                    unchecked.add(name)
+                    continue
+                remaining -= len(content)
+                checksum.update(name + b"\0" + hashlib.sha256(content).digest())
+            except FileNotFoundError:
+                continue
+            except OSError:
+                unchecked.add(name)
+        return whole, checksum.digest(), unchecked
+
+    return git_on_tree(cwd, deadline, digest)
 
 
 def verification_paths(context, cwd):
@@ -1169,18 +1267,31 @@ def verification_paths(context, cwd):
             if isinstance(path, str) and path.strip()]
 
 
-def concurrent_job_in_tree(cwd, run_dir, started):
-    root = tree_key(cwd)
-    for job_dir in job_directories():
+def concurrent_writer_in_scope(paths, run_dir, started):
+    roots = [Path(tree_key(path)) for path in paths]
+    runs = HOME / "runs"
+    for job_dir in [*job_directories(), *(runs.iterdir() if runs.exists() else ())]:
         if job_dir == run_dir:
             continue
         with suppress(OSError, ValueError, TypeError):
-            dates = job_listing_times(job_dir)
-            if dates["started_at"] is None or (dates["finished_at"] is not None and dates["finished_at"] <= started):
+            if not (job_dir / "stderr.log").exists():
                 continue
             task = task_record(job_dir)
-            if task.get("cwd") and tree_key(task["cwd"]) == root and (
-                    dates["finished_at"] is not None or job_status(job_dir.name)["status"] == "running"):
+            cwd, sandbox = task.get("cwd"), task.get("sandbox")
+            if not cwd or not sandbox or not writer(sandbox, task.get("context")):
+                continue
+            scopes = [scope_path(cwd, path) for path in task.get("scope") or []]
+            writable = scopes or write_lock_roots(cwd, sandbox, task.get("writable_roots"), task.get("context")).values()
+            other = [Path(tree_key(path)) for path in writable]
+            if not any(path.is_relative_to(root) or root.is_relative_to(path) for path in other for root in roots):
+                continue
+            result_file = job_dir / "result.json"
+            if result_file.exists():
+                if result_file.stat().st_mtime > started:
+                    return True
+            elif job_dir.parent == runs and recorded_pid(job_dir / "worker.pid") is not None:
+                return True
+            elif job_dir.parent != runs and job_status(job_dir.name)["status"] == "running":
                 return True
     return False
 
@@ -1384,26 +1495,28 @@ def execute(args, prompt, run_dir):
                   "当前目录是核验暂存区。先读取上述项目目录中适用的 AGENTS.md。项目目录只读，"
                   "相对路径均以该项目目录为准。运行检查时先切到项目目录（cd <项目绝对路径> && …），"
                   "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
-    paths = verification_paths(context, args.cwd) if host_verification else []
+    declared_paths = verification_paths(context, args.cwd) if host_verification else []
+    paths = declared_paths or [args.cwd]
     before_digest = verification_git_digest(args.cwd, paths) if host_verification else None
 
     def finish(result):
         if not host_verification:
             return result
         after_digest = verification_git_digest(args.cwd, paths) if before_digest is not None else None
-        if after_digest is None:
+        if after_digest is None or after_digest[1] is None:
             result["verification_integrity"] = "unavailable"
-        elif before_digest != after_digest:
-            before_whole, before_scope = before_digest
-            after_whole, after_scope = after_digest
-            concurrent = (before_scope == after_scope if before_scope is not None else
-                          before_whole != after_whole and concurrent_job_in_tree(args.cwd, run_dir, started))
-            if concurrent:
-                result["verification_integrity"] = "concurrent_changes"
-            else:
+        else:
+            before_whole, before_scope, before_unchecked = before_digest
+            after_whole, after_scope, after_unchecked = after_digest
+            unchecked = before_unchecked | after_unchecked
+            if unchecked:
+                result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
+            if before_scope != after_scope and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
                 result.pop("structured", None)
                 result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
-                              error="Git status or HEAD changed within the monitored verification paths.")
+                              error="Git status, index or file contents changed within the monitored verification paths.")
+            elif before_whole != after_whole or before_scope != after_scope:
+                result["verification_integrity"] = "concurrent_changes"
         return result
 
     repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
@@ -2996,8 +3109,10 @@ def main():
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
         run_dir.mkdir(parents=True)
-        if args.sandbox != "read-only":
+        if writer(args.sandbox, getattr(args, "context", None)):
             task = {k: getattr(args, k) for k in ("cwd", "sandbox", "writable_roots")}
+            if args.scope:
+                task["scope"] = args.scope
             (run_dir / "write-lock.json").write_text(json.dumps(task), "utf-8")
         boot = boot_id()
         if boot:

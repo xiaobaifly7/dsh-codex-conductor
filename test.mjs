@@ -6546,6 +6546,53 @@ test('planner continuation records decisions, counters and handover visibility',
   assert.match(runtime.content.at(-1).text, /代所有者决定 1 项（任务 CHILD）/);
 });
 
+test('review fix: a planner resolution survives two successive fresh repairs', async (t) => {
+  const { source, setup, exec } = decisionFixture(t);
+  let starts = 0;
+  const h = setup({ listResult: { jobs: [] },
+    startResult: () => ({ status: 'completed', job_id: `REPAIR-${++starts}` }) });
+  const resolution = 'Choose SQLite and reject JSON';
+  await h.tools.codex_continue.execute({ job_id: source.job_id, resolution, fresh: true }, exec);
+  const payloads = () => h.requests.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin));
+  const [first] = payloads();
+  assert.ok(first.prompt.includes(resolution));
+  h.finals['REPAIR-1'] = { ...source, job_id: 'REPAIR-1', context: first.context,
+    structured: { ...source.structured, summary: 'Implementation still incomplete', blockers: [],
+      criteria: source.structured.criteria.map(row => ({ ...row, status: 'not_met', evidence: 'Implementation gap' })) } };
+  await h.tools.codex_continue.execute({ job_id: 'REPAIR-1', fresh: true }, exec);
+  const [, second] = payloads();
+  assert.ok(second.prompt.includes(resolution));
+  assert.ok(second.context.task.includes(resolution));
+  assert.doesNotMatch(second.context.task, /Implementation still incomplete/);
+});
+
+test('review fix: owner-only questions count only after the host opens them', async (t) => {
+  const { source, state, review, setup, exec } = decisionFixture(t);
+  const h = setup({ acceptOpenEvidence: 'off' });
+  await h.tools.codex_review.execute({ ...review,
+    criteria: review.criteria.map(item => ({ ...item, owner_only: 'outward_action' })) }, exec);
+  const file = path.join(state, 'accepted-open.json');
+  const ledger = () => readFileSync(file, 'utf8');
+  const before = ledger();
+  const ask = next => h.handlers['tools/execute']({ ...exec, name: 'ask_user_question',
+    arguments: { questions: [{ id: 'choice-1', intent: 'owner_only', question: `[owner_only] ${source.job_id} 请选择。` }] } }, next);
+  const denied = { isError: true };
+  assert.equal(await ask(async () => denied), denied);
+  const afterDenied = ledger();
+  await assert.rejects(ask(async () => { throw new Error('question never opened'); }), /never opened/);
+  assert.equal(afterDenied, before);
+  assert.equal(ledger(), before);
+  await ask(async () => ({ value: {} }));
+  assert.ok(JSON.parse(ledger()).items.every(item => item.asked));
+});
+
+test('review fix: unrelated scripts cannot match solely through a shared extension', async (t) => {
+  const { source, setup, exec } = decisionFixture(t);
+  const h = setup({ repeatGuardResult: { status: 'completed', standing: [{ ...standingFailure, words: ['c01e011e'] }] } });
+  const run = steps => h.tools.codex_run.execute({ ...RUN, cwd: source.cwd, acceptance_needs: [{ index: 1, steps }] }, exec);
+  assert.doesNotMatch((await run(['check_network.ps1'])).next, /依赖的步骤 ps1/);
+});
+
 test('predispatch warns only for the unchanged same-index environment block and declared step words', async (t) => {
   const { source, setup, state, exec } = decisionFixture(t, 'environment');
   const [first, second] = source.context.acceptance;

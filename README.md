@@ -26,7 +26,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录和主机访问。未启用 modelAB 时沿用原模型，启用时使用配置的默认模型。全程只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后用 `codex_review` 记录原任务的验收。同一版本已完成验收、产物未变且没有新证据时，不再追加核验；`codex_review` 只记录验收，不另派调查。Gemini 正文的核对见下文，不能用旧素材任务的 `codex_verify` 替代。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
 
-核验可以实际运行原项目的检查。沙箱核验在每单的暂存目录启动，提示核验员先读项目的 `AGENTS.md`，再切到项目目录运行检查。只有暂存目录可写，测试临时文件和缓存使用其中的 `TMPDIR`。主机访问核验沿用原有权限，临时文件仍在项目外。runner 在核验前后比较 Git 状态和提交，受核验范围内的变化会使核验失败，范围外或可识别的并行变更会出提示。非 Git 目录或查询超时会注明比对不可用。
+核验可以实际运行原项目的检查。沙箱核验在每单的暂存目录启动，提示核验员先读项目的 `AGENTS.md`，再切到项目目录运行检查。只有暂存目录可写，测试临时文件和缓存使用其中的 `TMPDIR`。主机访问核验沿用原有权限，临时文件仍在项目外。runner 在核验前后比较受核验范围的 Git 状态、提交、索引和已改动或未跟踪文件的内容。未指定范围或产物时，以原任务目录为范围，此时只有范围重叠的并行写任务才算并行变更。范围内变化会使核验失败，范围外变化会出提示。无法读取的内容、单文件超过 1 MiB 或单次比对超过 32 MiB 的部分会标注未比对，非 Git 目录或查询超时会注明比对不可用。
 
 ### 0.9.56：设置里的“Codex 指挥”
 
@@ -596,7 +596,7 @@ Use `codex_verify` for factual checks after mechanically checking product presen
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [eleven Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
-Verification can run the project's checks. Sandboxed verification starts in writable per-job scratch, reads the project's `AGENTS.md`, and runs checks from the read-only project directory. Temporary and cache files go to `TMPDIR` inside scratch. Host-access verification keeps its original access and also uses project-external scratch for temporary files. The runner compares Git status and committed state before and after. Changes within the verified paths fail the check, while out-of-scope or identifiable concurrent changes produce a notice. The receipt also reports when Git comparison is unavailable.
+Verification can run the project's checks. Sandboxed verification starts in writable per-job scratch, reads the project's `AGENTS.md`, and runs checks from the read-only project directory. Temporary and cache files go to `TMPDIR` inside scratch. Host-access verification keeps its original access and also uses project-external scratch for temporary files. The runner compares Git status, committed state, index state and dirty or untracked contents within the verified paths. In the absence of scope and products, it monitors the source job's directory and counts only overlapping writers as concurrent changes. Changes inside the monitored paths fail the check, subject to that concurrency check. The receipt reports changes outside the scope, unavailable comparisons, and files left unchecked because they could not be read or exceeded the 1 MiB per-file or 32 MiB per-snapshot limit.
 
 ### 0.9.56: Codex control panel
 

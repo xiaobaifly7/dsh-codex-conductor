@@ -662,8 +662,9 @@ const EXPECT_BLOCKED = { type: 'array', items: { type: 'integer', minimum: 1 },
 const ACCEPTANCE_NEEDS = { type: 'array', items: { type: 'object', additionalProperties: false,
   properties: { index: { type: 'integer', minimum: 1 }, steps: { type: 'array', minItems: 1, items: { type: 'string', minLength: 1 } } },
   required: ['index', 'steps'] }, description: '显式声明验收条目依赖的步骤名称（Verb-Noun 或脚本文件名），派单时提示本目录的近期重复失败。' };
-const stepWords = step => step.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2').replace(/([a-z0-9])([A-Z])/g, '$1 $2')
-  .toLowerCase().match(/[a-z0-9]+/g) ?? [];
+const SCRIPT_EXTENSIONS = new Set('ps1 psm1 psd1 py pyi sh bash zsh fish js mjs cjs ts jsx tsx bat cmd rb pl php lua'.split(' '));
+const stepWords = step => (step.replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2').replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+  .toLowerCase().match(/[a-z0-9]+/g) ?? []).filter(word => !SCRIPT_EXTENSIONS.has(word));
 function predispatchWarnings(args, cwd, parent, repeat) {
   if (repeat?.status !== 'completed') return [];
   const warnings = new Set();
@@ -727,11 +728,12 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       `先核对已有产物（codex_output artifact=diff/events），再按原任务重新派单${resume}；不要当作失败结论处理。`;
   }
   if (value.error_kind === 'verification_tree_changed') {
-    return '主机核验期间受核验范围的 Git 状态或 HEAD 发生变化，核验失败。请核对仓库改动来源和现状，勿使用本轮核验结论。';
+    return '主机核验期间受核验范围的 Git 状态、索引或文件内容发生变化，核验失败。请核对仓库改动来源和现状，勿使用本轮核验结论。';
   }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     (value.verification_integrity === 'concurrent_changes' ? '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。'
       : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
+    (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个文件的内容未比对，请核对对应验收证据。` : '') +
     '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers, ownerDecisions })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
@@ -3585,7 +3587,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
-    if (exec.name === 'ask_user_question') observeOwnerQuestion(exec);
     // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
     // 已交接出去的会话只能读，不能再派活、验收或取消，避免两个会话同时处理同一批任务。
     if (['codex_run', 'codex_continue', 'codex_verify', 'codex_review', 'codex_cancel', 'gemini_write'].includes(exec.name)) {
@@ -3709,6 +3710,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       if (goal.ledgerUnreadable) content.push({ type: 'text', text: `${unreadableLedgerLine}，未核对未完成项` });
       return { ...result, content };
+    }
+    if (exec.name === 'ask_user_question') {
+      const result = await next();
+      if (result && !result.isError) observeOwnerQuestion(exec);
+      return result;
     }
     // 先执行原生 job_output，保留 ownership、消费与实时状态语义，再缩短回执。
     if (exec.name !== 'job_output' || exec.arguments?.wait === true || !exec.agent?.id) return next();

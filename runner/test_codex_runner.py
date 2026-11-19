@@ -110,6 +110,10 @@ FAKE_CODEX = textwrap.dedent(r"""
             (state / "edited").touch()
             time.sleep(300)
         finish()
+    elif mode in ("verification_overwrite", "verification_sibling"):
+        target = Path("a.txt") if mode == "verification_overwrite" else Path("../outside.txt")
+        target.write_bytes(b"changed by verifier\n")
+        finish()
     elif mode == "hang_with_detached_child":
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -337,6 +341,8 @@ class RunnerTests(unittest.TestCase):
         (job_dir / "prompt.txt").write_text("original task", "utf-8")
         calls = []
         elapsed = 100.0
+        popen = subprocess.Popen
+        thread = codex_runner.threading.Thread
 
         def stream(events):
             nonlocal elapsed
@@ -345,6 +351,8 @@ class RunnerTests(unittest.TestCase):
                 yield (json.dumps({k: v for k, v in event.items() if k != "_seconds"}) + "\n").encode()
 
         def spawn(argv, **kwargs):
+            if argv[0] in ("git", "git.exe"):
+                return popen(argv, **kwargs)
             events = turns[len(calls)]
             if isinstance(events, BaseException):
                 raise events
@@ -360,11 +368,16 @@ class RunnerTests(unittest.TestCase):
             calls.append((argv, proc))
             return proc
 
+        def spawn_thread(target, daemon=None, **kwargs):
+            if kwargs:
+                return thread(target=target, daemon=daemon, **kwargs)
+            return mock.Mock(start=target)
+
         with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
                 mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed), \
                 mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
                 mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
-                mock.patch.object(codex_runner.threading, "Thread", side_effect=lambda target, daemon: mock.Mock(start=target)), \
+                mock.patch.object(codex_runner.threading, "Thread", side_effect=spawn_thread), \
                 mock.patch.object(codex_runner, "record_pid"), mock.patch.object(codex_runner, "kill_tree") as kill:
             result = codex_runner.execute(args, "original task", job_dir)
             codex_runner.write_result(job_dir, result)
@@ -420,13 +433,53 @@ class RunnerTests(unittest.TestCase):
         self.repeat_job("seed-words", [*self.repeat_step(1, command=command), *self.repeat_step(2, command=command)])
         query = self.control("repeat-guard", "--cwd", str(self.cwd))
         self.assertEqual(query["_changed_at"], 0)
-        words = ("invoke", "build", "widget", "check", "setup", "py")
+        words = ("invoke", "build", "widget", "check", "setup")
         self.assertEqual(set(query["standing"][0]["words"]),
                          {hashlib.sha1(word.encode()).hexdigest()[:8] for word in words})
         self.repeat_job("changed-words", [self.repeat_patch()])
         query = self.control("repeat-guard", "--cwd", str(self.cwd))
         self.assertGreater(query["_changed_at"], 0)
         self.assertEqual(query["standing"], [])
+
+    def test_review_fix_repeat_guard_allows_edit_to_named_script_between_jobs(self):
+        script = self.cwd / "setup.py"
+        script.write_text("raise RuntimeError('broken')\n", encoding="utf-8")
+        step = lambda number, code=1: self.repeat_step(number, code, command="python ./setup.py")
+        self.repeat_job("failed-script", [*step(1), *step(2)])
+        script.write_text("print('fixed')\n", encoding="utf-8")
+        _, result, _, kills = self.repeat_job("fixed-script", step(3, 0), [])
+        self.assertEqual((result["status"], result["repeat_guard"]["blocks"], kills), ("completed", [], 0))
+        self.assertGreater(self.control("repeat-guard", "--cwd", str(self.cwd))["_changed_at"], 0)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_fix_repeat_guard_allows_changed_git_status_between_jobs(self):
+        _, cwd, _ = self.git_repo("repeat-git")
+        self.repeat_job("failed-in-git", [*self.repeat_step(1), *self.repeat_step(2)], cwd=cwd)
+        (cwd / "a.txt").write_bytes(b"edited by the owner\n")
+        _, result, _, kills = self.repeat_job("edited-in-git", self.repeat_step(3, 0), [], cwd=cwd)
+        self.assertEqual((result["status"], result["repeat_guard"]["blocks"], kills), ("completed", [], 0))
+
+    def test_review_fix_repeat_guard_ignores_patch_outside_guarded_cwd(self):
+        self.repeat_job("failed-elsewhere", [*self.repeat_step(1), *self.repeat_step(2)])
+        patch = self.repeat_patch()
+        patch["item"]["changes"][0]["path"] = str(self.cwd.parent / "outside" / "setup.ps1")
+        _, result, _, kills = self.repeat_job("patched-elsewhere", [patch, *self.repeat_step(3, None)], [])
+        self.assertEqual(kills, 1)
+        self.assertEqual(result["repeat_guard"]["blocks"][0]["prior_failures"], 2)
+
+    def test_review_fix_repeat_guard_expires_each_failure_individually(self):
+        import codex_runner
+
+        epoch = time.time()
+        with mock.patch.object(codex_runner.time, "time", return_value=epoch):
+            self.repeat_job("first-failure", self.repeat_step(1))
+        with mock.patch.object(codex_runner.time, "time", return_value=epoch + 23 * 3600):
+            self.repeat_job("second-failure", self.repeat_step(2))
+        with mock.patch.object(codex_runner.time, "time", return_value=epoch + 25 * 3600):
+            _, result, _, kills = self.repeat_job("after-first-expired", self.repeat_step(3), [])
+        self.assertEqual(kills, 0)
+        self.assertEqual(result["repeat_guard"]["standing"][0]["failures"], 2)
+        self.assertEqual(result["repeat_guard"]["standing"][0]["seconds"], 120)
 
     def test_predispatch_thread_listing_includes_previous_environment_criteria_without_evidence(self):
         context = self.sample_context()
@@ -459,8 +512,8 @@ class RunnerTests(unittest.TestCase):
         self.assertRegex(cwd_key, r"^[a-f0-9]{16}$")
         key, = set(record[cwd_key]) - {"_changed_at"}
         self.assertRegex(key, r"^[a-f0-9]{40}$")
-        self.assertEqual(record[cwd_key][key]["jobs"], ["seed"])
-        self.assertEqual(set(record[cwd_key][key]), {"jobs", "failures", "seconds", "last_exit", "last_at", "words"})
+        self.assertEqual([event[1:] for event in record[cwd_key][key]["events"]], [[60, 1], [60, 2]])
+        self.assertEqual(set(record[cwd_key][key]), {"events", "fingerprint", "words"})
 
     def test_repeat_guard_worker_restart_before_job_finalization(self):
         dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
@@ -529,7 +582,8 @@ class RunnerTests(unittest.TestCase):
         data = json.loads(ledger.read_text("utf-8"))
         for cwd_key in set(data) - {"_totals"}:
             for step in set(data[cwd_key]) - {"_changed_at"}:
-                data[cwd_key][step]["last_at"] -= 3600
+                for event in data[cwd_key][step]["events"]:
+                    event[0] -= 3600
         ledger.write_text(json.dumps(data), "utf-8")
         _, result, calls, kills = self.repeat_job("expired", self.repeat_step(3, None, command="setup3.ps1"), options=options)
         self.assertEqual((result["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
@@ -4715,12 +4769,65 @@ class RunnerTests(unittest.TestCase):
                 source = {"status": "completed", **({"files_changed": [{"path": "elsewhere.txt"}]} if kind == "products" else {})}
                 self.stored_job("SOURCE", source, cwd=str(project), scope=["elsewhere.txt"] if kind == "scope" else [])
                 if kind == "running":
-                    self.stored_job("WRITER", None, cwd=str(project), sandbox="workspace-write")
+                    writer = self.stored_job("WRITER", None, cwd=str(project), sandbox="workspace-write")
+                    (writer / "stderr.log").touch()
                 result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
                                      mode="repo_edit", prompt=prompt)
                 self.assertEqual((result["status"], result.get("verification_integrity")),
                                  ("completed", "concurrent_changes"), result)
                 shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_fix_host_verification_checks_dirty_bytes_and_reports_large_files(self):
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for kind in ("dirty", "untracked", "oversize"):
+            with self.subTest(kind=kind):
+                _, project, git = self.git_repo(f"verification-{kind}")
+                if kind == "untracked":
+                    git("rm", "-q", "sub/a.txt")
+                    git("commit", "-qm", "untrack a.txt")
+                (project / "a.txt").write_bytes(b"already dirty\n" if kind != "oversize" else b"x" * (2 * 1024 * 1024))
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode="verification_overwrite" if kind != "oversize" else "warnings_then_ok", prompt=prompt)
+                    if kind == "oversize":
+                        self.assertEqual((result["status"], result.get("verification_integrity"),
+                                          result.get("verification_unchecked_files")), ("completed", "unchecked", 1))
+                    else:
+                        self.assertEqual((result["status"], result.get("error_kind"), result.get("retryable")),
+                                         ("failed", "verification_tree_changed", False))
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_fix_host_verification_defaults_to_source_cwd_and_requires_overlapping_writer(self):
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for kind in ("sibling", "reader", "disjoint-writer", "overlapping-writer"):
+            with self.subTest(kind=kind):
+                root, project, _ = self.git_repo(f"verification-{kind}")
+                source = self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project))
+                if kind != "sibling":
+                    other = self.stored_job("OTHER", None, cwd=str(root if kind != "reader" else project),
+                                            sandbox="read-only" if kind == "reader" else "workspace-write",
+                                            scope=["outside.txt"] if kind == "disjoint-writer" else [])
+                    (other / "stderr.log").touch()
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode="verification_sibling" if kind == "sibling" else "verification_overwrite",
+                                         prompt=prompt)
+                    if kind in ("sibling", "overlapping-writer"):
+                        self.assertEqual((result["status"], result.get("verification_integrity")),
+                                         ("completed", "concurrent_changes"))
+                    else:
+                        self.assertEqual((result["status"], result.get("error_kind")),
+                                         ("failed", "verification_tree_changed"))
+                finally:
+                    shutil.rmtree(source)
+                    if kind != "sibling":
+                        shutil.rmtree(other)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_writer_changes_become_a_patch_without_touching_the_repository(self):
