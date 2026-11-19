@@ -12,6 +12,7 @@ Every command prints exactly one JSON object on stdout. Raw events go to a log f
 """
 import argparse
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, suppress
 import errno
 from functools import cache
@@ -78,6 +79,8 @@ SCRIPT_NAMES = re.compile(
     rf"|(?<![^{SCRIPT_DELIMITERS}])(?P<bare_dir>(?:[^{SCRIPT_DELIMITERS}]*[/\\])*)(?P<bare>[^{SCRIPT_DELIMITERS}]+{SCRIPT_SUFFIX})(?=$|[{SCRIPT_DELIMITERS}])", re.I)
 VERIFY_FILE_LIMIT = 1024 * 1024
 VERIFY_TOTAL_LIMIT = 32 * 1024 * 1024
+VERIFY_CONTENT_FILES = 256
+VERIFY_STAT_WORKERS = 16
 GIT_DIRTY_STATUS = ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 DETACHED_PROCESS = 0x00000008
@@ -1193,7 +1196,7 @@ def git(cwd, *argv, deadline, env=None, program="git"):
     return p.stdout
 
 
-def git_on_tree(cwd, deadline, operation):
+def git_on_tree(cwd, deadline, operation, *, raise_errors=False):
     def run(directory, program):
         def query(*argv, at=directory):
             if time.monotonic() >= deadline:
@@ -1205,43 +1208,85 @@ def git_on_tree(cwd, deadline, operation):
         return result
 
     try:
-        return run(cwd, "git")
-    except (OSError, ValueError):
-        drive = re.fullmatch(r"/mnt/([a-zA-Z])/(.*)", cwd) if not IS_WIN else None
-        windows_git = drive and shutil.which("git.exe")
-        if windows_git and time.monotonic() < deadline:
+        try:
+            return run(cwd, "git")
+        except (OSError, ValueError):
+            drive = re.fullmatch(r"/mnt/([a-zA-Z])/(.*)", cwd) if not IS_WIN else None
+            windows_git = drive and shutil.which("git.exe")
+            if not windows_git or time.monotonic() >= deadline:
+                raise
             directory = f"{drive[1].upper()}:/" + drive[2]
-            with suppress(OSError, ValueError, subprocess.TimeoutExpired):
-                return run(directory, windows_git)
-    except subprocess.TimeoutExpired:
-        pass
-    return None
+            return run(directory, windows_git)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        if raise_errors:
+            raise
+        return None
 
 
 def observations_changed(before, after):
     return any(key in before and before[key] != value for key, value in after.items())
 
 
-def dirty_file_hashes(directory, status, deadline):
+def stat_fingerprint(info):
+    return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
+
+
+def dirty_file_stats(directory, names, deadline):
+    def scan(batch):
+        fingerprints, unchecked = {}, set()
+        for name in batch:
+            if time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("dirty file checks", 0)
+            path = directory / os.fsdecode(name)
+            try:
+                info = path.lstat()
+                if stat.S_ISREG(info.st_mode):
+                    fingerprints[name] = stat_fingerprint(info)
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    fingerprints[name] = hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest()
+                    continue
+            except (OSError, ValueError):
+                pass
+            unchecked.add(name)
+        return fingerprints, unchecked
+
+    fingerprints, unchecked = {}, set()
+    batches = (names[offset::VERIFY_STAT_WORKERS] for offset in range(VERIFY_STAT_WORKERS))
+    with ThreadPoolExecutor(max_workers=VERIFY_STAT_WORKERS) as workers:
+        for batch, skipped in workers.map(scan, batches):
+            fingerprints.update(batch)
+            unchecked.update(skipped)
+    return fingerprints, unchecked
+
+
+def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
+    names = [entry[3:] for entry in status.split(b"\0") if entry and entry[1:2] != b"D"]
+    if stat_fallback and len(names) > VERIFY_CONTENT_FILES:
+        return dirty_file_stats(directory, names, deadline)
+
     hashes, unchecked = {}, set()
     remaining = VERIFY_TOTAL_LIMIT
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    for entry in status.split(b"\0"):
-        if not entry or entry[1:2] == b"D":
-            continue
+    for name in names:
         if time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired("dirty file checks", 0)
-        name = entry[3:]
         path = directory / os.fsdecode(name)
         limit = min(remaining, VERIFY_FILE_LIMIT)
         try:
             info = path.lstat()
             if stat.S_ISLNK(info.st_mode):
                 content = os.fsencode(os.readlink(path))
-            elif stat.S_ISREG(info.st_mode) and info.st_size <= limit:
-                with os.fdopen(os.open(path, flags), "rb") as file:
-                    opened = os.fstat(file.fileno())
-                    content = file.read(limit + 1) if stat.S_ISREG(opened.st_mode) and opened.st_size <= limit else None
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_size <= limit:
+                    with os.fdopen(os.open(path, flags), "rb") as file:
+                        opened = os.fstat(file.fileno())
+                        content = file.read(limit + 1) if stat.S_ISREG(opened.st_mode) and opened.st_size <= limit else None
+                elif stat_fallback:
+                    hashes[name] = stat_fingerprint(info)
+                    continue
+                else:
+                    content = None
             else:
                 content = None
         except (OSError, ValueError):
@@ -1271,11 +1316,11 @@ def verification_git_digest(cwd, paths):
         index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
                       "HEAD", "--", *relative, at=top)
         scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
-        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline)
+        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=True)
         checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
         return whole, (checksum, hashes), unchecked
 
-    return git_on_tree(cwd, deadline, digest)
+    return git_on_tree(cwd, deadline, digest, raise_errors=True)
 
 
 def verification_paths(context, cwd):
@@ -1518,14 +1563,24 @@ def execute(args, prompt, run_dir):
                   "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
     declared_paths = verification_paths(context, args.cwd) if host_verification else []
     paths = declared_paths or [args.cwd]
-    before_digest = verification_git_digest(args.cwd, paths) if host_verification else None
+
+    def take_snapshot(stage):
+        try:
+            digest = verification_git_digest(args.cwd, paths)
+        except subprocess.TimeoutExpired:
+            return None, f"{stage}_timeout"
+        except (OSError, ValueError):
+            return None, f"{stage}_git_error"
+        return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
+
+    before_digest, before_reason = take_snapshot("before") if host_verification else (None, None)
 
     def finish(result):
         if not host_verification:
             return result
-        after_digest = verification_git_digest(args.cwd, paths) if before_digest is not None else None
-        if after_digest is None or before_digest[1] is None or after_digest[1] is None:
-            result["verification_integrity"] = "unavailable"
+        after_digest, reason = take_snapshot("after") if before_digest is not None else (None, before_reason)
+        if reason:
+            result.update(verification_integrity="unavailable", verification_integrity_reason=reason)
         else:
             before_whole, before_scope, before_unchecked = before_digest
             after_whole, after_scope, after_unchecked = after_digest

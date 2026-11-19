@@ -114,6 +114,13 @@ FAKE_CODEX = textwrap.dedent(r"""
         target = Path("a.txt") if mode == "verification_overwrite" else Path("../outside.txt")
         target.write_bytes(b"changed by verifier\n")
         finish()
+    elif mode == "verification_overwrite_large":
+        target = Path("a.txt")
+        info = target.stat()
+        with target.open("r+b") as file:
+            file.write(b"y")
+        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+        finish()
     elif mode == "hang_with_detached_child":
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True,
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -4816,28 +4823,76 @@ class RunnerTests(unittest.TestCase):
                 shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_review_fix_host_verification_checks_dirty_bytes_and_reports_large_files(self):
+    def test_review_fix_host_verification_checks_dirty_bytes(self):
         prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
-        for kind in ("dirty", "untracked", "oversize"):
+        for kind in ("dirty", "untracked"):
             with self.subTest(kind=kind):
                 _, project, git = self.git_repo(f"verification-{kind}")
                 if kind == "untracked":
                     git("rm", "-q", "sub/a.txt")
                     git("commit", "-qm", "untrack a.txt")
-                (project / "a.txt").write_bytes(b"already dirty\n" if kind != "oversize" else b"x" * (2 * 1024 * 1024))
+                (project / "a.txt").write_bytes(b"already dirty\n")
                 self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
                 try:
                     result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
-                                         mode="verification_overwrite" if kind != "oversize" else "warnings_then_ok", prompt=prompt)
-                    if kind == "oversize":
-                        self.assertEqual((result["status"], result.get("verification_integrity"),
-                                          result.get("verification_unchecked_files")), ("completed", "unchecked", 1))
-                    else:
-                        self.assertEqual((result["status"], result.get("error_kind"), result.get("retryable")),
-                                         ("failed", "verification_tree_changed", False))
+                                         mode="verification_overwrite", prompt=prompt)
+                    self.assertEqual((result["status"], result.get("error_kind"), result.get("retryable")),
+                                     ("failed", "verification_tree_changed", False))
                 finally:
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_detects_large_dirty_file_change(self):
+        _, project, _ = self.git_repo("verification-large")
+        target = project / "a.txt"
+        target.write_bytes(b"x" * (2 * 1024 * 1024))
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                             mode="verification_overwrite_large", prompt=prompt)
+        self.assertEqual((result["status"], result.get("error_kind"), target.stat().st_size),
+                         ("failed", "verification_tree_changed", 2 * 1024 * 1024))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_accepts_unchanged_large_dirty_file(self):
+        _, project, _ = self.git_repo("verification-large-unchanged")
+        (project / "a.txt").write_bytes(b"x" * (2 * 1024 * 1024))
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access", prompt=prompt)
+        self.assertEqual((result["status"], result.get("verification_integrity"),
+                          result.get("verification_unchecked_files")), ("completed", None, None))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_compares_dirty_files_beyond_total_content_budget(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-budget")
+        (project / "a.txt").write_bytes(b"abcd")
+        target = project / "gone.txt"
+        target.write_bytes(b"abcd")
+        with mock.patch.object(codex_runner, "VERIFY_TOTAL_LIMIT", 4):
+            before = codex_runner.verification_git_digest(str(project), [str(project)])
+            info = target.stat()
+            target.write_bytes(b"efgh")
+            os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+            after = codex_runner.verification_git_digest(str(project), [str(project)])
+        self.assertEqual(before[2] | after[2], set())
+        self.assertEqual(before[1][0], after[1][0])
+        self.assertTrue(codex_runner.observations_changed(before[1][1], after[1][1]))
+
+    def test_host_verification_saves_unavailable_reason(self):
+        self.stored_job("SOURCE", {"status": "completed"})
+        prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        job = self.invoke("--context-json", "--sandbox", "danger-full-access", command="start", prompt=prompt)
+        result = self.control("status", job["job_id"], "--wait", "30")
+        saved = json.loads((Path(result["log_dir"]) / "result.json").read_text(encoding="utf-8"))
+        self.assertEqual((saved["status"], saved.get("verification_integrity"), saved.get("verification_integrity_reason")),
+                         ("completed", "unavailable", "before_git_error"))
 
     @unittest.skipUnless(hasattr(os, "mkfifo") and shutil.which("git"), "needs POSIX FIFOs and git")
     def test_review_r2_host_verification_does_not_wait_on_fifo_replacing_dirty_file(self):
@@ -4893,9 +4948,9 @@ class RunnerTests(unittest.TestCase):
 
         with mock.patch.object(codex_runner, "git", side_effect=git), \
                 mock.patch.object(Path, "lstat", slow_lstat), \
-                mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed):
-            result = codex_runner.verification_git_digest(str(self.cwd), [str(target)])
-        self.assertIsNone(result)
+                mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed), \
+                self.assertRaises(subprocess.TimeoutExpired):
+            codex_runner.verification_git_digest(str(self.cwd), [str(target)])
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_review_fix_host_verification_defaults_to_source_cwd_and_requires_overlapping_writer(self):
