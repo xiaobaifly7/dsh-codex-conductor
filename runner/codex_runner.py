@@ -78,6 +78,7 @@ SCRIPT_NAMES = re.compile(
     rf"|(?<![^{SCRIPT_DELIMITERS}])(?P<bare_dir>(?:[^{SCRIPT_DELIMITERS}]*[/\\])*)(?P<bare>[^{SCRIPT_DELIMITERS}]+{SCRIPT_SUFFIX})(?=$|[{SCRIPT_DELIMITERS}])", re.I)
 VERIFY_FILE_LIMIT = 1024 * 1024
 VERIFY_TOTAL_LIMIT = 32 * 1024 * 1024
+GIT_DIRTY_STATUS = ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
 NO_WINDOW = 0x08000000 if IS_WIN else 0
 DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -810,27 +811,35 @@ class RepeatGuard:
         self.blocked = None
 
     def fingerprint(self, command):
+        deadline = time.monotonic() + 2
+
         def git_state(query):
-            status = query("status", "--porcelain=v1", "-z", "--untracked-files=all", "--", ".")
-            head = b""
+            status = query(*GIT_DIRTY_STATUS, "--", ".")
+            state = {"git:status": hashlib.sha256(status).hexdigest()}
             with suppress(ValueError):
-                head = query("rev-parse", "--verify", "HEAD")
-            return hashlib.sha256(head + b"\0" + status).hexdigest()
+                state["git:head"] = query("rev-parse", "--verify", "HEAD").decode("ascii").strip()
+            if status:
+                top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
+                hashes, _ = dirty_file_hashes(Path(local_path(top)), status, deadline)
+                state.update({"file:" + hashlib.sha256(name).hexdigest(): digest for name, digest in hashes.items()})
+            return state
 
         cwd = Path(self.cwd)
-        state = None
+        state = {}
         if os.environ.get("GIT_DIR") or any((parent / ".git").exists() for parent in (cwd, *cwd.parents)):
-            state = git_on_tree(self.cwd, time.monotonic() + 2, git_state)
-        scripts = {}
+            state = git_on_tree(self.cwd, deadline, git_state) or {}
         for match in SCRIPT_NAMES.finditer(command):
             script = (match["quoted_dir"] or match["bare_dir"] or "") + (match["quoted"] or match["bare"])
             path = scope_path(self.cwd, script)
-            with suppress(OSError, ValueError):
+            key = "script:" + hashlib.sha256(os.fsencode(normalized_path(path))).hexdigest()
+            try:
                 info = os.stat(path)
-                scripts[normalized_path(path)] = (info.st_size, info.st_mtime_ns)
-        if state is None and not scripts:
-            return None
-        return hashlib.sha256(json.dumps([state, scripts], sort_keys=True).encode("utf-8")).hexdigest()
+                state[key] = [info.st_size, info.st_mtime_ns]
+            except FileNotFoundError:
+                state[key] = "missing"
+            except (OSError, ValueError):
+                pass
+        return state
 
     @staticmethod
     def step_names(command):
@@ -859,7 +868,9 @@ class RepeatGuard:
             if key != "_changed_at":
                 events = [event for event in value.get("events", []) if event[0] >= cutoff]
                 if events:
-                    recent[key] = {**value, "events": events}
+                    fingerprint = value.get("fingerprint")
+                    recent[key] = {**value, "events": events,
+                                   "fingerprint": fingerprint if isinstance(fingerprint, dict) else {}}
         changed_at = steps.get("_changed_at", 0)
         if recent or changed_at:
             recent["_changed_at"] = changed_at
@@ -948,7 +959,7 @@ class RepeatGuard:
     def check_start(self, step, command):
         with self.edit() as (steps, totals, now):
             record = steps.get(step)
-            if record and record["fingerprint"] != self.fingerprint(command):
+            if record and observations_changed(record["fingerprint"], self.fingerprint(command)):
                 steps.pop(step)
                 steps["_changed_at"] = now
                 record = None
@@ -983,7 +994,7 @@ class RepeatGuard:
             else:
                 prior = steps.get(step, {})
                 fingerprint = self.fingerprint(item["command"])
-                if prior and prior["fingerprint"] != fingerprint:
+                if prior and observations_changed(prior["fingerprint"], fingerprint):
                     prior = {}
                     steps["_changed_at"] = now
                 words = set(prior.get("words", []))
@@ -995,7 +1006,7 @@ class RepeatGuard:
                                  if word not in SCRIPT_EXTENSIONS)
                 steps.setdefault("_changed_at", 0)
                 steps[step] = {"events": [*prior.get("events", []), [now, seconds, exit_code]],
-                               "fingerprint": fingerprint, "words": sorted(words)}
+                               "fingerprint": {**prior.get("fingerprint", {}), **fingerprint}, "words": sorted(words)}
 
     def blocks(self):
         try:
@@ -1188,7 +1199,10 @@ def git_on_tree(cwd, deadline, operation):
             if time.monotonic() >= deadline:
                 raise subprocess.TimeoutExpired(argv, 0)
             return git(at, *argv, deadline=deadline, program=program)
-        return operation(query)
+        result = operation(query)
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired(program, 0)
+        return result
 
     try:
         return run(cwd, "git")
@@ -1204,13 +1218,48 @@ def git_on_tree(cwd, deadline, operation):
     return None
 
 
+def observations_changed(before, after):
+    return any(key in before and before[key] != value for key, value in after.items())
+
+
+def dirty_file_hashes(directory, status, deadline):
+    hashes, unchecked = {}, set()
+    remaining = VERIFY_TOTAL_LIMIT
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    for entry in status.split(b"\0"):
+        if not entry or entry[1:2] == b"D":
+            continue
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("dirty file checks", 0)
+        name = entry[3:]
+        path = directory / os.fsdecode(name)
+        limit = min(remaining, VERIFY_FILE_LIMIT)
+        try:
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                content = os.fsencode(os.readlink(path))
+            elif stat.S_ISREG(info.st_mode) and info.st_size <= limit:
+                with os.fdopen(os.open(path, flags), "rb") as file:
+                    opened = os.fstat(file.fileno())
+                    content = file.read(limit + 1) if stat.S_ISREG(opened.st_mode) and opened.st_size <= limit else None
+            else:
+                content = None
+        except (OSError, ValueError):
+            content = None
+        if content is None or len(content) > limit:
+            unchecked.add(name)
+        else:
+            remaining -= len(content)
+            hashes[name] = hashlib.sha256(content).hexdigest()
+    return hashes, unchecked
+
+
 def verification_git_digest(cwd, paths):
     deadline = time.monotonic() + 30
 
     def digest(query):
         head = query("rev-parse", "--verify", "HEAD")
-        status = ("status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames")
-        whole = hashlib.sha256(head + b"\0" + query(*status)).digest()
+        whole = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS)).digest()
         top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
         directory = Path(local_path(top))
         root = Path(normalized_path(str(directory)))
@@ -1221,38 +1270,10 @@ def verification_git_digest(cwd, paths):
         tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
         index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
                       "HEAD", "--", *relative, at=top)
-        scoped = query("--literal-pathspecs", *status, "--", *relative, at=top)
-        checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped)
-        unchecked = set()
-        remaining = VERIFY_TOTAL_LIMIT
-        for entry in scoped.split(b"\0"):
-            if not entry:
-                continue
-            name = entry[3:]
-            path = directory / os.fsdecode(name)
-            try:
-                if time.monotonic() >= deadline:
-                    raise subprocess.TimeoutExpired("verification file checks", 30)
-                info = path.lstat()
-                if stat.S_ISLNK(info.st_mode):
-                    content = os.fsencode(os.readlink(path))
-                elif stat.S_ISREG(info.st_mode) and info.st_size <= min(remaining, VERIFY_FILE_LIMIT):
-                    limit = min(remaining, VERIFY_FILE_LIMIT)
-                    with path.open("rb") as file:
-                        content = file.read(limit + 1)
-                    if len(content) > limit:
-                        unchecked.add(name)
-                        continue
-                else:
-                    unchecked.add(name)
-                    continue
-                remaining -= len(content)
-                checksum.update(name + b"\0" + hashlib.sha256(content).digest())
-            except FileNotFoundError:
-                continue
-            except OSError:
-                unchecked.add(name)
-        return whole, checksum.digest(), unchecked
+        scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
+        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline)
+        checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
+        return whole, (checksum, hashes), unchecked
 
     return git_on_tree(cwd, deadline, digest)
 
@@ -1503,19 +1524,20 @@ def execute(args, prompt, run_dir):
         if not host_verification:
             return result
         after_digest = verification_git_digest(args.cwd, paths) if before_digest is not None else None
-        if after_digest is None or after_digest[1] is None:
+        if after_digest is None or before_digest[1] is None or after_digest[1] is None:
             result["verification_integrity"] = "unavailable"
         else:
             before_whole, before_scope, before_unchecked = before_digest
             after_whole, after_scope, after_unchecked = after_digest
+            scope_changed = before_scope[0] != after_scope[0] or observations_changed(before_scope[1], after_scope[1])
             unchecked = before_unchecked | after_unchecked
             if unchecked:
                 result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
-            if before_scope != after_scope and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
+            if scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
                 result.pop("structured", None)
                 result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
                               error="Git status, index or file contents changed within the monitored verification paths.")
-            elif before_whole != after_whole or before_scope != after_scope:
+            elif before_whole != after_whole or scope_changed:
                 result["verification_integrity"] = "concurrent_changes"
         return result
 

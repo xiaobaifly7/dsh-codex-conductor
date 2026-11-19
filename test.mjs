@@ -2001,12 +2001,14 @@ test('codex_continue dispatches 22 original criteria with original context, perm
     else assert.equal(flag('--sandbox'), sandbox);
     const { dispatcher, ...taskContext } = envelope.context;
     assert.equal(dispatcher.pid, process.pid);
-    assert.deepEqual(taskContext, { owner: 'S1', task: source.context.task, acceptance: source.context.acceptance,
+    const durableTask = `${source.context.task}\n\n规划端解决依据（仅补充信息）：历史处理记录`;
+    assert.deepEqual(taskContext, { owner: 'S1', task: durableTask, acceptance: source.context.acceptance,
       write: source.context.write, continuation: { parent_job_id: 'PARENT', answers, resolution },
       routing: { continuation_mode: 'resume', continuation_reason: 'answers', parent_thread_id: source.thread_id } });
     assert.match(envelope.prompt, /保留旧 CSV 格式/);
     assert.ok(envelope.prompt.includes(source.context.acceptance.map((item, i) => `${i + 1}. ${item}`).join('\n')));
-    assert.doesNotMatch(envelope.prompt, /WHOLE-HISTORY-MUST-NOT-BE-COPIED|历史处理记录/);
+    assert.match(envelope.prompt, /历史处理记录/);
+    assert.doesNotMatch(envelope.prompt, /WHOLE-HISTORY-MUST-NOT-BE-COPIED/);
     assert.deepEqual(source, before);
   }
 });
@@ -6546,24 +6548,32 @@ test('planner continuation records decisions, counters and handover visibility',
   assert.match(runtime.content.at(-1).text, /代所有者决定 1 项（任务 CHILD）/);
 });
 
-test('review fix: a planner resolution survives two successive fresh repairs', async (t) => {
-  const { source, setup, exec } = decisionFixture(t);
-  let starts = 0;
-  const h = setup({ listResult: { jobs: [] },
-    startResult: () => ({ status: 'completed', job_id: `REPAIR-${++starts}` }) });
-  const resolution = 'Choose SQLite and reject JSON';
-  await h.tools.codex_continue.execute({ job_id: source.job_id, resolution, fresh: true }, exec);
-  const payloads = () => h.requests.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin));
-  const [first] = payloads();
-  assert.ok(first.prompt.includes(resolution));
-  h.finals['REPAIR-1'] = { ...source, job_id: 'REPAIR-1', context: first.context,
-    structured: { ...source.structured, summary: 'Implementation still incomplete', blockers: [],
-      criteria: source.structured.criteria.map(row => ({ ...row, status: 'not_met', evidence: 'Implementation gap' })) } };
-  await h.tools.codex_continue.execute({ job_id: 'REPAIR-1', fresh: true }, exec);
-  const [, second] = payloads();
-  assert.ok(second.prompt.includes(resolution));
-  assert.ok(second.context.task.includes(resolution));
-  assert.doesNotMatch(second.context.task, /Implementation still incomplete/);
+test('review fix: planner and owner resolutions survive two successive fresh repairs', async (t) => {
+  for (const ownerReplied of [false, true]) {
+    await t.test(ownerReplied ? 'owner reply' : 'planner decision', async (t) => {
+      const { source, setup } = decisionFixture(t);
+      const resolution = 'Choose SQLite and reject JSON';
+      const log = ownerReplied ? [{ type: 'user/message', time: (source.finished_at + 1) * 1000,
+        data: { source: { kind: 'user' }, content: [{ type: 'text', text: resolution }] } }] : [];
+      const exec = { agent: agentAt('/work', log) };
+      let starts = 0;
+      const h = setup({ listResult: { jobs: [] },
+        startResult: () => ({ status: 'completed', job_id: `REPAIR-${++starts}` }) });
+      await h.tools.codex_continue.execute({ job_id: source.job_id, resolution, fresh: true }, exec);
+      const payloads = () => h.requests.filter(({ argv }) => argv[0] === 'start').map(({ stdin }) => JSON.parse(stdin));
+      const [first] = payloads();
+      assert.ok(first.prompt.includes(resolution));
+      assert.equal(first.context.continuation.decided_by, ownerReplied ? undefined : 'planner');
+      h.finals['REPAIR-1'] = { ...source, job_id: 'REPAIR-1', context: first.context,
+        structured: { ...source.structured, summary: 'Implementation still incomplete', blockers: [],
+          criteria: source.structured.criteria.map(row => ({ ...row, status: 'not_met', evidence: 'Implementation gap' })) } };
+      await h.tools.codex_continue.execute({ job_id: 'REPAIR-1', fresh: true }, exec);
+      const [, second] = payloads();
+      assert.ok(second.prompt.includes(resolution));
+      assert.ok(second.context.task.includes(resolution));
+      assert.doesNotMatch(second.context.task, /Implementation still incomplete/);
+    });
+  }
 });
 
 test('review fix: owner-only questions count only after the host opens them', async (t) => {

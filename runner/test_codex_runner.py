@@ -459,6 +459,44 @@ class RunnerTests(unittest.TestCase):
         _, result, _, kills = self.repeat_job("edited-in-git", self.repeat_step(3, 0), [], cwd=cwd)
         self.assertEqual((result["status"], result["repeat_guard"]["blocks"], kills), ("completed", [], 0))
 
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_r2_repeat_guard_detects_edited_dirty_and_untracked_configuration(self):
+        for kind, filename in (("dirty", "a.txt"), ("untracked", "local-settings.json"), ("oversize", "a.txt")):
+            with self.subTest(kind=kind):
+                _, cwd, git = self.git_repo(kind)
+                config = cwd / filename
+                config.write_bytes(b"before\n")
+                status = git("status", "--porcelain", "--", f"sub/{filename}")
+                self.assertTrue(status.strip())
+                self.repeat_job(f"{kind}-failed", [*self.repeat_step(1), *self.repeat_step(2)], cwd=cwd)
+                if kind == "oversize":
+                    config.write_bytes(b"x" * (2 * 1024 * 1024))
+                    _, result, _, kills = self.repeat_job("over-budget", self.repeat_step(3, None), [], cwd=cwd)
+                    self.assertEqual(([block["prior_failures"] for block in result["repeat_guard"]["blocks"]], kills), ([2], 1))
+                    self.assertEqual(self.control("repeat-guard", "--cwd", str(cwd))["_changed_at"], 0)
+                config.write_bytes(b"after\n")
+                self.assertEqual(git("status", "--porcelain", "--", f"sub/{filename}"), status)
+                _, result, _, kills = self.repeat_job(f"{kind}-edited", self.repeat_step(3, 0), [], cwd=cwd)
+                self.assertEqual((result["repeat_guard"]["blocks"], kills), ([], 0))
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_review_r2_unavailable_git_keeps_failures_and_observes_script_edits(self):
+        import codex_runner
+
+        _, cwd, _ = self.git_repo("git-availability")
+        script = cwd / "setup.py"
+        script.write_bytes(b"before\n")
+        step = lambda number, exit_code: self.repeat_step(number, exit_code, command="python ./setup.py")
+        self.repeat_job("known", [*step(1, 1), *step(2, 1)], cwd=cwd)
+        with mock.patch.object(codex_runner, "git_on_tree", return_value=None):
+            _, result, _, kills = self.repeat_job("git-unavailable", step(3, None), [], cwd=cwd)
+        self.assertEqual(([block["prior_failures"] for block in result["repeat_guard"]["blocks"]], kills), ([2], 1))
+        self.assertEqual(self.control("repeat-guard", "--cwd", str(cwd))["_changed_at"], 0)
+        script.write_bytes(b"owner edited this script\n")
+        with mock.patch.object(codex_runner, "git_on_tree", return_value=None):
+            _, result, _, kills = self.repeat_job("script-edited", step(4, 0), [], cwd=cwd)
+        self.assertEqual((result["repeat_guard"]["blocks"], kills), ([], 0))
+
     def test_review_fix_repeat_guard_ignores_patch_outside_guarded_cwd(self):
         self.repeat_job("failed-elsewhere", [*self.repeat_step(1), *self.repeat_step(2)])
         patch = self.repeat_patch()
@@ -544,7 +582,7 @@ class RunnerTests(unittest.TestCase):
         dropped = {"type": "turn.failed", "error": {"message": "stream disconnected"}}
         _, result, _, kills = self.repeat_job("retried", [*self.repeat_step(1), dropped],
             [*self.repeat_step(2), *self.repeat_step(3, None)], [], options=("--retries", "1"))
-        self.assertEqual((result["status"], result["attempts"], kills), ("completed", 3, 1))
+        self.assertEqual((result["status"], result["attempts"], kills), ("completed", 3, 1 if os.name == "nt" else 2))
         _, result, _, kills = self.repeat_job("no-thread", None)
         self.assertEqual((result["error_kind"], result["attempts"], kills), ("repeated_failure", 1, 1))
 
@@ -4800,6 +4838,64 @@ class RunnerTests(unittest.TestCase):
                                          ("failed", "verification_tree_changed", False))
                 finally:
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo") and shutil.which("git"), "needs POSIX FIFOs and git")
+    def test_review_r2_host_verification_does_not_wait_on_fifo_replacing_dirty_file(self):
+        _, cwd, _ = self.git_repo("verification-fifo")
+        target = cwd / "a.txt"
+        target.write_bytes(b"dirty\n")
+        code = textwrap.dedent("""
+            import os, sys
+            from pathlib import Path
+            from unittest import mock
+
+            sys.path.insert(0, sys.argv[1])
+            import codex_runner
+
+            target = Path(sys.argv[2])
+            lstat = Path.lstat
+
+            def replace_with_fifo(path, *args, **kwargs):
+                info = lstat(path, *args, **kwargs)
+                if path == target:
+                    path.unlink()
+                    os.mkfifo(path)
+                return info
+
+            with mock.patch.object(Path, "lstat", replace_with_fifo):
+                result = codex_runner.verification_git_digest(str(target.parent), [str(target)])
+            assert target.is_fifo()
+            assert result is not None and result[2] == {b"sub/a.txt"}, result
+        """)
+        try:
+            subprocess.run([sys.executable, "-B", "-c", code, str(RUNNER.parent), str(target)], check=True,
+                           timeout=8, env=self.env)
+        except subprocess.TimeoutExpired:
+            self.fail("verification waited on a FIFO substituted for a dirty file")
+
+    def test_review_r2_host_verification_discards_a_snapshot_past_its_deadline(self):
+        import codex_runner
+
+        target = self.cwd / "dirty.txt"
+        target.write_bytes(b"changed\n")
+        lstat = Path.lstat
+        elapsed = 0
+
+        def git(cwd, *argv, **kwargs):
+            if "--show-toplevel" in argv:
+                return os.fsencode(self.cwd) + b"\n"
+            return b" M dirty.txt\0" if "status" in argv else b""
+
+        def slow_lstat(path):
+            nonlocal elapsed
+            elapsed = 31
+            return lstat(path)
+
+        with mock.patch.object(codex_runner, "git", side_effect=git), \
+                mock.patch.object(Path, "lstat", slow_lstat), \
+                mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed):
+            result = codex_runner.verification_git_digest(str(self.cwd), [str(target)])
+        self.assertIsNone(result)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_review_fix_host_verification_defaults_to_source_cwd_and_requires_overlapping_writer(self):

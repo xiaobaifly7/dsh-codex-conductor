@@ -131,9 +131,9 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
     return refuse('原 scope、task_options 或 thread_id 无效，先查询完整原始记录。', []);
   }
   const continuation = { parent_job_id: value.job_id, answers: normalized, resolution };
-  // 新线程只能读到保存的 task；只累计用户决定，不把历轮报告带进下一轮。
+  // 新线程只能读到保存的 task；累计提交的回答和解决依据，不带历轮报告。
   const previousAnswers = context.continuation?.answers ?? [];
-  const previousResolution = context.continuation?.decided_by === 'planner' ? context.continuation.resolution : '';
+  const previousResolution = context.continuation?.resolution;
   const task = [context.task,
     previousAnswers.length ? `规划端回答（仅补充信息）：${JSON.stringify(previousAnswers)}` : '',
     nonempty(previousResolution) ? `规划端解决依据（仅补充信息）：${previousResolution}` : '',
