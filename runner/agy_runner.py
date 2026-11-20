@@ -24,6 +24,8 @@ DENIAL = re.compile(
     r"|(?:tool call|command) (?:was )?denied"
     r"|(?:approval|permission) [^\n]*(?:headless|non.interactive))\b", re.IGNORECASE
 )
+INVALID_FLAG = re.compile(r"flag provided but not defined|unknown (?:flag|option)|invalid value .+ for flag", re.IGNORECASE)
+HTTP_FORBIDDEN = re.compile(r"\b403\b")
 
 
 def _reject_unc(path):
@@ -246,6 +248,8 @@ def _launch(run_dir, job_id, cwd, command, flags):
         threading.Thread(target=send_prompt, daemon=True).start()
     denied = []
     diagnostics_tail = [""]
+    invalid_flag = []
+    provider_denial = []
 
     def stderr():
         with child.stderr:
@@ -255,7 +259,12 @@ def _launch(run_dir, job_id, cwd, command, flags):
                 text = line.decode("utf-8", "replace").strip()
                 if text:
                     diagnostics_tail[0] = text[-1000:]
-                if not denied and (DENIAL.search(text) or "permissions.allow" in text):
+                if not invalid_flag and INVALID_FLAG.search(text):
+                    invalid_flag.append(text[:1000])
+                if HTTP_FORBIDDEN.search(text):
+                    if not provider_denial:
+                        provider_denial.append(text[:1000])
+                elif not denied and (DENIAL.search(text) or "permissions.allow" in text):
                     denied.append(text[-1000:])
 
     diagnostics = threading.Thread(target=stderr, daemon=True)
@@ -278,13 +287,17 @@ def _launch(run_dir, job_id, cwd, command, flags):
         payload = (result or {}).get("result")
         payload = payload if isinstance(payload, dict) else {}
         conversation_id = (result or {}).get("conversation_id") or payload.get("conversation_id")
-        if denied:
+        problem = (result or {}).get("error") or payload.get("error")
+        if denied and not _provider_forbidden(problem) and not (result is None and provider_denial):
             _emit({"event": "permission_denied", "error": denied[0],
                    "conversation_id": conversation_id})
         if result is not None and (not code or payload.get("status") != "SUCCESS"):
             _emit(result)
         elif code:
-            _emit({"event": "error", "error": diagnostics_tail[0] or f"agy process exited with code {code}",
+            message = provider_denial[0] if provider_denial else diagnostics_tail[0]
+            if invalid_flag:
+                message = f"agy rejected a CLI argument: {invalid_flag[0]}"
+            _emit({"event": "error", "error": message or f"agy process exited with code {code}",
                    "conversation_id": conversation_id})
         return code
     finally:
@@ -298,6 +311,10 @@ def _message(payload):
         message = payload.get("message") or payload.get("error") or payload.get("code") or payload.get("type")
         return _message(message) if message else ""
     return ""
+
+
+def _provider_forbidden(problem):
+    return (isinstance(problem, dict) and str(problem.get("code")) == "403") or bool(HTTP_FORBIDDEN.search(_message(problem)))
 
 
 class EventAdapter:
@@ -331,6 +348,9 @@ class EventAdapter:
         status = str(result.get("status", raw_event.get("status", "")))
         problem = raw_event.get("error") or result.get("error") or step.get("error") or info.get("error")
         error = _message(problem)
+        if kind in ("result", "error") and status != "SUCCESS" and _provider_forbidden(problem):
+            yield self._failed(error if HTTP_FORBIDDEN.search(error) else f"HTTP 403: {error or 'Forbidden'}")
+            return
         denial = next((text for text in (error, status, str(kind), str(step.get("state", "")),
                                         str(info.get("status", "")),
                                         str(problem.get("type") or problem.get("code")) if isinstance(problem, dict) else "")

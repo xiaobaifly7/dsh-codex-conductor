@@ -201,7 +201,9 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### Gemini 执行
 
-已有 `gemini.command` 配置时，`codex_run`、`codex_continue`、`codex_verify` 可传 `engine: "gemini"`，经 Windows Antigravity 执行。`codex_status`、`codex_output`、`codex_jobs`、`codex_cancel` 和 `codex_review` 共用原 runner job ID。Gemini 的模型和推理强度沿用 `gemini.model`、`gemini.effort`，没有 Codex 服务档位。两种引擎都提交同一份逐条验收报告。
+已有 `gemini.command` 配置时，`codex_run`、`codex_continue`、`codex_verify` 可传 `engine: "gemini"`，经 Windows Antigravity 执行。`codex_status`、`codex_output`、`codex_jobs`、`codex_cancel` 和 `codex_review` 共用原 runner job ID。两种引擎都提交同一份逐条验收报告。
+
+模型名使用 `agy models` 列出的完整 ID，例如 `gemini-4-carbon-high` 或 `gemini-3.8-flash-high`。任务和 `gemini.model` 都未指定时，runner 省略 `--model`，由 agy 选择。新任务仅在显式配置 `gemini.effort` 时传 `--effort`。使用模型名指定档位时可省略 `gemini.effort`。模型不可用、额度不足或账号无权限时，任务回执提示规划端改用 `engine: "codex"` 重新派单或核验。
 
 | 配置 | 默认 | 作用 |
 | --- | --- | --- |
@@ -511,13 +513,13 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
     gemini:
       command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
       proxy: 'http://127.0.0.1:7890'
-      model: gemini-4-argon
+      model: gemini-4-argon-medium
       effort: medium
       timeoutSeconds: 1800
       idleTimeoutSeconds: 600
 ```
 
-`model / effort / timeoutSeconds / idleTimeoutSeconds` 的默认值如上，两个超时均须为正有限秒数，`effort` 支持 `low / medium / high`；`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
+`model` 用 `agy models` 核对完整 ID。两个超时的默认值如上，均须为正有限秒数。`gemini_write` 固定传入 `--effort`，默认 `medium`，支持 `low / medium / high`。`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
 
 启动与思考阶段只受 `timeoutSeconds` 总上限约束；收到非空 `agent_response.text_delta` 或 `tool/write_file` 步骤后才启用 `idleTimeoutSeconds`，之后任意 stdout 字节（含不完整 JSON）均续时，stderr 不续时。首稿与压缩共用总预算（默认 1800 秒），CLI 的 `--print-timeout` 同步总上限；超时或取消后等待子进程关闭，再保稿、回滚。回执累计记录 `stdout_bytes / event_count / event_types`，步骤类型以 `step_update:<step_type>` 计数，`last_event_type` 为最后已解析事件的同类标签，不保存事件正文；`last_progress_s` 是最后一次尝试关闭时距最后 stdout 的秒数（无输出则从启动计），`timeout_kind` 为 `idle / total / null`。本机 agy 帮助与内置发布说明确认顶层事件为 `init / step_update / result`；程序的 `DeriveStepType` 区分 `user_input / agent_response / tool / finish / subagent / system_message / checkpoint / error_message / unknown`，`PollPrintmode` 在生成文本增量前调用 `StripThoughts`，因此不能依赖思考心跳。历史 1545 字节、2 个事件的失败回执没有类型记录，无法反推那两个事件的性质。
 
@@ -794,13 +796,13 @@ Use `codex_run` for source changes, investigation and material notes; use `gemin
     gemini:
       command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
       proxy: 'http://127.0.0.1:7890'
-      model: gemini-4-argon
+      model: gemini-4-argon-medium
       effort: medium
       timeoutSeconds: 1800
       idleTimeoutSeconds: 600
 ```
 
-The model, effort and two timeout values shown are the defaults; both timeouts accept positive finite seconds, and effort accepts `low / medium / high`. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
+Use the full model ID listed by `agy models`. The two timeout values shown are defaults and accept positive finite seconds. `gemini_write` always passes `--effort`, which defaults to `medium` and accepts `low / medium / high`. New runner tasks pass `--effort` only when `gemini.effort` is explicitly configured. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
 
 Startup and thinking use only the total `timeoutSeconds` deadline; a nonempty `agent_response.text_delta` or `tool/write_file` step enables `idleTimeoutSeconds`, after which any stdout bytes, including incomplete JSON, renew it; stderr does not. Generation and compression share the total deadline (1800 seconds by default), also passed to CLI `--print-timeout`. Timeout/cancellation waits for child close before draft preservation and rollback. Receipts accumulate `stdout_bytes / event_count / event_types`, labeling steps as `step_update:<step_type>`; `last_event_type` uses the same label for the last parsed event, without saving event bodies. `last_progress_s` measures seconds since the last stdout, or launch if silent, at the last attempt's close; `timeout_kind` is `idle / total / null`. Local agy help and embedded release notes confirm `init / step_update / result` events. Its `DeriveStepType` distinguishes `user_input / agent_response / tool / finish / subagent / system_message / checkpoint / error_message / unknown`, and `PollPrintmode` calls `StripThoughts` before producing text deltas, so thinking heartbeats cannot be assumed. The historical failure receipt with 1545 bytes and two events has no event types, leaving their nature unknown.
 

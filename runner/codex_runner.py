@@ -100,8 +100,9 @@ TRANSIENT = re.compile(
     r"stream disconnected|stream error|timed? ?out|connection|reset by peer|\b429\b|rate.?limit"
     r"|\b50[0234]\b|overloaded|server_error|temporarily|try again", re.I)
 PROVIDER_PERMANENT = re.compile(
-    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|quota|insufficient balance"
-    r"|model.{0,40}(not found|not supported|does not exist)", re.I)
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|log.?in required|sign.?in required"
+    r"|usage limit|quota|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
+    r"|model.{0,40}(not found|not supported|not available|does not exist)", re.I)
 
 
 def emit(obj):
@@ -810,8 +811,13 @@ def classify(state, run_dir):
             text = ""
         engine = "Gemini" if state.get("engine") == "gemini" else "Codex"
         state["error"] = text.strip()[-500:] or f"{engine} exited without turn.completed"
-    if state.get("engine") == "gemini" and "agy permission denied" in text.lower():
-        return "permission_denied", False
+    if state.get("engine") == "gemini":
+        if "agy permission denied" in text.lower():
+            return "permission_denied", False
+        if text.startswith("agy rejected a CLI argument:"):
+            return "bad_arguments", False
+        if PROVIDER_PERMANENT.search(text):
+            return "provider_permanent", False
     if REFUSED.search(text):
         return "model_refused", False
     if PERMANENT.search(text):
@@ -843,7 +849,7 @@ GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c"
             "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--submodule=short")
 
 
-def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None, *, strict=False):
+def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None, *, strict=False, exclude_tree=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
     None when the walk exceeds the budget. With scope, entries that took over SCOPE_SLOW_S to walk, or that were being
     walked when the budget ran out, are appended to slow; when only the whole scoped walk took over SCOPE_SLOW_S, its
@@ -881,6 +887,8 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None, *, strict=Fals
                 if slow is not None and scope:
                     slow.append(top)
                 return None
+            if exclude_tree and normalized_path(dirpath) == os.path.dirname(exclude_tree):
+                dirnames[:] = [name for name in dirnames if normalized_path(os.path.join(dirpath, name)) != exclude_tree]
             if strict:
                 add(dirpath)
                 filenames.extend(name for name in dirnames if os.path.islink(os.path.join(dirpath, name)))
@@ -1753,7 +1761,10 @@ def execute(args, prompt, run_dir):
     def fallback_snapshot():
         monitored = list(dict.fromkeys(os.path.realpath(path) for path in roots.values())) if roots else [args.cwd]
         try:
-            return snapshot(args.cwd, scope=monitored, strict=True)
+            runner_home = Path(normalized_path(str(HOME.resolve())))
+            if any(Path(normalized_path(path)).is_relative_to(runner_home) for path in monitored):
+                return None
+            return snapshot(args.cwd, scope=monitored, strict=True, exclude_tree=str(runner_home))
         except (OSError, ValueError):
             return None
 
@@ -3147,7 +3158,10 @@ def gemini_admission(args):
                 continue
             prior = task.get("context") or {}
             if parent and prior.get("fallback_of") == parent and prior.get("owner") == owner:
-                return {"job_id": job_dir.name, "status": job_status(job_dir.name)["status"], "deduplicated": True}
+                if (job_dir / "worker.pid").is_file() or (job_dir / "result.json").is_file():
+                    child = job_status(job_dir.name)
+                    if child.get("error_kind") != "worker_start_failed":
+                        return {"job_id": job_dir.name, "status": child["status"], "deduplicated": True}
             if limit:
                 worker_running = not (job_dir / "result.json").exists() and recorded_pid(job_dir / "worker.pid") is not None
                 if worker_running or recorded_pid(job_dir / "codex.pid") is not None:
@@ -3176,15 +3190,38 @@ def start_job(args, prompt):
         (job_dir / "boot_id").write_text(boot)
     # Windows cannot replace a PID file while another publisher is replacing it.
     with acquire_file_lock(job_dir / "process.lock", blocking=True):
-        worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
-                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                  creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
-                                  start_new_session=not IS_WIN, close_fds=True)
+        try:
+            worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
+                                      start_new_session=not IS_WIN, close_fds=True)
+        except OSError as error:
+            if args.engine != "gemini":
+                raise
+            failure = {**job_metadata(job_dir, task=task), "status": "failed", "error_kind": "worker_start_failed",
+                       "error": f"Could not start Gemini worker: {error}", "retryable": True, "attempts": 0}
+            write_result(job_dir, failure)
+            return {"job_id": job_id, **failure}
         record_pid(job_dir / "worker.pid", worker.pid)
     return {"job_id": job_id, "status": "running"}
 
 
 PRUNE_TTL = 30 * 86400
+
+
+def keep_fallback_child(job_dir, result=None):
+    with suppress(OSError, ValueError):
+        task = task_record(job_dir)
+        parent = (task.get("context") or {}).get("fallback_of")
+        if task.get("engine") != "gemini" or not parent or parent == job_dir.name or not job_directory(parent).is_dir():
+            return False
+        if result is None:
+            record = job_dir / "result.json"
+            if not record.is_file():
+                return (job_dir / "worker.pid").is_file()
+            result = json.loads(record.read_text("utf-8"))
+        return isinstance(result, dict) and result.get("error_kind") != "worker_start_failed"
+    return False
 
 
 def prune_old(subdir):
@@ -3204,7 +3241,7 @@ def prune_old(subdir):
                 expired = result.stat().st_mtime < cutoff
             else:
                 expired = max(p.stat().st_mtime for p in [d, *d.rglob("*")]) < cutoff
-            if expired:
+            if expired and not (subdir == "jobs" and keep_fallback_child(d)):
                 shutil.rmtree(d, ignore_errors=True)
         except (OSError, ValueError):
             pass
@@ -3238,6 +3275,8 @@ def prune_storage(max_storage_mb, keep=()):
                     continue
                 value = json.loads(result.read_text("utf-8"))
                 if not isinstance(value, dict) or value.get("status") not in ("completed", "failed", "cancelled"):
+                    continue
+                if root.name == "jobs" and keep_fallback_child(d, value):
                     continue
                 if any(recorded_pid(d / name) is not None for name in ("worker.pid", "codex.pid")):
                     continue

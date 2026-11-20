@@ -736,6 +736,15 @@ function failureReceipt(value, cause) {
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions } = {}) {
   const blocking = blockingState(value);
   if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
+  if (value.error_kind === 'provider_permanent') {
+    const target = value.context?.verification_of;
+    return `Gemini 提供方无法执行：${String(value.error ?? '请核对账号、模型和额度').slice(0, 300)}。` +
+      (target ? `用 codex_verify 对 ${target} 显式传 engine: "codex" 重新核验。`
+        : '先核对已有产物，再按原授权用 codex_run 显式传 engine: "codex" 重新派单，只补缺项。');
+  }
+  if (jobEngine(value) === 'gemini' && value.error_kind === 'bad_arguments') {
+    return `Gemini 启动参数无效：${String(value.error ?? '请核对 agy 参数和任务权限').slice(0, 300)}。`;
+  }
   if (value.error_kind === 'executor_lost') {
     const resume = value.thread_id ? `，或用 codex_continue ${value.job_id} 在原线程续接（fresh=false）` : '';
     return `任务 ${value.job_id} 的执行环境中断（${value.lost_reason}：WSL 重启或执行进程退出），没有生成报告。` +
@@ -1099,7 +1108,8 @@ function settings(config, logger) {
           : key === 'effort' ? ['low', 'medium', 'high'].includes(value) : typeof value === 'string' && value.trim().length > 0;
         if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
         config.gemini[key] = valid ? value : fallback;
-        if (key === 'model') config.gemini.executionModel = valid ? value : 'gemini-4-carbon';
+        if (key === 'model' && valid) config.gemini.executionModel = value;
+        if (key === 'effort' && valid) config.gemini.executionEffort = value;
       }
       // The configured effort wins over whatever the planner passes.
       if (gemini.forceEffort !== undefined) {
@@ -2033,7 +2043,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const [result, notices, parked, fallback] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
       value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined,
       allowFallback ? fallbackOnFailure(value, exec) : undefined]);
-    const next = parked && !['executor_lost', 'verification_tree_changed'].includes(value.error_kind)
+    const next = parked && !['executor_lost', 'verification_tree_changed', 'provider_permanent'].includes(value.error_kind)
       ? [parked.line] : [result.next, parked?.line];
     return notices.length || parked || blockLine || standingLine || fallback ? {
       ...result, ...(parked ? { parked_review: parked.parked_review } : {}), ...(fallback ? { fallback: fallback.receipt } : {}),
@@ -2060,6 +2070,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           writable_roots: options?.writable_roots ?? [], host_access: sandbox === 'danger-full-access', wait_seconds: 0,
         }, { agent }, continuation, context.task, context.verification_of, undefined, undefined, { parent: source, fallbackOf: parent });
         if (!child.job_id || unknownState(child)) throw new Error(child.error ?? child.error_kind ?? child.status);
+        if (child.error_kind === 'worker_start_failed') {
+          return { receipt: { job_id: child.job_id, engine: 'gemini', status: child.status },
+            line: `Gemini 接替任务 ${child.job_id} 未启动：${child.error}。可重新查询原任务触发接替。` };
+        }
         return { receipt: { job_id: child.job_id, engine: 'gemini', status: child.status },
           line: `Codex 任务 ${parent} 因 ${source.error_kind ?? '上游失败'} 终止。已转交 Gemini 任务 ${child.job_id}。${waitForJob(child.job_id)}` };
       } catch (error) {
@@ -2503,8 +2517,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const engine = runEngine(args, cfg);
     let effortLine;
-    if (engine === 'gemini' && !continuation && args.effort !== undefined) {
-      effortLine = `本单 Gemini 使用配置的 effort=${cfg.gemini?.effort ?? 'high'}。`;
+    if (engine === 'gemini' && !continuation && !verificationOf && args.effort !== undefined) {
+      effortLine = cfg.gemini?.executionEffort ? `本单 Gemini 使用配置的 effort=${cfg.gemini.executionEffort}。`
+        : '本单 Gemini 由 agy 决定推理档位。';
       args = { ...args, effort: undefined };
     }
     if (engine === 'codex' && !continuation && !verificationOf && (args.effort !== undefined || args.effort_reason !== undefined)) {
@@ -3010,7 +3025,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         effort: cfg.readOnlyEffort || (same ? options.effort : cfg.effort) || undefined,
         model: cfg.modelAB.enabled || !same ? cfg.model : options.model ?? '',
         service_tier: same ? options.service_tier ?? '' : cfg.serviceTier,
-      } : same ? { model: options.model, effort: options.effort } : {}),
+      } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
     }, exec, undefined, undefined, source.job_id, undefined, undefined, { onStarted });
   }

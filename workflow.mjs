@@ -164,10 +164,11 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (scope != null) args.scope = [...scope];
   if (options.writable_roots != null) args.writable_roots = [...options.writable_roots];
   if (options.effort != null) args.effort = options.effort;
-  if (options.model != null) args.model = options.model;
-  if (options.service_tier != null) args.service_tier = options.service_tier;
   if (value.thread_id != null) args.resume = value.thread_id;
-  if (value.conversation_id != null) args.conversation_id = value.conversation_id;
+  if (value.conversation_id != null) {
+    args.conversation_id = value.conversation_id;
+    if (options.model != null) args.model = options.model;
+  }
   return { ready: true, args, task, continuation, blocking,
     next: value.conversation_id ? '计划已准备，使用原 conversation_id 续接；尚未执行。'
       : value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };

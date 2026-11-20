@@ -85,6 +85,18 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(list(adapter.events({"event": "result", "result": {"status": "SUCCESS"}})), [])
 
     @unittest.skipIf(os.name == "nt", "exercises the Linux fake executable path")
+    def test_cli_flag_error_is_reported_instead_of_usage_tail(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            fake = Path(run_dir) / "fake-agy"
+            fake.write_text("#!/bin/sh\nprintf '%s\\n' 'flag provided but not defined: -json-schema' 'Usage: agy' >&2\nexit 2\n")
+            fake.chmod(0o700)
+            command, env = agy_runner.build_command(args(run_dir, agy_command=fake), run_dir, None)
+            child = subprocess.run(command, env=env, input=b"example", capture_output=True, timeout=5)
+            self.assertEqual(child.returncode, 2)
+            self.assertEqual(json.loads(child.stdout)["error"],
+                             "agy rejected a CLI argument: flag provided but not defined: -json-schema")
+
+    @unittest.skipIf(os.name == "nt", "exercises the Linux fake executable path")
     def test_linux_fake_preserves_prompt_and_overrides_success_on_stderr_denial(self):
         with tempfile.TemporaryDirectory() as run_dir:
             fake = Path(run_dir) / "fake-agy"

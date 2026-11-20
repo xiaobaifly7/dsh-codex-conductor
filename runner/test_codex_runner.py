@@ -179,7 +179,9 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "fallback_stderr":
         print("connection reset", file=sys.stderr)
         sys.exit(1)
-    elif mode in ("fallback_event", "fallback_retry_write", "fallback_local_error"):
+    elif mode in ("fallback_event", "fallback_retry_write", "fallback_local_error", "fallback_unreported_file"):
+        if mode == "fallback_unreported_file":
+            Path("real-change.txt").write_text("changed")
         if mode == "fallback_event":
             say(type="item.updated", item={"type": "file_change", "changes": [{"path": "rewritten.txt"}]})
         if mode == "fallback_retry_write":
@@ -254,6 +256,12 @@ FAKE_AGY = textwrap.dedent(r"""
         time.sleep(300)
     if mode == "deny":
         print("command blocked by permissions", file=sys.stderr, flush=True)
+    if mode == "provider_error":
+        error = json.loads(os.environ["FAKE_AGY_ERROR"])
+        if isinstance(error, str):
+            print(error, file=sys.stderr, flush=True)
+        say(event="result", result={"status": "ERROR", "error": error})
+        sys.exit(1)
     report = json.loads(os.environ["FAKE_AGY_REPORT"])
     say(event="result", result={"status": "SUCCESS", "structured_output": report,
                                 "conversation_id": conversation, "usage": {"input_tokens": 5}})
@@ -2796,6 +2804,62 @@ class RunnerTests(unittest.TestCase):
                 if mode == "fallback_retry_write":
                     self.assertEqual(result["attempts"], 2)
                     self.assertFalse((self.cwd / ".git" / "ignored-change").exists())
+
+    def test_fallback_deduplication_survives_storage_and_age_pruning(self):
+        import codex_runner
+
+        context = self.sample_context()
+        parent = self.stored_job("parent", {"status": "failed", "fallback_safe": True}, context=context)
+        child = self.stored_job("child", {"status": "completed"}, engine="gemini",
+                                context={**context, "fallback_of": parent.name})
+        os.utime(child / "result.json", (1, 1))
+        args = argparse.Namespace(context={**context, "fallback_of": parent.name}, max_engine_running=None)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            codex_runner.prune_storage(0.000001, keep={parent.name})
+            codex_runner.prune_old("jobs")
+            result = codex_runner.gemini_admission(args)
+        self.assertTrue(parent.exists())
+        self.assertEqual(result, {"job_id": child.name, "status": "completed", "deduplicated": True})
+
+    def test_a_failed_gemini_worker_spawn_is_terminal_and_allows_another_fallback(self):
+        import codex_runner
+
+        context = self.sample_context()
+        parent = self.stored_job("parent", {"status": "failed", "fallback_safe": True}, context=context)
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", "unused"])
+        args.context = {**context, "fallback_of": parent.name}
+        args.max_engine_running = 1
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            with mock.patch.object(codex_runner.subprocess, "Popen", side_effect=OSError(errno.EAGAIN, "busy")):
+                failed = codex_runner.start_job(args, "fallback")
+            stored = codex_runner.job_status(failed["job_id"])
+            self.assertEqual((stored["status"], stored["error_kind"], stored["attempts"]),
+                             ("failed", "worker_start_failed", 0))
+            self.assertIn("busy", stored["error"])
+            self.assertIsNone(codex_runner.gemini_admission(args))
+
+    def test_fallback_snapshots_exclude_runner_home_but_detect_workspace_changes(self):
+        home = self.cwd / ".local" / "state" / "codex-runner"
+        checked = ("--gemini-fallback-check", "--retries", "0")
+        env = {"CODEX_RUNNER_HOME": str(home)}
+        for mode, expected in (("refused_turn", True), ("fallback_unreported_file", False)):
+            with self.subTest(mode=mode):
+                result = self.invoke(*checked, mode=mode, env=env)
+                self.assertIs(result["fallback_safe"], expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_model_quota_and_login_failures_are_provider_permanent(self):
+        argv, env, _ = self.fake_gemini(mode="provider_error")
+        for error in ("invalid model selection: --effort is not supported for model", "weekly quota exhausted",
+                      "not logged in", "model is not available", "403 PERMISSION_DENIED: account disabled",
+                      {"code": 403, "status": "PERMISSION_DENIED", "message": "Account disabled"}):
+            with self.subTest(error=error):
+                result = self.invoke(*argv, env={**env, "FAKE_AGY_ERROR": json.dumps(error)})
+                self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                                 ("failed", "provider_permanent", False, 1))
+                self.assertIn(error["message"] if isinstance(error, dict) else error, result["error"])
 
     def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
         import codex_runner
