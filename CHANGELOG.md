@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.132-gemini.0` 在通用 runner 中接入 Windows Antigravity 执行。`codex_run`、`codex_continue` 和 `codex_verify` 支持按单选引擎，共用任务记录、写锁和逐条验收。支持默认引擎、经 runner 确认无写入后的 Codex 失败接替、独立交叉核验和 Gemini 并发上限。修复新会话续接丢失原模型及服务档位的问题。
+
 `0.9.131` `codex_continue` 和带 `resume` 的 `codex_run` 启动写任务前，比对同线程及续接链上仍在运行的核验范围。范围重叠时复查核验状态，再提示规划端等待。查询失败会记录警告，已结束的核验、只读续接和范围不重叠的续接可照常启动。
 
 `0.9.130` 主机核验比对常规文件的大小、纳秒级修改时间和类型，两次快照均取得内容哈希时也比对哈希。脏文件较多时并行读取元数据。快照不可用时（包括线程启动失败），保留核验结果并记录失败阶段和原因类型。
@@ -157,6 +159,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.132-gemini.0` adds Windows Antigravity as a runner engine for dispatch, continuation and verification. The same jobs, write locks and per-criterion reviews serve both engines. The plugin supports default engine selection, eligible Codex failures with no observed writes, cross-engine verification and a Gemini concurrency limit. Fresh continuations retain the original model and service tier.
 
 `0.9.131` checks running verifications in the same thread or continuation chain before starting write continuations in `codex_continue` and `codex_run` with `resume`. It rechecks an overlapping verification before asking the planner to wait. Query failures log a warning. Completed verifications, read-only continuations and disjoint write scopes do not block dispatch.
 

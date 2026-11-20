@@ -14,6 +14,7 @@ const { apply, nextStep, normPath } = await import('./index.mjs');
 const schema = JSON.parse(readFileSync(new URL('./report.v2.schema.json', import.meta.url), 'utf8'));
 const exec = { agent: { id: 'verify-session', session: { header: { cwd: '/work/planner' }, log: [] } } };
 const acceptance = ['核对原任务书及产物', '逐条核实结论的原始出处'];
+const gemini = { command: 'C:\\tools\\agy.exe', model: 'gemini-4-carbon', effort: 'high' };
 
 function report(criteria = acceptance) {
   return { summary: '已核对结论及其出处',
@@ -97,6 +98,88 @@ test('codex_run validates, stores and prompts for must_verify indices', async ()
   }
 });
 
+const option = (argv, flag) => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined;
+
+test('codex_run uses the configured default engine and a per-task override', async () => {
+  const args = { task: 'Inspect the project layout.', acceptance, write: false };
+  for (const [requested, selected] of [[undefined, 'gemini'], ['codex', 'codex'], ['gemini', 'gemini']]) {
+    const h = harness({ config: { gemini, defaultEngine: 'gemini', maxGeminiRunningJobs: 3, defaultHostAccess: true } });
+    await h.tools.codex_run.execute({ ...args, ...(requested ? { engine: requested } : {}) }, exec);
+    const { argv } = h.start();
+    assert.equal(option(argv, '--sandbox'), 'danger-full-access');
+    assert.equal(option(argv, '--engine') ?? 'codex', selected);
+    assert.equal(option(argv, '--model'), selected === 'gemini' ? gemini.model : 'new-default-model');
+    assert.equal(option(argv, '--max-engine-running'), selected === 'gemini' ? '3' : undefined);
+    assert.equal(option(argv, '--service-tier'), selected === 'gemini' ? undefined : 'new-default-tier');
+  }
+});
+
+test('codex_verify switches engines by default and starts an independent read-only session', async () => {
+  for (const [from, override, enabled, to] of [
+    ['codex', undefined, true, 'gemini'], ['gemini', undefined, true, 'codex'],
+    ['codex', 'codex', true, 'codex'], ['gemini', undefined, false, 'gemini'],
+  ]) {
+    const source = sourceJob();
+    if (from === 'gemini') {
+      source.engine = 'gemini';
+      source.conversation_id = source.thread_id;
+      delete source.thread_id;
+    }
+    const h = harness({ source, config: { gemini, crossEngineVerify: enabled } });
+    await h.verify(override ? { engine: override } : {});
+    const { argv } = h.start();
+    assert.equal(option(argv, '--engine') ?? 'codex', to);
+    assert.equal(option(argv, '--resume'), undefined);
+    assert.equal(option(argv, '--sandbox'), undefined);
+    assert.equal(h.payload().context.write, false);
+    assert.equal(h.payload().context.verification_of, 'SOURCE-1');
+    assert.equal(option(argv, '--model'), from === to ? 'original-model' : to === 'gemini' ? gemini.model : 'new-default-model');
+  }
+});
+
+test('codex_continue retains the native session and settings or starts fresh on an engine switch', async () => {
+  for (const [from, to, fresh] of [['gemini', 'gemini', false], ['gemini', 'codex', false], ['codex', 'gemini', false], ['codex', 'codex', true]]) {
+    const source = sourceJob();
+    source.structured.criteria[0].status = 'not_met';
+    if (from === 'gemini') {
+      source.engine = 'gemini';
+      source.conversation_id = source.thread_id;
+      delete source.thread_id;
+    }
+    const h = harness({ source, config: { gemini, defaultEngine: from === 'codex' ? 'gemini' : 'codex' } });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, ...(to !== from ? { engine: to } : {}), fresh }, exec);
+    const { argv } = h.start();
+    assert.equal(option(argv, '--engine') ?? 'codex', to);
+    assert.equal(option(argv, '--resume'), !fresh && from === to ? 'original-thread' : undefined);
+    assert.equal(option(argv, '--model'), from === to ? 'original-model' : to === 'gemini' ? gemini.model : 'new-default-model');
+    assert.equal(option(argv, '--effort'), from === to ? 'low' : 'high');
+    assert.equal(option(argv, '--sandbox'), 'workspace-write');
+    assert.equal(option(argv, '--service-tier'), to === 'gemini' ? undefined : from === to ? 'priority' : 'new-default-tier');
+    assert.match(h.payload().prompt, /上轮未满足项/);
+  }
+});
+
+test('terminal Codex failure starts Gemini only on a runner-confirmed no-write result', async () => {
+  for (const [fallbackSafe, enabled] of [[true, true], [false, true], [true, false]]) {
+    const source = { ...sourceJob(), status: 'failed', error_kind: 'upstream_rejected', fallback_safe: fallbackSafe };
+    const h = harness({ source, config: { gemini, geminiFallback: enabled } });
+    const value = await h.tools.codex_status.execute({ job_id: source.job_id }, exec);
+    if (!fallbackSafe || !enabled) {
+      assert.equal(h.start(), undefined);
+      assert.equal(value.fallback, undefined);
+      continue;
+    }
+    assert.equal(option(h.start().argv, '--engine'), 'gemini');
+    assert.equal(option(h.start().argv, '--resume'), undefined);
+    assert.equal(h.payload().context.fallback_of, source.job_id);
+    assert.equal(h.payload().context.continuation.parent_job_id, source.job_id);
+    assert.deepEqual(h.payload().context.acceptance, acceptance);
+    assert.match(h.payload().prompt, /上一轮报告摘要/);
+    assert.equal(value.fallback.job_id, 'VERIFY-1');
+    assert.match(value.next, /已转交 Gemini 任务 VERIFY-1/);
+  }
+});
+
 test('must_verify is checked before sampling and needs a matching independent result at closeout', async () => {
   const source = { ...sourceJob(), started_at: 10, finished_at: 20 };
   source.context.must_verify = [2, 1];
@@ -150,10 +233,11 @@ function backgroundJobs() {
   };
 }
 
-test('codex_verify exposes only its four inputs and sample/wait bounds', () => {
+test('codex_verify exposes engine selection and sample/wait bounds', () => {
   const { parameters } = harness().tools.codex_verify;
   assert.deepEqual(parameters.required, ['job_id']);
-  assert.deepEqual(Object.keys(parameters.properties).sort(), ['focus', 'job_id', 'samples', 'wait_seconds']);
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ['engine', 'focus', 'job_id', 'samples', 'wait_seconds']);
+  assert.deepEqual(parameters.properties.engine.enum, ['codex', 'gemini']);
   assert.equal(parameters.properties.job_id.type, 'string');
   assert.equal(parameters.properties.focus.type, 'string');
   assert.equal(parameters.properties.samples.type, 'integer');

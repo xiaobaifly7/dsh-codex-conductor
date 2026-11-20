@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-当前版本为 `0.9.127`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
+候选版本为 `0.9.132-gemini.0`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 0.9.66：规划端只读产物与独立核验
 
@@ -199,14 +199,29 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ## 功能
 
+### Gemini 执行
+
+已有 `gemini.command` 配置时，`codex_run`、`codex_continue`、`codex_verify` 可传 `engine: "gemini"`，经 Windows Antigravity 执行。`codex_status`、`codex_output`、`codex_jobs`、`codex_cancel` 和 `codex_review` 共用原 runner job ID。Gemini 的模型和推理强度沿用 `gemini.model`、`gemini.effort`，没有 Codex 服务档位。两种引擎都提交同一份逐条验收报告。
+
+| 配置 | 默认 | 作用 |
+| --- | --- | --- |
+| `defaultEngine` | `codex` | 新任务未指定引擎时采用此值 |
+| `crossEngineVerify` | `true` | 已配置 Gemini 时用另一引擎独立只读核验，`codex_verify` 的显式引擎优先 |
+| `geminiFallback` | `true` | Codex 因模型或上游问题失败且 runner 确认无写入时，启动关联的 Gemini 任务 |
+| `maxGeminiRunningJobs` | `2` | Gemini 运行和排队任务合计上限，`null` 表示不设单独上限 |
+
+`codex_continue` 按原任务记录恢复引擎、模型、推理强度和权限。Gemini 用准确的 `conversation_id`。显式选择另一引擎会附交接摘要、开新会话。自动接替保留原任务书、验收和范围，原回执给出接替任务号。Antigravity 每次使用订阅内额度，关闭超额 AI credits。
+
+Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。只读任务限制模型工具的文件写入、shell 和 MCP 调用。非主机任务使用 `--sandbox`。Antigravity 单独加载的本机 Hook 和插件仍属于受信任配置。当前 agy 无法经此接口建立严格限定于 `scope` 的可写隔离，因此拒绝 `write: true` 的非主机任务。主机访问仍遵循 `allowHostAccess` 和 `defaultHostAccess`。
+
 **派活工具**
 
 | 工具 | 作用 |
 | --- | --- |
-| `codex_run` | 把任务交给 WSL 里的 Codex；登记后台任务后直接返回任务号。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `must_verify`、`model`、`host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
-| `codex_verify` | 独立核验本会话一个已结束的任务：新线程、只读，沿用原目录和主机访问，先核对 `must_verify`，再回到出处抽查其余结论；启用 `modelAB` 时用配置默认模型，否则沿用原模型。可选 `focus`、`samples`（默认 8，1–30）、`wait_seconds`；结束后用 `codex_review` 记录原任务的验收 |
+| `codex_run` | 把任务交给 Codex 或 Gemini，登记后台任务后返回任务号。必填 `task`、`acceptance`（至少 1 条，每条至少 4 个字符）和 `write`。可选 `engine`、`must_verify`、`model`、`host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
+| `codex_verify` | 在新会话独立只读核验本会话已结束的任务，沿用原目录和主机访问，先核对 `must_verify` 再抽查。可选 `engine`、`focus`、`samples`（默认 8，1–30）、`wait_seconds`。结束后用 `codex_review` 记录原任务的验收 |
 | `codex_status` | 先派齐本批独立且不重叠的任务，再留在本轮按 runner `job_id` 并行调用，每次传一个任务号与 `wait_seconds: 3600`。120 秒内无实质变化的重复查询保留短回执，并引导本轮长等 |
-| `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
+| `codex_cancel` | 取消任务并结束执行进程树。任务已经结束时返回结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
 | `codex_output` | 按 Unicode 字符分页、可重复读取完整原始报告、结果 JSON、原任务与验收上下文或 stderr / events 日志；读取不消费结果，也不启动或恢复任务 |
 | `codex_continue` | 回答阻塞问题或提供环境恢复依据后续接原任务；保留原线程、目录、验收、write、scope 和权限，同一父任务不重复派活 |
@@ -568,11 +583,13 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`codex_run`, `codex_continue` and `codex_verify` accept `engine: "codex"` or `engine: "gemini"`. Gemini uses the configured Windows `agy.exe` and shares the runner's job IDs, reports, write locks and review workflow. `defaultEngine` defaults to `codex`. `geminiFallback` and `crossEngineVerify` default to `true` when Gemini is configured. `maxGeminiRunningJobs` defaults to two running or queued jobs. Continue uses the recorded session and model. Switching engines starts a new session with the handoff.
+
 `codex_run` accepts optional 1-based `must_verify` indices such as `[1, 3]`. Use it for the one to three most important criteria. `codex_continue` keeps the indices. `codex_verify` checks each marked criterion against actual observations or original run records before sampling other claims. Closing a marked criterion as `met` requires a matching independent verification result.
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-The current version is `0.9.127`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The candidate version is `0.9.132-gemini.0`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 

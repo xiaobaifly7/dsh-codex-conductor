@@ -176,6 +176,22 @@ FAKE_CODEX = textwrap.dedent(r"""
         say(type="turn.failed", error={"message": '{"error":{"code":null,"message":"Codex: Bad Request",'
                                                   '"param":null,"type":"invalid_request_error"}}'})
         sys.exit(1)
+    elif mode == "fallback_stderr":
+        print("connection reset", file=sys.stderr)
+        sys.exit(1)
+    elif mode in ("fallback_event", "fallback_retry_write", "fallback_local_error"):
+        if mode == "fallback_event":
+            say(type="item.updated", item={"type": "file_change", "changes": [{"path": "rewritten.txt"}]})
+        if mode == "fallback_retry_write":
+            target = Path(".git/ignored-change")
+            if calls == 0:
+                target.write_text("first attempt")
+                say(type="turn.failed", error={"message": "connection reset"})
+                sys.exit(1)
+            target.unlink()
+        error = "unrecognized setting" if mode == "fallback_local_error" else "This content was flagged for example risk"
+        say(type="turn.failed", error={"message": error})
+        sys.exit(1)
     elif mode == "retry_notice_then_ok":
         say(type="error", message="Reconnecting... 1/5")
         finish()
@@ -217,6 +233,33 @@ FAKE_CODEX = textwrap.dedent(r"""
 """)
 
 
+FAKE_AGY = textwrap.dedent(r"""
+    import json, os, sys, time
+    from pathlib import Path
+
+    def say(**event):
+        print(json.dumps(event), flush=True)
+
+    argv = sys.argv[1:]
+    mode = os.environ["FAKE_AGY_MODE"]
+    request = json.loads(sys.stdin.readline())
+    conversation = argv[argv.index("--conversation") + 1] if "--conversation" in argv else "agy-conversation-1"
+    assert request["event"] == "user"
+    say(event="init", conversation_id=conversation)
+    Path(os.environ["FAKE_AGY_CALL"]).write_text(json.dumps({
+        "argv": argv, "prompt": request["message"]["content"], "proxy": os.environ.get("HTTPS_PROXY"),
+        "pid": os.getpid(),
+    }), encoding="utf-8")
+    if mode == "hang":
+        time.sleep(300)
+    if mode == "deny":
+        print("command blocked by permissions", file=sys.stderr, flush=True)
+    report = json.loads(os.environ["FAKE_AGY_REPORT"])
+    say(event="result", result={"status": "SUCCESS", "structured_output": report,
+                                "conversation_id": conversation, "usage": {"input_tokens": 5}})
+""")
+
+
 def alive(pid):
     if os.name != "nt":
         try:
@@ -243,7 +286,8 @@ class RunnerTests(unittest.TestCase):
         self.cwd.mkdir()
         (root / "isolated-codex-home").mkdir()
         self.env = dict(os.environ, CODEX_RUNNER_HOME=str(root / "home"), FAKE_STATE=str(self.state),
-                        CODEX_RUNNER_CMD=json.dumps([sys.executable, "-B", str(self.fake)]), CODEX_RUNNER_ROUTER_URL="",
+                        CODEX_RUNNER_CMD=json.dumps([sys.executable, "-B", str(self.fake)]),
+                        CODEX_RUNNER_ROUTER_URL="", CODEX_RUNNER_ROUTE_URL="",
                         CODEX_HOME=str(root / "isolated-codex-home"), PYTHONDONTWRITEBYTECODE="1")
         environment = mock.patch.dict(os.environ, self.env)
         environment.start()
@@ -2538,6 +2582,257 @@ class RunnerTests(unittest.TestCase):
     def sample_report(self, **fields):
         return {"summary": "done", "criteria": [{"criterion": "Criterion one", "status": "met", "evidence": "checked"}],
                 "files_changed": [], "deviations": [], "unresolved": [], **fields}
+
+    def fake_gemini(self, mode="finish", report=None):
+        fake = Path(self.tmp.name) / "fake-agy"
+        if not fake.exists():
+            fake.write_text(f"#!{sys.executable}\n{FAKE_AGY}", encoding="utf-8")
+            fake.chmod(0o700)
+        call = fake.with_suffix(".json")
+        schema = RUNNER.parents[1] / "report.v2.schema.json"
+        return (
+            ("--engine", "gemini", "--agy-command", str(fake), "--schema", str(schema)),
+            {"FAKE_AGY_MODE": mode, "FAKE_AGY_REPORT": json.dumps(self.sample_report() if report is None else report),
+             "FAKE_AGY_CALL": str(call), "CODEX_RUNNER_ROUTER_URL": "http://unused:invalid-port"},
+            call,
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_report_metadata_output_and_resume(self):
+        argv, env, call = self.fake_gemini()
+        prompt = '核对 `%PATH%`、引号和换行\n第二行'
+        start = self.invoke(*argv, "--model", "gemini-test", "--effort", "high", "--agy-proxy", "http://unused.invalid:8080",
+                            "--model-ab", '[["codex-a","codex-b"],1]', command="start", prompt=prompt, env=env)
+        result = self.control("status", start["job_id"], "--wait", "10")
+        conversation = result["conversation_id"]
+        self.assertEqual((result["status"], result["report_status"], result["sandbox"], conversation),
+                         ("completed", "valid", "read-only", "agy-conversation-1"))
+        self.assertEqual(result["structured"], self.sample_report())
+        self.assertEqual(result["usage"], {"input_tokens": 5})
+        self.assertNotIn("thread_id", result)
+        self.assertEqual({key: result["task_options"][key] for key in ("engine", "model", "effort")},
+                         {"engine": "gemini", "model": "gemini-test", "effort": "high"})
+        received = json.loads(call.read_text("utf-8"))
+        self.assertEqual((received["prompt"], received["proxy"]), (prompt, "http://unused.invalid:8080"))
+        self.assertIn("gemini-test", received["argv"])
+        self.assertFalse(set(("codex-a", "codex-b", "exec", "--ephemeral")) & set(received["argv"]))
+        self.assertEqual(self.calls(), [])
+        report = self.control("output", start["job_id"], "--artifact", "report")
+        self.assertEqual(json.loads(report["text"]), self.sample_report())
+        events = self.control("output", start["job_id"], "--artifact", "events")["text"]
+        self.assertNotIn("thread_id", events)
+        self.assertNotIn("router_check", events)
+        self.assertEqual(self.control("list", "--thread-id", conversation)["total"], 0)
+        self.assertEqual(self.control("list", "--job-id", start["job_id"])["jobs"][0]["conversation_id"], conversation)
+        resumed = self.invoke(*argv, "--resume", conversation, env=env)
+        self.assertEqual((resumed["status"], resumed["conversation_id"]), ("completed", conversation))
+        resumed_argv = json.loads(call.read_text("utf-8"))["argv"]
+        self.assertEqual(resumed_argv[resumed_argv.index("--conversation") + 1], conversation)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_invalid_report_and_soft_denial(self):
+        argv, env, call = self.fake_gemini(report={"summary": "incorrect format"})
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["report_status"]),
+                         ("failed", "schema_invalid", "invalid"))
+        denial = self.invoke(*argv, env={**env, "FAKE_AGY_MODE": "deny"})
+        self.assertEqual((denial["status"], denial["error_kind"], denial["retryable"], denial["attempts"]),
+                         ("failed", "permission_denied", False, 1))
+        self.assertIn("agy permission denied", denial["error"])
+        self.assertNotIn("structured", denial)
+        call.unlink()
+        unsafe = self.invoke(*argv, "--writable-root", str(self.cwd.parent), env=env)
+        self.assertEqual(unsafe["error_kind"], "bad_arguments")
+        self.assertFalse(call.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_read_only_verification_runs_in_project_without_codex_scratch(self):
+        argv, env, call = self.fake_gemini()
+        context = {**self.sample_context(), "write": False, "verification_of": "original"}
+        result = self.invoke(*argv, "--context-json", env=env,
+                             prompt=json.dumps({"prompt": "survey the project", "context": context}))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["context"], context)
+        self.assertEqual(json.loads(call.read_text("utf-8"))["prompt"], "survey the project")
+        self.assertFalse((Path(result["log_dir"]) / "scratch").exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_parallel_start_limit_and_cancellation(self):
+        argv, env, call = self.fake_gemini(mode="hang")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            requests = [pool.submit(self.invoke, *argv, "--max-engine-running", "1", command="start", env=env)
+                        for _ in range(2)]
+            started, limited = sorted((request.result() for request in requests), key=lambda result: result["status"], reverse=True)
+        self.assertEqual(started["status"], "running")
+        self.assertEqual((limited["error_kind"], limited["retryable"]), ("engine_limit", True))
+        self.wait_for(call.exists)
+        self.wait_for(lambda: (self.control("status", started["job_id"]).get("conversation_id") == "agy-conversation-1"))
+        pid = json.loads(call.read_text("utf-8"))["pid"]
+        cancelled = self.control("cancel", started["job_id"])
+        self.assertEqual((cancelled["status"], cancelled["conversation_id"]), ("cancelled", "agy-conversation-1"))
+        self.assertNotIn("thread_id", cancelled)
+        self.wait_for(lambda: not alive(pid))
+
+    def test_gemini_windows_cancel_requires_adapter_confirmation(self):
+        import agy_runner
+        import codex_runner
+
+        job = self.stored_job("windows", None, engine="gemini", agy_command=r"C:\test\agy.exe")
+        codex_runner.runner_event(job, 1, "gemini_running")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(sys, "argv", [str(RUNNER), "cancel", job.name]), \
+                mock.patch.object(agy_runner, "cancel", side_effect=[False, True], create=True) as confirm, \
+                mock.patch.object(codex_runner, "emit") as emit, mock.patch.object(codex_runner, "kill_tree") as kill:
+            codex_runner.main()
+            result = emit.call_args.args[0]
+            self.assertEqual((result["status"], result["error_kind"]), ("monitor_failed", "cancel_unconfirmed"))
+            self.assertFalse((job / "result.json").exists())
+            kill.assert_not_called()
+            codex_runner.main()
+            self.assertEqual(emit.call_args.args[0]["status"], "cancelled")
+            kill.assert_called_once_with(os.getpid())
+            self.assertEqual(confirm.call_args_list, [mock.call(job), mock.call(job)])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "simulates a Windows job with a Linux fake agy")
+    def test_gemini_timeout_waits_for_windows_job_confirmation_before_retry_and_unlock(self):
+        import agy_runner
+        import codex_runner
+
+        fake_argv, fake_env, _ = self.fake_gemini()
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), *fake_argv, "--agy-command", r"C:\test\agy.exe",
+                                  "--sandbox", "danger-full-access", "--idle-timeout", "0.7", "--backoff", "0",
+                                  "--retries", "1", "--no-diff"])
+        runner_home = Path(self.env["CODEX_RUNNER_HOME"])
+        run_dir = runner_home / "runs" / "timeout"
+        build = agy_runner.build_command
+        launches = []
+        confirmations = []
+
+        def fake_build(task, directory, conversation_id, scratch):
+            self.assertEqual(len(confirmations), 0 if not launches else 2)
+            cmd, env = build(argparse.Namespace(**{**vars(task), "agy_command": fake_argv[3]}), directory,
+                             conversation_id, scratch)
+            launches.append(conversation_id)
+            return cmd, {**env, **fake_env, "FAKE_AGY_MODE": "hang" if len(launches) == 1 else "finish"}
+
+        def confirm(directory):
+            self.assertIsNone(codex_runner.acquire_write_lock(str(self.cwd)))
+            confirmations.append((len(launches), codex_runner.runner_activity(directory / "events.jsonl")["phase"]))
+            return len(confirmations) > 1
+
+        with mock.patch.object(codex_runner, "HOME", runner_home), \
+                mock.patch.object(agy_runner, "build_command", side_effect=fake_build), \
+                mock.patch.object(agy_runner, "cancel", side_effect=confirm):
+            result = codex_runner.execute(args, "retry after cleanup", run_dir)
+            with codex_runner.acquire_write_lock(str(self.cwd)):
+                self.assertEqual(result["status"], "completed")
+        self.assertEqual(launches, [None, "agy-conversation-1"])
+        self.assertEqual(confirmations, [(1, "gemini_running"), (1, "cleanup_wait"), (2, "gemini_running")])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_writer_shares_codex_directory_lock(self):
+        argv, env, call = self.fake_gemini()
+        codex = self.invoke("--sandbox", "workspace-write", "--no-diff", command="start", mode="gated_ok")
+        self.wait_for((self.state / "ready-0").exists)
+        try:
+            gemini = self.invoke(*argv, "--sandbox", "danger-full-access", "--no-diff", command="start", env=env)
+            self.wait_for(lambda: self.control("status", gemini["job_id"]).get("phase") == "lock_wait")
+            self.assertFalse(call.exists())
+        finally:
+            (self.state / "release-0").touch()
+        self.assertEqual(self.control("status", codex["job_id"], "--wait", "10")["status"], "completed")
+        self.assertEqual(self.control("status", gemini["job_id"], "--wait", "10")["status"], "completed")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_fallback_start_deduplicates_persisted_child_before_cap(self):
+        argv, env, _ = self.fake_gemini(mode="hang")
+        context = {**self.sample_context(), "write": False}
+        source = self.invoke("--context-json", "--gemini-fallback-check", "--retries", "0", command="start",
+                             mode="refused_turn", prompt=json.dumps({"prompt": "source", "context": context}))
+        parent = source["job_id"]
+        self.assertIs(self.control("status", parent, "--wait", "10")["fallback_safe"], True)
+        context.update(fallback_of=parent, continuation={"parent_job_id": parent, "answers": [], "resolution": ""})
+
+        def submit(context):
+            return self.invoke(*argv, "--max-engine-running", "1", "--context-json", command="start", env=env,
+                               prompt=json.dumps({"prompt": "fallback", "context": context}))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.map(submit, (context, context))
+        child = first["job_id"]
+        self.assertEqual(second["job_id"], child)
+        self.assertEqual(sum(receipt.get("deduplicated", False) for receipt in (first, second)), 1)
+        rows = self.control("list", "--parent-job", parent)["jobs"]
+        self.assertEqual([(row["job_id"], row["context"]["fallback_of"]) for row in rows], [(child, parent)])
+        wrong_owner = submit({**context, "owner": "other"})
+        self.assertEqual(wrong_owner["error_kind"], "invalid_fallback")
+        self.stored_job("unsafe", {"status": "failed", "fallback_safe": False}, context=context)
+        unsafe = submit({**context, "fallback_of": "unsafe", "continuation": {**context["continuation"], "parent_job_id": "unsafe"}})
+        self.assertEqual(unsafe["error_kind"], "invalid_fallback")
+        self.assertEqual(self.control("cancel", child)["status"], "cancelled")
+        self.assertEqual(submit(context), {"job_id": child, "status": "cancelled", "deduplicated": True})
+
+    def test_gemini_fallback_check_requires_complete_snapshots_and_preserves_retry_evidence(self):
+        self.assertNotIn("fallback_safe", self.invoke(mode="refused_turn"))
+        checked = ("--gemini-fallback-check", "--sandbox", "workspace-write", "--no-diff")
+        (self.cwd / ".git").mkdir()
+        cases = (
+            ("refused_turn", (), True),
+            ("fallback_event", ("--ignore", ".*"), False),
+            ("fallback_retry_write", ("--ignore", ".*"), False),
+            ("refused_turn", ("--writable-root", str(self.cwd / "missing")), False),
+            ("fallback_local_error", (), False),
+            ("fallback_stderr", (), False),
+            ("exit0_without_completion", (), False),
+        )
+        for mode, extra, expected in cases:
+            with self.subTest(mode=mode, extra=extra):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                result = self.invoke(*checked, *extra, mode=mode)
+                self.assertIs(result["fallback_safe"], expected)
+                if mode == "fallback_retry_write":
+                    self.assertEqual(result["attempts"], 2)
+                    self.assertFalse((self.cwd / ".git" / "ignored-change").exists())
+
+    def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
+        import codex_runner
+
+        checked = ("--gemini-fallback-check", "--sandbox", "danger-full-access", "--no-diff", "--retries", "0")
+        for mode, extra, expected in (("retry_before_turn", (), True),
+                                      ("retry_before_turn", ("--use-user-config",), False),
+                                      ("refused_turn", (), True),
+                                      ("fallback_event", (), False)):
+            with self.subTest(mode=mode, extra=extra):
+                self.state = Path(self.tmp.name) / (mode + str(len(extra)))
+                result = self.invoke(*checked, *extra, mode=mode, env={"FAKE_STATE": str(self.state)})
+                self.assertIs(result["fallback_safe"], expected)
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), *checked])
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "router_reachable", return_value=False), \
+                mock.patch.object(codex_runner, "run_attempt") as attempt:
+            result = codex_runner.execute(args, "source", Path(self.tmp.name) / "router")
+        attempt.assert_not_called()
+        self.assertEqual((result["error_kind"], result["fallback_safe"]), ("router_down", True))
+
+    def test_gemini_fallback_check_rejects_known_uncovered_mcp_configuration(self):
+        checked = ("--gemini-fallback-check", "--sandbox", "danger-full-access", "--no-diff", "--retries", "0")
+        user_config = Path(self.env["CODEX_HOME"]) / "config.toml"
+        for settings, expected in (('[mcp_servers.ordinary]\ncommand = "unused"', True),
+                                   ('[mcp_servers."dotted.name"]\ncommand = "unused"', False),
+                                   ('[plugins."test@local"]\nenabled = true', False)):
+            with self.subTest(settings=settings):
+                user_config.write_text(settings, encoding="utf-8")
+                self.assertIs(self.invoke(*checked, mode="refused_turn")["fallback_safe"], expected)
+        user_config.unlink()
+        project_config = self.cwd / ".codex" / "config.toml"
+        project_config.parent.mkdir()
+        project_config.write_text('[mcp_servers.project]\ncommand = "unused"', encoding="utf-8")
+        self.assertIs(self.invoke(*checked, mode="refused_turn")["fallback_safe"], False)
 
     def stored_job(self, job_id, result, **task):
         root = Path(self.tmp.name) / "home" / "jobs" / job_id
