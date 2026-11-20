@@ -2840,6 +2840,35 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("busy", stored["error"])
             self.assertIsNone(codex_runner.gemini_admission(args))
 
+    def test_gemini_admission_reserves_a_fallback_before_worker_pid_is_published(self):
+        import codex_runner
+
+        context = self.sample_context()
+        parent = self.stored_job("parent", {"status": "failed", "fallback_safe": True}, context=context)
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", "unused"])
+        args.context = {**context, "fallback_of": parent.name}
+        args.max_engine_running = 1
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            with mock.patch.object(codex_runner.subprocess, "Popen", return_value=argparse.Namespace(pid=123)), \
+                    mock.patch.object(codex_runner, "record_pid", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    codex_runner.start_job(args, "fallback")
+            child, = (path for path in parent.parent.iterdir() if path != parent)
+            self.assertFalse((child / "worker.pid").exists())
+            self.assertFalse((child / "result.json").exists())
+            with self.subTest("engine capacity"):
+                unrelated = argparse.Namespace(context=context, max_engine_running=1)
+                receipt = codex_runner.gemini_admission(unrelated)
+                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
+            with self.subTest("age pruning"):
+                self.assertTrue(codex_runner.keep_fallback_child(child))
+            with self.subTest("fallback replay"):
+                receipt = codex_runner.gemini_admission(args) or {}
+                self.assertEqual(receipt.get("job_id"), child.name)
+                self.assertIs(receipt.get("deduplicated"), True)
+
     def test_fallback_snapshots_exclude_runner_home_but_detect_workspace_changes(self):
         home = self.cwd / ".local" / "state" / "codex-runner"
         checked = ("--gemini-fallback-check", "--retries", "0")
@@ -2860,6 +2889,28 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
                                  ("failed", "provider_permanent", False, 1))
                 self.assertIn(error["message"] if isinstance(error, dict) else error, result["error"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_retries_transient_model_unavailability(self):
+        argv, env, _ = self.fake_gemini(mode="provider_error")
+        error = "429: model not available, try again"
+        result = self.invoke(*argv, "--retries", "1", env={**env, "FAKE_AGY_ERROR": json.dumps(error)})
+        self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                         ("failed", "transient", True, 2))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_distinguishes_403_tool_denials_from_disabled_accounts(self):
+        argv, env, _ = self.fake_gemini(mode="provider_error")
+        for error, expected in (
+            ("403 PERMISSION_DENIED: tool call was denied", "permission_denied"),
+            ({"code": 403, "message": "tool call was denied"}, "permission_denied"),
+            ("403 PERMISSION_DENIED: disabled in this account", "provider_permanent"),
+            ({"code": 403, "message": "violation of Terms of Service"}, "provider_permanent"),
+        ):
+            with self.subTest(error=error):
+                result = self.invoke(*argv, "--retries", "1", env={**env, "FAKE_AGY_ERROR": json.dumps(error)})
+                self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                                 ("failed", expected, False, 1))
 
     def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
         import codex_runner

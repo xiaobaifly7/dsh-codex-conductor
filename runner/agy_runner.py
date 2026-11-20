@@ -17,13 +17,14 @@ WSL_DRIVE = re.compile(r"^/mnt/([a-zA-Z])(?:/(.*))?$")
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 JOB_RECORD = "agy.windows-job"
 CANCEL_RECORD = "agy.windows-cancel"
-DENIAL = re.compile(
-    r"\b(?:soft[-_ ]den(?:y|ied|ial)|permission[-_ ]denied|(?:denied|blocked) (?:by|due to) permissions?"
+TOOL_DENIAL = re.compile(
+    r"\b(?:soft[-_ ]den(?:y|ied|ial)|(?:denied|blocked) (?:by|due to) permissions?"
     r"|(?:permission|approval) (?:is )?required|requires (?:\w+ )?(?:approval|permission)"
     r"|not (?:pre-?)?approved|without (?:pre-?)?approval|permission (?:request )?was denied"
-    r"|(?:tool call|command) (?:was )?denied"
+    r"|(?:tool call|command) (?:was )?denied|permissions\.allow"
     r"|(?:approval|permission) [^\n]*(?:headless|non.interactive))\b", re.IGNORECASE
 )
+DENIAL = re.compile(r"\bpermission[-_ ]denied\b", re.IGNORECASE)
 INVALID_FLAG = re.compile(r"flag provided but not defined|unknown (?:flag|option)|invalid value .+ for flag", re.IGNORECASE)
 HTTP_FORBIDDEN = re.compile(r"\b403\b")
 
@@ -247,6 +248,7 @@ def _launch(run_dir, job_id, cwd, command, flags):
 
         threading.Thread(target=send_prompt, daemon=True).start()
     denied = []
+    tool_denied = []
     diagnostics_tail = [""]
     invalid_flag = []
     provider_denial = []
@@ -261,10 +263,13 @@ def _launch(run_dir, job_id, cwd, command, flags):
                     diagnostics_tail[0] = text[-1000:]
                 if not invalid_flag and INVALID_FLAG.search(text):
                     invalid_flag.append(text[:1000])
-                if HTTP_FORBIDDEN.search(text):
+                if TOOL_DENIAL.search(text):
+                    if not tool_denied:
+                        tool_denied.append(text[-1000:])
+                elif HTTP_FORBIDDEN.search(text):
                     if not provider_denial:
                         provider_denial.append(text[:1000])
-                elif not denied and (DENIAL.search(text) or "permissions.allow" in text):
+                elif not denied and DENIAL.search(text):
                     denied.append(text[-1000:])
 
     diagnostics = threading.Thread(target=stderr, daemon=True)
@@ -288,8 +293,9 @@ def _launch(run_dir, job_id, cwd, command, flags):
         payload = payload if isinstance(payload, dict) else {}
         conversation_id = (result or {}).get("conversation_id") or payload.get("conversation_id")
         problem = (result or {}).get("error") or payload.get("error")
-        if denied and not _provider_forbidden(problem) and not (result is None and provider_denial):
-            _emit({"event": "permission_denied", "error": denied[0],
+        denial = tool_denied or (denied if not (_provider_forbidden(problem) or (result is None and provider_denial)) else [])
+        if denial:
+            _emit({"event": "permission_denied", "error": denial[0],
                    "conversation_id": conversation_id})
         if result is not None and (not code or payload.get("status") != "SUCCESS"):
             _emit(result)
@@ -348,13 +354,13 @@ class EventAdapter:
         status = str(result.get("status", raw_event.get("status", "")))
         problem = raw_event.get("error") or result.get("error") or step.get("error") or info.get("error")
         error = _message(problem)
-        if kind in ("result", "error") and status != "SUCCESS" and _provider_forbidden(problem):
+        signals = (error, status, str(kind), str(step.get("state", "")), str(info.get("status", "")),
+                   str(problem.get("type") or problem.get("code")) if isinstance(problem, dict) else "")
+        tool_denial = next((text for text in signals if TOOL_DENIAL.search(text)), None)
+        if not tool_denial and kind in ("result", "error") and status != "SUCCESS" and _provider_forbidden(problem):
             yield self._failed(error if HTTP_FORBIDDEN.search(error) else f"HTTP 403: {error or 'Forbidden'}")
             return
-        denial = next((text for text in (error, status, str(kind), str(step.get("state", "")),
-                                        str(info.get("status", "")),
-                                        str(problem.get("type") or problem.get("code")) if isinstance(problem, dict) else "")
-                       if DENIAL.search(text)), None)
+        denial = tool_denial or next((text for text in signals if DENIAL.search(text)), None)
         if denial:
             yield self._failed(f"agy permission denied: {error or denial}")
         elif kind == "result":

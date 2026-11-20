@@ -816,6 +816,8 @@ def classify(state, run_dir):
             return "permission_denied", False
         if text.startswith("agy rejected a CLI argument:"):
             return "bad_arguments", False
+        if TRANSIENT.search(text):
+            return "transient", True
         if PROVIDER_PERMANENT.search(text):
             return "provider_permanent", False
     if REFUSED.search(text):
@@ -3158,13 +3160,14 @@ def gemini_admission(args):
                 continue
             prior = task.get("context") or {}
             if parent and prior.get("fallback_of") == parent and prior.get("owner") == owner:
-                if (job_dir / "worker.pid").is_file() or (job_dir / "result.json").is_file():
-                    child = job_status(job_dir.name)
-                    if child.get("error_kind") != "worker_start_failed":
-                        return {"job_id": job_dir.name, "status": child["status"], "deduplicated": True}
+                child = job_status(job_dir.name)
+                if child.get("error_kind") != "worker_start_failed":
+                    return {"job_id": job_dir.name, "status": child["status"], "deduplicated": True}
             if limit:
-                worker_running = not (job_dir / "result.json").exists() and recorded_pid(job_dir / "worker.pid") is not None
-                if worker_running or recorded_pid(job_dir / "codex.pid") is not None:
+                worker_pid = job_dir / "worker.pid"
+                worker_active = not (job_dir / "result.json").exists() and (
+                    not worker_pid.exists() or recorded_pid(worker_pid) is not None)
+                if worker_active or recorded_pid(job_dir / "codex.pid") is not None:
                     running += 1
         except (OSError, ValueError):
             continue
@@ -3218,7 +3221,7 @@ def keep_fallback_child(job_dir, result=None):
         if result is None:
             record = job_dir / "result.json"
             if not record.is_file():
-                return (job_dir / "worker.pid").is_file()
+                return True
             result = json.loads(record.read_text("utf-8"))
         return isinstance(result, dict) and result.get("error_kind") != "worker_start_failed"
     return False
