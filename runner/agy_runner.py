@@ -30,6 +30,17 @@ DENIAL = re.compile(
 )
 INVALID_FLAG = re.compile(r"flag provided but not defined|unknown (?:flag|option)|invalid value .+ for flag", re.IGNORECASE)
 HTTP_FORBIDDEN = re.compile(r"\b403\b")
+HTTP_STATUS = re.compile(r"(?:^|HTTP\s+|status code\s+)([1-5][0-9]{2})(?=[:\s]|$)", re.I)
+MAX_RETRYABLE_DELAY_SECONDS = 300
+QUOTA_STATUS_CODES = (429, 499, 503)
+GOOGLE_RPC = "type.googleapis.com/google.rpc."
+CLOUD_CODE_DOMAINS = {
+    "cloudcode-pa.googleapis.com",
+    "staging-cloudcode-pa.googleapis.com",
+    "autopush-cloudcode-pa.googleapis.com",
+}
+CAPACITY_EXHAUSTION = re.compile(r"exhausted your capacity|capacity exceeded|MODEL_CAPACITY_EXHAUSTED", re.I)
+TERMINAL_QUOTA_REASONS = ("MODEL_CAPACITY_EXHAUSTED", "MODEL_CAPACITY_EXCEEDED", "INSUFFICIENT_G1_CREDITS_BALANCE")
 
 
 def _reject_unc(path):
@@ -262,13 +273,17 @@ def _launch(run_dir, job_id, cwd, command, flags):
                 sys.stderr.buffer.write(line)
                 sys.stderr.buffer.flush()
                 text = line.decode("utf-8", "replace").strip()
-                if text.startswith("{"):
-                    try:
-                        text = _message(json.loads(text)) or text
-                    except ValueError:
-                        pass
-                if text:
-                    diagnostics_tail[0] = text[-1000:]
+                problem = _error_payload(text)
+                rendered = _message(problem)
+                if isinstance(problem, dict) and rendered:
+                    diagnostics_tail[0] = problem
+                elif text:
+                    previous = diagnostics_tail[0]
+                    if isinstance(previous, str) and _http_status(previous) in QUOTA_STATUS_CODES and not _http_status(text):
+                        diagnostics_tail[0] = f"{previous}\n{text}"[:1000]
+                    else:
+                        diagnostics_tail[0] = text[-1000:]
+                text = rendered or text
                 if not invalid_flag and INVALID_FLAG.search(text):
                     invalid_flag.append(text[:1000])
                 if EXPLICIT_TOOL_DENIAL.search(text):
@@ -300,7 +315,7 @@ def _launch(run_dir, job_id, cwd, command, flags):
         payload = (result or {}).get("result")
         payload = payload if isinstance(payload, dict) else {}
         conversation_id = (result or {}).get("conversation_id") or payload.get("conversation_id")
-        problem = (result or {}).get("error") or payload.get("error")
+        problem = _error_payload((result or {}).get("error") or payload.get("error"))
         denial = tool_denied or (
             denied if not (HTTP_FORBIDDEN.search(_message(problem)) or (result is None and provider_denial)) else [])
         if denial:
@@ -309,38 +324,115 @@ def _launch(run_dir, job_id, cwd, command, flags):
         if result is not None and (not code or payload.get("status") != "SUCCESS"):
             _emit(result)
         elif code:
-            message = provider_denial[0] if provider_denial else diagnostics_tail[0]
+            problem = provider_denial[0] if provider_denial else diagnostics_tail[0]
             if invalid_flag:
-                message = f"agy rejected a CLI argument: {invalid_flag[0]}"
-            _emit({"event": "error", "error": message or f"agy process exited with code {code}",
+                problem = f"agy rejected a CLI argument: {invalid_flag[0]}"
+            _emit({"event": "error", "error": problem or f"agy process exited with code {code}",
                    "conversation_id": conversation_id})
         return code
     finally:
         finished.set()
 
 
-def _quota_details(details):
-    if not isinstance(details, list):
-        return
-    for detail in details:
-        if not isinstance(detail, dict):
-            continue
-        kind = detail.get("@type")
-        if kind == "type.googleapis.com/google.rpc.RetryInfo":
-            yield f"RetryInfo {detail.get('retryDelay', '')}".rstrip()
-        elif kind == "type.googleapis.com/google.rpc.QuotaFailure":
-            violations = detail.get("violations")
-            if isinstance(violations, list):
-                for violation in violations:
-                    if isinstance(violation, dict):
-                        for key in ("quotaId", "description"):
-                            value = violation.get(key)
-                            if isinstance(value, str):
-                                yield value
-        elif kind == "type.googleapis.com/google.rpc.ErrorInfo":
-            metadata = detail.get("metadata")
-            if isinstance(metadata, dict) and isinstance(metadata.get("quota_limit"), str):
-                yield metadata["quota_limit"]
+def _error_payload(problem):
+    if isinstance(problem, str) and problem.lstrip().startswith("{"):
+        try:
+            parsed = json.loads(problem)
+        except ValueError:
+            return problem
+        if isinstance(parsed, dict):
+            return _error_payload(parsed)
+    if isinstance(problem, dict):
+        for field in ("message", "error"):
+            nested = _error_payload(problem.get(field))
+            if isinstance(nested, dict):
+                return {**problem, **nested}
+    return problem
+
+
+def _http_status(problem):
+    if isinstance(problem, dict):
+        for value in (problem.get("code"), problem.get("status")):
+            if re.fullmatch(r"[1-5][0-9]{2}", str(value)):
+                return int(value)
+    elif isinstance(problem, str) and (match := HTTP_STATUS.search(problem.strip())):
+        return int(match[1])
+    return None
+
+
+def _quota_details(problem):
+    details = problem.get("details") if isinstance(problem, dict) else None
+    by_type = {}
+    if isinstance(details, list):
+        for detail in details:
+            if isinstance(detail, dict) and isinstance(kind := detail.get("@type"), str):
+                by_type.setdefault(kind, detail)
+    return by_type
+
+
+def _duration_seconds(value):
+    if isinstance(value, str) and (match := re.fullmatch(r"(\d+(?:\.\d*)?|\.\d+)(ms|s)", value)):
+        return float(match[1]) / (1000 if match[2] == "ms" else 1)
+    return None
+
+
+def _retry_kind(delay_seconds):
+    return "provider_permanent" if delay_seconds > MAX_RETRYABLE_DELAY_SECONDS else "transient"
+
+
+def _google_quota_kind(problem, message):
+    if isinstance(problem, dict):
+        name = problem.get("name")
+        if name == "TerminalQuotaError":
+            return "provider_permanent"
+        if name == "RetryableQuotaError":
+            return "transient"
+    status = _http_status(problem) or _http_status(message)
+    if status in (401, 403, 404):
+        return None
+    if status in QUOTA_STATUS_CODES and re.search(r"limit:\s*0(?!\d|\.\d)", message, re.I):
+        return "provider_permanent"
+    if status in (400, 429, 499) and re.search(r"\b(?:spending|spend)\s+cap\b", message, re.I):
+        return "provider_permanent"
+
+    details = _quota_details(problem)
+    if status not in QUOTA_STATUS_CODES or not details:
+        if match := re.search(r"Please retry in ([0-9.]+(?:ms|s))", message):
+            seconds = _duration_seconds(match[1])
+            return _retry_kind(seconds) if seconds is not None else None
+        if status in QUOTA_STATUS_CODES and CAPACITY_EXHAUSTION.search(message):
+            return "provider_permanent"
+        if (status is None or status in QUOTA_STATUS_CODES) and "quota" in message.lower():
+            if re.search(r"per[ _-]?(?:day|week)|daily|weekly", message, re.I):
+                return "provider_permanent"
+            if re.search(r"per[ _-]?minute", message, re.I):
+                return "transient"
+            if re.search(r"\bquota (?:is )?exhausted\b", message, re.I):
+                return "provider_permanent"
+        return "transient" if status in QUOTA_STATUS_CODES else None
+
+    violations = details.get(GOOGLE_RPC + "QuotaFailure", {}).get("violations")
+    quota_ids = [str(item.get("quotaId", "")) for item in (violations if isinstance(violations, list) else ())
+                 if isinstance(item, dict)]
+    if any("PerDay" in quota or "Daily" in quota for quota in quota_ids):
+        return "provider_permanent"
+
+    delay = _duration_seconds(details.get(GOOGLE_RPC + "RetryInfo", {}).get("retryDelay"))
+    info = details.get(GOOGLE_RPC + "ErrorInfo", {})
+    reason = info.get("reason")
+    if reason in TERMINAL_QUOTA_REASONS:
+        return "provider_permanent"
+    domain = re.sub(r"[^a-zA-Z0-9.-]", "", str(info.get("domain", "")))
+    if domain in CLOUD_CODE_DOMAINS and (
+            reason == "QUOTA_EXHAUSTED" or (reason == "RATE_LIMIT_EXCEEDED" and not delay)):
+        return "provider_permanent"
+    if delay:
+        return _retry_kind(delay)
+    metadata = info.get("metadata")
+    quota_limit = str(metadata.get("quota_limit", "")) if isinstance(metadata, dict) else ""
+    if any("PerMinute" in quota for quota in quota_ids) or "PerMinute" in quota_limit:
+        return "transient"
+    return "provider_permanent" if CAPACITY_EXHAUSTION.search(message) else "transient"
 
 
 def _message(payload):
@@ -348,11 +440,9 @@ def _message(payload):
         return payload
     if isinstance(payload, dict):
         message = _message(payload.get("message") or payload.get("error") or payload.get("code") or payload.get("type"))
-        for status in (payload.get("code"), payload.get("status")):
-            if re.fullmatch(r"[1-5][0-9]{2}", str(status)):
-                message = f"HTTP {status}: {message}" if message and message != str(status) else f"HTTP {status}"
-                break
-        return "\n".join(filter(None, (message, *_quota_details(payload.get("details")))))
+        if status := _http_status(payload):
+            return f"HTTP {status}: {message}" if message and message != str(status) else f"HTTP {status}"
+        return message
     return ""
 
 
@@ -362,9 +452,12 @@ class EventAdapter:
         self.finished = False
         self.commands = {}
 
-    def _failed(self, message):
+    def _failed(self, message, problem=None):
         self.finished = True
-        return {"type": "turn.failed", "error": {"message": message}}
+        error = {"message": message}
+        if problem is not None and (kind := _google_quota_kind(problem, message)):
+            error["quota_kind"] = kind
+        return {"type": "turn.failed", "error": error}
 
     def events(self, raw_event):
         if not isinstance(raw_event, dict) or self.finished:
@@ -385,7 +478,7 @@ class EventAdapter:
         info = step.get("tool_info")
         info = info if isinstance(info, dict) else {}
         status = str(result.get("status", raw_event.get("status", "")))
-        problem = raw_event.get("error") or result.get("error") or step.get("error") or info.get("error")
+        problem = _error_payload(raw_event.get("error") or result.get("error") or step.get("error") or info.get("error"))
         error = _message(problem)
         signals = (error, status, str(kind), str(step.get("state", "")), str(info.get("status", "")),
                    str(problem.get("type") or problem.get("code")) if isinstance(problem, dict) else "")
@@ -398,8 +491,8 @@ class EventAdapter:
             yield self._failed(f"agy permission denied: {error or denial}")
         elif kind == "result":
             if status != "SUCCESS":
-                yield self._failed(error or _message(result.get("response"))[:1000] or
-                                   f"agy result status: {status or 'missing'}")
+                problem = problem or _error_payload(result.get("response"))
+                yield self._failed(error or _message(problem) or f"agy result status: {status or 'missing'}", problem)
                 return
             report = result.get("structured_output")
             if isinstance(report, str):
@@ -416,7 +509,7 @@ class EventAdapter:
             }}
             yield {"type": "turn.completed", "usage": result.get("usage")}
         elif kind == "error":
-            yield self._failed(error or "agy reported an error")
+            yield self._failed(error or "agy reported an error", problem)
         elif kind == "user_input" or step.get("step_type") == "user_input":
             yield {"type": "turn.started"}
         elif step.get("step_type") == "tool":

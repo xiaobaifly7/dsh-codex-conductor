@@ -2967,6 +2967,124 @@ class RunnerTests(unittest.TestCase):
                     if isinstance(error, dict) and (status := error.get("code", error.get("status"))):
                         self.assertIn(str(status), result["error"])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_official_google_quota_cases_from_stderr_and_events(self):
+        argv, env, _ = self.fake_gemini()
+
+        def api_error(code, message, *details):
+            return {"code": code, "message": message, "details": list(details)}
+
+        def rpc(kind, **fields):
+            return {"@type": f"type.googleapis.com/google.rpc.{kind}", **fields}
+
+        def retry_after(delay):
+            return rpc("RetryInfo", retryDelay=delay)
+
+        cloud = "cloudcode-pa.googleapis.com"
+
+        def error_info(reason, domain=cloud, **metadata):
+            return rpc("ErrorInfo", reason=reason, domain=domain, metadata=metadata)
+
+        def quota_failure(identifier, description):
+            return rpc("QuotaFailure", violations=[{"quotaId": identifier, "description": description}])
+
+        def nested_error(delay, limit):
+            message = f"Quota exceeded for metric: generate_content_free_tier_requests, limit: {limit}\nPlease retry in {delay}."
+            inner = api_error(429, message, {"detail": f"APP_ERROR(8) {message}"})
+            return json.dumps({"error": {"code": 429, "status": "Too Many Requests",
+                                         "message": json.dumps({"error": inner})}})
+
+        capacity = "You have exhausted your capacity on this model."
+        no_capacity = "No capacity available for model gemini-3.1-pro-preview on the server"
+        reset_fast = f"{capacity} Your quota will reset after 0s."
+        spending_cap = "Your project has exceeded its monthly spending cap."
+        daily = quota_failure("RequestsPerDay-limit", "daily limit")
+        cases = (
+            ("wrapped retry in seconds", nested_error("44.097740004s", 2), True),
+            ("wrapped retry in milliseconds", nested_error("900.2ms", 2), True),
+            ("503 Service Unavailable", api_error(503, "Service Unavailable"), True),
+            ("503 capacity exhaustion with RetryInfo",
+             api_error(503, no_capacity, error_info("MODEL_CAPACITY_EXHAUSTED"), retry_after("9s")), False),
+            ("429 monthly spending cap", api_error(429, spending_cap), False),
+            ("400 monthly spending cap", api_error(400, spending_cap), False),
+            ("capacity exhaustion without delay",
+             api_error(429, no_capacity, error_info("MODEL_CAPACITY_EXHAUSTED")), False),
+            ("capacity text with Help detail", api_error(429, capacity, rpc("Help", links=[])), False),
+            ("capacity exhaustion outside Cloud Code",
+             api_error(429, no_capacity, error_info("MODEL_CAPACITY_EXHAUSTED", "other.googleapis.com")), False),
+            ("capacity exceeded without delay",
+             api_error(429, no_capacity, error_info("MODEL_CAPACITY_EXCEEDED")), False),
+            ("499 Client Closed Request", api_error(499, "Client Closed Request"), True),
+            ("daily QuotaFailure", api_error(429, "Quota exceeded", daily), False),
+            ("RetryInfo at 301 seconds", api_error(429, "Too many requests", retry_after("301s")), False),
+            ("RetryInfo at 45.123 seconds", api_error(429, "Too many requests", retry_after("45.123s")), True),
+            ("per-minute QuotaFailure",
+             api_error(429, "Quota exceeded", quota_failure("RequestsPerMinute-limit", "per minute limit")), True),
+            ("per-minute ErrorInfo", api_error(429, "Quota exceeded", error_info(
+                "QUOTA_EXCEEDED", "googleapis.com", quota_limit="RequestsPerMinute_PerProject_PerUser")), True),
+            ("short 56-second retry with quota and Help details", api_error(
+                429, "Quota exceeded for metric: generate_content_free_tier_requests, limit: 2\nPlease retry in 56.185908122s.",
+                quota_failure("GenerateRequestsPerMinutePerProjectPerModel-FreeTier", ""),
+                rpc("Help", links=[]), retry_after("56s")), True),
+            ("Cloud Code rate limit with short delay",
+             api_error(429, reset_fast, error_info("RATE_LIMIT_EXCEEDED"), retry_after("0.539477544s")), True),
+            ("Cloud Code rate limit with long delay", api_error(
+                429, f"{capacity} Your quota will reset after 10m.",
+                error_info("RATE_LIMIT_EXCEEDED"), retry_after("600s")), False),
+            ("Cloud Code rate limit without delay",
+             api_error(429, "Rate limit exceeded", error_info("RATE_LIMIT_EXCEEDED")), False),
+            ("Cloud Code quota exhaustion despite short delay",
+             api_error(429, reset_fast, error_info("QUOTA_EXHAUSTED"), retry_after("0.539477544s")), False),
+            ("insufficient credits without domain", api_error(
+                429, "Resource has been exhausted (e.g. check quota).",
+                rpc("ErrorInfo", reason="INSUFFICIENT_G1_CREDITS_BALANCE")), False),
+            ("daily quota beats RetryInfo", api_error(429, "Quota exceeded", daily, retry_after("10s")), False),
+            ("generic 429 with DebugInfo", api_error(429, "Too many requests", rpc("DebugInfo", detail="some debug info")), True),
+            ("empty-details wrapper with short text delay",
+             {"error": api_error(429, "Resource exhausted. Please retry in 5s")}, True),
+            ("empty-details wrapper with long text delay",
+             {"error": api_error(429, "Resource exhausted. Please retry in 400s")}, False),
+            ("RetryInfo at exactly 300 seconds", api_error(429, "Too many requests", retry_after("300s")), True),
+            ("generic numeric status", {"status": 429, "message": "Resource exhausted. No specific retry info."}, True),
+            ("generic 429 with empty details",
+             {"error": api_error(429, "A generic 429 error with no retry message.")}, True),
+            ("generic 429 with ErrorInfo", {"error": api_error(
+                429, "A generic 429 error with no retry message.", error_info("QUOTA_EXCEEDED", "googleapis.com", quota_limit=""))}, True),
+            ("Cloud Code quota exhaustion with SSE-corrupted domain", api_error(
+                429, f"{capacity} Your quota will reset after 19h14m47s.",
+                error_info("QUOTA_EXHAUSTED", f"{cloud},"), retry_after("68940s")), False),
+            ("wrapped zero limit before text delay", nested_error("59.906331105s", 0), False),
+            ("zero limit before RetryInfo",
+             api_error(429, "Quota exceeded for limit: 0", retry_after("59s")), False),
+            ("zero limit on another line",
+             api_error(429, "Quota exceeded for metric: ...\nlimit: 0, model: gemini-3-pro"), False),
+            ("zero limit followed by a period",
+             api_error(429, "Quota exceeded for metric: ...\nlimit: 0. Please retry in 59s."), False),
+            ("multiline stderr representation of zero limit",
+             "429: Quota exceeded for metric: ...\nlimit: 0.\nPlease retry in 59s.", False),
+            ("fractional limit", api_error(429, "Quota exceeded for metric: ...\nlimit: 0.5. Please retry in 59s."), True),
+            ("plain zero limit with numeric status", {"status": 429, "message": "Quota exceeded, limit: 0"}, False),
+            ("spending cap predicate", api_error(429, spending_cap), False),
+            ("spend cap predicate", api_error(429, "Manage your project spend cap."), False),
+            ("spend capacity is not a cap", api_error(429, "Unable to spend capacity on model."), True),
+            ("spending capital is not a cap", api_error(429, "Spending capital limit reached."), True),
+            ("500 stays with the runner's general retry policy", api_error(500, "Server error"), True),
+        )
+        for case, error, retryable in cases:
+            kind = "transient" if retryable else "provider_permanent"
+            for mode in ("stderr_error", "provider_error"):
+                with self.subTest(case=case, mode=mode):
+                    result = self.invoke(*argv, "--retries", "1", env={
+                        **env, "FAKE_AGY_ERROR": json.dumps(error), "FAKE_AGY_MODE": mode,
+                    })
+                    self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                                     ("failed", kind, retryable, 2 if retryable else 1))
+                    if isinstance(error, dict) and error.get("code") == 500:
+                        lines = (Path(result["log_dir"]) / "events.jsonl").read_text("utf-8").splitlines()
+                        failed = [event["error"] for event in map(json.loads, lines) if event["type"] == "turn.failed"]
+                        self.assertEqual(len(failed), 2)
+                        self.assertTrue(all("quota_kind" not in event for event in failed))
+
     def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
         import codex_runner
 

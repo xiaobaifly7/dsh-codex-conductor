@@ -104,12 +104,6 @@ PROVIDER_PERMANENT = re.compile(
     r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|log.?in required|sign.?in required"
     r"|usage limit|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
     r"|model.{0,40}(not found|not supported|does not exist)", re.I)
-GEMINI_QUOTA = re.compile(r"\b429\b|quota|resource[ _-]exhausted", re.I)
-QUOTA_LONG_TERM = re.compile(r"per[ _-]?(?:day|week)|daily|weekly", re.I)
-QUOTA_PER_MINUTE = re.compile(r"per[ _-]?minute", re.I)
-QUOTA_EXHAUSTED = re.compile(r"(?:\b|_)exhausted\b", re.I)
-QUOTA_RETRY_HINT = re.compile(
-    r"\b(?:RetryInfo|retryDelay)\b|(?:please retry in|suggested retry after) \d+(?:\.\d+)?m?s\b", re.I)
 
 
 def emit(obj):
@@ -702,6 +696,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     state["failed"] = True
                     state["error"] = (ev.get("error") or {}).get("message") or json.dumps(ev, ensure_ascii=False)
                     if gemini:
+                        state["gemini_quota_kind"] = (ev.get("error") or {}).get("quota_kind")
                         completed_at = time.monotonic()
                 elif kind == "error" and not (gemini and state["failed"]):
                     # Retry notices also arrive as top-level errors, so this alone does not end the turn.
@@ -824,14 +819,9 @@ def classify(state, run_dir):
             return "permission_denied", False
         if text.startswith("agy rejected a CLI argument:"):
             return "bad_arguments", False
+        if quota_kind := state.get("gemini_quota_kind"):
+            return quota_kind, quota_kind == "transient"
         if PROVIDER_PERMANENT.search(text):
-            return "provider_permanent", False
-        quota = GEMINI_QUOTA.search(text)
-        if quota and QUOTA_LONG_TERM.search(text):
-            return "provider_permanent", False
-        if QUOTA_RETRY_HINT.search(text) or (quota and QUOTA_PER_MINUTE.search(text)):
-            return "transient", True
-        if quota and QUOTA_EXHAUSTED.search(text):
             return "provider_permanent", False
     if REFUSED.search(text):
         return "model_refused", False
