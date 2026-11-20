@@ -17,14 +17,17 @@ WSL_DRIVE = re.compile(r"^/mnt/([a-zA-Z])(?:/(.*))?$")
 POWERSHELL = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 JOB_RECORD = "agy.windows-job"
 CANCEL_RECORD = "agy.windows-cancel"
-TOOL_DENIAL = re.compile(
-    r"\b(?:soft[-_ ]den(?:y|ied|ial)|(?:denied|blocked) (?:by|due to) permissions?"
+EXPLICIT_TOOL_DENIAL = re.compile(
+    r"\b(?:soft[-_ ]den(?:y|ied|ial)|(?:tool call|command) (?:was )?denied|permissions\.allow"
+    r"|not pre-?approved|without pre-?approval"
+    r"|approval (?:is )?required\b[^\n]*(?:headless|non.interactive))\b", re.IGNORECASE
+)
+DENIAL = re.compile(
+    r"\b(?:permission[-_ ]denied|(?:denied|blocked) (?:by|due to) permissions?"
     r"|(?:permission|approval) (?:is )?required|requires (?:\w+ )?(?:approval|permission)"
-    r"|not (?:pre-?)?approved|without (?:pre-?)?approval|permission (?:request )?was denied"
-    r"|(?:tool call|command) (?:was )?denied|permissions\.allow"
+    r"|not approved|without approval|permission (?:request )?was denied"
     r"|(?:approval|permission) [^\n]*(?:headless|non.interactive))\b", re.IGNORECASE
 )
-DENIAL = re.compile(r"\bpermission[-_ ]denied\b", re.IGNORECASE)
 INVALID_FLAG = re.compile(r"flag provided but not defined|unknown (?:flag|option)|invalid value .+ for flag", re.IGNORECASE)
 HTTP_FORBIDDEN = re.compile(r"\b403\b")
 
@@ -263,7 +266,7 @@ def _launch(run_dir, job_id, cwd, command, flags):
                     diagnostics_tail[0] = text[-1000:]
                 if not invalid_flag and INVALID_FLAG.search(text):
                     invalid_flag.append(text[:1000])
-                if TOOL_DENIAL.search(text):
+                if EXPLICIT_TOOL_DENIAL.search(text):
                     if not tool_denied:
                         tool_denied.append(text[-1000:])
                 elif HTTP_FORBIDDEN.search(text):
@@ -356,7 +359,7 @@ class EventAdapter:
         error = _message(problem)
         signals = (error, status, str(kind), str(step.get("state", "")), str(info.get("status", "")),
                    str(problem.get("type") or problem.get("code")) if isinstance(problem, dict) else "")
-        tool_denial = next((text for text in signals if TOOL_DENIAL.search(text)), None)
+        tool_denial = next((text for text in signals if EXPLICIT_TOOL_DENIAL.search(text)), None)
         if not tool_denial and kind in ("result", "error") and status != "SUCCESS" and _provider_forbidden(problem):
             yield self._failed(error if HTTP_FORBIDDEN.search(error) else f"HTTP 403: {error or 'Forbidden'}")
             return

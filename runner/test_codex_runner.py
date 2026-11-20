@@ -256,11 +256,12 @@ FAKE_AGY = textwrap.dedent(r"""
         time.sleep(300)
     if mode == "deny":
         print("command blocked by permissions", file=sys.stderr, flush=True)
-    if mode == "provider_error":
+    if mode in ("provider_error", "stderr_error"):
         error = json.loads(os.environ["FAKE_AGY_ERROR"])
-        if isinstance(error, str):
-            print(error, file=sys.stderr, flush=True)
-        say(event="result", result={"status": "ERROR", "error": error})
+        if mode == "stderr_error":
+            print(error if isinstance(error, str) else json.dumps(error), file=sys.stderr, flush=True)
+        else:
+            say(event="result", result={"status": "ERROR", "error": error})
         sys.exit(1)
     report = json.loads(os.environ["FAKE_AGY_REPORT"])
     say(event="result", result={"status": "SUCCESS", "structured_output": report,
@@ -2870,14 +2871,32 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(receipt.get("job_id"), child.name)
                 self.assertIs(receipt.get("deduplicated"), True)
 
+    def test_gemini_admission_counts_worker_with_delayed_pid_publication(self):
+        import codex_runner
+
+        job = self.stored_job("starting", None, engine="gemini")
+        pid_file = job / "worker.pid"
+        pid_file.unlink()
+        args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.time, "time", return_value=job.stat().st_ctime + 6):
+            with self.subTest("before PID publication"):
+                receipt = codex_runner.gemini_admission(args)
+                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
+            codex_runner.record_pid(pid_file, os.getpid())
+            with self.subTest("after PID publication"):
+                receipt = codex_runner.gemini_admission(args)
+                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
+
     def test_gemini_admission_releases_slot_after_worker_start_grace(self):
         import codex_runner
 
         job = self.stored_job("abandoned", None, engine="gemini")
         (job / "worker.pid").unlink()
         args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
+        expired = job.stat().st_ctime + codex_runner.LOST_AFTER + 1
         with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
-                mock.patch.object(codex_runner.time, "time", return_value=job.stat().st_ctime + 6):
+                mock.patch.object(codex_runner.time, "time", return_value=expired):
             self.assertIsNone(codex_runner.gemini_admission(args))
         self.assertFalse((job / "result.json").exists())
 
@@ -2891,38 +2910,34 @@ class RunnerTests(unittest.TestCase):
                 self.assertIs(result["fallback_safe"], expected)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
-    def test_gemini_model_quota_and_login_failures_are_provider_permanent(self):
+    def test_gemini_error_classification_from_stderr_and_events(self):
         argv, env, _ = self.fake_gemini(mode="provider_error")
-        for error in ("invalid model selection: --effort is not supported for model", "weekly quota exhausted",
-                      "not logged in", "model is not available", "403 PERMISSION_DENIED: account disabled",
-                      {"code": 403, "status": "PERMISSION_DENIED", "message": "Account disabled"}):
-            with self.subTest(error=error):
-                result = self.invoke(*argv, env={**env, "FAKE_AGY_ERROR": json.dumps(error)})
-                self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
-                                 ("failed", "provider_permanent", False, 1))
-                self.assertIn(error["message"] if isinstance(error, dict) else error, result["error"])
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
-    def test_gemini_retries_transient_model_unavailability(self):
-        argv, env, _ = self.fake_gemini(mode="provider_error")
-        error = "429: model not available, try again"
-        result = self.invoke(*argv, "--retries", "1", env={**env, "FAKE_AGY_ERROR": json.dumps(error)})
-        self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
-                         ("failed", "transient", True, 2))
-
-    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
-    def test_gemini_distinguishes_403_tool_denials_from_disabled_accounts(self):
-        argv, env, _ = self.fake_gemini(mode="provider_error")
-        for error, expected in (
-            ("403 PERMISSION_DENIED: tool call was denied", "permission_denied"),
-            ({"code": 403, "message": "tool call was denied"}, "permission_denied"),
-            ("403 PERMISSION_DENIED: disabled in this account", "provider_permanent"),
-            ({"code": 403, "message": "violation of Terms of Service"}, "provider_permanent"),
+        for error, kind, retryable in (
+            ("403 PERMISSION_DENIED: This service has been disabled in this account for violation of Terms of Service. "
+             "Please submit an appeal to continue using this product.", "provider_permanent", False),
+            ("401 Unauthorized: not logged in. Please log in and try again.", "provider_permanent", False),
+            ("429: weekly quota exhausted", "provider_permanent", False),
+            ("429: model not available, try again", "transient", True),
+            ("503 overloaded", "transient", True),
+            ("stream disconnected", "transient", True),
+            ("403 PERMISSION_DENIED: tool call was denied", "permission_denied", False),
+            ({"code": 403, "message": "tool call was denied"}, "permission_denied", False),
+            ({"code": 403, "message": "IAM permission required to access this model"}, "provider_permanent", False),
+            ("403 soft deny: blocked by permissions.allow", "permission_denied", False),
+            ("403: approval required for this command in headless mode", "permission_denied", False),
+            ("permission request was denied", "permission_denied", False),
+            ('--effort is not supported for model "gemini-4-carbon"', "incomplete", False),
+            ('invalid model selection: --effort is not supported for model "gemini-4-carbon"',
+             "provider_permanent", False),
         ):
-            with self.subTest(error=error):
-                result = self.invoke(*argv, "--retries", "1", env={**env, "FAKE_AGY_ERROR": json.dumps(error)})
-                self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
-                                 ("failed", expected, False, 1))
+            for mode in ("stderr_error", "provider_error"):
+                with self.subTest(error=error, mode=mode):
+                    result = self.invoke(*argv, "--retries", "1", env={
+                        **env, "FAKE_AGY_ERROR": json.dumps(error), "FAKE_AGY_MODE": mode,
+                    })
+                    self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                                     ("failed", kind, retryable, 2 if retryable else 1))
+                    self.assertIn(error["message"] if isinstance(error, dict) else error, result["error"])
 
     def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
         import codex_runner

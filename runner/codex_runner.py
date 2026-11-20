@@ -103,7 +103,7 @@ TRANSIENT = re.compile(
 PROVIDER_PERMANENT = re.compile(
     r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|log.?in required|sign.?in required"
     r"|usage limit|quota|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
-    r"|model.{0,40}(not found|not supported|not available|does not exist)", re.I)
+    r"|model.{0,40}(not found|not supported|does not exist)", re.I)
 
 
 def emit(obj):
@@ -817,8 +817,6 @@ def classify(state, run_dir):
             return "permission_denied", False
         if text.startswith("agy rejected a CLI argument:"):
             return "bad_arguments", False
-        if TRANSIENT.search(text):
-            return "transient", True
         if PROVIDER_PERMANENT.search(text):
             return "provider_permanent", False
     if REFUSED.search(text):
@@ -3167,7 +3165,7 @@ def gemini_admission(args):
             if limit:
                 worker_pid = job_dir / "worker.pid"
                 worker_active = not (job_dir / "result.json").exists() and (
-                    (not worker_pid.exists() and time.time() - job_dir.stat().st_ctime < WORKER_START_GRACE_SECONDS)
+                    (not worker_pid.exists() and time.time() - job_dir.stat().st_ctime < LOST_AFTER)
                     or recorded_pid(worker_pid) is not None)
                 if worker_active or recorded_pid(job_dir / "codex.pid") is not None:
                     running += 1
