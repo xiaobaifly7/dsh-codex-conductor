@@ -262,6 +262,11 @@ def _launch(run_dir, job_id, cwd, command, flags):
                 sys.stderr.buffer.write(line)
                 sys.stderr.buffer.flush()
                 text = line.decode("utf-8", "replace").strip()
+                if text.startswith("{"):
+                    try:
+                        text = _message(json.loads(text)) or text
+                    except ValueError:
+                        pass
                 if text:
                     diagnostics_tail[0] = text[-1000:]
                 if not invalid_flag and INVALID_FLAG.search(text):
@@ -296,7 +301,8 @@ def _launch(run_dir, job_id, cwd, command, flags):
         payload = payload if isinstance(payload, dict) else {}
         conversation_id = (result or {}).get("conversation_id") or payload.get("conversation_id")
         problem = (result or {}).get("error") or payload.get("error")
-        denial = tool_denied or (denied if not (_provider_forbidden(problem) or (result is None and provider_denial)) else [])
+        denial = tool_denied or (
+            denied if not (HTTP_FORBIDDEN.search(_message(problem)) or (result is None and provider_denial)) else [])
         if denial:
             _emit({"event": "permission_denied", "error": denial[0],
                    "conversation_id": conversation_id})
@@ -313,17 +319,41 @@ def _launch(run_dir, job_id, cwd, command, flags):
         finished.set()
 
 
+def _quota_details(details):
+    if not isinstance(details, list):
+        return
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        kind = detail.get("@type")
+        if kind == "type.googleapis.com/google.rpc.RetryInfo":
+            yield f"RetryInfo {detail.get('retryDelay', '')}".rstrip()
+        elif kind == "type.googleapis.com/google.rpc.QuotaFailure":
+            violations = detail.get("violations")
+            if isinstance(violations, list):
+                for violation in violations:
+                    if isinstance(violation, dict):
+                        for key in ("quotaId", "description"):
+                            value = violation.get(key)
+                            if isinstance(value, str):
+                                yield value
+        elif kind == "type.googleapis.com/google.rpc.ErrorInfo":
+            metadata = detail.get("metadata")
+            if isinstance(metadata, dict) and isinstance(metadata.get("quota_limit"), str):
+                yield metadata["quota_limit"]
+
+
 def _message(payload):
     if isinstance(payload, str):
         return payload
     if isinstance(payload, dict):
-        message = payload.get("message") or payload.get("error") or payload.get("code") or payload.get("type")
-        return _message(message) if message else ""
+        message = _message(payload.get("message") or payload.get("error") or payload.get("code") or payload.get("type"))
+        for status in (payload.get("code"), payload.get("status")):
+            if re.fullmatch(r"[1-5][0-9]{2}", str(status)):
+                message = f"HTTP {status}: {message}" if message and message != str(status) else f"HTTP {status}"
+                break
+        return "\n".join(filter(None, (message, *_quota_details(payload.get("details")))))
     return ""
-
-
-def _provider_forbidden(problem):
-    return (isinstance(problem, dict) and str(problem.get("code")) == "403") or bool(HTTP_FORBIDDEN.search(_message(problem)))
 
 
 class EventAdapter:
@@ -360,8 +390,8 @@ class EventAdapter:
         signals = (error, status, str(kind), str(step.get("state", "")), str(info.get("status", "")),
                    str(problem.get("type") or problem.get("code")) if isinstance(problem, dict) else "")
         tool_denial = next((text for text in signals if EXPLICIT_TOOL_DENIAL.search(text)), None)
-        if not tool_denial and kind in ("result", "error") and status != "SUCCESS" and _provider_forbidden(problem):
-            yield self._failed(error if HTTP_FORBIDDEN.search(error) else f"HTTP 403: {error or 'Forbidden'}")
+        if not tool_denial and kind in ("result", "error") and status != "SUCCESS" and HTTP_FORBIDDEN.search(error):
+            yield self._failed(error)
             return
         denial = tool_denial or next((text for text in signals if DENIAL.search(text)), None)
         if denial:

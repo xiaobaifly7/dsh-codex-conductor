@@ -2912,13 +2912,39 @@ class RunnerTests(unittest.TestCase):
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_error_classification_from_stderr_and_events(self):
         argv, env, _ = self.fake_gemini(mode="provider_error")
+        retry_info = {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "56s"}
+        minute_quota = {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                            "description": "per minute limit"}],
+        }
+        daily_quota = {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [{"quotaId": "RequestsPerDay-limit", "description": "daily limit"}],
+        }
         for error, kind, retryable in (
             ("403 PERMISSION_DENIED: This service has been disabled in this account for violation of Terms of Service. "
              "Please submit an appeal to continue using this product.", "provider_permanent", False),
             ("401 Unauthorized: not logged in. Please log in and try again.", "provider_permanent", False),
             ("429: weekly quota exhausted", "provider_permanent", False),
             ("429: model not available, try again", "transient", True),
+            ({"code": 429, "message": "Quota exceeded", "details": [minute_quota, retry_info]}, "transient", True),
+            ({"code": 429, "message": "Quota exceeded", "details": [minute_quota]}, "transient", True),
+            ({"code": 429, "message": "Quota exhausted", "details": [retry_info]}, "transient", True),
+            ({"code": 429, "message": "Quota exceeded", "details": [daily_quota]}, "provider_permanent", False),
+            ({"code": 429, "message": "Quota exceeded", "details": [daily_quota, retry_info]},
+             "provider_permanent", False),
+            ({"code": 429, "message": "Quota exceeded", "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "metadata": {"quota_limit": "RequestsPerMinute_PerProject_PerUser"},
+            }]}, "transient", True),
+            ("429: per minute quota exhausted", "transient", True),
+            ("429: quota exceeded", "transient", True),
+            ("429: quota exhausted", "provider_permanent", False),
+            ("429: quota exceeded. Please retry in 56.185908122s.", "transient", True),
             ("503 overloaded", "transient", True),
+            ({"code": 503, "message": "Service Unavailable", "details": []}, "transient", True),
+            ({"status": 503, "message": "Service Unavailable"}, "transient", True),
             ("stream disconnected", "transient", True),
             ("403 PERMISSION_DENIED: tool call was denied", "permission_denied", False),
             ({"code": 403, "message": "tool call was denied"}, "permission_denied", False),
@@ -2938,6 +2964,8 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
                                      ("failed", kind, retryable, 2 if retryable else 1))
                     self.assertIn(error["message"] if isinstance(error, dict) else error, result["error"])
+                    if isinstance(error, dict) and (status := error.get("code", error.get("status"))):
+                        self.assertIn(str(status), result["error"])
 
     def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
         import codex_runner

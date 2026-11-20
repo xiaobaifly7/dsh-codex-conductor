@@ -88,7 +88,7 @@ DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 PERMANENT = re.compile(
-    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|quota|insufficient"
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|insufficient"
     r"|model.{0,40}(not found|not supported|does not exist)|invalid.{0,20}(config|schema)|unrecognized", re.I)
 # The model refusing the request arrives inside "Reconnecting... n/5" notices; the same prompt is refused again,
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
@@ -102,8 +102,14 @@ TRANSIENT = re.compile(
     r"|\b50[0234]\b|overloaded|server_error|temporarily|try again", re.I)
 PROVIDER_PERMANENT = re.compile(
     r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|log.?in required|sign.?in required"
-    r"|usage limit|quota|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
+    r"|usage limit|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
     r"|model.{0,40}(not found|not supported|does not exist)", re.I)
+GEMINI_QUOTA = re.compile(r"\b429\b|quota|resource[ _-]exhausted", re.I)
+QUOTA_LONG_TERM = re.compile(r"per[ _-]?(?:day|week)|daily|weekly", re.I)
+QUOTA_PER_MINUTE = re.compile(r"per[ _-]?minute", re.I)
+QUOTA_EXHAUSTED = re.compile(r"(?:\b|_)exhausted\b", re.I)
+QUOTA_RETRY_HINT = re.compile(
+    r"\b(?:RetryInfo|retryDelay)\b|(?:please retry in|suggested retry after) \d+(?:\.\d+)?m?s\b", re.I)
 
 
 def emit(obj):
@@ -802,6 +808,7 @@ def classify(state, run_dir):
         return "model_refused", False
     if state["end_reason"] == "repeated_failure":
         return "repeated_failure", False
+    gemini = state.get("engine") == "gemini"
     text = state["error"] or ""
     if not state["failed"] and not text:
         try:
@@ -810,18 +817,25 @@ def classify(state, run_dir):
                 text = f.read().decode("utf-8", "replace")[-2000:]
         except OSError:
             text = ""
-        engine = "Gemini" if state.get("engine") == "gemini" else "Codex"
+        engine = "Gemini" if gemini else "Codex"
         state["error"] = text.strip()[-500:] or f"{engine} exited without turn.completed"
-    if state.get("engine") == "gemini":
+    if gemini:
         if "agy permission denied" in text.lower():
             return "permission_denied", False
         if text.startswith("agy rejected a CLI argument:"):
             return "bad_arguments", False
         if PROVIDER_PERMANENT.search(text):
             return "provider_permanent", False
+        quota = GEMINI_QUOTA.search(text)
+        if quota and QUOTA_LONG_TERM.search(text):
+            return "provider_permanent", False
+        if QUOTA_RETRY_HINT.search(text) or (quota and QUOTA_PER_MINUTE.search(text)):
+            return "transient", True
+        if quota and QUOTA_EXHAUSTED.search(text):
+            return "provider_permanent", False
     if REFUSED.search(text):
         return "model_refused", False
-    if PERMANENT.search(text):
+    if PERMANENT.search(text) or (not gemini and "quota" in text.lower()):
         return "permanent", False
     if REJECTED.search(text):
         return "upstream_rejected", False
@@ -1877,9 +1891,10 @@ def execute(args, prompt, run_dir):
             can_retry = (not report_only and retryable and attempt <= args.retries and
                          (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
+                error = state.get("error") or ""
                 if baseline is not None and (
                         kind in ("router_down", "model_refused", "upstream_rejected", "transient", "reconnect_timeout") or
-                        (kind == "permanent" and PROVIDER_PERMANENT.search(state.get("error") or ""))):
+                        (kind == "permanent" and (PROVIDER_PERMANENT.search(error) or "quota" in error.lower()))):
                     base["fallback_safe"] = True
                 runner_event(run_dir, attempt, "finalizing", kind)
                 return finish({**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
