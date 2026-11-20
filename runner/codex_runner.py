@@ -60,6 +60,7 @@ HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
              else Path.home() / ".local/state/codex-runner"))
 EXIT_GRACE_SECONDS = 20
+WORKER_START_GRACE_SECONDS = 5
 LOST_AFTER = 300
 REPEAT_MIN_SECONDS = 60
 REPEAT_FAILURES = 2
@@ -2635,7 +2636,7 @@ def job_status(job_id, record=None, *, lost_after=LOST_AFTER):
             reconcile_lost_executor(job_dir, result, record["task"] if record is not None else None, lost_after)
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")), record)
-        if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
+        if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < WORKER_START_GRACE_SECONDS:
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None}, record)
         return enriched_status(job_id, job_dir, worker_died(job_id, job_dir, record["task"] if record else None), record)
     except (OSError, ValueError, TypeError) as e:
@@ -3166,7 +3167,8 @@ def gemini_admission(args):
             if limit:
                 worker_pid = job_dir / "worker.pid"
                 worker_active = not (job_dir / "result.json").exists() and (
-                    not worker_pid.exists() or recorded_pid(worker_pid) is not None)
+                    (not worker_pid.exists() and time.time() - job_dir.stat().st_ctime < WORKER_START_GRACE_SECONDS)
+                    or recorded_pid(worker_pid) is not None)
                 if worker_active or recorded_pid(job_dir / "codex.pid") is not None:
                     running += 1
         except (OSError, ValueError):

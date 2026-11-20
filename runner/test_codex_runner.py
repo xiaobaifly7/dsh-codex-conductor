@@ -2865,9 +2865,21 @@ class RunnerTests(unittest.TestCase):
             with self.subTest("age pruning"):
                 self.assertTrue(codex_runner.keep_fallback_child(child))
             with self.subTest("fallback replay"):
-                receipt = codex_runner.gemini_admission(args) or {}
+                with mock.patch.object(codex_runner.time, "time", return_value=child.stat().st_ctime + 6):
+                    receipt = codex_runner.gemini_admission(args) or {}
                 self.assertEqual(receipt.get("job_id"), child.name)
                 self.assertIs(receipt.get("deduplicated"), True)
+
+    def test_gemini_admission_releases_slot_after_worker_start_grace(self):
+        import codex_runner
+
+        job = self.stored_job("abandoned", None, engine="gemini")
+        (job / "worker.pid").unlink()
+        args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.time, "time", return_value=job.stat().st_ctime + 6):
+            self.assertIsNone(codex_runner.gemini_admission(args))
+        self.assertFalse((job / "result.json").exists())
 
     def test_fallback_snapshots_exclude_runner_home_but_detect_workspace_changes(self):
         home = self.cwd / ".local" / "state" / "codex-runner"
