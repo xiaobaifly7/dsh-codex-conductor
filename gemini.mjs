@@ -209,7 +209,7 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
   const started = performance.now();
   let restoreOutput, draft;
   const value = { status: 'failed', output: typeof args?.output === 'string' ? args.output : '', chars: 0, cjk_chars: 0,
-    over_limit: false, out_of_scope: [], duration_s: 0, usage: null, model: args?.model ?? cfg.model, effort: cfg.forceEffort ? cfg.effort : (args?.effort ?? cfg.effort),
+    over_limit: false, out_of_scope: [], duration_s: 0, usage: null, model: cfg.forceModel ? cfg.model : args?.model ?? cfg.model, effort: cfg.forceEffort ? cfg.effort : (args?.effort ?? cfg.effort),
     files_changed: [], write_paths: [], unattributed_changes: [], rolled_back: false, attempts: 0, attempt_chars: [],
     reused_draft: false, stdout_bytes: 0, event_count: 0, event_types: {}, last_event_type: null,
     last_progress_s: 0, timeout_kind: null };

@@ -272,7 +272,7 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   effortOverride: '单次推理强度覆盖',
   repeatFailureGuard: '重复失败拦截设置',
   plannerReadAllow: '额外允许读取的路径',
-  defaultEngine: '新任务默认执行端', crossEngineVerify: '核验换另一引擎', geminiFallback: 'Codex 失败转 Gemini',
+  defaultEngine: '新任务默认执行端', lockEngine: '锁定执行端', crossEngineVerify: '核验换另一引擎', geminiFallback: 'Codex 失败转 Gemini',
   maxGeminiRunningJobs: 'Gemini 同时运行的任务数上限' };
 // null clears a limit and restores the runner default.
 const count = (v) => Number.isInteger(v) && v > 0;
@@ -305,7 +305,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'ownerDecisions') valid = ['planner', 'owner'].includes(v);
     else if (key === 'autoVerify') valid = ['off', 'flagged'].includes(v);
     else if (key === 'effortOverride') valid = ['planner', 'raise-only-listed', 'config'].includes(v);
-    else if (['jobDiff', 'closeoutGuard', 'crossEngineVerify', 'geminiFallback'].includes(key)) valid = typeof v === 'boolean';
+    else if (['jobDiff', 'closeoutGuard', 'crossEngineVerify', 'geminiFallback', 'lockEngine'].includes(key)) valid = typeof v === 'boolean';
     else if (key === 'defaultEngine') valid = v === 'codex' || (v === 'gemini' && geminiConfigured);
     else if (Object.hasOwn(listSettings, key)) {
       valid = Array.isArray(v) && v.length <= listSettings[key][0] && v.every((item) => typeof item === 'string' && listSettings[key][1](item));
