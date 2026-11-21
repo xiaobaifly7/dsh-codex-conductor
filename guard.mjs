@@ -93,8 +93,8 @@ export function normPath(p) {
   // \\wsl.localhost\<distro>\... 与 \\wsl$\<distro>\... 是同一个 WSL 路径的 Windows 写法。
   let s = p.trim().replace(/\\/g, '/').replace(/^\/\/(?:wsl\.localhost|wsl\$)\/[^/]+(?=\/|$)/i, '') || '/';
   const windows = /^[A-Za-z]:/.test(s) || s.startsWith('//');
-  // Resolve .. in WSL before converting a mount to its Windows drive.
-  s = path.posix.normalize(s);
+  // Keep a drive's root when resolving ..; convert WSL mounts after resolving their Linux path.
+  s = /^[A-Za-z]:\//.test(s) ? path.win32.normalize(s).replace(/\\/g, '/') : path.posix.normalize(s);
   const m = /^\/mnt\/([a-z])(\/.*)?$/i.exec(s);
   if (m) s = `${m[1]}:${m[2] ?? '/'}`;
   s = s.replace(/\/+$/, '') || '/';

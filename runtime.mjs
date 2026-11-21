@@ -688,7 +688,7 @@ export function registerRuntimeTool({ ctx, conductor, moduleUrl, loadedIdentity,
       'reload 默认 when=idle，同时等 Codex 任务结束且所有会话 status 不为 running，最多等 10 分钟；超时不重载，需重新请求。' +
       'when=now 立即重载，可能中止正在进行的 DeepSeek 回合；Codex 后台任务继续运行，重载后按登记记录接回。' +
       '已提交的重载会复用原请求；等到实际加载标记才报告生效。后台取消只停止观察。' +
-      'action=doctor 只读自检 WSL 里的 Python、Codex、登录文件、路由和 bash，不启动任务。',
+      'action=doctor 检查 Python、Codex、登录文件和路由。WSL 额外检查 bash，Windows 原生模式预检私有 Codex 沙箱。两种模式均不调用模型。',
     presentCall: (args) => ({ card: 'generic', kind: args?.action === 'reload' ? 'write' : 'read', title: 'Codex runtime' }),
     parameters: { type: 'object', properties: {
       action: { type: 'string', enum: ['status', 'reload', 'doctor'], default: 'status' },

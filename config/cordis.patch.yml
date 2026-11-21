@@ -1,0 +1,94 @@
+# Windows-native candidate based on the loaded ASA desktop conductor (0.9.131, commit 005e869).
+# id and name select the separate migration plugin and repository.
+# runnerMode replaces distro. python, codexBin and pwshDir select native executables and shell.
+# codexHome, runnerHome and stateDir isolate configuration, jobs and conductor state.
+# runtimeProfileFile points to this candidate. workspaces are limited to the migration repository and test work.
+# codexRoute.baseUrl uses the Windows Magpie listener on 3425. All other settings inherit the ASA entry.
+- insert:
+    - id: codex-conductor-win-native
+      name: file:///D:/AI-Workspace/win-migration/dsh-codex-conductor/index.mjs
+      config:
+        codexRoute:
+          provider: "magpie"
+          baseUrl: "http://127.0.0.1:3425/v1"
+        runtimeProfileFile: D:/AI-Workspace/win-migration/dsh-codex-conductor/config/cordis.patch.yml
+        workspaces:
+          - D:/AI-Workspace/win-migration/dsh-codex-conductor
+          - D:/AI-Workspace/win-migration/state/work
+        runnerMode: native
+        python: C:/Python314/python.exe
+        codexBin: C:/Users/apple/AppData/Roaming/npm/node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe
+        pwshDir: C:/Program Files/PowerShell/7
+        stateDir: D:/AI-Workspace/win-migration/state/conductor
+        codexHome: D:/AI-Workspace/win-migration/state/runner/codex-home
+        runnerHome: D:/AI-Workspace/win-migration/state/runner
+        # 2026-11-17：0.9.104 runnerAgentsMd 启用。Codex 任务改读精简版 AGENTS.md（20,979 字，原 43,998 字），文件在 WSL ~/.config/codex-runner；删了这个文件任务会静默不带 AGENTS.md。
+        # 2026-11-18：0.9.122 改用随包短版执行指令（executor-agents.md，约 15 行）。回退：把下一行改回 /home/xiaobai/.config/codex-runner/AGENTS.runner.md
+        runnerAgentsMd: bundled
+        # 2026-11-18：0.9.122 新增。新线程在两个模型间各半分配，用于持续对照；统计脚本 tools/model_ab_stats.py。关闭：enabled 改 false。
+        modelAB:
+          # 2026-11-18：对照结束（6.1 胜出），关闭。
+          enabled: false
+          models: [ 'codex/gpt-6.1-sol', 'codex/gpt-6.2-sol' ]
+          share: 0.5
+        # 2026-11-07：默认 GPT-6.1 Sol + high，Fast 模式；codex_run 的 effort 可单次覆盖。
+        # 用 codex/ 直连名，不走 Magpie 的 auto/gpt-6.1-sol 路由组（该组会丢掉 Fast 档位）。
+        # 2026-11-11：按用户要求改为 GPT-6.1 Sol + high + Fast。
+        # 2026-11-18：按用户要求改为 GPT-6.2 Sol + high + Fast；只读调查保持 readOnlyEffort medium。
+        # 2026-11-18：按用户要求改回 GPT-6.1 Sol。依据：A/B 盲评 35 个同会话任务，6.1 做成或主体做成 15/25、6.2 为 3/10；6.2 报达成但无证据的条目多、拒答多。
+        model: codex/gpt-6.1-sol
+        effort: medium
+        # 2026-11-18：用户选定 raise-only-listed，写单默认 medium；提高推理强度要带列举的 effort_reason。
+        effortOverride: raise-only-listed
+        serviceTier: fast
+        # 2026-11-17：0.9.103 新增。只读调查和 codex_verify 默认用 medium，单次传 effort 可覆盖。
+        readOnlyEffort: medium
+        # 2026-11-10：0.9.44 新增。无人值守时由规划端（DeepSeek）代答 Codex 留下的问题，不再等用户本人回复；删掉或改 false 即恢复原规则。
+        plannerAnswers: true
+        # 2026-11-11：规划端只读 Codex 的产物，原料（源码、日志、资料）一律交给 Codex 读。
+        # 2026-11-18：0.9.117 新增。放行 draw.io 的画图工具，其他 MCP 写入类工具照旧拒绝。
+        mcpWriteAllow:
+          - 'mcp__drawio__*'
+          - 'mcp__drawio-skill__*'
+        plannerReads: products
+        plannerReadAllow:
+          - 'E:\obsidian\study\AGENTS.md'
+          - 'E:\obsidian\study\CLAUDE.md'
+          - 'E:\obsidian\study\08 - 本库指南'
+        # 2026-11-10：0.9.43 新增。教程、文档正文用 gemini_write 交给本机官方 agy 的 Gemini 写；代理只注入给 agy 子进程。
+        gemini:
+          command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
+          proxy: 'http://127.0.0.1:7890'
+          # 2026-11-11：按用户要求换最强模型；同题盲测 carbon-high 8.4 > argon-high 8.1 > argon-medium 7.2 > opus-4.6 6.2。原值 gemini-4-argon / medium。
+          model: gemini-4-carbon
+          effort: high
+          # 2026-11-11：插件新增 forceEffort，规划端传的 effort 一律按上面 high 执行；改 false 恢复调用方自定。
+          forceEffort: true
+          # 2026-11-12：教程改为约 16 章、每章 4000–10000 字；不传 max_chars 时按此上限兜底。
+          defaultMaxChars: 12000
+          # 2026-11-13：agy 遇上游流卡住会自己重试 3 次、每次约 10 分钟；总上限给到 45 分钟让它重试完（默认 1800 会掐断第 3 次）。
+          timeoutSeconds: 2700
+        # 2026-11-10：0.9.40 新增。排队等写锁最多 4 小时（长于持锁任务 3 次尝试的最长用时），超时报 lock_timeout，不再无限显示 running。
+        # 2026-11-13：0.9.92 新增。Harness 重启后自动续接被打断的会话（每宿主进程一次；用户手动停止、暂停的不动）。
+        # 2026-11-18：conductor 的重启续接改为兜底——宿主启动 180 秒后，只续接仍未恢复的会话（大会话会被 dsh-client-auto-continue 的 5 秒读取超时漏掉）；改回 enabled: false 即关闭。
+        autoResume:
+          enabled: true
+          maxAgeHours: 12
+          delaySeconds: 180
+          message: '接着上次中断的地方继续。'
+        # 2026-11-18：0.9.109 会话交接，全自动。会话超过 handoverSuggestMessages 条、空闲且没有运行中的 Codex 任务时自动交接到同一分组的新会话；改 confirm 则先在面板询问，off 关闭。
+        autoHandover:
+          mode: auto
+        lockTimeoutSeconds: 14400
+        # 2026-11-17：全局同时运行或排队的 Codex 任务上限，超出时新派单被拒、不启动。
+        maxRunningJobs: 10
+        # 2026-11-18：开新线程续接效果更差（今日 fresh 4 ok/10 blocked/2 refused，resume 14 ok/10 blocked，且更慢），先关；单次 fresh:true 仍可用。
+        continueFreshAboveTokens: 0
+        # 任务记录（jobs/runs）合计上限 2 GiB，启动新任务时从最旧的已结束记录删起；当前约 85 MB。
+        maxStorageMb: 2048
+        # 2026-11-06：用户确认放开沙箱，codex_run 可传 host_access=true 让 Codex 操作 Windows、Hyper-V 和虚拟机。
+        allowHostAccess: true
+        defaultHostAccess: true
+        # 2026-11-07：这个日志由其他进程持续写入，不计入改动清单、改动数和超出 scope 的检查（路径相对任务目录）。
+        ignoreChanges:
+          - '^30-evidence/des-bridge\.log$'

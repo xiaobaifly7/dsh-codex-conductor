@@ -13,6 +13,7 @@ import { readOnlyCommand, splitCommand, decide, normPath, validateRun, composePr
   outOfScope, taskCwd, nextStep, withReport, reviewState, turnSummary, runnerArgv, runProcess, runRunner, PS_SYNTAX, hasUserReply } from './index.mjs';
 import { createPanelApi, PANEL_PATH } from './panel.mjs';
 import { wslPath, GEMINI_CHECK_HINT, GEMINI_READ_DENY } from './guard.mjs';
+import { prepareNativeTest } from './runner/native-test-config.mjs';
 import './panel.test.mjs';
 import './resume.test.mjs';
 import './planner.test.mjs';
@@ -894,6 +895,7 @@ test('tree rejects output options inside short-option clusters', () => {
 });
 
 test('guard regressions match Bash semantics using only printed markers and /dev/null', (t) => {
+  if (process.platform === 'win32' && process.env.CODEX_TEST_WSL !== '1') return t.skip('WSL test is opt-in on Windows');
   const executable = process.platform === 'win32' ? 'wsl.exe' : 'bash';
   const prefix = process.platform === 'win32' ? ['-e', 'bash'] : [];
   const bash = (script) => spawnSync(executable, [...prefix, '--noprofile', '--norc', '-c', script],
@@ -3740,6 +3742,32 @@ test('runProcess streams progress and accepts the final line before process exit
   assert.equal(incomplete.error_kind, 'bridge_error');
 });
 
+test('runProcess releases inherited pipes when a bounded query is aborted', () => {
+  const caller = [
+    'import assert from "node:assert/strict"',
+    'import cp from "node:child_process"',
+    'import { EventEmitter } from "node:events"',
+    'import { syncBuiltinESMExports } from "node:module"',
+    'import { PassThrough } from "node:stream"',
+    'const child = new EventEmitter()',
+    'for (const name of ["stdin", "stdout", "stderr"]) child[name] = new PassThrough()',
+    'child.kill = () => true',
+    'child.unref = () => {}',
+    'cp.spawn = () => child',
+    'syncBuiltinESMExports()',
+    'const { runProcess } = await import(' + JSON.stringify(new URL('./index.mjs', import.meta.url).href) + ')',
+    'const controller = new AbortController()',
+    'const waiting = runProcess("runner", [], { signal: controller.signal, onProgress: () => controller.abort() })',
+    'child.stdout.write(JSON.stringify({ status: "running" }) + "\\n")',
+    'assert.equal((await waiting).error_kind, "bridge_error")',
+    'assert.ok(child.stdin.destroyed && child.stdout.destroyed && child.stderr.destroyed)',
+  ].join(';\n');
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', caller],
+    { encoding: 'utf8', timeout: 3500, windowsHide: true });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('runner single-result calls return complete JSON while their output pipes remain open', async () => {
   const runner = wslPath(fileURLToPath(new URL('./runner/codex_runner.py', import.meta.url)));
   for (const status of ['running', 'completed']) {
@@ -3896,6 +3924,160 @@ test('runRunner forwards argv, stdin, signal, timeoutMs and WSL_UTF8 to the exec
   assert.equal(seen[2].env.WSL_UTF8, '1');
 });
 
+test('ASA WSL profile keeps the published bridge contract with a default or explicit bundled runner', async () => {
+  const bundled = (file) => wslPath(fileURLToPath(new URL(file, import.meta.url)));
+  const runner = bundled('./runner/codex_runner.py');
+  const route = { provider: 'magpie', baseUrl: 'http://127.0.0.1:3426/v1' };
+  const home = '/home/test';
+  const cwd = 'D:/Test/Project';
+  for (const mode of [{}, { runnerMode: 'wsl' }]) {
+    for (const location of [{}, { runner }]) {
+      const calls = [];
+      const tools = {};
+      let settings;
+      applyPlugin({ tools: { register: (tool) => { tools[tool.name] = tool; }, guard() {} }, on() {} },
+        { ...mode, ...location, distro: 'Ubuntu-24.04', codexHome: home + '/.codex',
+          runnerHome: home + '/.local/state/codex-runner', codexRoute: route, runnerAgentsMd: 'bundled',
+          model: 'codex/gpt-6.1-sol', effort: 'medium', serviceTier: 'fast', autoVerify: 'off' },
+        (cfg, argv, options) => {
+          settings = cfg;
+          return runRunner(cfg, argv, options, (...launch) => {
+            calls.push(launch);
+            return { status: 'completed' };
+          });
+        });
+      await tools.codex_run.execute({ ...RUN, cwd }, {});
+      assert.equal(calls.length, 2);
+      const [command, argv, options] = calls[1];
+      const prefix = ['-d', 'Ubuntu-24.04', '-e', 'env',
+        'CODEX_HOME=' + home + '/.codex', 'CODEX_RUNNER_HOME=' + home + '/.local/state/codex-runner',
+        'CODEX_RUNNER_AGENTS_MD=' + bundled('./executor-agents.md'), 'CODEX_RUNNER_ROUTE_PROVIDER=magpie',
+        'CODEX_RUNNER_ROUTE_URL=' + route.baseUrl, 'python3', runner];
+      assert.equal(command, 'wsl.exe');
+      assert.deepEqual(calls[0][1], [...prefix, 'repeat-guard', '--cwd', cwd]);
+      assert.deepEqual(argv, [...prefix, 'start', '--cwd', cwd, '--repeat-guard', 'on', '--repeat-min-seconds', '60',
+        '--repeat-failures', '2', '--repeat-window-hours', '24', '--effort', 'medium', '--model', 'codex/gpt-6.1-sol',
+        '--service-tier', 'fast', '--schema', bundled('./report.v2.schema.json'), '--context-json']);
+      assert.deepEqual(options.env, { ...process.env, WSL_UTF8: '1' });
+      assert.equal(options.singleResult, true);
+
+      const watch = createConductor(settings, (cfg, args, opts) => runRunner(cfg, args, opts, (...launch) => {
+        calls.push(launch);
+        return { status: 'completed' };
+      }));
+      const progress = () => {};
+      await watch.waitJob('J', 5, undefined, progress);
+      assert.deepEqual(calls[2][1], [...prefix, 'status', 'J', '--wait', '5', '--follow']);
+      assert.equal(calls[2][2].onProgress, progress);
+
+      // Every other bridge method keeps the wsl.exe launch, env and single-result streaming of the WSL runner.
+      const signal = new AbortController().signal;
+      const expected = [
+        [() => watch.cancel('J'), ['cancel', 'J']],
+        [() => watch.output('J', { artifact: 'diff', offset: 0, limit: 10 }, signal), ['output', 'J', '--artifact', 'diff', '--offset', '0', '--limit', '10']],
+        [() => watch.products('A'), ['products', '--owner', 'A', '--limit', '10000']],
+        [() => watch.doctor(), ['doctor']],
+        [() => watch.rollback('J', { check: true }), ['rollback', 'J', '--check']],
+        [() => watch.threadSize('T', signal), ['thread-size', 'T']],
+        [() => watch.verificationVersion('J', signal), ['verification-version', 'J']],
+      ];
+      for (const [invoke, args] of expected) {
+        const seen = calls.length;
+        await invoke();
+        const [command, argv, options] = calls[seen];
+        assert.equal(command, 'wsl.exe');
+        assert.deepEqual(argv, [...prefix, ...args]);
+        assert.deepEqual(options.env, { ...process.env, WSL_UTF8: '1' });
+        assert.equal(options.singleResult, true);
+      }
+    }
+  }
+});
+
+test('native use_user_config is rejected without starting a job', { skip: process.platform !== 'win32' }, async () => {
+  const config = { runnerMode: 'native', ...Object.fromEntries(
+    ['stateDir', 'runnerHome', 'codexHome'].map(key => [key, path.join(localAppData, key)])) };
+  const { tools, calls } = harness({ config });
+  await assert.rejects(tools.codex_run.execute({ ...RUN, cwd: 'D:/Test/Project', use_user_config: true }, {}),
+    /Windows 原生模式.*不支持 use_user_config=true/);
+  assert.equal(calls.some(([command]) => command === 'start'), false);
+});
+
+test('native doctor requests the sandbox check and forwards the configured PowerShell directory', { skip: process.platform !== 'win32' }, async () => {
+  const config = { runnerMode: 'native', python: 'python.exe', runner: 'D:/Test/runner.py',
+    stateDir: path.join(localAppData, 'state'), runnerHome: path.join(localAppData, 'runner'),
+    codexHome: path.join(localAppData, 'codex'), pwshDir: 'D:/Test/PowerShell' };
+  const tools = {};
+  applyPlugin({ tools: { register: (tool) => { tools[tool.name] = tool; }, guard() {} }, on() {} }, config,
+    (cfg, args, opts) => runRunner(cfg, args, opts, (_, argv, { env }) => {
+      assert.deepEqual(argv, [config.runner, 'doctor', '--sandbox']);
+      assert.equal(env.CODEX_RUNNER_PWSH_DIR, config.pwshDir);
+      assert.equal(env.Path ?? env.PATH, process.env.Path ?? process.env.PATH);
+      return { status: 'completed', ok: true };
+    }));
+  assert.equal((await tools.codex_runtime.execute({ action: 'doctor' }, {})).ok, true);
+});
+
+test('native private state validation precedes initialization and resolves Windows junction aliases', { skip: process.platform !== 'win32' }, async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'conductor-privacy-'));
+  const profile = path.join(root, 'profile');
+  const protectedHome = path.join(profile, '.codex');
+  const local = path.join(root, 'local');
+  const onlineState = path.join(local, 'dsh-codex-conductor');
+  const alias = path.join(root, 'alias');
+  mkdirSync(protectedHome, { recursive: true });
+  symlinkSync(protectedHome, alias, 'junction');
+  const originalEnv = { USERPROFILE: process.env.USERPROFILE, LOCALAPPDATA: process.env.LOCALAPPDATA };
+  process.env.USERPROFILE = profile;
+  process.env.LOCALAPPDATA = local;
+  t.after(() => {
+    for (const [key, value] of Object.entries(originalEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    fs.rmdirSync(alias);
+    rmSync(root, { recursive: true, force: true });
+  });
+  const config = { runnerMode: 'native', stateDir: path.join(root, 'state'), runnerHome: path.join(root, 'runner'),
+    codexHome: path.join(root, 'codex') };
+  const register = t.mock.fn();
+  const cases = [['stateDir', undefined], ['stateDir', 'relative'], ['stateDir', '\\relative-to-drive'],
+    ['stateDir', path.join(onlineState.toUpperCase(), 'child').replaceAll('\\', '/')],
+    ['codexHome', path.join(protectedHome, 'sessions')], ['codexHome', path.join(alias, 'not-created')],
+    ['runnerHome', alias]];
+  for (const [key, value] of cases) {
+    const invalid = { ...config, [key]: value };
+    assert.throws(() => applyPlugin({ tools: { register } }, invalid), new RegExp(key), String(value));
+    const result = await runRunner(invalid, ['doctor'], {}, register);
+    assert.equal(result.error_kind, 'bridge_error');
+    assert.match(result.error, new RegExp(key));
+  }
+  assert.equal(register.mock.callCount(), 0);
+  assert.deepEqual(readdirSync(protectedHome), []);
+  assert.ok(!fs.existsSync(config.stateDir));
+});
+
+test('native bundled runner aliases preserve follow and single-result streaming', { skip: process.platform !== 'win32' }, async () => {
+  const cfg = { runnerMode: 'native', runner: fileURLToPath(new URL('./runner/codex_runner.py', import.meta.url))
+    .toUpperCase().replaceAll('\\', '/'), stateDir: path.join(localAppData, 'state'),
+  runnerHome: path.join(localAppData, 'runner'), codexHome: path.join(localAppData, 'codex') };
+  const progress = () => {};
+  const conductor = createConductor(cfg, (settings, args, opts) => runRunner(settings, args, opts, (_, argv, options) => {
+    assert.deepEqual(argv, [cfg.runner, 'status', 'J', '--wait', '5', '--follow']);
+    assert.equal(options.singleResult, true);
+    assert.equal(options.onProgress, progress);
+    return { status: 'completed' };
+  }));
+  assert.equal((await conductor.waitJob('J', 5, undefined, progress)).status, 'completed');
+});
+
+test('native test preparation refuses a non-Windows platform before creating directories', (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { value: 'linux' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  assert.throws(prepareNativeTest, /require Windows/);
+});
+
 test('codex_status validates wait_seconds and waitJob clamps it so the timeout cannot overflow', async () => {
   const { tools } = harness({ jobs: fakeJobs() });
   await assert.rejects(tools.codex_status.execute({ job_id: 'J', wait_seconds: -1 }, {}), /wait_seconds/);
@@ -3905,6 +4087,14 @@ test('codex_status validates wait_seconds and waitJob clamps it so the timeout c
   await c.waitJob('J', 3_000_000);
   assert.equal(seenMs, 86_400 * 1000 + 10_000);
   assert.ok(seenMs < 2 ** 31 - 1);
+});
+
+test('codex_cancel reports process cleanup failure as unconfirmed', async () => {
+  const { tools } = harness({ config: { cancelResult: { status: 'failed', error_kind: 'process_cleanup_failed',
+    error: 'Access denied', retryable: false } } });
+  const result = await tools.codex_cancel.execute({ job_id: 'J' }, {});
+  assert.match(result.next, /取消未确认.*可能仍在运行/);
+  assert.equal(result.error, 'Access denied');
 });
 
 test('codex_cancel on a job that had already ended does not tell the agent to send it again', async () => {

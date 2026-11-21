@@ -583,6 +583,7 @@ test('after gemini_write, commands with unknown read targets get their own refus
 });
 
 test("'*' also guards sessions without a cwd, and WSL UNC paths match their mount or Linux root", () => {
+  assert.equal(inWorkspace('D:\\..\\WORK\\project', [normPath('d:/work')]), true);
   assert.equal(inWorkspace('', ['*']), true);
   assert.equal(inWorkspace(undefined, ['*']), true);
   assert.equal(inWorkspace('', ['/repo']), false);
