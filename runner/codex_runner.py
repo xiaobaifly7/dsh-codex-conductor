@@ -1203,8 +1203,10 @@ def forget_too_big(cwd):
     if not isinstance(data, dict):
         raise ValueError("Snapshot size cache must be a JSON object")
     root = tree_key(cwd)
-    keys = [k for k in data if k in (root, DIFF_TOO_BIG + root) or
-            (k.startswith(SCOPE_TOO_BIG) and (k[len(SCOPE_TOO_BIG):] == root or k[len(SCOPE_TOO_BIG):].startswith(root.rstrip(os.sep) + os.sep)))]
+    # Scope paths under the tree are remembered under both prefixes.
+    keys = [k for k in data if k == root or any(
+        k.startswith(prefix) and (k[len(prefix):] == root or k[len(prefix):].startswith(root.rstrip(os.sep) + os.sep))
+        for prefix in (SCOPE_TOO_BIG, DIFF_TOO_BIG))]
     if not keys:
         return had_index
     for key in keys:

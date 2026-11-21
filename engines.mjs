@@ -47,13 +47,18 @@ export function poolAccount(file, model, home) {
   return account;
 }
 
-// Codex 报额度用完时这一单结束的错误里带恢复时间（如 try again at Nov 23rd, 2026 11:23 PM，本机时区）。
-// 返回恢复的毫秒时间戳；没有可解析的时间时，从这单结束起停 30 分钟（不知道结束时间就不停，免得翻看旧任务时重新计时）。不是额度错误返回 0。
+// Codex 报额度用完时这一单结束的错误里带恢复时间（本机时区）：跨天写 try again at Nov 23rd, 2026 11:23 PM，当天只写 11:23 PM。
+// 返回恢复的毫秒时间戳；只有时刻时补上这单结束那天的日期，早于结束时间就算第二天；没有可解析的时间时从这单结束起停 30 分钟。
+// 这两种都要知道结束时间，不知道就不停，免得翻看旧任务时重新计时。不是额度错误返回 0。
 export function codexQuotaUntil(error, finishedAt) {
   if (!/usage limit/i.test(error ?? '')) return 0;
-  const stated = /try again at ([^.\n]+)/i.exec(error)?.[1].replace(/(\d)(?:st|nd|rd|th)\b/, '$1');
+  const stated = /try again at ([^.\n]+)/i.exec(error)?.[1].replace(/(\d)(?:st|nd|rd|th)\b/, '$1').trim();
   const at = stated ? Date.parse(stated) : NaN;
-  return !Number.isNaN(at) ? at : finishedAt ? finishedAt * 1000 + 30 * 60_000 : 0;
+  if (!Number.isNaN(at)) return at;
+  if (!finishedAt) return 0;
+  const ended = finishedAt * 1000;
+  const today = /^\d{1,2}:\d{2}\s*[AP]M$/i.test(stated ?? '') ? Date.parse(`${new Date(ended).toDateString()} ${stated}`) : NaN;
+  return Number.isNaN(today) ? ended + 30 * 60_000 : today > ended ? today : today + 86_400_000;
 }
 
 export function geminiArgv(args, cfg) {

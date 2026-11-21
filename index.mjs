@@ -2069,7 +2069,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // shortcut: 只记在内存里，重载插件即解除；重载后第一单 Codex 失败会重新记上。
   let codexQuota = 0;
   async function withCompletionNotices(value, exec, { allowFallback = true } = {}) {
-    if (value.status === 'failed' && jobEngine(value) === 'codex') {
+    // 只认配置的那个模型通道报的额度：单次指定的其他通道用完，不该停掉所有 Codex。
+    if (value.status === 'failed' && jobEngine(value) === 'codex' &&
+        (!cfg.model || !value.task_options?.model || value.task_options.model === cfg.model)) {
       codexQuota = Math.max(codexQuota, codexQuotaUntil(value.error, value.finished_at));
     }
     const terminal = ['completed', 'failed', 'cancelled'].includes(value.status) && !unknownState(value);
@@ -2671,7 +2673,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     // 额度用完后的 40 分钟里规划端又派了 8 单同样失败的 Codex 任务；恢复时间前不再启动 Codex。
     if (engine === 'codex' && Date.now() < codexQuota) {
       const until = new Date(codexQuota).toLocaleString('zh-CN', { hour12: false });
-      const takeover = cfg.gemini?.command && cfg.geminiFallback !== false;
+      // agy 只在主机访问下能写文件和运行命令，任务目录还得在 Windows 盘符下；做不了的不改派，直接说明原因。
+      const takeover = cfg.gemini?.command && cfg.geminiFallback !== false && cfg.allowHostAccess === true &&
+        (args.host_access ?? cfg.defaultHostAccess) === true &&
+        /^(?:[A-Za-z]:[\\/]|\/mnt\/[A-Za-z]\/)/.test(taskCwd(args, sessionCwd(exec), cfg.workspaces) ?? '');
       if (!takeover || args.engine !== undefined || args.resume) {
         throw reject(`${continuation ? 'codex_continue' : 'codex_run'}: Codex 额度已用完，预计 ${until} 恢复，这期间不再派 Codex，未启动任务。` +
           (cfg.gemini?.command ? '改传 engine: "gemini" 交给 Gemini。' : '') + '额度提前恢复时，在“Codex 指挥”面板重新加载插件即可解除。');
