@@ -203,14 +203,15 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 已有 `gemini.command` 配置时，`codex_run`、`codex_continue`、`codex_verify` 可传 `engine: "gemini"`，经 Windows Antigravity 执行。`codex_status`、`codex_output`、`codex_jobs`、`codex_cancel` 和 `codex_review` 共用原 runner job ID。两种引擎都提交同一份逐条验收报告。
 
-模型名使用 `agy models` 列出的完整 ID，例如 `gemini-4-carbon-high` 或 `gemini-3.8-flash-high`。任务和 `gemini.model` 都未指定时，runner 省略 `--model`，由 agy 选择。新任务仅在显式配置 `gemini.effort` 时传 `--effort`。使用模型名指定档位时可省略 `gemini.effort`。模型不可用、额度不足或账号无权限时，任务回执提示规划端改用 `engine: "codex"` 重新派单或核验。
+模型名使用 `agy models` 列出的完整 ID，例如 `gemini-4-carbon-high` 或 `gemini-3.8-flash-high`。任务和 `gemini.model` 都未指定时，runner 省略 `--model`，由 agy 选择。`gemini.forceModel: true` 时规划端传的 model 一律忽略，续接原 Gemini 会话也改用配置的模型；`gemini.forceEffort: true` 同样固定思考程度。账号池选号时跳过不支持该模型或额度不足 10%（本周不足 5%）的账号。新任务仅在显式配置 `gemini.effort` 时传 `--effort`。使用模型名指定档位时可省略 `gemini.effort`。模型不可用、额度不足或账号无权限时，任务回执提示规划端改用 `engine: "codex"` 重新派单或核验。
 
 | 配置 | 默认 | 作用 |
 | --- | --- | --- |
 | `defaultEngine` | `codex` | 新任务未指定引擎时采用此值 |
+| `lockEngine` | `false` | `true` 时新任务、续接和核验一律用 `defaultEngine`，规划端传的 `engine` 不生效；续接另一引擎的任务时附上轮交接开新会话，锁定 Gemini 时 `codex_run` 不接受 `resume` |
 | `crossEngineVerify` | `true` | 已配置 Gemini 时用另一引擎独立只读核验，`codex_verify` 的显式引擎优先 |
 | `geminiFallback` | `true` | Codex 因模型或上游问题失败且 runner 确认无写入时，启动关联的 Gemini 任务 |
-| `maxGeminiRunningJobs` | `2` | Gemini 运行和排队任务合计上限，`null` 表示不设单独上限 |
+| `maxGeminiRunningJobs` | `2` | 同时运行的 Gemini 任务上限；超出的任务排队（`phase: engine_wait`）直到有名额，最多等 `lockTimeoutSeconds`，`null` 表示不设单独上限 |
 
 `codex_continue` 按原任务记录恢复引擎、模型、推理强度和权限。Gemini 用准确的 `conversation_id`。显式选择另一引擎会附交接摘要、开新会话。自动接替保留原任务书、验收和范围，原回执给出接替任务号。Antigravity 每次使用订阅内额度，关闭超额 AI credits。
 
@@ -592,7 +593,7 @@ python3 runner/test_codex_runner.py
 
 ## English
 
-`codex_run`, `codex_continue` and `codex_verify` accept `engine: "codex"` or `engine: "gemini"`. Gemini uses the configured Windows `agy.exe` and shares the runner's job IDs, reports, write locks and review workflow. `defaultEngine` defaults to `codex`. `geminiFallback` and `crossEngineVerify` default to `true` when Gemini is configured. `maxGeminiRunningJobs` defaults to two running or queued jobs. Continue uses the recorded session and model. Switching engines starts a new session with the handoff.
+`codex_run`, `codex_continue` and `codex_verify` accept `engine: "codex"` or `engine: "gemini"`. Gemini uses the configured Windows `agy.exe` and shares the runner's job IDs, reports, write locks and review workflow. `defaultEngine` defaults to `codex`. `geminiFallback` and `crossEngineVerify` default to `true` when Gemini is configured. `maxGeminiRunningJobs` (default two) limits running Gemini jobs; jobs over it queue (`phase: engine_wait`) for up to `lockTimeoutSeconds` instead of failing. `lockEngine: true` runs every task, continuation and verification on `defaultEngine` whatever `engine` the planner passes; with Gemini locked, `codex_run` refuses `resume` and points to `codex_continue`. `gemini.forceModel` / `gemini.forceEffort` apply the configured model and effort to every Gemini job, continued conversations included. The account pool skips accounts that do not list the model or have under 10% quota left (5% weekly). Continue uses the recorded session and model. Switching engines starts a new session with the handoff.
 
 `codex_run` accepts optional 1-based `must_verify` indices such as `[1, 3]`. Use it for the one to three most important criteria. `codex_continue` keeps the indices. `codex_verify` checks each marked criterion against actual observations or original run records before sampling other claims. Closing a marked criterion as `met` requires a matching independent verification result.
 

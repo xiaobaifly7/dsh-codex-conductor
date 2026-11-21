@@ -2695,16 +2695,39 @@ class RunnerTests(unittest.TestCase):
         with ThreadPoolExecutor(max_workers=2) as pool:
             requests = [pool.submit(self.invoke, *argv, "--max-engine-running", "1", command="start", env=env)
                         for _ in range(2)]
-            started, limited = sorted((request.result() for request in requests), key=lambda result: result["status"], reverse=True)
-        self.assertEqual(started["status"], "running")
-        self.assertEqual((limited["error_kind"], limited["retryable"]), ("engine_limit", True))
+            jobs = [request.result()["job_id"] for request in requests]
+        # Over the limit a job queues instead of failing; it starts once the running one ends.
         self.wait_for(call.exists)
-        self.wait_for(lambda: (self.control("status", started["job_id"]).get("conversation_id") == "agy-conversation-1"))
+        statuses = lambda: [self.control("status", job) for job in jobs]
+        self.wait_for(lambda: sorted(s.get("phase") == "engine_wait" for s in statuses()) == [False, True])
+        started, queued = sorted(jobs, key=lambda job: self.control("status", job).get("phase") == "engine_wait")
+        self.wait_for(lambda: (self.control("status", started).get("conversation_id") == "agy-conversation-1"))
+        self.assertEqual(self.control("status", queued)["status"], "running")
         pid = json.loads(call.read_text("utf-8"))["pid"]
-        cancelled = self.control("cancel", started["job_id"])
+        cancelled = self.control("cancel", started)
         self.assertEqual((cancelled["status"], cancelled["conversation_id"]), ("cancelled", "agy-conversation-1"))
         self.assertNotIn("thread_id", cancelled)
         self.wait_for(lambda: not alive(pid))
+        self.wait_for(lambda: self.control("status", queued).get("conversation_id") == "agy-conversation-1")
+        self.assertEqual(self.control("cancel", queued)["status"], "cancelled")
+
+    def test_gemini_slot_is_a_lock_held_until_closed(self):
+        import codex_runner
+
+        run_dir = Path(self.tmp.name) / "slot-run"
+        run_dir.mkdir()
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            held = codex_runner.wait_for_engine_slot(run_dir, 1, None)
+            self.assertIsNotNone(held)
+            self.assertIsNone(codex_runner.wait_for_engine_slot(run_dir, 1, time.monotonic() + 0.3))
+            self.assertEqual(json.loads((run_dir / "phase.json").read_text("utf-8"))["phase"], "engine_wait")
+            second = codex_runner.wait_for_engine_slot(run_dir, 2, time.monotonic() + 0.3)
+            self.assertIsNotNone(second)
+            second.close()
+            held.close()
+            again = codex_runner.wait_for_engine_slot(run_dir, 1, time.monotonic() + 0.3)
+            self.assertIsNotNone(again)
+            again.close()
 
     def test_gemini_windows_cancel_requires_adapter_confirmation(self):
         import agy_runner
@@ -2884,10 +2907,6 @@ class RunnerTests(unittest.TestCase):
             child, = (path for path in parent.parent.iterdir() if path != parent)
             self.assertFalse((child / "worker.pid").exists())
             self.assertFalse((child / "result.json").exists())
-            with self.subTest("engine capacity"):
-                unrelated = argparse.Namespace(context=context, max_engine_running=1)
-                receipt = codex_runner.gemini_admission(unrelated)
-                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
             with self.subTest("age pruning"):
                 self.assertTrue(codex_runner.keep_fallback_child(child))
             with self.subTest("fallback replay"):
@@ -2895,35 +2914,6 @@ class RunnerTests(unittest.TestCase):
                     receipt = codex_runner.gemini_admission(args) or {}
                 self.assertEqual(receipt.get("job_id"), child.name)
                 self.assertIs(receipt.get("deduplicated"), True)
-
-    def test_gemini_admission_counts_worker_with_delayed_pid_publication(self):
-        import codex_runner
-
-        job = self.stored_job("starting", None, engine="gemini")
-        pid_file = job / "worker.pid"
-        pid_file.unlink()
-        args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
-        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
-                mock.patch.object(codex_runner.time, "time", return_value=job.stat().st_ctime + 6):
-            with self.subTest("before PID publication"):
-                receipt = codex_runner.gemini_admission(args)
-                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
-            codex_runner.record_pid(pid_file, os.getpid())
-            with self.subTest("after PID publication"):
-                receipt = codex_runner.gemini_admission(args)
-                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
-
-    def test_gemini_admission_releases_slot_after_worker_start_grace(self):
-        import codex_runner
-
-        job = self.stored_job("abandoned", None, engine="gemini")
-        (job / "worker.pid").unlink()
-        args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
-        expired = job.stat().st_ctime + codex_runner.LOST_AFTER + 1
-        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
-                mock.patch.object(codex_runner.time, "time", return_value=expired):
-            self.assertIsNone(codex_runner.gemini_admission(args))
-        self.assertFalse((job / "result.json").exists())
 
     def test_fallback_snapshots_exclude_runner_home_but_detect_workspace_changes(self):
         home = self.cwd / ".local" / "state" / "codex-runner"

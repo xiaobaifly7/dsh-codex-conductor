@@ -12,9 +12,21 @@ export function checkEngine(engine) {
 }
 
 export const jobEngine = (job) => job?.engine ?? job?.task_options?.engine ?? 'codex';
-export const runEngine = (args, cfg) => args.engine ?? (args.resume ? 'codex' : cfg.defaultEngine ?? 'codex');
+// lockEngine: every task, continuation and verification runs on defaultEngine, whatever the planner passes.
+export const runEngine = (args, cfg) => cfg.lockEngine ? cfg.defaultEngine ?? 'codex'
+  : args.engine ?? (args.resume ? 'codex' : cfg.defaultEngine ?? 'codex');
+
+// The text planners see for engine choice: the general guidance, or which engine and model every task now uses.
+export function engineGuidance(cfg) {
+  if (!cfg.lockEngine) return ENGINE_GUIDANCE;
+  const gemini = (cfg.defaultEngine ?? 'codex') === 'gemini';
+  return `执行端已锁定为 ${gemini ? `Gemini（${cfg.gemini?.executionModel ?? cfg.gemini?.model}）` : 'Codex'}：codex_run、codex_continue、` +
+    'codex_verify 都由它执行，传 engine 会被忽略。' + (gemini ? '返工用 codex_continue(job_id)，不要传 resume；续接原 Codex 任务时插件自动转给 Gemini 并附上轮交接。' +
+    '任务目录须在 Windows 盘符下；只有主机访问任务能运行命令和写文件。' : '');
+}
 
 export function verifyEngine(requested, source, cfg) {
+  if (cfg.lockEngine) return cfg.defaultEngine ?? 'codex';
   const engine = jobEngine(source);
   if (requested !== undefined) return requested;
   if (cfg.crossEngineVerify === false) return engine;
@@ -25,7 +37,9 @@ const samePath = (a, b) => path.win32.resolve(a).toLowerCase() === path.win32.re
 
 // 只读 DSH agy 插件的账号池：每个账号有自己的 HOME 目录和代理，换号、冷却和额度由 DSH 插件维护，这里不写回。
 // home 是续接原会话时原账号的目录：agy 会话按 HOME 分开保存，续接只能回到原账号。
-// shortcut: 不看额度剩余比例和 Argon 资格，只按启用、未要求重新登录、未冷却选号；额度用尽时由 agy 报错，需要时再照 DSH 的 isAccountEligible 补齐。
+// 选号按 DSH agy-link 的 isAccountEligible：启用、未要求重新登录、未冷却、支持这个模型（额度组列了模型时须在列），
+// 额度组剩余不到 10% 或本周不到 5% 时等它重置。此前不查模型：只有一个号有 Gemini 4，换到另一个号就跑不了 Neon。
+// shortcut: 没管 DSH 进程内记的“不支持模型”名单和发现的模型目录，只看 pool.json；不符时 agy 报错，再补。
 export function poolAccount(file, model, home) {
   let pool;
   try {
@@ -41,9 +55,28 @@ export function poolAccount(file, model, home) {
   }
   const family = /argon/i.test(model ?? '') ? 'argon' : 'google';
   const now = Date.now();
-  const usable = accounts.filter((a) => a.enabled === true && !a.authRequired && !(a.cooldowns?.[family]?.cooldownUntil > now));
+  const base = (id) => String(id ?? '').trim().toLowerCase().replace(/\./g, '-').replace(/-(?:low|medium|high|xhigh|max)$/, '');
+  const supports = (a) => {
+    if (!model) return true;
+    if (family === 'argon') return a.quotas?.argon !== undefined || a.dedicatedGroups?.includes('argon') === true ||
+      (a.quotas?.google?.models ?? []).some((m) => /argon/i.test(m?.modelId ?? ''));
+    const listed = a.quotas?.[family]?.models;
+    return !Array.isArray(listed) || !listed.length || listed.some((m) => base(m?.modelId) === base(model));
+  };
+  const benched = (a) => {
+    const q = a.quotas?.[family] ?? (family === 'argon' ? a.quotas?.google : undefined);
+    const cleared = a.quotaGateClearedAt?.[family];
+    if (!q || (cleared !== undefined && (q.updatedAt ?? 0) <= cleared)) return false;
+    const pending = (time) => !time || !(Date.parse(time) <= now);
+    return (typeof q.remainingFraction === 'number' && q.remainingFraction <= 0.1 && pending(q.resetTime)) ||
+      (typeof q.weeklyFraction === 'number' && q.weeklyFraction <= 0.05 && pending(q.weeklyResetTime));
+  };
+  const usable = accounts.filter((a) => a.enabled === true && !a.authRequired && !(a.cooldowns?.[family]?.cooldownUntil > now) &&
+    supports(a) && !benched(a));
   const account = [pool.activeAccountIds?.[family], pool.lastActiveAccountId].map((id) => usable.find((a) => a.id === id)).find(Boolean) ?? usable[0];
-  if (!account) throw new Error('DSH agy 账号池里没有可用账号（都已停用、需要重新登录或在冷却中）；请先在 DSH 的 agy 插件里处理账号');
+  if (!account) {
+    throw new Error(`DSH agy 账号池里没有可用账号：没有能用 ${model || 'Gemini'} 的账号（已停用、需要重新登录、在冷却中、不支持这个模型或额度不足）；请先在 DSH 的 agy 插件里处理账号`);
+  }
   return account;
 }
 
@@ -63,8 +96,10 @@ export function codexQuotaUntil(error, finishedAt) {
 
 export function geminiArgv(args, cfg) {
   if (!cfg.gemini?.command) throw new Error('Gemini 执行需要在插件中配置 gemini.command');
-  const effort = args.effort ?? (args.conversation_id ? undefined : cfg.gemini.executionEffort);
-  const model = args.model ?? (args.conversation_id ? undefined : cfg.gemini.executionModel);
+  // forceModel / forceEffort: the configured model and effort apply to every Gemini job, continued conversations included
+  // (agy switches the model of a conversation it resumes).
+  const effort = cfg.gemini.forceEffort ? cfg.gemini.executionEffort : args.effort ?? (args.conversation_id ? undefined : cfg.gemini.executionEffort);
+  const model = cfg.gemini.forceModel ? cfg.gemini.executionModel : args.model ?? (args.conversation_id ? undefined : cfg.gemini.executionModel);
   if (effort !== undefined && !GEMINI_EFFORTS.includes(effort)) throw new Error(`Gemini effort 必须是 ${GEMINI_EFFORTS.join('、')}`);
   const account = cfg.gemini.accountPool
     ? poolAccount(cfg.gemini.accountPool, model ?? cfg.gemini.executionModel, args.conversation_id ? args.agy_home : undefined) : null;
