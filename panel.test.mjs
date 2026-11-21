@@ -415,6 +415,13 @@ test('panel HTTP implements every valid route using only stub runtime/conductor'
   assert.deepEqual(f.conductor.output.mock.calls[1].arguments.slice(0, 2), ['job-1', { artifact: 'context', offset: 0, limit: 8000 }]);
   assert.equal((await f.request('GET', '/output?job_id=J_2&offset=12&limit=20000')).status, 200);
   assert.deepEqual(f.conductor.output.mock.calls.at(-1).arguments.slice(0, 2), ['J_2', { artifact: 'report', offset: 12, limit: 20000 }]);
+  // A job that ended before writing its report is a 404 with a readable hint, not a task-service failure.
+  for (const error_kind of ['artifact_empty', 'artifact_missing']) {
+    f.conductor.output.mock.mockImplementationOnce(async () => ({ status: 'failed', error_kind, execution_status: 'failed' }));
+    const missing = await f.request('GET', '/output?job_id=J_3');
+    assert.equal(missing.status, 404);
+    assert.match(missing.body.error, /没有这份内容.*错误日志/);
+  }
   assert.deepEqual(await f.request('POST', '/cancel', { job_id: 'job-1', confirm: true }),
     { status: 200, body: { job_id: 'job-1', status: 'cancelled' } });
   assert.deepEqual(f.conductor.cancel.mock.calls[0].arguments, ['job-1']);
@@ -459,7 +466,6 @@ test('panel returns pending report pages as HTTP 200 without reading optional co
   }
   for (const failure of [
     { status: 'failed', error_kind: 'artifact_read_failed' },
-    { status: 'failed', error_kind: 'artifact_missing' },
     { status: 'pending', error_kind: 'artifact_read_failed' },
     { status: 'pending', error: 'runner read failed' },
   ]) {
