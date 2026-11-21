@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.140` 让规划端少返工、少压缩。执行端只是停下来等规划端回答时不再自动核验：报告没有 `not_met`，至少有一个阻塞且全是 `user_input` / `task_conflict`，`must_verify` 条目也都没报 `met`；补扫同样跳过，续接后的那一轮照常判断，新开关 `autoVerifySkipQuestions`（默认开启，`false` 恢复原样）。历史上 125 次核验核的是这种只在等回答的任务。防兜圈的“相同条目”在汇报条数和编号与验收标准对得上时按位置对应，不再要求原文逐字相同（2.6 万行报告条目里只有 10 行逐字相同，此前几乎不触发）；续接回答了上一轮卡住的问题时不算原样重派。派单一致性检查只把像文件路径的文字当作必写文件，禁止项里的路径、限定了范围的只读句和只写文件名的交付项不再误报（历史回放 29 单误报降到 0），“【交付】写入当前 cwd：”下的文件现在也会参与检查。`codex_review` 写入后只回执结案状态、仍待回答的阻塞和下一步，不再把整份报告、改动清单和规划端刚写的证据原样回显：这部分每次 9 到 18 KB，占近期会话写入内容的 12% 到 19%，是上下文变大、频繁压缩的主要来源之一。结果文字里的改动文件只列前 30 个，其余用 `codex_output` 查看，超出 scope 的改动照常单独列出。runner 的产物登记从最新任务开始扫描，超过 10000 条上限时丢弃的是最早的产物，不再是规划端接下来要读的最新报告。
+
 `0.9.139` Codex 任务默认不再加载 Codex 插件（`--disable plugins`，`use_user_config=true` 时照常加载）。此前只要 Codex 配置里启用了任何插件，失败的任务就不会自动交给 Gemini 接替，因为插件自带的 MCP 和应用随会话启动、无法按名字关掉；本机启用了 9 个，所以这条接替从未触发。631 个任务里没有一个调用过插件工具。大目录里按范围留补丁时，范围路径被 `.gitignore` 排除不再让整单没有补丁：这类路径跳过，其余照常记录。
 
 `0.9.138` 由 LoopX 续跑的会话交接后不再停住：交接时把 LoopX 的线程绑定挪给继任会话，交接单以 `/loopx` 开头送达，继任会话由 LoopX 接着按待办续跑，不重建原生目标；撤回或自动回滚时绑定挪回原会话。只在原会话最近一轮是 LoopX 续跑时生效，由原生目标循环驱动的会话照旧；没装 LoopX 或绑定挪不动时交接照常进行，结果的 `steps.loopx` 记下原因。
@@ -175,6 +177,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.140` Less rework and less compression for the planner. Automatic verification is skipped when a round only stops for planner answers: no `not_met`, at least one blocker and every blocker is `user_input` or `task_conflict`, and no `must_verify` item reported `met`. Catch-up scans skip it too and the round after the continuation is judged as usual; new switch `autoVerifySkipQuestions` (default on, `false` restores the old behavior). 125 past verifications only confirmed a job was waiting for an answer. The convergence guard matches rewritten report rows to acceptance by position when counts and numbering agree instead of requiring identical text (10 of 26,000 report rows matched verbatim, so it almost never fired), and a continuation that answers the stuck question is not treated as an unchanged retry. Dispatch consistency only treats path-like text as a required write and no longer flags paths in prohibitions, scoped read-only sentences or bare deliverable file names (29 false positives in a replay of past jobs, now 0); files listed under “【交付】写入当前 cwd：” are now checked too. `codex_review` answers with the recorded outcome, open blockers and the next step instead of echoing the whole report, the change list and the planner's own evidence: 9-18 KB per call and 12-19% of everything written into recent sessions, one of the main drivers of context growth and compression. Result text lists at most 30 changed files and points to `codex_output` for the rest; out-of-scope changes are still listed separately. The runner's products scan starts from the newest job, so a session past the 10000-path limit drops its oldest products rather than the latest reports the planner reads next.
 
 `0.9.139` Codex jobs no longer load Codex plugins by default (`--disable plugins`; `use_user_config=true` still loads them). Until now any enabled plugin in the Codex configuration kept a failed job from being handed to Gemini, because plugin MCP servers and apps start with the session and cannot be turned off by name; this machine has nine enabled, so that takeover never fired. None of 631 jobs called a plugin tool. A scope path excluded by `.gitignore` no longer costs a writer in a too-big tree its whole patch: such a path is skipped and the others are recorded.
 
