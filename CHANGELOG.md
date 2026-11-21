@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.135` 面板打开没有写出报告的任务（多为执行失败）时，提示改看错误日志或任务书，不再显示为任务服务出错。
+
 `0.9.134` “Codex 指挥”面板支持 Gemini 执行引擎。运行状态显示默认执行端、核验是否换引擎、Codex 失败是否转 Gemini、Gemini 并发上限和账号池里下一单要用的账号，读池失败时显示原因。常用设置可以修改这四项，Gemini 思考程度可选“不设置”，由模型名决定档位。任务列表标出由 Gemini 执行或接替的任务，报告按实际执行端署名。
 
 `0.9.133` 新增 `gemini.accountPool`，指向 DSH agy 插件账号池的 `pool.json`。配置后 Gemini 任务和 `gemini_write` 改用池中当前可用的账号：以账号目录作 `HOME / USERPROFILE`，账号设了代理就用它自己的代理。选号只读，跳过停用、需要重新登录和正在冷却的账号；续接 Gemini 会话回到原账号，原账号已不在池中时拒绝续接。
@@ -165,6 +167,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.135` the panel tells you to check the error log or task brief when a job ended without writing its report (usually a failed run), instead of reporting a task-service failure.
 
 `0.9.134` brings the Gemini execution engine to the **Codex 指挥** panel. Runtime status shows the default executor, whether verification switches engines, whether failed Codex jobs fall back to Gemini, the Gemini concurrency limit and the pool account the next Gemini job will use, with the reason when the pool cannot be read. Common settings can change those four options, and the Gemini level can be left unset so the model ID decides it. The job list marks jobs run or taken over by Gemini, and reports name the executor that actually ran them.
 

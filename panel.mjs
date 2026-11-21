@@ -98,6 +98,10 @@ function runnerResult(value, output = false) {
   if (output && (value?.error_kind === 'artifact_pending' || (value?.status === 'pending' && !value.error_kind && !value.error))) {
     return { ...value, status: 'pending', error_kind: 'artifact_pending', message: '这个任务还在运行，报告会在任务结束后生成。' };
   }
+  // 这一单本身没有这份文件（常见于执行失败没写出报告），不是面板或任务服务出错。
+  if (output && ['artifact_missing', 'artifact_empty'].includes(value?.error_kind)) {
+    throw bad('这一单没有这份内容，任务没有写出它（例如在出报告前就结束了）。请改看其他内容，如“错误日志”或“任务书与验收”。', 404);
+  }
   if (value?.error || value?.error_kind || value?.status === 'failed') {
     throw bad(value?.error ?? value?.error_kind ?? '任务查询失败', 502);
   }
