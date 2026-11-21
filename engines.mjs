@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-export const ENGINE_GUIDANCE = 'Codex 适合常规工程执行和原 Codex 线程续接。Gemini 使用 Windows Antigravity，适合已授权的 Windows 工程任务和独立交叉核验；需配置 gemini.command。';
+export const ENGINE_GUIDANCE = 'Codex 适合常规工程执行和原 Codex 线程续接。Gemini 使用 Windows Antigravity，任务目录须在 Windows 盘符下；只有主机访问任务能运行命令和写文件，沙箱内只能读文件；需配置 gemini.command。';
 export const ENGINE_PARAMETER = { type: 'string', enum: ['codex', 'gemini'], description: ENGINE_GUIDANCE };
 const GEMINI_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -45,6 +45,20 @@ export function poolAccount(file, model, home) {
   const account = [pool.activeAccountIds?.[family], pool.lastActiveAccountId].map((id) => usable.find((a) => a.id === id)).find(Boolean) ?? usable[0];
   if (!account) throw new Error('DSH agy 账号池里没有可用账号（都已停用、需要重新登录或在冷却中）；请先在 DSH 的 agy 插件里处理账号');
   return account;
+}
+
+// Codex 报额度用完时这一单结束的错误里带恢复时间（本机时区）：跨天写 try again at Nov 23rd, 2026 11:23 PM，当天只写 11:23 PM。
+// 返回恢复的毫秒时间戳；只有时刻时补上这单结束那天的日期，早于结束时间就算第二天；没有可解析的时间时从这单结束起停 30 分钟。
+// 这两种都要知道结束时间，不知道就不停，免得翻看旧任务时重新计时。不是额度错误返回 0。
+export function codexQuotaUntil(error, finishedAt) {
+  if (!/usage limit/i.test(error ?? '')) return 0;
+  const stated = /try again at ([^.\n]+)/i.exec(error)?.[1].replace(/(\d)(?:st|nd|rd|th)\b/, '$1').trim();
+  const at = stated ? Date.parse(stated) : NaN;
+  if (!Number.isNaN(at)) return at;
+  if (!finishedAt) return 0;
+  const ended = finishedAt * 1000;
+  const today = /^\d{1,2}:\d{2}\s*[AP]M$/i.test(stated ?? '') ? Date.parse(`${new Date(ended).toDateString()} ${stated}`) : NaN;
+  return Number.isNaN(today) ? ended + 30 * 60_000 : today > ended ? today : today + 86_400_000;
 }
 
 export function geminiArgv(args, cfg) {

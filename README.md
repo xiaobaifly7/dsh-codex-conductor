@@ -214,7 +214,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 `codex_continue` 按原任务记录恢复引擎、模型、推理强度和权限。Gemini 用准确的 `conversation_id`。显式选择另一引擎会附交接摘要、开新会话。自动接替保留原任务书、验收和范围，原回执给出接替任务号。Antigravity 每次使用订阅内额度，关闭超额 AI credits。
 
-Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。只读任务限制模型工具的文件写入、shell 和 MCP 调用。非主机任务使用 `--sandbox`。Antigravity 单独加载的本机 Hook 和插件仍属于受信任配置。当前 agy 无法经此接口建立严格限定于 `scope` 的可写隔离，因此拒绝 `write: true` 的非主机任务。主机访问仍遵循 `allowHostAccess` 和 `defaultHostAccess`。
+Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。只读任务限制模型工具的文件写入和 MCP 调用；非主机的只读任务还禁止 shell。非主机任务使用 `--sandbox`。主机访问任务放行 shell 命令（无界面运行的 agy 不能询问，没有放行规则的命令一律被拒）：写任务可运行命令和改文件，只读任务可运行命令但仍禁止写文件，和 Codex 的主机访问一样只靠任务书约束命令本身的写入。Antigravity 单独加载的本机 Hook 和插件仍属于受信任配置。当前 agy 无法经此接口建立严格限定于 `scope` 的可写隔离，因此拒绝 `write: true` 的非主机任务。主机访问仍遵循 `allowHostAccess` 和 `defaultHostAccess`。
 
 **派活工具**
 

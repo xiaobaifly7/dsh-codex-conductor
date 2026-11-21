@@ -184,6 +184,68 @@ test('Gemini runs under a DSH agy pool account and continues under the same one'
   await assert.rejects(run(), /读取 DSH agy 账号池失败/);
 });
 
+test('a Codex usage limit stops Codex dispatch until the stated reset time', async () => {
+  const { codexQuotaUntil } = await import('./engines.mjs');
+  assert.equal(codexQuotaUntil('You’ve hit your usage limit. Visit the usage page or try again at Nov 23rd, 2026 11:23 PM.'),
+    new Date(2026, 10, 23, 23, 23).getTime());
+  assert.equal(codexQuotaUntil('You have hit your usage limit.', 1000), 1000 * 1000 + 30 * 60_000);
+  assert.equal(codexQuotaUntil('You have hit your usage limit.'), 0);
+  // A reset later the same day is stated as a time only; one that already passed that day means tomorrow.
+  const noon = new Date(2026, 10, 21, 12, 0).getTime() / 1000;
+  assert.equal(codexQuotaUntil('You’ve hit your usage limit. Try again at 11:23 PM.', noon), new Date(2026, 10, 21, 23, 23).getTime());
+  assert.equal(codexQuotaUntil('You’ve hit your usage limit. Try again at 9:05 AM.', noon), new Date(2026, 10, 22, 9, 5).getTime());
+  assert.equal(codexQuotaUntil('You’ve hit your usage limit. Try again at 11:23 PM.'), 0);
+  assert.equal(codexQuotaUntil('stream disconnected'), 0);
+  assert.equal(codexQuotaUntil(undefined), 0);
+
+  const limited = { status: 'failed', error_kind: 'permanent', structured: undefined,
+    error: 'You’ve hit your usage limit. Visit the usage page or try again at Jan 2nd, 2099 1:00 AM.' };
+  const input = { task: 'Inspect the project layout.', acceptance, write: false };
+  const starts = h => h.calls.filter(call => call.argv[0] === 'start');
+  const windows = { cwd: 'D:/work/project' };
+  const h = harness({ config: { gemini, defaultHostAccess: true }, verificationResult: limited });
+  await h.tools.codex_run.execute(input, exec);
+  assert.equal(option(starts(h)[0].argv, '--engine'), undefined, 'the first task still goes to Codex');
+  // A new task with no engine of its own moves to Gemini, without the Codex-only options.
+  const moved = await h.tools.codex_run.execute({ ...input, ...windows, model: 'codex/other', use_user_config: true }, exec);
+  assert.equal(option(starts(h)[1].argv, '--engine'), 'gemini');
+  assert.equal(option(starts(h)[1].argv, '--model'), gemini.model);
+  assert.ok(!starts(h)[1].argv.includes('--service-tier') && !starts(h)[1].argv.includes('--use-user-config'));
+  assert.match(moved.next, /Codex 额度已用完（预计 2099.*恢复），本单已改派 Gemini/);
+  // Codex asked for by name, or a Codex thread, is refused before anything starts.
+  for (const extra of [{ engine: 'codex' }, { resume: 'thread-1' }]) {
+    await assert.rejects(h.tools.codex_run.execute({ ...input, ...extra }, exec), /Codex 额度已用完，预计 2099.*未启动任务。改传 engine: "gemini"/);
+  }
+  await assert.rejects(h.verify({ engine: 'codex' }), /Codex 额度已用完/);
+  assert.equal(starts(h).length, 2);
+  // Gemini is not handed a task it cannot run (no host access, or a directory outside the Windows drives),
+  // and another model's exhausted channel does not stop the configured one.
+  for (const [config, extra] of [[{ gemini, defaultHostAccess: true, geminiFallback: false }, windows], [{ gemini }, windows],
+    [{ gemini, defaultHostAccess: true }, {}]]) {
+    const off = harness({ config, verificationResult: limited });
+    await off.tools.codex_run.execute(input, exec);
+    await assert.rejects(off.tools.codex_run.execute({ ...input, ...extra }, exec), /Codex 额度已用完.*重新加载插件/);
+    assert.equal(starts(off).length, 1);
+  }
+  const other = harness({ config: { gemini, defaultHostAccess: true },
+    verificationResult: { ...limited, task_options: { model: 'other/model' } } });
+  await other.tools.codex_run.execute(input, exec);
+  await other.tools.codex_run.execute(input, exec);
+  assert.deepEqual(starts(other).map(call => option(call.argv, '--engine')), [undefined, undefined]);
+});
+
+test('codex_run refuses a bare model name when the configured model carries a provider prefix', async () => {
+  const input = { task: 'Inspect the project layout.', acceptance, write: false };
+  const h = harness({ config: { model: 'codex/gpt-default' } });
+  await assert.rejects(h.tools.codex_run.execute({ ...input, model: 'gpt-other' }, exec), /model 要带提供方前缀，例如 codex\/gpt-other/);
+  assert.equal(h.start(), undefined);
+  await h.tools.codex_run.execute({ ...input, model: 'codex/gpt-other' }, exec);
+  assert.equal(option(h.start().argv, '--model'), 'codex/gpt-other');
+  const plain = harness();
+  await plain.tools.codex_run.execute({ ...input, model: 'gpt-other' }, exec);
+  assert.equal(option(plain.start().argv, '--model'), 'gpt-other');
+});
+
 test('Gemini provider failure tells the planner how to redispatch on Codex', async () => {
   const failure = { status: 'failed', error_kind: 'provider_permanent', error: 'model not available',
     task_options: { engine: 'gemini' }, structured: undefined };

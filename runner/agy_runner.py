@@ -71,6 +71,9 @@ def _path_from_cwd(path, cwd, windows):
     return os.path.realpath(os.path.join(cwd, path))
 
 
+HOST_COMMANDS = ["command(*)", "unsandboxed(*)"]
+
+
 def build_command(args, run_dir, conversation_id, scratch=None):
     """Return argv and env for a process that accepts the runner's raw UTF-8 prompt.
 
@@ -105,14 +108,20 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         if scratch is not None:
             raise ValueError("agy read-only cannot provide writable verification scratch")
         flags.append("--sandbox")
+    # Host access means the task runs unsandboxed with the machine's full permissions, as it does for Codex. Headless
+    # agy cannot prompt, so without an allow rule every shell command is denied and the task fails.
+    host = args.sandbox == "danger-full-access"
     if readonly:
         flags += ["--mode", "plan"]
-        settings.update(allowNonWorkspaceAccess=False, enableTerminalSandbox=True, permissions={
-            "allow": [], "ask": [],
-            "deny": ["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "read_url(*)", "execute_url(*)"],
+        settings.update(allowNonWorkspaceAccess=False, enableTerminalSandbox=not host, permissions={
+            "allow": HOST_COMMANDS if host else [], "ask": [],
+            "deny": ["write_file(*)", *([] if host else ["command(*)", "unsandboxed(*)"]),
+                     "mcp(*)", "read_url(*)", "execute_url(*)"],
         })
     else:
         flags += ["--mode", "accept-edits"]
+        if host:
+            settings["permissions"] = {"allow": HOST_COMMANDS}
 
     flags += ["--settings", json.dumps(settings, separators=(",", ":"))]
     if args.schema:

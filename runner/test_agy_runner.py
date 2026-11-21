@@ -42,15 +42,28 @@ class AdapterTests(unittest.TestCase):
                 self.assertTrue({"HOME", "USERPROFILE", "HTTPS_PROXY"} <= set(env["WSLENV"].split(":")))
             self.assertEqual((Path(run_dir) / agy_runner.JOB_RECORD).read_text(), command[3])
 
-    def test_host_read_only_context_enforces_tool_denies(self):
+    def test_host_access_allows_commands_and_read_only_still_denies_writes(self):
         with tempfile.TemporaryDirectory() as run_dir:
-            command, _ = agy_runner.build_command(args(
-                run_dir, sandbox="danger-full-access", context={"write": False},
-            ), run_dir, None)
-            settings = json.loads(command[command.index("--settings") + 1])
+            def built(**overrides):
+                command, _ = agy_runner.build_command(args(run_dir, **overrides), run_dir, None)
+                return command, json.loads(command[command.index("--settings") + 1])
+
+            command, settings = built(sandbox="danger-full-access", context={"write": False})
             self.assertEqual(command[command.index("--mode") + 1], "plan")
-            self.assertIn("command(*)", settings["permissions"]["deny"])
+            self.assertEqual(settings["permissions"]["allow"], ["command(*)", "unsandboxed(*)"])
+            self.assertEqual(settings["permissions"]["deny"], ["write_file(*)", "mcp(*)", "read_url(*)", "execute_url(*)"])
             self.assertNotIn("--effort", command)
+            # Headless agy denies every command that has no allow rule, so a host write task needs one to run anything.
+            command, settings = built(sandbox="danger-full-access")
+            self.assertEqual(command[command.index("--mode") + 1], "accept-edits")
+            self.assertEqual(settings["permissions"], {"allow": ["command(*)", "unsandboxed(*)"]})
+            self.assertNotIn("--sandbox", command)
+            self.assertNotIn("--dangerously-skip-permissions", command)
+            # Outside host access nothing is allowed to run.
+            command, settings = built()
+            self.assertIn("--sandbox", command)
+            self.assertEqual(settings["permissions"]["allow"], [])
+            self.assertIn("command(*)", settings["permissions"]["deny"])
 
     def test_unrepresentable_paths_and_sandbox_fail_closed(self):
         with tempfile.TemporaryDirectory() as run_dir:

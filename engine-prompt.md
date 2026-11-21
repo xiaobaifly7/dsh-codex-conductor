@@ -1,4 +1,6 @@
 - 常规工程和原 Codex 线程续接用 Codex。已授权的 Windows 工程任务可选 `engine: "gemini"`，交给 Antigravity。
 - `codex_continue` 用原 `job_id` 续接。指定不同引擎会转交上轮摘要并开新会话。
-- `codex_verify` 默认用另一引擎做独立只读核验。报告必须逐条核验。
+- Gemini 的任务目录必须在 Windows 盘符下。只有主机访问任务能运行命令和写文件；沙箱内的 Gemini 只能读文件。
+- `codex_verify` 的核验引擎由插件配置决定，要指定时传 `engine`。报告必须逐条核验。
+- Codex 额度用完后到恢复时间前不再派 Codex：没有指定引擎的新任务在可接替时自动改派 Gemini，其余按回执提示传 `engine: "gemini"`。
 - 失败回执如已给出 Gemini 接替任务的 `job_id`，等待该任务。原任务已有写入时，按原回执检查和处理。
