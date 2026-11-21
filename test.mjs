@@ -8131,6 +8131,59 @@ test('release C: synchronous must_verify-only completion starts a check and excl
   assert.ok(!off.calls.some(argv => argv[0] === 'start'));
 });
 
+const waitingReport = (statuses, kinds) => ({ summary: '停下来等回答', files_changed: ['docs/report.md'], deviations: [], unresolved: [],
+  criteria: statuses.map((status, i) => ({ criterion: `改写后的第 ${i + 1} 条`, status, evidence: '见报告' })),
+  blockers: kinds.map((kind, i) => ({ id: `B${i + 1}`, kind, message: '需要决定',
+    question: ['user_input', 'task_conflict'].includes(kind) ? '选哪一个？' : '', resolution: '' })) });
+const waitingRound = (f, id, statuses, kinds, context = {}) =>
+  f.completed(id, { structured: waitingReport(statuses, kinds) }, { acceptance: ['第一条验收', '第二条验收'], ...context });
+
+test('auto verification skips a round that only waits for planner answers', async (t) => {
+  const f = autoVerifyFixture(t);
+  const cases = {
+    ASK: [['met', 'blocked'], ['user_input'], {}, false],
+    CONFLICT: [['blocked', 'blocked'], ['task_conflict', 'user_input'], {}, false],
+    MUST_BLOCKED: [['met', 'blocked'], ['user_input'], { must_verify: [2] }, false],
+    NOT_MET: [['not_met', 'blocked'], ['user_input'], {}, true],
+    ENVIRONMENT: [['met', 'blocked'], ['environment'], {}, true],
+    IMPLEMENTATION: [['met', 'blocked'], ['implementation'], {}, true],
+    MIXED: [['met', 'blocked'], ['task_conflict', 'environment'], {}, true],
+    MUST_MET: [['met', 'blocked'], ['user_input'], { must_verify: [1] }, true],
+    NO_BLOCKER: [['met', 'blocked'], [], {}, true],
+  };
+  const h = f.load({ autoVerify: 'flagged' });
+  await settleAutoVerify();
+  const checked = [];
+  for (const [id, [statuses, kinds, context]] of Object.entries(cases)) {
+    h.finals[id] = waitingRound(f, id, statuses, kinds, context);
+    if ((await queryStatus(h, id)).auto_verify?.job_id) checked.push(id);
+  }
+  assert.deepEqual(checked, Object.keys(cases).filter(id => cases[id][3]));
+  // 续接结束后的那一轮照常核验。
+  h.finals['ASK-NEXT'] = waitingRound(f, 'ASK-NEXT', ['not_met', 'met'], [], { continuation: { parent_job_id: 'ASK', answers: [], resolution: '' } });
+  assert.ok((await queryStatus(h, 'ASK-NEXT')).auto_verify?.job_id);
+  const off = f.load({ autoVerifySkipQuestions: false });
+  off.finals['ASK-OFF'] = waitingRound(f, 'ASK-OFF', ['met', 'blocked'], ['user_input']);
+  assert.ok((await queryStatus(off, 'ASK-OFF')).auto_verify?.job_id);
+});
+
+test('auto catch-up does not later dispatch a round that only waits for planner answers', async (t) => {
+  const f = autoVerifyFixture(t);
+  let now = Date.now();
+  t.mock.method(Date, 'now', () => now);
+  waitingRound(f, 'ASK', ['met', 'blocked'], ['user_input']);
+  waitingRound(f, 'GAP', ['not_met', 'blocked'], ['user_input']);
+  const h = f.load();
+  await settleAutoVerify();
+  now += 60_000;
+  await f.call(h);
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['GAP']);
+  f.load({ autoVerifySkipQuestions: false });
+  await settleAutoVerify();
+  assert.deepEqual(f.starts.map(c => c.verification_of), ['GAP', 'ASK']);
+});
+
 test('release D: effort policies use the write/read default and record requested and applied effort', async () => {
   const reasons = ['concurrency_or_locking', 'cross_session_state', 'security_boundary', 'data_migration', 'prior_rework'];
   for (const [mode, write, requested, reason, applied, ignored] of [

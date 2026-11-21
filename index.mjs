@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation, previousRoundBrief, ownerBlockerIds, resolvedBlockerIds,
-  repeatedOutcome, writeContradictions, withoutVerificationProduct, continuationSubmission } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+  repeatedOutcome, writeContradictions, withoutVerificationProduct, continuationSubmission, sameCriteria } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS,
   REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
@@ -94,6 +94,8 @@ const DEFAULTS = {
   closeoutEvidence: 'independent',
   acceptOpenEvidence: 'strict',
   autoVerify: 'flagged',
+  // 报告只是停下来等规划端回答（阻塞全是 user_input / task_conflict、没有 not_met）时不自动核验；false 照旧核验
+  autoVerifySkipQuestions: true,
   // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
   continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
@@ -660,15 +662,13 @@ export function withReport(value) {
   return { ...normalized, blocking: blockingState(normalized) };
 }
 
-// 汇报条数和验收标准一致、编号也对得上时，逐条汇报显示验收标准原文（Codex 几乎总会改写条目），下一步不再重复列出。
-// 编号认 1. / 1) / 1、 / 1: / 第1条，NFKC 先把全角数字和标点换成半角
-function sameCriteria(report, acceptance) {
-  const criteria = report?.criteria;
-  return Array.isArray(criteria) && criteria.length > 0 && acceptance?.length === criteria.length && criteria.every((c, i) => {
-    if (typeof c?.criterion !== 'string') return false;
-    const n = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、])/.exec(String(c.criterion ?? '').normalize('NFKC'))?.[1];
-    return n === undefined || Number(n) === i + 1;
-  });
+// 执行端只是停下来等规划端回答：阻塞全是会进 blocking.questions 的种类，没有 not_met，must_verify 条目都没报 met。
+// 这时核验只能确认“在等回答”，还会让续接等它结束。
+function awaitingAnswers(value) {
+  const { blockers, questions } = blockingState(value);
+  const rows = value.report.criteria;
+  return blockers.length > 0 && questions.length === blockers.length && rows.every(row => row.status !== 'not_met') &&
+    (value.context.must_verify ?? []).every(index => reportRowOf(value.context.acceptance, rows, index)?.status === 'blocked');
 }
 
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
@@ -1893,7 +1893,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     !job.context.verification_of && (job.execution_status ?? job.status) === 'completed' &&
     (job.verification_status == null || job.verification_status === 'unreviewed') && job.report_status !== 'invalid';
   const eligibleForAutoVerification = (value) => automaticCandidate(value) && value.verification_status === 'unreviewed' &&
-    !beforeCutoff(value, autoVerifyFrom) && validReport(value.report) && (flaggedCriteria(value).length || value.context.must_verify?.length);
+    !beforeCutoff(value, autoVerifyFrom) && validReport(value.report) && (flaggedCriteria(value).length || value.context.must_verify?.length) &&
+    !(cfg.autoVerifySkipQuestions && awaitingAnswers(value));
   const autoVerifyWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 补派自动核验失败：${error?.message ?? error}`);
 
   async function hasLaterRound(source) {
@@ -2527,7 +2528,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return matches;
   }
 
-  function convergenceDecision(tool, rounds, candidate, note) {
+  function convergenceDecision(tool, rounds, candidate, note, answers = []) {
     const [latest, earlier] = rounds;
     if (!latest) return {};
     const premises = attemptPremises(latest);
@@ -2539,6 +2540,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const outcome = repeatedOutcome(latest);
     if (!outcome || premises !== attemptPremises(earlier) ||
         JSON.stringify(outcome) !== JSON.stringify(repeatedOutcome(earlier))) return {};
+    // 这次续接回答了卡住的问题，是新输入，不算原样重派。
+    if (blockingState(latest).questions.some(({ id }) => answers.some(answer => answer.id === id))) return {};
     const exhausted = latest.context.routing?.convergence_override === true;
     if (!exhausted && note && note !== latest.context.routing?.change_fingerprint) return { override: true };
     const items = [...outcome.criteria.map(([index, status]) => `验收 ${index}=${status}`), ...outcome.blockers];
@@ -2883,7 +2886,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             sandbox: (args.host_access ?? cfg.defaultHostAccess) === true ? 'danger-full-access' : args.write ? 'workspace-write' : 'read-only',
             task_options: { writable_roots: args.writable_roots, use_user_config: args.use_user_config },
             context: { task: originalTask, acceptance: args.acceptance, write: args.write, must_verify: args.must_verify,
-              routing: { convergence_task: convergenceTask, required_writes: args.required_writes } } }, note);
+              routing: { convergence_task: convergenceTask, required_writes: args.required_writes } } }, note, continuation?.answers);
           if (refusal) throw reject(refusal);
           if (!continuation && previous?.job_id && (linked || repeatedOutcome(previous))) {
             routing = { ...routing, parent_job_id: previous.job_id };
