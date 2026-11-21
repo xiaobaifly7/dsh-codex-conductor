@@ -313,11 +313,52 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
   return text;
 }
 
-const handoverMessage = (from, briefPath, brief) => `[codex-conductor 交接] 本会话接手会话 ${from} 的工作；原会话的目标已暂停，` +
+// loopx：原会话由 LoopX 续跑、绑定已挪到本会话时传入。消息以 /loopx 开头，宿主把它当作 loopx 技能调用，LoopX 由此在本会话接着续跑。
+const handoverMessage = (from, briefPath, brief, loopx) =>
+  (loopx ? `/loopx 这是会话交接后的续接，不是新任务：原会话 ${from} 的 LoopX 绑定（goal ${loopx.goalId}，agent ${loopx.agentId}）已挪到本会话。` +
+    '不要新建 LoopX 目标，也不要创建原生目标；先用 resolve-agent-thread 核对本会话的绑定。\n' : '') +
+  `[codex-conductor 交接] 本会话接手会话 ${from} 的工作；原会话的目标已暂停，` +
   '它不能再派活或验收。下面是插件按记录生成的交接单' + (briefPath ? `（文件：${briefPath}）` : '') + '。\n' +
   '先调 codex_summary（session_id="current"）和 codex_jobs 看详情：本会话现在可以查看、验收、续接、核验和取消原会话的任务。' +
   '工具的 job_id 参数只填交接单里的任务号；线程号只用于 codex_run 的 resume。' +
-  '收尾规则照旧：先给列出的待收尾任务做 codex_review 或返工，再派新任务。本会话若还没有目标，按交接单里的目标创建后继续推进。\n\n' + brief;
+  '收尾规则照旧：先给列出的待收尾任务做 codex_review 或返工，再派新任务。' +
+  (loopx ? '本轮只核对绑定、读完交接单并处理待收尾任务，然后结束；之后由 LoopX 按待办续跑。' : '本会话若还没有目标，按交接单里的目标创建后继续推进。') +
+  '\n\n' + brief;
+
+// LoopX 跟随交接：原会话最近由 LoopX 续跑（而不是原生目标循环）时，把它的线程绑定挪给继任会话。
+// loopx(args, cwd) 运行 LoopX CLI 并返回解析后的 JSON，失败时抛出。这里的任何失败都只记在步骤里，不影响交接。
+const LOOPX_HOST = 'deepseek-harness-native';
+export function loopxDriven(log) {
+  for (let i = (log?.length ?? 0) - 1; i >= 0; i--) {
+    const kind = log[i]?.type === 'user/message' ? log[i].data?.source?.kind : undefined;
+    if (kind === 'loopx-continuation') return true;
+    if (kind === 'goal') return false;
+  }
+  return false;
+}
+
+export async function moveLoopxBinding(loopx, cwd, from, to) {
+  const thread = (id) => ['--host-surface', LOOPX_HOST, '--thread-id', id];
+  const run = async (args) => {
+    const value = await loopx(args, cwd);
+    if (value?.ok !== true) throw new Error(`loopx ${args[0]} refused`);
+    return value;
+  };
+  try {
+    if (!cwd) return { loopx: 'unbound' };
+    const bound = await run(['resolve-agent-thread', ...thread(from)]);
+    if (bound.status !== 'bound' || typeof bound.goal_id !== 'string' || typeof bound.agent_id !== 'string') return { loopx: 'unbound' };
+    const pair = ['--goal-id', bound.goal_id, '--agent-id', bound.agent_id];
+    await run(['unbind-agent-thread', ...pair, ...thread(from), '--execute']);
+    try { await run(['bind-agent-thread', ...pair, ...thread(to), '--execute']); }
+    catch (error) {
+      // 没绑上目标会话：把绑定还回去，不留一个两边都没绑的 LoopX 目标。
+      await run(['bind-agent-thread', ...pair, ...thread(from), '--execute']).catch(() => {});
+      throw error;
+    }
+    return { loopx: 'moved', goalId: bound.goal_id, agentId: bound.agent_id };
+  } catch (error) { return { loopx: `failed:${error?.message ?? error}` }; }
+}
 
 // 首条消息走 sessionController.prompt（与界面发送相同的路径）；它可能等到整轮结束才返回，8 秒内没回执就当作已投递。
 async function deliver(controller, sessionId, text, waitMs) {
@@ -499,7 +540,8 @@ export async function repairLinks({ registry, controller, aliases, directory, lo
 export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, pending, sessionJobs, aliases, from, to, registry, instructionArchive }) {
   const checks = {};
   const hasGoal = goal && goal.phase !== 'complete' && typeof goal.objective === 'string';
-  if (!hasGoal) checks.goal = 'skipped:no_goal';
+  if (steps.successorGoal === 'loopx') checks.goal = 'skipped:loopx';
+  else if (!hasGoal) checks.goal = 'skipped:no_goal';
   else if (steps.successorGoal === 'exists') checks.goal = 'skipped:successor_had_goal';
   else {
     const created = goals?.get(agentB);
@@ -575,7 +617,8 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
 
 export async function handOver(ctx, deps, request) {
   const { aliases, sessionJobs, pendingOf, since, directory, deliverWaitMs = 8_000, autoContinue,
-    disableAutoContinue: turnOffAutoContinue = true, autoMessage, sessionRead = () => false, contextDeadlineMs, workspaces = () => undefined, withRunningJobs = false } = deps;
+    disableAutoContinue: turnOffAutoContinue = true, autoMessage, sessionRead = () => false, contextDeadlineMs, workspaces = () => undefined, withRunningJobs = false,
+    loopx } = deps;
   const result = { status: 'refused', from: request.from ?? request.revert?.from, to: request.to ?? request.revert?.to ?? null, steps: {} };
   const refuse = (reason, extra = {}) => Object.assign(result, { reason, ...extra });
   const controller = ctx.get('sessionController');
@@ -619,6 +662,13 @@ export async function handOver(ctx, deps, request) {
       } catch (error) { result.steps[key] = `failed: ${error.message}`; }
     }
     Object.assign(result.steps, await removeFromWorkspace(workspaces(), link, to));
+    // 交接时挪给继任会话的 LoopX 绑定，撤回时挪回原会话。
+    if (link.loopx && loopx) {
+      let cwd;
+      try { cwd = (await agentOf(from)).session?.header?.cwd; } catch {}
+      const back = await moveLoopxBinding(loopx, cwd, to, from);
+      result.steps.loopx = back.loopx === 'moved' ? 'restored' : back.loopx;
+    }
     // 交接时由插件关掉的自动续接，撤回时恢复成原来的值（原来没有这个键就删掉）。
     if (link.autoContinue === 'disabled' && Object.hasOwn(link, 'autoContinuePrevious')) {
       result.steps.autoContinue = await restoreAutoContinue(autoContinue, from, link.autoContinuePrevious);
@@ -673,6 +723,10 @@ export async function handOver(ctx, deps, request) {
   if (!request.to) result.steps.title = await renameSuccessor(controller, to, successorTitle(from, titleOf(agentA)));
   const autoContinueStep = turnOffAutoContinue ? await disableAutoContinue(autoContinue, from) : {};
   if (autoContinueStep.autoContinue) result.steps.autoContinue = autoContinueStep.autoContinue;
+  // 原会话由 LoopX 续跑：绑定随交接挪给继任会话，继任会话由 LoopX 接着跑，不重建原生目标。
+  const follow = loopx && loopxDriven(agentA.session?.log) ? await moveLoopxBinding(loopx, header.cwd, from, to) : undefined;
+  if (follow) result.steps.loopx = follow.loopx;
+  const followed = follow?.loopx === 'moved' ? { goalId: follow.goalId, agentId: follow.agentId } : undefined;
   const pending = pendingOf(jobs);
   Object.assign(result, { pending, running });
   const at = new Date().toISOString();
@@ -699,8 +753,9 @@ export async function handOver(ctx, deps, request) {
     try { goals.pause(agentA, ref(goals.get(agentA))); result.steps.predecessorGoal = 'paused'; }
     catch (error) { result.steps.predecessorGoal = `failed: ${error.message}`; }
   } else result.steps.predecessorGoal = goal ? `unchanged_${goal.phase}` : 'none';
-  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief), deliverWaitMs));
-  if (goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
+  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed), deliverWaitMs));
+  if (followed) result.steps.successorGoal = 'loopx';
+  else if (goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
     try {
       const existing = goals.get(agentB);
       if (existing && existing.phase !== 'complete') result.steps.successorGoal = 'exists';
@@ -715,7 +770,8 @@ export async function handOver(ctx, deps, request) {
     aliases.annotate(to, { delivered: result.steps.delivered !== 'failed',
       ...(placed.workspaceId ? { workspaceId: placed.workspaceId } : {}), ...(placed.pin === 'pinned' ? { pinned: true } : {}),
       ...(result.steps.autoContinue ? { autoContinue: result.steps.autoContinue } : {}),
-      ...(Object.hasOwn(autoContinueStep, 'previous') ? { autoContinuePrevious: autoContinueStep.previous } : {}) });
+      ...(Object.hasOwn(autoContinueStep, 'previous') ? { autoContinuePrevious: autoContinueStep.previous } : {}),
+      ...(followed ? { loopx: followed } : {}) });
   } catch (error) { result.steps.linkNote = `failed: ${error.message}`; }
   // 首条消息没送达，或继任会话的目标没建起来：不留一个没有交接单或没有目标的“继任”，自动撤回一次（不带 force）。
   const broken = result.steps.delivered === 'failed' ? 'delivery_failed' : result.steps.successorGoal.startsWith('failed') ? 'successor_goal_failed' : '';
