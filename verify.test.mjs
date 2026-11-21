@@ -1,6 +1,6 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -129,6 +129,59 @@ test('Gemini execution passes effort only when explicitly configured or inherite
   await verification.verify({ engine: 'gemini' });
   assert.equal(option(verification.start().argv, '--resume'), undefined);
   assert.equal(option(verification.start().argv, '--effort'), undefined);
+});
+
+test('Gemini runs under a DSH agy pool account and continues under the same one', async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), 'conductor-pool-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const accountPool = path.join(dir, 'pool.json');
+  const pool = { mode: 'sequential', activeAccountIds: { google: 'acc_a' }, lastActiveAccountId: 'acc_b', accounts: [
+    { id: 'acc_off', dir: 'D:\\pool\\off', enabled: false },
+    { id: 'acc_login', dir: 'D:\\pool\\login', enabled: true, authRequired: true },
+    { id: 'acc_a', dir: 'D:\\pool\\a', enabled: true, proxyUrl: 'http://127.0.0.1:7894',
+      cooldowns: { google: { cooldownUntil: Date.now() + 3600e3 } } },
+    { id: 'acc_b', dir: 'D:\\pool\\b', enabled: true }] };
+  writeFileSync(accountPool, JSON.stringify(pool));
+  const config = { gemini: { command: gemini.command, model: gemini.model, proxy: 'http://127.0.0.1:7890', accountPool } };
+  const run = async () => {
+    const h = harness({ config });
+    await h.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false, engine: 'gemini' }, exec);
+    return h.start().argv;
+  };
+  // The pinned account is cooling down for Gemini, so the last active usable one runs it with the configured proxy.
+  let argv = await run();
+  assert.equal(option(argv, '--agy-home'), 'D:\\pool\\b');
+  assert.equal(option(argv, '--agy-proxy'), 'http://127.0.0.1:7890');
+  writeFileSync(accountPool, JSON.stringify({ ...pool, accounts: pool.accounts.map(a => ({ ...a, cooldowns: {} })) }));
+  argv = await run();
+  assert.equal(option(argv, '--agy-home'), 'D:\\pool\\a');
+  assert.equal(option(argv, '--agy-proxy'), 'http://127.0.0.1:7894');
+
+  const source = sourceJob();
+  source.structured.criteria[0].status = 'not_met';
+  source.engine = 'gemini';
+  source.conversation_id = 'conversation-a';
+  delete source.thread_id;
+  source.task_options = { ...source.task_options, engine: 'gemini', agy_home: 'd:\\POOL\\a' };
+  const resume = async (input) => {
+    const h = harness({ source, config });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, ...input }, exec);
+    return h.start().argv;
+  };
+  writeFileSync(accountPool, JSON.stringify(pool));
+  // The conversation lives under acc_a's HOME, so continuing returns there even while it cools down.
+  argv = await resume({ fresh: false });
+  assert.equal(option(argv, '--resume'), 'conversation-a');
+  assert.equal(option(argv, '--agy-home'), 'D:\\pool\\a');
+  assert.equal(option(argv, '--agy-proxy'), 'http://127.0.0.1:7894');
+  assert.equal(option(await resume({ fresh: true }), '--agy-home'), 'D:\\pool\\b');
+  assert.equal(option(await resume({ engine: 'codex' }), '--agy-home'), undefined);
+  writeFileSync(accountPool, JSON.stringify({ ...pool, accounts: pool.accounts.filter(a => a.id !== 'acc_a') }));
+  await assert.rejects(resume({ fresh: false }), /已不在 DSH 账号池/);
+  writeFileSync(accountPool, JSON.stringify({ ...pool, accounts: pool.accounts.slice(0, 2) }));
+  await assert.rejects(run(), /没有可用账号/);
+  writeFileSync(accountPool, '{');
+  await assert.rejects(run(), /读取 DSH agy 账号池失败/);
 });
 
 test('Gemini provider failure tells the planner how to redispatch on Codex', async () => {

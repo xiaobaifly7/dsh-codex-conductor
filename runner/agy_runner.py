@@ -134,6 +134,11 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env[key] = env[key.lower()] = args.agy_proxy
             exported.append(key)
+    if getattr(args, "agy_home", None):
+        # agy reads its login and conversations from HOME/USERPROFILE; one directory per pooled account.
+        home = _windows_path(args.agy_home) if windows else os.path.realpath(args.agy_home)
+        env["HOME"] = env["USERPROFILE"] = home
+        exported.extend(("HOME", "USERPROFILE"))
     if scratch is not None:
         tmp = Path(scratch) / "tmp"
         temp = _windows_path(tmp) if windows else str(tmp.resolve())

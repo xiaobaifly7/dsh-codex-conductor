@@ -250,6 +250,7 @@ FAKE_AGY = textwrap.dedent(r"""
     say(event="init", conversation_id=conversation)
     Path(os.environ["FAKE_AGY_CALL"]).write_text(json.dumps({
         "argv": argv, "prompt": request["message"]["content"], "proxy": os.environ.get("HTTPS_PROXY"),
+        "home": [os.environ.get("HOME"), os.environ.get("USERPROFILE")],
         "pid": os.getpid(),
     }), encoding="utf-8")
     if mode == "hang":
@@ -2610,8 +2611,10 @@ class RunnerTests(unittest.TestCase):
     def test_gemini_report_metadata_output_and_resume(self):
         argv, env, call = self.fake_gemini()
         prompt = '核对 `%PATH%`、引号和换行\n第二行'
+        home = Path(self.tmp.name) / "pooled account"
+        home.mkdir()
         start = self.invoke(*argv, "--model", "gemini-test", "--effort", "high", "--agy-proxy", "http://unused.invalid:8080",
-                            "--model-ab", '[["codex-a","codex-b"],1]', command="start", prompt=prompt, env=env)
+                            "--agy-home", str(home), "--model-ab", '[["codex-a","codex-b"],1]', command="start", prompt=prompt, env=env)
         result = self.control("status", start["job_id"], "--wait", "10")
         conversation = result["conversation_id"]
         self.assertEqual((result["status"], result["report_status"], result["sandbox"], conversation),
@@ -2619,10 +2622,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["structured"], self.sample_report())
         self.assertEqual(result["usage"], {"input_tokens": 5})
         self.assertNotIn("thread_id", result)
-        self.assertEqual({key: result["task_options"][key] for key in ("engine", "model", "effort")},
-                         {"engine": "gemini", "model": "gemini-test", "effort": "high"})
+        self.assertEqual({key: result["task_options"][key] for key in ("engine", "model", "effort", "agy_home")},
+                         {"engine": "gemini", "model": "gemini-test", "effort": "high", "agy_home": str(home)})
         received = json.loads(call.read_text("utf-8"))
         self.assertEqual((received["prompt"], received["proxy"]), (prompt, "http://unused.invalid:8080"))
+        self.assertEqual(received["home"], [os.path.realpath(home)] * 2)
         self.assertIn("gemini-test", received["argv"])
         self.assertFalse(set(("codex-a", "codex-b", "exec", "--ephemeral")) & set(received["argv"]))
         self.assertEqual(self.calls(), [])

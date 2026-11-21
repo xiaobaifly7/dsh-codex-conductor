@@ -1996,6 +1996,7 @@ def add_task_arguments(p):
     p.add_argument("--engine", choices=("codex", "gemini"), default="codex")
     p.add_argument("--agy-command", help="Antigravity executable for Gemini")
     p.add_argument("--agy-proxy", help="Proxy for Antigravity")
+    p.add_argument("--agy-home", help="Windows directory used as HOME/USERPROFILE for Antigravity (one pooled account)")
     p.add_argument("--gemini-fallback-check", action="store_true", help="Check whether a failed Codex task left its worktree untouched")
     # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
@@ -2225,6 +2226,9 @@ def task_options(task):
     if task.get("engine") == "gemini":
         options.update(engine="gemini", model=task.get("model"))
         options.pop("service_tier", None)
+        # agy keeps conversations under HOME, so a continuation must return to the same account directory.
+        if task.get("agy_home"):
+            options["agy_home"] = task["agy_home"]
     return options
 
 
@@ -3546,8 +3550,8 @@ def main():
                 parser.error("--engine gemini requires --agy-command")
             if args.gemini_fallback_check:
                 parser.error("--gemini-fallback-check is for Codex")
-        elif args.agy_command or args.agy_proxy or getattr(args, "max_engine_running", None):
-            parser.error("--agy-command, --agy-proxy and --max-engine-running require --engine gemini")
+        elif args.agy_command or args.agy_proxy or args.agy_home or getattr(args, "max_engine_running", None):
+            parser.error("--agy-command, --agy-proxy, --agy-home and --max-engine-running require --engine gemini")
         if args.engine == "codex" and getattr(args, "model_ab", None) is not None:
             if not context or args.model is not None or args.resume or context.get("continuation") or context.get("verification_of"):
                 parser.error("--model-ab requires a new contextual task without a model override")

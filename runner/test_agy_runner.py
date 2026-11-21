@@ -21,7 +21,7 @@ class AdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as run_dir:
             command, env = agy_runner.build_command(args(
                 r"D:\local project", agy_command=r"C:\tools\agy.exe", schema=r"schemas\report.json",
-                scope=["."], effort="xhigh", agy_proxy="http://127.0.0.1:7890",
+                scope=["."], effort="xhigh", agy_proxy="http://127.0.0.1:7890", agy_home="D:/pool/acc 1/",
             ), run_dir, "AbC-中文-012")
             settings = json.loads(command[command.index("--settings") + 1])
             self.assertEqual(settings["modelProvider"], "")
@@ -37,6 +37,9 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(command[command.index("--json-schema") + 1], r"D:\local project\schemas\report.json")
             self.assertEqual(command[command.index("--conversation") + 1], "AbC-中文-012")
             self.assertEqual(env["HTTPS_PROXY"], "http://127.0.0.1:7890")
+            self.assertEqual((env["HOME"], env["USERPROFILE"]), (r"D:\pool\acc 1",) * 2)
+            if os.name != "nt":
+                self.assertTrue({"HOME", "USERPROFILE", "HTTPS_PROXY"} <= set(env["WSLENV"].split(":")))
             self.assertEqual((Path(run_dir) / agy_runner.JOB_RECORD).read_text(), command[3])
 
     def test_host_read_only_context_enforces_tool_denies(self):

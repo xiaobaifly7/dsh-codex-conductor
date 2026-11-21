@@ -26,7 +26,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
   REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
-const { ENGINE_GUIDANCE, ENGINE_PARAMETER, checkEngine, jobEngine, runEngine, verifyEngine, geminiArgv } =
+const { ENGINE_GUIDANCE, ENGINE_PARAMETER, checkEngine, jobEngine, runEngine, verifyEngine, geminiArgv, poolAccount } =
   await import(new URL(`./engines.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
@@ -1129,6 +1129,10 @@ function settings(config, logger) {
       if (gemini.forceEffort !== undefined) {
         if (typeof gemini.forceEffort === 'boolean') config.gemini.forceEffort = gemini.forceEffort;
         else logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.forceEffort，必须是 true 或 false');
+      }
+      if (gemini.accountPool !== undefined) {
+        if (typeof gemini.accountPool === 'string' && path.isAbsolute(gemini.accountPool.trim())) config.gemini.accountPool = gemini.accountPool.trim();
+        else logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.accountPool，必须是 DSH agy 账号池 pool.json 的绝对路径');
       }
       // Applied when a call omits max_chars, so length stays capped even if the planner forgets it.
       if (gemini.defaultMaxChars !== undefined) {
@@ -3565,7 +3569,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const engine = args.engine ?? sourceEngine;
         plan.args.engine = engine;
         if (engine !== sourceEngine) {
-          for (const key of ['resume', 'conversation_id', 'model', 'service_tier', 'effort', 'use_user_config']) delete plan.args[key];
+          for (const key of ['resume', 'conversation_id', 'agy_home', 'model', 'service_tier', 'effort', 'use_user_config']) delete plan.args[key];
         }
         if (args.fresh === true) delete plan.args.conversation_id;
         const thread = engine === 'codex' ? await continuationThread(plan, args, exec?.signal) : null;
@@ -3910,13 +3914,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     async execute(input, exec) {
       const { background, ...args } = input ?? {};
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
+      const account = cfg.gemini.accountPool ? poolAccount(cfg.gemini.accountPool, args.model ?? cfg.gemini.model) : null;
+      const gemini = account ? { ...cfg.gemini, home: account.dir, proxy: account.proxyUrl || cfg.gemini.proxy } : cfg.gemini;
       const key = normPath(cwd);
       const busy = geminiWrites.has(key) ? '同一任务目录的 gemini_write 尚未结束，请先等它结束'
         : [...startingWrites].some((writer) => writer.cwd === key) ? '同一任务目录的可写 Codex 任务正在启动，请先等它结束' : '';
       // 查询与启动之间也占住本实例的入口，避免规划端同时派入另一种写任务。
       if (!busy) geminiWrites.add(key);
       const owner = exec?.agent?.id;
-      const write = (signal, extra = {}) => geminiWrite(cfg.gemini, { ...args, cwd,
+      const write = (signal, extra = {}) => geminiWrite(gemini, { ...args, cwd,
         ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
         { signal, busy,
           // products 模式下规划端不能读原料，也就不能把工作区外的文件当素材发给 Gemini。
