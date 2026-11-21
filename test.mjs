@@ -44,6 +44,9 @@ test('entry reload queries re-evaluate helper modules', async () => {
         `globalThis[${JSON.stringify(traceKey)}].push('resume-${version}');\nexport const registerResumeRequests = () => {}, registerAutoWake = () => {};\n`);
       writeFileSync(path.join(dir, 'gemini.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('gemini-${version}');\nexport const geminiWrite = () => ({});\n`);
+      writeFileSync(path.join(dir, 'engines.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('engines-${version}');\n` +
+        readFileSync(new URL('./engines.mjs', import.meta.url), 'utf8'));
       writeFileSync(path.join(dir, 'panel.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('panel-${version}');\nexport const registerPanel = () => {};\n`);
       writeFileSync(path.join(dir, 'closeout.mjs'),
@@ -59,7 +62,7 @@ test('entry reload queries re-evaluate helper modules', async () => {
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'engines-new', 'engines-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
@@ -906,7 +909,7 @@ test('guard regressions match Bash semantics using only printed markers and /dev
   const dynamic = bash("read 'a[0]' < /etc/hostname; test \"$(printf -- -v)\" 'a[$(printf DYNAMIC_TEST >&2)0]'");
   assert.equal(dynamic.status, 0, dynamic.stderr);
   assert.equal(dynamic.stderr, 'DYNAMIC_TEST');
-  const glob = bash("printf '<%s>\\n' runner/*.py; uniq /dev/null /dev/null");
+  const glob = bash("printf '<%s>\\n' runner/*codex_runner.py; uniq /dev/null /dev/null");
   assert.equal(glob.status, 0, glob.stderr);
   assert.equal(glob.stdout, '<runner/codex_runner.py>\n<runner/test_codex_runner.py>\n');
   const tree = bash('command -v tree >/dev/null || exit 77; tree -ao /dev/null -L 1 tools');
@@ -1488,7 +1491,7 @@ test('codex_run accepts minimal calls and every declared parameter with host acc
     for (const write of [false, true]) {
       assert.equal((await h.tools.codex_run.execute({ task: RUN.task, acceptance: RUN.acceptance, write }, exec)).job_id, 'J');
       for (const access of allowHostAccess ? [{ host_access: false }, { host_access: true }] : [{}]) {
-        const args = { ...RUN, write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
+        const args = { ...RUN, engine: 'codex', write, ...access, must_verify: [1], scope: ['src'], writable_roots: write ? ['/work/extra'] : [],
           cwd: '/work/original', resume: 'THREAD', fresh: false, verify_previous: 'PREV', use_user_config: true, model: 'chosen',
           effort: 'low', effort_reason: 'prior_rework', rerun_after_change: '用户已修好虚拟机', wait_seconds: 1,
           acceptance_needs: [{ index: 1, steps: ['Invoke-Pytest'] }], expect_blocked: [], required_writes: [] };
@@ -4793,7 +4796,7 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   assert.equal(readFileSync(value.output, 'utf8'), '正文汉字𠀀😀abc\n');
   assert.deepEqual(value.usage, { input_tokens: 10, output_tokens: 20 });
   assert.equal(value.model, 'gemini-4-argon');
-  assert.equal(value.effort, 'medium');
+  assert.equal(value.effort, '');
   assert.ok(value.duration_s >= 0);
   assert.deepEqual(value.out_of_scope, []);
   assert.deepEqual(value.files_changed, [{ path: value.output, change: 'added' }]);
@@ -4809,7 +4812,7 @@ test('gemini_write writes one file, counts Unicode from disk and preserves usage
   const spawned = h.spawns[0];
   assert.equal(spawned.command, GEMINI.command);
   assert.deepEqual(spawned.argv, ['--output-format', 'stream-json', '--input-format', 'stream-json', '--print-timeout', '30m',
-    '--mode', 'accept-edits', '--model', 'gemini-4-argon', '--effort', 'medium']);
+    '--mode', 'accept-edits', '--model', 'gemini-4-argon']);
   assert.equal(spawned.options.windowsHide, true);
   assert.equal(spawned.options.cwd, h.cwd);
   assert.equal(spawned.stdin.split('\n').length, 2);
@@ -5449,7 +5452,8 @@ test('gemini configuration warns and defaults invalid optional values without di
   const value = await h.execute();
   assert.equal(value.status, 'completed');
   assert.equal(value.model, 'gemini-4-argon');
-  assert.equal(value.effort, 'medium');
+  assert.equal(value.effort, '');
+  assert.equal(h.spawns[0].argv.includes('--effort'), false);
   assert.equal(h.spawns[0].argv[h.spawns[0].argv.indexOf('--print-timeout') + 1], '30m');
 });
 

@@ -60,6 +60,7 @@ HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
              else Path.home() / ".local/state/codex-runner"))
 EXIT_GRACE_SECONDS = 20
+WORKER_START_GRACE_SECONDS = 5
 LOST_AFTER = 300
 REPEAT_MIN_SECONDS = 60
 REPEAT_FAILURES = 2
@@ -87,7 +88,7 @@ DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 PERMANENT = re.compile(
-    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|quota|insufficient"
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|insufficient"
     r"|model.{0,40}(not found|not supported|does not exist)|invalid.{0,20}(config|schema)|unrecognized", re.I)
 # The model refusing the request arrives inside "Reconnecting... n/5" notices; the same prompt is refused again,
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
@@ -99,6 +100,10 @@ REJECTED = re.compile(r"bad request|invalid_request_error", re.I)
 TRANSIENT = re.compile(
     r"stream disconnected|stream error|timed? ?out|connection|reset by peer|\b429\b|rate.?limit"
     r"|\b50[0234]\b|overloaded|server_error|temporarily|try again", re.I)
+PROVIDER_PERMANENT = re.compile(
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|log.?in required|sign.?in required"
+    r"|usage limit|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
+    r"|model.{0,40}(not found|not supported|does not exist)", re.I)
 
 
 def emit(obj):
@@ -482,17 +487,44 @@ def build_command(args, run_dir, thread_id, scratch=None):
     return cmd, env
 
 
+def windows_agy(command):
+    return IS_WIN or (command or "").lower().endswith(".exe")
+
+
+def confirm_agy_stopped(run_dir):
+    import agy_runner
+
+    confirm = getattr(agy_runner, "cancel", None)
+    with suppress(OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return confirm is not None and confirm(run_dir) is True
+    return False
+
+
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
-    """Run one Codex process to a verdict. turn.completed decides success, not the exit code."""
+    """Run one provider process to a verdict. A completed turn determines success."""
     scratch = getattr(args, "verification_scratch", None)
-    cmd, env = build_command(args, run_dir, thread_id, scratch)
+    gemini = getattr(args, "engine", None) == "gemini"
+    id_field = "conversation_id" if gemini else "thread_id"
+    fallback_check = getattr(args, "gemini_fallback_check", False)
     state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
              "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
              "file_changes": [], "prompt_delivered": False}
+    if gemini:
+        import agy_runner
+        state["engine"] = "gemini"
+        adapter = agy_runner.EventAdapter()
+    else:
+        cmd, env = build_command(args, run_dir, thread_id, scratch)
     start = time.monotonic()
     proc = reader = writer = None
     startup = acquire_file_lock(run_dir / "process.lock", blocking=True)
     try:
+        if gemini:
+            try:
+                cmd, env = agy_runner.build_command(args, run_dir, thread_id, scratch)
+            except ValueError as error:
+                state.update(end_reason="bad_arguments", error=str(error))
+                return state
         with open(run_dir / "stderr.log", "ab") as stderr_log, open(run_dir / "events.jsonl", "ab") as event_log:
             state["stderr_offset"] = stderr_log.tell()
             try:
@@ -523,11 +555,36 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     stdin_done.set()
 
             lines = queue.Queue()
+            stdout_eof = possible_write = failure_observed = False
 
             def pump():
+                nonlocal stdout_eof, possible_write, failure_observed
                 try:
                     for raw in proc.stdout:
-                        lines.put((raw, time.monotonic() if repeat_guard else None))
+                        received = time.monotonic() if repeat_guard else None
+                        if not (gemini or fallback_check):
+                            lines.put((raw, received))
+                            continue
+                        try:
+                            event = json.loads(raw)
+                        except (ValueError, UnicodeError):
+                            event = None
+                        if fallback_check:
+                            if not fallback_read_only_event(event):
+                                possible_write = True
+                            elif event["type"] in ("error", "turn.failed"):
+                                failure_observed = True
+                        if gemini:
+                            if not isinstance(event, dict):
+                                continue
+                            for normalized in adapter.events(event):
+                                if normalized.get("type") == "thread.started":
+                                    normalized = dict(normalized)
+                                    normalized[id_field] = normalized.pop("thread_id")
+                                lines.put(((json.dumps(normalized) + "\n").encode("ascii"), received))
+                        else:
+                            lines.put((raw, received))
+                    stdout_eof = True
                 finally:
                     proc.stdout.close()
                     lines.put(None)
@@ -588,7 +645,9 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                 event_log.flush()
                 try:
                     ev = json.loads(raw)
-                except ValueError:
+                except (ValueError, UnicodeError):
+                    continue
+                if not isinstance(ev, dict):
                     continue
                 kind = ev.get("type")
                 item = ev.get("item") or {}
@@ -628,7 +687,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     reconnecting_since = None
                     last_event = time.monotonic()
                 if kind == "thread.started":
-                    state["thread_id"] = ev.get("thread_id") or state["thread_id"]
+                    state["thread_id"] = ev.get(id_field) or state["thread_id"]
                 elif kind == "turn.completed":
                     state["completed"] = True
                     state["usage"] = ev.get("usage")
@@ -636,7 +695,10 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                 elif kind == "turn.failed":
                     state["failed"] = True
                     state["error"] = (ev.get("error") or {}).get("message") or json.dumps(ev, ensure_ascii=False)
-                elif kind == "error":
+                    if gemini:
+                        state["gemini_quota_kind"] = (ev.get("error") or {}).get("quota_kind")
+                        completed_at = time.monotonic()
+                elif kind == "error" and not (gemini and state["failed"]):
                     # Retry notices also arrive as top-level errors, so this alone does not end the turn.
                     state["error"] = ev.get("message") or state["error"]
                 elif kind == "item.completed" and item.get("type") == "agent_message":
@@ -665,9 +727,20 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
         raise
     finally:
         startup.close()
-        with acquire_file_lock(run_dir / "process.lock", blocking=True):
-            (run_dir / "codex.pid").unlink(missing_ok=True)
-            (run_dir / "codex.start").unlink(missing_ok=True)
+        wait_for_windows = proc is not None and gemini and windows_agy(args.agy_command)
+        waiting = False
+        while True:
+            with acquire_file_lock(run_dir / "process.lock", blocking=True):
+                if not wait_for_windows or confirm_agy_stopped(run_dir):
+                    (run_dir / "codex.pid").unlink(missing_ok=True)
+                    (run_dir / "codex.start").unlink(missing_ok=True)
+                    break
+            if not waiting:
+                with suppress(OSError):
+                    attempt = runner_activity(run_dir / "events.jsonl")["attempt"]
+                    runner_event(run_dir, attempt, "cleanup_wait", "process_cleanup_unconfirmed")
+                waiting = True
+            time.sleep(2)
         for thread, pipe in ((writer, proc.stdin if proc else None), (reader, proc.stdout if proc else None)):
             if thread is not None:
                 with suppress(RuntimeError):
@@ -675,7 +748,45 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
             elif pipe is not None:
                 with suppress(OSError):
                     pipe.close()
+    if fallback_check:
+        state["fallback_stream_safe"] = stdout_eof and failure_observed and not possible_write
     return state
+
+
+def fallback_read_only_event(event):
+    if not isinstance(event, dict):
+        return False
+    kind = event.get("type")
+    if kind in ("item.started", "item.updated", "item.completed"):
+        item = event.get("item")
+        return isinstance(item, dict) and item.get("type") in ("agent_message", "reasoning", "todo_list", "error")
+    return kind in ("thread.started", "turn.started", "turn.completed", "turn.failed", "error")
+
+
+def fallback_config_isolated(cwd):
+    user_config = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
+    project = Path(cwd)
+    configs = {user_config: True}
+    for path in (project, *project.parents):
+        configs.setdefault(path / ".codex" / "config.toml", False)
+
+    for path, user in configs.items():
+        try:
+            config = tomllib.loads(path.read_text("utf-8"))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            return False
+        plugins = config.get("plugins", {})
+        servers = config.get("mcp_servers", {})
+        if not isinstance(plugins, dict) or not isinstance(servers, dict):
+            return False
+        if any(not isinstance(plugin, dict) or plugin.get("enabled") is not False for plugin in plugins.values()):
+            return False
+        for name, server in servers.items():
+            if (not user or "." in name) and (not isinstance(server, dict) or server.get("enabled") is not False):
+                return False
+    return True
 
 
 def classify(state, run_dir):
@@ -686,10 +797,13 @@ def classify(state, run_dir):
         return state["end_reason"], True
     if state["end_reason"] == "spawn_failed":
         return "spawn_failed", False
+    if state["end_reason"] == "bad_arguments":
+        return "bad_arguments", False
     if state["end_reason"] == "model_refused":
         return "model_refused", False
     if state["end_reason"] == "repeated_failure":
         return "repeated_failure", False
+    gemini = state.get("engine") == "gemini"
     text = state["error"] or ""
     if not state["failed"] and not text:
         try:
@@ -698,10 +812,20 @@ def classify(state, run_dir):
                 text = f.read().decode("utf-8", "replace")[-2000:]
         except OSError:
             text = ""
-        state["error"] = text.strip()[-500:] or "Codex exited without turn.completed"
+        engine = "Gemini" if gemini else "Codex"
+        state["error"] = text.strip()[-500:] or f"{engine} exited without turn.completed"
+    if gemini:
+        if "agy permission denied" in text.lower():
+            return "permission_denied", False
+        if text.startswith("agy rejected a CLI argument:"):
+            return "bad_arguments", False
+        if quota_kind := state.get("gemini_quota_kind"):
+            return quota_kind, quota_kind == "transient"
+        if PROVIDER_PERMANENT.search(text):
+            return "provider_permanent", False
     if REFUSED.search(text):
         return "model_refused", False
-    if PERMANENT.search(text):
+    if PERMANENT.search(text) or (not gemini and "quota" in text.lower()):
         return "permanent", False
     if REJECTED.search(text):
         return "upstream_rejected", False
@@ -730,7 +854,7 @@ GIT_DIFF = ("-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c"
             "diff", "--no-color", "--no-ext-diff", "--no-textconv", "--no-renames", "--submodule=short")
 
 
-def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
+def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None, *, strict=False, exclude_tree=None):
     """Map path relative to root -> (size, mtime_ns, mode) under root, or only under the scope files/directories;
     None when the walk exceeds the budget. With scope, entries that took over SCOPE_SLOW_S to walk, or that were being
     walked when the budget ran out, are appended to slow; when only the whole scoped walk took over SCOPE_SLOW_S, its
@@ -744,11 +868,16 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
         try:
             st = os.stat(path, follow_symlinks=False)
         except FileNotFoundError:
+            if strict:
+                raise
             return
-        files[os.path.relpath(path, root).replace(os.sep, "/")] = (st.st_size, st.st_mtime_ns, st.st_mode)
+        fingerprint = (st.st_size, st.st_mtime_ns, st.st_mode)
+        if strict:
+            fingerprint += (st.st_ctime_ns, st.st_ino)
+        files[os.path.relpath(path, root).replace(os.sep, "/")] = fingerprint
 
     def onerror(error):
-        if not isinstance(error, FileNotFoundError):
+        if strict or not isinstance(error, FileNotFoundError):
             raise error
 
     for top in scope or [root]:
@@ -763,7 +892,13 @@ def snapshot(root, budget=SNAPSHOT_BUDGET, scope=None, slow=None):
                 if slow is not None and scope:
                     slow.append(top)
                 return None
-            dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
+            if exclude_tree and normalized_path(dirpath) == os.path.dirname(exclude_tree):
+                dirnames[:] = [name for name in dirnames if normalized_path(os.path.join(dirpath, name)) != exclude_tree]
+            if strict:
+                add(dirpath)
+                filenames.extend(name for name in dirnames if os.path.islink(os.path.join(dirpath, name)))
+            else:
+                dirnames[:] = [d for d in dirnames if d not in SNAPSHOT_SKIP]
             for name in filenames:
                 if time.monotonic() > deadline:
                     if slow is not None and scope:
@@ -1573,8 +1708,13 @@ def parse_final_message(final):
 def execute(args, prompt, run_dir):
     run_dir.mkdir(parents=True, exist_ok=True)
     args.cwd = os.path.realpath(args.cwd)
+    gemini = getattr(args, "engine", None) == "gemini"
+    id_field = "conversation_id" if gemini else "thread_id"
     scope_args = [scope_path(args.cwd, s) for s in getattr(args, "scope", None) or []]
     base = {"cwd": args.cwd, "sandbox": args.sandbox, "log_dir": str(run_dir)}
+    fallback_check = getattr(args, "gemini_fallback_check", False)
+    if fallback_check:
+        base["fallback_safe"] = False
     ignore, warnings = ignore_patterns(getattr(args, "ignore", None))
     if warnings:
         base["ignore_warnings"] = warnings
@@ -1584,16 +1724,19 @@ def execute(args, prompt, run_dir):
         base.update(scope=getattr(args, "scope", None), scope_paths=scope_args)
     started = time.time()
     context = getattr(args, "context", None) or {}
+    if gemini:
+        args.context = context or None
+        base["task_options"] = task_options(vars(args))
     verification = context.get("verification_of") and context.get("write") is False
     host_verification = verification and args.sandbox == "danger-full-access"
-    if verification and args.sandbox in ("read-only", "danger-full-access"):
+    if not gemini and verification and args.sandbox in ("read-only", "danger-full-access"):
         scratch = (run_dir / "scratch").resolve()
         if Path(normalized_path(str(scratch))).is_relative_to(Path(normalized_path(args.cwd))):
             return {**base, "status": "failed", "error_kind": "verification_scratch_overlap",
                     "error": "Verification scratch would be inside the project directory.",
                     "retryable": False, "attempts": 0}
         args.verification_scratch = scratch
-    if verification and args.sandbox == "read-only":
+    if not gemini and verification and args.sandbox == "read-only":
         prompt = (f"Verification project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
                   "当前目录是核验暂存区。先读取上述项目目录中适用的 AGENTS.md。项目目录只读，"
                   "相对路径均以该项目目录为准。运行检查时先切到项目目录（cd <项目绝对路径> && …），"
@@ -1646,6 +1789,18 @@ def execute(args, prompt, run_dir):
     before = scope = None
     event_changes = []
     writes = writer(args.sandbox, getattr(args, "context", None))
+    roots = {}
+
+    def fallback_snapshot():
+        monitored = list(dict.fromkeys(os.path.realpath(path) for path in roots.values())) if roots else [args.cwd]
+        try:
+            runner_home = Path(normalized_path(str(HOME.resolve())))
+            if any(Path(normalized_path(path)).is_relative_to(runner_home) for path in monitored):
+                return None
+            return snapshot(args.cwd, scope=monitored, strict=True, exclude_tree=str(runner_home))
+        except (OSError, ValueError):
+            return None
+
     try:
         if writes:
             try:
@@ -1658,7 +1813,7 @@ def execute(args, prompt, run_dir):
                 while True:
                     if waiting and deadline is not None and time.monotonic() >= deadline:
                         return {**base, "status": "failed", "error_kind": "lock_timeout",
-                                "error": "Timed out waiting for directory write locks; Codex was not started.",
+                                "error": f"Timed out waiting for directory write locks; {'Gemini' if gemini else 'Codex'} was not started.",
                                 "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
                     admission = acquire_file_lock(HOME / "locks" / "admission.lock")
                     if admission is not None:
@@ -1683,14 +1838,21 @@ def execute(args, prompt, run_dir):
             except OSError as error:
                 return {**base, "status": "failed", "error_kind": "runner_error", "error": str(error),
                         "retryable": False, "attempts": 0, "duration_s": round(time.time() - started, 1)}
+        baseline = (fallback_snapshot() if fallback_check and not args.use_user_config and
+                    fallback_config_isolated(args.cwd) else None)
+        if writes:
             # Jobs queued before --scope existed have no scope in args.json.
             before, scope = snapshot_before(args.cwd, scope_args)
             with suppress(OSError):  # not even a full disk may fail the task over its diff
                 diff_begin(run_dir, args.cwd, not getattr(args, "no_diff", False))
 
         def changes():
-            # Without a snapshot (read-only full-access jobs) this still reports Codex's own patch events.
-            return files_changed(args.cwd, before, event_changes, scope, ignore) if args.sandbox != "read-only" else {}
+            if args.sandbox == "read-only":
+                return {}
+            result = files_changed(args.cwd, before, event_changes, scope, ignore)
+            if gemini:
+                result["files_changed_source"] = result["files_changed_source"].replace("codex_events", "gemini_events")
+            return result
 
         def diff():
             try:
@@ -1699,7 +1861,7 @@ def execute(args, prompt, run_dir):
                 return {"diff_status": "skipped", "diff_reason": str(error)[:300]}
 
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
-        resumable = lambda tid: tid if args.sandbox != "read-only" else args.resume
+        resumable = lambda tid: tid if gemini or args.sandbox != "read-only" else args.resume
         prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
         thread_id = args.resume
         attempt = 0
@@ -1707,15 +1869,23 @@ def execute(args, prompt, run_dir):
         report_only = False
         while True:
             attempt += 1
-            runner_event(run_dir, attempt, "router_check", last_error_kind)
-            if not router_reachable():
+            if not gemini:
+                runner_event(run_dir, attempt, "router_check", last_error_kind)
+            if not gemini and not router_reachable():
                 state = {"end_reason": "router_down", "error": "Local model router is not reachable", "thread_id": thread_id}
                 kind, retryable = "router_down", True
+                if baseline is not None and baseline != fallback_snapshot():
+                    baseline = None
             else:
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
-                runner_event(run_dir, attempt, "codex_running", last_error_kind)
+                runner_event(run_dir, attempt, "gemini_running" if gemini else "codex_running", last_error_kind)
                 state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard)
-                followup_thread = thread_id if args.sandbox == "read-only" else state["thread_id"]
+                if baseline is not None and (not state.get("fallback_stream_safe") or state["file_changes"] or
+                                             baseline != fallback_snapshot()):
+                    baseline = None
+                followup_thread = resumable(state["thread_id"])
+                if not gemini and args.sandbox == "read-only":
+                    followup_thread = thread_id
                 thread_id = state["thread_id"]
                 event_changes += state["file_changes"]
                 if state.get("repeat_block") and not report_only and followup_thread:
@@ -1735,44 +1905,54 @@ def execute(args, prompt, run_dir):
                     break
                 kind, retryable = classify(state, run_dir)
             last_error_kind = kind
-            # Read-only runs are ephemeral and safe to restart. A writer that started a thread must resume it.
+            # Codex read-only runs are ephemeral. Gemini resumes any conversation it started.
             can_retry = (not report_only and retryable and attempt <= args.retries and
                          (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
+                error = state.get("error") or ""
+                if baseline is not None and (
+                        kind in ("router_down", "model_refused", "upstream_rejected", "transient", "reconnect_timeout") or
+                        (kind == "permanent" and (PROVIDER_PERMANENT.search(error) or "quota" in error.lower()))):
+                    base["fallback_safe"] = True
                 runner_event(run_dir, attempt, "finalizing", kind)
                 return finish({**base, "status": "failed", "error_kind": kind, "error": state.get("error"), "retryable": retryable,
-                        "attempts": attempt, "thread_id": resumable(thread_id), "duration_s": round(time.time() - started, 1),
+                        "attempts": attempt, id_field: resumable(thread_id), "duration_s": round(time.time() - started, 1),
                         **changes(), **diff(), "repeat_guard": repeat_guard.summary()})
             delay = min(60, args.backoff * 3 ** (attempt - 1)) * random.uniform(0.8, 1.2)
             runner_event(run_dir, attempt, "retry_wait", kind, time.time() + delay)
             time.sleep(delay)
-            if thread_id and args.sandbox != "read-only" and kind != "router_down" and state["prompt_delivered"]:
+            if thread_id and (gemini or args.sandbox != "read-only") and kind != "router_down" and state["prompt_delivered"]:
                 prompt = ("The previous attempt was interrupted. Inspect the current state of the workspace, "
                           "then finish the original task without repeating completed work.")
-            elif args.sandbox == "read-only" and kind != "router_down":
+            elif not gemini and args.sandbox == "read-only" and kind != "router_down":
                 thread_id = None
 
         runner_event(run_dir, attempt, "finalizing", last_error_kind)
         message_file = run_dir / "last_message.txt"
+        if gemini and state["last_text"] is not None:
+            message_file.write_text(state["last_text"], encoding="utf-8", errors="replace")
         final = message_file.read_text("utf-8", "replace").strip() if message_file.exists() else ""
         final = final or state["last_text"] or ""
-        result = {**base, "status": "completed", "attempts": attempt, "thread_id": resumable(thread_id),
+        result = {**base, "status": "completed", "attempts": attempt, id_field: resumable(thread_id),
                   "final_message": final[:8000],
                   "truncated": len(final) > 8000, "usage": state["usage"], "commands_run": state["commands"],
                   "forced_exit": state["forced_exit"], "duration_s": round(time.time() - started, 1), **changes(), **diff(),
                   "repeat_guard": repeat_guard.summary()}
-        if resumed:
+        if resumed and not gemini:
             result["usage_scope"] = "thread_total"  # exec resume reports the whole thread's cumulative usage
         if args.schema:
             try:
                 report, repaired = parse_final_message(final)
+                if gemini and not valid_report(report):
+                    raise ValueError("Final message does not match the task report schema")
                 result["structured"] = report
                 if repaired:
                     result["final_message_repaired"] = repaired
             except ValueError as error:
-                detail = f": {error.msg} (line {error.lineno}, column {error.colno})" if isinstance(error, json.JSONDecodeError) else ""
-                result.update(status="failed", error_kind="schema_invalid", error="Final message is not valid JSON" + detail,
-                              retryable=False)
+                message = str(error) if gemini and not isinstance(error, json.JSONDecodeError) else "Final message is not valid JSON"
+                if isinstance(error, json.JSONDecodeError):
+                    message += f": {error.msg} (line {error.lineno}, column {error.colno})"
+                result.update(status="failed", error_kind="schema_invalid", error=message, retryable=False)
         return finish(result)
     finally:
         for lock in reversed(locks):
@@ -1813,13 +1993,17 @@ def select_ab_model(job_id, models, share):
 def add_task_arguments(p):
     p.add_argument("--context-json", action="store_true", help="Read a prompt/context JSON envelope from stdin")
     p.add_argument("--cwd", required=True)
+    p.add_argument("--engine", choices=("codex", "gemini"), default="codex")
+    p.add_argument("--agy-command", help="Antigravity executable for Gemini")
+    p.add_argument("--agy-proxy", help="Proxy for Antigravity")
+    p.add_argument("--gemini-fallback-check", action="store_true", help="Check whether a failed Codex task left its worktree untouched")
     # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
     p.add_argument("--model", help="Model override; omitted keeps the Codex config default")
     p.add_argument("--effort", help="Reasoning effort override; omitted keeps the Codex config default")
     p.add_argument("--service-tier", help='Codex service tier, e.g. "fast" for Fast mode; omitted keeps the config value')
     p.add_argument("--schema")
-    p.add_argument("--resume", help="Continue an existing thread id")
+    p.add_argument("--resume", help="Continue a Codex thread or Gemini conversation by provider ID")
     p.add_argument("--scope", action="append",
                    help="File or directory (relative to --cwd) to snapshot when cwd is too big to walk; repeatable")
     p.add_argument("--writable-root", dest="writable_roots", action="append",
@@ -1911,7 +2095,8 @@ def last_activity(events):
 
 def task_context(value):
     fields = {"owner", "task", "acceptance", "write"}
-    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - {"continuation", "dispatcher", "verification_of", "routing", "must_verify"}:
+    optional = {"continuation", "dispatcher", "verification_of", "fallback_of", "routing", "must_verify"}
+    if not isinstance(value, dict) or not fields <= set(value) or set(value) - fields - optional:
         raise ValueError("context must contain owner, task, acceptance and write")
     if value["owner"] is not None and (not isinstance(value["owner"], str) or not value["owner"].strip()):
         raise ValueError("context.owner must be a nonempty string or null")
@@ -1925,13 +2110,15 @@ def task_context(value):
     if "must_verify" in value and (not isinstance(value["must_verify"], list) or any(
             type(index) is not int or not 1 <= index <= len(value["acceptance"]) for index in value["must_verify"])):
         raise ValueError("context.must_verify must be a list of 1-based acceptance indices")
-    if "verification_of" in value:
-        if not isinstance(value["verification_of"], str):
-            raise ValueError("context.verification_of must be a job identifier")
+    for field in ("verification_of", "fallback_of"):
+        if field not in value:
+            continue
+        if not isinstance(value[field], str):
+            raise ValueError(f"context.{field} must be a job identifier")
         try:
-            job_identifier(value["verification_of"])
+            job_identifier(value[field])
         except argparse.ArgumentTypeError as e:
-            raise ValueError("context.verification_of: " + str(e)) from e
+            raise ValueError(f"context.{field}: {e}") from e
     # routing: how the plugin dispatched this job (fresh/resume, parent thread, verify_previous), for later analysis.
     if "routing" in value and (not isinstance(value["routing"], dict) or any(
             not isinstance(k, str) or not (v is None or isinstance(v, (str, int, bool)) or
@@ -2031,21 +2218,31 @@ def job_repeat_guard(job_dir, *, blocking=True):
     return {"blocks": [], "standing": []}
 
 
-def job_metadata(job_dir, task=None, finished_at=None, thread_id=None, *, resolve=None):
+def task_options(task):
+    options = {"writable_roots": task.get("writable_roots"),
+               "use_user_config": task.get("use_user_config", False), "effort": task.get("effort")}
+    options.update({key: task[key] for key in ("model", "service_tier") if task.get(key) is not None})
+    if task.get("engine") == "gemini":
+        options.update(engine="gemini", model=task.get("model"))
+        options.pop("service_tier", None)
+    return options
+
+
+def job_metadata(job_dir, task=None, finished_at=None, thread_id=None, *, conversation_id=None, resolve=None):
     resolve = resolve or os.path.realpath
     task = task_record(job_dir) if task is None else task
     meta = {"context": task.get("context"), "sandbox": task.get("sandbox"), "scope": task.get("scope")}
-    meta["task_options"] = {"writable_roots": task.get("writable_roots"),
-                            "use_user_config": task.get("use_user_config", False), "effort": task.get("effort")}
-    meta["task_options"].update({k: task[k] for k in ("model", "service_tier") if task.get(k) is not None})
+    meta["task_options"] = task_options(task)
     if task.get("cwd"):
         meta["cwd"] = resolve(local_path(task["cwd"]))
         if task.get("scope"):
             meta.update(scope=task["scope"], scope_paths=[scope_path(meta["cwd"], s, resolve=resolve) for s in task["scope"]])
-    thread = thread_id or task.get("resume")
-    if not thread_id and task.get("sandbox") and task["sandbox"] != "read-only":
-        thread = started_thread(job_dir / "events.jsonl") or thread
-    meta["thread_id"] = thread
+    gemini = task.get("engine") == "gemini"
+    id_field = "conversation_id" if gemini else "thread_id"
+    provider_id = conversation_id if gemini else thread_id
+    if not provider_id and (gemini or task.get("sandbox") not in (None, "read-only")):
+        provider_id = started_thread(job_dir / "events.jsonl", id_field)
+    meta[id_field] = provider_id or task.get("resume")
     args_file = job_dir / "args.json"
     if finished_at is not None and args_file.exists():
         meta["duration_s"] = round(max(0, finished_at - args_file.stat().st_mtime), 1)
@@ -2364,7 +2561,8 @@ def runner_activity(events):
 def enriched_status(job_id, job_dir, value, record=None):
     finished = (job_dir / "result.json").stat().st_mtime if (job_dir / "result.json").exists() else None
     metadata = record["metadata"] if record is not None else job_metadata(job_dir, finished_at=finished,
-                                                                         thread_id=value.get("thread_id"))
+                                                                         thread_id=value.get("thread_id"),
+                                                                         conversation_id=value.get("conversation_id"))
     result = {**metadata, **diff_fields(job_dir), **value, "job_id": job_id}
     if finished is None and "repeat_guard" not in result:
         result["repeat_guard"] = job_repeat_guard(job_dir)
@@ -2372,7 +2570,7 @@ def enriched_status(job_id, job_dir, value, record=None):
     args_file = job_dir / "args.json"
     result.setdefault("started_at", args_file.stat().st_mtime if args_file.exists() else None)
     result.setdefault("finished_at", finished)
-    for key in ("model", "service_tier"):
+    for key in ("engine", "model", "service_tier"):
         if key in metadata["task_options"]:
             result["task_options"] = {**result["task_options"], key: metadata["task_options"][key]}
     result.update(review_summary(result))
@@ -2478,7 +2676,7 @@ def job_status(job_id, record=None, *, lost_after=LOST_AFTER):
             reconcile_lost_executor(job_dir, result, record["task"] if record is not None else None, lost_after)
         if result.exists():
             return enriched_status(job_id, job_dir, json.loads(result.read_text("utf-8")), record)
-        if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < 5:
+        if not pid_file.exists() and time.time() - job_dir.stat().st_ctime < WORKER_START_GRACE_SECONDS:
             return enriched_status(job_id, job_dir, {"status": "running", "seconds_since_last_event": None}, record)
         return enriched_status(job_id, job_dir, worker_died(job_id, job_dir, record["task"] if record else None), record)
     except (OSError, ValueError, TypeError) as e:
@@ -2576,7 +2774,8 @@ def matching_jobs(args, *, page_dates=None):
             try:
                 record["metadata"] = job_metadata(job_dir, task=record["task"],
                                                  finished_at=result_file.stat().st_mtime if result_file.exists() else None,
-                                                 thread_id=value.get("thread_id"), resolve=resolve)
+                                                 thread_id=value.get("thread_id"),
+                                                 conversation_id=value.get("conversation_id"), resolve=resolve)
                 value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
             except (OSError, ValueError, TypeError):
                 record = None
@@ -2584,9 +2783,9 @@ def matching_jobs(args, *, page_dates=None):
                 value["_details"] = dict(value)
                 if not matches_metadata(value, job_dir.name):
                     continue
-        context = value.get("context")
-        parent = ((context or {}).get("continuation", {}).get("parent_job_id") or
-                  (context or {}).get("routing", {}).get("parent_job_id"))
+        context = value.get("context") or {}
+        parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
+                  context.get("routing", {}).get("parent_job_id"))
         if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
             continue
         if getattr(args, "parent_job", None) and parent != args.parent_job:
@@ -2638,16 +2837,17 @@ def list_jobs(args):
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
               "last_error_kind", "retry_at")
-    page = [{**{k: j.get(k) for k in fields},
+    page = [{**{k: j.get(k) for k in fields if k != "thread_id" or "conversation_id" not in j},
              "context": {"owner": j["context"].get("owner"),
                          **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
                          "task": j["context"]["task"].strip().splitlines()[0][:160],
                          **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
-                         **({"verification_of": j["context"]["verification_of"]} if "verification_of" in j["context"] else {})}
+                         **{key: j["context"][key] for key in ("verification_of", "fallback_of") if key in j["context"]}}
              if j.get("context") else None,
              **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
              **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
-             **{k: j[k] for k in ("diff_status", "diff_files", "rolled_back_at", "verification_version", "verification_scope") if k in j},
+             **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
+                                  "verification_version", "verification_scope") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     if predispatch is not None:
@@ -2950,20 +3150,22 @@ def worker_died(job_id, job_dir, task=None):
             task = json.loads((job_dir / "args.json").read_text("utf-8"))
         except (OSError, ValueError):
             task = {}
-    thread = task.get("resume")
-    if task.get("sandbox") != "read-only":
-        thread = started_thread(job_dir / "events.jsonl") or thread
+    gemini = task.get("engine") == "gemini"
+    id_field = "conversation_id" if gemini else "thread_id"
+    provider_id = task.get("resume")
+    if gemini or task.get("sandbox") != "read-only":
+        provider_id = started_thread(job_dir / "events.jsonl", id_field) or provider_id
     result = {"job_id": job_id, "status": "failed", "error_kind": "worker_died", "retryable": True,
               "error": "The runner worker exited without writing a result (WSL restart or crash).",
-              "sandbox": task.get("sandbox"), "thread_id": thread, "log_dir": str(job_dir)}
+              "sandbox": task.get("sandbox"), id_field: provider_id, "log_dir": str(job_dir)}
     pid = recorded_pid(job_dir / "codex.pid")
     if pid is not None:
-        result.update(residual_codex_pid=pid, retryable=False)
-        result["error"] += f" Codex PID {pid} is still present. Do not retry until the residual process is stopped."
+        result.update({"residual_provider_pid" if gemini else "residual_codex_pid": pid}, retryable=False)
+        result["error"] += f" {'Gemini' if gemini else 'Codex'} PID {pid} is still present. Do not retry until the residual process is stopped."
     return result
 
 
-def started_thread(events):
+def started_thread(events, id_field="thread_id"):
     try:
         with open(events, "rb") as f:
             for raw in f:
@@ -2971,14 +3173,108 @@ def started_thread(events):
                     ev = json.loads(raw)
                 except ValueError:
                     continue
-                if isinstance(ev, dict) and ev.get("type") == "thread.started" and ev.get("thread_id"):
-                    return ev["thread_id"]
+                if isinstance(ev, dict) and ev.get("type") == "thread.started" and ev.get(id_field):
+                    return ev[id_field]
     except OSError:
         pass
     return None
 
 
+def gemini_admission(args):
+    context = getattr(args, "context", None) or {}
+    parent = context.get("fallback_of")
+    owner = context.get("owner")
+    if parent:
+        try:
+            source_dir = job_directory(parent)
+            source = task_record(source_dir)
+            result = json.loads((source_dir / "result.json").read_text("utf-8"))
+            authorized = (source.get("engine", "codex") == "codex" and owner and
+                          (source.get("context") or {}).get("owner") == owner and
+                          result.get("status") == "failed" and result.get("fallback_safe") is True)
+        except (OSError, ValueError, AttributeError):
+            authorized = False
+        if not authorized:
+            return {"status": "failed", "error_kind": "invalid_fallback", "retryable": False,
+                    "error": "fallback_of must identify a fallback-safe failed Codex job owned by this task's owner."}
+
+    limit = args.max_engine_running
+    if not (parent or limit):
+        return None
+    running = 0
+    for job_dir in job_directories():
+        try:
+            task = task_record(job_dir)
+            if task.get("engine") != "gemini":
+                continue
+            prior = task.get("context") or {}
+            if parent and prior.get("fallback_of") == parent and prior.get("owner") == owner:
+                child = job_status(job_dir.name)
+                if child.get("error_kind") != "worker_start_failed":
+                    return {"job_id": job_dir.name, "status": child["status"], "deduplicated": True}
+            if limit:
+                worker_pid = job_dir / "worker.pid"
+                worker_active = not (job_dir / "result.json").exists() and (
+                    (not worker_pid.exists() and time.time() - job_dir.stat().st_ctime < LOST_AFTER)
+                    or recorded_pid(worker_pid) is not None)
+                if worker_active or recorded_pid(job_dir / "codex.pid") is not None:
+                    running += 1
+        except (OSError, ValueError):
+            continue
+    if limit and running >= limit:
+        return {"status": "failed", "error_kind": "engine_limit", "retryable": True,
+                "error": f"Gemini already has {running} active jobs (limit {limit})."}
+    return None
+
+
+def start_job(args, prompt):
+    job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+    if args.engine == "codex" and args.model_ab is not None:
+        args.model = select_ab_model(job_id, *args.model_ab)
+        args.context["routing"] = {**args.context.get("routing", {}), "ab": True, "model": args.model}
+    job_dir = HOME / "jobs" / job_id
+    job_dir.mkdir(parents=True)
+    (job_dir / "prompt.txt").write_text(prompt, "utf-8")
+    task = {k: v for k, v in vars(args).items() if k not in ("command", "model_ab")}
+    (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
+    # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
+    boot = boot_id()
+    if boot:
+        (job_dir / "boot_id").write_text(boot)
+    # Windows cannot replace a PID file while another publisher is replacing it.
+    with acquire_file_lock(job_dir / "process.lock", blocking=True):
+        try:
+            worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
+                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                      creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
+                                      start_new_session=not IS_WIN, close_fds=True)
+        except OSError as error:
+            if args.engine != "gemini":
+                raise
+            failure = {**job_metadata(job_dir, task=task), "status": "failed", "error_kind": "worker_start_failed",
+                       "error": f"Could not start Gemini worker: {error}", "retryable": True, "attempts": 0}
+            write_result(job_dir, failure)
+            return {"job_id": job_id, **failure}
+        record_pid(job_dir / "worker.pid", worker.pid)
+    return {"job_id": job_id, "status": "running"}
+
+
 PRUNE_TTL = 30 * 86400
+
+
+def keep_fallback_child(job_dir, result=None):
+    with suppress(OSError, ValueError):
+        task = task_record(job_dir)
+        parent = (task.get("context") or {}).get("fallback_of")
+        if task.get("engine") != "gemini" or not parent or parent == job_dir.name or not job_directory(parent).is_dir():
+            return False
+        if result is None:
+            record = job_dir / "result.json"
+            if not record.is_file():
+                return True
+            result = json.loads(record.read_text("utf-8"))
+        return isinstance(result, dict) and result.get("error_kind") != "worker_start_failed"
+    return False
 
 
 def prune_old(subdir):
@@ -2998,7 +3294,7 @@ def prune_old(subdir):
                 expired = result.stat().st_mtime < cutoff
             else:
                 expired = max(p.stat().st_mtime for p in [d, *d.rglob("*")]) < cutoff
-            if expired:
+            if expired and not (subdir == "jobs" and keep_fallback_child(d)):
                 shutil.rmtree(d, ignore_errors=True)
         except (OSError, ValueError):
             pass
@@ -3032,6 +3328,8 @@ def prune_storage(max_storage_mb, keep=()):
                     continue
                 value = json.loads(result.read_text("utf-8"))
                 if not isinstance(value, dict) or value.get("status") not in ("completed", "failed", "cancelled"):
+                    continue
+                if root.name == "jobs" and keep_fallback_child(d, value):
                     continue
                 if any(recorded_pid(d / name) is not None for name in ("worker.pid", "codex.pid")):
                     continue
@@ -3109,6 +3407,7 @@ def main():
     start = sub.add_parser("start")
     add_task_arguments(start)
     start.add_argument("--model-ab", type=parse_model_ab, help="Assign a fresh job by job ID using [models, share]")
+    start.add_argument("--max-engine-running", type=positive_int, help="Limit active Gemini jobs under the runner home")
     status = sub.add_parser("status")
     status.add_argument("job_id", type=job_identifier)
     status.add_argument("--wait", type=float, default=0)
@@ -3237,18 +3536,28 @@ def main():
     if args.command in ("run", "start"):
         args.cwd = os.path.realpath(local_path(args.cwd))
         prompt = read_task_input(args, parser)
-        if getattr(args, "model_ab", None) is not None:
-            context = getattr(args, "context", None)
+        context = getattr(args, "context", None) or {}
+        fallback_of = context.get("fallback_of")
+        if fallback_of and (args.command != "start" or args.engine != "gemini" or args.resume or
+                            (context.get("continuation") or {}).get("parent_job_id", fallback_of) != fallback_of):
+            parser.error("fallback_of requires a fresh Gemini start linked to the same parent")
+        if args.engine == "gemini":
+            if not args.agy_command:
+                parser.error("--engine gemini requires --agy-command")
+            if args.gemini_fallback_check:
+                parser.error("--gemini-fallback-check is for Codex")
+        elif args.agy_command or args.agy_proxy or getattr(args, "max_engine_running", None):
+            parser.error("--agy-command, --agy-proxy and --max-engine-running require --engine gemini")
+        if args.engine == "codex" and getattr(args, "model_ab", None) is not None:
             if not context or args.model is not None or args.resume or context.get("continuation") or context.get("verification_of"):
                 parser.error("--model-ab requires a new contextual task without a model override")
         if args.command == "start" or args.max_storage_mb is not None:
             prune_old("jobs")
             prune_old("runs")
             prune_diff_index()
-        if args.max_storage_mb is not None:
-            context = getattr(args, "context", None) or {}
-            prune_storage(args.max_storage_mb, {context.get("verification_of"),
-                                                (context.get("continuation") or {}).get("parent_job_id")})
+        keep = {fallback_of, context.get("verification_of"), (context.get("continuation") or {}).get("parent_job_id")}
+        if args.max_storage_mb is not None and (args.command != "start" or args.engine != "gemini"):
+            prune_storage(args.max_storage_mb, keep)
 
     if args.command == "run":
         run_dir = HOME / "runs" / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
@@ -3269,27 +3578,18 @@ def main():
         sys.exit(0 if result["status"] == "completed" else 1)
 
     if args.command == "start":
-        job_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-        if args.model_ab is not None:
-            args.model = select_ab_model(job_id, *args.model_ab)
-            args.context["routing"] = {**args.context.get("routing", {}), "ab": True, "model": args.model}
-        job_dir = HOME / "jobs" / job_id
-        job_dir.mkdir(parents=True)
-        (job_dir / "prompt.txt").write_text(prompt, "utf-8")
-        task = {k: v for k, v in vars(args).items() if k not in ("command", "model_ab")}
-        (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
-        # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
-        boot = boot_id()
-        if boot:
-            (job_dir / "boot_id").write_text(boot)
-        # Windows cannot replace a PID file while another publisher is replacing it.
-        with acquire_file_lock(job_dir / "process.lock", blocking=True):
-            worker = subprocess.Popen([sys.executable, os.path.abspath(__file__), "_worker", job_id],
-                                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                      creationflags=(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP) if IS_WIN else 0,
-                                      start_new_session=not IS_WIN, close_fds=True)
-            record_pid(job_dir / "worker.pid", worker.pid)
-        emit({"job_id": job_id, "status": "running"})
+        if args.engine == "gemini":
+            locks = HOME / "locks"
+            locks.mkdir(parents=True, exist_ok=True)
+            with acquire_file_lock(locks / "gemini-start.lock", blocking=True):
+                result = gemini_admission(args)
+                if result is None:
+                    if args.max_storage_mb is not None:
+                        prune_storage(args.max_storage_mb, keep)
+                    result = start_job(args, prompt)
+        else:
+            result = start_job(args, prompt)
+        emit(result)
         return
 
     if args.command == "_worker":
@@ -3303,7 +3603,8 @@ def main():
         except Exception as e:
             result = {"status": "failed", "error_kind": "runner_error", "error": repr(e), "retryable": False}
         try:
-            result = {**job_metadata(job_dir, thread_id=result.get("thread_id")), **result}
+            result = {**job_metadata(job_dir, thread_id=result.get("thread_id"),
+                                     conversation_id=result.get("conversation_id")), **result}
             result.update(review_summary(result))
             write_result(job_dir, result)
         except Exception as e:
@@ -3311,7 +3612,7 @@ def main():
             write_result(job_dir, {
                 "status": "failed", "error_kind": "runner_error", "retryable": False, "log_dir": str(job_dir),
                 "error": f"Saving the result failed after execution ended as {result.get('status')!r}: {repr(e)[:500]}",
-                **({"thread_id": result["thread_id"]} if result.get("thread_id") else {})})
+                **{key: result[key] for key in ("thread_id", "conversation_id") if result.get(key)}})
         return
 
     if args.command == "status":
@@ -3340,6 +3641,16 @@ def main():
             if (job_dir / "result.json").exists():
                 emit(job_status(args.job_id))
                 return
+            task = {}
+            with suppress(OSError, ValueError):
+                task = task_record(job_dir)
+            if task.get("engine") == "gemini" and windows_agy(task.get("agy_command")):
+                phase = runner_activity(job_dir / "events.jsonl")["phase"]
+                if phase not in (None, "lock_wait") or (job_dir / "codex.pid").exists():
+                    if not confirm_agy_stopped(job_dir):
+                        emit({"job_id": args.job_id, "status": "monitor_failed", "error_kind": "cancel_unconfirmed",
+                              "error": "The Windows Gemini process tree has not confirmed termination.", "retryable": True})
+                        return
             # With a diff to finish, hold admission: the killed worker frees its write locks, and a queued writer
             # must not change the tree before the final tree is recorded.
             (HOME / "locks").mkdir(parents=True, exist_ok=True)

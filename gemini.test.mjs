@@ -27,14 +27,14 @@ const done = (child, code = 0, result = { status: 'SUCCESS', response: '已写�
 };
 
 // action({ child, cwd, output }) plays agy; the default writes the chapter and succeeds.
-function fixture(t, action) {
+function fixture(t, action, cfg = CFG) {
   const cwd = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-gemini-')));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   writeFileSync(path.join(cwd, 'notes.md'), '素材事实：每章只说明一个操作。');
   const spawns = [];
-  const launch = (_command, _argv, options) => {
+  const launch = (_command, argv, options) => {
     const child = new EventEmitter();
-    Object.assign(child, { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    Object.assign(child, { argv, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
       kill() { setImmediate(() => this.emit('close', null)); return true; } });
     spawns.push(child);
     child.stdin.resume();
@@ -46,8 +46,18 @@ function fixture(t, action) {
     return child;
   };
   return { cwd, spawns, output: path.join(cwd, 'chapter.md'),
-    execute: (args = {}, options = {}) => geminiWrite(CFG, { ...WRITING, cwd, ...args }, conductor, options, launch) };
+    execute: (args = {}, options = {}) => geminiWrite(cfg, { ...WRITING, cwd, ...args }, conductor, options, launch) };
 }
+
+test('gemini_write passes --effort only when an effort is configured', async (t) => {
+  for (const [effort, expected] of [['low', 'low'], ['', undefined]]) await t.test(effort || 'unset', async (t) => {
+    const h = fixture(t, undefined, { ...CFG, model: 'gemini-4-carbon-high', effort });
+    assert.equal((await h.execute()).status, 'completed');
+    const { argv } = h.spawns[0];
+    assert.equal(argv[argv.indexOf('--model') + 1], 'gemini-4-carbon-high');
+    assert.equal(argv.includes('--effort') ? argv[argv.indexOf('--effort') + 1] : undefined, expected);
+  });
+});
 
 test('an existing target that agy leaves untouched is neither completed nor saved as a draft', async (t) => {
   for (const [name, action] of [['success without writing', ({ child }) => done(child)],

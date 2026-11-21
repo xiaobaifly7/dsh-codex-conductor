@@ -176,6 +176,24 @@ FAKE_CODEX = textwrap.dedent(r"""
         say(type="turn.failed", error={"message": '{"error":{"code":null,"message":"Codex: Bad Request",'
                                                   '"param":null,"type":"invalid_request_error"}}'})
         sys.exit(1)
+    elif mode == "fallback_stderr":
+        print("connection reset", file=sys.stderr)
+        sys.exit(1)
+    elif mode in ("fallback_event", "fallback_retry_write", "fallback_local_error", "fallback_unreported_file"):
+        if mode == "fallback_unreported_file":
+            Path("real-change.txt").write_text("changed")
+        if mode == "fallback_event":
+            say(type="item.updated", item={"type": "file_change", "changes": [{"path": "rewritten.txt"}]})
+        if mode == "fallback_retry_write":
+            target = Path(".git/ignored-change")
+            if calls == 0:
+                target.write_text("first attempt")
+                say(type="turn.failed", error={"message": "connection reset"})
+                sys.exit(1)
+            target.unlink()
+        error = "unrecognized setting" if mode == "fallback_local_error" else "This content was flagged for example risk"
+        say(type="turn.failed", error={"message": error})
+        sys.exit(1)
     elif mode == "retry_notice_then_ok":
         say(type="error", message="Reconnecting... 1/5")
         finish()
@@ -217,6 +235,40 @@ FAKE_CODEX = textwrap.dedent(r"""
 """)
 
 
+FAKE_AGY = textwrap.dedent(r"""
+    import json, os, sys, time
+    from pathlib import Path
+
+    def say(**event):
+        print(json.dumps(event), flush=True)
+
+    argv = sys.argv[1:]
+    mode = os.environ["FAKE_AGY_MODE"]
+    request = json.loads(sys.stdin.readline())
+    conversation = argv[argv.index("--conversation") + 1] if "--conversation" in argv else "agy-conversation-1"
+    assert request["event"] == "user"
+    say(event="init", conversation_id=conversation)
+    Path(os.environ["FAKE_AGY_CALL"]).write_text(json.dumps({
+        "argv": argv, "prompt": request["message"]["content"], "proxy": os.environ.get("HTTPS_PROXY"),
+        "pid": os.getpid(),
+    }), encoding="utf-8")
+    if mode == "hang":
+        time.sleep(300)
+    if mode == "deny":
+        print("command blocked by permissions", file=sys.stderr, flush=True)
+    if mode in ("provider_error", "stderr_error"):
+        error = json.loads(os.environ["FAKE_AGY_ERROR"])
+        if mode == "stderr_error":
+            print(error if isinstance(error, str) else json.dumps(error), file=sys.stderr, flush=True)
+        else:
+            say(event="result", result={"status": "ERROR", "error": error})
+        sys.exit(1)
+    report = json.loads(os.environ["FAKE_AGY_REPORT"])
+    say(event="result", result={"status": "SUCCESS", "structured_output": report,
+                                "conversation_id": conversation, "usage": {"input_tokens": 5}})
+""")
+
+
 def alive(pid):
     if os.name != "nt":
         try:
@@ -243,7 +295,8 @@ class RunnerTests(unittest.TestCase):
         self.cwd.mkdir()
         (root / "isolated-codex-home").mkdir()
         self.env = dict(os.environ, CODEX_RUNNER_HOME=str(root / "home"), FAKE_STATE=str(self.state),
-                        CODEX_RUNNER_CMD=json.dumps([sys.executable, "-B", str(self.fake)]), CODEX_RUNNER_ROUTER_URL="",
+                        CODEX_RUNNER_CMD=json.dumps([sys.executable, "-B", str(self.fake)]),
+                        CODEX_RUNNER_ROUTER_URL="", CODEX_RUNNER_ROUTE_URL="",
                         CODEX_HOME=str(root / "isolated-codex-home"), PYTHONDONTWRITEBYTECODE="1")
         environment = mock.patch.dict(os.environ, self.env)
         environment.start()
@@ -2538,6 +2591,536 @@ class RunnerTests(unittest.TestCase):
     def sample_report(self, **fields):
         return {"summary": "done", "criteria": [{"criterion": "Criterion one", "status": "met", "evidence": "checked"}],
                 "files_changed": [], "deviations": [], "unresolved": [], **fields}
+
+    def fake_gemini(self, mode="finish", report=None):
+        fake = Path(self.tmp.name) / "fake-agy"
+        if not fake.exists():
+            fake.write_text(f"#!{sys.executable}\n{FAKE_AGY}", encoding="utf-8")
+            fake.chmod(0o700)
+        call = fake.with_suffix(".json")
+        schema = RUNNER.parents[1] / "report.v2.schema.json"
+        return (
+            ("--engine", "gemini", "--agy-command", str(fake), "--schema", str(schema)),
+            {"FAKE_AGY_MODE": mode, "FAKE_AGY_REPORT": json.dumps(self.sample_report() if report is None else report),
+             "FAKE_AGY_CALL": str(call), "CODEX_RUNNER_ROUTER_URL": "http://unused:invalid-port"},
+            call,
+        )
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_report_metadata_output_and_resume(self):
+        argv, env, call = self.fake_gemini()
+        prompt = '核对 `%PATH%`、引号和换行\n第二行'
+        start = self.invoke(*argv, "--model", "gemini-test", "--effort", "high", "--agy-proxy", "http://unused.invalid:8080",
+                            "--model-ab", '[["codex-a","codex-b"],1]', command="start", prompt=prompt, env=env)
+        result = self.control("status", start["job_id"], "--wait", "10")
+        conversation = result["conversation_id"]
+        self.assertEqual((result["status"], result["report_status"], result["sandbox"], conversation),
+                         ("completed", "valid", "read-only", "agy-conversation-1"))
+        self.assertEqual(result["structured"], self.sample_report())
+        self.assertEqual(result["usage"], {"input_tokens": 5})
+        self.assertNotIn("thread_id", result)
+        self.assertEqual({key: result["task_options"][key] for key in ("engine", "model", "effort")},
+                         {"engine": "gemini", "model": "gemini-test", "effort": "high"})
+        received = json.loads(call.read_text("utf-8"))
+        self.assertEqual((received["prompt"], received["proxy"]), (prompt, "http://unused.invalid:8080"))
+        self.assertIn("gemini-test", received["argv"])
+        self.assertFalse(set(("codex-a", "codex-b", "exec", "--ephemeral")) & set(received["argv"]))
+        self.assertEqual(self.calls(), [])
+        report = self.control("output", start["job_id"], "--artifact", "report")
+        self.assertEqual(json.loads(report["text"]), self.sample_report())
+        events = self.control("output", start["job_id"], "--artifact", "events")["text"]
+        self.assertNotIn("thread_id", events)
+        self.assertNotIn("router_check", events)
+        self.assertEqual(self.control("list", "--thread-id", conversation)["total"], 0)
+        self.assertEqual(self.control("list", "--job-id", start["job_id"])["jobs"][0]["conversation_id"], conversation)
+        resumed = self.invoke(*argv, "--resume", conversation, env=env)
+        self.assertEqual((resumed["status"], resumed["conversation_id"]), ("completed", conversation))
+        resumed_argv = json.loads(call.read_text("utf-8"))["argv"]
+        self.assertEqual(resumed_argv[resumed_argv.index("--conversation") + 1], conversation)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_invalid_report_and_soft_denial(self):
+        argv, env, call = self.fake_gemini(report={"summary": "incorrect format"})
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["report_status"]),
+                         ("failed", "schema_invalid", "invalid"))
+        denial = self.invoke(*argv, env={**env, "FAKE_AGY_MODE": "deny"})
+        self.assertEqual((denial["status"], denial["error_kind"], denial["retryable"], denial["attempts"]),
+                         ("failed", "permission_denied", False, 1))
+        self.assertIn("agy permission denied", denial["error"])
+        self.assertNotIn("structured", denial)
+        call.unlink()
+        unsafe = self.invoke(*argv, "--writable-root", str(self.cwd.parent), env=env)
+        self.assertEqual(unsafe["error_kind"], "bad_arguments")
+        self.assertFalse(call.exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_read_only_verification_runs_in_project_without_codex_scratch(self):
+        argv, env, call = self.fake_gemini()
+        context = {**self.sample_context(), "write": False, "verification_of": "original"}
+        result = self.invoke(*argv, "--context-json", env=env,
+                             prompt=json.dumps({"prompt": "survey the project", "context": context}))
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["context"], context)
+        self.assertEqual(json.loads(call.read_text("utf-8"))["prompt"], "survey the project")
+        self.assertFalse((Path(result["log_dir"]) / "scratch").exists())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_parallel_start_limit_and_cancellation(self):
+        argv, env, call = self.fake_gemini(mode="hang")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            requests = [pool.submit(self.invoke, *argv, "--max-engine-running", "1", command="start", env=env)
+                        for _ in range(2)]
+            started, limited = sorted((request.result() for request in requests), key=lambda result: result["status"], reverse=True)
+        self.assertEqual(started["status"], "running")
+        self.assertEqual((limited["error_kind"], limited["retryable"]), ("engine_limit", True))
+        self.wait_for(call.exists)
+        self.wait_for(lambda: (self.control("status", started["job_id"]).get("conversation_id") == "agy-conversation-1"))
+        pid = json.loads(call.read_text("utf-8"))["pid"]
+        cancelled = self.control("cancel", started["job_id"])
+        self.assertEqual((cancelled["status"], cancelled["conversation_id"]), ("cancelled", "agy-conversation-1"))
+        self.assertNotIn("thread_id", cancelled)
+        self.wait_for(lambda: not alive(pid))
+
+    def test_gemini_windows_cancel_requires_adapter_confirmation(self):
+        import agy_runner
+        import codex_runner
+
+        job = self.stored_job("windows", None, engine="gemini", agy_command=r"C:\test\agy.exe")
+        codex_runner.runner_event(job, 1, "gemini_running")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(sys, "argv", [str(RUNNER), "cancel", job.name]), \
+                mock.patch.object(agy_runner, "cancel", side_effect=[False, True], create=True) as confirm, \
+                mock.patch.object(codex_runner, "emit") as emit, mock.patch.object(codex_runner, "kill_tree") as kill:
+            codex_runner.main()
+            result = emit.call_args.args[0]
+            self.assertEqual((result["status"], result["error_kind"]), ("monitor_failed", "cancel_unconfirmed"))
+            self.assertFalse((job / "result.json").exists())
+            kill.assert_not_called()
+            codex_runner.main()
+            self.assertEqual(emit.call_args.args[0]["status"], "cancelled")
+            kill.assert_called_once_with(os.getpid())
+            self.assertEqual(confirm.call_args_list, [mock.call(job), mock.call(job)])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "simulates a Windows job with a Linux fake agy")
+    def test_gemini_timeout_waits_for_windows_job_confirmation_before_retry_and_unlock(self):
+        import agy_runner
+        import codex_runner
+
+        fake_argv, fake_env, _ = self.fake_gemini()
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), *fake_argv, "--agy-command", r"C:\test\agy.exe",
+                                  "--sandbox", "danger-full-access", "--idle-timeout", "0.7", "--backoff", "0",
+                                  "--retries", "1", "--no-diff"])
+        runner_home = Path(self.env["CODEX_RUNNER_HOME"])
+        run_dir = runner_home / "runs" / "timeout"
+        build = agy_runner.build_command
+        launches = []
+        confirmations = []
+
+        def fake_build(task, directory, conversation_id, scratch):
+            self.assertEqual(len(confirmations), 0 if not launches else 2)
+            cmd, env = build(argparse.Namespace(**{**vars(task), "agy_command": fake_argv[3]}), directory,
+                             conversation_id, scratch)
+            launches.append(conversation_id)
+            return cmd, {**env, **fake_env, "FAKE_AGY_MODE": "hang" if len(launches) == 1 else "finish"}
+
+        def confirm(directory):
+            self.assertIsNone(codex_runner.acquire_write_lock(str(self.cwd)))
+            confirmations.append((len(launches), codex_runner.runner_activity(directory / "events.jsonl")["phase"]))
+            return len(confirmations) > 1
+
+        with mock.patch.object(codex_runner, "HOME", runner_home), \
+                mock.patch.object(agy_runner, "build_command", side_effect=fake_build), \
+                mock.patch.object(agy_runner, "cancel", side_effect=confirm):
+            result = codex_runner.execute(args, "retry after cleanup", run_dir)
+            with codex_runner.acquire_write_lock(str(self.cwd)):
+                self.assertEqual(result["status"], "completed")
+        self.assertEqual(launches, [None, "agy-conversation-1"])
+        self.assertEqual(confirmations, [(1, "gemini_running"), (1, "cleanup_wait"), (2, "gemini_running")])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_writer_shares_codex_directory_lock(self):
+        argv, env, call = self.fake_gemini()
+        codex = self.invoke("--sandbox", "workspace-write", "--no-diff", command="start", mode="gated_ok")
+        self.wait_for((self.state / "ready-0").exists)
+        try:
+            gemini = self.invoke(*argv, "--sandbox", "danger-full-access", "--no-diff", command="start", env=env)
+            self.wait_for(lambda: self.control("status", gemini["job_id"]).get("phase") == "lock_wait")
+            self.assertFalse(call.exists())
+        finally:
+            (self.state / "release-0").touch()
+        self.assertEqual(self.control("status", codex["job_id"], "--wait", "10")["status"], "completed")
+        self.assertEqual(self.control("status", gemini["job_id"], "--wait", "10")["status"], "completed")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_fallback_start_deduplicates_persisted_child_before_cap(self):
+        argv, env, _ = self.fake_gemini(mode="hang")
+        context = {**self.sample_context(), "write": False}
+        source = self.invoke("--context-json", "--gemini-fallback-check", "--retries", "0", command="start",
+                             mode="refused_turn", prompt=json.dumps({"prompt": "source", "context": context}))
+        parent = source["job_id"]
+        self.assertIs(self.control("status", parent, "--wait", "10")["fallback_safe"], True)
+        context.update(fallback_of=parent, continuation={"parent_job_id": parent, "answers": [], "resolution": ""})
+
+        def submit(context):
+            return self.invoke(*argv, "--max-engine-running", "1", "--context-json", command="start", env=env,
+                               prompt=json.dumps({"prompt": "fallback", "context": context}))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first, second = pool.map(submit, (context, context))
+        child = first["job_id"]
+        self.assertEqual(second["job_id"], child)
+        self.assertEqual(sum(receipt.get("deduplicated", False) for receipt in (first, second)), 1)
+        rows = self.control("list", "--parent-job", parent)["jobs"]
+        self.assertEqual([(row["job_id"], row["context"]["fallback_of"]) for row in rows], [(child, parent)])
+        wrong_owner = submit({**context, "owner": "other"})
+        self.assertEqual(wrong_owner["error_kind"], "invalid_fallback")
+        self.stored_job("unsafe", {"status": "failed", "fallback_safe": False}, context=context)
+        unsafe = submit({**context, "fallback_of": "unsafe", "continuation": {**context["continuation"], "parent_job_id": "unsafe"}})
+        self.assertEqual(unsafe["error_kind"], "invalid_fallback")
+        self.assertEqual(self.control("cancel", child)["status"], "cancelled")
+        self.assertEqual(submit(context), {"job_id": child, "status": "cancelled", "deduplicated": True})
+
+    def test_gemini_fallback_check_requires_complete_snapshots_and_preserves_retry_evidence(self):
+        self.assertNotIn("fallback_safe", self.invoke(mode="refused_turn"))
+        checked = ("--gemini-fallback-check", "--sandbox", "workspace-write", "--no-diff")
+        (self.cwd / ".git").mkdir()
+        cases = (
+            ("refused_turn", (), True),
+            ("fallback_event", ("--ignore", ".*"), False),
+            ("fallback_retry_write", ("--ignore", ".*"), False),
+            ("refused_turn", ("--writable-root", str(self.cwd / "missing")), False),
+            ("fallback_local_error", (), False),
+            ("fallback_stderr", (), False),
+            ("exit0_without_completion", (), False),
+        )
+        for mode, extra, expected in cases:
+            with self.subTest(mode=mode, extra=extra):
+                if self.state.exists():
+                    shutil.rmtree(self.state)
+                result = self.invoke(*checked, *extra, mode=mode)
+                self.assertIs(result["fallback_safe"], expected)
+                if mode == "fallback_retry_write":
+                    self.assertEqual(result["attempts"], 2)
+                    self.assertFalse((self.cwd / ".git" / "ignored-change").exists())
+
+    def test_fallback_deduplication_survives_storage_and_age_pruning(self):
+        import codex_runner
+
+        context = self.sample_context()
+        parent = self.stored_job("parent", {"status": "failed", "fallback_safe": True}, context=context)
+        child = self.stored_job("child", {"status": "completed"}, engine="gemini",
+                                context={**context, "fallback_of": parent.name})
+        os.utime(child / "result.json", (1, 1))
+        args = argparse.Namespace(context={**context, "fallback_of": parent.name}, max_engine_running=None)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            codex_runner.prune_storage(0.000001, keep={parent.name})
+            codex_runner.prune_old("jobs")
+            result = codex_runner.gemini_admission(args)
+        self.assertTrue(parent.exists())
+        self.assertEqual(result, {"job_id": child.name, "status": "completed", "deduplicated": True})
+
+    def test_a_failed_gemini_worker_spawn_is_terminal_and_allows_another_fallback(self):
+        import codex_runner
+
+        context = self.sample_context()
+        parent = self.stored_job("parent", {"status": "failed", "fallback_safe": True}, context=context)
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", "unused"])
+        args.context = {**context, "fallback_of": parent.name}
+        args.max_engine_running = 1
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            with mock.patch.object(codex_runner.subprocess, "Popen", side_effect=OSError(errno.EAGAIN, "busy")):
+                failed = codex_runner.start_job(args, "fallback")
+            stored = codex_runner.job_status(failed["job_id"])
+            self.assertEqual((stored["status"], stored["error_kind"], stored["attempts"]),
+                             ("failed", "worker_start_failed", 0))
+            self.assertIn("busy", stored["error"])
+            self.assertIsNone(codex_runner.gemini_admission(args))
+
+    def test_gemini_admission_reserves_a_fallback_before_worker_pid_is_published(self):
+        import codex_runner
+
+        context = self.sample_context()
+        parent = self.stored_job("parent", {"status": "failed", "fallback_safe": True}, context=context)
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", "unused"])
+        args.context = {**context, "fallback_of": parent.name}
+        args.max_engine_running = 1
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            with mock.patch.object(codex_runner.subprocess, "Popen", return_value=argparse.Namespace(pid=123)), \
+                    mock.patch.object(codex_runner, "record_pid", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    codex_runner.start_job(args, "fallback")
+            child, = (path for path in parent.parent.iterdir() if path != parent)
+            self.assertFalse((child / "worker.pid").exists())
+            self.assertFalse((child / "result.json").exists())
+            with self.subTest("engine capacity"):
+                unrelated = argparse.Namespace(context=context, max_engine_running=1)
+                receipt = codex_runner.gemini_admission(unrelated)
+                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
+            with self.subTest("age pruning"):
+                self.assertTrue(codex_runner.keep_fallback_child(child))
+            with self.subTest("fallback replay"):
+                with mock.patch.object(codex_runner.time, "time", return_value=child.stat().st_ctime + 6):
+                    receipt = codex_runner.gemini_admission(args) or {}
+                self.assertEqual(receipt.get("job_id"), child.name)
+                self.assertIs(receipt.get("deduplicated"), True)
+
+    def test_gemini_admission_counts_worker_with_delayed_pid_publication(self):
+        import codex_runner
+
+        job = self.stored_job("starting", None, engine="gemini")
+        pid_file = job / "worker.pid"
+        pid_file.unlink()
+        args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.time, "time", return_value=job.stat().st_ctime + 6):
+            with self.subTest("before PID publication"):
+                receipt = codex_runner.gemini_admission(args)
+                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
+            codex_runner.record_pid(pid_file, os.getpid())
+            with self.subTest("after PID publication"):
+                receipt = codex_runner.gemini_admission(args)
+                self.assertEqual((receipt or {}).get("error_kind"), "engine_limit")
+
+    def test_gemini_admission_releases_slot_after_worker_start_grace(self):
+        import codex_runner
+
+        job = self.stored_job("abandoned", None, engine="gemini")
+        (job / "worker.pid").unlink()
+        args = argparse.Namespace(context=self.sample_context(), max_engine_running=1)
+        expired = job.stat().st_ctime + codex_runner.LOST_AFTER + 1
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner.time, "time", return_value=expired):
+            self.assertIsNone(codex_runner.gemini_admission(args))
+        self.assertFalse((job / "result.json").exists())
+
+    def test_fallback_snapshots_exclude_runner_home_but_detect_workspace_changes(self):
+        home = self.cwd / ".local" / "state" / "codex-runner"
+        checked = ("--gemini-fallback-check", "--retries", "0")
+        env = {"CODEX_RUNNER_HOME": str(home)}
+        for mode, expected in (("refused_turn", True), ("fallback_unreported_file", False)):
+            with self.subTest(mode=mode):
+                result = self.invoke(*checked, mode=mode, env=env)
+                self.assertIs(result["fallback_safe"], expected)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_error_classification_from_stderr_and_events(self):
+        argv, env, _ = self.fake_gemini(mode="provider_error")
+        retry_info = {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": "56s"}
+        minute_quota = {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier",
+                            "description": "per minute limit"}],
+        }
+        daily_quota = {
+            "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+            "violations": [{"quotaId": "RequestsPerDay-limit", "description": "daily limit"}],
+        }
+        for error, kind, retryable in (
+            ("403 PERMISSION_DENIED: This service has been disabled in this account for violation of Terms of Service. "
+             "Please submit an appeal to continue using this product.", "provider_permanent", False),
+            ("401 Unauthorized: not logged in. Please log in and try again.", "provider_permanent", False),
+            ("429: weekly quota exhausted", "provider_permanent", False),
+            ("429: model not available, try again", "transient", True),
+            ({"code": 429, "message": "Quota exceeded", "details": [minute_quota, retry_info]}, "transient", True),
+            ({"code": 429, "message": "Quota exceeded", "details": [minute_quota]}, "transient", True),
+            ({"code": 429, "message": "Quota exhausted", "details": [retry_info]}, "transient", True),
+            ({"code": 429, "message": "Quota exceeded", "details": [daily_quota]}, "provider_permanent", False),
+            ({"code": 429, "message": "Quota exceeded", "details": [daily_quota, retry_info]},
+             "provider_permanent", False),
+            ({"code": 429, "message": "Quota exceeded", "details": [{
+                "@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                "metadata": {"quota_limit": "RequestsPerMinute_PerProject_PerUser"},
+            }]}, "transient", True),
+            ("429: per minute quota exhausted", "transient", True),
+            ("429: quota exceeded", "transient", True),
+            ("429: quota exhausted", "provider_permanent", False),
+            ("429: quota exceeded. Please retry in 56.185908122s.", "transient", True),
+            ("503 overloaded", "transient", True),
+            ({"code": 503, "message": "Service Unavailable", "details": []}, "transient", True),
+            ({"status": 503, "message": "Service Unavailable"}, "transient", True),
+            ("stream disconnected", "transient", True),
+            ("403 PERMISSION_DENIED: tool call was denied", "permission_denied", False),
+            ({"code": 403, "message": "tool call was denied"}, "permission_denied", False),
+            ({"code": 403, "message": "IAM permission required to access this model"}, "provider_permanent", False),
+            ("403 soft deny: blocked by permissions.allow", "permission_denied", False),
+            ("403: approval required for this command in headless mode", "permission_denied", False),
+            ("permission request was denied", "permission_denied", False),
+            ('--effort is not supported for model "gemini-4-carbon"', "incomplete", False),
+            ('invalid model selection: --effort is not supported for model "gemini-4-carbon"',
+             "provider_permanent", False),
+        ):
+            for mode in ("stderr_error", "provider_error"):
+                with self.subTest(error=error, mode=mode):
+                    result = self.invoke(*argv, "--retries", "1", env={
+                        **env, "FAKE_AGY_ERROR": json.dumps(error), "FAKE_AGY_MODE": mode,
+                    })
+                    self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                                     ("failed", kind, retryable, 2 if retryable else 1))
+                    self.assertIn(error["message"] if isinstance(error, dict) else error, result["error"])
+                    if isinstance(error, dict) and (status := error.get("code", error.get("status"))):
+                        self.assertIn(str(status), result["error"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_official_google_quota_cases_from_stderr_and_events(self):
+        argv, env, _ = self.fake_gemini()
+
+        def api_error(code, message, *details):
+            return {"code": code, "message": message, "details": list(details)}
+
+        def rpc(kind, **fields):
+            return {"@type": f"type.googleapis.com/google.rpc.{kind}", **fields}
+
+        def retry_after(delay):
+            return rpc("RetryInfo", retryDelay=delay)
+
+        cloud = "cloudcode-pa.googleapis.com"
+
+        def error_info(reason, domain=cloud, **metadata):
+            return rpc("ErrorInfo", reason=reason, domain=domain, metadata=metadata)
+
+        def quota_failure(identifier, description):
+            return rpc("QuotaFailure", violations=[{"quotaId": identifier, "description": description}])
+
+        def nested_error(delay, limit):
+            message = f"Quota exceeded for metric: generate_content_free_tier_requests, limit: {limit}\nPlease retry in {delay}."
+            inner = api_error(429, message, {"detail": f"APP_ERROR(8) {message}"})
+            return json.dumps({"error": {"code": 429, "status": "Too Many Requests",
+                                         "message": json.dumps({"error": inner})}})
+
+        capacity = "You have exhausted your capacity on this model."
+        no_capacity = "No capacity available for model gemini-3.1-pro-preview on the server"
+        reset_fast = f"{capacity} Your quota will reset after 0s."
+        spending_cap = "Your project has exceeded its monthly spending cap."
+        daily = quota_failure("RequestsPerDay-limit", "daily limit")
+        cases = (
+            ("wrapped retry in seconds", nested_error("44.097740004s", 2), True),
+            ("wrapped retry in milliseconds", nested_error("900.2ms", 2), True),
+            ("503 Service Unavailable", api_error(503, "Service Unavailable"), True),
+            ("503 capacity exhaustion with RetryInfo",
+             api_error(503, no_capacity, error_info("MODEL_CAPACITY_EXHAUSTED"), retry_after("9s")), False),
+            ("429 monthly spending cap", api_error(429, spending_cap), False),
+            ("400 monthly spending cap", api_error(400, spending_cap), False),
+            ("capacity exhaustion without delay",
+             api_error(429, no_capacity, error_info("MODEL_CAPACITY_EXHAUSTED")), False),
+            ("capacity text with Help detail", api_error(429, capacity, rpc("Help", links=[])), False),
+            ("capacity exhaustion outside Cloud Code",
+             api_error(429, no_capacity, error_info("MODEL_CAPACITY_EXHAUSTED", "other.googleapis.com")), False),
+            ("capacity exceeded without delay",
+             api_error(429, no_capacity, error_info("MODEL_CAPACITY_EXCEEDED")), False),
+            ("499 Client Closed Request", api_error(499, "Client Closed Request"), True),
+            ("daily QuotaFailure", api_error(429, "Quota exceeded", daily), False),
+            ("RetryInfo at 301 seconds", api_error(429, "Too many requests", retry_after("301s")), False),
+            ("RetryInfo at 45.123 seconds", api_error(429, "Too many requests", retry_after("45.123s")), True),
+            ("per-minute QuotaFailure",
+             api_error(429, "Quota exceeded", quota_failure("RequestsPerMinute-limit", "per minute limit")), True),
+            ("per-minute ErrorInfo", api_error(429, "Quota exceeded", error_info(
+                "QUOTA_EXCEEDED", "googleapis.com", quota_limit="RequestsPerMinute_PerProject_PerUser")), True),
+            ("short 56-second retry with quota and Help details", api_error(
+                429, "Quota exceeded for metric: generate_content_free_tier_requests, limit: 2\nPlease retry in 56.185908122s.",
+                quota_failure("GenerateRequestsPerMinutePerProjectPerModel-FreeTier", ""),
+                rpc("Help", links=[]), retry_after("56s")), True),
+            ("Cloud Code rate limit with short delay",
+             api_error(429, reset_fast, error_info("RATE_LIMIT_EXCEEDED"), retry_after("0.539477544s")), True),
+            ("Cloud Code rate limit with long delay", api_error(
+                429, f"{capacity} Your quota will reset after 10m.",
+                error_info("RATE_LIMIT_EXCEEDED"), retry_after("600s")), False),
+            ("Cloud Code rate limit without delay",
+             api_error(429, "Rate limit exceeded", error_info("RATE_LIMIT_EXCEEDED")), False),
+            ("Cloud Code quota exhaustion despite short delay",
+             api_error(429, reset_fast, error_info("QUOTA_EXHAUSTED"), retry_after("0.539477544s")), False),
+            ("insufficient credits without domain", api_error(
+                429, "Resource has been exhausted (e.g. check quota).",
+                rpc("ErrorInfo", reason="INSUFFICIENT_G1_CREDITS_BALANCE")), False),
+            ("daily quota beats RetryInfo", api_error(429, "Quota exceeded", daily, retry_after("10s")), False),
+            ("generic 429 with DebugInfo", api_error(429, "Too many requests", rpc("DebugInfo", detail="some debug info")), True),
+            ("empty-details wrapper with short text delay",
+             {"error": api_error(429, "Resource exhausted. Please retry in 5s")}, True),
+            ("empty-details wrapper with long text delay",
+             {"error": api_error(429, "Resource exhausted. Please retry in 400s")}, False),
+            ("RetryInfo at exactly 300 seconds", api_error(429, "Too many requests", retry_after("300s")), True),
+            ("generic numeric status", {"status": 429, "message": "Resource exhausted. No specific retry info."}, True),
+            ("generic 429 with empty details",
+             {"error": api_error(429, "A generic 429 error with no retry message.")}, True),
+            ("generic 429 with ErrorInfo", {"error": api_error(
+                429, "A generic 429 error with no retry message.", error_info("QUOTA_EXCEEDED", "googleapis.com", quota_limit=""))}, True),
+            ("Cloud Code quota exhaustion with SSE-corrupted domain", api_error(
+                429, f"{capacity} Your quota will reset after 19h14m47s.",
+                error_info("QUOTA_EXHAUSTED", f"{cloud},"), retry_after("68940s")), False),
+            ("wrapped zero limit before text delay", nested_error("59.906331105s", 0), False),
+            ("zero limit before RetryInfo",
+             api_error(429, "Quota exceeded for limit: 0", retry_after("59s")), False),
+            ("zero limit on another line",
+             api_error(429, "Quota exceeded for metric: ...\nlimit: 0, model: gemini-3-pro"), False),
+            ("zero limit followed by a period",
+             api_error(429, "Quota exceeded for metric: ...\nlimit: 0. Please retry in 59s."), False),
+            ("multiline stderr representation of zero limit",
+             "429: Quota exceeded for metric: ...\nlimit: 0.\nPlease retry in 59s.", False),
+            ("fractional limit", api_error(429, "Quota exceeded for metric: ...\nlimit: 0.5. Please retry in 59s."), True),
+            ("plain zero limit with numeric status", {"status": 429, "message": "Quota exceeded, limit: 0"}, False),
+            ("spending cap predicate", api_error(429, spending_cap), False),
+            ("spend cap predicate", api_error(429, "Manage your project spend cap."), False),
+            ("spend capacity is not a cap", api_error(429, "Unable to spend capacity on model."), True),
+            ("spending capital is not a cap", api_error(429, "Spending capital limit reached."), True),
+            ("500 stays with the runner's general retry policy", api_error(500, "Server error"), True),
+        )
+        for case, error, retryable in cases:
+            kind = "transient" if retryable else "provider_permanent"
+            for mode in ("stderr_error", "provider_error"):
+                with self.subTest(case=case, mode=mode):
+                    result = self.invoke(*argv, "--retries", "1", env={
+                        **env, "FAKE_AGY_ERROR": json.dumps(error), "FAKE_AGY_MODE": mode,
+                    })
+                    self.assertEqual((result["status"], result["error_kind"], result["retryable"], result["attempts"]),
+                                     ("failed", kind, retryable, 2 if retryable else 1))
+                    if isinstance(error, dict) and error.get("code") == 500:
+                        lines = (Path(result["log_dir"]) / "events.jsonl").read_text("utf-8").splitlines()
+                        failed = [event["error"] for event in map(json.loads, lines) if event["type"] == "turn.failed"]
+                        self.assertEqual(len(failed), 2)
+                        self.assertTrue(all("quota_kind" not in event for event in failed))
+
+    def test_gemini_fallback_check_allows_host_mode_with_only_non_tool_events(self):
+        import codex_runner
+
+        checked = ("--gemini-fallback-check", "--sandbox", "danger-full-access", "--no-diff", "--retries", "0")
+        for mode, extra, expected in (("retry_before_turn", (), True),
+                                      ("retry_before_turn", ("--use-user-config",), False),
+                                      ("refused_turn", (), True),
+                                      ("fallback_event", (), False)):
+            with self.subTest(mode=mode, extra=extra):
+                self.state = Path(self.tmp.name) / (mode + str(len(extra)))
+                result = self.invoke(*checked, *extra, mode=mode, env={"FAKE_STATE": str(self.state)})
+                self.assertIs(result["fallback_safe"], expected)
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), *checked])
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "router_reachable", return_value=False), \
+                mock.patch.object(codex_runner, "run_attempt") as attempt:
+            result = codex_runner.execute(args, "source", Path(self.tmp.name) / "router")
+        attempt.assert_not_called()
+        self.assertEqual((result["error_kind"], result["fallback_safe"]), ("router_down", True))
+
+    def test_gemini_fallback_check_rejects_known_uncovered_mcp_configuration(self):
+        checked = ("--gemini-fallback-check", "--sandbox", "danger-full-access", "--no-diff", "--retries", "0")
+        user_config = Path(self.env["CODEX_HOME"]) / "config.toml"
+        for settings, expected in (('[mcp_servers.ordinary]\ncommand = "unused"', True),
+                                   ('[mcp_servers."dotted.name"]\ncommand = "unused"', False),
+                                   ('[plugins."test@local"]\nenabled = true', False)):
+            with self.subTest(settings=settings):
+                user_config.write_text(settings, encoding="utf-8")
+                self.assertIs(self.invoke(*checked, mode="refused_turn")["fallback_safe"], expected)
+        user_config.unlink()
+        project_config = self.cwd / ".codex" / "config.toml"
+        project_config.parent.mkdir()
+        project_config.write_text('[mcp_servers.project]\ncommand = "unused"', encoding="utf-8")
+        self.assertIs(self.invoke(*checked, mode="refused_turn")["fallback_safe"], False)
 
     def stored_job(self, job_id, result, **task):
         root = Path(self.tmp.name) / "home" / "jobs" / job_id

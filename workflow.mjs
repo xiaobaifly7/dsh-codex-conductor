@@ -190,7 +190,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (blocking.next_action === 'done' && !normalized.length && !nonempty(resolution)) return refuse('原任务已独立核验通过，没有新增信息，无需续跑。', []);
   const report = reportOf(value);
   const lost = executionOf(value) === 'failed' && value.error_kind === 'executor_lost' &&
-    value.report_status === 'missing' && report == null && nonempty(value.thread_id);
+    value.report_status === 'missing' && report == null && nonempty(value.thread_id ?? value.conversation_id);
   if ((!lost && !validReport(report)) || value.report_status === 'invalid' || verificationOf(value) === 'invalid' ||
       (object(value.verification) && Object.hasOwn(value.verification, 'blockers') && !validBlockers(value.verification.blockers))) {
     return refuse('报告无效或缺失，先查询并核实原报告，不能据此自动续跑。', []);
@@ -206,7 +206,8 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
       (options.writable_roots != null && (!strings(options.writable_roots) || options.writable_roots.length > 50 || !options.writable_roots.every(nonempty))) ||
       (options.writable_roots?.length && !context.write) ||
       (options.use_user_config !== undefined && typeof options.use_user_config !== 'boolean') ||
-      (options.effort != null && !nonempty(options.effort)) || (value.thread_id != null && !nonempty(value.thread_id))) {
+      (options.effort != null && !nonempty(options.effort)) || (value.thread_id != null && !nonempty(value.thread_id)) ||
+      (value.conversation_id != null && !nonempty(value.conversation_id))) {
     return refuse('原 scope、task_options 或 thread_id 无效，先查询完整原始记录。', []);
   }
   const continuation = { parent_job_id: value.job_id, answers: normalized, resolution };
@@ -243,8 +244,13 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (options.writable_roots != null) args.writable_roots = [...options.writable_roots];
   if (options.effort != null) args.effort = options.effort;
   if (value.thread_id != null) args.resume = value.thread_id;
+  if (value.conversation_id != null) {
+    args.conversation_id = value.conversation_id;
+    if (options.model != null) args.model = options.model;
+  }
   return { ready: true, args, task, continuation, blocking,
-    next: value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
+    next: value.conversation_id ? '计划已准备，使用原 conversation_id 续接；尚未执行。'
+      : value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
 }
 
 // codex_run 带 resume 改开新线程时，放在规划端任务前面的上轮交接内容：只用原任务记录、结构化报告和最新验收，不带旧线程对话。
@@ -252,7 +258,8 @@ export function previousRoundBrief(value) {
   value = object(value) ? value : {};
   const context = object(value.context) ? value.context : {};
   const report = reportOf(value);
-  const lines = [`## 上一轮交接（任务 ${value.job_id ?? '?'}，原线程 ${value.thread_id ?? '?'}；本轮在新线程里执行，看不到旧线程的对话）`];
+  const session = value.conversation_id ? `原 Gemini 会话 ${value.conversation_id}` : `原线程 ${value.thread_id ?? '?'}`;
+  const lines = [`## 上一轮交接（任务 ${value.job_id ?? '?'}，${session}；本轮在新线程里执行，看不到旧线程的对话）`];
   if (nonempty(context.task)) lines.push(`上一轮的任务书：\n${context.task.trim()}`);
   if (Array.isArray(context.acceptance) && context.acceptance.length) {
     lines.push(`上一轮的验收标准：\n${context.acceptance.map((item, index) => `${index + 1}. ${item}`).join('\n')}`);
