@@ -2700,7 +2700,8 @@ class RunnerTests(unittest.TestCase):
             codex_runner.main()
             self.assertEqual(emit.call_args.args[0]["status"], "cancelled")
             kill.assert_called_once_with(os.getpid())
-            self.assertEqual(confirm.call_args_list, [mock.call(job), mock.call(job)])
+            # Windows may spell the temp directory with an 8.3 short name on one side.
+            self.assertEqual([Path(call.args[0]).resolve() for call in confirm.call_args_list], [job.resolve()] * 2)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "simulates a Windows job with a Linux fake agy")
     def test_gemini_timeout_waits_for_windows_job_confirmation_before_retry_and_unlock(self):
