@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { validBlockers, blockingState, prepareContinuation } from './workflow.mjs';
+import { validBlockers, blockingState, prepareContinuation, writeContradictions, repeatedOutcome } from './workflow.mjs';
+import { normPath, under } from './guard.mjs';
 
 const blocker = (id, kind, extra = {}) => ({ id, kind, message: `处理 ${id}`,
   question: ['user_input', 'task_conflict'].includes(kind) ? `请决定 ${id}` : '', resolution: '', ...extra });
@@ -358,4 +359,33 @@ test('blockingState agrees with the runner on every shared case', () => {
     catch { differences.push({ ...item, expected: undefined, want: item.expected, got }); }
   }
   assert.deepEqual(differences.slice(0, 5), [], `${differences.length} of ${cases.length} cases differ`);
+});
+
+test('dispatch consistency ignores non-path deliverable text and finds a write location heading', () => {
+  const resolve = (cwd, p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd}/${p}`);
+  const check = (task, extra = {}) => writeContradictions({ task, acceptance: ['核实报告'], write: true, ...extra }, '/work', resolve, under);
+  // 历史误报：报告小节标题、禁止项里的目录、限定了范围的只读句、标为只读的已有文件、相对交付目录的文件名。
+  assert.deepEqual(check('## 交付物\n1. `/work/out/report.md`，标题如下：\n   - `一、一句话结论`\n   - `## 二、目标文件与基线`', { scope: ['out'] }), []);
+  assert.deepEqual(check('硬性禁止：启动程序；写入 `D:\software\app\resources` 目录。', { scope: ['out'] }), []);
+  assert.deepEqual(check('- 全程只读。唯一主动写入是本轮报告文件。\n写入 `/work/out/r.md`（UTF-8）'), []);
+  assert.deepEqual(check('## 交付物\n- /work/out/a.md：报告\n- drt-lite.exe 与 config.yaml 只读，不复制到项目内。', { scope: ['out'] }), []);
+  assert.deepEqual(check('## 交付物\n`out/run/` 下：\n- `report.md`\n- evidence.json\n生成 `changes.diff`，贴行数', { scope: ['out/run'] }), []);
+  // 真冲突照常报出。
+  assert.match(check('## 交付物\n- `/work/elsewhere/a.md`', { scope: ['out'] }).join(), /a\.md 不在 scope/);
+  assert.match(check('写入 `cache/probe.json`', { scope: ['out'], required_writes: ['cache/probe.json'] }).join(), /required_writes\[0\].*不在 scope/);
+  assert.match(check('写出 `docs/report.md`，不要改别的', { write: false }).join(), /write=false.*docs\/report\.md/);
+  const cwdHeading = '【任务】只读诊断下面三件，不改任何文件：\n- 全程只读：不写文件、不改配置\n【交付】写入当前 cwd：\n- 338-诊断.md\n- 338-summary.json（含 verdict）';
+  assert.deepEqual(check(cwdHeading, { write: false }).filter(line => line.startsWith('write=false')),
+    ['write=false 与 【交付】中的 338-诊断.md 的必写路径 338-诊断.md 冲突', 'write=false 与 【交付】中的 338-summary.json 的必写路径 338-summary.json 冲突']);
+  assert.match(check(cwdHeading).join(), /「全程只读：不写文件、不改配置」与 【交付】中的 338-诊断\.md/);
+});
+
+test('repeatedOutcome matches rewritten rows by position only when counts and numbering agree', () => {
+  const value = (labels) => ({ status: 'completed', verification_status: 'unreviewed', context: { acceptance: ['甲项', '乙项'] },
+    structured: { summary: '', files_changed: [], deviations: [], unresolved: [],
+      criteria: labels.map((criterion, i) => ({ criterion, status: i ? 'met' : 'not_met', evidence: '见报告' })) } });
+  assert.deepEqual(repeatedOutcome(value(['1. 甲项（改写）', '2. 乙项（改写）'])), { criteria: [[1, 'not_met']], blockers: [] });
+  assert.deepEqual(repeatedOutcome(value(['甲项', '乙项'])), { criteria: [[1, 'not_met']], blockers: [] });
+  assert.equal(repeatedOutcome(value(['2. 乙项', '1. 甲项'])), undefined);
+  assert.equal(repeatedOutcome(value(['甲项（改写）'])), undefined);
 });
