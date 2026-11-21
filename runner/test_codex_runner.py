@@ -2579,14 +2579,15 @@ class RunnerTests(unittest.TestCase):
             for thread in (None, "thread-1"):
                 cmd, env = codex_runner.build_command(args, real, thread)
                 self.assertEqual("resume" in cmd, thread is not None)
-                self.assertEqual(Path(env["CODEX_HOME"]), effective_home)
+                # resolve(): CI temp dirs come as 8.3 short names (RUNNER~1) while the runner reports long ones.
+                self.assertEqual(Path(env["CODEX_HOME"]).resolve(), effective_home.resolve())
                 self.assertEqual((effective_home / "AGENTS.md").read_bytes(), short.read_bytes())
                 if os.name == "nt":
                     self.assertFalse((effective_home / "AGENTS.md").is_symlink())
             os.environ.update(CODEX_HOME=str(real))
             os.environ.pop("CODEX_RUNNER_AGENTS_MD")
             _, env = codex_runner.build_command(args, real, None)
-            self.assertEqual(Path(env["CODEX_HOME"]), real)
+            self.assertEqual(Path(env["CODEX_HOME"]).resolve(), real.resolve())
             self.assertEqual((real / "AGENTS.md").read_text(encoding="utf-8"), "long user instructions")
 
     @unittest.skipIf(os.name == "nt", "symlinks need Developer Mode on Windows")
