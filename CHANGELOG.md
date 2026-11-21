@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.138` 由 LoopX 续跑的会话交接后不再停住：交接时把 LoopX 的线程绑定挪给继任会话，交接单以 `/loopx` 开头送达，继任会话由 LoopX 接着按待办续跑，不重建原生目标；撤回或自动回滚时绑定挪回原会话。只在原会话最近一轮是 LoopX 续跑时生效，由原生目标循环驱动的会话照旧；没装 LoopX 或绑定挪不动时交接照常进行，结果的 `steps.loopx` 记下原因。
+
 `0.9.137` Gemini 的主机访问任务可以运行命令：写任务放行命令，只读任务放行命令但仍禁止写文件；沙箱内的 Gemini 任务照旧不能运行命令。任务目录太大、无法在时限内遍历时，Codex 失败转 Gemini 改按事件流判断：整单没有任何工具调用即可接替。Codex 报额度用完后，到回执给出的恢复时间前不再启动 Codex；没有指定引擎的新任务在可接替时改派 Gemini，其余直接拒绝并提示改传 `engine: "gemini"`，重新加载插件即解除。网关报上游账号已退出登录按永久错误处理，不再重试。配置的模型带提供方前缀时，`codex_run` 拒绝不带前缀的模型名。记录为太大的工作区里，带 `scope` 的写任务只对 scope 路径记录改动，可以查看和回滚。面板速度档增加标准档 `default`。
 
 `0.9.136` `plannerReads: products` 下，`allowCommands` 放行的命令不再被当作“读原料”拒绝；它的输入重定向和 `$(...)` 里的命令照常检查。此前这类条目只对护栏本来就认识的读取命令有效，像 `loopx quota should-run` 这样的状态管理命令写进 `allowCommands` 也照样被拒。
@@ -171,6 +173,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.138` a session driven by LoopX no longer stops after a hand-over: the hand-over moves the LoopX thread binding to the successor and delivers the brief as a `/loopx` message, so LoopX keeps working through the todos there and no native goal is rebuilt; a revert or automatic rollback moves the binding back. This applies only when the predecessor's latest loop turn came from LoopX; sessions driven by the native goal loop behave as before, and when LoopX is absent or the binding cannot be moved the hand-over proceeds and `steps.loopx` records why.
 
 `0.9.137` Gemini host-access tasks can run commands: write tasks allow them, read-only tasks allow them while still denying file writes; sandboxed Gemini tasks still cannot run any. When the task directory is too big to walk in time, the Codex-to-Gemini fallback decides from the event stream: a run with no tool call at all can be taken over. After Codex reports its usage limit, no Codex task starts before the reset time in that receipt; a new task with no engine of its own moves to Gemini when takeover is available, anything else is refused with a hint to pass `engine: "gemini"`, and reloading the plugin clears it. A gateway answer saying the upstream account is signed out is a permanent error and is no longer retried. `codex_run` refuses a model name without a provider prefix when the configured model has one. In a work tree recorded as too big, a write task with `scope` records changes for the scope paths only, so they can be viewed and rolled back. The panel speed tier gains the standard tier `default`.
 

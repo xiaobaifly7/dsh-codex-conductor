@@ -1015,3 +1015,77 @@ test('a goal-loop session with running jobs is handed over at the idle edge; a n
   auto.settled({ from: agent.id, requestedAt: submitted[1].requestedAt, status: 'refused', reason: 'successor_unavailable' });
   assert.equal(Date.parse(record().retryAfter) - clock, RETRY_COOLDOWN_MS);
 });
+
+test('a session last driven by LoopX hands its LoopX thread binding to the successor, starts it with /loopx and builds no native goal', async (t) => {
+  const { loopxDriven } = await import('./handover.mjs');
+  // 一份假的 LoopX 绑定表：线程 → 目标/代理，按 CLI 的三个子命令读写。
+  const cli = (bound, { failBind } = {}) => {
+    const calls = [];
+    const loopx = async (args, cwd) => {
+      calls.push([args[0], args[args.indexOf('--thread-id') + 1], cwd]);
+      const id = args[args.indexOf('--thread-id') + 1];
+      if (args[0] === 'resolve-agent-thread') return bound.has(id) ? { ok: true, status: 'bound', ...bound.get(id) } : { ok: true, status: 'missing' };
+      if (args[0] === 'unbind-agent-thread') { bound.delete(id); return { ok: true, changed: true }; }
+      if (failBind?.(id)) return { ok: false };
+      bound.set(id, { goal_id: args[args.indexOf('--goal-id') + 1], agent_id: args[args.indexOf('--agent-id') + 1] });
+      return { ok: true, changed: true };
+    };
+    return { loopx, calls };
+  };
+  const pair = { goal_id: 'goal-1', agent_id: 'agent-1' };
+  const continuation = userEvent('continue', 2, 'loopx-continuation');
+  assert.deepEqual([loopxDriven([userEvent('g', 1, 'goal'), continuation, userEvent('typed', 3)]), loopxDriven([continuation, userEvent('g', 3, 'goal')]), loopxDriven([])],
+    [true, false, false]);
+
+  // LoopX 续跑的会话：绑定挪走，首条消息是 /loopx，不重建原生目标（原来那个暂停着的目标也不重建）。
+  const h = host(t);
+  const a = h.agent('session-A');
+  a.session.log.push(continuation);
+  h.goalsByAgent.set(a, { id: 'G1', revision: 1, phase: 'paused', objective: '旧的原生目标' });
+  const bound = new Map([['session-A', pair]]);
+  const { loopx, calls } = cli(bound);
+  const moved = await h.request({ sessionId: 'session-A' }, { loopx });
+  assert.deepEqual([moved.status, moved.steps.loopx, moved.steps.successorGoal, moved.checks.goal], ['handed_over', 'moved', 'loopx', 'skipped:loopx']);
+  assert.deepEqual([...bound], [[moved.to, pair]]);
+  assert.deepEqual(calls.map((c) => c[2]), ['/work/p', '/work/p', '/work/p'], 'the CLI runs in the session directory');
+  assert.match(h.prompts[0].content[0].text, /^\/loopx 这是会话交接后的续接.*goal goal-1，agent agent-1/);
+  assert.doesNotMatch(h.prompts[0].content[0].text, /按交接单里的目标创建/);
+  assert.equal(h.goalsByAgent.get(h.agents.get(moved.to)), undefined);
+  assert.deepEqual(h.aliases.links()[moved.to].loopx, { goalId: 'goal-1', agentId: 'agent-1' });
+  // 撤回：绑定挪回原会话。
+  const reverted = await h.request({ revert: { from: 'session-A', to: moved.to } }, { loopx });
+  assert.deepEqual([reverted.status, reverted.steps.loopx, [...bound]], ['reverted', 'restored', [['session-A', pair]]]);
+
+  // 原生目标循环驱动的会话，即使有 LoopX 绑定也照旧：不调 CLI，重建原生目标。
+  const native = host(t);
+  const b = native.agent('session-B');
+  b.session.log.push(continuation, userEvent('g', 3, 'goal'));
+  native.goalsByAgent.set(b, { id: 'G1', revision: 1, phase: 'active', objective: '原生目标' });
+  const untouched = cli(new Map([['session-B', pair]]));
+  const plain = await native.request({ sessionId: 'session-B' }, { loopx: untouched.loopx });
+  assert.deepEqual([plain.steps.loopx, plain.steps.successorGoal, untouched.calls.length], [undefined, 'created', 0]);
+  assert.match(native.prompts[0].content[0].text, /^\[codex-conductor 交接\]/);
+
+  // 没绑定、CLI 不可用、继任绑不上：交接照常进行并如实记录；绑不上时绑定还给原会话。
+  for (const [name, runner, step, left] of [
+    ['unbound', cli(new Map()).loopx, 'unbound', []],
+    ['missing cli', async () => { throw new Error('loopx resolve-agent-thread: ENOENT'); }, 'failed:loopx resolve-agent-thread: ENOENT', null],
+    ['bind refused', null, 'failed:loopx bind-agent-thread refused', [['session-C', pair]]],
+  ]) {
+    const x = host(t);
+    const c = x.agent('session-C');
+    c.session.log.push(continuation);
+    const table = new Map([['session-C', pair]]);
+    const result = await x.request({ sessionId: 'session-C' }, { loopx: runner ?? cli(table, { failBind: (id) => id !== 'session-C' }).loopx });
+    assert.deepEqual([result.status, result.steps.loopx, result.steps.successorGoal], ['handed_over', step, 'none'], name);
+    assert.match(x.prompts[0].content[0].text, /^\[codex-conductor 交接\]/, name);
+    if (name === 'bind refused') assert.deepEqual([...table], left);
+  }
+
+  // 首条消息没送达而自动回滚：绑定也回到原会话。
+  const offline = host(t, { prompt: async () => { throw new Error('offline'); } });
+  offline.agent('session-D').session.log.push(continuation);
+  const table = new Map([['session-D', pair]]);
+  const rolled = await offline.request({ sessionId: 'session-D' }, { loopx: cli(table).loopx });
+  assert.deepEqual([rolled.status, rolled.rollback.steps.loopx, [...table]], ['rolled_back', 'restored', [['session-D', pair]]]);
+});

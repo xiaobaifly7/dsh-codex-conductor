@@ -12,7 +12,7 @@
 //
 // 护栏 fail-closed：范围内判定出错就拒绝并给出原因；范围外的会话完全不受影响。
 
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -4283,7 +4283,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       autoContinue: (id) => autoContinueFromSettings(ctx.get?.('settings'))(id),
       // 交接单里“最近的用户指令”排除重启续接的固定话术；有 session_read 工具时写上回看旧会话的用法。
       autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')),
-      workspaces, onResult: (result) => autoHandover.settled(result), withRunningJobs: cfg.autoHandover.withRunningJobs });
+      workspaces, onResult: (result) => autoHandover.settled(result), withRunningJobs: cfg.autoHandover.withRunningJobs,
+      // 由 LoopX 续跑的会话：交接时把 LoopX 的线程绑定挪给继任会话。只在会话日志里有 LoopX 续跑消息时才调用；没装 loopx 时调用失败，交接照常。
+      loopx: (args, cwd) => new Promise((resolve, reject) => {
+        execFile(process.env.LOOPX_BIN || 'loopx', ['--registry', '.loopx/registry.json', '--format', 'json', ...args],
+          { cwd, timeout: 30_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+            if (error) return reject(new Error(`loopx ${args[0]}: ${error.code ?? error.message}`));
+            try { resolve(JSON.parse(stdout)); } catch { reject(new Error(`loopx ${args[0]}: unreadable output`)); }
+          });
+      }) });
   });
   // 旧版本交接出的继任会话落在“未分组”、标题是固定的交接标题：工作区服务可用后对每条现存链接修复一次。
   if (resumeDirectory) ctx.inject?.(['workspaceRegistry', 'sessionController'], (repairCtx) => {
