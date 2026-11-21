@@ -2144,6 +2144,28 @@ test('codex_review cannot record accepted deviations before the user replies', a
   assert.deepEqual(JSON.parse(h.requests.find(({ argv }) => argv[0] === 'review').stdin).accepted_deviations, accepted_deviations);
 });
 
+test('codex_review answers with the recorded outcome and next step, not the whole report again', async () => {
+  const source = workflowSource('implementation');
+  source.finished_at = 1000;
+  source.structured.deviations = ['CSV 输出文件名有偏差'];
+  source.files_changed = Array.from({ length: 80 }, (_, i) => ({ path: `evidence/${i}.stdout`, change: 'added' }));
+  source.files_changed_total = 80;
+  const record = { status: 'accepted_deviations', criteria: [{ index: 1, status: 'met', evidence: '规划端写的核验证据-唯一标记' }],
+    notes: '规划端写的说明-唯一标记', accepted_deviations: [{ kind: 'reported', index: 1, evidence: '按原目标核对，保留现有文件名' }] };
+  const h = harness({ config: { plannerAnswers: true,
+    reviewResult: { ...source, verification_status: 'accepted_deviations', verification: { ...record, reviewer: 'planner' } } } });
+  h.finals.PARENT = source;
+  const value = await h.tools.codex_review.execute({ job_id: 'PARENT', ...record }, { agent: agentAt('/work/current') });
+  const text = h.tools.codex_review.output.render({}, value)[0].text;
+  assert.match(text, /^completed · .*已核验 accepted_deviations.*job_id: PARENT/);
+  assert.match(text, /\n已记录独立核验：accepted_deviations（核验人：planner）\n/);
+  assert.match(text, /\n--- 下一步 ---\n/);
+  // 报告、改动清单和规划端自己写的证据都不再回显
+  assert.doesNotMatch(text, /逐条汇报|详细字段|改动文件|evidence\/0\.stdout|唯一标记/);
+  // 同一结果交给 codex_status 的渲染仍是完整的
+  assert.match(h.tools.codex_status.output.render({}, value)[0].text, /逐条汇报[\s\S]*改动文件（/);
+});
+
 test('plannerAnswers lets the planner record accepted deviations without a user reply', async () => {
   const source = workflowSource('implementation');
   source.finished_at = 1000; // 截止时间之前结束的旧任务：按 planner 规则结案，本测试不涉及独立依据
@@ -3683,6 +3705,12 @@ test('the slim completed view keeps the schema note, flags a truncated answer an
   const capped = render({ status: 'completed', files_changed_source: 'snapshot', files_changed_total: 500, files_changed: files });
   assert.match(capped, /^completed · 500 files/);
   assert.match(capped, /改动文件（snapshot，共 500 个，只列出前 300 个，超出 scope 的检查也只看这些，其余的到任务目录里核对）：src\/f0\.py\(modified\)/);
+  // 文字里只列前 30 个，其余指向 codex_output；30 个以内照常全列
+  assert.match(capped, /src\/f29\.py\(modified\)；此处只显示前 30 个，完整清单用 codex_output（artifact: "result"）查看$/);
+  assert.doesNotMatch(capped, /src\/f30\.py/);
+  const few = render({ status: 'completed', files_changed_source: 'snapshot', files_changed_total: 30, files_changed: files.slice(0, 30) });
+  assert.match(few, /src\/f29\.py\(modified\)$/);
+  assert.doesNotMatch(few, /此处只显示/);
 });
 
 test('a report that breaks the schema still renders, and clipping never leaves half a surrogate pair', () => {
