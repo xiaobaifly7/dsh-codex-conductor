@@ -6,6 +6,7 @@ import io
 import json
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -13,16 +14,16 @@ import textwrap
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from threading import Event
+from threading import Event, current_thread
 from types import SimpleNamespace
 from unittest import mock
 
 RUNNER = Path(__file__).with_name("codex_runner.py")
 
 FAKE_CODEX = textwrap.dedent(r"""
-    import json, os, subprocess, sys, time
+    import atexit, json, os, subprocess, sys, time
     from pathlib import Path
 
     state = Path(os.environ["FAKE_STATE"])
@@ -89,6 +90,18 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "nonzero_after_completed":
         finish()
         sys.exit(1)
+    elif mode in ("sandbox_setup_failed", "exit_minus_one"):
+        output = "ordinary command failure"
+        if mode == "sandbox_setup_failed":
+            output = ("Failed to create unified exec process: orchestrator_helper_incomplete: "
+                      "setup helper exited successfully before setup completed")
+        say(type="item.completed", item={
+            "type": "command_execution", "exit_code": -1, "status": "failed",
+            "aggregated_output": output,
+        })
+        finish()
+        time.sleep(.25)  # Let the worker process the command event before the pipe reader observes exit.
+        (state / "exit-time").write_text(str(time.time()))
     elif mode == "exit0_without_completion":
         sys.exit(0)
     elif mode == "close_stdout_then_hang":
@@ -132,23 +145,42 @@ FAKE_CODEX = textwrap.dedent(r"""
                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         (state / "child.pid").write_text(str(child.pid))
         time.sleep(300)
+    elif mode == "hang_with_orphan":
+        launcher = ("import os, subprocess, sys\n"
+                    "child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(300)'], "
+                    "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                    "print(os.getpid(), child.pid)")
+        parent, child = subprocess.check_output([sys.executable, "-B", "-c", launcher], text=True).split()
+        (state / "parent.pid").write_text(parent)
+        (state / "child.pid").write_text(child)
+        time.sleep(300)
     elif mode == "hang_after_completed":
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         finish()
         time.sleep(300)
-    elif mode in ("transient_then_ok", "transient_with_inherited_group_child", "success_with_inherited_group_child"):
+    elif mode == "fast_exit":
+        atexit.register(lambda: (state / "exit-time").write_text(str(time.time())))
+        finish()
+    elif mode == "split_output":
+        say(type="item.completed", item={"type": "agent_message", "text": "x" * 20000})
+        sys.stdout.write('{"type":"turn.completed","usage":{"input_tokens":1}}')
+    elif mode in ("transient_then_ok", "transient_with_inherited_group_child",
+                  "success_with_inherited_group_child", "success_with_open_stdout", "invalid_report_with_background"):
         if calls == 0:
             say(type="item.completed", item={"id": "command-0", "type": "command_execution", "status": "completed"})
             if mode != "transient_then_ok":
                 child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"],
-                                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                         stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         stdout=None if mode == "success_with_open_stdout" else subprocess.DEVNULL)
                 (state / "child.pid").write_text(str(child.pid))
-            if mode != "success_with_inherited_group_child":
+            if mode.startswith("transient"):
                 say(type="error", message="stream disconnected before completion")
                 say(type="turn.failed", error={"message": "stream disconnected before completion"})
                 sys.exit(1)
-        finish()
+        if mode == "success_with_open_stdout":
+            atexit.register(lambda: (state / "exit-time").write_text(str(time.time())))
+        finish("{}" if mode == "invalid_report_with_background" else "done")
     elif mode in ("retry_before_turn", "retry_after_warning"):
         if calls == 0:
             say(type="item.completed", item={"type": "error", "message": "unrecognized configuration"})
@@ -167,6 +199,9 @@ FAKE_CODEX = textwrap.dedent(r"""
             time.sleep(1.2)
         say(type="item.completed", item={"id": "a", "type": "command_execution", "status": "completed"})
         if mode == "completed_command_idle":
+            child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"],
+                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            (state / "child.pid").write_text(str(child.pid))
             time.sleep(300)
         finish()
     elif mode == "permanent":
@@ -286,8 +321,12 @@ def alive(pid):
             return Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z"  # a killed, unreaped child is gone
         except OSError:
             return False
-    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"], capture_output=True, text=True, errors="replace").stdout
-    return f'"{pid}"' in out
+    import codex_runner
+    try:
+        codex_runner.proc_start(pid)
+    except ProcessLookupError:
+        return False
+    return True
 
 
 class RunnerTests(unittest.TestCase):
@@ -443,9 +482,10 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
                 mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: elapsed), \
                 mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
+                mock.patch.object(codex_runner, "windows_output_lines", side_effect=lambda _, proc: iter(proc.stdout)), \
                 mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
                 mock.patch.object(codex_runner.threading, "Thread", side_effect=spawn_thread), \
-                mock.patch.object(codex_runner, "record_pid"), mock.patch.object(codex_runner, "kill_tree") as kill:
+                mock.patch.object(codex_runner, "record_pid"), mock.patch.object(codex_runner, "stop_attempt") as kill:
             result = codex_runner.execute(args, "original task", job_dir)
             codex_runner.write_result(job_dir, result)
         prompts = [(argv, proc.stdin.write.call_args.args[0].decode()) for argv, proc in calls]
@@ -809,6 +849,16 @@ class RunnerTests(unittest.TestCase):
     def test_turn_completed_wins_over_nonzero_exit(self):
         self.assertEqual(self.invoke(mode="nonzero_after_completed")["status"], "completed")
 
+    def test_sandbox_setup_failure_survives_completed_turn_without_retry(self):
+        r = self.invoke("--retries", "2", "--exit-grace", "5", mode="sandbox_setup_failed")
+        if os.name != "nt":
+            self.assertEqual(r["status"], "completed")
+            return
+        self.assertEqual((r["status"], r["error_kind"], r["retryable"]), ("failed", "sandbox_setup_failed", False))
+        self.assertIn("orchestrator_helper_incomplete", r["error"])
+        self.assertEqual(len(self.calls()), 1)
+        self.assertLess(self.exit_to_finalizing_ms(Path(r["log_dir"])), 1500)
+
     def test_exit_zero_without_turn_completed_is_a_failure(self):
         r = self.invoke(mode="exit0_without_completion")
         self.assertEqual(r["status"], "failed")
@@ -820,6 +870,28 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(r["retryable"])
         time.sleep(1)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
+
+    @unittest.skipUnless(os.name == "nt", "Windows Job Object regression")
+    def test_native_silent_after_first_command_times_out_and_empties_job(self):
+        import codex_runner
+
+        first = self.invoke("--sandbox", "workspace-write", "--idle-timeout", "2", "--timeout", "30",
+                            "--retries", "0", command="start", mode="completed_command_idle")
+        job_id = first["job_id"]
+        job = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / job_id
+        child_file = self.state / "child.pid"
+        self.wait_for(child_file.exists, timeout=5)
+        child = int(child_file.read_text())
+        members = codex_runner.windows_job_pids(job)
+        self.assertIn(child, members)
+        status = subprocess.run([sys.executable, "-B", str(RUNNER), "status", job_id, "--wait", "1", "--follow"],
+                                env=self.env, capture_output=True, timeout=8, check=True)
+        result = json.loads(status.stdout.splitlines()[-1])
+        self.assertEqual((result["status"], result["error_kind"]), ("failed", "idle_timeout"))
+        self.assertIn("2s without activity (1 commands completed, 0 active)", result["error"])
+        self.assertLess(result["duration_s"], 8)
+        self.assertEqual(codex_runner.windows_job_pids(job), [])
+        self.wait_for(lambda: not any(alive(pid) for pid in members), timeout=5)
 
     def test_endless_reconnect_notices_are_cut_off_and_retryable(self):
         start = time.time()
@@ -849,6 +921,7 @@ class RunnerTests(unittest.TestCase):
         clock.monotonic.side_effect = [10] * 4 + [13] * 10
         with mock.patch.object(codex_runner, "time", clock), \
                 mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(codex_runner, "windows_output_lines", return_value=iter(proc.stdout)), \
                 mock.patch.object(codex_runner.os, "waitid", return_value=object(), create=True), \
                 mock.patch.object(codex_runner.threading, "Thread", side_effect=lambda target, daemon: mock.Mock(start=target)), \
                 mock.patch.object(codex_runner, "kill_tree") as kill:
@@ -876,6 +949,8 @@ class RunnerTests(unittest.TestCase):
     def test_total_timeout_is_not_retried(self):
         r = self.invoke("--timeout", "3", "--idle-timeout", "30", mode="hang_with_child")
         self.assertEqual(r["error_kind"], "timeout")
+        if os.name == "nt":
+            self.assertIn("3s total execution", r["error"])  # Windows receipt text, not deadline enforcement.
         self.assertEqual(r["attempts"], 1)
 
     def test_attempt_timeouts_ignore_wall_clock_jumps(self):
@@ -932,6 +1007,15 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["attempts"], 1)
         self.assertLess(time.monotonic() - start, 5)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
+
+    @unittest.skipUnless(os.name == "nt", "cmd.exe launchers exist only on Windows")
+    def test_windows_rejects_a_cmd_launcher_before_spawning(self):
+        script = self.cwd / "codex.cmd"
+        script.write_text("@echo off\r\nexit /b 0\r\n")
+        r = self.invoke(env={"CODEX_RUNNER_CMD": json.dumps([str(script)])})
+        self.assertEqual((r["status"], r["error_kind"]), ("failed", "bad_arguments"))
+        self.assertIn("codex.exe", r["error"])
+        self.assertEqual(r["attempts"], 1)
 
     def test_process_that_hangs_after_completion_still_succeeds(self):
         start = time.time()
@@ -1013,12 +1097,19 @@ class RunnerTests(unittest.TestCase):
                 run_dir.mkdir()
                 failure = OSError(errno.ENOSPC, "injected " + operation + " failure")
                 spawned = []
+                outputs = []
                 real_popen = subprocess.Popen
+                real_output_pipe = codex_runner.windows_output_pipe
 
                 def spawn(*a, **kw):
                     proc = real_popen(*a, **kw)
                     spawned.append(proc)
                     return proc
+
+                def output_pipe(name):
+                    handle, fd = real_output_pipe(name)
+                    outputs.append(handle)
+                    return handle, fd
 
                 def write_pid(path, *a, **kw):
                     if operation == "pid" and path.parent == run_dir and path.name.startswith("codex.pid"):
@@ -1043,6 +1134,7 @@ class RunnerTests(unittest.TestCase):
                 try:
                     with mock.patch.dict(os.environ, {**self.env, "FAKE_MODE": "fault_logging"}), \
                             mock.patch.object(codex_runner.subprocess, "Popen", side_effect=spawn), \
+                            mock.patch.object(codex_runner, "windows_output_pipe", side_effect=output_pipe), \
                             mock.patch.object(Path, "write_text", write_pid), \
                             mock.patch.object(codex_runner.os, "replace", replace_pid), \
                             mock.patch.object(codex_runner, "open", open_log, create=True):
@@ -1050,16 +1142,23 @@ class RunnerTests(unittest.TestCase):
                             codex_runner.run_attempt(args, "do it", run_dir, None)
                     self.assertIs(stopped.exception, failure)
                     self.assertIsNotNone(spawned[0].returncode)
-                    self.assertFalse(alive(spawned[0].pid))
+                    if os.name == "nt":
+                        winapi = codex_runner._winapi
+                        self.assertEqual(winapi.WaitForSingleObject(int(spawned[0]._handle), 0), winapi.WAIT_OBJECT_0)
+                        with self.assertRaises(OSError) as closed:
+                            winapi.PeekNamedPipe(outputs[0], 0)
+                        self.assertEqual(closed.exception.winerror, 6)  # ERROR_INVALID_HANDLE
+                    else:
+                        self.assertFalse(alive(spawned[0].pid))
+                        self.assertTrue(spawned[0].stdout.closed)
                     self.assertTrue(spawned[0].stdin.closed)
-                    self.assertTrue(spawned[0].stdout.closed)
                     child_file = self.state / "child.pid"
                     if child_file.exists():
                         self.assertFalse(alive(int(child_file.read_text())))
                 finally:
                     for proc in spawned:
-                        if alive(proc.pid):
-                            codex_runner.kill_tree(proc.pid)
+                        if proc.poll() is None:
+                            proc.kill()
                         proc.wait(timeout=10)
 
     def test_cancel_waits_for_pid_publication_before_killing_the_worker(self):
@@ -1123,7 +1222,7 @@ class RunnerTests(unittest.TestCase):
                 if proc is not None:
                     if alive(proc.pid):
                         if proc is worker:
-                            codex_runner.kill_tree(proc.pid)
+                            self.stop_process(proc.pid) if os.name == "nt" else codex_runner.kill_tree(proc.pid)
                         else:
                             proc.kill()
                     proc.wait(timeout=10)
@@ -1131,7 +1230,7 @@ class RunnerTests(unittest.TestCase):
                         if pipe is not None:
                             pipe.close()
             if child is not None:
-                codex_runner.kill_tree(child)
+                self.stop_process(child)
 
     def test_symlink_cwd_reports_one_change_for_relative_and_absolute_scopes(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -1842,7 +1941,8 @@ class RunnerTests(unittest.TestCase):
                             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as output, \
                             mock.patch.object(codex_runner, "read_prompt", return_value="do it"), \
                             mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc) as popen, \
-                            mock.patch.object(codex_runner, "kill_tree") as kill:
+                            mock.patch.object(codex_runner, "windows_output_lines", return_value=iter(())), \
+                            mock.patch.object(codex_runner, "stop_attempt") as kill:
                         with self.assertRaises(SystemExit) as stopped:
                             codex_runner.main()
                         self.assertEqual(stopped.exception.code, 1)
@@ -1853,10 +1953,12 @@ class RunnerTests(unittest.TestCase):
                         self.assertFalse(result["retryable"])
                         self.assertEqual(result["attempts"], 1)
                         popen.assert_called_once()
-                        kill.assert_called_once_with(proc.pid)
+                        kill.assert_called_once()
+                        self.assertIs(kill.call_args.args[0], proc)
                         proc.wait.assert_called_once_with(timeout=10)
                         proc.stdin.close.assert_called()
-                        proc.stdout.close.assert_called_once_with()
+                        if os.name != "nt":
+                            proc.stdout.close.assert_called_once_with()
                         self.assertTrue(popen.call_args.kwargs["stderr"].closed)
 
     def test_timeout_cleanup_does_not_wait_indefinitely_for_pipe_threads(self):
@@ -1872,10 +1974,10 @@ class RunnerTests(unittest.TestCase):
                                   idle_timeout=30, reconnect_timeout=30, exit_grace=1)
         with mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc), \
                 mock.patch.object(codex_runner.threading, "Thread", side_effect=[reader, writer]), \
-                mock.patch.object(codex_runner, "kill_tree") as kill:
+                mock.patch.object(codex_runner, "stop_attempt") as kill:
             result = codex_runner.run_attempt(args, "large prompt", Path(self.tmp.name), None)
         self.assertEqual(result["end_reason"], "timeout")
-        self.assertEqual(kill.call_args_list, [mock.call(proc.pid), mock.call(proc.pid)])
+        self.assertEqual([call.args[0] for call in kill.call_args_list], [proc, proc])
         proc.wait.assert_called_once_with(timeout=10)
         for thread in (reader, writer):
             thread.join.assert_called_once_with(timeout=1)
@@ -1900,13 +2002,39 @@ class RunnerTests(unittest.TestCase):
 
         running = {"job_id": "J", "status": "running"}
         done = {"job_id": "J", "status": "completed"}
+        # This tests emission order. The wait and clock are mocked, so it does not test the 100 ms interval.
         with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
                 mock.patch.object(sys, "argv", [str(RUNNER), "status", "J", "--wait", "1", "--follow"]), \
                 mock.patch.object(codex_runner, "job_status", side_effect=[running, done]), \
                 mock.patch.object(codex_runner.time, "monotonic", side_effect=[0, 1, 2, 3]), \
+                mock.patch.object(codex_runner, "wait_for_windows_receipt"), \
                 mock.patch.object(codex_runner.time, "sleep"), mock.patch.object(codex_runner, "emit") as emit:
             codex_runner.main()
         self.assertEqual(emit.call_args_list, [mock.call(running), mock.call(done)])
+
+    @unittest.skipUnless(os.name == "nt", "native Windows status observation latency")
+    def test_windows_follow_observes_published_receipt_before_next_progress_poll(self):
+        import codex_runner
+
+        job_dir = self.stored_job("status-receipt", None)
+        codex_runner.record_pid(job_dir / "worker.pid", os.getpid())
+        staged = codex_runner.stage_result(job_dir, {"status": "completed"})
+        stdout = Path(self.tmp.name) / "status.stdout"
+        argv = [sys.executable, "-B", str(RUNNER), "status", job_dir.name, "--wait", "1", "--follow"]
+        with stdout.open("wb") as output, subprocess.Popen(argv, stdout=output, env=self.env) as observer:
+            try:
+                self.wait_for(lambda: stdout.read_bytes().endswith(b"\n"), timeout=8)
+                self.assertEqual(json.loads(stdout.read_bytes().splitlines()[0])["status"], "running")
+                published = time.monotonic()
+                os.replace(staged, job_dir / "result.json")
+                self.assertEqual(observer.wait(timeout=5), 0)
+                elapsed = time.monotonic() - published
+            finally:
+                if observer.poll() is None:
+                    observer.kill()
+        self.assertEqual(json.loads(stdout.read_bytes().splitlines()[-1])["status"], "completed")
+        # This single 500 ms wall-clock threshold is sensitive to host scheduling load.
+        self.assertLess(elapsed, .5, f"published receipt observed after {elapsed:.3f}s")
 
     def test_cancel_kills_the_worker_and_the_tree(self):
         context = self.sample_context()
@@ -1940,6 +2068,8 @@ class RunnerTests(unittest.TestCase):
         (job_dir / "codex.pid").write_text("456")
         (job_dir / "worker.start").write_text("worker-start")
         (job_dir / "codex.start").write_text("codex-start")
+        if os.name == "nt":
+            (job_dir / "args.json").write_text(json.dumps({"cwd": str(self.cwd), "windows_job_containment": True}))
         completed = {"status": "completed", "final_message": "done", "usage": {"input_tokens": 1}}
         for finishing_pid in (123, 456):
             with self.subTest(finishing_pid=finishing_pid):
@@ -1955,13 +2085,18 @@ class RunnerTests(unittest.TestCase):
                     # Killing the worker can let init reap its already-exited Codex leader.
                     return "worker-start" if pid == 123 else (None if 123 in killed else "codex-start")
 
+                def stop_windows(pid_file):
+                    finish_during_kill(int(pid_file.read_text()))
+                    return True
+
                 with mock.patch.object(codex_runner, "HOME", home), \
                         mock.patch.object(codex_runner, "process_start", side_effect=start), \
                         mock.patch.object(sys, "argv", [str(RUNNER), "cancel", "raced"]), \
                         mock.patch.object(codex_runner, "kill_tree", side_effect=finish_during_kill) as kill, \
+                        mock.patch.object(codex_runner, "stop_recorded_windows_process", side_effect=stop_windows), \
                         mock.patch.object(codex_runner, "emit") as emit:
                     codex_runner.main()
-                    self.assertEqual(kill.call_args_list, [mock.call(456), mock.call(123)])
+                    self.assertEqual(killed, [456, 123])
                     emit.assert_called_once()
                     published = emit.call_args.args[0]
                     self.assertEqual({k: published[k] for k in completed}, completed)
@@ -1971,6 +2106,7 @@ class RunnerTests(unittest.TestCase):
                     saved = json.loads((job_dir / "result.json").read_text("utf-8"))
                     self.assertEqual({k: saved[k] for k in completed}, completed)
 
+    @unittest.skipIf(os.name == "nt", "POSIX PID handling, Windows exercises real process handles separately")
     def test_status_and_cancel_check_process_start_within_the_same_boot(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -1993,7 +2129,7 @@ class RunnerTests(unittest.TestCase):
                     status = codex_runner.job_status(jd.name)
                     self.assertEqual(status["status"], "failed" if reused == 123 else "running")
                     codex_runner.main()
-                    self.assertEqual(kill.call_args_list, [mock.call(456 if reused == 123 else 123)])
+                    self.assertEqual([call.args[0] for call in kill.call_args_list], [456 if reused == 123 else 123])
                     self.assertEqual(emit.call_args.args[0]["status"], "failed" if reused == 123 else "cancelled")
 
     def test_cancel_during_retry_wait_has_no_stale_codex_pid(self):
@@ -2009,7 +2145,139 @@ class RunnerTests(unittest.TestCase):
         finally:
             self.control("cancel", job["job_id"])
 
-    @unittest.skipIf(os.name == "nt", "requires POSIX process-group inheritance")
+    @unittest.skipUnless(os.name == "nt", "requires Windows nested Job Objects")
+    def test_cancel_and_worker_exit_reap_orphan_in_nested_windows_jobs(self):
+        import codex_runner
+
+        for action in ("cancel", "worker_exit"):
+            with self.subTest(action=action):
+                child_file = self.state / "child.pid"
+                child_file.unlink(missing_ok=True)
+                job = self.invoke(command="start", mode="hang_with_orphan")
+                jd = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / job["job_id"]
+                self.wait_for(child_file.exists)
+                child = int(child_file.read_text())
+                parent = int((self.state / "parent.pid").read_text())
+                self.assertFalse(alive(parent))
+                self.assertTrue(alive(child))
+                inner = codex_runner.create_windows_job(None)
+                winapi = codex_runner._winapi
+                try:
+                    handle = winapi.OpenProcess(0x101, False, child)  # SET_QUOTA | TERMINATE
+                    try:
+                        self.assertTrue(codex_runner.kernel.AssignProcessToJobObject(inner, handle))
+                    finally:
+                        winapi.CloseHandle(handle)
+                    if action == "cancel":
+                        self.assertEqual(self.control("cancel", job["job_id"])["status"], "cancelled")
+                    else:
+                        self.assertTrue(codex_runner.stop_recorded_windows_process(jd / "worker.pid"))
+                    self.wait_for(lambda: not alive(child))
+                finally:
+                    winapi.CloseHandle(inner)
+                    self.control("cancel", job["job_id"])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows process handles")
+    def test_cancel_windows_rejects_reused_pid_and_reports_access_denied(self):
+        import codex_runner
+
+        jd = self.stored_job("windows-identity", None)
+        pid_file = jd / "worker.pid"
+        winapi = codex_runner._winapi
+        with subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(120)"]) as child:
+            try:
+                codex_runner.record_pid(pid_file, child.pid)
+                original = pid_file.with_suffix(".start").read_text()
+                pid_file.with_suffix(".start").write_text(str(int(original) - 1))
+                self.assertFalse(codex_runner.stop_recorded_windows_process(pid_file))
+                self.assertTrue(alive(child.pid))
+                pid_file.with_suffix(".start").write_text(original)
+                self.assertTrue(codex_runner.stop_recorded_windows_process(pid_file))
+                self.assertFalse(alive(child.pid))
+            finally:
+                if child.poll() is None:
+                    child.kill()
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(sys, "argv", [str(RUNNER), "cancel", jd.name]), \
+                mock.patch.object(winapi, "OpenProcess", side_effect=PermissionError("access denied")), \
+                mock.patch.object(codex_runner, "emit") as emit:
+            codex_runner.main()
+        self.assertEqual(emit.call_args.args[0]["error_kind"], "process_cleanup_failed")
+        self.assertIn("access denied", emit.call_args.args[0]["error"])
+        self.assertFalse((jd / "result.json").exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows legacy process trees")
+    def test_windows_legacy_cancel_reaps_known_tree_and_reports_unprovable_cleanup(self):
+        import codex_runner
+
+        jd = self.stored_job("legacy", None)
+        marker = Path(self.tmp.name) / "legacy-child.pid"
+        leaf = "import time; time.sleep(120)"
+        launcher = "import subprocess, sys, time; from pathlib import Path; " \
+                   "p = subprocess.Popen([sys.executable, '-B', '-c', sys.argv[2]]); " \
+                   "Path(sys.argv[1]).write_text(str(p.pid)); time.sleep(120)"
+        with subprocess.Popen([sys.executable, "-B", "-c", launcher, str(marker), leaf]) as worker:
+            child = None
+            try:
+                self.wait_for(lambda: marker.exists() and marker.read_text().isdigit())
+                child = int(marker.read_text())
+                codex_runner.record_pid(jd / "worker.pid", worker.pid)
+                self.assertTrue(alive(child))
+                result = self.control("cancel", jd.name)
+                self.assertEqual((result["status"], result.get("error_kind")), ("failed", "process_cleanup_failed"))
+                self.assertFalse((jd / "result.json").exists())
+                self.assertFalse(alive(worker.pid))
+                self.assertFalse(alive(child))
+            finally:
+                if child is not None:
+                    self.stop_process(child)
+                if worker.poll() is None:
+                    worker.kill()
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows legacy process trees")
+    def test_legacy_cancel_continues_after_access_denied_for_one_child(self):
+        import codex_runner
+
+        jd = self.stored_job("legacy-denied", None)
+        marker = Path(self.tmp.name) / "siblings.pid"
+        leaf = "import time; time.sleep(120)"
+        worker_code = (
+            "import subprocess, sys, time; from pathlib import Path; "
+            "children = [subprocess.Popen([sys.executable, '-B', '-c', sys.argv[2]]) for _ in range(2)]; "
+            "Path(sys.argv[1]).write_text(' '.join(str(p.pid) for p in children)); time.sleep(120)"
+        )
+        with subprocess.Popen([sys.executable, "-B", "-c", worker_code, str(marker), leaf]) as worker:
+            children = []
+            try:
+                self.wait_for(lambda: marker.exists() and len(marker.read_text().split()) == 2)
+                children = list(map(int, marker.read_text().split()))
+                denied, accessible = children
+                codex_runner.record_pid(jd / "worker.pid", worker.pid)
+                open_process, snapshot = codex_runner.open_windows_process, codex_runner.windows_processes
+
+                def open_unless_denied(pid, access):
+                    if pid == denied:
+                        raise PermissionError("access denied to test child")
+                    return open_process(pid, access)
+
+                with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "windows_processes",
+                                          side_effect=lambda: sorted(snapshot(), key=lambda row: row[0] != denied)), \
+                        mock.patch.object(codex_runner, "open_windows_process", side_effect=open_unless_denied), \
+                        mock.patch.object(sys, "argv", [str(RUNNER), "cancel", jd.name]), \
+                        mock.patch.object(codex_runner, "emit") as emit:
+                    codex_runner.main()
+                result = emit.call_args.args[0]
+                self.assertEqual((result["status"], result["error_kind"]), ("failed", "process_cleanup_failed"))
+                self.assertIn("access denied to test child", result["error"])
+                self.assertTrue(alive(denied))
+                self.assertFalse(alive(accessible))
+            finally:
+                for pid in children:
+                    self.stop_process(pid)
+                if worker.poll() is None:
+                    worker.kill()
+
     def test_cancel_during_retry_wait_kills_child_in_exited_launchers_group(self):
         job = self.invoke("--sandbox", "workspace-write", "--backoff", "60", command="start",
                           mode="transient_with_inherited_group_child")
@@ -2028,30 +2296,176 @@ class RunnerTests(unittest.TestCase):
             finally:
                 if child_file.exists():
                     child = int(child_file.read_text())
-                    try:
-                        os.kill(child, 9)
-                    except ProcessLookupError:
-                        pass
-                    self.wait_for(lambda: not alive(child))
+                    self.stop_process(child)
                     child_file.unlink()
 
-    def test_successful_task_preserves_child_in_exited_launchers_group(self):
+    def test_successful_task_preserves_background_child_after_receipt(self):
         child_file = self.state / "child.pid"
         try:
             result = self.invoke("--sandbox", "workspace-write", mode="success_with_inherited_group_child")
             self.assertEqual(result["status"], "completed")
             self.assertEqual(result["final_message"], "done")
             self.assertFalse(result["forced_exit"])
-            self.assertTrue(alive(int(child_file.read_text())), "successful task killed its background child")
+            self.assertTrue(alive(int(child_file.read_text())))
         finally:
             if child_file.exists():
                 child = int(child_file.read_text())
-                try:
-                    os.kill(child, 9)
-                except ProcessLookupError:
-                    pass
-                self.wait_for(lambda: not alive(child))
+                self.stop_process(child)
                 child_file.unlink()
+
+    def exit_to_finalizing_ms(self, run_dir):
+        events = (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        finalizing = next(e["time"] for e in map(json.loads, events) if e.get("phase") == "finalizing")
+        return 1000 * (finalizing - float((self.state / "exit-time").read_text()))
+
+    @unittest.skipUnless(os.name == "nt", "Windows overlapped stdout")
+    def test_windows_exit_minus_one_closes_stdout_and_finalizes_promptly(self):
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--exit-grace", "5"])
+        read_lines = codex_runner.windows_output_lines
+        close_handle = codex_runner._winapi.CloseHandle
+        for fail_close in (False, True):
+            with self.subTest(fail_close=fail_close):
+                run_dir = Path(self.tmp.name) / f"exit-minus-one-{fail_close}"
+                run_dir.mkdir()
+                readers = []
+
+                def capture_reader(handle, proc):
+                    readers.append((handle, current_thread()))
+                    yield from read_lines(handle, proc)
+
+                def close(handle):
+                    close_handle(handle)
+                    if fail_close and (handle, current_thread()) in readers:
+                        raise OSError("injected reader close error")
+
+                with mock.patch.dict(os.environ, {"FAKE_MODE": "exit_minus_one"}), \
+                        mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "windows_output_lines", side_effect=capture_reader), \
+                        mock.patch.object(codex_runner._winapi, "CloseHandle", side_effect=close), \
+                        mock.patch.object(codex_runner.threading, "excepthook") as thread_error:
+                    result = codex_runner.execute(args, "test", run_dir)
+
+                [(handle, reader)] = readers
+                try:
+                    codex_runner._winapi.PeekNamedPipe(handle, 0)
+                except OSError as error:
+                    winerror = error.winerror
+                else:
+                    close_handle(handle)  # Clean up if the code under test leaked the handle.
+                    winerror = None
+                self.assertEqual(result["status"], "completed")
+                elapsed = self.exit_to_finalizing_ms(run_dir)
+                self.assertLess(elapsed, 1500, f"exit to finalizing: {elapsed:.1f} ms")
+                self.assertFalse(reader.is_alive())
+                self.assertEqual(winerror, 6)  # ERROR_INVALID_HANDLE
+                self.assertEqual(thread_error.call_count, int(fail_close))
+
+    @unittest.skipUnless(os.name == "nt", "Windows process signal and inherited stdout")
+    def test_windows_exit_reaches_finalizing_without_a_poll_or_pipe_eof(self):
+        for mode in ("fast_exit", "success_with_open_stdout"):
+            with self.subTest(mode=mode):
+                samples = []
+                for _ in range(5):
+                    for call in self.state.glob("call-*.json"):
+                        call.unlink()
+                    child_file = self.state / "child.pid"
+                    try:
+                        result = self.invoke("--exit-grace", "2", mode=mode)
+                        self.assertEqual(result["status"], "completed")
+                        self.assertEqual(result["final_message"], "done")
+                        samples.append(self.exit_to_finalizing_ms(Path(result["log_dir"])))
+                        if mode == "success_with_open_stdout":
+                            self.assertTrue(alive(int(child_file.read_text())))
+                    finally:
+                        if child_file.exists():
+                            self.stop_process(int(child_file.read_text()))
+                            child_file.unlink()
+                self.assertLess(statistics.median(samples), 250, f"exit to finalizing (ms): {samples}")
+
+    @unittest.skipUnless(os.name == "nt", "native Windows retained background and delayed Job release")
+    def test_windows_background_inherited_stdout_survives_only_a_successful_receipt(self):
+        schema = RUNNER.parent.parent / "report.schema.json"
+        for extra, expected in (((), "completed"), (("--schema", str(schema)), "failed")):
+            with self.subTest(expected=expected):
+                child_file = self.state / "child.pid"
+                for call in self.state.glob("call-*.json"):
+                    call.unlink()
+                try:
+                    result = self.invoke("--exit-grace", "1", *extra, mode="success_with_open_stdout")
+                    self.assertEqual(result["status"], expected)
+                    if expected == "failed":
+                        self.assertEqual(result["error_kind"], "schema_invalid")
+                    self.assertEqual(alive(int(child_file.read_text())), expected == "completed")
+                finally:
+                    if child_file.exists():
+                        self.stop_process(int(child_file.read_text()))
+                        child_file.unlink()
+
+    @unittest.skipUnless(os.name == "nt", "Windows overlapped stdout")
+    def test_windows_pipe_preserves_multichunk_and_unterminated_events(self):
+        result = self.invoke(mode="split_output")
+        self.assertEqual(result["status"], "completed")
+        events = [json.loads(line) for line in (Path(result["log_dir"]) / "events.jsonl").read_text("utf-8").splitlines()]
+        messages = [e["item"]["text"] for e in events if e.get("type") == "item.completed"
+                    and e["item"]["type"] == "agent_message"]
+        self.assertEqual(messages, ["x" * 20000])
+        self.assertEqual(sum(e["type"] == "turn.completed" for e in events), 1)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows Job Objects")
+    def test_windows_invalid_structured_report_reaps_background_child(self):
+        result = self.invoke("--schema", str(RUNNER.parent.parent / "report.schema.json"),
+                             mode="invalid_report_with_background")
+        self.assertEqual(result["structured"], {})
+        self.assertEqual(result["report_status"], "invalid")
+        self.assertFalse(alive(int((self.state / "child.pid").read_text())))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows Job Objects")
+    def test_failed_windows_job_release_never_exposes_completed_receipt(self):
+        import codex_runner
+
+        jd = self.stored_job("release-failed", None)
+        codex_runner.record_pid(jd / "worker.pid", os.getpid())
+        statuses = []
+
+        def fail_release(job, enabled):
+            self.assertFalse(enabled)
+            statuses.append(codex_runner.job_status(jd.name)["status"])
+            raise OSError("cannot release Job flag")
+
+        handle = codex_runner.create_windows_job(None)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "set_windows_job_kill_on_close", side_effect=fail_release):
+            codex_runner.write_task_result(SimpleNamespace(windows_job=handle), jd, {"status": "completed"})
+            verdict = codex_runner.job_status(jd.name)
+        self.assertEqual(statuses, ["running"])
+        self.assertEqual((verdict["status"], verdict["error_kind"]), ("failed", "process_cleanup_failed"))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows executor identity")
+    def test_windows_interrupted_staged_receipt_requires_manual_cleanup(self):
+        import codex_runner
+
+        jd = self.stored_job("staged-crash", None)
+        (jd / "codex.job").write_text("Local\\dsh-codex-" + "1" * 32)
+        with subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(120)"]) as proc:
+            try:
+                for name in ("worker.pid", "codex.pid"):
+                    codex_runner.record_pid(jd / name, proc.pid)
+            finally:
+                proc.kill()
+                proc.wait()
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            codex_runner.runner_event(jd, 1, "finalizing")
+            codex_runner.stage_result(jd, {"status": "completed"})
+            for lost_after in (300, 0):
+                verdict = codex_runner.job_status(jd.name, lost_after=lost_after)
+                self.assertEqual((verdict["status"], verdict["error_kind"], verdict["retryable"]),
+                                 ("failed", "process_cleanup_failed", False))
+                self.assertIn("Background processes may still be running", verdict["error"])
+        self.assertEqual(json.loads((jd / "result.json").read_text("utf-8"))["status"], "failed")
 
     def test_windows_cwd_is_mapped_only_inside_wsl(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -2156,17 +2570,24 @@ class RunnerTests(unittest.TestCase):
         short = Path(self.tmp.name) / "executor-agents.md"
         shutil.copyfile(RUNNER.parent.parent / "executor-agents.md", short)
         args = SimpleNamespace(use_user_config=False, model=None, effort=None, sandbox="read-only", schema=None)
-        # Use a file hard link as a test double where Windows symlinks require extra privileges.
-        links = mock.patch.object(Path, "symlink_to", Path.hardlink_to) if os.name == "nt" else nullcontext()
-        with links, mock.patch.object(codex_runner, "HOME", Path(self.tmp.name) / "runner"), \
+        runner_home = Path(self.tmp.name) / "runner"
+        with mock.patch.object(codex_runner, "HOME", runner_home), \
                 mock.patch.dict(os.environ, {"CODEX_HOME": str(real), "CODEX_RUNNER_AGENTS_MD": str(short)}):
+            effective_home = runner_home / "codex-home" if os.name != "nt" else real.with_name("executor-codex")
+            if os.name == "nt":
+                os.environ["CODEX_HOME"] = str(effective_home)
             for thread in (None, "thread-1"):
                 cmd, env = codex_runner.build_command(args, real, thread)
                 self.assertEqual("resume" in cmd, thread is not None)
-                self.assertEqual((Path(env["CODEX_HOME"]) / "AGENTS.md").read_bytes(), short.read_bytes())
+                # resolve(): CI temp dirs come as 8.3 short names (RUNNER~1) while the runner reports long ones.
+                self.assertEqual(Path(env["CODEX_HOME"]).resolve(), effective_home.resolve())
+                self.assertEqual((effective_home / "AGENTS.md").read_bytes(), short.read_bytes())
+                if os.name == "nt":
+                    self.assertFalse((effective_home / "AGENTS.md").is_symlink())
+            os.environ.update(CODEX_HOME=str(real))
             os.environ.pop("CODEX_RUNNER_AGENTS_MD")
             _, env = codex_runner.build_command(args, real, None)
-            self.assertEqual(Path(env["CODEX_HOME"]), real)
+            self.assertEqual(Path(env["CODEX_HOME"]).resolve(), real.resolve())
             self.assertEqual((real / "AGENTS.md").read_text(encoding="utf-8"), "long user instructions")
 
     @unittest.skipIf(os.name == "nt", "symlinks need Developer Mode on Windows")
@@ -2738,7 +3159,8 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
                 mock.patch.object(sys, "argv", [str(RUNNER), "cancel", job.name]), \
                 mock.patch.object(agy_runner, "cancel", side_effect=[False, True], create=True) as confirm, \
-                mock.patch.object(codex_runner, "emit") as emit, mock.patch.object(codex_runner, "kill_tree") as kill:
+                mock.patch.object(codex_runner, "emit") as emit,                 mock.patch.object(codex_runner, "stop_windows_task" if os.name == "nt" else "kill_tree",
+                                  return_value=True) as kill:
             codex_runner.main()
             result = emit.call_args.args[0]
             self.assertEqual((result["status"], result["error_kind"]), ("monitor_failed", "cancel_unconfirmed"))
@@ -2746,7 +3168,13 @@ class RunnerTests(unittest.TestCase):
             kill.assert_not_called()
             codex_runner.main()
             self.assertEqual(emit.call_args.args[0]["status"], "cancelled")
-            kill.assert_called_once_with(os.getpid())
+            # Windows native stops the task's Job and recorded processes; Linux stops the recorded worker tree.
+            kill.assert_called_once()
+            target = kill.call_args.args[0]
+            if os.name == "nt":
+                self.assertEqual(Path(target).resolve(), job.resolve())
+            else:
+                self.assertEqual(target, os.getpid())
             # Windows may spell the temp directory with an 8.3 short name on one side.
             self.assertEqual([Path(call.args[0]).resolve() for call in confirm.call_args_list], [job.resolve()] * 2)
 
@@ -3111,6 +3539,10 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(mode=mode, extra=extra):
                 self.state = Path(self.tmp.name) / (mode + str(len(extra)))
                 result = self.invoke(*checked, *extra, mode=mode, env={"FAKE_STATE": str(self.state)})
+                if os.name == "nt" and extra:
+                    # Windows native rejects the user configuration before any job state is written.
+                    self.assertEqual(result["error_kind"], "invalid_config")
+                    continue
                 self.assertIs(result["fallback_safe"], expected)
         parser = codex_runner.Parser()
         codex_runner.add_task_arguments(parser)
@@ -3577,13 +4009,15 @@ class RunnerTests(unittest.TestCase):
         context = {**self.sample_context(), "continuation": {"parent_job_id": "parent-1",
                    "answers": [{"id": "b1", "answer": "private answer"}], "resolution": "use option A"}}
         envelope = json.dumps({"prompt": "continue", "context": context})
+        user_config = ["--use-user-config"] if os.name != "nt" else []
         started = self.invoke("--context-json", "--sandbox", "danger-full-access", "--writable-root", str(self.cwd),
-                              "--use-user-config", "--effort", "high", "--resume", "thread-parent", prompt=envelope,
+                              *user_config, "--effort", "high", "--resume", "thread-parent", prompt=envelope,
                               command="start")
         value = self.control("status", started["job_id"], "--wait", "30")
         self.assertEqual(value["context"], context)
         self.assertEqual(value["sandbox"], "danger-full-access")
-        self.assertEqual(value["task_options"], {"writable_roots": [str(self.cwd)], "use_user_config": True, "effort": "high"})
+        options = {"writable_roots": [str(self.cwd)], "use_user_config": bool(user_config), "effort": "high"}
+        self.assertEqual(value["task_options"], options)
         self.stored_job("unrelated", {"status": "completed", "thread_id": "different"}, context=self.sample_context())
         listing = self.control("list", "--parent-job", "parent-1", "--thread-id", "thread-1")
         self.assertEqual([j["job_id"] for j in listing["jobs"]], [started["job_id"]])
@@ -4784,7 +5218,7 @@ class RunnerTests(unittest.TestCase):
         context = {"owner": "S1", "task": "write a file", "acceptance": ["file saved"], "write": True}
         job = self.stored_job(job_id, None, sandbox="workspace-write", context=context, scope=["src"])
         if boot is not None:
-            (job / "boot_id").write_text(boot)
+            (job / "boot_id").write_text(boot.partition(":")[0] if os.name == "nt" else boot)
         for name, pid, start in (("worker", "123", "11"), ("codex", "456", "12")):
             (job / f"{name}.pid").write_text(pid)
             (job / f"{name}.start").write_text(start)
@@ -4796,20 +5230,22 @@ class RunnerTests(unittest.TestCase):
             os.utime(job / name, (active_at, active_at))
         return job
 
+    @contextmanager
     def lost_proc(self, worker=None, codex=None):
-        read_text = Path.read_text
-        def read(path, *args, **kwargs):
-            if path.as_posix() == "/proc/sys/kernel/random/boot_id":
-                return "00000000-0000-0000-0000-000000000001\n"
-            if path.as_posix() in ("/proc/1/stat", "/proc/123/stat", "/proc/456/stat"):
-                start = {"1": "10", "123": worker, "456": codex}[path.parent.name]
-                if start is None:
-                    raise FileNotFoundError(str(path))
-                if isinstance(start, OSError):
-                    raise start
-                return f"{path.parent.name} (fake process) " + "S " * 19 + start
-            return read_text(path, *args, **kwargs)
-        return mock.patch.object(Path, "read_text", read)
+        import codex_runner
+
+        def process_observation(pid):
+            start = {1: "10", 123: worker, 456: codex}[pid]
+            if start is None:
+                # What the real proc_start raises for a missing process: no /proc entry on Linux, no handle on Windows.
+                raise ProcessLookupError(pid) if os.name == "nt" else FileNotFoundError(f"/proc/{pid}/stat")
+            if isinstance(start, OSError):
+                raise start
+            return start
+
+        with mock.patch.object(codex_runner, "kernel_boot_id", return_value="00000000-0000-0000-0000-000000000001"), \
+                mock.patch.object(codex_runner, "proc_start", side_effect=process_observation):
+            yield
 
     def test_executor_loss_never_finalizes_a_live_worker_residual_codex_or_proc_error(self):
         import codex_runner
@@ -4980,7 +5416,6 @@ class RunnerTests(unittest.TestCase):
             s = codex_runner.job_status(jd.name)
             self.assertEqual((s["error_kind"], s["thread_id"]), ("worker_died", "W"))
 
-    @unittest.skipIf(os.name == "nt", "boot ids come from Linux /proc")
     def test_start_records_the_boot_id(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
@@ -5326,7 +5761,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(jobs["repaired"]["final_message_repaired"], ["invalid_escape"])
         self.assertNotIn("final_message_repaired", jobs["plain"])
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "walks the Linux /proc parent chain")
+    @unittest.skipUnless(os.name == "nt" or sys.platform.startswith("linux"), "needs a Windows Job or Linux /proc")
     def test_timeout_kills_descendants_that_left_the_process_group(self):
         bystander = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"], start_new_session=True)
         try:
@@ -5346,30 +5781,226 @@ class RunnerTests(unittest.TestCase):
         home = Path(self.env["CODEX_RUNNER_HOME"])
         auth = Path(self.env["CODEX_HOME"]) / "auth.json"
         auth.write_text("SECRET-TOKEN")
-        names = ["python", "codex", "codex_version", "codex_home", "codex_auth", "runner_home", "router", "bash"]
+        names = ["python", "codex", "codex_version", "codex_home", "codex_auth", "runner_home", "router"]
+        if os.name != "nt":
+            names.append("bash")
         tool = SimpleNamespace(returncode=0, stdout="tool 1.2.3\nsecond line\n", stderr="")
+        version_probe = codex_runner if os.name == "nt" else codex_runner.subprocess
+        version_method = "run_windows_diagnostic" if os.name == "nt" else "run"
         with mock.patch.object(codex_runner, "HOME", home), \
-                mock.patch.object(codex_runner.subprocess, "run", return_value=tool):
+                mock.patch.object(version_probe, version_method, return_value=tool):
             report = codex_runner.doctor()
         self.assertEqual([c["name"] for c in report["checks"]], names)
         self.assertEqual((report["status"], report["ok"]), ("completed", True), report)
-        self.assertEqual(report["checks"][-1], {"name": "bash", "ok": True, "detail": "tool 1.2.3"})
+        if os.name != "nt":
+            self.assertEqual(report["checks"][-1], {"name": "bash", "ok": True, "detail": "tool 1.2.3"})
         self.assertNotIn("SECRET-TOKEN", json.dumps(report))
         auth.unlink()
         with mock.patch.object(codex_runner, "HOME", home), \
                 mock.patch.dict(os.environ, {"CODEX_RUNNER_ROUTER_URL": "http://user:hunter2@127.0.0.1:1"}), \
-                mock.patch.object(codex_runner.subprocess, "run", side_effect=OSError("no such tool")):
+                mock.patch.object(version_probe, version_method, side_effect=OSError("no such tool")):
             report = codex_runner.doctor()
-        self.assertEqual({c["name"] for c in report["checks"] if not c["ok"]}, {"codex_version", "codex_auth", "router", "bash"})
+        failed = {"codex_version", "codex_auth", "router"}
+        if os.name != "nt":
+            failed.add("bash")
+        self.assertEqual({c["name"] for c in report["checks"] if not c["ok"]}, failed)
         self.assertEqual((report["status"], report["ok"]), ("completed", False))
         self.assertNotIn("hunter2", json.dumps(report))
-        # The real command prints one JSON object and creates nothing, not even the runner home.
+        # The real command prints one JSON object and leaves the runner home absent.
         self.assertEqual([c["name"] for c in self.control("doctor")["checks"]], names)
         self.assertFalse(home.exists())
         with mock.patch.object(codex_runner, "tomllib", None), mock.patch.object(codex_runner, "emit") as emit, \
                 mock.patch.object(sys, "argv", [str(RUNNER), "list"]), self.assertRaises(SystemExit):
             codex_runner.main()
         self.assertIn("3.11", emit.call_args.args[0]["error"])
+
+    @unittest.skipUnless(os.name == "nt", "native Windows sandbox preflight")
+    def test_native_doctor_runs_one_sandbox_probe_and_preserves_the_child_error(self):
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        private = Path(self.env["CODEX_HOME"])
+        home.mkdir()
+        portable = Path(self.tmp.name) / "PowerShell"
+        inherited = os.environ["PATH"]
+        info = SimpleNamespace(returncode=0, stdout="codex-cli 0.170.0\n", stderr="")
+        for code, output, error in [(0, "7.7.0\n", ""), (1, "", "windows sandbox failed: 拒绝访问。")]:
+            with self.subTest(code=code), mock.patch.object(codex_runner, "HOME", home), \
+                    mock.patch.dict(os.environ, CODEX_HOME=str(private), CODEX_RUNNER_PWSH_DIR=str(portable)), \
+                    mock.patch.object(codex_runner, "run_windows_diagnostic", side_effect=[
+                        info, SimpleNamespace(returncode=code, stdout=output, stderr=error)
+                    ]) as child:
+                report = codex_runner.doctor(sandbox=True)
+                self.assertEqual(os.environ["PATH"], inherited)
+            version, sandbox = child.call_args_list
+            self.assertEqual(version.args[0][-1], "--version")
+            self.assertEqual(version.kwargs["timeout"], 10)
+            self.assertEqual(sandbox.kwargs["timeout"], codex_runner.SANDBOX_PROBE_TIMEOUT)
+            argv, cwd, env = sandbox.args
+            self.assertEqual(argv[-11:], ["sandbox", "--permission-profile", ":workspace", "--include-managed-config",
+                                         "-C", cwd, "--", str(portable / "pwsh.exe"), "-NoProfile",
+                                         "-Command", "$PSVersionTable.PSVersion.ToString()"])
+            self.assertEqual(env["PATH"].split(os.pathsep, 1), [str(portable), inherited])
+            self.assertEqual(report["ok"], code == 0)
+            probe = report["checks"][-1]
+            self.assertEqual(probe["name"], "sandbox")
+            if code:
+                self.assertEqual(probe["error_kind"], "sandbox_setup_failed")
+                self.assertEqual(probe["detail"], f"sandbox_setup_failed: {error}")
+            else:
+                self.assertEqual(probe["detail"], "7.7.0")
+            self.assertFalse(Path(cwd).exists())
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows runner")
+    def test_native_runner_rejects_use_user_config_before_state_writes(self):
+        for command in ("run", "start"):
+            with self.subTest(command=command):
+                result = self.invoke("--use-user-config", command=command)
+                self.assertEqual(result.get("error_kind"), "invalid_config")
+                self.assertIn("--use-user-config", result["error"])
+                self.assertFalse(Path(self.env["CODEX_RUNNER_HOME"]).exists())
+                self.assertEqual(self.calls(), [])
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows worker")
+    def test_native_worker_rejects_persisted_user_config_before_touching_state(self):
+        jd = self.stored_job("unsafe-worker", None, use_user_config=True)
+        (jd / "prompt.txt").write_text("must not run")
+        before = {item.name: (item.read_bytes(), item.stat().st_mtime_ns) for item in jd.iterdir()}
+        result = self.control("_worker", jd.name)
+        self.assertEqual((result["status"], result["error_kind"]), ("failed", "invalid_config"))
+        self.assertIn("--use-user-config", result["error"])
+        self.assertEqual({item.name: (item.read_bytes(), item.stat().st_mtime_ns) for item in jd.iterdir()}, before)
+        self.assertEqual(self.calls(), [])
+
+    def test_simultaneous_total_and_reconnect_deadlines_preserve_platform_priority(self):
+        import codex_runner
+
+        args = SimpleNamespace(timeout=10, reconnect_timeout=5, idle_timeout=20)
+        for is_win, expected, retryable in ((False, "reconnect_timeout", True), (True, "timeout", False)):
+            with self.subTest(is_win=is_win), mock.patch.object(codex_runner, "IS_WIN", is_win):
+                timeout = codex_runner.attempt_timeout(args, 12, 1, 6, 1, False)
+                self.assertEqual(timeout, expected)
+                self.assertEqual(codex_runner.classify({"end_reason": timeout}, self.cwd), (expected, retryable))
+                self.assertEqual(codex_runner.attempt_timeout(args, 11, 1, 6, 1, False),
+                                 "timeout" if is_win else None)
+                self.assertEqual(codex_runner.attempt_timeout(args, 7, 1, 2, 1, False),
+                                 "reconnect_timeout" if is_win else None)
+                self.assertEqual(codex_runner.attempt_timeout(args, 21, 20, None, 1, False),
+                                 "idle_timeout" if is_win else None)
+
+    def test_monitor_enforces_platform_deadline_order_at_the_boundary(self):
+        import codex_runner
+
+        args = SimpleNamespace(cwd=str(self.cwd), sandbox="read-only", timeout=10, reconnect_timeout=5,
+                               idle_timeout=20, exit_grace=1)
+        events = codex_runner.queue.Queue()
+        events.put((b'{"type":"error","message":"reconnecting"}\n', None))
+        clock = mock.Mock(side_effect=[100, 100, 100, 105, 110, 111])
+        proc = mock.Mock(pid=123)
+        with mock.patch.object(codex_runner, "build_command", return_value=(["fake"], self.env)), \
+                mock.patch.object(codex_runner, "time", SimpleNamespace(monotonic=clock)), \
+                mock.patch.object(codex_runner, "record_pid"), \
+                mock.patch.object(codex_runner.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(codex_runner.threading, "Thread"), \
+                mock.patch.object(codex_runner.queue, "Queue", return_value=events), \
+                mock.patch.object(codex_runner, "stop_attempt") as stop, \
+                mock.patch.object(codex_runner, "stop_windows_job"):
+            result = codex_runner.run_attempt(args, "test", Path(self.tmp.name), None)
+        expected = ("timeout", False) if os.name == "nt" else ("reconnect_timeout", True)
+        self.assertEqual(codex_runner.classify(result, self.cwd), expected)
+        self.assertEqual(clock.call_count, 5 if os.name == "nt" else 6)
+        stop.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows diagnostic Job")
+    def test_native_doctor_cleans_inherited_output_on_exit_timeout_and_abort(self):
+        root = Path(self.tmp.name)
+        fake = root / "doctor-child.py"
+        fake.write_text(
+            "import subprocess, sys, time\nfrom pathlib import Path\n"
+            "if '--version' in sys.argv: print('codex-cli test'); sys.exit()\n"
+            "child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(120)'])\n"
+            "Path(sys.argv[1]).write_text(str(child.pid))\n"
+            "print('7.7.0', flush=True)\n"
+            "if sys.argv[2] != 'exit': time.sleep(120)\n"
+        )
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        home.mkdir()
+        for action in ("exit", "timeout", "abort"):
+            with self.subTest(action=action):
+                marker = root / (action + ".pid")
+                env = {**self.env, "CODEX_RUNNER_CMD": json.dumps([sys.executable, "-B", str(fake), str(marker), action])}
+                argv = [sys.executable, "-B", str(RUNNER), "doctor", "--sandbox"]
+                if action == "timeout":
+                    argv = [sys.executable, "-B", "-c",
+                            "import sys; sys.path.insert(0, sys.argv.pop(1)); import codex_runner as r; "
+                            "r.SANDBOX_PROBE_TIMEOUT = 2; r.main()", str(RUNNER.parent), "doctor", "--sandbox"]
+                with subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as doctor:
+                    child = None
+                    try:
+                        self.wait_for(lambda: marker.exists() and marker.read_text().isdigit(), timeout=5)
+                        child = int(marker.read_text())
+                        if action == "abort":
+                            self.assertTrue(alive(child))
+                            doctor.kill()
+                        output, _ = doctor.communicate(timeout=6)
+                        self.wait_for(lambda: not alive(child), timeout=5)
+                        if action != "abort":
+                            check = json.loads(output)["checks"][-1]
+                            self.assertEqual(check["ok"], action == "exit", check)
+                            if action == "timeout":
+                                self.assertEqual(check["error_kind"], "sandbox_setup_failed")
+                                self.assertIn("timed out", check["detail"])
+                    finally:
+                        if doctor.poll() is None:
+                            doctor.kill()
+                        if child is not None:
+                            self.stop_process(child)
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows diagnostic Job")
+    def test_native_doctor_version_reaps_child_with_inherited_output(self):
+        root = Path(self.tmp.name)
+        fake = root / "doctor-version.py"
+        marker = root / "version-child.pid"
+        fake.write_text(
+            "import subprocess, sys, time\nfrom pathlib import Path\n"
+            "assert sys.argv[-1] == '--version'\n"
+            "child = subprocess.Popen([sys.executable, '-B', '-c', 'import time; time.sleep(120)'])\n"
+            "Path(sys.argv[1]).write_text(str(child.pid))\n"
+            "print('codex-cli test', flush=True)\n"
+        )
+        env = {**self.env, "CODEX_RUNNER_CMD": json.dumps([sys.executable, "-B", str(fake), str(marker)])}
+        with subprocess.Popen([sys.executable, "-B", str(RUNNER), "doctor"], env=env,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as doctor:
+            child = None
+            try:
+                self.wait_for(lambda: marker.exists() and marker.read_text().isdigit(), timeout=5)
+                child = int(marker.read_text())
+                output, _ = doctor.communicate(timeout=5)
+                version = next(check for check in json.loads(output)["checks"] if check["name"] == "codex_version")
+                self.assertEqual(version, {"name": "codex_version", "ok": True, "detail": "codex-cli test"})
+                self.wait_for(lambda: not alive(child), timeout=5)
+            finally:
+                if doctor.poll() is None:
+                    doctor.kill()
+                if child is not None:
+                    self.stop_process(child)
+
+    @unittest.skipUnless(os.name == "nt", "native Windows runner boundaries")
+    def test_native_exec_uses_separate_private_home_without_login_shell(self):
+        source = self.cwd / "instructions.md"
+        source.write_text("isolated instructions", "utf-8")
+        result = self.invoke(env={"CODEX_RUNNER_AGENTS_MD": str(source)})
+        self.assertEqual(result["status"], "completed")
+        private = Path(self.env["CODEX_HOME"])
+        self.assertEqual((private / "AGENTS.md").read_text("utf-8"), "isolated instructions")
+        self.assertIn("allow_login_shell=false", self.calls()[0]["argv"])
+        profile = self.cwd / "user-profile"
+        online = profile / ".codex"
+        online.mkdir(parents=True)
+        refused = self.invoke(env={"USERPROFILE": str(profile), "CODEX_HOME": str(online).upper()})
+        self.assertEqual(refused["error_kind"], "invalid_config")
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(list(online.iterdir()), [])
 
     def git_repo(self, name, commit=True):
         """A repository whose sub/ is the task directory; the fake's repo_edit changes three files there."""

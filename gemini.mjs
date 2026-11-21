@@ -205,7 +205,8 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
   });
 }
 
-export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sourceRoots } = {}, launch = spawn) {
+export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sourceRoots,
+  stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor') } = {}, launch = spawn) {
   const started = performance.now();
   let restoreOutput, draft;
   const value = { status: 'failed', output: typeof args?.output === 'string' ? args.output : '', chars: 0, cjk_chars: 0,
@@ -248,10 +249,10 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
     if (outputInfo && args.overwrite !== true) throw new Error('output 已存在，需要 overwrite=true');
     let reused;
     if (args.reuse_draft !== undefined) {
-      if (typeof args.reuse_draft !== 'string' || !args.reuse_draft.trim() || !process.env.LOCALAPPDATA) {
+      if (typeof args.reuse_draft !== 'string' || !args.reuse_draft.trim() || !stateDirectory) {
         throw new Error('reuse_draft 必须是插件草稿目录内的 .md 文件路径');
       }
-      const directory = realpathSync(path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-drafts'));
+      const directory = realpathSync(path.join(stateDirectory, 'gemini-drafts'));
       const file = resolve(args.reuse_draft);
       const info = statSync(file);
       if (!under(normPath(file), normPath(directory)) || path.extname(file).toLowerCase() !== '.md' || !info.isFile()) {
@@ -406,8 +407,8 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
         delete value[key];
       }
       if (draft !== undefined) try {
-        if (!process.env.LOCALAPPDATA) throw new Error('LOCALAPPDATA 未设置，无法保存失败稿');
-        const directory = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-drafts');
+        if (!stateDirectory) throw new Error('LOCALAPPDATA 未设置，无法保存失败稿');
+        const directory = path.join(stateDirectory, 'gemini-drafts');
         mkdirSync(directory, { recursive: true });
         const name = `${new Date().toISOString().replace(/[:.]/g, '-')}-${randomUUID()}.md`;
         const file = path.join(directory, name);

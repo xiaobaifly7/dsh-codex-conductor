@@ -1,0 +1,14 @@
+# Install in the private codexHome from cordis.patch.yml.
+# The gateway key is inherited from the environment.
+# Keep unified exec from loading the caller's PowerShell profile in unelevated mode.
+allow_login_shell = false
+
+[model_providers.magpie]
+name = "Magpie"
+base_url = "http://127.0.0.1:3425/v1"
+env_key = "MAGPIE_GATEWAY_KEY"
+wire_api = "responses"
+
+[windows]
+# Run the native doctor before the first task to initialize and check this sandbox.
+sandbox = "elevated"

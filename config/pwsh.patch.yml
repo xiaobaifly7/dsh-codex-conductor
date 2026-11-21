@@ -1,0 +1,12 @@
+# Proposed substitutions in the matching desktop profile entries.
+# Merge by ID in the existing profile so args, enablement and other env values stay in place.
+- id: mcp-asa-github-readonly
+  config:
+    command: 'C:/Program Files/PowerShell/7/pwsh.exe'
+- id: mcp-asa-postgres-readonly
+  config:
+    command: 'C:/Program Files/PowerShell/7/pwsh.exe'
+- id: mcp-des-opsecvm
+  config:
+    env:
+      OPSEC_PWSH: 'C:/Program Files/PowerShell/7/pwsh.exe'

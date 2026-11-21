@@ -14,7 +14,8 @@
 
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
@@ -44,17 +45,25 @@ export const name = 'codex-conductor';
 // systemPrompt 不列为依赖（这里的 inject 每一项都是必需的），用 ctx.get 取：有就注入规划要求，没有照样能用其余功能
 export const inject = ['tools'];
 
-const here = (file) => wslPath(fileURLToPath(new URL(file, import.meta.url)));
+const here = (file) => fileURLToPath(new URL(file, import.meta.url));
 const bundledAgentsMd = here('./executor-agents.md');
+const nativeDefaults = {
+  python: 'python.exe',
+  runner: here('./runner/codex_runner.py'),
+  reportSchema: here('./report.v2.schema.json'),
+};
 
 // 留空的项都沿用 WSL 默认发行版和 Codex 自己的配置
 const DEFAULTS = {
+  runnerMode: 'wsl',
   distro: '',
   python: 'python3',
-  runner: here('./runner/codex_runner.py'),
+  runner: wslPath(nativeDefaults.runner),
   codexBin: '',
+  pwshDir: '',
   codexHome: '',
   runnerHome: '',
+  stateDir: '',
   // Codex 任务用的用户级 AGENTS.md：留空沿用 CODEX_HOME 里的；none 不带；绝对路径换成该文件（仅未传 use_user_config 的任务）
   runnerAgentsMd: '',
   routerCheckUrl: '',
@@ -129,7 +138,7 @@ const DEFAULTS = {
   plannerReads: 'open',
   plannerReadAllow: [],
   // runner 在 WSL 里读取这个文件，用 --output-schema 约束 Codex 的最终答复
-  reportSchema: here('./report.v2.schema.json'),
+  reportSchema: wslPath(nativeDefaults.reportSchema),
   // 用户写给 DeepSeek 的规划要求（Markdown）；留空用 %LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md
   plannerPromptFile: '',
   // 附在每一单任务书后面、给 Codex 的固定要求（Markdown）；留空用规划要求文件同目录的 executor-prompt.md
@@ -233,18 +242,22 @@ function loadedGateway(cfg) {
 }
 
 // wsl.exe 的参数。配置了的路径用 env 显式传入，不依赖宿主进程继承来的环境
-export function runnerArgv(cfg, args) {
+function runnerEnvironment(cfg, mapPath) {
   const { router, route, routeUrl } = routeConfiguration(cfg);
-  const env = [
+  return [
     cfg.codexHome && `CODEX_HOME=${cfg.codexHome}`,
     cfg.runnerHome && `CODEX_RUNNER_HOME=${cfg.runnerHome}`,
-    cfg.runnerAgentsMd && `CODEX_RUNNER_AGENTS_MD=${cfg.runnerAgentsMd === 'bundled' ? bundledAgentsMd : cfg.runnerAgentsMd}`,
+    cfg.runnerAgentsMd && `CODEX_RUNNER_AGENTS_MD=${cfg.runnerAgentsMd === 'bundled' ? mapPath(bundledAgentsMd) : cfg.runnerAgentsMd}`,
     router && `CODEX_RUNNER_ROUTER_URL=${router.origin}`,
     routeUrl && `CODEX_RUNNER_ROUTE_PROVIDER=${route.provider}`,
     routeUrl && `CODEX_RUNNER_ROUTE_URL=${routeUrl.href}`,
     cfg.codexBin && `CODEX_RUNNER_CMD=${JSON.stringify([cfg.codexBin])}`,
   ].filter(Boolean);
-  return [...(cfg.distro ? ['-d', cfg.distro] : []), '-e', 'env', ...env, cfg.python, cfg.runner, ...args];
+}
+
+export function runnerArgv(cfg, args) {
+  return [...(cfg.distro ? ['-d', cfg.distro] : []), '-e', 'env', ...runnerEnvironment(cfg, wslPath),
+    cfg.python, cfg.runner, ...args];
 }
 
 // 跑一个命令，返回它输出的最后一行 JSON。timeoutMs 到了还没结束（WSL 卡死或起不来）就结束它并按 bridge_error 返回，
@@ -261,11 +274,19 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
     }
     const out = [];
     const err = [];
+    const stopChild = () => {
+      child.kill();
+      // The promise and the Node process must both be free to exit when a bridge is done.
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.unref();
+    };
     if (!onProgress && !singleResult) child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));
     const onAbort = () => {
       cleanup();
-      child.kill();
+      stopChild();
       resolve({ status: 'failed', error_kind: 'bridge_error', error: `${command} 查询已中止`, retryable: true });
     };
     signal?.addEventListener('abort', onAbort, { once: true });
@@ -280,13 +301,13 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
     const timer = timeoutMs && setInterval(() => {
       if (++ticks * 1000 < timeoutMs) return;
       cleanup();
-      child.kill();
+      stopChild();
       resolve({ status: 'failed', error_kind: 'bridge_error', retryable: true,
-        error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束它（WSL 可能卡住或正在启动）` });
+        error: `${command} 超过 ${Math.round(timeoutMs / 1000)} 秒没有返回，已结束该查询进程` });
     }, 1000);
     if (onProgress || singleResult) {
       const lines = createInterface({ input: child.stdout });
-      const fail = (error) => { cleanup(); child.kill(); reject(error); };
+      const fail = (error) => { cleanup(); stopChild(); reject(error); };
       lines.on('error', fail);
       lines.on('line', (line) => {
         if (!line.trim()) return;
@@ -297,7 +318,7 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
           // Runner emits one JSON result; inherited pipes must not delay its delivery.
           cleanup();
           resolve(value);
-          child.kill();
+          stopChild();
           return;
         }
         ticks = 0;
@@ -325,9 +346,63 @@ export function runProcess(command, argv, { stdin, signal, timeoutMs, env, onPro
 
 // 调用 WSL 里的 runner。不设 WSL_UTF8 时 wsl.exe 自己的报错是 UTF-16LE，按 UTF-8 读出来是乱码
 // exec 可注入，默认 runProcess；测试据此验证超时/stdin/signal/env 真的传到了 spawn，而不是只在假 run 上验证
-export const runRunner = (cfg, args, opts = {}, exec = runProcess) =>
-  exec('wsl.exe', runnerArgv(cfg, args), { ...opts, singleResult: cfg.runner === DEFAULTS.runner,
-    env: { ...process.env, WSL_UTF8: '1' } });
+const bundledRunner = (cfg) => cfg.runnerMode === 'native'
+  ? typeof cfg.runner === 'string' && path.win32.isAbsolute(cfg.runner) && path.win32.relative(nativeDefaults.runner, cfg.runner) === ''
+  : cfg.runner === DEFAULTS.runner;
+
+function resolveStatePath(dir) {
+  try {
+    return realpathSync.native(dir);
+  } catch (error) {
+    if (error.code !== 'ENOENT' || path.dirname(dir) === dir || lstatSync(dir, { throwIfNoEntry: false })) throw error;
+    return path.join(resolveStatePath(path.dirname(dir)), path.basename(dir));
+  }
+}
+
+function validateNativeState(cfg) {
+  const local = process.env.LOCALAPPDATA;
+  const profile = process.env.USERPROFILE || homedir();
+  const protectedRoots = [path.join(profile, '.codex'), path.join(profile, '.local', 'state', 'codex-runner'),
+    ...(local ? [path.join(local, 'dsh-codex-conductor'), path.join(local, 'codex-runner')] : [])]
+    .flatMap(dir => [dir, resolveStatePath(dir)]);
+  const directories = {};
+  for (const key of ['stateDir', 'runnerHome', 'codexHome']) {
+    if (typeof cfg[key] !== 'string' || path.win32.parse(cfg[key]).root.length < 3) {
+      throw new Error(`Windows 原生模式需要配置独立的绝对路径 ${key}`);
+    }
+    const dir = path.win32.normalize(cfg[key]);
+    const resolved = resolveStatePath(dir);
+    for (const candidate of [dir, resolved]) {
+      if (protectedRoots.some(root => {
+        const relative = path.win32.relative(root, candidate);
+        return relative === '' || (!path.win32.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..\\'));
+      })) throw new Error(`Windows 原生模式的 ${key} 指向线上状态目录：${candidate}`);
+    }
+    directories[key] = resolved;
+  }
+  return directories;
+}
+
+export function runRunner(cfg, args, opts = {}, exec = runProcess) {
+  const options = { ...opts, singleResult: bundledRunner(cfg) };
+  if (cfg.runnerMode === 'native') {
+    try {
+      if (process.platform !== 'win32') throw new Error('原生 runner 需要 Windows');
+      cfg = { ...cfg, ...validateNativeState(cfg) };
+    } catch (error) {
+      return Promise.resolve({ status: 'failed', error_kind: 'bridge_error', retryable: false,
+        error: error.message });
+    }
+    const env = { ...process.env, PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
+    if (cfg.pwshDir) env.CODEX_RUNNER_PWSH_DIR = cfg.pwshDir;
+    for (const assignment of runnerEnvironment(cfg, (file) => file)) {
+      const separator = assignment.indexOf('=');
+      env[assignment.slice(0, separator)] = assignment.slice(separator + 1);
+    }
+    return exec(cfg.python || 'python.exe', [cfg.runner, ...args], { ...options, env });
+  }
+  return exec('wsl.exe', runnerArgv(cfg, args), { ...options, env: { ...process.env, WSL_UTF8: '1' } });
+}
 
 // Mutations retain the cold-start allowance; only background streams use the longer silence watchdog.
 const BRIDGE_TIMEOUT_MS = 120_000;
@@ -335,7 +410,8 @@ const BRIDGE_SLACK_MS = 60_000;
 
 const unknownState = (value) => ['bridge_error', 'unknown_job', 'invalid_record'].includes(value.error_kind) ||
   ['monitor_failed', 'unknown'].includes(value.status);
-const cancelUnconfirmed = (value) => unknownState(value) || !['cancelled', 'completed', 'failed'].includes(value.status);
+const cancelUnconfirmed = (value) => unknownState(value) || value.error_kind === 'process_cleanup_failed' ||
+  !['cancelled', 'completed', 'failed'].includes(value.status);
 
 export function createConductor(cfg, run = runRunner) {
   async function query(argv, signal, timeoutMs = QUERY_TIMEOUT_MS) {
@@ -351,7 +427,7 @@ export function createConductor(cfg, run = runRunner) {
   async function waitJob(jobId, seconds, signal, onProgress) {
     // 夹在 1 天内：既防超大值让底层 status 等上几十天，也让 timeoutMs 远小于 2^31
     const wait = Math.min(Math.max(0, seconds), 86_400);
-    const follow = onProgress && cfg.runner === DEFAULTS.runner;
+    const follow = onProgress && bundledRunner(cfg);
     const argv = ['status', jobId, '--wait', String(wait)];
     if (follow) argv.push('--follow');
     const value = signal?.aborted ? undefined
@@ -363,6 +439,9 @@ export function createConductor(cfg, run = runRunner) {
   }
 
   async function start(args, cwd, signal, context) {
+    if (cfg.runnerMode === 'native' && args.use_user_config === true) {
+      throw new Error('Windows 原生模式使用独立的 Codex home，不支持 use_user_config=true。请改用默认精简配置，或在 WSL 模式使用原用户配置。');
+    }
     const argv = ['start', '--cwd', cwd];
     const engine = runEngine(args, cfg);
     const repeat = cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS;
@@ -462,7 +541,8 @@ export function createConductor(cfg, run = runRunner) {
     }
     return query(argv, signal).catch(() => undefined);
   }
-  const doctor = (signal) => run(cfg, ['doctor'], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
+  const doctor = (signal) => run(cfg, cfg.runnerMode === 'native' ? ['doctor', '--sandbox'] : ['doctor'],
+    { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   const rollback = (jobId, { check = false } = {}, signal) =>
     run(cfg, ['rollback', jobId, ...(check ? ['--check'] : [])], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard, verificationVersion };
@@ -733,6 +813,7 @@ const SERVICE_FAILURE = new Map([
   ['reconnect_timeout', 'Codex 重连超时'], ['router_down', 'Codex 本地路由不可达'],
   ['idle_timeout', 'Codex 执行空闲超时'], ['transient', '模型服务或连接暂时异常'],
   ['timeout', 'Codex 执行达到总超时，runner 不自动重试'],
+  ['sandbox_setup_failed', 'Windows Codex 沙箱初始化失败，命令未启动'],
 ]);
 
 function failureReceipt(value, cause) {
@@ -1055,7 +1136,8 @@ function settings(config, logger) {
   // A misspelt key (workspace for workspaces) would otherwise switch the guard off without a trace.
   const unknownConfig = Object.keys(config).filter(key => !Object.hasOwn(DEFAULTS, key));
   if (unknownConfig.length) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.join(', ')} 已忽略，请核对拼写`);
-  config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
+  config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, defaults]) => {
+    const fallback = config.runnerMode === 'native' ? (nativeDefaults[key] ?? defaults) : defaults;
     const value = config[key];
     const counts = ['maxRunningJobs', 'maxSessionJobs', 'maxSessionTokens', 'maxGeminiRunningJobs'];
     const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb', ...counts].includes(key);
@@ -1063,6 +1145,8 @@ function settings(config, logger) {
     const valid = optionalBudget
       ? value === null || (Number.isFinite(value) && (key === 'retries' ? Number.isInteger(value) && value >= 0
         : counts.includes(key) ? Number.isInteger(value) && value > 0 : value > 0))
+      : key === 'stateDir' ? typeof value === 'string' && path.isAbsolute(value)
+      : key === 'runnerMode' ? ['native', 'wsl'].includes(value)
       : key === 'plannerReads' ? ['open', 'products'].includes(value)
       : key === 'toolPolicy' ? ['denylist', 'allowlist'].includes(value)
       : key === 'closeoutEvidence' ? ['independent', 'planner', 'off'].includes(value)
@@ -1214,22 +1298,27 @@ const hostAutoVerifyScans = globalThis[Symbol.for('dsh-codex-conductor.autoVerif
 const automaticVerification = Symbol('automaticVerification');
 
 export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
+  if (config.runnerMode === 'native') {
+    if (process.platform !== 'win32') throw new Error('原生 runner 需要 Windows');
+    config = { ...config, ...validateNativeState(config) };
+  }
   const cfg = settings(config, ctx.logger);
+  const stateDirectory = cfg.stateDir || (process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
   const canAnswer = (log, job, owner) => cfg.plannerAnswers === true || hasUserReply(log, job, owner, cfg.autoResume.message);
   const conductor = createConductor(cfg, run);
   let dispatching = 0;
   let dispatchGeneration = 0;
   const geminiWrites = new Set();
   const startingWrites = new Set();
-  const closeoutFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
+  const closeoutFrom = closeoutSince(stateDirectory);
   // 独立依据规则从本机第一次加载这一版起生效；之前结束的任务按 planner 规则（0.9.103）结案，不会因升级变难收尾。
-  const evidenceFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+  const evidenceFrom = closeoutSince(stateDirectory,
     Date.now() / 1000, 'closeout-evidence-since.json');
-  const reworkFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+  const reworkFrom = closeoutSince(stateDirectory,
     Date.now() / 1000, 'closeout-rework-since.json');
-  const acceptOpenFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+  const acceptOpenFrom = closeoutSince(stateDirectory,
     Date.now() / 1000, 'accept-open-evidence-since.json');
-  const autoVerifyFrom = closeoutSince(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+  const autoVerifyFrom = closeoutSince(stateDirectory,
     Date.now() / 1000, 'auto-verify-since.json');
   const beforeCutoff = (source, since) => {
     if (Number.isFinite(source.finished_at)) return source.finished_at < since;
@@ -1405,7 +1494,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // 用户设定的规划要求：作为系统提示词的一段，每次组装时现读文件，改完下一步就生效
   const plannerFile = cfg.plannerPromptFile ||
-    (process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'planner-prompt.md') : '');
+    (stateDirectory ? path.join(stateDirectory, 'planner-prompt.md') : '');
   // 后继会话也能读交接前任任务的产物；任一查询失败就整体按失败处理。
   const productReads = createProductReads(cfg, async (owner) => {
     const values = await Promise.all(aliases.owners(owner).map((id) => conductor.products(id)));
@@ -1419,11 +1508,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   } });
   const productJobs = new Map();
   // 交接后后继会话也是前任会话任务的归属方；没有交接记录时只认本会话。
-  const aliases = createAliases(process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
+  const aliases = createAliases(stateDirectory);
   const owns = (id, owner) => Boolean(id && owner) && aliases.owners(id).includes(owner);
-  const history = createHistoryTracker({ directory: process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'),
+  const history = createHistoryTracker({ directory: stateDirectory,
     threshold: () => cfg.handoverSuggestMessages ?? 0 });
-  const stateDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
   const parkedEvaluations = hostParkedReviews.get(parkedFile) ?? new Map();
   if (parkedFile) hostParkedReviews.set(parkedFile, parkedEvaluations);
@@ -1778,7 +1866,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } });
   // 结案验收的结果分类：all_met（全部 met，自标未满足的有依据）、accepted_open（未满足但接受）、rejected_unsupported（缺独立依据被拒），
   // 按会话和总数累计到 closeout-stats.json，codex_runtime 显示。
-  const closeoutStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'closeout-stats.json');
+  const closeoutStatsFile = stateDirectory && path.join(stateDirectory, 'closeout-stats.json');
   const countCloseout = (owner, kind, amount = 1, repeatJobId) => {
     if (!closeoutStatsFile) return;
     try {
@@ -1800,7 +1888,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } catch {}
   };
   // 新派活的验收标准条数：超过 acceptanceWarnAbove 时提醒一句（不拦截），并累计到 acceptance-stats.json 供日后对比。
-  const acceptanceStatsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'acceptance-stats.json');
+  const acceptanceStatsFile = stateDirectory && path.join(stateDirectory, 'acceptance-stats.json');
   const acceptanceHint = (args) => {
     if (args?.resume || !Array.isArray(args?.acceptance)) return '';
     const items = args.acceptance.length;
@@ -1868,7 +1956,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     writeFileSync(cfg.executorPromptFile, EXECUTOR_TEMPLATE);
   } catch {}
   // 面板里的 Gemini 写作记录：gemini_write 没有 runner 任务，单独留最近 200 条
-  const geminiHistoryFile = process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'gemini-history.jsonl') : '';
+  const geminiHistoryFile = stateDirectory ? path.join(stateDirectory, 'gemini-history.jsonl') : '';
   const recordGemini = (value, session) => {
     if (!geminiHistoryFile) return;
     try {
@@ -2662,7 +2750,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   // 收尾护栏拒绝时没有任务记录可写：把被点名的任务号（只有 ID）追加到 closeout-refusals.jsonl，供日后分析。保留最近 500 行。
-  const refusalsFile = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'closeout-refusals.jsonl');
+  const refusalsFile = stateDirectory && path.join(stateDirectory, 'closeout-refusals.jsonl');
   function logRefusal(entry) {
     if (!refusalsFile) return;
     try {
@@ -3019,6 +3107,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         ? (cfg.defaultHostAccess === true
           ? '当前默认以 danger-full-access 运行：省略 host_access 也没有沙箱，可以启动 Windows 程序及访问主机网络；resume 同样生效。host_access=false 可为单次任务恢复沙箱。'
           : '任务需要启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V 命令等）或连接 Hyper-V 虚拟机时传 host_access=true；不传时 WSL 里的 Codex 启动不了 Windows 程序。')
+        : cfg.runnerMode === 'native' ? '当前使用 Windows 原生 Codex，命令仍受任务沙箱限制。'
         : 'WSL 里的 Codex 启动不了 Windows 程序（pwsh.exe、Hyper-V 命令等），不要把需要 Windows 运行时的检查写进 task/acceptance，这类检查你自己跑。'),
     parameters: {
       type: 'object',
@@ -3374,7 +3463,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           source = await ensureOwnJob(args.job_id, exec, 'codex_status');
           signal.throwIfAborted();
         }
-        return collect(args.job_id, bg, seconds, exec?.signal);
+        const waitSignal = exec?.signal ? AbortSignal.any([signal, exec.signal]) : signal;
+        return collect(args.job_id, bg, seconds, waitSignal);
       }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
       if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
       const result = value.rendered ? await verifyRendered(value, exec, source) : notifyOnDone(await finishStatus(value, exec), exec, finishStatus);
@@ -3915,9 +4005,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   const runtime = registerRuntimeTool({ ctx, conductor, moduleUrl: import.meta.url, loadedIdentity,
     profileFile: cfg.runtimeProfileFile,
-    loadedFile: process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor', 'loaded.json') : '',
+    loadedFile: stateDirectory ? path.join(stateDirectory, 'loaded.json') : '',
     activeDispatches: () => dispatching, dispatchGeneration: () => dispatchGeneration });
-  registerPanel({ ctx, cfg, conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
+  registerPanel({ ctx, cfg, selftestDirectory: stateDirectory ?? '', conductor, runtime, plannerFile, plannerInjected, executorFile: cfg.executorPromptFile, geminiHistoryFile,
     history: () => history.snapshot(), handover: () => {
       const { sessions, threshold } = history.snapshot();
       return autoHandover.snapshot(sessions, threshold);
@@ -3996,7 +4086,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const owner = exec?.agent?.id;
       const write = (signal, extra = {}) => geminiWrite(gemini, { ...args, cwd,
         ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
-        { signal, busy,
+        { signal, stateDirectory: cfg.stateDir || undefined, busy,
           // products 模式下规划端不能读原料，也就不能把工作区外的文件当素材发给 Gemini。
           ...(restrictedReads(exec) && !cfg.roots.includes('*')
             ? { sourceRoots: [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] } : {}) }, launchGemini)
@@ -4273,8 +4363,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 桌面宿主日志不落盘，留一个加载标记，便于确认插件是否在运行中的 DSH 里生效
   // 没有 LOCALAPPDATA（Linux 上跑测试）时不写，免得落到当前目录
   let previousLoad;
-  if (process.env.LOCALAPPDATA) try {
-    const dir = path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
+  if (stateDirectory) try {
+    const dir = stateDirectory;
     mkdirSync(dir, { recursive: true });
     const loadedFile = path.join(dir, 'loaded.json');
     const { record } = loadedRecord(loadedFile);
@@ -4299,29 +4389,28 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),
         plannerPromptFile: plannerFile, plannerPromptInjected: plannerInjected, executorPromptFile: cfg.executorPromptFile }, null, 1));
   } catch {}
-  const resumeDirectory = process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor');
   // 每 2 秒把排队或进行中的交接写进 handover-pending.json（只在变化时写），看门狗据此不去打扰这些会话。
-  if (resumeDirectory) ctx.effect?.(() => {
+  if (stateDirectory) ctx.effect?.(() => {
     let last;
     const timer = setInterval(() => {
       try {
-        const sessions = handoverPendingSessions(resumeDirectory);
+        const sessions = handoverPendingSessions(stateDirectory);
         const key = sessions.join(',');
         if (key === last) return;
-        mkdirSync(resumeDirectory, { recursive: true });
-        writeJsonAtomic(path.join(resumeDirectory, 'handover-pending.json'), { updatedAt: new Date().toISOString(), sessions });
+        mkdirSync(stateDirectory, { recursive: true });
+        writeJsonAtomic(path.join(stateDirectory, 'handover-pending.json'), { updatedAt: new Date().toISOString(), sessions });
         last = key;
       } catch {}
     }, 2_000);
     timer.unref?.();
     return () => clearInterval(timer);
   });
-  if (resumeDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
-    registerResumeRequests({ ctx: resumeCtx, directory: resumeDirectory, autoResume: cfg.autoResume, pluginFiber: ctx.fiber, previousLoad,
+  if (stateDirectory) ctx.inject?.(['agents', 'sessionController', 'sessionQuery', 'sessionPersistence', 'goals', 'appReady'], (resumeCtx) => {
+    registerResumeRequests({ ctx: resumeCtx, directory: stateDirectory, autoResume: cfg.autoResume, pluginFiber: ctx.fiber, previousLoad,
       // 自动兜底和热重载续接都跳过已交接和已归档的会话。
       retired: (id) => Boolean(aliases.successor(id)),
       archived: (id) => Boolean(ctx.get?.('workspaceRegistry')?.archivedSessionIds?.includes?.(id)) });
-    registerHandoverRequests({ ctx: resumeCtx, directory: resumeDirectory, aliases, since: closeoutFrom,
+    registerHandoverRequests({ ctx: resumeCtx, directory: stateDirectory, aliases, since: closeoutFrom,
       sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom, reworkFrom),
       disableAutoContinue: cfg.autoHandover.disableAutoContinue,
       // 交接时通过宿主设置服务关掉旧会话在 dsh-client-auto-continue 里的自动继续；没装该插件时什么都不做。
@@ -4339,9 +4428,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }) });
   });
   // 旧版本交接出的继任会话落在“未分组”、标题是固定的交接标题：工作区服务可用后对每条现存链接修复一次。
-  if (resumeDirectory) ctx.inject?.(['workspaceRegistry', 'sessionController'], (repairCtx) => {
+  if (stateDirectory) ctx.inject?.(['workspaceRegistry', 'sessionController'], (repairCtx) => {
     void repairLinks({ registry: repairCtx.get('workspaceRegistry'), controller: repairCtx.get('sessionController'), aliases,
-      directory: resumeDirectory, logger: ctx.logger }).catch((error) => ctx.logger?.warn?.(`[codex-conductor] 旧交接修复失败：${error?.message ?? error}`));
+      directory: stateDirectory, logger: ctx.logger }).catch((error) => ctx.logger?.warn?.(`[codex-conductor] 旧交接修复失败：${error?.message ?? error}`));
   });
   if (parkedFile || cfg.autoVerify !== 'off') void Promise.resolve().then(() => Promise.all([
     scanParkedReviews().catch(parkedWarning), cfg.autoVerify !== 'off' && scanAutoVerifications(2).catch(autoVerifyWarning),
