@@ -901,6 +901,9 @@ function summaryLine(value) {
     ? `续接未启动：${value.next?.split('\n')[0]} · continuation_ready=false\n原任务状态：${summary}` : summary;
 }
 
+// 结果文字里列出的改动文件数上限；一单常有上百个证据文件，全列会让每次 codex_status 多出上万字
+const FILES_SHOWN = 30;
+
 // 已完成的结果只留核验用得上的：任务目录和一行改动清单；失败、取消、仍在执行的保留全部字段，便于排查。
 // 用量、日志目录等完整字段在 runner 的 result.json（runnerHome/jobs/<job_id>/）里
 function details(rest) {
@@ -910,12 +913,14 @@ function details(rest) {
       ...(value.context.verification_of ? { verification_of: value.context.verification_of } : {}) };
     return [JSON.stringify(value, null, 2)];
   }
-  // runner 最多列 300 条，总数照实给
+  // runner 最多列 300 条，总数照实给；文字里只列前 FILES_SHOWN 条，超出 scope 的改动由 outOfScope 单独列出
   const shown = rest.files_changed?.length;
   const total = rest.files_changed_total ?? shown;
+  const listed = rest.files_changed?.slice(0, FILES_SHOWN);
   const files = Array.isArray(rest.files_changed) && `改动文件（${rest.files_changed_source ?? '来源未知'}，共 ${total} 个` +
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
-    (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
+    (listed.map((f) => `${f.path}(${f.change})`).join('、') || '无') +
+    (shown > listed.length ? `；此处只显示前 ${listed.length} 个，完整清单用 codex_output（artifact: "result"）查看` : '');
   return [rest.cwd && `任务目录：${rest.cwd}`, files,
     rest.continuation_ready === false && 'continuation_ready=false',
     rest.context?.verification_of && `独立核验任务；核验对象：${rest.context.verification_of}`,
@@ -987,6 +992,23 @@ export function turnSummary(log, turn) {
 }
 
 const OUTPUT = { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => render(value) };
+
+// codex_review 写入后的回执：规划端刚看过报告、刚写完验收，不再把整份报告、改动清单和它自己的核验证据原样回显，
+// 只留结案状态、仍待回答的阻塞和下一步。完整内容仍可用 codex_status / codex_output 读取。
+function renderReview(value) {
+  if (typeof value?.rendered === 'string') return [{ type: 'text', text: value.rendered }];
+  const blockers = value?.blocking ?? blockingState(value);
+  const recorded = value?.verification_status ? `已记录独立核验：${value.verification_status}` +
+    (value.verification?.reviewer ? `（核验人：${value.verification.reviewer}）` : '') : '';
+  return [{ type: 'text', text: [
+    `${summaryLine(value ?? {})}${value?.job_id ? `  job_id: ${value.job_id}` : ''}${value?.thread_id ? `  thread_id: ${value.thread_id}` : ''}`,
+    recorded, value?.verification_error && `核验记录异常：${value.verification_error}`,
+    ...(blockers.blockers.length ? ['--- 阻塞与待回答问题 ---', ...blockers.blockers.map((b) =>
+      `${b.id} [${b.kind}] ${b.message}${b.question ? `\n需要回答：${b.question}` : ''}${b.resolution ? `\n解除条件/已有信息：${b.resolution}` : ''}`)] : []),
+    ...(value?.next ? ['--- 下一步 ---', value.next, USER_REPORT] : []),
+  ].filter(Boolean).join('\n') }];
+}
+const REVIEW_OUTPUT = { schema: OUTPUT.schema, render: (_args, value) => renderReview(value) };
 const DATA_OUTPUT = { schema: { type: 'object', additionalProperties: true },
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 
@@ -3694,7 +3716,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         message: { type: 'string' }, question: { type: 'string' }, resolution: { type: 'string' },
       }, required: ['id', 'kind', 'message', 'question', 'resolution'] } },
     }, required: ['job_id', 'status', 'criteria'] },
-    output: OUTPUT,
+    output: REVIEW_OUTPUT,
     async execute(args, exec) {
       const owner = exec?.agent?.id;
       const noSuchJob = async message => {
