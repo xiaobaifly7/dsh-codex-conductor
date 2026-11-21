@@ -221,7 +221,8 @@ test('closeout, hand-entered review IDs and answer IDs return resubmission data 
 });
 
 test('asset-less blocked rounds skip automatic and explicit verification; first and changed checks still run', async t => {
-  const harness = fixture(t, { autoVerify: 'flagged' });
+  // blocked-44s 只在等 task_conflict 的回答，默认 autoVerifySkipQuestions 下根本不自动核验；这里关掉它，测无产物跳过本身。
+  const harness = fixture(t, { autoVerify: 'flagged', autoVerifySkipQuestions: false });
   harness.add('blocked-44s', { duration_s: 44, context: { must_verify: [1] },
     structured: { blockers: [question('scope-denied', 'task_conflict')] } });
   harness.add('with-product', { files_changed: [{ path: 'docs/report.md' }], context: { must_verify: [1] } });
@@ -283,4 +284,55 @@ test('turning off convergence, historical gaps and verification reuse preserves 
     'status', 'review', 'status', 'list', 'repeat-guard', 'start',
   ]);
   assert.ok(actual.every(([argv]) => !argv.includes('--task-key') && !argv.includes('--verification-of')));
+});
+
+test('rewritten report rows match acceptance by position; answers to the stuck question are new input', async t => {
+  const harness = fixture(t);
+  const rows = (labels, kind = 'implementation', id = 'same-gap') => ({ blockers: [question(id, kind)],
+    criteria: labels.map((label, i) => ({ criterion: label, status: i ? 'met' : 'blocked', evidence: '未获得该前置条件' })) });
+  const rewritten = acceptance.map((text, i) => `${i + 1}. ${text}（执行端改写）`);
+  const chain = (name, structured) => {
+    harness.add(`${name}-1`, { structured });
+    harness.add(`${name}-2`, { context: { continuation: { parent_job_id: `${name}-1` } }, structured });
+  };
+  chain('pos', rows(rewritten));
+  chain('short', rows(rewritten.slice(0, 1)));
+  chain('renumbered', rows([...rewritten].reverse()));
+  chain('ask', rows(rewritten, 'user_input', 'pick-input'));
+  const tools = harness.load();
+  await assert.rejects(tools.codex_continue.execute({ job_id: 'pos-2' }, caller()), /pos-1 → pos-2 卡在 验收 1=blocked、implementation:same-gap/);
+  // 条数不等或编号和位置对不上时，保持不按位置对应。
+  await tools.codex_continue.execute({ job_id: 'short-2' }, caller());
+  await tools.codex_continue.execute({ job_id: 'renumbered-2' }, caller());
+  assert.equal(harness.starts.length, 2);
+  // 只换说法、不回答卡住的问题照样拦；回答了它就是新输入。
+  await assert.rejects(tools.codex_continue.execute({ job_id: 'ask-2', resolution: '按原约束继续' }, caller()), /ask-1 → ask-2.*user_input:pick-input/);
+  await tools.codex_continue.execute({ job_id: 'ask-2', answers: [{ id: 'pick-input', answer: '改用已授权的第二项' }] }, caller());
+  assert.equal(harness.starts.length, 3);
+  assert.deepEqual(harness.starts[2].context.continuation.answers, [{ id: 'pick-input', answer: '改用已授权的第二项' }]);
+});
+
+test('resubmitting the same answer to the same stuck question is still a repeat; a different answer goes through', async t => {
+  const harness = fixture(t);
+  const structured = { blockers: [question('pick-input', 'user_input')] };
+  const same = [{ id: 'pick-input', answer: '用第二项' }];
+  harness.add('q-1', { structured });
+  harness.add('q-2', { context: { continuation: { parent_job_id: 'q-1', answers: same, resolution: '' } }, structured });
+  const tools = harness.load();
+  await assert.rejects(tools.codex_continue.execute({ job_id: 'q-2', answers: same }, caller()), /q-1 → q-2 卡在/);
+  assert.equal(harness.starts.length, 0);
+  await tools.codex_continue.execute({ job_id: 'q-2', answers: [{ id: 'pick-input', answer: '改用第三项' }] }, caller());
+  assert.equal(harness.starts.length, 1);
+});
+
+test('review receipts keep a failed write\'s reason; truncated change lists still name out-of-scope files', async t => {
+  const harness = fixture(t);
+  const files = Array.from({ length: 40 }, (_, i) => ({ path: i === 35 ? 'src/evil.py' : `docs/f${i}.md`, change: 'modified' }));
+  harness.add('ask', { scope_paths: ['docs'], files_changed: files, files_changed_total: 40, files_changed_source: 'snapshot',
+    structured: { blockers: [question('q1', 'user_input')] } });
+  const tools = harness.load();
+  const failed = { status: 'failed', error_kind: 'bridge_error', error: 'runner exited 2: Invalid review: criteria[0].index 9 out of range' };
+  assert.match(tools.codex_review.output.render({}, failed)[0].text, /错误：runner exited 2: Invalid review/);
+  const value = await tools.codex_status.execute({ job_id: 'ask' }, caller());
+  assert.match(tools.codex_status.output.render({}, value)[0].text, /其中超出 scope 的：src\/evil\.py/);
 });

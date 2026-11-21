@@ -110,18 +110,21 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         flags.append("--sandbox")
     # Host access means the task runs unsandboxed with the machine's full permissions, as it does for Codex. Headless
     # agy cannot prompt, so without an allow rule every shell command is denied and the task fails.
+    # The file tools need their own rules: a read_file outside the workspace otherwise asks, headless agy auto-denies it
+    # and the whole job fails (3 of the first 10 host jobs on 2026-11-22). They grant nothing command(*) does not.
     host = args.sandbox == "danger-full-access"
     if readonly:
         flags += ["--mode", "plan"]
-        settings.update(allowNonWorkspaceAccess=False, enableTerminalSandbox=not host, permissions={
-            "allow": HOST_COMMANDS if host else [], "ask": [],
+        settings.update(allowNonWorkspaceAccess=host, enableTerminalSandbox=not host, permissions={
+            "allow": [*HOST_COMMANDS, "read_file(*)"] if host else [], "ask": [],
             "deny": ["write_file(*)", *([] if host else ["command(*)", "unsandboxed(*)"]),
                      "mcp(*)", "read_url(*)", "execute_url(*)"],
         })
     else:
         flags += ["--mode", "accept-edits"]
         if host:
-            settings["permissions"] = {"allow": HOST_COMMANDS}
+            settings.update(allowNonWorkspaceAccess=True,
+                            permissions={"allow": [*HOST_COMMANDS, "read_file(*)", "write_file(*)"]})
 
     flags += ["--settings", json.dumps(settings, separators=(",", ":"))]
     if args.schema:
