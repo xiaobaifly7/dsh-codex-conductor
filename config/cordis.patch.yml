@@ -1,9 +1,7 @@
-# Windows-native candidate based on the loaded ASA desktop conductor (0.9.131, commit 005e869).
-# id and name select the separate migration plugin and repository.
-# runnerMode replaces distro. python, codexBin and pwshDir select native executables and shell.
-# codexHome, runnerHome and stateDir isolate configuration, jobs and conductor state.
-# runtimeProfileFile points to this candidate. workspaces are limited to the migration repository and test work.
-# codexRoute.baseUrl uses the Windows Magpie listener on 3425. All other settings inherit the ASA entry.
+# Test candidate for the model-free and live native scripts (runner/native-live-e2e.mjs, bench-live.mjs,
+# sandbox-probe.mjs). They read runnerMode, python, codexBin, pwshDir, stateDir, codexHome, runnerHome and
+# codexRoute from here, so every directory stays under D:/AI-Workspace/win-migration/state.
+# The production entry to merge into ASA is described in config/CUTOVER.md, not in this file.
 - insert:
     - id: codex-conductor-win-native
       name: file:///D:/AI-Workspace/win-migration/dsh-codex-conductor/index.mjs
