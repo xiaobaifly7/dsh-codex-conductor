@@ -100,6 +100,12 @@ FAKE_CODEX = textwrap.dedent(r"""
         child = subprocess.Popen([sys.executable, "-B", "-c", "import time; time.sleep(300)"])
         (state / "child.pid").write_text(str(child.pid))
         time.sleep(300)
+    elif mode == "scoped_write_repo":
+        Path("a.txt").write_bytes(b"changed\n")
+        Path("new.txt").write_bytes(b"new\n")
+        Path("gone.txt").write_bytes(b"back again\n")
+        Path("unscoped.txt").write_bytes(b"outside the scope\n")
+        finish()
     elif mode in ("repo_edit", "repo_edit_hang"):
         Path("a.txt").write_bytes(b"changed\n")
         Path("new.txt").write_bytes(b"new\n")
@@ -898,6 +904,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(value["attempts"], 2)
         self.assertEqual(value["error"], "second attempt stopped")
         self.assertIn("first attempt", (Path(value["log_dir"]) / "stderr.log").read_text())
+
+    def test_a_signed_out_gateway_route_is_permanent_instead_of_retried(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        # Three attempts on this 502 took 10.5 minutes per job; signing in again is the only fix.
+        state = {"end_reason": None, "engine": "codex", "failed": True, "error": "stream disconnected before completion: Claude Code: "
+                 "Claude Code is no longer signed in; sign in again in magpie (502: you can retry your request)"}
+        self.assertEqual(codex_runner.classify(state, Path(self.tmp.name)), ("permanent", False))
+        self.assertTrue(codex_runner.PROVIDER_PERMANENT.search(state["error"]))
+        state["error"] = "stream disconnected before completion: 502 Bad Gateway"
+        self.assertEqual(codex_runner.classify(state, Path(self.tmp.name)), ("transient", True))
 
     def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
         start = time.monotonic()
@@ -3109,6 +3127,28 @@ class RunnerTests(unittest.TestCase):
                 mock.patch.object(codex_runner, "router_reachable", return_value=False), \
                 mock.patch.object(codex_runner, "run_attempt") as attempt:
             result = codex_runner.execute(args, "source", Path(self.tmp.name) / "router")
+        attempt.assert_not_called()
+        self.assertEqual((result["error_kind"], result["fallback_safe"]), ("router_down", True))
+
+    def test_gemini_fallback_check_trusts_the_event_stream_when_the_tree_is_too_big_to_walk(self):
+        import codex_runner
+
+        checked = ("--gemini-fallback-check", "--sandbox", "danger-full-access", "--no-diff", "--retries", "0")
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        (home / codex_runner.TOO_BIG_FILE).write_text(json.dumps({codex_runner.tree_key(str(self.cwd)): time.time()}))
+        for mode, expected in (("refused_turn", True), ("fallback_event", False)):
+            with self.subTest(mode=mode):
+                self.state = Path(self.tmp.name) / ("big-" + mode)
+                result = self.invoke(*checked, mode=mode, env={"FAKE_STATE": str(self.state)})
+                self.assertIs(result["fallback_safe"], expected)
+        # A walk that runs out of budget is treated the same way, without recording the tree.
+        (home / codex_runner.TOO_BIG_FILE).unlink()
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), *checked])
+        with mock.patch.object(codex_runner, "HOME", home), mock.patch.object(codex_runner, "snapshot", return_value=None),                 mock.patch.object(codex_runner, "router_reachable", return_value=False),                 mock.patch.object(codex_runner, "run_attempt") as attempt:
+            result = codex_runner.execute(args, "source", Path(self.tmp.name) / "big-router")
         attempt.assert_not_called()
         self.assertEqual((result["error_kind"], result["fallback_safe"]), ("router_down", True))
 
@@ -5696,6 +5736,35 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual((result["status"], result.get("diff_status")), ("completed", status), result)
                 self.assertFalse((Path(result["log_dir"]) / "diff.patch").exists())
         self.assertIn("--no-diff", self.invoke("--sandbox", "workspace-write", "--no-diff")["diff_reason"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_a_tree_too_big_to_diff_still_records_and_rolls_back_the_scope_paths(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        root, sub, git = self.git_repo("repo")
+        (sub / "gone.txt").unlink()  # tracked, but already gone before the task: its return must not look like an edit
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        (home / codex_runner.TOO_BIG_FILE).write_text(json.dumps({codex_runner.tree_key(str(sub)): time.time()}))
+        writer = ("--sandbox", "workspace-write", "--cwd", str(sub))
+        skipped = self.invoke(*writer, mode="scoped_write_repo")
+        self.assertEqual((skipped["diff_status"], skipped["diff_reason"]), ("skipped", "the tree is recorded as too big"))
+        git("checkout", "-q", "--", "sub/a.txt")
+        (sub / "new.txt").unlink()
+        (sub / "gone.txt").unlink()
+        job_id = self.invoke(*writer, "--scope", "a.txt", "--scope", "new.txt", "--scope", "gone.txt",
+                             command="start", mode="scoped_write_repo")["job_id"]
+        done = self.control("status", job_id, "--wait", "30")
+        self.assertEqual((done["diff_status"], done["diff_files"]), ("captured", 3), done)
+        text = self.control("output", job_id, "--artifact", "diff")["text"]
+        self.assertIn("b/sub/new.txt", text)
+        # gone.txt was absent before the task, so the patch creates it and the rollback removes it again.
+        self.assertRegex(text, r"--- /dev/null\n\+\+\+ b/sub/gone\.txt")
+        self.assertNotIn("unscoped.txt", text)
+        self.assertEqual(self.control("rollback", job_id)["rolled_back"], True)
+        self.assertEqual(((sub / "a.txt").read_bytes(), (sub / "new.txt").exists(), (sub / "gone.txt").exists(),
+                          (sub / "unscoped.txt").exists()), (b"original\n", False, False, True))
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_rollback_checks_then_reverses_the_patch_once(self):

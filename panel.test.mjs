@@ -707,7 +707,7 @@ test('panel HTTP settings accept all supported enums, model characters and posit
   const patches = [
     ...['', 'low', 'medium', 'high', 'xhigh', 'max'].map((effort) => ({ effort })),
     ...['', 'low', 'medium', 'high', 'xhigh', 'max'].map((readOnlyEffort) => ({ readOnlyEffort })),
-    ...['', 'fast', 'ultrafast'].map((serviceTier) => ({ serviceTier })),
+    ...['', 'default', 'fast', 'ultrafast'].map((serviceTier) => ({ serviceTier })),
     ...['low', 'medium', 'high'].map((effort) => ({ gemini: { effort } })),
     { model: '' }, { model: 'A0._/:-' }, { model: 'm'.repeat(80) }, { gemini: { model: 'google/gemini-4:latest' } },
     { plannerAnswers: false }, { plannerAnswers: true }, { lockTimeoutSeconds: 0.5, maxStorageMb: 1.25 },

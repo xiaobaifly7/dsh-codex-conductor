@@ -296,7 +296,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     if (key === 'model') valid = v === '' || model(v);
     else if (key === 'effort') valid = v === '' || efforts.includes(v);
     else if (key === 'readOnlyEffort') valid = v === '' || efforts.includes(v);
-    else if (key === 'serviceTier') valid = ['', 'fast', 'ultrafast'].includes(v);
+    else if (key === 'serviceTier') valid = ['', 'default', 'fast', 'ultrafast'].includes(v);
     else if (key === 'plannerAnswers') valid = typeof v === 'boolean';
     else if (key === 'plannerReads') valid = ['open', 'products'].includes(v);
     else if (key === 'toolPolicy') valid = ['denylist', 'allowlist'].includes(v);

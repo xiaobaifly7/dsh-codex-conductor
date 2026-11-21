@@ -88,7 +88,7 @@ DETACHED_PROCESS = 0x00000008
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 
 PERMANENT = re.compile(
-    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|usage limit|insufficient"
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|no longer signed in|usage limit|insufficient"
     r"|model.{0,40}(not found|not supported|does not exist)|invalid.{0,20}(config|schema)|unrecognized", re.I)
 # The model refusing the request arrives inside "Reconnecting... n/5" notices; the same prompt is refused again,
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
@@ -101,7 +101,7 @@ TRANSIENT = re.compile(
     r"stream disconnected|stream error|timed? ?out|connection|reset by peer|\b429\b|rate.?limit"
     r"|\b50[0234]\b|overloaded|server_error|temporarily|try again", re.I)
 PROVIDER_PERMANENT = re.compile(
-    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|log.?in required|sign.?in required"
+    r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|no longer signed in|log.?in required|sign.?in required"
     r"|usage limit|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
     r"|model.{0,40}(not found|not supported|does not exist)", re.I)
 
@@ -837,6 +837,8 @@ def classify(state, run_dir):
 SNAPSHOT_SKIP = {".git", "node_modules", "__pycache__", ".venv", ".mypy_cache", ".pytest_cache"}
 # A 10k-file tree on /mnt took 47s to walk; past this budget fall back to Codex's own file_change events.
 SNAPSHOT_BUDGET = 20
+# Fallback baseline of a tree too big to walk: only the event stream shows that Codex ran no tool.
+STREAM_ONLY = object()
 # Trees that blew the budget are remembered, so later writers skip the doomed 20s walk.
 TOO_BIG_FILE = "snapshot-too-big.json"
 TOO_BIG_TTL = 7 * 86400
@@ -1568,16 +1570,38 @@ def diff_tree(job_dir, base, budget):
     env = {"GIT_INDEX_FILE": str(job_dir / "diff.index"), "GIT_OBJECT_DIRECTORY": base["object_dir"],
            "GIT_ALTERNATE_OBJECT_DIRECTORIES": base["objects"]}
     (job_dir / "diff.index.lock").unlink(missing_ok=True)  # left by a git that was stopped at its deadline
-    git(base["cwd"], "add", "-A", "--", ".", deadline=deadline, env=env)
+    paths = base.get("paths") or ["."]
+    # A scope path that is not there has nothing to add, and `git add` fails on it; when the index tracks it, the
+    # tree must still say the file is gone.
+    missing = [p for p in paths if not os.path.lexists(os.path.join(base["cwd"], p))]
+    if missing:
+        git(base["cwd"], "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", *missing,
+            deadline=deadline, env=env)
+    if len(missing) < len(paths):
+        git(base["cwd"], "--literal-pathspecs", "add", "-A", "--", *(p for p in paths if p not in missing),
+            deadline=deadline, env=env)
     return git(base["cwd"], "write-tree", deadline=deadline, env=env).decode("ascii").strip(), env
 
 
-def diff_begin(job_dir, cwd, enabled=True):
+def diff_slow_paths(base):
+    """What a diff that ran out of time is remembered by: the scope paths it was limited to, or the whole tree."""
+    return [os.path.join(base["cwd"], p) for p in base.get("paths") or ["."]]
+
+
+def diff_begin(job_dir, cwd, enabled=True, scope=None):
     """Record the tree a writer starts from. Nothing here may fail the task: every problem becomes diff.json."""
     if not enabled:
         return diff_skipped(job_dir, "disabled by --no-diff")
-    if {tree_key(cwd), DIFF_TOO_BIG + tree_key(cwd)} & too_big_trees().keys():
-        return diff_skipped(job_dir, "the tree is recorded as too big")
+    known = too_big_trees().keys()
+    only = None
+    if {tree_key(cwd), DIFF_TOO_BIG + tree_key(cwd)} & known:
+        # 310 of 310 writers in two big work trees left no patch. A task with a scope still gets one for the paths it
+        # may change: git then looks at those instead of the whole tree.
+        here = os.path.realpath(cwd)
+        inside = [p for p in scope or [] if p != here and Path(p).is_relative_to(here) and DIFF_TOO_BIG + tree_key(p) not in known]
+        if not inside or len(inside) < len(scope):
+            return diff_skipped(job_dir, "the tree is recorded as too big")
+        only = [os.path.relpath(p, here).replace(os.sep, "/") for p in inside]
     try:
         try:
             paths = git(cwd, "rev-parse", "--show-toplevel", "--git-path", "objects", "--git-path", "index",
@@ -1587,7 +1611,7 @@ def diff_begin(job_dir, cwd, enabled=True):
                 raise
             return diff_save(job_dir, {"diff_status": "not_git"})
         repo, objects, index = (os.path.normpath(os.path.join(cwd, p)) for p in paths)
-        base = {"cwd": cwd, "repo": repo, "objects": objects}
+        base = {"cwd": cwd, "repo": repo, "objects": objects, **({"paths": only} if only else {})}
         deadline = time.monotonic() + DIFF_BUDGET
         cache = diff_index_cache(cwd)
 
@@ -1615,7 +1639,8 @@ def diff_begin(job_dir, cwd, enabled=True):
             base["tree"] = diff_tree(job_dir, base, max(0.1, deadline - time.monotonic()))[0]
         (job_dir / "diff-base.json").write_text(json.dumps(base), "utf-8")
     except subprocess.TimeoutExpired:
-        remember_too_big(cwd, DIFF_TOO_BIG)
+        for path in diff_slow_paths({"cwd": cwd, "paths": only}):
+            remember_too_big(path, DIFF_TOO_BIG)
         diff_skipped(job_dir, f"recording the starting tree exceeded {DIFF_BUDGET}s")
     except (OSError, ValueError) as e:
         diff_skipped(job_dir, str(e) or type(e).__name__)
@@ -1658,7 +1683,8 @@ def diff_end(job_dir, budget=DIFF_BUDGET, note=None):
         return diff_save(job_dir, info)
     except subprocess.TimeoutExpired:
         if budget >= DIFF_BUDGET:
-            remember_too_big(base["cwd"], DIFF_TOO_BIG)
+            for path in diff_slow_paths(base):
+                remember_too_big(path, DIFF_TOO_BIG)
         reason = f"recording the final tree exceeded {budget}s"
     except (OSError, ValueError, KeyError, TypeError) as e:
         reason = str(e) or type(e).__name__
@@ -1797,9 +1823,18 @@ def execute(args, prompt, run_dir):
             runner_home = Path(normalized_path(str(HOME.resolve())))
             if any(Path(normalized_path(path)).is_relative_to(runner_home) for path in monitored):
                 return None
-            return snapshot(args.cwd, scope=monitored, strict=True, exclude_tree=str(runner_home))
+            # Every tool call arrives as an item event, so a stream with none of them is enough when the walk cannot
+            # finish; without this a big workspace never hands a refused or out-of-quota task to Gemini.
+            known = too_big_trees()
+            if all(tree_key(path) in known for path in monitored):
+                return STREAM_ONLY
+            walked = snapshot(args.cwd, scope=monitored, strict=True, exclude_tree=str(runner_home))
+            return STREAM_ONLY if walked is None else walked
         except (OSError, ValueError):
             return None
+
+    def tree_changed():
+        return baseline is not STREAM_ONLY and baseline != fallback_snapshot()
 
     try:
         if writes:
@@ -1844,7 +1879,7 @@ def execute(args, prompt, run_dir):
             # Jobs queued before --scope existed have no scope in args.json.
             before, scope = snapshot_before(args.cwd, scope_args)
             with suppress(OSError):  # not even a full disk may fail the task over its diff
-                diff_begin(run_dir, args.cwd, not getattr(args, "no_diff", False))
+                diff_begin(run_dir, args.cwd, not getattr(args, "no_diff", False), scope_args)
 
         def changes():
             if args.sandbox == "read-only":
@@ -1874,14 +1909,14 @@ def execute(args, prompt, run_dir):
             if not gemini and not router_reachable():
                 state = {"end_reason": "router_down", "error": "Local model router is not reachable", "thread_id": thread_id}
                 kind, retryable = "router_down", True
-                if baseline is not None and baseline != fallback_snapshot():
+                if baseline is not None and tree_changed():
                     baseline = None
             else:
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
                 runner_event(run_dir, attempt, "gemini_running" if gemini else "codex_running", last_error_kind)
                 state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard)
                 if baseline is not None and (not state.get("fallback_stream_safe") or state["file_changes"] or
-                                             baseline != fallback_snapshot()):
+                                             tree_changed()):
                     baseline = None
                 followup_thread = resumable(state["thread_id"])
                 if not gemini and args.sandbox == "read-only":

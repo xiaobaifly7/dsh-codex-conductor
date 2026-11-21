@@ -26,7 +26,7 @@ const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWith
   REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
-const { ENGINE_GUIDANCE, ENGINE_PARAMETER, checkEngine, jobEngine, runEngine, verifyEngine, geminiArgv, poolAccount } =
+const { ENGINE_GUIDANCE, ENGINE_PARAMETER, checkEngine, jobEngine, runEngine, verifyEngine, geminiArgv, poolAccount, codexQuotaUntil } =
   await import(new URL(`./engines.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
 const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
@@ -2066,7 +2066,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     })]);
   }
 
+  // shortcut: 只记在内存里，重载插件即解除；重载后第一单 Codex 失败会重新记上。
+  let codexQuota = 0;
   async function withCompletionNotices(value, exec, { allowFallback = true } = {}) {
+    if (value.status === 'failed' && jobEngine(value) === 'codex') {
+      codexQuota = Math.max(codexQuota, codexQuotaUntil(value.error, value.finished_at));
+    }
     const terminal = ['completed', 'failed', 'cancelled'].includes(value.status) && !unknownState(value);
     const blockLine = terminal && repeatBlockLine(value.repeat_guard?.blocks);
     const standingLine = terminal && repeatStandingLine(value.repeat_guard?.standing);
@@ -2661,7 +2666,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       args = { ...args, expect_blocked: [...new Set(args.expect_blocked)] };
       routing = { ...routing, expect_blocked_count: args.expect_blocked.length };
     }
-    const engine = runEngine(args, cfg);
+    let engine = runEngine(args, cfg);
+    let quotaLine;
+    // 额度用完后的 40 分钟里规划端又派了 8 单同样失败的 Codex 任务；恢复时间前不再启动 Codex。
+    if (engine === 'codex' && Date.now() < codexQuota) {
+      const until = new Date(codexQuota).toLocaleString('zh-CN', { hour12: false });
+      const takeover = cfg.gemini?.command && cfg.geminiFallback !== false;
+      if (!takeover || args.engine !== undefined || args.resume) {
+        throw reject(`${continuation ? 'codex_continue' : 'codex_run'}: Codex 额度已用完，预计 ${until} 恢复，这期间不再派 Codex，未启动任务。` +
+          (cfg.gemini?.command ? '改传 engine: "gemini" 交给 Gemini。' : '') + '额度提前恢复时，在“Codex 指挥”面板重新加载插件即可解除。');
+      }
+      engine = 'gemini';
+      args = { ...args, engine, model: undefined, service_tier: undefined, use_user_config: undefined };
+      quotaLine = `Codex 额度已用完（预计 ${until} 恢复），本单已改派 Gemini。`;
+    }
     let effortLine;
     if (engine === 'gemini' && !continuation && !verificationOf && args.effort !== undefined) {
       effortLine = cfg.gemini?.executionEffort ? `本单 Gemini 使用配置的 effort=${cfg.gemini.executionEffort}。`
@@ -2923,7 +2941,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
     const key = shown.rendered ? 'rendered' : 'next';
-    const lines = [standingLine, effortLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
+    const lines = [standingLine, effortLine, quotaLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
     const renderedNext = [standingLine, ...predispatch].filter(Boolean).join('\n');
     return { ...shown, ...(shown.rendered && renderedNext ? { next: [shown.next, renderedNext].filter(Boolean).join('\n') } : {}),
       ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
@@ -3008,6 +3026,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (unknown.length) throw new Error(`codex_run: 未知参数 ${unknown.join(', ')}；codex_run 的任务正文写在 task，不是 prompt/message/content`);
       if (args.fresh !== undefined && typeof args.fresh !== 'boolean') throw new Error('codex_run: fresh 必须是布尔值');
       if (args.model !== undefined && (typeof args.model !== 'string' || !args.model.trim())) throw new Error('codex_run: model 必须是非空字符串');
+      // 配置的模型带提供方前缀时，网关按前缀选通道；3 单裸名 gpt-6.2 被转到未登录的通道，各自重试了 10 分钟。
+      if (args.model && runEngine(args, cfg) === 'codex' && cfg.model?.includes('/') && !args.model.includes('/')) {
+        throw new Error(`codex_run: model 要带提供方前缀，例如 ${cfg.model.split('/')[0]}/${args.model}；裸模型名会被网关转到其他通道。省略 model 则用配置的 ${cfg.model}。`);
+      }
       const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, args, exec, 'codex_run');
       // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
       let thread = null;
