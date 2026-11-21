@@ -72,6 +72,9 @@ def _path_from_cwd(path, cwd, windows):
 
 
 HOST_COMMANDS = ["command(*)", "unsandboxed(*)"]
+# Files outside the workspace need their own allow rules; without them 5 of 13 host jobs had reads auto-denied and one failed.
+HOST_READS = ["read_file(*)"]
+HOST_WRITES = ["read_file(*)", "write_file(*)"]
 
 
 def build_command(args, run_dir, conversation_id, scratch=None):
@@ -113,15 +116,15 @@ def build_command(args, run_dir, conversation_id, scratch=None):
     host = args.sandbox == "danger-full-access"
     if readonly:
         flags += ["--mode", "plan"]
-        settings.update(allowNonWorkspaceAccess=False, enableTerminalSandbox=not host, permissions={
-            "allow": HOST_COMMANDS if host else [], "ask": [],
+        settings.update(allowNonWorkspaceAccess=host, enableTerminalSandbox=not host, permissions={
+            "allow": HOST_COMMANDS + HOST_READS if host else [], "ask": [],
             "deny": ["write_file(*)", *([] if host else ["command(*)", "unsandboxed(*)"]),
                      "mcp(*)", "read_url(*)", "execute_url(*)"],
         })
     else:
         flags += ["--mode", "accept-edits"]
         if host:
-            settings["permissions"] = {"allow": HOST_COMMANDS}
+            settings["permissions"] = {"allow": HOST_COMMANDS + HOST_WRITES}
 
     flags += ["--settings", json.dumps(settings, separators=(",", ":"))]
     if args.schema:

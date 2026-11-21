@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.141` Gemini 主机访问任务可以读写工作区外的文件：写任务放行 `read_file(*)` 和 `write_file(*)`，只读任务放行 `read_file(*)` 并允许访问工作区外，仍禁止写文件。此前 agy 无人值守时没有对应放行规则就自动拒绝，13 个 Gemini 任务里 5 个读文件被拒、1 个因此失败。沙箱内的 Gemini 任务不变。
+
 `0.9.140` 新增 `lockEngine`：打开后新任务、续接和核验一律用 `defaultEngine`，规划端传的 `engine` 不生效，续接原 Codex 任务时自动转给 Gemini 并附上轮交接，锁定 Gemini 时 `codex_run` 不接受 `resume`（改用 `codex_continue`）；工具说明和注入的引擎提示改为说明锁定。新增 `gemini.forceModel`：规划端传的 model 一律忽略，续接原 Gemini 会话也改用配置的模型；`gemini.forceEffort` 同样作用于续接和核验。Gemini 超过 `maxGeminiRunningJobs` 时不再直接失败（`engine_limit`），改为排队等名额（`engine_wait`，最多等 `lockTimeoutSeconds`），名额是操作系统文件锁，进程退出即释放。账号池选号时检查账号是否支持该模型、额度是否不足 10%（本周 5%）：此前 Neon 等 Gemini 4 模型可能被派到没有 Gemini 4 的账号。
 
 `0.9.139` Codex 任务默认不再加载 Codex 插件（`--disable plugins`，`use_user_config=true` 时照常加载）。此前只要 Codex 配置里启用了任何插件，失败的任务就不会自动交给 Gemini 接替，因为插件自带的 MCP 和应用随会话启动、无法按名字关掉；本机启用了 9 个，所以这条接替从未触发。631 个任务里没有一个调用过插件工具。大目录里按范围留补丁时，范围路径被 `.gitignore` 排除不再让整单没有补丁：这类路径跳过，其余照常记录。
@@ -177,6 +179,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.141` Gemini host-access jobs can read and write files outside the workspace: writers allow `read_file(*)` and `write_file(*)`, read-only jobs allow `read_file(*)` with non-workspace access and still deny writes. Headless agy auto-denies anything without an allow rule; 5 of 13 Gemini jobs had reads denied and one failed on it. Sandboxed Gemini jobs are unchanged.
 
 `0.9.140` New `lockEngine`: every task, continuation and verification runs on `defaultEngine` whatever `engine` the planner passes; continuing a Codex job moves it to Gemini with the previous round handed over, and with Gemini locked `codex_run` refuses `resume` (use `codex_continue`). Tool descriptions and the injected engine guidance describe the lock. New `gemini.forceModel`: the planner's model is ignored and continued Gemini conversations switch to the configured model; `gemini.forceEffort` now covers continuations and verifications too. Gemini jobs over `maxGeminiRunningJobs` queue for a slot (`engine_wait`, up to `lockTimeoutSeconds`) instead of failing with `engine_limit`; a slot is an OS file lock released when the worker exits. The account pool now checks that an account supports the model and has more than 10% (weekly 5%) quota left: a Gemini 4 model such as Neon could be sent to an account without Gemini 4.
 
