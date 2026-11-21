@@ -30,6 +30,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -57,6 +58,7 @@ else:
 # could not be handed to Gemini (their MCP servers and apps start with the session and cannot be turned off by name).
 STRIP_USER_EXTRAS = ["--disable", "hooks", "-c", "skills.include_instructions=false",
                      "--disable", "goals", "--disable", "image_generation", "--disable", "plugins"]
+WINDOWS_USER_CONFIG_ERROR = "Windows native mode does not support --use-user-config. Use the private Codex configuration."
 
 HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
@@ -96,6 +98,9 @@ PERMANENT = re.compile(
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
 # The same refusal also arrives as a failed turn with no reconnect notice ("This content was flagged for ...").
 REFUSED = re.compile(r"refused this request|safety filter|content was flagged for", re.I)
+SANDBOX_PROBE_TIMEOUT = 90
+SANDBOX_SETUP_FAILURE = ("Failed to create unified exec process: orchestrator_helper_incomplete: "
+                         "setup helper exited successfully before setup completed")
 # The model service answering 400 "Bad Request" to one request of a thread: seven jobs in one evening, and both a
 # retry inside the job and a later resume of the same thread were rejected again, while a new thread worked.
 REJECTED = re.compile(r"bad request|invalid_request_error", re.I)
@@ -124,7 +129,8 @@ def find_codex():
     """Locate the codex CLI. Inside WSL a PATH entry under /mnt/ is the Windows build, so skip it;
     `wsl.exe -e` also skips the login profile, so check the usual npm/user bin directories too."""
     if IS_WIN:
-        return shutil.which("codex")
+        # Only the real executable: npm's codex.cmd runs through cmd.exe, which expands & | %VAR% in task arguments.
+        return shutil.which("codex.exe")
     for d in os.environ.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(d, "codex")
         if d and not d.startswith("/mnt/") and os.access(candidate, os.X_OK):
@@ -138,11 +144,295 @@ def find_codex():
 def launcher():
     """Return the argv prefix and env; CODEX_RUNNER_CMD (a JSON argv list) overrides the lookup."""
     env = dict(os.environ)
+    if IS_WIN and env.get("CODEX_RUNNER_PWSH_DIR"):
+        env["PATH"] = os.pathsep.join(filter(None, (env["CODEX_RUNNER_PWSH_DIR"], env.get("PATH"))))
     override = os.environ.get("CODEX_RUNNER_CMD")
     if override:
-        return json.loads(override), env
+        argv = json.loads(override)
+        if IS_WIN and str(argv[0]).lower().endswith((".cmd", ".bat")):
+            raise ValueError(f"codexBin must be codex.exe, not a cmd.exe script: {argv[0]}")
+        return argv, env
     # A missing CLI fails at spawn with a clear "No such file" error.
     return [find_codex() or "codex"], env
+
+
+if IS_WIN:
+    import _winapi
+    import ctypes
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [
+            ("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+            ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+            ("parent", wintypes.DWORD), ("priority", wintypes.LONG), ("flags", wintypes.DWORD),
+            ("name", wintypes.WCHAR * 260),
+        ]
+
+    for enumerate_process in (kernel.Process32FirstW, kernel.Process32NextW):
+        enumerate_process.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+
+    class JobBasicLimits(ctypes.Structure):
+        _fields_ = [("process_time", ctypes.c_int64), ("job_time", ctypes.c_int64), ("flags", wintypes.DWORD),
+                    ("min_working_set", ctypes.c_size_t), ("max_working_set", ctypes.c_size_t),
+                    ("active_limit", wintypes.DWORD), ("affinity", ctypes.c_size_t),
+                    ("priority", wintypes.DWORD), ("scheduling", wintypes.DWORD)]
+
+    class JobExtendedLimits(ctypes.Structure):
+        _fields_ = [("basic", JobBasicLimits), ("io", ctypes.c_uint64 * 6),
+                    ("memory", ctypes.c_size_t * 4)]
+
+    class JobAccounting(ctypes.Structure):
+        _fields_ = [("times", ctypes.c_int64 * 4), ("faults", wintypes.DWORD),
+                    ("total", wintypes.DWORD), ("active", wintypes.DWORD), ("terminated", wintypes.DWORD)]
+
+    class JobProcessIds(ctypes.Structure):
+        _fields_ = [("assigned", wintypes.DWORD), ("count", wintypes.DWORD), ("pids", ctypes.c_size_t * 256)]
+
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.OpenJobObjectW.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel.OpenJobObjectW.restype = wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+
+
+def create_windows_job(name):
+    ctypes.set_last_error(0)
+    handle = kernel.CreateJobObjectW(None, name)
+    error = ctypes.get_last_error()
+    if not handle:
+        raise ctypes.WinError(error)
+    try:
+        if error == 183:
+            raise ctypes.WinError(error)
+        set_windows_job_kill_on_close(handle, True)
+        return handle
+    except OSError:
+        _winapi.CloseHandle(handle)
+        raise
+
+
+def set_windows_job_kill_on_close(handle, enabled):
+    limits = JobExtendedLimits()
+    limits.basic.flags = 0x2000 if enabled else 0  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE; no breakaway.
+    if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def open_windows_job(name, access):
+    handle = kernel.OpenJobObjectW(access, False, name)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error != 2:  # ERROR_FILE_NOT_FOUND: the owner closed the job or exited.
+            raise ctypes.WinError(error)
+    return handle
+
+
+def stop_windows_job(handle):
+    if not kernel.TerminateJobObject(handle, 1):
+        raise ctypes.WinError(ctypes.get_last_error())
+    deadline = time.monotonic() + 10
+    accounting = JobAccounting()
+    while True:
+        if not kernel.QueryInformationJobObject(handle, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if accounting.active == 0:
+            return
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Windows Codex Job did not empty after termination")
+        time.sleep(.02)
+
+
+def windows_job_pids(job_dir):
+    """Read Job membership for the end-to-end diagnostic, including orphaned and cross-account processes."""
+    try:
+        name = (Path(job_dir) / "codex.job").read_text()
+    except FileNotFoundError:
+        return []
+    handle = open_windows_job(name, 0x0004)  # JOB_OBJECT_QUERY
+    if not handle:
+        return []
+    try:
+        entries = JobProcessIds()
+        if not kernel.QueryInformationJobObject(handle, 3, ctypes.byref(entries), ctypes.sizeof(entries), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return list(entries.pids[:entries.count])
+    finally:
+        _winapi.CloseHandle(handle)
+
+
+class WindowsJobCleanupError(OSError):
+    pass
+
+
+def windows_job_command(directory, name, command):
+    return [sys.executable, "-B", os.path.abspath(__file__), "_job_exec", str(directory), name, *command]
+
+
+def windows_job_exec(directory, name, command):
+    # Join before creating Codex. Only the worker retains the kill-on-close handle.
+    with acquire_file_lock(Path(directory) / "process.lock", blocking=True):
+        handle = open_windows_job(name, 0x0001)  # JOB_OBJECT_ASSIGN_PROCESS
+        if not handle:
+            return 1
+        try:
+            if not kernel.AssignProcessToJobObject(handle, _winapi.GetCurrentProcess()):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            _winapi.CloseHandle(handle)
+    return subprocess.call(command, stdin=sys.stdin.buffer, stdout=sys.stdout.buffer, stderr=sys.stderr.buffer,
+                           creationflags=NO_WINDOW)
+
+
+def stop_attempt(proc, job):
+    if job is None:
+        kill_tree(proc.pid)
+        return
+    try:
+        stop_windows_job(job)
+        # An early timeout can catch the bootstrap before it has joined.
+        if proc.poll() is None:
+            proc.kill()
+        # Popen.kill can record an exit code before a concurrently terminated process is signalled.
+        if _winapi.WaitForSingleObject(int(proc._handle), 10000) != _winapi.WAIT_OBJECT_0:
+            raise TimeoutError("Windows Codex bootstrap did not terminate")
+    except OSError as error:
+        raise WindowsJobCleanupError(str(error)) from error
+
+
+def open_windows_process(pid, access):
+    try:
+        return _winapi.OpenProcess(access | 0x1000 | _winapi.SYNCHRONIZE, False, pid)
+    except OSError as error:
+        if getattr(error, "winerror", None) != 87:  # ERROR_INVALID_PARAMETER: no such PID.
+            raise
+        return None
+
+
+def terminate_windows_process(handle, pid):
+    if _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_OBJECT_0:
+        return False
+    try:
+        _winapi.TerminateProcess(handle, 1)
+    except PermissionError:
+        if _winapi.WaitForSingleObject(handle, 1000) != _winapi.WAIT_OBJECT_0:
+            raise
+    if _winapi.WaitForSingleObject(handle, 10000) != _winapi.WAIT_OBJECT_0:
+        raise TimeoutError(f"Windows process {pid} did not terminate")
+    return True
+
+
+def stop_legacy_windows_children(parent, parent_handle, errors):
+    # Keep the stopped parent's PID pinned. A child PID recycled after the snapshot starts after its parent exited.
+    born, exited = windows_process_times(parent_handle)
+    for pid, ppid, _ in windows_processes():
+        if ppid != parent or pid == parent:
+            continue
+        try:
+            handle = open_windows_process(pid, 0x0001)  # PROCESS_TERMINATE
+            if handle is None:
+                continue
+            try:
+                started, _ = windows_process_times(handle)
+                if born < started < exited:
+                    terminate_windows_process(handle, pid)
+                    stop_legacy_windows_children(pid, handle, errors)
+            finally:
+                _winapi.CloseHandle(handle)
+        except OSError as error:
+            errors.append(f"PID {pid}: {error}")
+
+
+def stop_recorded_windows_process(pid_file, *, tree_errors=None):
+    """Verify the recorded creation time on the handle used to terminate."""
+    try:
+        pid = int(pid_file.read_text())
+    except FileNotFoundError:
+        return False
+    handle = open_windows_process(pid, 0x0001)
+    if handle is None:
+        return False
+    try:
+        if tree_errors is None and _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_OBJECT_0:
+            return False
+        expected = pid_file.with_suffix(".start").read_text().strip()
+        if not expected:
+            raise OSError(f"Missing Windows creation time for PID {pid}")
+        actual, _ = windows_process_times(handle)
+        if str(actual) != expected:
+            return False
+        stopped = terminate_windows_process(handle, pid)
+        if tree_errors is not None:
+            stop_legacy_windows_children(pid, handle, tree_errors)
+        return stopped
+    finally:
+        _winapi.CloseHandle(handle)
+
+
+def stop_windows_task(job_dir):
+    try:
+        name = (job_dir / "codex.job").read_text()
+    except FileNotFoundError:
+        name = None
+    if name is not None:
+        if not re.fullmatch(r"Local\\dsh-codex-[0-9a-f]{32}", name):
+            raise ValueError("Invalid Windows Codex Job name")
+        handle = open_windows_job(name, 0x0004 | 0x0008)  # QUERY | TERMINATE
+        if handle:
+            try:
+                stop_windows_job(handle)
+            finally:
+                _winapi.CloseHandle(handle)
+    worker = job_dir / "worker.pid"
+    codex = job_dir / "codex.pid"
+    if name is not None or task_record(job_dir).get("windows_job_containment") is True:
+        # Covers the bootstrap before it joins and workers between attempts.
+        stop_recorded_windows_process(codex)
+        return stop_recorded_windows_process(worker)
+    errors = []
+    for record in (codex, worker):
+        try:
+            stop_recorded_windows_process(record, tree_errors=errors)
+        except (OSError, ValueError) as error:
+            errors.append(f"{record.name}: {error}")
+    detail = "Legacy Windows task has no Job record. Previously orphaned processes cannot be ruled out."
+    if errors:
+        detail += " Cleanup errors: " + "; ".join(errors)
+    raise OSError(detail)
+
+
+def windows_processes():
+    # tasklist/taskkill may be denied by a restricted Windows token, even for our own children.
+    snapshot = kernel.CreateToolhelp32Snapshot(2, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        entry = ProcessEntry()
+        entry.size = ctypes.sizeof(entry)
+        present = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        while present:
+            yield entry.pid, entry.parent, entry.name
+            present = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        _winapi.CloseHandle(snapshot)
+
+
+def windows_process_times(handle):
+    times = (wintypes.FILETIME * 4)()
+    if not kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return tuple((t.dwHighDateTime << 32) | t.dwLowDateTime for t in times[:2])
 
 
 def descendants(pid):
@@ -164,18 +454,13 @@ def descendants(pid):
 
 
 def kill_tree(pid):
-    if not IS_WIN:
-        found = descendants(pid)  # before the group dies: orphans are reparented and lose the chain
-        try:
-            os.killpg(pid, signal.SIGKILL)  # children start in their own session, so the group id is the pid
-        except ProcessLookupError:
-            pass
-        for child, started in found:
-            with suppress(OSError):
-                if process_start(child) == started:  # the pid still names the process that was a descendant
-                    os.kill(child, signal.SIGKILL)
-        return
-    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, creationflags=NO_WINDOW)
+    found = descendants(pid)  # before the group dies: orphans are reparented and lose the chain
+    with suppress(ProcessLookupError):
+        os.killpg(pid, signal.SIGKILL)  # children start in their own session, so the group id is the pid
+    for child, started in found:
+        with suppress(OSError):
+            if process_start(child) == started:
+                os.kill(child, signal.SIGKILL)
 
 
 def pid_alive(pid):
@@ -187,36 +472,28 @@ def pid_alive(pid):
         except PermissionError:
             pass
         return True
-    out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"], capture_output=True, text=True,
-                         errors="replace", creationflags=NO_WINDOW).stdout
-    return f'"{pid}"' in out
+    return process_start(pid) is not None
 
 
 def proc_start(pid):
-    return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    if not IS_WIN:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+    handle = open_windows_process(pid, 0)
+    if handle is None:
+        raise ProcessLookupError(pid)
+    try:
+        if _winapi.WaitForSingleObject(handle, 0) == _winapi.WAIT_OBJECT_0:
+            raise ProcessLookupError(pid)
+        return str(windows_process_times(handle)[0])
+    finally:
+        _winapi.CloseHandle(handle)
 
 
 def process_start(pid):
-    if not IS_WIN:
-        try:
-            return proc_start(pid)
-        except (OSError, IndexError):
-            return None
-    import ctypes
-    from ctypes import wintypes
-
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.OpenProcess.restype = wintypes.HANDLE
-    handle = wintypes.HANDLE(kernel.OpenProcess(0x1000, False, pid))
-    if not handle:
-        return None
-    times = (wintypes.FILETIME * 4)()
     try:
-        if kernel.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
-            return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
-    finally:
-        kernel.CloseHandle(handle)
-    return None
+        return proc_start(pid)
+    except (OSError, IndexError):
+        return None
 
 
 def record_pid(path, pid):
@@ -239,6 +516,13 @@ def recorded_pid(path):
 
 
 def kernel_boot_id():
+    if IS_WIN:
+        # SystemBootEnvironmentInformation starts with the current Windows boot GUID.
+        data = ctypes.create_string_buffer(32)
+        query = ctypes.WinDLL("ntdll").NtQuerySystemInformation
+        if query(90, ctypes.byref(data), ctypes.sizeof(data), None) != 0:
+            raise OSError("Windows boot identity unavailable")
+        return str(uuid.UUID(bytes_le=data.raw[:16]))
     return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
 
 
@@ -246,9 +530,9 @@ def boot_id():
     """Identifies this distro instance: the kernel boot id plus when this PID namespace's init (pid 1) started.
     The kernel boot id alone misses `wsl --terminate <distro>` or a distro auto-stop while the VM stays up — the
     kernel does not reboot but pids start over, so a bare pid could then name an unrelated process. init's start
-    time (field 22 of /proc/1/stat, ticks since kernel boot) changes on every distro restart. None where no /proc."""
+    time (field 22 of /proc/1/stat, ticks since kernel boot) changes on every distro restart."""
     try:
-        return kernel_boot_id() + ":" + proc_start(1)
+        return kernel_boot_id() if IS_WIN else kernel_boot_id() + ":" + proc_start(1)
     except (OSError, IndexError):
         return None
 
@@ -403,17 +687,46 @@ def disable_user_mcp_servers():
     return out
 
 
+def private_windows_path(value, name):
+    if not value or not Path(value).is_absolute():
+        raise ValueError(f"Windows native mode requires a private absolute {name}")
+    directory = Path(value)
+    profile = Path(os.environ.get("USERPROFILE") or Path.home())
+    local = os.environ.get("LOCALAPPDATA")
+    protected = [profile / ".codex", profile / ".local/state/codex-runner"]
+    if local:
+        protected.extend(Path(local) / name for name in ("dsh-codex-conductor", "codex-runner"))
+    resolved = directory.resolve()
+    if any(path.is_relative_to(root) for path in (directory, resolved)
+           for base in protected for root in (base, base.resolve())):
+        raise ValueError(f"Windows native {name} points into an online state directory: {directory}")
+    return resolved
+
+
 def replace_user_agents_md(env):
     """Opt-in CODEX_RUNNER_AGENTS_MD: "none" leaves the user-level AGENTS.md out of jobs, a file path puts that file
-    in its place. Codex reads it only from CODEX_HOME, so jobs get a home of symlinks to every other entry of the
-    real one (same config, sessions and state databases, so resume still finds the thread)."""
+    in its place. Windows uses the runner's private Codex home for config and all session state.
+    WSL uses a linked view of the existing home so resume can still find its threads."""
     choice = env.get("CODEX_RUNNER_AGENTS_MD")
     if not choice:
         return
     real = Path(env.get("CODEX_HOME") or Path.home() / ".codex")
     home = HOME / "codex-home"
+    if IS_WIN:
+        home = private_windows_path(env.get("CODEX_HOME"), "CODEX_HOME")
+        home.mkdir(parents=True, exist_ok=True)
+        agents = home / "AGENTS.md"
+        if choice == "none":
+            agents.unlink(missing_ok=True)
+        else:
+            temp = home / f".AGENTS.md.{os.getpid()}"
+            try:
+                temp.write_bytes(Path(local_path(choice)).read_bytes())
+                os.replace(temp, agents)
+            finally:
+                temp.unlink(missing_ok=True)
+        return
     home.mkdir(parents=True, exist_ok=True)
-    # shortcut: symlinks need Linux/WSL (Windows needs Developer Mode); a failure here fails the job visibly.
     for entry in real.iterdir():
         if entry.name != "AGENTS.md":
             try:
@@ -437,6 +750,9 @@ def build_command(args, run_dir, thread_id, scratch=None):
     if thread_id:
         cmd.append("resume")
     cmd += ["--json", "--skip-git-repo-check", "-o", str(run_dir / "last_message.txt")]
+    if IS_WIN:
+        env["CODEX_HOME"] = str(private_windows_path(env.get("CODEX_HOME"), "CODEX_HOME"))
+        cmd += ["-c", "allow_login_shell=false"]
     if not args.use_user_config:
         cmd += STRIP_USER_EXTRAS + disable_user_mcp_servers()
         replace_user_agents_md(env)
@@ -502,8 +818,76 @@ def confirm_agy_stopped(run_dir):
     return False
 
 
+def attempt_timeout(args, now, start, reconnecting_since, last_event, active_commands):
+    if IS_WIN and now - start >= args.timeout:
+        return "timeout"
+    expired = (lambda elapsed, limit: elapsed >= limit) if IS_WIN else (lambda elapsed, limit: elapsed > limit)
+    if reconnecting_since and expired(now - reconnecting_since, args.reconnect_timeout):
+        return "reconnect_timeout"
+    if not IS_WIN and now - start > args.timeout:
+        return "timeout"
+    if not active_commands and expired(now - last_event, args.idle_timeout):
+        return "idle_timeout"
+    return None
+
+
+def windows_output_pipe(name):
+    address = "\\\\.\\pipe\\" + name.removeprefix("Local\\")
+    output = _winapi.CreateNamedPipe(address, _winapi.PIPE_ACCESS_INBOUND | _winapi.FILE_FLAG_OVERLAPPED
+                                    | _winapi.FILE_FLAG_FIRST_PIPE_INSTANCE, _winapi.PIPE_WAIT,
+                                    1, 0, 8192, _winapi.NMPWAIT_WAIT_FOREVER, _winapi.NULL)
+    child = None
+    try:
+        child = _winapi.CreateFile(address, _winapi.GENERIC_WRITE, 0, _winapi.NULL, _winapi.OPEN_EXISTING, 0, _winapi.NULL)
+        _winapi.ConnectNamedPipe(output, overlapped=True).GetOverlappedResult(True)
+        return output, msvcrt.open_osfhandle(child, os.O_WRONLY | os.O_BINARY)
+    except BaseException:
+        if child is not None:
+            _winapi.CloseHandle(child)
+        _winapi.CloseHandle(output)
+        raise
+
+
+def windows_output_lines(output, proc):
+    process = int(proc._handle)
+    remaining = None
+    partial = bytearray()
+    try:
+        while remaining != 0:
+            if remaining is None and _winapi.WaitForSingleObject(process, 0) == _winapi.WAIT_OBJECT_0:
+                # The bootstrap has reaped Codex. A surviving child can keep stdout open or keep writing.
+                remaining, _ = _winapi.PeekNamedPipe(output, 0)
+                if not remaining:
+                    break
+            operation, error = _winapi.ReadFile(output, 8192 if remaining is None else min(8192, remaining), True)
+            if error == _winapi.ERROR_IO_PENDING and remaining is None:
+                if _winapi.WaitForMultipleObjects([process, operation.event], False, _winapi.INFINITE) == _winapi.WAIT_OBJECT_0:
+                    operation.cancel()
+            size, error = operation.GetOverlappedResult(True)
+            if error == _winapi.ERROR_OPERATION_ABORTED:
+                continue  # The process signalled. Read only what is already buffered.
+            if not size:
+                break
+            if remaining is not None:
+                remaining -= size
+            parts = operation.getbuffer().split(b"\n")
+            if len(parts) > 1:
+                partial.extend(parts[0])
+                yield bytes(partial) + b"\n"
+                for line in parts[1:-1]:
+                    yield line + b"\n"
+                partial.clear()
+            partial.extend(parts[-1])
+    except BrokenPipeError:
+        pass
+    if partial:
+        yield bytes(partial) + b"\n"  # Keep the next runner phase on a separate JSONL line.
+    # EOF can precede process exit. Wake the monitor only when the bootstrap actually exits.
+    _winapi.WaitForSingleObject(process, _winapi.INFINITE)
+
+
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
-    """Run one provider process to a verdict. A completed turn determines success."""
+    """Run one provider process to a verdict, including command setup failures. A completed turn determines success."""
     scratch = getattr(args, "verification_scratch", None)
     gemini = getattr(args, "engine", None) == "gemini"
     id_field = "conversation_id" if gemini else "thread_id"
@@ -516,9 +900,17 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
         state["engine"] = "gemini"
         adapter = agy_runner.EventAdapter()
     else:
-        cmd, env = build_command(args, run_dir, thread_id, scratch)
+        try:
+            cmd, env = build_command(args, run_dir, thread_id, scratch)
+        except ValueError as error:
+            state.update(end_reason="bad_arguments", error=str(error))
+            return state
     start = time.monotonic()
-    proc = reader = writer = None
+    proc = reader = writer = job = stdout_handle = None
+    reader_started = False
+    job_file = run_dir / "codex.job"
+    sandbox_setup_failure = None
+    preserve_job = False
     startup = acquire_file_lock(run_dir / "process.lock", blocking=True)
     try:
         if gemini:
@@ -531,8 +923,19 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
             state["stderr_offset"] = stderr_log.tell()
             try:
                 cwd = scratch if scratch and args.sandbox == "read-only" else args.cwd
-                proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                        stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
+                child_stdout = subprocess.PIPE
+                if IS_WIN:
+                    name = "Local\\dsh-codex-" + uuid.uuid4().hex
+                    job = create_windows_job(name)
+                    job_file.write_text(name)
+                    cmd = windows_job_command(run_dir, name, cmd)
+                    stdout_handle, child_stdout = windows_output_pipe(name)
+                try:
+                    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=child_stdout,
+                                            stderr=stderr_log, creationflags=NO_WINDOW, start_new_session=not IS_WIN)
+                finally:
+                    if IS_WIN:
+                        os.close(child_stdout)
             except OSError as e:
                 state["end_reason"] = "spawn_failed"
                 state["error"] = str(e)
@@ -541,6 +944,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
             startup.close()
             stdin_done = threading.Event()
             stdin_errors = []
+            lines = queue.Queue()
+            stdin_marker = object()
 
             def send_prompt():
                 # A child that stops reading must not block the timeout monitor.
@@ -555,14 +960,16 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                         pass  # Closing can flush the same broken pipe again.
                 finally:
                     stdin_done.set()
+                    if IS_WIN:
+                        lines.put(stdin_marker)
 
-            lines = queue.Queue()
             stdout_eof = possible_write = failure_observed = False
 
             def pump():
                 nonlocal stdout_eof, possible_write, failure_observed
                 try:
-                    for raw in proc.stdout:
+                    stream = windows_output_lines(stdout_handle, proc) if IS_WIN else proc.stdout
+                    for raw in stream:
                         received = time.monotonic() if repeat_guard else None
                         if not (gemini or fallback_check):
                             lines.put((raw, received))
@@ -588,11 +995,18 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                             lines.put((raw, received))
                     stdout_eof = True
                 finally:
-                    proc.stdout.close()
-                    lines.put(None)
+                    if IS_WIN:
+                        try:
+                            _winapi.CloseHandle(stdout_handle)
+                        finally:
+                            lines.put(None)
+                    else:
+                        proc.stdout.close()
+                        lines.put(None)
 
             reader = threading.Thread(target=pump, daemon=True)
             reader.start()
+            reader_started = True
             writer = threading.Thread(target=send_prompt, daemon=True)
             writer.start()
             last_event = time.monotonic()
@@ -607,7 +1021,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                 now = time.monotonic()
                 if stdin_errors:
                     state.update(completed=False, end_reason="spawn_failed", error=str(stdin_errors[0]))
-                    kill_tree(proc.pid)
+                    stop_attempt(proc, job)
                     break
                 if stdout_done and stdin_done.is_set() and (timeout_reason is None or completed_at):
                     # Keep the Linux leader unreaped until group cleanup so its PID cannot be reused.
@@ -616,16 +1030,14 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     if exited:
                         break
                 if completed_at and now - completed_at > args.exit_grace:
-                    state["forced_exit"] = True
-                    kill_tree(proc.pid)
+                    if not IS_WIN or proc.poll() is None:
+                        # The turn is done and may have written files; as on Linux, reap the process and keep the result.
+                        state["forced_exit"] = True
+                        stop_attempt(proc, job)
+                    # A successful Windows background child can still hold the stdout pipe.
                     break
                 if not completed_at and timeout_reason is None:
-                    if reconnecting_since and now - reconnecting_since > args.reconnect_timeout:
-                        timeout_reason = "reconnect_timeout"
-                    elif now - start > args.timeout:
-                        timeout_reason = "timeout"
-                    elif not active_commands and now - last_event > args.idle_timeout:
-                        timeout_reason = "idle_timeout"
+                    timeout_reason = attempt_timeout(args, now, start, reconnecting_since, last_event, active_commands)
                     if timeout_reason:
                         # Honour a completion already queued without letting later output defer the timeout.
                         lines.put(timeout_marker)
@@ -633,11 +1045,23 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     line = lines.get(timeout=0.5)
                 except queue.Empty:
                     continue
+                if IS_WIN and line is stdin_marker:
+                    continue
                 if line is timeout_marker:
                     if completed_at:
                         continue
                     state["end_reason"] = timeout_reason
-                    kill_tree(proc.pid)
+                    if IS_WIN:
+                        limit = {"timeout": args.timeout, "idle_timeout": args.idle_timeout,
+                                 "reconnect_timeout": args.reconnect_timeout}[timeout_reason]
+                        activity = {"timeout": "total execution", "idle_timeout": "without activity",
+                                    "reconnect_timeout": "reconnecting"}[timeout_reason]
+                        engine = "Gemini" if gemini else "Codex"
+                        detail = f"{engine} timed out after {limit:g}s {activity} ({state['commands']} commands completed, {len(active_commands)} active)"
+                        if state["error"]:
+                            detail += f"; last {engine} error: {state['error']}"
+                        state["error"] = detail
+                    stop_attempt(proc, job)
                     break
                 if line is None:
                     stdout_done = True
@@ -668,7 +1092,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                                 if block:
                                     state.update(completed=False, end_reason="repeated_failure", repeat_block=block,
                                                  error="A command started again after repeated long failures.")
-                                    kill_tree(proc.pid)
+                                    stop_attempt(proc, job)
                                     repeat_guard.record_block(block, event_log)
                                     break
                                 if item.get("id") is not None:
@@ -682,7 +1106,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                 if kind == "error":
                     if REFUSED.search(str(ev.get("message") or "")):
                         state.update(end_reason="model_refused", error=str(ev["message"])[:500])
-                        kill_tree(proc.pid)
+                        stop_attempt(proc, job)
                         break
                     reconnecting_since = reconnecting_since or time.monotonic()
                 else:
@@ -707,6 +1131,10 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     state["last_text"] = item.get("text")
                 elif kind == "item.completed" and item.get("type") == "command_execution":
                     state["commands"] += 1
+                    if IS_WIN and item.get("exit_code") == -1:
+                        command_output = (item.get("aggregated_output") or "").strip()
+                        if command_output.startswith(SANDBOX_SETUP_FAILURE):
+                            sandbox_setup_failure = command_output[:500]
                 elif kind == "item.completed" and item.get("type") == "file_change":
                     state["file_changes"] += [(c.get("path", ""), c.get("kind", "modified")) for c in item.get("changes", [])]
                     if repeat_guard and item.get("changes"):
@@ -714,35 +1142,57 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
             with acquire_file_lock(run_dir / "process.lock", blocking=True):
                 # Failed launchers can leave children behind after closing their standard streams.
                 if not IS_WIN and state["end_reason"] is None and (not state["completed"] or state["failed"]):
-                    kill_tree(proc.pid)
+                    stop_attempt(proc, job)
                 try:
                     proc.wait(timeout=10)
                 except subprocess.TimeoutExpired:
-                    kill_tree(proc.pid)
+                    stop_attempt(proc, job)
+        # Gemini keeps its own Job and confirmation path, so only Codex retains background children on success.
+        preserve_job = (job is not None and not gemini and state["completed"] and not state["failed"]
+                        and not state.get("forced_exit")
+                        and not sandbox_setup_failure and getattr(args, "retain_windows_job", False))
+    except WindowsJobCleanupError as error:
+        state.update(completed=False, end_reason="process_cleanup_failed", error=str(error))
+        state.pop("repeat_block", None)
     except BaseException:
         if proc is not None:
             # Preserve the original failure even if process cleanup also fails.
             with suppress(Exception):
-                kill_tree(proc.pid)
+                stop_attempt(proc, job)
             with suppress(Exception):
                 proc.wait(timeout=10)
         raise
     finally:
         startup.close()
-        wait_for_windows = proc is not None and gemini and windows_agy(args.agy_command)
-        waiting = False
-        while True:
-            with acquire_file_lock(run_dir / "process.lock", blocking=True):
-                if not wait_for_windows or confirm_agy_stopped(run_dir):
-                    (run_dir / "codex.pid").unlink(missing_ok=True)
-                    (run_dir / "codex.start").unlink(missing_ok=True)
-                    break
-            if not waiting:
-                with suppress(OSError):
-                    attempt = runner_activity(run_dir / "events.jsonl")["attempt"]
-                    runner_event(run_dir, attempt, "cleanup_wait", "process_cleanup_unconfirmed")
-                waiting = True
-            time.sleep(2)
+        if stdout_handle is not None and not reader_started:
+            _winapi.CloseHandle(stdout_handle)
+        if preserve_job:
+            args.windows_job = job
+        else:
+            wait_for_windows = proc is not None and gemini and windows_agy(args.agy_command)
+            waiting = False
+            try:
+                while True:
+                    with acquire_file_lock(run_dir / "process.lock", blocking=True):
+                        if not wait_for_windows or confirm_agy_stopped(run_dir):
+                            try:
+                                if job is not None:
+                                    stop_windows_job(job)
+                            except OSError as error:
+                                state.update(completed=False, end_reason="process_cleanup_failed", error=str(error))
+                                state.pop("repeat_block", None)
+                            else:
+                                clear_attempt_record(run_dir)
+                            break
+                    if not waiting:
+                        with suppress(OSError):
+                            attempt = runner_activity(run_dir / "events.jsonl")["attempt"]
+                            runner_event(run_dir, attempt, "cleanup_wait", "process_cleanup_unconfirmed")
+                        waiting = True
+                    time.sleep(2)
+            finally:
+                if job is not None:
+                    _winapi.CloseHandle(job)
         for thread, pipe in ((writer, proc.stdin if proc else None), (reader, proc.stdout if proc else None)):
             if thread is not None:
                 with suppress(RuntimeError):
@@ -752,6 +1202,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     pipe.close()
     if fallback_check:
         state["fallback_stream_safe"] = stdout_eof and failure_observed and not possible_write
+    if sandbox_setup_failure and state["end_reason"] != "process_cleanup_failed":
+        state.update(failed=True, end_reason="sandbox_setup_failed", error=sandbox_setup_failure)
     return state
 
 
@@ -790,20 +1242,22 @@ def fallback_config_isolated(cwd):
     return True
 
 
+def clear_attempt_record(run_dir):
+    for name in ("codex.pid", "codex.start"):
+        (run_dir / name).unlink(missing_ok=True)
+    if IS_WIN:
+        (run_dir / "codex.job").unlink(missing_ok=True)
+
+
 def classify(state, run_dir):
     """Return (error_kind, retryable) for an attempt that did not complete."""
     if state["end_reason"] == "timeout":
         return "timeout", False
     if state["end_reason"] in ("idle_timeout", "reconnect_timeout"):
         return state["end_reason"], True
-    if state["end_reason"] == "spawn_failed":
-        return "spawn_failed", False
-    if state["end_reason"] == "bad_arguments":
-        return "bad_arguments", False
-    if state["end_reason"] == "model_refused":
-        return "model_refused", False
-    if state["end_reason"] == "repeated_failure":
-        return "repeated_failure", False
+    if state["end_reason"] in ("spawn_failed", "bad_arguments", "model_refused", "repeated_failure", "sandbox_setup_failed",
+                               "process_cleanup_failed"):
+        return state["end_reason"], False
     gemini = state.get("engine") == "gemini"
     text = state["error"] or ""
     if not state["failed"] and not text:
@@ -1778,9 +2232,11 @@ def execute(args, prompt, run_dir):
                     "retryable": False, "attempts": 0}
         args.verification_scratch = scratch
     if not gemini and verification and args.sandbox == "read-only":
+        change_directory = ("用 Set-Location -LiteralPath 切到项目目录" if IS_WIN else
+                            "先切到项目目录（cd <项目绝对路径> && …）")
         prompt = (f"Verification project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
                   "当前目录是核验暂存区。先读取上述项目目录中适用的 AGENTS.md。项目目录只读，"
-                  "相对路径均以该项目目录为准。运行检查时先切到项目目录（cd <项目绝对路径> && …），"
+                  f"相对路径均以该项目目录为准。运行检查时{change_directory}，"
                   "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
     declared_paths = verification_paths(context, args.cwd) if host_verification else []
     paths = declared_paths or [args.cwd]
@@ -2103,7 +2559,7 @@ def read_prompt(strict=False):
     return prompt
 
 
-def write_result(job_dir, result, *, activity=None):
+def stage_result(job_dir, result, *, activity=None):
     tmp = job_dir / "result.json.tmp"
     if activity is None:
         activity = runner_activity(job_dir / "events.jsonl")
@@ -2116,7 +2572,45 @@ def write_result(job_dir, result, *, activity=None):
         # A report can carry an unpaired surrogate escape (\ud83d); keep it escaped instead of losing the result.
         data = json.dumps(value).encode("ascii")
     tmp.write_bytes(data)
-    os.replace(tmp, job_dir / "result.json")
+    return tmp
+
+
+def write_result(job_dir, result, *, activity=None):
+    os.replace(stage_result(job_dir, result, activity=activity), job_dir / "result.json")
+
+
+def write_task_result(args, run_dir, result):
+    job = getattr(args, "windows_job", None) if IS_WIN else None
+    if job is None:
+        write_result(run_dir, result)
+        return
+    try:
+        with acquire_file_lock(run_dir / "process.lock", blocking=True):
+            if result["status"] == "completed" and result.get("report_status") != "invalid":
+                pending = stage_result(run_dir, result)
+                released = False
+                try:
+                    set_windows_job_kill_on_close(job, False)
+                    released = True
+                    os.replace(pending, run_dir / "result.json")
+                except OSError as error:
+                    if released:
+                        with suppress(OSError):  # Explicit termination follows even if rearming fails.
+                            set_windows_job_kill_on_close(job, True)
+                    result.update(status="failed", error_kind="process_cleanup_failed", error=str(error), retryable=False)
+                else:
+                    with suppress(OSError):  # A terminal receipt already makes the PID record inert.
+                        clear_attempt_record(run_dir)
+                    return
+            try:
+                stop_windows_job(job)
+            except OSError as error:
+                result.update(status="failed", error_kind="process_cleanup_failed", error=str(error), retryable=False)
+            else:
+                clear_attempt_record(run_dir)
+            write_result(run_dir, result)
+    finally:
+        _winapi.CloseHandle(job)
 
 
 def last_activity(events):
@@ -2663,6 +3157,10 @@ def recorded_process_exited(pid_file):
         actual = proc_start(pid)
     except FileNotFoundError:
         return True
+    except ProcessLookupError:
+        if IS_WIN:
+            return True
+        raise
     expected = pid_file.with_suffix(".start").read_text().strip()
     return actual.isdecimal() and expected.isdecimal() and int(actual) != int(expected)
 
@@ -2713,11 +3211,13 @@ def reconcile_lost_executor(job_dir, result_file, task, lost_after):
                  "log_dir": str(job_dir), "attempts": attempts, "started_at": started_at,
                  "finished_at": finished_at, "last_activity_at": last_activity,
                  "repeat_guard": job_repeat_guard(job_dir, blocking=False)}
+        if reason == "worker_exited" and interrupted_windows_finalization(job_dir):
+            value.update(worker_finalization_failure())
         value.update(review_summary(value))
-        activity = {"phase": "lost", "attempt": attempts, "last_error_kind": "executor_lost", "retry_at": None}
+        activity = {"phase": "lost", "attempt": attempts, "last_error_kind": value["error_kind"], "retry_at": None}
         write_result(job_dir, value, activity=activity)
         with suppress(OSError):  # The result is authoritative even if the terminal event cannot be logged.
-            runner_event(job_dir, attempts, "lost", "executor_lost")
+            runner_event(job_dir, attempts, "lost", value["error_kind"])
 
 
 def job_status(job_id, record=None, *, lost_after=LOST_AFTER):
@@ -2749,6 +3249,17 @@ def job_status(job_id, record=None, *, lost_after=LOST_AFTER):
                  "error": str(e), "retryable": False}
         return {**value, **review_summary(value), "blocking": blocking_summary(value),
                 "verification_status": "invalid", "verification": None}
+
+
+def wait_for_windows_receipt(job_dir):
+    # Keep the one-second full status cadence. Between checks, look only for the published receipt.
+    receipt = job_dir / "result.json"
+    deadline = time.monotonic() + 1
+    while (remaining := deadline - time.monotonic()) > 0:
+        time.sleep(min(.1, remaining))
+        with suppress(OSError):
+            if receipt.is_file():
+                return
 
 
 def job_details(job, args):
@@ -3208,6 +3719,16 @@ def rollback_job(args):
             "files": value.get("diff_files")}
 
 
+def interrupted_windows_finalization(job_dir):
+    return IS_WIN and (job_dir / "result.json.tmp").exists() and (job_dir / "codex.job").exists()
+
+
+def worker_finalization_failure():
+    return {"error_kind": "process_cleanup_failed", "retryable": False,
+            "error": "The Windows worker exited before publishing its staged result. Background processes may "
+                     "still be running. Check the previous task's processes before retrying."}
+
+
 def worker_died(job_id, job_dir, task=None):
     """The worker exited without a result (WSL restart, crash). A writer can still be resumed from its thread;
     a read-only run is --ephemeral, so only a writer thread it resumed can be."""
@@ -3228,6 +3749,8 @@ def worker_died(job_id, job_dir, task=None):
     if pid is not None:
         result.update({"residual_provider_pid" if gemini else "residual_codex_pid": pid}, retryable=False)
         result["error"] += f" {'Gemini' if gemini else 'Codex'} PID {pid} is still present. Do not retry until the residual process is stopped."
+    if interrupted_windows_finalization(job_dir):
+        result.update(worker_finalization_failure())
     return result
 
 
@@ -3307,6 +3830,8 @@ def start_job(args, prompt):
     job_dir.mkdir(parents=True)
     (job_dir / "prompt.txt").write_text(prompt, "utf-8")
     task = {k: v for k, v in vars(args).items() if k not in ("command", "model_ab")}
+    if IS_WIN:
+        task["windows_job_containment"] = True
     (job_dir / "args.json").write_text(json.dumps(task), "utf-8")
     # Written before worker.pid, so a status that sees the pid also sees which boot it belongs to.
     boot = boot_id()
@@ -3418,8 +3943,53 @@ def prune_storage(max_storage_mb, keep=()):
             pass
 
 
-def doctor():
-    """Read-only environment checks: starts no task, calls no model and writes nothing."""
+@contextmanager
+def windows_doctor_scratch(parent=None):
+    scratch = tempfile.TemporaryDirectory(prefix="doctor-", dir=parent)
+    try:
+        yield scratch.name
+    finally:
+        # Job accounting can reach zero before Windows releases a child's current directory.
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                scratch.cleanup()
+                break
+            except PermissionError as error:
+                if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
+                    raise
+                time.sleep(.02)
+
+
+def run_windows_diagnostic(command, scratch, env, *, timeout, label, cwd=None):
+    name = "Local\\dsh-codex-" + uuid.uuid4().hex
+    job = create_windows_job(name)
+    try:
+        # File-backed output cannot wait for EOF from a descendant that inherited stdout or stderr.
+        with tempfile.TemporaryFile(dir=scratch) as stdout, tempfile.TemporaryFile(dir=scratch) as stderr:
+            proc = subprocess.Popen(windows_job_command(scratch, name, command), cwd=cwd, env=env,
+                                    stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, creationflags=NO_WINDOW)
+            timed_out = False
+            try:
+                code = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+            finally:
+                stop_attempt(proc, job)
+            stdout.seek(0)
+            stderr.seek(0)
+            output, errors = (stream.read().decode("utf-8", "replace") for stream in (stdout, stderr))
+            if timed_out:
+                detail = (errors or output).strip()
+                raise TimeoutError(f"{label} timed out after {timeout:g}s"
+                                   + (f"; last output: {detail[:200]}" if detail else ""))
+            return subprocess.CompletedProcess(command, code, output, errors)
+    finally:
+        _winapi.CloseHandle(job)
+
+
+def doctor(sandbox=False):
+    """Inspect the runner. The explicit native sandbox check may initialize Codex's private sandbox."""
     checks = []
 
     def check(name, probe):
@@ -3430,8 +4000,12 @@ def doctor():
         checks.append({"name": name, "ok": bool(ok), "detail": detail})
 
     def first_line(argv):
-        p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
-                           timeout=10, creationflags=NO_WINDOW)
+        if IS_WIN:
+            with windows_doctor_scratch(HOME if sandbox and HOME.is_dir() else None) as scratch:
+                p = run_windows_diagnostic(argv, scratch, launcher()[1], timeout=10, label="Codex version check")
+        else:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
+                               timeout=10, creationflags=NO_WINDOW)
         return p.returncode == 0, ((p.stdout or p.stderr).strip().splitlines() or [f"exit {p.returncode}"])[0][:200]
 
     def codex_path():
@@ -3456,6 +4030,23 @@ def doctor():
         present = (codex_home / "auth.json").is_file()
         return present, "auth.json exists" if present else "auth.json missing (expected with an API key or a custom provider)"
 
+    def sandbox_launch():
+        home = private_windows_path(os.environ.get("CODEX_HOME"), "CODEX_HOME")
+        if not IS_WIN or not home.is_dir():
+            return False, "Windows sandbox preflight requires an existing private CODEX_HOME"
+        private_windows_path(HOME, "CODEX_RUNNER_HOME")
+        prefix, env = launcher()
+        directory = env.get("CODEX_RUNNER_PWSH_DIR")
+        pwsh = str(Path(directory) / "pwsh.exe") if directory else shutil.which("pwsh.exe") or "powershell.exe"
+        with windows_doctor_scratch(HOME) as cwd:
+            result = run_windows_diagnostic(
+                [*prefix, "sandbox", "--permission-profile", ":workspace", "--include-managed-config", "-C", cwd,
+                 "--", pwsh, "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"],
+                cwd, env, timeout=SANDBOX_PROBE_TIMEOUT, label="Windows sandbox preflight", cwd=cwd)
+        if result.returncode == 0 and result.stdout.strip():
+            return True, result.stdout.strip()
+        return False, (result.stderr or result.stdout).strip() or f"exit {result.returncode} without a version"
+
     codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     check("python", lambda: (sys.version_info >= (3, 11), sys.version.split()[0]))
     check("codex", codex_path)
@@ -3464,15 +4055,25 @@ def doctor():
     check("codex_auth", codex_auth)
     check("runner_home", runner_home)
     check("router", router)
-    check("bash", lambda: first_line(["bash", "--version"]))
+    if not IS_WIN:
+        check("bash", lambda: first_line(["bash", "--version"]))
+    if sandbox:
+        check("sandbox", sandbox_launch)
+        probe = checks[-1]
+        if not probe["ok"]:
+            probe.update(error_kind="sandbox_setup_failed", detail=f"sandbox_setup_failed: {probe['detail']}")
     # codex_auth is advisory: API-key and custom-provider setups have no auth.json.
     return {"status": "completed", "ok": all(c["ok"] for c in checks if c["name"] != "codex_auth"), "checks": checks}
 
 
 def main():
+    if IS_WIN and sys.argv[1:2] == ["_job_exec"]:
+        sys.exit(windows_job_exec(sys.argv[2], sys.argv[3], sys.argv[4:]))
     parser = Parser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True, parser_class=Parser)
-    sub.add_parser("doctor")
+    diagnostics = sub.add_parser("doctor")
+    if IS_WIN:
+        diagnostics.add_argument("--sandbox", action="store_true", help="Test launch in the private Windows Codex sandbox")
     run = sub.add_parser("run")
     add_task_arguments(run)
     start = sub.add_parser("start")
@@ -3532,8 +4133,18 @@ def main():
     args = parser.parse_args()
     if hasattr(args, "lost_after") and not (isfinite(args.lost_after) and args.lost_after >= 0):
         parser.error("--lost-after requires nonnegative finite seconds")
+    if IS_WIN and (args.command != "doctor" or args.sandbox):
+        try:
+            if getattr(args, "use_user_config", False):
+                raise ValueError(WINDOWS_USER_CONFIG_ERROR)
+            private_windows_path(HOME, "CODEX_RUNNER_HOME")
+            private_windows_path(os.environ.get("CODEX_HOME"), "CODEX_HOME")
+        except (OSError, ValueError) as error:
+            kind = "sandbox_setup_failed" if args.command == "doctor" else "invalid_config"
+            emit({"status": "failed", "error_kind": kind, "retryable": False, "error": str(error)})
+            return
     if args.command == "doctor":
-        emit(doctor())
+        emit(doctor(getattr(args, "sandbox", False)))
         return
     if tomllib is None:
         parser.error("Python 3.11 or newer is required")
@@ -3642,9 +4253,10 @@ def main():
         if boot:
             (run_dir / "boot_id").write_text(boot)
         record_pid(run_dir / "worker.pid", os.getpid())
+        args.retain_windows_job = IS_WIN
         result = execute(args, prompt, run_dir)
         result.update(review_summary(result))
-        write_result(run_dir, result)
+        write_task_result(args, run_dir, result)
         emit(result)
         sys.exit(0 if result["status"] == "completed" else 1)
 
@@ -3665,10 +4277,21 @@ def main():
 
     if args.command == "_worker":
         job_dir = HOME / "jobs" / args.job_id
+        if IS_WIN:
+            try:
+                task = argparse.Namespace(**json.loads((job_dir / "args.json").read_text("utf-8")))
+                if getattr(task, "use_user_config", False):
+                    raise ValueError(WINDOWS_USER_CONFIG_ERROR)
+            except (OSError, ValueError, TypeError) as error:
+                emit({"status": "failed", "job_id": args.job_id, "error_kind": "invalid_config",
+                      "error": str(error), "retryable": False})
+                return
         with acquire_file_lock(job_dir / "process.lock", blocking=True):
             if recorded_pid(job_dir / "worker.pid") != os.getpid():
                 record_pid(job_dir / "worker.pid", os.getpid())
-        task = argparse.Namespace(**json.loads((job_dir / "args.json").read_text("utf-8")))
+        if not IS_WIN:
+            task = argparse.Namespace(**json.loads((job_dir / "args.json").read_text("utf-8")))
+        task.retain_windows_job = IS_WIN
         try:
             result = execute(task, (job_dir / "prompt.txt").read_text("utf-8"), job_dir)
         except Exception as e:
@@ -3677,8 +4300,10 @@ def main():
             result = {**job_metadata(job_dir, thread_id=result.get("thread_id"),
                                      conversation_id=result.get("conversation_id")), **result}
             result.update(review_summary(result))
-            write_result(job_dir, result)
+            write_task_result(task, job_dir, result)
         except Exception as e:
+            if IS_WIN and (job_dir / "result.json").exists():
+                return  # A published terminal receipt cannot be replaced by a later cleanup error.
             # Codex may have finished and changed files: a missing result would read as a dead worker to retry.
             write_result(job_dir, {
                 "status": "failed", "error_kind": "runner_error", "retryable": False, "log_dir": str(job_dir),
@@ -3699,7 +4324,10 @@ def main():
                 if not args.follow or current["status"] != "running":
                     return
                 deadline = now + interval
-            time.sleep(1)
+            if IS_WIN:
+                wait_for_windows_receipt(job_directory(args.job_id))
+            else:
+                time.sleep(1)
 
     if args.command == "cancel":
         job_dir = job_directory(args.job_id)
@@ -3728,16 +4356,23 @@ def main():
             admission = acquire_file_lock(HOME / "locks" / "admission.lock", blocking=True) \
                 if (job_dir / "diff-base.json").exists() else None
             try:
-                codex_pid = job_dir / "codex.pid"
-                pid = recorded_pid(codex_pid)
-                if pid is not None:
-                    # On Linux Codex runs in its own session, so killing the worker's group does not reach it.
-                    kill_tree(pid)
-                # Stop Codex before its worker: orphaning an exited leader can reap its recorded identity.
-                worker_pid = recorded_pid(pid_file)
-                if worker_pid is not None:
-                    kill_tree(worker_pid)
-                if worker_pid is None:
+                if IS_WIN:
+                    try:
+                        stopped = stop_windows_task(job_dir)
+                    except (OSError, ValueError) as error:
+                        emit({"status": "failed", "job_id": args.job_id, "error_kind": "process_cleanup_failed",
+                              "retryable": False, "error": str(error)})
+                        return
+                else:
+                    pid = recorded_pid(job_dir / "codex.pid")
+                    if pid is not None:
+                        kill_tree(pid)
+                    # Stop Codex before its worker: orphaning an exited leader can reap its recorded identity.
+                    worker_pid = recorded_pid(pid_file)
+                    stopped = worker_pid is not None
+                    if stopped:
+                        kill_tree(worker_pid)
+                if not stopped:
                     emit(job_status(args.job_id))
                     return
                 # The worker may have published its result after the initial check, before it was killed.

@@ -231,7 +231,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 | `codex_review` | 保存规划端逐条独立核验的证据与结论；通过、待修正、明确接受偏差分别记录，原报告保留 |
 | `codex_summary` | 按 Codex 线程汇总多轮结果、涉及文件、未闭环事项、已结束耗时和用量，并统计筛选范围内的错误类型；执行状态与独立核验分别展示，不重复相加线程累计用量 |
 | `codex_watch` | 安静观察当前会话的原生 Codex 后台任务，首次重要变化时通知；停止观察不会取消 Codex |
-| `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效；`action="doctor"` 只读自检 WSL 里的 Python、Codex、登录文件、路由和 bash，不启动任务 |
+| `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效；`action=doctor` 检查 Python、Codex、登录文件和路由；WSL 额外检查 bash，Windows 原生模式预检私有 Codex 沙箱。两种模式均不调用模型 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 
 ### 任务生命周期
