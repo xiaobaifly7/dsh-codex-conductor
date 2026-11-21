@@ -129,7 +129,8 @@ def find_codex():
     """Locate the codex CLI. Inside WSL a PATH entry under /mnt/ is the Windows build, so skip it;
     `wsl.exe -e` also skips the login profile, so check the usual npm/user bin directories too."""
     if IS_WIN:
-        return shutil.which("codex")
+        # Only the real executable: npm's codex.cmd runs through cmd.exe, which expands & | %VAR% in task arguments.
+        return shutil.which("codex.exe")
     for d in os.environ.get("PATH", "").split(os.pathsep):
         candidate = os.path.join(d, "codex")
         if d and not d.startswith("/mnt/") and os.access(candidate, os.X_OK):
@@ -147,7 +148,10 @@ def launcher():
         env["PATH"] = os.pathsep.join(filter(None, (env["CODEX_RUNNER_PWSH_DIR"], env.get("PATH"))))
     override = os.environ.get("CODEX_RUNNER_CMD")
     if override:
-        return json.loads(override), env
+        argv = json.loads(override)
+        if IS_WIN and str(argv[0]).lower().endswith((".cmd", ".bat")):
+            raise ValueError(f"codexBin must be codex.exe, not a cmd.exe script: {argv[0]}")
+        return argv, env
     # A missing CLI fails at spawn with a clear "No such file" error.
     return [find_codex() or "codex"], env
 
@@ -896,7 +900,11 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
         state["engine"] = "gemini"
         adapter = agy_runner.EventAdapter()
     else:
-        cmd, env = build_command(args, run_dir, thread_id, scratch)
+        try:
+            cmd, env = build_command(args, run_dir, thread_id, scratch)
+        except ValueError as error:
+            state.update(end_reason="bad_arguments", error=str(error))
+            return state
     start = time.monotonic()
     proc = reader = writer = job = stdout_handle = None
     reader_started = False
@@ -1023,10 +1031,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                         break
                 if completed_at and now - completed_at > args.exit_grace:
                     if not IS_WIN or proc.poll() is None:
+                        # The turn is done and may have written files; as on Linux, reap the process and keep the result.
                         state["forced_exit"] = True
-                        if IS_WIN:
-                            state.update(completed=False, end_reason="timeout",
-                                         error="Codex did not exit after turn.completed within the exit grace period.")
                         stop_attempt(proc, job)
                     # A successful Windows background child can still hold the stdout pipe.
                     break
@@ -1143,6 +1149,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                     stop_attempt(proc, job)
         # Gemini keeps its own Job and confirmation path, so only Codex retains background children on success.
         preserve_job = (job is not None and not gemini and state["completed"] and not state["failed"]
+                        and not state.get("forced_exit")
                         and not sandbox_setup_failure and getattr(args, "retain_windows_job", False))
     except WindowsJobCleanupError as error:
         state.update(completed=False, end_reason="process_cleanup_failed", error=str(error))

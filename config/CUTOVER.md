@@ -6,7 +6,7 @@
 
 - 官方便携 PowerShell 7.7.0 放在 `C:\Program Files\PowerShell\7`，用完整路径加 `-NoProfile` 返回 `7.7.0`（2026-11-22 复核仍满足）。不要依赖 PATH 上的 Store 版 `pwsh`：Codex 沙箱的受限令牌执行不了 WindowsApps 下的别名。
 - Windows 原生 Python 3.11 以上（`C:\Python314\python.exe`）和原生 Codex CLI（`codex.exe` 0.170.0 的 vendor 路径）。
-- 三个绝对路径的私有目录 `stateDir`、`runnerHome`、`codexHome`。它们不能等于或位于 `%USERPROFILE%\.codex`、`%USERPROFILE%\.local\state\codex-runner`、`%LOCALAPPDATA%\dsh-codex-conductor`、`%LOCALAPPDATA%\codex-runner` 之下（按大小写、分隔符和 junction 解析后比较），否则插件拒绝加载。在私有 `codexHome` 里把 `config\codex.native.toml` 装成 `config.toml`，Windows 沙箱为 `elevated`。
+- 三个绝对路径的私有目录 `stateDir`、`runnerHome`、`codexHome`。它们不能等于或位于 `%USERPROFILE%\.codex`、`%USERPROFILE%\.local\state\codex-runner`、`%LOCALAPPDATA%\dsh-codex-conductor`、`%LOCALAPPDATA%\codex-runner` 之下（按大小写、分隔符和 junction 解析后比较），否则插件拒绝加载。在私有 `codexHome` 里把 `config\codex.native.toml` 装成 `config.toml`，Windows 沙箱为 `elevated`。三个目录对 `CodexSandboxUsers`、`Authenticated Users` 和 Codex 能力 SID 都不能有写权限，插件不检查这一点：放在只有 SYSTEM、Administrators 和当前用户可写的位置（如 `D:\software\` 下），或用 `icacls <目录> /inheritance:r /grant:r "%USERNAME%:(OI)(CI)F"` 断开继承。否则沙箱里的命令可能改写私有 `config.toml`，影响之后的每个任务。`codexBin` 配成 `codex.exe`；配成 `.cmd`/`.bat` 时任务以 `bad_arguments` 拒绝。
 - Harness 宿主进程能提供 `MAGPIE_GATEWAY_KEY`，路由用 Windows 上 Magpie 的 `http://127.0.0.1:3425/v1`，不经 WSL 的 3426 转发。
 - 启用 Gemini 时，`gemini.command` 指向 Windows 的 `agy.exe`。原生模式下 agy 仍由随包的 `agy_process.ps1`（系统自带 Windows PowerShell 5.1）启动，它的 Job 嵌套在 runner 的 Job 里。
 

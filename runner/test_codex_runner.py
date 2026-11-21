@@ -1008,14 +1008,20 @@ class RunnerTests(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 5)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
 
-    def test_process_that_hangs_after_turn_completion_is_reaped(self):
+    @unittest.skipUnless(os.name == "nt", "cmd.exe launchers exist only on Windows")
+    def test_windows_rejects_a_cmd_launcher_before_spawning(self):
+        script = self.cwd / "codex.cmd"
+        script.write_text("@echo off\r\nexit /b 0\r\n")
+        r = self.invoke(env={"CODEX_RUNNER_CMD": json.dumps([str(script)])})
+        self.assertEqual((r["status"], r["error_kind"]), ("failed", "bad_arguments"))
+        self.assertIn("codex.exe", r["error"])
+        self.assertEqual(r["attempts"], 1)
+
+    def test_process_that_hangs_after_completion_still_succeeds(self):
         start = time.time()
         r = self.invoke("--exit-grace", "2", mode="hang_after_completed")
-        if os.name == "nt":
-            self.assertEqual((r["status"], r["error_kind"]), ("failed", "timeout"))
-        else:
-            self.assertEqual(r["status"], "completed")
-            self.assertTrue(r["forced_exit"])
+        self.assertEqual(r["status"], "completed")
+        self.assertTrue(r["forced_exit"])
         self.assertLess(time.time() - start, 20)
         time.sleep(1)
         self.assertFalse(alive(int((self.state / "child.pid").read_text())))
