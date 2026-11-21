@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.134` “Codex 指挥”面板支持 Gemini 执行引擎。运行状态显示默认执行端、核验是否换引擎、Codex 失败是否转 Gemini、Gemini 并发上限和账号池里下一单要用的账号，读池失败时显示原因。常用设置可以修改这四项，Gemini 思考程度可选“不设置”，由模型名决定档位。任务列表标出由 Gemini 执行或接替的任务，报告按实际执行端署名。
+
 `0.9.133` 新增 `gemini.accountPool`，指向 DSH agy 插件账号池的 `pool.json`。配置后 Gemini 任务和 `gemini_write` 改用池中当前可用的账号：以账号目录作 `HOME / USERPROFILE`，账号设了代理就用它自己的代理。选号只读，跳过停用、需要重新登录和正在冷却的账号；续接 Gemini 会话回到原账号，原账号已不在池中时拒绝续接。
 
 `0.9.132`规划端先派齐已就绪、互不冲突且护栏允许的只读调查和核验，再留在本轮逐单等待并验收已收到的报告。提示词明确同目录写锁和收尾欠账的派单条件。同一交付链连续两轮卡在相同条目且参数未变时拦截重派，提交具体变化说明最多放行一次。支持归档不可补回的历史证据、派单前检查必写路径、按回执中的编号和提交结构收尾。受阻且无可核验产出的任务先解除阻塞，同一任务的文件版本及核验范围未变时复用已有核验。
@@ -163,6 +165,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.134` brings the Gemini execution engine to the **Codex 指挥** panel. Runtime status shows the default executor, whether verification switches engines, whether failed Codex jobs fall back to Gemini, the Gemini concurrency limit and the pool account the next Gemini job will use, with the reason when the pool cannot be read. Common settings can change those four options, and the Gemini level can be left unset so the model ID decides it. The job list marks jobs run or taken over by Gemini, and reports name the executor that actually ran them.
 
 `0.9.133` adds `gemini.accountPool`, the path to the DSH agy plugin's account pool `pool.json`. When set, Gemini jobs and `gemini_write` run under the pool's current usable account: its directory becomes `HOME / USERPROFILE`, and its own proxy is used when it has one. Selection is read-only and skips disabled accounts, accounts that need to sign in again and accounts in cooldown. A Gemini continuation returns to the original account and is refused when that account has left the pool.
 

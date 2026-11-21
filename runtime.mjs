@@ -271,12 +271,14 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   autoVerify: '完成后自动核验',
   effortOverride: '单次推理强度覆盖',
   repeatFailureGuard: '重复失败拦截设置',
-  plannerReadAllow: '额外允许读取的路径' };
+  plannerReadAllow: '额外允许读取的路径',
+  defaultEngine: '新任务默认执行端', crossEngineVerify: '核验换另一引擎', geminiFallback: 'Codex 失败转 Gemini',
+  maxGeminiRunningJobs: 'Gemini 同时运行的任务数上限' };
 // null clears a limit and restores the runner default.
 const count = (v) => Number.isInteger(v) && v > 0;
 const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) => v > 0, timeoutSeconds: (v) => v > 0,
   idleTimeoutSeconds: (v) => v > 0, retries: (v) => Number.isInteger(v) && v >= 0, maxRunningJobs: count,
-  maxSessionJobs: count, maxSessionTokens: count, handoverSuggestMessages: (v) => Number.isInteger(v) && v >= 0,
+  maxSessionJobs: count, maxSessionTokens: count, maxGeminiRunningJobs: count, handoverSuggestMessages: (v) => Number.isInteger(v) && v >= 0,
   acceptanceWarnAbove: (v) => Number.isInteger(v) && v >= 0, continueFreshAboveTokens: (v) => Number.isInteger(v) && v >= 0 };
 // Lists are replaced as a whole; an entry is one line of plain text.
 const listSettings = { allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v)],
@@ -303,7 +305,8 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'ownerDecisions') valid = ['planner', 'owner'].includes(v);
     else if (key === 'autoVerify') valid = ['off', 'flagged'].includes(v);
     else if (key === 'effortOverride') valid = ['planner', 'raise-only-listed', 'config'].includes(v);
-    else if (key === 'jobDiff' || key === 'closeoutGuard') valid = typeof v === 'boolean';
+    else if (['jobDiff', 'closeoutGuard', 'crossEngineVerify', 'geminiFallback'].includes(key)) valid = typeof v === 'boolean';
+    else if (key === 'defaultEngine') valid = v === 'codex' || (v === 'gemini' && geminiConfigured);
     else if (Object.hasOwn(listSettings, key)) {
       valid = Array.isArray(v) && v.length <= listSettings[key][0] && v.every((item) => typeof item === 'string' && listSettings[key][1](item));
     } else if (Object.hasOwn(numericSettings, key)) valid = v === null || (typeof v === 'number' && Number.isFinite(v) && numericSettings[key](v));
@@ -314,7 +317,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
         Object.entries(v).every(([field, item]) => validRepeatFailureField(field, item));
     } else if (key === 'gemini') {
       valid = geminiConfigured && v !== null && typeof v === 'object' && !Array.isArray(v) && Object.keys(v).length > 0 &&
-        Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['low', 'medium', 'high'].includes(item));
+        Object.entries(v).every(([k, item]) => k === 'model' ? model(item) : k === 'effort' && ['', 'low', 'medium', 'high'].includes(item));
     }
     if (!valid) throw new Error(`${settingLabels[key] ?? '提交的设置'}无效，请检查填写内容后重新保存。`);
   }

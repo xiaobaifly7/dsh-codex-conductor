@@ -123,13 +123,13 @@ window.__ModuleLoader__.load({
       }
     }
 
-    function ReadableReport({ report, acceptance = [] }) {
+    function ReadableReport({ report, acceptance = [], executor = 'Codex' }) {
       const list = (title, items) => items.length ? h('div', null, h('h4', null, title),
         h('ul', null, ...items.map((text, i) => h('li', { key: i }, text)))) : null;
       return h('div', { className: 'dcc-readable' },
-        h('h4', null, '概述'), h('p', null, report.summary || 'Codex 没有填写概述。'),
-        h('h4', null, '逐条验收（Codex 自述）'),
-        h('small', null, '以下是 Codex 的汇报，还需要核对实际结果。'),
+        h('h4', null, '概述'), h('p', null, report.summary || `${executor} 没有填写概述。`),
+        h('h4', null, `逐条验收（${executor} 自述）`),
+        h('small', null, `以下是 ${executor} 的汇报，还需要核对实际结果。`),
         h('ol', null, ...report.criteria.map((item, i) => {
           const number = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、]|$)/.exec(item.criterion.normalize('NFKC'))?.[1];
           const index = number === undefined ? i + 1 : Number(number);
@@ -140,15 +140,15 @@ window.__ModuleLoader__.load({
             h('strong', null, chars.length ? `第 ${index} 条：${chars.slice(0, 300).join('')}${chars.length > 300 ? '…' : ''} —— ${status}`
               : `${status}：${item.criterion}`),
             chars.length > 300 ? h('details', null, h('summary', null, '展开验收标准原文'), h('p', null, original)) : null,
-            item.evidence.length > 300 ? h('details', null, h('summary', null, '展开 Codex 给的证据'), h('p', null, item.evidence))
+            item.evidence.length > 300 ? h('details', null, h('summary', null, `展开 ${executor} 给的证据`), h('p', null, item.evidence))
               : h('p', null, `证据：${item.evidence || '未提供'}`));
         })),
-        report.blockers?.length ? h('div', null, h('h4', null, 'Codex 留下的问题（以下为 Codex 原话）'),
+        report.blockers?.length ? h('div', null, h('h4', null, `${executor} 留下的问题（以下为 ${executor} 原话）`),
           ...report.blockers.map((item) => h('div', { key: item.id, className: 'dcc-status' },
             h('p', null, `问题：${item.message}`), h('p', null, `它想问：${item.question || '未填写'}`),
             h('p', null, `它说的解除条件：${item.resolution || '未填写'}`)))) : null,
-        list('改动了哪些文件', report.files_changed), list('与原计划不同的地方（Codex 原话）', report.deviations),
-        list('还没解决的事（Codex 原话）', report.unresolved));
+        list('改动了哪些文件', report.files_changed), list(`与原计划不同的地方（${executor} 原话）`, report.deviations),
+        list(`还没解决的事（${executor} 原话）`, report.unresolved));
     }
 
     // 嵌套设置在表单里用“父.子”作键。
@@ -170,6 +170,7 @@ window.__ModuleLoader__.load({
       maxStorageMb: [(v) => v > 0, '等待秒数和存储上限请填大于 0 的数字，或留空。'],
       maxSessionJobs: [(v) => Number.isInteger(v) && v > 0, '每个会话最多派几单请填正整数，或留空。'],
       maxSessionTokens: [(v) => Number.isInteger(v) && v > 0, '每个会话的用量上限请填正整数，或留空。'],
+      maxGeminiRunningJobs: [(v) => Number.isInteger(v) && v > 0, 'Gemini 同时运行的任务数上限请填正整数，或留空。'],
       handoverSuggestMessages: [(v) => Number.isInteger(v) && v >= 0, '建议交接的消息数请填 0 或正整数（0 表示关闭），或留空恢复默认 5000。'],
       acceptanceWarnAbove: [(v) => Number.isInteger(v) && v >= 0, '验收标准条数提醒请填 0 或正整数（0 表示关闭），或留空恢复默认 8。'],
       continueFreshAboveTokens: [(v) => Number.isInteger(v) && v >= 0, '续接开新线程的阈值请填 0 或正整数（0 表示总是沿用原线程），或留空恢复默认 100000。'],
@@ -199,7 +200,7 @@ window.__ModuleLoader__.load({
           // 空的 Codex 模型表示沿用 Codex 配置。
           if (!(key === 'model' && value === '') && !/^[A-Za-z0-9._/:-]{1,80}$/.test(value)) throw new Error('模型名请填 1 到 80 个字母、数字或 . _ / : -；Codex 模型可留空。');
         } else if (['effort', 'readOnlyEffort', 'gemini.effort'].includes(key)) {
-          const allowed = key === 'gemini.effort' ? ['low', 'medium', 'high'] : ['', ...EFFORTS.map(([v]) => v)];
+          const allowed = key === 'gemini.effort' ? ['', 'low', 'medium', 'high'] : ['', ...EFFORTS.map(([v]) => v)];
           if (!allowed.includes(value)) throw new Error('请从列表中选择思考程度。');
         } else if (key === 'serviceTier') {
           if (!['', 'fast', 'ultrafast'].includes(value)) throw new Error('请从列表中选择服务速度。');
@@ -317,7 +318,17 @@ window.__ModuleLoader__.load({
             statusRow('自动回答 Codex 的问题', activeSettings ? activeSettings.plannerAnswers ? '已开启' : '已关闭' : '未读到', '打开后 DeepSeek 会替你回答 Codex 的问题并继续干活，不再等你'),
             statusRow('规划端读取范围', activeSettings ? activeSettings.plannerReads === 'products' ? '只读 Codex 的产物' : '不限制读取' : '未读到', '这是当前正在生效的读取范围。'),
             statusRow('额外允许读取的路径', activeSettings ? `${activeSettings.plannerReadAllowCount ?? 0} 条` : '未读到', '这里只显示数量，需要修改时请编辑插件配置。'),
-            statusRow('Gemini 写作', activeSettings ? activeSettings.gemini ? '已开启' : '未开启' : '未读到', '已配置时，可以让 Gemini 写教程和文档。'),
+            statusRow('Gemini', activeSettings ? activeSettings.gemini ? '已配置' : '未配置' : '未读到',
+              '配置后可以让 Gemini 写教程和文档，也可以按单把任务交给 Gemini 执行。'),
+            activeSettings?.gemini ? h('div', null,
+              statusRow('新任务默认执行端', activeSettings.defaultEngine === 'gemini' ? 'Gemini' : 'Codex', '规划端派单时没有指定执行端就用它。'),
+              statusRow('核验换另一引擎', activeSettings.crossEngineVerify ? '已开启' : '已关闭', '开启后 Codex 做的任务交给 Gemini 核验，Gemini 做的交给 Codex 核验。'),
+              statusRow('Codex 失败转 Gemini', activeSettings.geminiFallback ? '已开启' : '已关闭', '开启后 Codex 失败且确认没有写入文件时，自动交给 Gemini 接着做。'),
+              statusRow('Gemini 同时运行', activeSettings.maxGeminiRunningJobs ? `最多 ${activeSettings.maxGeminiRunningJobs} 单` : '不限制', '同时在跑的 Gemini 任务超过这个数时，新任务排队。'),
+              statusRow('Gemini 账号', !activeSettings.gemini.accountPool ? '本机默认登录' : status.geminiAccount?.error ? '账号池不可用'
+                : status.geminiAccount ? `账号池：${status.geminiAccount.alias || status.geminiAccount.id}` : '未读到',
+                activeSettings.gemini.accountPool ? '使用 DSH agy 插件账号池里当前可用的账号；续接原会话时回到原来的账号。' : '使用本机默认用户目录里登录的 agy 账号。'),
+              status.geminiAccount?.error ? h(Message, { error: true, text: status.geminiAccount.error }) : null) : null,
             statusRow('建议交接的会话', !status.history ? '未读到' : !status.history.threshold ? '提示已关闭'
               : status.history.sessions.filter((s) => s.suggest).map((s) => `${s.sessionId}（${s.messages} 条消息）`).join('、') || '暂无',
               `消息数超过 ${status.history?.threshold || '设定值'} 条的会话每一步都会变慢，可以在下方“会话交接”里交接到新会话。`),
@@ -366,7 +377,7 @@ window.__ModuleLoader__.load({
             })) : null) : null);
     }
 
-    function Report({ jobId, refreshKey, onClose, selftest }) {
+    function Report({ jobId, refreshKey, onClose, selftest, executor }) {
       const [document, setDocument] = useState(null);
       const [pageIndex, setPageIndex] = useState(0);
       const [raw, setRaw] = useState(false);
@@ -423,7 +434,7 @@ window.__ModuleLoader__.load({
         h(Message, { text: error, error: true }),
         loading ? h('p', { role: 'status' }, '正在读取报告…') : null,
         pending ? h('p', { role: 'status', 'data-dcc-report-pending': true }, '这个任务还在运行，报告会在任务结束后生成。') : null,
-        readable ? h(ReadableReport, { report: document.report, acceptance: document.pages[0].acceptance }) : page ? h('pre', { className: 'dcc-report', tabIndex: 0, 'aria-label': '本页报告全文' }, page.text || '这一页还没有输出。') : null,
+        readable ? h(ReadableReport, { report: document.report, acceptance: document.pages[0].acceptance, executor }) : page ? h('pre', { className: 'dcc-report', tabIndex: 0, 'aria-label': '本页报告全文' }, page.text || '这一页还没有输出。') : null,
         h('div', { className: 'dcc-row' },
           !readable && !pending ? h(Button, { size: 'sm', disabled: loading || pageIndex === 0, onClick: () => setPageIndex((v) => v - 1) }, '上一页') : null,
           !readable && !pending ? h(Button, { size: 'sm', disabled: loading || !page || page.eof || !(page.next_offset > page.offset), onClick: nextPage }, '下一页') : null,
@@ -750,8 +761,11 @@ window.__ModuleLoader__.load({
               field('autoVerify', '完成后自动核验', '写任务完成且报告有未完成项或任务有 must_verify 时，自动派出只读核验。', [['flagged', '自动核验（默认）'], ['off', '关闭']]),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
-              settings.gemini ? field('gemini.model', 'Gemini 模型', '只影响已经配置好的 Gemini 写作功能。') : null,
-              settings.gemini ? field('gemini.effort', 'Gemini 思考程度', 'Gemini 支持低、中、高三档。', EFFORTS.slice(0, 3)) : null),
+              settings.gemini ? field('gemini.model', 'Gemini 模型', 'Gemini 写作和交给 Gemini 执行的任务都用它；填 agy models 列出的完整 ID。') : null,
+              settings.gemini ? field('gemini.effort', 'Gemini 思考程度', '模型名已带档位（如 gemini-4-carbon-high）时选“不设置”。',
+                [['', '不设置（由模型名决定）'], ...EFFORTS.slice(0, 3)]) : null,
+              settings.gemini ? field('defaultEngine', '新任务默认执行端', '规划端派单时没有指定执行端就用它。', [['codex', 'Codex（默认）'], ['gemini', 'Gemini']]) : null,
+              settings.gemini ? field('maxGeminiRunningJobs', 'Gemini 同时运行的任务数上限', '超过时新的 Gemini 任务排队；留空表示不限制。') : null),
             h('div', { className: 'dcc-actions' },
               h(Checkbox, { label: '自动回答 Codex 的问题', checked: Object.hasOwn(edits, 'plannerAnswers') ? edits.plannerAnswers : editingSettings.plannerAnswers === true,
                 disabled: !!busy, onChange: (value) => edit('plannerAnswers', value) }),
@@ -778,6 +792,14 @@ window.__ModuleLoader__.load({
               h(Checkbox, { label: '未收尾时拒绝开新任务', checked: (Object.hasOwn(edits, 'closeoutGuard') ? edits.closeoutGuard : editingSettings.closeoutGuard) !== false,
                 disabled: !!busy, onChange: (value) => edit('closeoutGuard', value) }),
               h('small', null, '还有报告标出问题却没验收、或判为需修改却没返工的任务时，DeepSeek 不能开新任务，要先收尾。')),
+            settings.gemini ? h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '核验换另一引擎', checked: (Object.hasOwn(edits, 'crossEngineVerify') ? edits.crossEngineVerify : editingSettings.crossEngineVerify) !== false,
+                disabled: !!busy, onChange: (value) => edit('crossEngineVerify', value) }),
+              h('small', null, 'Codex 做的任务交给 Gemini 核验，Gemini 做的交给 Codex 核验；关闭后由原执行端核验。Gemini 只读核验不能运行命令。')) : null,
+            settings.gemini ? h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: 'Codex 失败转 Gemini', checked: (Object.hasOwn(edits, 'geminiFallback') ? edits.geminiFallback : editingSettings.geminiFallback) !== false,
+                disabled: !!busy, onChange: (value) => edit('geminiFallback', value) }),
+              h('small', null, 'Codex 失败且确认没有写入文件时，自动交给 Gemini 接着做。')) : null,
             (Object.hasOwn(edits, 'toolPolicy') ? edits.toolPolicy : editingSettings.toolPolicy) === 'allowlist' ? h('p', { className: 'dcc-warn', role: 'status' },
               '白名单模式下，未列入白名单的工具在受护栏会话里会被拒绝。') : null,
             h('div', { className: 'dcc-grid dcc-actions' },
@@ -828,12 +850,13 @@ window.__ModuleLoader__.load({
             const canRollback = ['completed', 'failed', 'cancelled'].includes(job.execution_status || job.status) &&
               job.diff_status === 'captured' && !job.rolled_back_at;
             // 只显示任务记录里实际有的信息。
-            const facts = [job.owner && `会话 ${job.owner}`, job.cwd && `目录 ${job.cwd}`,
+            const facts = [job.owner && `会话 ${job.owner}`,
+              job.engine === 'gemini' && (job.fallback_of ? `Gemini 接替 ${job.fallback_of}` : '由 Gemini 执行'), job.cwd && `目录 ${job.cwd}`,
               job.duration_s != null && `耗时 ${Math.round(job.duration_s)} 秒`,
               !running && counts && `验收 ${counts.met} 通过 / ${counts.not_met} 未通过 / ${counts.blocked} 受阻`,
               job.error_kind && `失败原因 ${job.error_kind}`,
               job.verification_status && `独立核验 ${verificationText[job.verification_status] || job.verification_status}`,
-              running && job.phase && `当前阶段 ${phaseText[job.phase] || job.phase}${job.attempt ? `（第 ${job.attempt} 轮）` : ''}`,
+              running && job.phase && `当前阶段 ${job.engine === 'gemini' && job.phase === 'codex_running' ? 'Gemini 执行中' : phaseText[job.phase] || job.phase}${job.attempt ? `（第 ${job.attempt} 轮）` : ''}`,
               running && (job.last_activity ? `最近活动 ${job.last_activity}` : job.updated_at && `最近活动 ${when(job.updated_at * 1000)}`),
               job.diff_status === 'captured' ? `改动 diff ${job.diff_files != null ? `${job.diff_files} 个文件` : '已记录'}` : diffText[job.diff_status],
               job.rolled_back_at && `已回滚 ${when(typeof job.rolled_back_at === 'number' ? job.rolled_back_at * 1000 : job.rolled_back_at)}`].filter(Boolean);
@@ -886,6 +909,7 @@ window.__ModuleLoader__.load({
           h(Message, { text: messages.cancel }), h(Message, { text: errors.cancel, error: true }),
           h(Message, { text: messages.rollback }), h(Message, { text: errors.rollback, error: true }),
           reportJob ? h(Report, { key: reportJob, jobId: reportJob, refreshKey: jobs,
+            executor: pageJobs.find((job) => job.job_id === reportJob)?.engine === 'gemini' ? 'Gemini' : 'Codex',
             onClose: () => setReportJob(null), selftest }) : null),
 
         settings?.gemini ? h('section', { 'aria-label': 'Gemini 写作记录' }, h('h3', null, 'Gemini 写作记录'),

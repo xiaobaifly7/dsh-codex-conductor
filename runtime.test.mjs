@@ -43,10 +43,12 @@ test('panel settings preserve comments, quotes, nested fields, other entries and
   writeFileSync(f.profileFile, Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from(original)]));
   const before = readFileSync(f.profileFile);
   const result = saveRuntimeSettings({ ...f, changes: { model: 'codex/gpt-6-astra', effort: 'max', serviceTier: 'ultrafast',
-    plannerAnswers: true, gemini: { model: 'gemini-4-argon', effort: 'high' } } });
+    plannerAnswers: true, gemini: { model: 'gemini-4-argon', effort: '' }, defaultEngine: 'gemini', crossEngineVerify: false,
+    maxGeminiRunningJobs: 3 } });
   const expected = original.replace("'old-model'", "'codex/gpt-6-astra'").replace('effort: medium', 'effort: max')
     .replace('serviceTier: fast', 'serviceTier: ultrafast').replace('plannerAnswers: false', 'plannerAnswers: true')
-    .replace('model: old-gemini', 'model: gemini-4-argon').replace('effort: low', 'effort: high');
+    .replace('model: old-gemini', 'model: gemini-4-argon').replace('effort: low', "effort: ''")
+    .replace('    config:\r\n', '    config:\r\n      defaultEngine: gemini\r\n      crossEngineVerify: false\r\n      maxGeminiRunningJobs: 3\r\n');
   assert.deepEqual(readFileSync(result.backup), before);
   assert.deepEqual(readFileSync(f.profileFile), Buffer.concat([before.subarray(0, 3), Buffer.from(expected)]));
 });
@@ -124,9 +126,14 @@ test('panel settings reject invalid values and unsupported YAML without changing
     assert.throws(() => saveRuntimeSettings({ ...f, changes }));
     assert.equal(readFileSync(f.profileFile, 'utf8'), text);
   }
-  for (const value of [{ gemini: {} }, { gemini: { command: 'other' } }, { gemini: { effort: 'max' } }]) {
+  for (const value of [{ gemini: {} }, { gemini: { command: 'other' } }, { gemini: { effort: 'max' } },
+    { defaultEngine: 'other' }, { crossEngineVerify: 'true' }, { geminiFallback: 1 }, { maxGeminiRunningJobs: 0 }]) {
     assert.throws(() => validatePanelSettings(value, true));
   }
+  // Gemini can be the default executor only once gemini is configured.
+  assert.throws(() => validatePanelSettings({ defaultEngine: 'gemini' }, false));
+  validatePanelSettings({ defaultEngine: 'gemini', crossEngineVerify: false, geminiFallback: true, maxGeminiRunningJobs: null,
+    gemini: { effort: '' } }, true);
   for (const config of ['    config: {}\n', '    config:\n      model: |\n        previous\n',
     '    config:\n      model: old\n      model: duplicate\n']) {
     const original = text.slice(0, text.indexOf('    config:')) + config;

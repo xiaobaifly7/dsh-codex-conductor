@@ -703,7 +703,8 @@ test('the Codex model and execution effort can be cleared to follow Codex; a Gem
   const { settingsPatch } = host.exports;
   assert.deepEqual(plain(settingsPatch({ model: '', effort: '' }, { model: '', effort: '' })), {});
   assert.throws(() => settingsPatch(settings(), { 'gemini.model': '' }), /模型名请填/);
-  assert.throws(() => settingsPatch(settings(), { 'gemini.effort': '' }), /请从列表中选择思考程度/);
+  assert.deepEqual(plain(settingsPatch(settings(), { 'gemini.effort': '' })), { gemini: { effort: '' } }, 'the level can be left to the model ID');
+  assert.throws(() => settingsPatch(settings(), { 'gemini.effort': 'max' }), /请从列表中选择思考程度/);
   assert.throws(() => settingsPatch(settings(), { model: 'a b' }), /模型名请填/);
 });
 
@@ -798,6 +799,41 @@ test('the auto-answer section shows waiting time, human-only questions and both 
     { path: '/auto-answer/action', body: { id: 'a', action: 'answer' } },
     { path: '/auto-answer/action', body: { id: 'b', action: 'manual' } },
   ]);
+});
+
+test('the panel covers the Gemini engine switches, the account pool and who ran each job', async (t) => {
+  const { Status } = clientHost().exports, service = panelService();
+  const engine = { ...settings(), gemini: { model: 'gemini-4-carbon-high', effort: '', accountPool: true }, defaultEngine: 'gemini',
+    crossEngineVerify: false, geminiFallback: true, maxGeminiRunningJobs: 2 };
+  const view = (value, extra = {}) => text(Status({ status: { settings: value, runtime: service.status.runtime, ...extra } }));
+  let shown = view(engine, { geminiAccount: { id: 'acc_1', alias: 'work' } });
+  for (const value of ['新任务默认执行端： Gemini', '核验换另一引擎： 已关闭', 'Codex 失败转 Gemini： 已开启',
+    'Gemini 同时运行： 最多 2 单', 'Gemini 账号： 账号池：work']) assert.ok(shown.includes(value), value);
+  shown = view(engine, { geminiAccount: { error: 'DSH agy 账号池里没有可用账号' } });
+  assert.ok(shown.includes('Gemini 账号： 账号池不可用') && shown.includes('没有可用账号'));
+  assert.ok(view({ ...engine, gemini: { ...engine.gemini, accountPool: false } }).includes('Gemini 账号： 本机默认登录'));
+  assert.ok(!view({ ...engine, gemini: null }).includes('新任务默认执行端'));
+
+  service.cfg = structuredClone(engine);
+  service.status.settings = structuredClone(engine);
+  const job = { job_id: 'G', title: 'task', status: 'completed', execution_status: 'completed', started_at: 0, engine: 'gemini', fallback_of: 'C' };
+  const host = clientHost((path, body) => path.startsWith('/jobs') ? { total: 1, jobs: [{ ...job }] } : service.handle(path, body));
+  t.after(() => host.dispose());
+  host.mount(host.exports.Panel); await host.flush();
+  assert.ok(text(host.tree).includes('Gemini 接替 C'));
+  await click(host, '查看报告');
+  const report = host.tree.children.flatMap((node) => node?.children || []).find((node) => node?.type === host.exports.Report);
+  assert.equal(report.props.executor, 'Gemini');
+  assert.ok(text(host.exports.ReadableReport({ report: sample(), executor: 'Gemini' })).includes('逐条验收（Gemini 自述）'));
+  assert.ok(nodes(field(host, 'Gemini 思考程度')).some((node) => node.type === 'option' && node.props.value === '' && text(node) === '不设置（由模型名决定）'));
+  await change(host, '新任务默认执行端', 'codex');
+  await change(host, 'Gemini 同时运行的任务数上限', '');
+  nodes(host.tree).find((node) => node.type === 'checkbox' && node.props.label === '核验换另一引擎').props.onChange(true);
+  nodes(host.tree).find((node) => node.type === 'checkbox' && node.props.label === 'Codex 失败转 Gemini').props.onChange(false);
+  await host.flush();
+  await click(host, '等当前任务结束后自动生效');
+  assert.deepEqual(host.requests.find((request) => request.body), { path: '/settings',
+    body: { defaultEngine: 'codex', maxGeminiRunningJobs: null, crossEngineVerify: true, geminiFallback: false } });
 });
 
 test('status shows guard scope, host access and unknown keys, and folds secondary rows without hiding their errors', () => {
