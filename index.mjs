@@ -754,7 +754,9 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
         : '先核对已有产物，再按原授权用 codex_run 显式传 engine: "codex" 重新派单，只补缺项。');
   }
   if (jobEngine(value) === 'gemini' && value.error_kind === 'bad_arguments') {
-    return `Gemini 启动参数无效：${String(value.error ?? '请核对 agy 参数和任务权限').slice(0, 300)}。`;
+    const error = String(value.error ?? '请核对 agy 参数和任务权限').slice(0, 300);
+    return `Gemini 启动参数无效：${error}。` + (/local Windows drive path/.test(error)
+      ? '该目录不在 Windows 盘符下，Windows 上的 agy 进不去；改用 engine: "codex" 重新派单或核验。' : '');
   }
   if (value.error_kind === 'executor_lost') {
     const resume = value.thread_id ? `，或用 codex_continue ${value.job_id} 在原线程续接（fresh=false）` : '';

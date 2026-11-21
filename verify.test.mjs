@@ -141,6 +141,8 @@ test('Gemini provider failure tells the planner how to redispatch on Codex', asy
   assert.match(task.next, /model not available/);
   assert.match(nextStep({ ...failure, error_kind: 'bad_arguments', error: 'agy rejected flag --json-schema' }),
     /Gemini 启动参数无效.*--json-schema/);
+  assert.match(nextStep({ ...failure, error_kind: 'bad_arguments', error: 'agy requires a local Windows drive path: /home/user/project' }),
+    /不在 Windows 盘符下.*engine: "codex"/);
 });
 
 test('a fresh Codex continuation without Gemini uses the current model and service tier', async () => {
