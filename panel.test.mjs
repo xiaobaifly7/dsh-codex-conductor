@@ -236,7 +236,8 @@ test('panel settings expose editable fields and read scope counts while redactin
     lockTimeoutSeconds: 1.5, maxStorageMb: 256, token: 'secret', runner: 'secret',
     gemini: { model: 'gemini', effort: 'low', command: 'secret' } };
   const expected = { acceptOpenEvidence: 'strict', ownerDecisions: 'planner', model: 'model', effort: 'high', readOnlyEffort: '', serviceTier: '', plannerAnswers: true,
-    lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low' },
+    lockTimeoutSeconds: 1.5, maxStorageMb: 256, plannerReads: 'open', plannerReadAllowCount: 0, gemini: { model: 'gemini', effort: 'low', accountPool: false },
+    defaultEngine: 'codex', crossEngineVerify: true, geminiFallback: true, maxGeminiRunningJobs: null,
     timeoutSeconds: null, idleTimeoutSeconds: null, retries: null, maxRunningJobs: null, autoResume: { enabled: true },
     roots: [], allowHostAccess: false, defaultHostAccess: false, unknownConfig: [], autoVerify: 'flagged',
     toolPolicy: 'denylist', allowTools: [], plannerReadAllow: [], maxSessionJobs: null, maxSessionTokens: null, jobDiff: false, closeoutGuard: true, handoverSuggestMessages: 5000, acceptanceWarnAbove: 8, continueFreshAboveTokens: 100000, closeoutEvidence: 'independent',
@@ -252,7 +253,11 @@ test('panel settings expose editable fields and read scope counts while redactin
     defaultHostAccess: true, unknownConfig: ['timoutSeconds'] }),
   { ...expected, timeoutSeconds: 900, idleTimeoutSeconds: 60, retries: 0, maxRunningJobs: 2, autoResume: { enabled: false },
     roots: ['*'], allowHostAccess: true, defaultHostAccess: true, unknownConfig: ['timoutSeconds'] });
-  assert.deepEqual(cfg.gemini, { ...expected.gemini, command: 'secret' });
+  assert.deepEqual(cfg.gemini, { model: 'gemini', effort: 'low', command: 'secret' });
+  assert.deepEqual(panelSettings({ ...cfg, gemini: { ...cfg.gemini, accountPool: 'D:\\private\\pool.json' }, defaultEngine: 'gemini',
+    crossEngineVerify: false, geminiFallback: false, maxGeminiRunningJobs: 3 }),
+  { ...expected, gemini: { ...expected.gemini, accountPool: true }, defaultEngine: 'gemini', crossEngineVerify: false,
+    geminiFallback: false, maxGeminiRunningJobs: 3 }, 'the pool path itself is not shown');
   assert.equal(panelSettings({ ...cfg, gemini: undefined }).gemini, null);
   assert.deepEqual(panelSettings({ ...cfg, plannerReads: 'products', plannerReadAllow: ['C:\\private', '/mnt/e/allowed'] }),
     { ...expected, plannerReads: 'products', plannerReadAllowCount: 2, plannerReadAllow: ['C:\\private', '/mnt/e/allowed'] });
@@ -355,6 +360,25 @@ test('panel reads the current connection on every request as authentication appe
   rejected(await f.request('GET', '/status'), 401);
   assert.equal(f.web.register.mock.callCount(), 1);
   assert.equal(f.unregister.mock.callCount(), 0);
+});
+
+test('panel status names the pooled Gemini account and the job list marks Gemini runs', async (t) => {
+  const f = fixture(t);
+  const pool = path.join(f.root, 'pool.json');
+  f.cfg.gemini.accountPool = pool;
+  writeFileSync(pool, JSON.stringify({ activeAccountIds: { google: 'acc_2' }, accounts: [
+    { id: 'acc_1', dir: 'D:/pool/1', enabled: true, refreshToken: 'private-token' },
+    { id: 'acc_2', alias: 'work', dir: 'D:/pool/2', enabled: true, refreshToken: 'private-token' }] }));
+  let status = await f.request('GET', '/status');
+  assert.deepEqual(status.body.geminiAccount, { id: 'acc_2', alias: 'work' });
+  assert.ok(!JSON.stringify(status.body).includes('private'), 'only the account name leaves the pool');
+  writeFileSync(pool, JSON.stringify({ accounts: [] }));
+  status = await f.request('GET', '/status');
+  assert.match(status.body.geminiAccount.error, /没有可用账号/);
+  f.jobs.push({ job_id: 'job-2', started_at: 124, status: 'completed', engine: 'gemini', context: { task: 't', fallback_of: 'job-1' } },
+    { job_id: 'job-3', started_at: 125, status: 'completed', task_options: { engine: 'gemini' }, context: { task: 't' } });
+  const { jobs } = (await f.request('GET', '/jobs')).body;
+  assert.deepEqual(jobs.map((job) => [job.engine, job.fallback_of]), [[undefined, undefined], ['gemini', 'job-1'], ['gemini', undefined]]);
 });
 
 test('panel HTTP implements every valid route using only stub runtime/conductor', async (t) => {

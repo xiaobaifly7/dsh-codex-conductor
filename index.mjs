@@ -1119,11 +1119,11 @@ function settings(config, logger) {
       for (const [key, fallback] of Object.entries({ proxy: '', model: 'gemini-4-argon', effort: '', timeoutSeconds: 1800, idleTimeoutSeconds: 600 })) {
         const value = gemini[key];
         const valid = ['timeoutSeconds', 'idleTimeoutSeconds'].includes(key) ? Number.isFinite(value) && value > 0
-          : key === 'effort' ? ['low', 'medium', 'high'].includes(value) : typeof value === 'string' && value.trim().length > 0;
+          : key === 'effort' ? ['', 'low', 'medium', 'high'].includes(value) : typeof value === 'string' && value.trim().length > 0;
         if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
         config.gemini[key] = valid ? value : fallback;
         if (key === 'model' && valid) config.gemini.executionModel = value;
-        if (key === 'effort' && valid) config.gemini.executionEffort = value;
+        if (key === 'effort' && valid && value) config.gemini.executionEffort = value;
       }
       // The configured effort wins over whatever the planner passes.
       if (gemini.forceEffort !== undefined) {

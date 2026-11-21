@@ -30,7 +30,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ### 0.9.56：设置里的“Codex 指挥”
 
-在 DSH 设置页打开“Codex 指挥”，可以查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、查看报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型和思考程度。运行状态和设置先显示，任务历史和关注数量分别加载。
+在 DSH 设置页打开“Codex 指挥”，可以查看加载版本、源码是否一致、当前执行设置和任务数量，修改常用设置，筛选最近 20 个任务、查看报告并确认取消正在跑的任务，也可以编辑规划提示词和请求空闲后重载。Gemini 已配置时才显示其模型、思考程度、默认执行端、核验换引擎、失败转 Gemini、Gemini 并发上限和当前使用的账号。运行状态和设置先显示，任务历史和关注数量分别加载。
 
 空闲指没有 Codex 活任务，且宿主所有会话均没有 `status === 'running'` 的回合，包括等待模型回复的回合；无法读取会话状态时拒绝等空闲重载。空闲时保存设置会立即应用；否则默认先保存为待生效设置，等待空闲后自动应用。待生效设置写在本机 `pending-settings.json`（与 `loaded.json` 同目录，通常是 `%LOCALAPPDATA%\dsh-codex-conductor`），重启后会恢复；它绑定当前环境配置的 `runtimeProfileFile`，避免误用到另一个实例。再次保存会覆盖之前的待生效设置，也可以撤销尚未应用的设置。等待期间每 5 秒检查一次是否空闲；面板每 7 秒刷新活任务数、运行中会话数与剩余秒数。最长等待 10 分钟，超时停止自动重载，不强制应用，保留待生效设置和原因；请重新保存、撤销，或明确确认立即生效。实际应用时先备份，再原子改写本插件对应的 profile 字段，保留注释和其他配置；只有确认新版本实际加载后才显示生效。规划提示词保存前也会备份。
 
@@ -626,7 +626,7 @@ Verification can run the project's checks. Sandboxed verification starts in writ
 
 ### 0.9.56: Codex control panel
 
-Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, read reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls appear only when Gemini is already configured. Runtime status and settings appear first; task history and attention counts load separately.
+Open **Codex 指挥** in DSH Settings to view the loaded/source version, execution settings and task counts, edit common settings, filter the latest 20 tasks, read reports, confirm cancellation, edit the planner prompt, and request an idle reload. Gemini controls (model, level, default executor, cross-engine verification, Gemini fallback, Gemini concurrency and the account in use) appear only when Gemini is already configured. Runtime status and settings appear first; task history and attention counts load separately.
 
 Idle means no active Codex tasks and no session with `status === 'running'`, including turns waiting for a model response; unavailable session status refuses an idle reload. Saving settings while idle applies them immediately; otherwise pending settings are saved and applied once idle. Pending settings are stored locally in `pending-settings.json`, beside `loaded.json` (normally in `%LOCALAPPDATA%\dsh-codex-conductor`), and restored after a restart. They are tied to the current environment's configured `runtimeProfileFile` so they cannot be applied to another instance by mistake. Saving again replaces the pending settings; you can also cancel settings that have not yet been applied. The idle check runs every 5 seconds, and the panel refreshes task counts, running session counts and remaining seconds every 7 seconds. After 10 minutes, automatic reload stops without forcing application, retaining pending settings and the reason; save again, cancel pending settings, or explicitly confirm immediate application. Applying settings backs up and atomically updates this plugin's profile fields, preserving comments and unrelated configuration; only the actual load marker confirms success. Prompt saves also create a backup.
 

@@ -4,6 +4,7 @@ import path from 'node:path';
 const { validatePanelSettings, writeBackedUpFile, queryWithTimeout, REPEAT_FAILURE_DEFAULTS } = await import(new URL(`./runtime.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { validateRequest, validateSendRequest, validateGoalRequest } = await import(new URL(`./resume.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { validateHandoverRequest, submitHandoverRequest } = await import(new URL(`./handover.mjs${new URL(import.meta.url).search}`, import.meta.url));
+const { jobEngine, poolAccount } = await import(new URL(`./engines.mjs${new URL(import.meta.url).search}`, import.meta.url));
 const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8'));
 
 export const PANEL_PATH = '/dsh-codex-conductor';
@@ -107,7 +108,9 @@ export function panelSettings(cfg) {
   return Object.fromEntries(['model', 'effort', 'readOnlyEffort', 'serviceTier', 'plannerAnswers', 'lockTimeoutSeconds', 'maxStorageMb']
     .map((key) => [key, cfg[key]]).concat([['plannerReads', cfg.plannerReads ?? 'open'],
       ['plannerReadAllowCount', cfg.plannerReadAllow?.length ?? 0],
-      ['gemini', cfg.gemini ? { model: cfg.gemini.model, effort: cfg.gemini.effort } : null],
+      ['gemini', cfg.gemini ? { model: cfg.gemini.model, effort: cfg.gemini.effort, accountPool: Boolean(cfg.gemini.accountPool) } : null],
+      ['defaultEngine', cfg.defaultEngine ?? 'codex'], ['crossEngineVerify', cfg.crossEngineVerify !== false],
+      ['geminiFallback', cfg.geminiFallback !== false], ['maxGeminiRunningJobs', cfg.maxGeminiRunningJobs ?? null],
       ...['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'maxRunningJobs'].map((key) => [key, cfg[key] ?? null]),
       ['autoResume', { enabled: cfg.autoResume?.enabled !== false }],
       ['roots', cfg.roots ?? []], ['allowHostAccess', cfg.allowHostAccess === true],
@@ -125,6 +128,16 @@ export function panelSettings(cfg) {
       ['closeoutGuard', cfg.closeoutGuard !== false],
       // 受护栏会话里出现过、白名单模式下不会放行的工具名；只读，不是设置项。
       ['seenTools', [...(cfg.seenTools ?? [])].sort()]]));
+}
+
+// 账号池里下一单 Gemini 会用的账号；读池失败时给出原因，不显示池里的其他字段。
+function geminiAccount(cfg) {
+  try {
+    const account = poolAccount(cfg.gemini.accountPool, cfg.gemini.executionModel ?? cfg.gemini.model);
+    return { id: account.id, ...(typeof account.alias === 'string' && account.alias ? { alias: account.alias } : {}) };
+  } catch (error) {
+    return { error: error.message };
+  }
 }
 
 // No runner commands come from HTTP input; file names from HTTP are only matched against fixed directory listings.
@@ -193,7 +206,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
     }
     if (route === '/status') {
       return { runtime: await runtime.execute({ action: 'status' }, { signal, panel: true }), settings: panelSettings(cfg),
-        history: history(), handover: handover(), ...(autoAnswer && { autoAnswer: autoAnswer.snapshot() }) };
+        history: history(), handover: handover(), ...(autoAnswer && { autoAnswer: autoAnswer.snapshot() }),
+        ...(cfg.gemini?.accountPool ? { geminiAccount: geminiAccount(cfg) } : {}) };
     }
     if (route === '/attention') {
       const now = Date.now() / 1000;
@@ -239,6 +253,8 @@ export function createPanelApi({ cfg, conductor, runtime, plannerFile, plannerIn
             (job.verification_status === 'unreviewed' && job.review_status === 'needs_attention'),
           // 只转交 runner 实际给出的字段。
           ...(job.context?.owner != null ? { owner: job.context.owner } : {}),
+          ...(jobEngine(job) === 'gemini' ? { engine: 'gemini' } : {}),
+          ...(job.context?.fallback_of != null ? { fallback_of: job.context.fallback_of } : {}),
           ...Object.fromEntries(['cwd', 'duration_s', 'error_kind', 'verification_status', 'phase', 'attempt', 'updated_at',
             'diff_status', 'diff_files', 'rolled_back_at', 'last_activity']
             .filter((key) => job[key] != null).map((key) => [key, job[key]])),
