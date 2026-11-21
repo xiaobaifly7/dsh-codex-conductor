@@ -20,13 +20,18 @@ import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
-const { validReport, blockingState, prepareContinuation, previousRoundBrief, ownerBlockerIds, resolvedBlockerIds } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+const { validReport, blockingState, prepareContinuation, previousRoundBrief, ownerBlockerIds, resolvedBlockerIds,
+  repeatedOutcome, writeContradictions, withoutVerificationProduct, continuationSubmission } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS,
   REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
 const { geminiWrite } = await import(new URL(`./gemini.mjs${reloadQuery}`, import.meta.url));
+const { ENGINE_GUIDANCE, ENGINE_PARAMETER, checkEngine, jobEngine, runEngine, verifyEngine, geminiArgv } =
+  await import(new URL(`./engines.mjs${reloadQuery}`, import.meta.url));
 const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, import.meta.url));
-const { prepareReview, reviewRejection, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince, flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
+const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
+  flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS,
+  HISTORICAL_GAP_KINDS, historicalCriteria } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
 const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
@@ -55,6 +60,10 @@ const DEFAULTS = {
   routerCheckUrl: '',
   codexRoute: null,
   model: '',
+  defaultEngine: 'codex',
+  geminiFallback: true,
+  crossEngineVerify: true,
+  maxGeminiRunningJobs: 2,
   modelAB: { enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 },
   effort: '',
   effortOverride: 'planner',
@@ -95,6 +104,11 @@ const DEFAULTS = {
   jobDiff: true,
   // 本会话有已结束、报告有标记却未 codex_review 或 needs_changes 未跟进的任务时，拒绝开新工作的 codex_run；false 关闭
   closeoutGuard: true,
+  convergenceGuard: true,
+  historicalGapReview: true,
+  dispatchConsistency: true,
+  actionableReceipts: true,
+  verificationReuse: true,
   // 受护栏会话的工具放行方式，allowlist 只放行护栏认识的工具和配置的名单。
   toolPolicy: 'denylist',
   allowTools: [],
@@ -347,19 +361,25 @@ export function createConductor(cfg, run = runRunner) {
 
   async function start(args, cwd, signal, context) {
     const argv = ['start', '--cwd', cwd];
+    const engine = runEngine(args, cfg);
     const repeat = cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS;
     argv.push('--repeat-guard', repeat.enabled ? 'on' : 'off', '--repeat-min-seconds', String(repeat.minSeconds),
       '--repeat-failures', String(repeat.failures), '--repeat-window-hours', String(repeat.windowHours));
     if (args.rerun_after_change) argv.push('--allow-rerun');
     const hostAccess = args.host_access ?? (cfg.defaultHostAccess === true);
-    const effort = args.effort ?? (context?.verification_of ? undefined : defaultEffort(cfg, args.write));
-    if (effort) argv.push('--effort', effort);
-    const model = args.model ?? cfg.model;
-    const serviceTier = args.service_tier ?? cfg.serviceTier;
-    if (cfg.modelAB?.enabled && args.model === undefined && !args.resume && context && !context.continuation && !context.verification_of) {
-      argv.push('--model-ab', JSON.stringify([cfg.modelAB.models, cfg.modelAB.share]));
-    } else if (model) argv.push('--model', model);
-    if (serviceTier) argv.push('--service-tier', serviceTier);
+    if (engine === 'gemini') {
+      argv.push(...geminiArgv(args, cfg));
+    } else {
+      const effort = args.effort ?? (context?.verification_of ? undefined : defaultEffort(cfg, args.write));
+      if (effort) argv.push('--effort', effort);
+      const model = args.model ?? cfg.model;
+      const serviceTier = args.service_tier ?? cfg.serviceTier;
+      if (cfg.modelAB?.enabled && args.model === undefined && !args.resume && context && !context.continuation && !context.verification_of) {
+        argv.push('--model-ab', JSON.stringify([cfg.modelAB.models, cfg.modelAB.share]));
+      } else if (model) argv.push('--model', model);
+      if (serviceTier) argv.push('--service-tier', serviceTier);
+      if (cfg.geminiFallback !== false && cfg.gemini?.command && context?.owner) argv.push('--gemini-fallback-check');
+    }
     for (const [key, flag] of [['timeoutSeconds', '--timeout'], ['idleTimeoutSeconds', '--idle-timeout'], ['retries', '--retries'],
       ['lockTimeoutSeconds', '--lock-timeout'], ['maxStorageMb', '--max-storage-mb']]) {
       if (cfg[key] != null) argv.push(flag, String(cfg[key]));
@@ -368,8 +388,9 @@ export function createConductor(cfg, run = runRunner) {
     // host_access 不管 write 都在沙箱外运行，write=false 的只读只靠提示约束
     if (hostAccess === true) argv.push('--sandbox', 'danger-full-access');
     else if (args.write === true) argv.push('--sandbox', 'workspace-write');
-    if (args.resume) argv.push('--resume', args.resume);
-    if (args.use_user_config === true) argv.push('--use-user-config');
+    const resume = engine === 'gemini' ? args.conversation_id : args.resume;
+    if (resume) argv.push('--resume', resume);
+    if (engine === 'codex' && args.use_user_config === true) argv.push('--use-user-config');
     if (cfg.reportSchema) argv.push('--schema', cfg.reportSchema);
     for (const s of args.scope ?? []) argv.push('--scope', s);
     for (const root of args.writable_roots ?? []) argv.push('--writable-root', root);
@@ -396,7 +417,8 @@ export function createConductor(cfg, run = runRunner) {
     const argv = ['list', '--limit', String(filters.limit ?? 20), '--offset', String(filters.offset ?? 0)];
     for (const key of ['cwd', 'owner', 'status']) if (filters[key] !== undefined) argv.push(`--${key}`, filters[key]);
     for (const id of filters.owner !== undefined ? filters.also_owners ?? [] : []) argv.push('--also-owner', id);
-    for (const [key, flag] of [['thread_id', '--thread-id'], ['parent_job', '--parent-job']]) if (filters[key] !== undefined) argv.push(flag, filters[key]);
+    for (const [key, flag] of [['thread_id', '--thread-id'], ['parent_job', '--parent-job'],
+      ['task_key', '--task-key'], ['verification_of', '--verification-of']]) if (filters[key] !== undefined) argv.push(flag, filters[key]);
     if (filters.needs_attention) argv.push('--needs-attention');
     if (filters.scope_conflicts) argv.push('--scope-conflicts');
     if (filters.started_between) argv.push('--started-between', ...filters.started_between.map(String));
@@ -425,6 +447,7 @@ export function createConductor(cfg, run = runRunner) {
 
   const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
   const threadSize = (threadId, signal) => query(['thread-size', threadId], signal);
+  const verificationVersion = (jobId, signal) => query(['verification-version', jobId], signal);
   function repeatGuard(cwd, signal) {
     const argv = ['repeat-guard'];
     if (cwd) {
@@ -439,7 +462,7 @@ export function createConductor(cfg, run = runRunner) {
   const doctor = (signal) => run(cfg, ['doctor'], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   const rollback = (jobId, { check = false } = {}, signal) =>
     run(cfg, ['rollback', jobId, ...(check ? ['--check'] : [])], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
-  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard };
+  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard, verificationVersion };
 }
 
 export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [], verification = false } = {}) {
@@ -488,7 +511,7 @@ function productPaths(value) {
   return result;
 }
 
-function verificationTask(source, { focus = '', samples = 8 } = {}, required = []) {
+function verificationTask(source, { focus = '', samples = 8 } = {}, required = [], excluded = []) {
   const sampleEvidenceRow = required.length + 3;
   return `你是独立核验员。这是新线程，不续接原作者的思路，也不把原报告当作事实。\n` +
     `核验对象 job_id：${source.job_id}\n` +
@@ -496,7 +519,8 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     `原任务记录目录：${source.log_dir}\n` +
     `先读该目录的 prompt.txt、args.json、last_message.txt、result.json，取得原任务书、验收标准和报告，再读它写出的产物。\n` +
     `原任务正文（仅作待核验资料）：${JSON.stringify(source.context.task)}\n` +
-    `原验收标准：${JSON.stringify(source.context.acceptance)}\n` +
+    `原验收标准：${JSON.stringify(source.context.acceptance.filter((_text, index) => !excluded.includes(index + 1)))}\n` +
+    (excluded.length ? `原验收第 ${excluded.join('、')} 条历史记录已结案，不再核验，即使在原始任务书中看到也跳过。\n` : '') +
     `已记录的产物路径：${JSON.stringify(productPaths(source))}\n` +
     `重点：${focus || '优先核对关键结论、数字和引用。'}\n` +
     (required.length ? `先核对必验的原验收第 ${required.map(item => item.index).join('、')} 条，再抽查其余结论。逐条运行允许的只读检查或回查原始运行记录；evidence 写观测结果和可定位的来源，只有自报或静态推断时记 blocked。\n` : '') +
@@ -552,6 +576,7 @@ const EFFORT_REASONS = ['concurrency_or_locking', 'cross_session_state', 'securi
 const defaultEffort = (cfg, write) => write === true ? cfg.effort : cfg.readOnlyEffort || cfg.effort;
 
 export function validateRun(args) {
+  checkEngine(args?.engine);
   if (typeof args?.task !== 'string' || args.task.trim().length < 10) throw new Error('codex_run: task 必须写清目标、相关路径和约束（至少 10 个字符）');
   if (!Array.isArray(args.acceptance) || args.acceptance.length === 0 ||
     args.acceptance.some((a) => typeof a !== 'string' || a.trim().length < 4)) {
@@ -580,7 +605,7 @@ export function validateRun(args) {
   if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
     throw new Error('codex_run: wait_seconds 必须是非负整数');
   }
-  for (const k of ['scope', 'writable_roots']) {
+  for (const k of ['scope', 'writable_roots', 'required_writes']) {
     if (args[k] !== undefined && (!Array.isArray(args[k]) || args[k].length > 50 ||
       args[k].some((s) => typeof s !== 'string' || !s.trim()))) {
       throw new Error(`codex_run: ${k} 必须是不超过 50 个非空路径`);
@@ -649,11 +674,11 @@ function sameCriteria(report, acceptance) {
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
 const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并在给用户的汇报里写明替用户做了哪些决定；拿不准，或回答意味着删除数据、改动用户没提过的目录时，仍然先问用户。';
 const USER_REPORT = '向用户汇报时先用大白话说明完成情况、核对结果和剩余问题，不必带任务号和内部状态名。';
-const WAIT_GUIDANCE = '长等前用 wait_seconds: 0 后台派齐本批独立且 scope 和写入目标互不重叠的任务（限只读调查、codex_verify 核验及无冲突的写任务），直接拿任务号。' +
-  '写同一文件、目录、工作区或真机、起停同一虚拟机或服务、有先后依赖的写任务须串行，完成并核对一单再派下一单。' +
-  '留在本轮，按 runner job_id 并行调用 codex_status（wait_seconds: 3600），未完则续等。报告直接验收，仅摘要、缺内容或截断时用 job_output 或 codex_output 补读。';
-const waitForJob = (jobId) => `先后台派齐本批独立且不重叠的任务，再留在本轮并行等待：codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
-  '仍在跑则续等，返回报告就直接验收，勿零等待轮询或重派。';
+const WAIT_GUIDANCE = '① 派齐本批：同一回合用 wait_seconds: 0 派出已就绪且护栏允许的独立只读调查（write=false）和 codex_verify，记 runner job_id，能并列调用就并列。' +
+  '有依赖、写同目录或改变同一真机、虚拟机、服务状态的任务须串行。' +
+  '② 等待与验收：留在本轮，先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑。报告有缺才用 job_output 或 codex_output 补读。';
+const waitForJob = (jobId) => `先派齐本批获准的独立只读调查和核验，再留在本轮一次等一单，例如 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
+  '其余单继续跑。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
 const RERUN_AFTER_CHANGE = { type: 'string', minLength: 1,
   description: '外部条件已经改变时填写具体变化（例如用户修好了虚拟机），允许本次重新运行此前反复失败的步骤。' };
 const minutes = seconds => Math.round(seconds / 60);
@@ -722,6 +747,17 @@ function failureReceipt(value, cause) {
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions } = {}) {
   const blocking = blockingState(value);
   if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
+  if (value.error_kind === 'provider_permanent') {
+    const target = value.context?.verification_of;
+    return `Gemini 提供方无法执行：${String(value.error ?? '请核对账号、模型和额度').slice(0, 300)}。` +
+      (target ? `用 codex_verify 对 ${target} 显式传 engine: "codex" 重新核验。`
+        : '先核对已有产物，再按原授权用 codex_run 显式传 engine: "codex" 重新派单，只补缺项。');
+  }
+  if (jobEngine(value) === 'gemini' && value.error_kind === 'bad_arguments') {
+    const error = String(value.error ?? '请核对 agy 参数和任务权限').slice(0, 300);
+    return `Gemini 启动参数无效：${error}。` + (/local Windows drive path/.test(error)
+      ? '该目录不在 Windows 盘符下，Windows 上的 agy 进不去；改用 engine: "codex" 重新派单或核验。' : '');
+  }
   if (value.error_kind === 'executor_lost') {
     const resume = value.thread_id ? `，或用 codex_continue ${value.job_id} 在原线程续接（fresh=false）` : '';
     return `任务 ${value.job_id} 的执行环境中断（${value.lost_reason}：WSL 重启或执行进程退出），没有生成报告。` +
@@ -812,7 +848,8 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     }
     // 只读任务用 --ephemeral 运行；只有它续跑的持久线程还能续。
     const thread = (value.sandbox !== 'read-only' || resumed !== false) && value.thread_id;
-    const resume = thread ? '沿用原授权，用 codex_run 的 resume 填原 thread_id，传 fresh=false 续接，只补缺项。' : '按原授权补做缺项。';
+    const resume = value.conversation_id ? '沿用原授权，用 codex_continue(job_id) 续接，只补缺项。'
+      : thread ? '沿用原授权，用 codex_run 的 resume 填原 thread_id，传 fresh=false 续接，只补缺项。' : '按原授权补做缺项。';
     if (value.error_kind === 'worker_died') {
       const check = readOnly ? '先按原验收核对已有产物。'
         : '退出前可能已改了部分文件。先用 codex_output（artifact=context）取回原验收标准，再用 git status 或对比文件核对已有产物。';
@@ -898,7 +935,8 @@ function render(value) {
   // 后台任务结算时存下的成品文字，原样交回
   if (typeof value?.rendered === 'string') return [{ type: 'text', text: value.rendered }];
   // acceptance 不放进详细字段：逐条汇报或下一步里已列出
-  const { final_message: answer, report, next, acceptance, ...rest } = value ?? {};
+  const { final_message: answer, report, next, acceptance, resubmit, ...rest } = value ?? {};
+  const executor = jobEngine(rest) === 'gemini' ? 'Gemini' : 'Codex';
   const full = rest.log_dir ? `${rest.log_dir}/last_message.txt` : 'runner 任务目录里的 last_message.txt';
   // 不合 schema 的汇报（如 evidence 为 null）也要能显示；截断处不留半个代理对
   const clip = (v) => {
@@ -907,7 +945,7 @@ function render(value) {
   };
   const original = sameCriteria(report, acceptance);
   const reportLines = report ? [
-    '--- Codex 逐条汇报（保留原记录）---', `概述：${report.summary ?? ''}`,
+    `--- ${executor} 逐条汇报（保留原记录）---`, `概述：${report.summary ?? ''}`,
     ...(report.criteria ?? []).map((c, i) => `${MARK[c.status] ?? '?'} ${i + 1}. ${original ? acceptance[i] : c.criterion} —— ${clip(c.evidence)}`),
     `自报改动：${report.files_changed?.join('、') || '无'}`,
     `偏离计划：${report.deviations?.join('；') || '无'}`,
@@ -916,12 +954,14 @@ function render(value) {
   const extra = details(rest);
   const blockers = value?.blocking ?? blockingState(value);
   return [{ type: 'text', text: [
-    `${summaryLine(value ?? {})}${rest.job_id ? `  job_id: ${rest.job_id}` : ''}${rest.thread_id ? `  thread_id: ${rest.thread_id}` : ''}`,
+    `${summaryLine(value ?? {})}${rest.job_id ? `  job_id: ${rest.job_id}` : ''}${rest.thread_id ? `  thread_id: ${rest.thread_id}` : ''}` +
+      (executor === 'Gemini' ? `  engine: gemini${rest.conversation_id ? `  conversation_id: ${rest.conversation_id}` : ''}` : ''),
     ...(report ? reportLines
-      : answer ? [`--- Codex 最终答复${rest.truncated ? `（超过 8000 字已截断，全文见 ${full}）` : ''} ---`, answer] : []),
+      : answer ? [`--- ${executor} 最终答复${rest.truncated ? `（超过 8000 字已截断，全文见 ${full}）` : ''} ---`, answer] : []),
     ...(extra.length ? ['--- 详细字段 ---', ...extra] : []),
     ...(blockers.blockers.length ? ['--- 阻塞与待回答问题 ---', ...blockers.blockers.map((b) =>
       `${b.id} [${b.kind}] ${b.message}${b.question ? `\n需要回答：${b.question}` : ''}${b.resolution ? `\n解除条件/已有信息：${b.resolution}` : ''}`)] : []),
+    ...(resubmit ? [`可填好后提交：codex_continue ${JSON.stringify(resubmit)}`] : []),
     ...(next ? ['--- 下一步 ---', next, USER_REPORT] : []),
   ].join('\n') }];
 }
@@ -990,7 +1030,7 @@ function settings(config, logger) {
   if (unknownConfig.length) logger?.warn?.(`[codex-conductor] 未知配置项 ${unknownConfig.join(', ')} 已忽略，请核对拼写`);
   config = Object.fromEntries(Object.entries(DEFAULTS).map(([key, fallback]) => {
     const value = config[key];
-    const counts = ['maxRunningJobs', 'maxSessionJobs', 'maxSessionTokens'];
+    const counts = ['maxRunningJobs', 'maxSessionJobs', 'maxSessionTokens', 'maxGeminiRunningJobs'];
     const optionalBudget = ['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'lockTimeoutSeconds', 'maxStorageMb', ...counts].includes(key);
     if (value === undefined || (value === '' && (typeof fallback === 'string' || optionalBudget))) return [key, fallback];
     const valid = optionalBudget
@@ -1002,6 +1042,7 @@ function settings(config, logger) {
       : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
       : key === 'ownerDecisions' ? ['planner', 'owner'].includes(value)
       : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
+      : key === 'defaultEngine' ? ENGINE_PARAMETER.enum.includes(value)
       : key === 'effortOverride' ? ['planner', 'raise-only-listed', 'config'].includes(value)
       : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
@@ -1075,12 +1116,14 @@ function settings(config, logger) {
       config.gemini = null;
     } else {
       config.gemini = { command: gemini.command.trim() };
-      for (const [key, fallback] of Object.entries({ proxy: '', model: 'gemini-4-argon', effort: 'medium', timeoutSeconds: 1800, idleTimeoutSeconds: 600 })) {
+      for (const [key, fallback] of Object.entries({ proxy: '', model: 'gemini-4-argon', effort: '', timeoutSeconds: 1800, idleTimeoutSeconds: 600 })) {
         const value = gemini[key];
         const valid = ['timeoutSeconds', 'idleTimeoutSeconds'].includes(key) ? Number.isFinite(value) && value > 0
           : key === 'effort' ? ['low', 'medium', 'high'].includes(value) : typeof value === 'string' && value.trim().length > 0;
         if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 gemini.${key}，使用默认值`);
         config.gemini[key] = valid ? value : fallback;
+        if (key === 'model' && valid) config.gemini.executionModel = value;
+        if (key === 'effort' && valid) config.gemini.executionEffort = value;
       }
       // The configured effort wins over whatever the planner passes.
       if (gemini.forceEffort !== undefined) {
@@ -1129,6 +1172,7 @@ const CANCEL_SETTLE_MS = 30_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 // 同一宿主内热重载后，旧的后台观察仍可能与新实例同时看到完成。
 const hostVerifications = globalThis[Symbol.for('dsh-codex-conductor.verifications')] ??= new WeakMap();
+const hostConvergenceStarts = globalThis[Symbol.for('dsh-codex-conductor.convergenceStarts')] ??= new Set();
 const hostParkedReviews = globalThis[Symbol.for('dsh-codex-conductor.parkedReviews')] ??= new Map();
 const hostAutoVerifyScans = globalThis[Symbol.for('dsh-codex-conductor.autoVerifyScans')] ??= new Map();
 const automaticVerification = Symbol('automaticVerification');
@@ -1424,12 +1468,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const saveLedger = (ledger) => {
     // 未完成项不按条数截断：只有复核或核验能让它离开台账。复核时间只为挡住迟到的旧回执：留最近 2000 个任务，仍有条目的任务一律保留。
     const { items } = ledger;
-    const keep = new Set(items.map(item => item.job_id));
+    const keep = new Set([...items, ...(ledger.historical ?? [])].map(item => item.job_id));
     const times = Object.entries(ledger.review_times ?? {}).sort((a, b) => a[1] - b[1]);
     const review_times = Object.fromEntries(times.filter(([id], i) => keep.has(id) || i >= times.length - 2000));
     if (ledgerFile) writeJsonAtomic(ledgerFile, { ...ledger, items, completions: ledger.completions.slice(-500), review_times });
   };
-  const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id;
+  const parentOf = (job) => job?.parent_job_id ?? job?.context?.continuation?.parent_job_id ?? job?.context?.routing?.parent_job_id;
   const ledgerJobIds = (items) => [...new Set(items.map(item => item.job_id))];
   const ownerKeys = item => (item.blocker_ids?.length ? item.blocker_ids : ['']).map(id => JSON.stringify([item.unit, id]));
   const itemId = ({ job_id, key, at }) => JSON.stringify([job_id, key, at]);
@@ -1442,7 +1486,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   const ledgerLine = (ledger, showCleared = false) => {
     if (!ledger) return unreadableLedgerLine;
-    const { items, completions, cleared } = ledger;
+    const { items, completions, cleared, historical = [] } = ledger;
     return [`未完成但接受的条目（本会话含前任）：${items.length} 项（任务 ${ledgerJobIds(items).join('、') || '无'}）；` +
       `以未完成项完成目标 ${completions.length} 次（最近 ${completions.at(-1)?.open_count ?? 0} 项）`,
       `待所有者决定 ${items.filter(item => item.needs_owner).length} 项`, laterRoundHint(items),
@@ -1452,6 +1496,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         return item.blocker_kinds?.some(kind => kind === 'user_input' || kind === 'task_conflict') ? [`${label} 可由规划端决定后继续`] : [];
       }),
       ...(showCleared ? cleared.map(item => `${item.job_id}#${item.index} cleared by later round ${item.cleared_by}`) : []),
+      ...historical.map(item => `${item.job_id}#${item.key} 历史证据不可补回（${item.historical_gap}）：${item.reason}`),
     ].filter(Boolean).join('\n');
   };
 
@@ -1513,8 +1558,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return root.thread_id ? `thread:${root.thread_id}` : `job:${root.job_id}`;
   }
 
-  function recordAcceptedOpen(source, acceptedOpen, at, owner, unit) {
-    if (!ledgerFile || (!unit && beforeCutoff(source, acceptOpenFrom))) return {};
+  function recordAcceptedOpen(source, acceptedOpen, at, owner, unit, historyOnly = false) {
+    if (!ledgerFile || (!unit && !acceptedOpen.some(item => item.historical_gap) && beforeCutoff(source, acceptOpenFrom))) return {};
     const warning = '本次复核已写入，未能更新未完成项台账。';
     try {
       const ledger = readLedger();
@@ -1529,7 +1574,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const previous = ledger.items.filter(item => item.needs_owner && owns(owner, item.session));
       const seen = new Set(previous.flatMap(ownerKeys));
       const asked = new Set(previous.filter(item => item.asked).flatMap(ownerKeys));
-      const fresh = beforeCutoff(source, acceptOpenFrom) ? acceptedOpen.filter(entry => entry.owner_only) : acceptedOpen;
+      const historical = acceptedOpen.filter(item => item.historical_gap).map(item => ({ session, job_id: jobId, ...item, at }));
+      const fresh = acceptedOpen.filter(item => !item.historical_gap && (item.owner_only || !beforeCutoff(source, acceptOpenFrom)));
       const items = fresh.map(({ owner_only, ...entry }) => {
         const item = { session, job_id: jobId, ...entry, blocker_kinds, at };
         if (owner_only) Object.assign(item, { needs_owner: owner_only, unit, blocker_ids, asked: ownerKeys({ unit, blocker_ids }).every(key => asked.has(key)) });
@@ -1537,9 +1583,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       });
       const newOwnerItems = items.filter(item => item.needs_owner && !previous.some(old => old.job_id === jobId && old.key === item.key));
       const askOwner = items.some(item => item.needs_owner && ownerKeys(item).some(key => !seen.has(key)));
-      const remaining = ledger.items.filter(item => item.job_id !== jobId);
+      const remaining = ledger.items.filter(item => item.job_id !== jobId ||
+        (historyOnly && !historical.some(entry => entry.key === item.key)));
       // 即使没有未完成项，也保留这次复核时间，防止迟到的旧回执恢复旧条目。
-      saveLedger({ ...ledger, review_times: { ...reviewTimes, [jobId]: at }, items: [...remaining, ...items] });
+      saveLedger({ ...ledger, review_times: { ...reviewTimes, [jobId]: at }, items: [...remaining, ...items],
+        ...(historical.length || ledger.historical ? { historical: [
+          ...(ledger.historical ?? []).filter(item => !historical.some(entry => entry.job_id === item.job_id && entry.key === item.key)),
+          ...historical,
+        ] } : {}) });
       if (newOwnerItems.length) countCloseout(owner, 'needs_owner_open', newOwnerItems.length);
       return { askOwner: askOwner
         ? `任务 ${jobId} 有事项须由所有者决定${blocker_ids.length ? `（阻塞 ${blocker_ids.join('、')}）` : ''}。` +
@@ -1607,13 +1658,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function acceptedOpenLedger(owner, signal) {
     const scope = aliases.owners(owner);
     const laterMet = new Map();
-    const view = ({ since, items, completions, cleared = [] }) => ({ since,
+    const view = ({ since, items, completions, cleared = [], historical }) => ({ since,
       items: items.filter(item => scope.includes(item.session)).map(item => {
         const later = laterMet.get(itemId(item));
         return later ? { ...item, later_met_by: later } : item;
       }),
       completions: completions.filter(entry => scope.includes(entry.session)),
-      cleared: cleared.filter(item => scope.includes(item.session)) });
+      cleared: cleared.filter(item => scope.includes(item.session)),
+      ...(historical ? { historical: historical.filter(item => scope.includes(item.session)) } : {}) });
     const initial = readLedger();
     if (!initial) return null;
     const snapshot = initial.items.filter(item => scope.includes(item.session));
@@ -1799,8 +1851,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 组装出错会让所有请求失败，所以 text 里不抛错（plannerPrompt 读不了就返回空）
   let plannerInjected = false;
   if (plannerFile) try {
+    const engineGuide = cfg.gemini ? plannerPrompt(fileURLToPath(new URL('./engine-prompt.md', import.meta.url))) : '';
     ctx.get?.('systemPrompt')?.section({ name: 'codex-conductor:planner', order: 10100, interpolate: false,
-      text: () => plannerSection(plannerPrompt(plannerFile)) });
+      text: () => plannerSection([engineGuide, plannerPrompt(plannerFile)].filter(Boolean).join('\n\n')) });
     plannerInjected = Boolean(ctx.get?.('systemPrompt'));
   } catch (error) {
     ctx.logger?.warn?.(`[codex-conductor] 规划要求没能注入系统提示词：${error?.message ?? error}`);
@@ -1841,12 +1894,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   async function hasLaterRound(source) {
     const id = source.job_id;
+    const owner = lastSuccessor(aliases, source.context?.owner) ?? source.context?.owner;
     const list = async filters => {
-      const page = await conductor.list(filters);
+      const page = await conductor.list(cfg.verificationReuse ? { owner, also_owners: aliases.predecessors(owner), ...filters } : filters);
       if (page.error_kind || !Array.isArray(page.jobs)) {
         throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
       }
-      return page;
+      return cfg.verificationReuse ? { ...page, jobs: page.jobs.filter(job => owns(owner, job.context?.owner)) } : page;
     };
     const children = await list({ parent_job: id, limit: 1 });
     if (children.jobs.some(job => job.parent_job_id === id || job.context?.continuation?.parent_job_id === id)) return true;
@@ -1884,6 +1938,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           const current = source ?? await conductor.waitJob(id, 0);
           if (unknownState(current)) return skipped(current.error ?? current.error_kind ?? current.status, 'error');
           if (!source && !eligibleForAutoVerification(withReport(current))) return;
+          if (cfg.verificationReuse && withoutVerificationProduct(current)) {
+            const reason = `任务 ${id} 受阻，未记录改动或可核验结果。先解除阻塞。`;
+            return { auto_verify: { skipped: reason }, line: reason };
+          }
           if (await hasLaterRound(current)) {
             return catchup ? undefined : skipped('已有后续轮次');
           }
@@ -2004,18 +2062,54 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     })]);
   }
 
-  async function withCompletionNotices(value, exec) {
+  async function withCompletionNotices(value, exec, { allowFallback = true } = {}) {
     const terminal = ['completed', 'failed', 'cancelled'].includes(value.status) && !unknownState(value);
     const blockLine = terminal && repeatBlockLine(value.repeat_guard?.blocks);
     const standingLine = terminal && repeatStandingLine(value.repeat_guard?.standing);
     const owner = value.context?.owner ?? exec?.agent?.id;
     if (blockLine && owner && value.job_id) countCloseout(owner, 'repeat_blocked', 1, value.job_id);
-    const [result, notices, parked] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
-      value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined]);
-    const next = parked && !['executor_lost', 'verification_tree_changed'].includes(value.error_kind)
+    const [result, notices, parked, fallback] = await Promise.all([withAutoVerification(value, exec), laterRoundNotices(value, exec),
+      value.context?.verification_of && owns(exec?.agent?.id, value.context.owner) ? observeParkedReview(value).catch(parkedWarning) : undefined,
+      allowFallback ? fallbackOnFailure(value, exec) : undefined]);
+    const next = parked && !['executor_lost', 'verification_tree_changed', 'provider_permanent'].includes(value.error_kind)
       ? [parked.line] : [result.next, parked?.line];
-    return notices.length || parked || blockLine || standingLine ? { ...result, ...(parked ? { parked_review: parked.parked_review } : {}),
-      next: [...next, blockLine, standingLine, ...notices].filter(Boolean).join('\n') } : result;
+    return notices.length || parked || blockLine || standingLine || fallback ? {
+      ...result, ...(parked ? { parked_review: parked.parked_review } : {}), ...(fallback ? { fallback: fallback.receipt } : {}),
+      next: [...next, blockLine, standingLine, ...notices, fallback?.line].filter(Boolean).join('\n') } : result;
+  }
+
+  const fallbacks = new Map();
+  async function fallbackOnFailure(source, exec) {
+    const { job_id: parent, context, task_options: options, sandbox } = source;
+    if (!cfg.gemini?.command || cfg.geminiFallback === false || source.status !== 'failed' ||
+        source.fallback_safe !== true || jobEngine(source) !== 'codex' || !parent || !context?.owner ||
+        !owns(exec?.agent?.id, context.owner)) return;
+    if (fallbacks.has(parent)) return fallbacks.get(parent);
+    const attempt = (async () => {
+      try {
+        const continuation = { parent_job_id: parent, answers: context.continuation?.answers ?? [],
+          resolution: context.continuation?.resolution ?? '' };
+        const task = [previousRoundBrief(source), `Codex 终止类别：${source.error_kind ?? '未知'}。runner 核对没有观察到原任务写入。`,
+          ...continuation.answers.map(({ id, answer }) => `已有答复 ${id}：${answer}`), continuation.resolution].filter(Boolean).join('\n\n');
+        const agent = context.owner === exec.agent.id ? exec.agent : { id: context.owner };
+        const child = await dispatch({
+          engine: 'gemini', task, cwd: source.cwd, write: context.write, acceptance: context.acceptance,
+          must_verify: context.must_verify, scope: source.scope_paths ?? source.scope ?? [],
+          writable_roots: options?.writable_roots ?? [], host_access: sandbox === 'danger-full-access', wait_seconds: 0,
+        }, { agent }, continuation, context.task, context.verification_of, undefined, undefined, { parent: source, fallbackOf: parent });
+        if (!child.job_id || unknownState(child)) throw new Error(child.error ?? child.error_kind ?? child.status);
+        if (child.error_kind === 'worker_start_failed') {
+          return { receipt: { job_id: child.job_id, engine: 'gemini', status: child.status },
+            line: `Gemini 接替任务 ${child.job_id} 未启动：${child.error}。可重新查询原任务触发接替。` };
+        }
+        return { receipt: { job_id: child.job_id, engine: 'gemini', status: child.status },
+          line: `Codex 任务 ${parent} 因 ${source.error_kind ?? '上游失败'} 终止。已转交 Gemini 任务 ${child.job_id}。${waitForJob(child.job_id)}` };
+      } catch (error) {
+        return { receipt: { error: String(error?.message ?? error) }, line: `Gemini 接替未启动：${error?.message ?? error}。` };
+      }
+    })();
+    fallbacks.set(parent, attempt);
+    try { return await attempt; } finally { fallbacks.delete(parent); }
   }
 
   async function scanAutoVerifications(limit, owner) {
@@ -2029,15 +2123,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       jobs.push(...page.jobs);
       offset = page.next_offset ?? null;
     }
-    const linked = new Set(jobs.flatMap(job => [job.parent_job_id, job.context?.continuation?.parent_job_id, job.context?.verification_of]));
+    const byId = new Map(jobs.map(job => [job.job_id, job]));
+    const currentOwners = new Map();
+    const currentOwner = job => {
+      const id = job.context?.owner;
+      if (!currentOwners.has(id)) currentOwners.set(id, lastSuccessor(aliases, id) ?? id);
+      return currentOwners.get(id);
+    };
+    const threadKey = job => cfg.verificationReuse ? JSON.stringify([currentOwner(job), job.thread_id]) : job.thread_id;
+    const linked = new Set(jobs.flatMap(job => [parentOf(job), job.context?.verification_of].filter(id =>
+      id && (!cfg.verificationReuse || (byId.has(id) && currentOwner(job) === currentOwner(byId.get(id)))))));
     const latestStart = new Map();
     for (const job of jobs) {
       if (job.thread_id && !job.context?.verification_of && Number.isFinite(job.started_at) &&
-          job.started_at > (latestStart.get(job.thread_id) ?? -Infinity)) latestStart.set(job.thread_id, job.started_at);
+          job.started_at > (latestStart.get(threadKey(job)) ?? -Infinity)) latestStart.set(threadKey(job), job.started_at);
     }
     let started = 0;
     for (const job of jobs) {
-      if (!automaticCandidate(job) || linked.has(job.job_id) || latestStart.get(job.thread_id) > job.started_at ||
+      if (!automaticCandidate(job) || linked.has(job.job_id) || latestStart.get(threadKey(job)) > job.started_at ||
           (Number.isFinite(job.finished_at) && beforeCutoff(job, autoVerifyFrom))) continue;
       // 列表行不带 must_verify 和原报告，完整状态也供后续派单使用。
       const source = await conductor.waitJob(job.job_id, 0);
@@ -2320,6 +2423,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const overlap = args.write === true ? verificationWriteOverlap(source, args, exec) : [];
     if (overlap.length) throw new Error(verificationOverlapRefusal(jobId, overlap, tool, running));
+    if (!running && cfg.verificationReuse && withoutVerificationProduct(source)) {
+      throw new Error(`${tool}: verify_previous 任务 ${jobId} 受阻，没有改动或可核验结果。先处理原阻塞，或去掉 verify_previous。`);
+    }
     return { source, overlap };
   }
   async function startVerifyPrevious(jobId, exec) {
@@ -2331,7 +2437,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           : `已同时派出对 ${jobId} 的只读核验（任务 ${value.job_id}），结果由完成通知送达；拿到后按原验收用 codex_review 记录 ${jobId}。` +
             '核验若判 needs_changes，用 codex_continue 返工原任务（续接不受收尾护栏限制）。' };
     } catch (error) {
-      return { error: String(error?.message ?? error), line: `对 ${jobId} 的核验没有派出：${error?.message ?? error}。这一单已经派出；之后再用 codex_verify ${jobId}。` };
+      return { error: String(error?.message ?? error), line: `对 ${jobId} 的核验没有派出：${error?.message ?? error}。这一单已经派出。` +
+        (error?.code === 'VERIFICATION_UNNEEDED' ? '' : `之后再用 codex_verify ${jobId}。`) };
     }
   }
 
@@ -2357,6 +2464,94 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const value = withReport(await conductor.waitJob(jobId, 0, exec?.signal));
       if (!unknownState(value) && owns(exec?.agent?.id, value.context?.owner)) return value;
     } catch { exec?.signal?.throwIfAborted(); }
+  }
+
+  const taskIdentity = task => createHash('sha256').update(task.trim()).digest('hex');
+  const orderedPaths = (cwd, paths) => [...new Set((paths ?? []).map(file => taskScopePath(cwd, file)))].sort();
+  function attemptPremises(value) {
+    const { context, cwd, sandbox, task_options } = value;
+    if (!cwd || !Array.isArray(context?.acceptance) || typeof context.task !== 'string' || typeof context.write !== 'boolean') return;
+    return JSON.stringify([context.routing?.convergence_task ?? taskIdentity(context.task),
+      context.acceptance.map(text => text.trim()), [...new Set(context.must_verify ?? [])].sort(), normPath(cwd), context.write, sandbox,
+      orderedPaths(cwd, value.scope_paths ?? value.scope), orderedPaths(cwd, task_options?.writable_roots),
+      orderedPaths(cwd, context.routing?.required_writes), task_options?.use_user_config === true]);
+  }
+
+  async function convergenceRounds(owner, task, acceptance, cwd, parent, signal, resumeJobs) {
+    const lookup = jobStatusLookup(signal);
+    const prior = async job => {
+      const id = job.context?.verification_of ?? parentOf(job);
+      if (id) {
+        const full = await lookup(id);
+        return owns(owner, full.context?.owner) && !unknownState(full) ? full : undefined;
+      }
+      if (!job.thread_id) return;
+      const related = [...resumeJobs.values()].filter(entry => entry.thread_id === job.thread_id && !entry.context?.verification_of);
+      const rows = related.length ? related : (await conductor.list({
+        owner, also_owners: aliases.predecessors(owner), thread_id: job.thread_id, limit: 2,
+      }, signal)).jobs;
+      if (rows?.[0]?.job_id !== job.job_id) return;
+      const earlier = rows[1];
+      if (earlier && owns(owner, earlier.context?.owner)) return lookup(earlier.job_id);
+    };
+    if (parent) {
+      if (!owns(owner, parent.context?.owner)) return [];
+      const latest = parent.context?.verification_of ? await prior(parent) : parent;
+      if (!latest || !repeatedOutcome(latest)) return [latest].filter(Boolean);
+      const earlier = await prior(latest);
+      return [latest, earlier].filter(job => job && owns(owner, job.context?.owner) && !job.context.verification_of);
+    }
+    const filters = { owner, also_owners: aliases.predecessors(owner), cwd, task_key: taskIdentity(task), limit: 100 };
+    const page = await conductor.list(filters, signal);
+    const title = task.trim().split('\n')[0].slice(0, 160);
+    const matches = [];
+    for (const job of page.jobs ?? []) {
+      if (!owns(owner, job.context?.owner) || job.context.verification_of || job.context.task !== title) continue;
+      const full = await lookup(job.job_id);
+      if (!owns(owner, full.context?.owner) || full.context.task?.trim() !== task.trim() ||
+          JSON.stringify(full.context.acceptance) !== JSON.stringify(acceptance)) continue;
+      matches.push(full);
+      if (matches.length === 2) break;
+    }
+    return matches;
+  }
+
+  function convergenceDecision(tool, rounds, candidate, note) {
+    const [latest, earlier] = rounds;
+    if (!latest) return {};
+    const premises = attemptPremises(latest);
+    if (!premises || premises !== attemptPremises(candidate)) return {};
+    if ((latest.execution_status ?? latest.status) === 'running' && latest.context.routing?.convergence_override) {
+      return { refusal: `${tool}: 交付链的变化重试 ${latest.job_id} 尚在运行。用 codex_status 查询该真实 job_id。` };
+    }
+    if (!earlier) return {};
+    const outcome = repeatedOutcome(latest);
+    if (!outcome || premises !== attemptPremises(earlier) ||
+        JSON.stringify(outcome) !== JSON.stringify(repeatedOutcome(earlier))) return {};
+    const exhausted = latest.context.routing?.convergence_override === true;
+    if (!exhausted && note && note !== latest.context.routing?.change_fingerprint) return { override: true };
+    const items = [...outcome.criteria.map(([index, status]) => `验收 ${index}=${status}`), ...outcome.blockers];
+    const refusal = `${tool}: 交付链 ${latest.thread_id ? `thread_id=${latest.thread_id}，` : ''}job_id=${latest.job_id} ` +
+      `连续两轮 ${earlier.job_id} → ${latest.job_id} 卡在 ${items.join('、')}，派单前提未变，未启动 Codex。` +
+      (exhausted ? '上一轮仅凭变化说明放行后，结果依旧相同，已用完一次机会。'
+        : '若环境或做法确有变化但无法在派单参数中体现，可用 rerun_after_change 说明并试一次。') +
+      `对最新轮次 ${latest.job_id} 用 codex_review 记录有依据的接受偏差及理由，或上报需用户决定的事项。`;
+    return { refusal };
+  }
+
+  function carryHistoricalCriteria(args, source, routing) {
+    const closed = new Set(historicalCriteria(source));
+    const indexes = args.acceptance.map((text, position) => ({ text, index: position + 1 }))
+      .filter(({ text, index }) => !closed.has(text) || args.must_verify?.includes(index) ||
+        args.acceptance.indexOf(text) !== args.acceptance.lastIndexOf(text));
+    if (indexes.length === args.acceptance.length) return { args, routing: closed.size ? { ...routing, historical_criteria: [...closed] } : routing };
+    const mapping = new Map(indexes.map(({ index }, position) => [index, position + 1]));
+    const remap = values => values?.filter(index => mapping.has(index)).map(index => mapping.get(index));
+    return { args: { ...args, acceptance: indexes.map(({ text }) => text), must_verify: remap(args.must_verify),
+      expect_blocked: remap(args.expect_blocked), acceptance_needs: args.acceptance_needs
+        ?.filter(({ index }) => mapping.has(index)).map(entry => ({ ...entry, index: mapping.get(entry.index) })),
+      task: `${args.task}\n\n## 已结案的历史记录\n以下条目已记录为不可补回。即使旧任务正文、报告或线程出现同一条，本单也不采补或验收：${JSON.stringify([...closed])}` },
+    routing: { ...routing, historical_criteria: [...closed] } };
   }
 
   // 本会话（含交接前任）在收尾截止时间之后开始的全部任务；runner 每页最多 100 条，逐页取全。
@@ -2394,14 +2589,27 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         plan.guard.parkedReview = parkedFor(owner).some(e => e.job_id === deferred.job_id);
         return '';
       }
-      const refusal = closeoutRefusal(tool, pending);
+      let refusal = closeoutRefusal(tool, pending);
       if (refusal) logRefusal({ session: owner, tool, unreviewed: pending.unreviewed, needs_changes: pending.needsChanges });
+      if (refusal && cfg.actionableReceipts) refusal += await pendingReviewReceipts(owner, pending, signal);
       return refusal;
     } catch (error) {
       // 从不抛出：派单可能先于这里的结果结束；中止由调用方在等待后处理。
       if (!signal?.aborted) ctx.logger?.warn?.(`[codex-conductor] 收尾检查失败，已放行：${error?.message ?? error}`);
       return '';
     }
+  }
+
+  async function pendingReviewReceipts(owner, pending, signal) {
+    const ids = [...new Set([...pending.unreviewed, ...pending.needsChanges])];
+    const entries = await Promise.all(ids.map(async id => {
+      try {
+        const source = await conductor.waitJob(id, 0, signal);
+        return !unknownState(source) && source.job_id === id && owns(owner, source.context?.owner)
+          ? `\ncodex_review ${JSON.stringify(reviewSkeleton(id, source))}` : '';
+      } catch { return ''; }
+    }));
+    return entries.join('');
   }
 
   // 收尾护栏拒绝时没有任务记录可写：把被点名的任务号（只有 ID）追加到 closeout-refusals.jsonl，供日后分析。保留最近 500 行。
@@ -2449,8 +2657,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       args = { ...args, expect_blocked: [...new Set(args.expect_blocked)] };
       routing = { ...routing, expect_blocked_count: args.expect_blocked.length };
     }
+    const engine = runEngine(args, cfg);
     let effortLine;
-    if (!continuation && !verificationOf && (args.effort !== undefined || args.effort_reason !== undefined)) {
+    if (engine === 'gemini' && !continuation && !verificationOf && args.effort !== undefined) {
+      effortLine = cfg.gemini?.executionEffort ? `本单 Gemini 使用配置的 effort=${cfg.gemini.executionEffort}。`
+        : '本单 Gemini 由 agy 决定推理档位。';
+      args = { ...args, effort: undefined };
+    }
+    if (engine === 'codex' && !continuation && !verificationOf && (args.effort !== undefined || args.effort_reason !== undefined)) {
       const { effort: requested, effort_reason: reason } = args;
       const configured = defaultEffort(cfg, args.write);
       const listed = EFFORT_REASONS.includes(reason);
@@ -2470,6 +2684,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
     if (!cwd) throw reject('codex_run: 当前会话没有工作区，请传 cwd');
+    const tool = continuation ? 'codex_continue' : 'codex_run';
+    if (cfg.dispatchConsistency && !verificationOf) {
+      const conflicts = writeContradictions({ ...args, task: originalTask }, cwd, taskScopePath, under);
+      if (conflicts.length) throw reject(`${tool}: ${conflicts.join('；')}。修正任务书后再派，未启动 Codex。`);
+      if (args.required_writes?.length) routing = { ...routing, required_writes: args.required_writes };
+    }
     // 只有 write=true 的任务加目录写锁；主机模式的只读任务不挡同目录的 gemini_write。
     const writer = cfg.gemini && args.write ? { cwd: normPath(cwd) } : null;
     if (writer && geminiWrites.has(writer.cwd)) throw reject('codex_run: 同一任务目录的 gemini_write 尚未结束，请先等它结束');
@@ -2488,6 +2708,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     // 取得 job_id 后才响应中止，避免留下已启动却无人管理的 Codex。
     exec?.signal?.throwIfAborted();
     let started;
+    let overrideSlot;
     let standingLine;
     let predispatch = [];
     dispatching++;
@@ -2497,7 +2718,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const owner = exec?.agent?.id;
       if (owner) dispatchedSessions.add(owner);
       const log = exec?.agent?.session?.log ?? [];
-      const tool = continuation ? 'codex_continue' : 'codex_run';
       const preflightUnavailable = (reason, value) => reject(`${tool}: ${reason}，未启动 Codex。` +
         (value.error_kind === 'bridge_error' ? 'Windows 无法连接 WSL。先恢复 WSL，再核对任务状态；不要重复派活。' : ''));
       // 收尾护栏只拦开新工作的 codex_run。读不到记录或判定出错时放行并记警告。
@@ -2618,12 +2838,52 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         exec?.signal?.throwIfAborted();
         if (refusal) throw reject(refusal);
       }
+      if (owner && !verificationOf && (cfg.convergenceGuard || cfg.historicalGapReview)) {
+        const linked = guard.parent ?? ((latestOnThread?.review_status === 'needs_attention' ||
+          ['needs_changes', 'accepted_deviations'].includes(latestOnThread?.verification_status))
+          ? await previousJob(latestOnThread.job_id, exec) : undefined);
+        let rounds = [];
+        if (cfg.convergenceGuard) {
+          if (linked || !resumeThread) {
+            try { rounds = await convergenceRounds(owner, originalTask, args.acceptance, cwd, linked, exec?.signal, resumeJobs); }
+            catch { exec?.signal?.throwIfAborted(); }
+          }
+          const previous = linked ?? rounds[0];
+          const convergenceTask = continuation && linked
+            ? linked.context.routing?.convergence_task ?? taskIdentity(linked.context.task) : taskIdentity(originalTask);
+          const note = args.rerun_after_change && taskIdentity(args.rerun_after_change);
+          const { refusal, override } = convergenceDecision(tool, rounds, { cwd, scope: args.scope,
+            sandbox: (args.host_access ?? cfg.defaultHostAccess) === true ? 'danger-full-access' : args.write ? 'workspace-write' : 'read-only',
+            task_options: { writable_roots: args.writable_roots, use_user_config: args.use_user_config },
+            context: { task: originalTask, acceptance: args.acceptance, write: args.write, must_verify: args.must_verify,
+              routing: { convergence_task: convergenceTask, required_writes: args.required_writes } } }, note);
+          if (refusal) throw reject(refusal);
+          if (!continuation && previous?.job_id && (linked || repeatedOutcome(previous))) {
+            routing = { ...routing, parent_job_id: previous.job_id };
+          }
+          if (convergenceTask !== taskIdentity(originalTask)) routing = { ...routing, convergence_task: convergenceTask };
+          if (note) routing = { ...routing, change_fingerprint: note };
+          if (override) {
+            const slot = JSON.stringify([cfg.runnerHome, rounds[0].job_id]);
+            if (hostConvergenceStarts.has(slot)) throw reject(`${tool}: 交付链 ${rounds[0].job_id} 已在提交一次变化重试。`);
+            hostConvergenceStarts.add(slot);
+            overrideSlot = slot;
+            routing = { ...routing, convergence_override: true };
+          }
+        }
+        const previous = linked ?? rounds[0];
+        if (cfg.historicalGapReview && previous) {
+          ({ args, routing } = carryHistoricalCriteria(args, previous, routing));
+          if (!args.acceptance.length) throw reject(`${tool}: ${previous.job_id} 的验收项已全部作为不可补回的历史记录结案，无需派单。`);
+        }
+      }
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         ...(args.must_verify?.length ? { must_verify: [...new Set(args.must_verify)] } : {}),
         dispatcher: { version: loadedIdentity.version, revision: loadedIdentity.revision, pid: process.pid },
         ...(continuation ?? fresh?.continuation ? { continuation: continuation ?? fresh.continuation } : {}),
         ...(verificationOf ? { verification_of: verificationOf } : {}),
+        ...(guard.fallbackOf ? { fallback_of: guard.fallbackOf } : {}),
         ...(routing ? { routing } : {}),
       });
       if (owner && started.job_id && !unknownState(started) && continuation?.decided_by === 'planner') {
@@ -2635,7 +2895,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       guard.onStarted?.(started);
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
-    } finally { dispatching--; if (writer) startingWrites.delete(writer); }
+    } finally {
+      dispatching--;
+      if (writer) startingWrites.delete(writer);
+      if (overrideSlot) hostConvergenceStarts.delete(overrideSlot);
+    }
     if (exec?.signal?.aborted) {
       if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
       exec.signal.throwIfAborted();
@@ -2667,9 +2931,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     ...PRESENT.codex_run,
     presentCall: (args) => PRESENT.codex_run.presentCall({ host_access: cfg.defaultHostAccess === true, ...args }),
     name: 'codex_run',
-    description: '把任务交给 WSL 里的 Codex（它看不到本对话）。登记后台任务后返回两个任务号。' + WAIT_GUIDANCE +
+    description: '把任务交给 Codex 或 Gemini。' + ENGINE_GUIDANCE + ` 新任务省略 engine 时用默认 ${cfg.defaultEngine}。` + WAIT_GUIDANCE +
       '同一任务书连续失败时不要原样重派，先读失败回执，按失败类别处理。' +
-      '一单一个可独立验收的结果，超过 8 条先按共同前置拆单。路径、平台和参数适配在原授权内处理。' +
+      (cfg.convergenceGuard ? '同一交付链连续两轮卡在相同条目且参数未变时，仅凭 rerun_after_change 最多再试一次。' : '') +
+      '一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单。路径、平台和参数适配在原授权内处理。' +
       '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
@@ -2678,7 +2943,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       (cfg.ownerDecisions === 'planner' ? '原任务有待决定阻塞时按常设授权用 codex_continue 提交 answers 或 resolution；'
         : cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。' +
-      (cfg.closeoutGuard !== false ? '开新任务前先收尾：本会话已结束且报告有标记的任务先 codex_review，needs_changes 先返工或改判，否则新任务会被拒绝；唯一一个待验收任务的核验在跑（或本单带 verify_previous 核验它）时，可以派写入范围不重叠的新任务。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      (cfg.closeoutGuard !== false ? '待收尾事项会挡住新开 codex_run，含只读单；可核验或续接。仅一单待验收、无其他返工欠账且首次核验在跑或由本单 verify_previous 发起时，容量足够且写入不重叠才放行。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       'verify_previous 可在派这一单的同时只读核验上一单（写入范围重叠时拒绝）。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
@@ -2690,12 +2955,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     parameters: {
       type: 'object',
       properties: {
+        engine: ENGINE_PARAMETER,
         task: { type: 'string', description: '完整任务：目标、相关文件路径、约束和背景。Codex 看不到本对话，必须写全。' },
         acceptance: { type: 'array', minItems: 1, items: { type: 'string' }, description: '至少 1 条，每条去除首尾空白后至少 4 个字符。只写结果、正常观测入口和预期值，只要求本轮可取得的证据。' +
           '哈希、校验和、逐文件枚举、纳秒时间戳、过程进度文件及全程零写入或零外发的证明，仅在涉及数据完整性、身份真实性、备份恢复或安全边界时要求，并写明用途。' },
         must_verify: { type: 'array', items: { type: 'integer', minimum: 1 }, description: '必须实测的验收条目编号（从 1 起）；记 met 前用 codex_verify 独立核验。' },
         acceptance_needs: ACCEPTANCE_NEEDS,
         expect_blocked: EXPECT_BLOCKED,
+        ...(cfg.dispatchConsistency ? { required_writes: { type: 'array', items: { type: 'string' },
+          description: '执行必须写入的文件或目录。插件对照 write、明确的只读约束和 scope；本字段不增加授权。' } } : {}),
         write: { type: 'boolean', description: '必填。true 允许 Codex 修改任务目录及 writable_roots 指定目录里的文件（使用沙箱时为 workspace-write）；' +
           'false 只读调查：新开的只读任务不留会话，事后不能 resume；带 resume 追问写任务线程时仍可续跑' +
           `${cfg.allowHostAccess === true ? '，带 host_access=true 时也会保留会话' : ''}。生成或删除文件、改变远端状态也需 true，按授权在 scope/task 写明目标。不得同时要求写入和禁止写入。` },
@@ -2727,6 +2995,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
     output: OUTPUT,
     async execute(args, exec) {
+      checkEngine(args?.engine);
+      if (args?.resume && args.engine === 'gemini') throw new Error('Gemini 续接请用 codex_continue(job_id)，由 runner 取得准确的 conversation_id');
       if (Object.hasOwn(args ?? {}, 'host_access') && cfg.allowHostAccess !== true) {
         throw new Error('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access');
       }
@@ -2774,15 +3044,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   ctx.tools.register(runTool);
 
-  async function* verificationJobs(owner, automatic, signal) {
-    const filters = automatic ? {} : { owner, also_owners: aliases.predecessors(owner), status: 'running' };
+  async function* verificationJobs(owner, automatic, signal, target) {
+    const filters = target && cfg.verificationReuse
+      ? { owner, also_owners: aliases.predecessors(owner), verification_of: target }
+      : automatic ? {} : { owner, also_owners: aliases.predecessors(owner), status: 'running' };
     for (let offset = 0; offset !== null;) {
       const page = await conductor.list({ ...filters, limit: 100, offset }, signal);
       if (page.error_kind || !Array.isArray(page.jobs)) {
         throw new Error(`codex_verify: 无法核对已有核验：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
       }
       for (const job of page.jobs) {
-        if (job.context?.verification_of && (automatic || (job.execution_status ?? job.status) === 'running')) yield job;
+        if (job.context?.verification_of && (target && cfg.verificationReuse
+          ? owns(owner, job.context.owner) && job.context.verification_of === target
+          : automatic || (job.execution_status ?? job.status) === 'running')) yield job;
       }
       offset = page.next_offset ?? null;
     }
@@ -2790,6 +3064,32 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function findVerification(jobId, owner, automatic, signal) {
     for await (const job of verificationJobs(owner, automatic, signal)) {
       if (job.context.verification_of === jobId) return { job_id: job.job_id, status: job.execution_status ?? job.status };
+    }
+  }
+  const verificationScope = (source, args, excluded) => JSON.stringify([args.focus?.trim() ?? '', args.samples ?? 8, excluded,
+    cfg.historicalGapReview ? (source.verification?.report_rows ?? []).filter(item => item.historical_gap).map(item => item.row) : []]);
+  const historicalIndexes = (source) => {
+    if (!cfg.historicalGapReview) return [];
+    const closed = new Set(historicalCriteria(source));
+    return source.context.acceptance.flatMap((text, index) =>
+      closed.has(text) && !source.context.must_verify?.includes(index + 1) ? [index + 1] : []);
+  };
+  async function verificationReuseCheck(source, args, owner, automatic, signal) {
+    const scope = verificationScope(source, args, historicalIndexes(source));
+    let completed;
+    for await (const job of verificationJobs(owner, automatic, signal, source.job_id)) {
+      const status = job.execution_status ?? job.status;
+      if (automatic || status === 'running') return { job_id: job.job_id, status };
+      if (!completed && status === 'completed' && job.report_status === 'valid' && job.verification_version && job.verification_scope === scope) completed = job;
+    }
+    if (completed) {
+      const { verification_version } = await conductor.verificationVersion(source.job_id, signal).catch(() => ({}));
+      signal?.throwIfAborted();
+      if (verification_version === completed.verification_version) {
+        throw Object.assign(new Error(`codex_verify: ${source.job_id} 的文件及核验范围未变，复用核验 ${completed.job_id}。` +
+          `用 codex_status ${JSON.stringify({ job_id: completed.job_id })} 取回核验报告，再对 ${source.job_id} 提交 codex_review。`),
+        { code: 'VERIFICATION_UNNEEDED' });
+      }
     }
   }
   async function runningVerificationRefusal(args, exec, tool, chain, resumeThread) {
@@ -2866,18 +3166,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   const verifyTool = {
     name: 'codex_verify',
-    description: '独立核验本会话一个已结束的 Codex 任务：新线程、只读，沿用原目录和主机访问，' +
-      (cfg.modelAB.enabled ? '使用配置的默认模型，' : '沿用原任务模型设置，') +
+    description: '独立核验本会话一个已结束的任务：新会话、只读，沿用原目录和主机访问。配置了 Gemini 时默认换另一引擎。' +
+      ENGINE_GUIDANCE +
+      (cfg.verificationReuse ? '没有可核验产出的受阻任务不派核验。文件和核验范围都未变时复用上一份核验。' : '') +
       '回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `独立核验 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string', description: '本会话已结束的 runner job_id。' },
+      engine: ENGINE_PARAMETER,
       focus: { type: 'string', description: '可选，重点核对什么。' },
       samples: { type: 'integer', minimum: 1, maximum: 30, description: '默认抽查 8 条，最多 30 条。' },
       wait_seconds: { type: 'integer', minimum: 0, description: waitSecondsDescription },
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {
+      checkEngine(args?.engine);
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_verify: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       if (args.focus !== undefined && typeof args.focus !== 'string') throw new Error('codex_verify: focus 必须是字符串');
       if (args.samples !== undefined && (!Number.isInteger(args.samples) || args.samples < 1 || args.samples > 30)) throw new Error('codex_verify: samples 必须是 1–30 的整数');
@@ -2889,6 +3192,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
       if (!owns(owner, source.context?.owner)) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
       if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
+      if (cfg.verificationReuse && withoutVerificationProduct(source)) {
+        throw new Error(`codex_verify: 原任务 ${source.job_id} 受阻，未记录改动或可核验结果。先处理原阻塞。`);
+      }
       if (!source.cwd || !source.log_dir || typeof source.context.task !== 'string' || !Array.isArray(source.context.acceptance) || !source.context.acceptance.length ||
           !['read-only', 'workspace-write', 'danger-full-access'].includes(source.sandbox)) throw new Error('codex_verify: 原任务缺少目录、任务书、验收标准或执行设置，无法独立核验');
       const id = source.job_id;
@@ -2904,7 +3210,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       verificationStarts.set(id, receipt.promise);
       const release = () => { if (verificationStarts.get(id) === receipt.promise) verificationStarts.delete(id); };
       try {
-        const existing = await findVerification(id, owner, automatic, exec?.signal);
+        const existing = cfg.verificationReuse ? await verificationReuseCheck(source, args, owner, automatic, exec?.signal)
+          : await findVerification(id, owner, automatic, exec?.signal);
         if (existing) {
           receipt.resolve({ value: existing, existing: true });
           return reuseVerification(id, existing);
@@ -2928,28 +3235,42 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     rememberProducts(source);
     const samples = args.samples ?? 8;
     const required = mustVerifyCriteria(source);
-    return dispatch({ task: verificationTask(source, { ...args, samples }, required),
+    const excluded = historicalIndexes(source);
+    const historicalRows = cfg.historicalGapReview && ['accepted_deviations', 'needs_changes'].includes(source.verification?.status)
+      ? new Set((source.verification.report_rows ?? []).filter(item => item.historical_gap).map(item => item.row)) : new Set();
+    if (excluded.length === source.context.acceptance.length && !required.length) {
+      throw new Error(`codex_verify: 原任务 ${source.job_id} 的验收全是已结案的不可补回历史证据，无需核验。`);
+    }
+    const engine = verifyEngine(args.engine, source, cfg);
+    const same = engine === jobEngine(source);
+    const options = source.task_options ?? {};
+    return dispatch({ task: verificationTask(source, { ...args, samples }, required, excluded),
       acceptance: [...required.map(verifyCriterionItem), '读取原任务书、验收标准和已产出的文件，明确核验范围。',
         `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
         '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
         '全程保持项目和系统状态只读，测试的临时文件和缓存写入项目外。',
         // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
-        ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key)).map(verifyCriterionItem)],
+        ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key) &&
+          !excluded.includes(item.index) && !historicalRows.has(item.row)).map(verifyCriterionItem)],
       cwd: source.cwd, write: false, scope: [], writable_roots: [],
+      engine,
       host_access: source.sandbox === 'danger-full-access',
       use_user_config: source.task_options?.use_user_config === true,
       // 核验只读：配置了 readOnlyEffort 时按它，否则沿用原任务的思考程度。
-      ...((cfg.readOnlyEffort || source.task_options?.effort) ? { effort: cfg.readOnlyEffort || source.task_options.effort } : {}),
-      model: cfg.modelAB.enabled ? cfg.model : source.task_options?.model ?? '',
-      service_tier: source.task_options?.service_tier ?? '',
+      ...(engine === 'codex' ? {
+        effort: cfg.readOnlyEffort || (same ? options.effort : cfg.effort) || undefined,
+        model: cfg.modelAB.enabled || !same ? cfg.model : options.model ?? '',
+        service_tier: same ? options.service_tier ?? '' : cfg.serviceTier,
+      } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
-    }, exec, undefined, undefined, source.job_id, undefined, undefined, { onStarted });
+    }, exec, undefined, undefined, source.job_id, undefined,
+    cfg.verificationReuse ? { verification_scope: verificationScope(source, args, excluded) } : undefined, { onStarted });
   }
 
   ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
-    description: '可并行等待多个 Codex 任务，每次调用传一个 job_id。' + WAIT_GUIDANCE +
+    description: '每次只等待传入 job_id 对应的 Codex 任务。' + WAIT_GUIDANCE +
       '中止本工具或 job_output 只停止观察。取消用 codex_cancel 或后台任务的显式取消。运行中返回最近活动及距今秒数、阶段和尝试轮次。' +
       '用 codex_output 分段读取任务、验收标准和报告。',
     parameters: {
@@ -2991,7 +3312,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     ...PRESENT.codex_cancel,
     name: 'codex_cancel',
-    description: '取消 codex_run 启动的任务，连同 WSL 里的 Codex 进程一起结束。',
+    description: '按 runner job_id 取消任务，同时结束该任务的执行进程树。适用于 Codex 和 Gemini。',
     parameters: {
       type: 'object',
       properties: { job_id: { type: 'string', description: 'codex_run 返回的 job_id。' } },
@@ -3034,7 +3355,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       } else {
         next = `任务 ${args.job_id} 在取消前已经结束（${done.error_kind ?? done.status}），没有结束任何进程；是否重派或续跑由用户决定，不要自行重派。`;
       }
-      return withCompletionNotices({ ...done, next }, exec);
+      return withCompletionNotices({ ...done, next }, exec, { allowFallback: false });
     },
   });
 
@@ -3098,7 +3419,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   ctx.tools.register({
     name: 'codex_jobs',
-    description: '只读列出 Codex 任务历史，找回 runner job_id、Codex thread_id 和本会话的 Harness 后台任务编号。' +
+    description: '只读列出 Codex 和 Gemini 任务，找回 runner job_id、引擎、原会话编号和本会话的 Harness 后台任务编号。' +
       '默认查当前工作区，可用 session_id="current" 查当前会话，或传指定会话 ID；旧任务归属未知时按 cwd 查。' +
       '可按执行状态或 needs_attention 筛选；新任务带派单版本和进程号，有在线后台记录时同时显示 Harness 后台状态。' +
       'completed 只表示执行结束，自报全部满足仍需独立核验。不会启动或恢复任务。',
@@ -3140,7 +3461,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   ctx.tools.register({
     name: 'codex_output',
-    description: '只读、可重复地分段读取 Codex 完整原始报告、runner 结果、原任务与验收上下文或诊断日志。' +
+    description: '只读、可重复地分段读取 Codex 或 Gemini 的完整原始报告、runner 结果、任务书与验收标准或诊断日志。' +
       'job_output 截断或已经消费结果时，用本工具找回；不会消费报告、启动或恢复任务。' +
       'offset 和 next_offset 按 Unicode 字符计算，按 next_offset 接着读取，直至 eof=true。',
     presentCall: (a) => ({ card: 'generic', kind: 'read', title: `Codex 完整结果 ${a?.job_id ?? ''}` }),
@@ -3175,7 +3496,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.tools.register({
     name: 'codex_continue',
     description: (cfg.ownerDecisions === 'planner' || cfg.plannerAnswers ? '在规划端回答阻塞问题或环境条件已改变后续接原任务；' : '在用户回答阻塞问题或环境条件已改变后续接原任务；') +
-      '先核对原归属，严格保留原 cwd、验收、write、scope、权限和线程。' +
+      '先核对原归属，保留原 cwd、验收、write、scope 和权限。默认续接原引擎；显式切换引擎时开新会话并附上轮交接。' + ENGINE_GUIDANCE +
+      (cfg.historicalGapReview ? '已结案的不可补回历史项不再带入验收。' : '') +
+      (cfg.convergenceGuard ? '同一交付链同一阻塞连续两轮且参数未变时，仅凭变化说明最多再试一次。' : '') +
       (cfg.ownerDecisions === 'planner' ? '按所有者常设授权提交 answers 或 resolution，写选定方案、理由和放弃的方案。不可逆或对外动作、花钱、账号凭据及扩大安全边界留给所有者；'
         : cfg.plannerAnswers ? 'answers 用阻塞问题的 id，可由规划端回答；' + PLANNER_ANSWERS : 'answers 用阻塞问题的 id，须来自原会话中的实际用户回复；') +
       '缺回答时只返回问题。resolution 说明环境变化或旧报告解除阻塞的事实。原任务运行中、状态未知或已取消时不重派。' +
@@ -3183,6 +3506,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `续接 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string' },
+      engine: ENGINE_PARAMETER,
       answers: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { id: { type: 'string' }, answer: { type: 'string' } }, required: ['id', 'answer'] } },
       resolution: { type: 'string', description: '已满足环境条件或查明旧阻塞的具体事实，不是授权扩大范围。' },
@@ -3196,6 +3520,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id'] },
     output: OUTPUT,
     async execute(args, exec) {
+      checkEngine(args?.engine);
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw continuationError('codex_continue: job_id 无效；请先用 codex_jobs 找回原任务的 runner 编号，再对它续接，不要因为这个报错另开新单');
       const owner = exec?.agent?.id;
       if (!owner) throw continuationError('codex_continue: 当前调用没有会话 ID');
@@ -3225,6 +3550,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const needsReply = plan.ready && plan.blocking.questions.length > 0 &&
           !plannerDecides && !canAnswer(log, source, owner);
         if (!plan.ready || needsReply) return { ...source, continuation_ready: false, blocking: plan.blocking,
+          ...(cfg.actionableReceipts && plan.blocking.questions.length ? { resubmit: continuationSubmission(source, args.answers) } : {}),
           remaining_questions: needsReply ? plan.blocking.questions : plan.remaining_questions,
           next: cfg.plannerAnswers && plan.blocking.questions.length ? plan.next + PLANNER_ANSWERS : needsReply
             ? '原会话尚未收到这些问题产生后的用户回复。先向用户确认，等实际回答后再用 codex_continue 提交 answers。' : plan.next };
@@ -3235,10 +3561,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             decided_at: Date.now() / 1000, resolves });
         }
         const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, plan.args, exec, 'codex_continue');
-        const thread = await continuationThread(plan, args, exec?.signal);
+        const sourceEngine = jobEngine(source);
+        const engine = args.engine ?? sourceEngine;
+        plan.args.engine = engine;
+        if (engine !== sourceEngine) {
+          for (const key of ['resume', 'conversation_id', 'model', 'service_tier', 'effort', 'use_user_config']) delete plan.args[key];
+        }
+        if (args.fresh === true) delete plan.args.conversation_id;
+        const thread = engine === 'codex' ? await continuationThread(plan, args, exec?.signal) : null;
         if (thread?.mode === 'fresh') delete plan.args.resume;
-        const route = retainThreadModel(plan.args, source, routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
+        const route = retainThreadModel(plan.args, engine === 'codex' && engine === sourceEngine ? source : undefined,
+          routingOf(thread, verifyPrevious ? args.verify_previous : undefined));
         const value = await dispatch({ ...route.args, rerun_after_change: args.rerun_after_change,
+          ...(cfg.dispatchConsistency ? { required_writes: source.context.routing?.required_writes } : {}),
           acceptance_needs: args.acceptance_needs, expect_blocked: args.expect_blocked,
           ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}) },
           exec, plan.continuation, plan.task, undefined, undefined, route.routing, { parent: source });
@@ -3246,6 +3581,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (verify) {
           const { line: verifyLine, ...verifyResult } = verify;
           Object.assign(value, { verify_previous: verifyResult, next: value.next ? `${value.next}\n${verifyLine}` : verifyLine });
+        }
+        if (engine !== sourceEngine && value.job_id) {
+          value.next = [`已从 ${sourceEngine} 切换为 ${engine}，新任务 ${value.job_id} 已带上轮交接。`, value.next].filter(Boolean).join('\n');
         }
         if (!thread) return value;
         const line = thread.mode === 'fresh'
@@ -3260,6 +3598,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   const ACCEPTED_FIELD = { type: 'string', minLength: 1, description: '只用于 accepted_deviations 里保留 not_met/blocked 的条目：为什么接受这一条未满足。其他情况省略。' };
   const OWNER_ONLY_FIELD = { type: 'string', enum: OWNER_ONLY_REASONS, description: '只用于有 accepted 的未满足条目，注明须由所有者决定的原因。' };
+  const historicalGapField = cfg.historicalGapReview ? { historical_gap: { type: 'string', enum: HISTORICAL_GAP_KINDS,
+    description: '原报告未满足、客观无法补回的历史记录。在 accepted 写原因。must_verify、安全及数据完整性项不得使用。' } } : {};
   async function submitReview(job_id, source, prepared, level, owner, signal) {
     const { review } = prepared;
     const previousTime = source.verification?.time ?? -Infinity;
@@ -3277,11 +3617,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         : flaggedMet && level !== 'independent' ? 'met_planner_level' : 'all_met');
       ledger = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time, owner, unit);
       if (!ledger.ledgerWarning) await clearLaterRoundItems(source, result.verification, owner, signal);
+    } else if (appended && prepared.acceptedOpen.some(item => item.historical_gap)) {
+      ledger = recordAcceptedOpen(source, prepared.acceptedOpen, result.verification.time, owner, unit, true);
     }
     // 无 job_id 的参数错误属于复核调用，不能按 Codex 执行结果补状态。
     if (result?.error_kind === 'bad_arguments' && !result.job_id) {
-      throw new Error(`codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
-        `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`);
+      const message = `codex_review: 复核操作失败：${result.error}。请先处理这项复核错误再重新提交；` +
+        `用 codex_status 查询原任务 ${job_id}，不要仅因此重新派活。`;
+      throw new Error(message + (cfg.actionableReceipts ? `\ncodex_review ${JSON.stringify(reviewSkeleton(job_id, source, review))}` : ''));
     }
     if (prepared.inferred && appended) countCloseout(owner, 'accepted_inferred');
     return { appended, result, ...ledger };
@@ -3297,16 +3640,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '被拒时回执附一份可直接修改提交的骨架，只需替换其中的占位。' +
       'verified 不能与原报告矛盾：报告自标 not_met/blocked 的条目要写你自己的核验证据；报告的未决项和阻塞须在 notes 逐项写「unresolved#N: 依据」「blocker:<id>: 依据」。' +
       'accepted_deviations 可以把核实后仍未满足的条目保留 not_met/blocked，并在该条目的 accepted 写接受原因。' +
+      (cfg.historicalGapReview ? '客观无法补回的历史记录可用 historical_gap 分类，仍须在 accepted 写明原因。' : '') +
       'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
       criteria: { type: 'array', items: { type: 'object', additionalProperties: false,
         properties: { index: { type: 'integer', minimum: 1 }, status: { type: 'string', enum: ['met', 'not_met', 'blocked'] },
-          evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD, owner_only: OWNER_ONLY_FIELD }, required: ['index', 'status', 'evidence'] } },
+          evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD, owner_only: OWNER_ONLY_FIELD, ...historicalGapField }, required: ['index', 'status', 'evidence'] } },
       report_rows: { type: 'array', description: 'Codex 报告行数与验收条数不同时，报告自标 not_met/blocked 又对不上任何验收原文的行，按报告行号（从 1 起）逐行记录；规则与 criteria 相同。没有这种行时省略。',
         items: { type: 'object', additionalProperties: false, properties: { row: { type: 'integer', minimum: 1 },
-          status: { type: 'string', enum: ['met', 'not_met', 'blocked'] }, evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD, owner_only: OWNER_ONLY_FIELD },
+          status: { type: 'string', enum: ['met', 'not_met', 'blocked'] }, evidence: { type: 'string', minLength: 1 }, accepted: ACCEPTED_FIELD, owner_only: OWNER_ONLY_FIELD, ...historicalGapField },
         required: ['row', 'status', 'evidence'] } },
       notes: { type: 'string', description: '没有补充说明可省略。' },
       accepted_deviations: { type: 'array', description: cfg.plannerAnswers
@@ -3321,9 +3665,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }, required: ['job_id', 'status', 'criteria'] },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_review: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       const owner = exec?.agent?.id;
+      const noSuchJob = async message => {
+        if (!cfg.actionableReceipts || !owner) return message;
+        const jobs = await sessionJobs(owner, exec?.signal).catch(() => []);
+        const pending = pendingCloseout(jobs, closeoutFrom, reworkFrom);
+        return message + await pendingReviewReceipts(owner, pending, exec?.signal);
+      };
+      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) {
+        throw new Error(await noSuchJob('codex_review: job_id 无效；请用 codex_jobs 找回 runner 任务编号'));
+      }
       const source = await conductor.waitJob(args.job_id, 0);
+      if (cfg.actionableReceipts && (source.error_kind === 'unknown_job' ||
+          (unknownState(source) && !source.context?.owner))) {
+        throw new Error(await noSuchJob(`codex_review: 未找到任务 ${args.job_id}；请核对本会话真实的 runner job_id。`));
+      }
       if (!owns(owner, source.context?.owner)) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
@@ -3336,16 +3692,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (closing && (checkOpen || level === 'independent' || source.context?.must_verify?.length)) {
         try { supports = await criterionSupport(source, owner, log, exec?.signal, checkOpen); } catch { exec?.signal?.throwIfAborted(); }
       }
-      const plannerDecides = cfg.ownerDecisions === 'planner' && args.status === 'accepted_deviations';
-      const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, ...supports });
+      const plannerDecides = cfg.ownerDecisions === 'planner' && ['accepted_deviations', 'needs_changes'].includes(args.status);
+      const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, historicalGapReview: cfg.historicalGapReview, ...supports });
       const ownerProblem = await ownerReviewProblem(source, prepared, owner, exec?.signal);
       if (ownerProblem) throw new Error(reviewRejection(job_id, source, { ...prepared, problems: [ownerProblem] }));
       const { review } = prepared;
       const opened = prepared.acceptedOpen;
       const mayClose = canAnswer(log, source, owner) || (plannerDecides && !review.accepted_deviations?.length && opened.length > 0 &&
-        (ownerBlockerIds(source.structured?.blockers).length > 0 || opened.every(entry => entry.owner_only)));
+        (ownerBlockerIds(source.structured?.blockers).length > 0 || opened.every(entry => entry.owner_only || entry.historical_gap)));
       if (!prepared.openUnsupported && (review.accepted_deviations?.length || openAccepted(review)) && !mayClose) {
-        throw new Error('codex_review: 原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。');
+        const message = '原会话尚未收到作业结束后的用户确认，未写入核验记录。不要替用户接受偏差。';
+        throw new Error(cfg.actionableReceipts ? reviewRejection(job_id, source, { ...prepared, problems: [...prepared.problems, message] })
+          : `codex_review: ${message}`);
       }
       if (prepared.problems.length) {
         const verification_id = supports?.runningVerification;
@@ -3527,7 +3885,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       output: { type: 'string', description: '唯一目标文件，绝对路径或相对任务目录；必须在任务目录内且不能与素材相同。' },
       cwd: { type: 'string', description: '任务目录，解析规则同 codex_run；Windows 路径或 /mnt/<盘符>/...。' },
       model: { type: 'string', description: `默认 ${cfg.gemini.model}。` },
-      effort: { type: 'string', enum: ['low', 'medium', 'high'], description: cfg.gemini.forceEffort ? `配置已固定为 ${cfg.gemini.effort}，传入值会被忽略。` : `默认 ${cfg.gemini.effort}。` },
+      effort: { type: 'string', enum: ['low', 'medium', 'high'], description: cfg.gemini.forceEffort ? `配置已固定为 ${cfg.gemini.effort || '模型名自带的档位'}，传入值会被忽略。`
+        : `默认 ${cfg.gemini.effort || '不传，由模型名决定'}。` },
       max_chars: { type: 'integer', minimum: 1, description: '正文 Unicode 码点硬上限，含标题、Markdown 标记、标点、空白及换行；目标为 floor(上限 × 0.8)，首次超限自动压缩一次；传 frontmatter 时元数据不计数。' +
         (cfg.gemini.defaultMaxChars ? `不传时默认 ${cfg.gemini.defaultMaxChars}。` : '') },
       overwrite: { type: 'boolean', description: '目标已存在时必须显式传 true；默认不覆盖。' },

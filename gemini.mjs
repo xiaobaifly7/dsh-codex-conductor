@@ -161,7 +161,9 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       checkTimeout();
       if (settled) return;
       child = launch(cfg.command, ['--output-format', 'stream-json', '--input-format', 'stream-json',
-        '--print-timeout', `${Math.ceil(cfg.timeoutSeconds / 60)}m`, '--mode', 'accept-edits', '--model', cfg.model, '--effort', cfg.effort],
+        '--print-timeout', `${Math.ceil(cfg.timeoutSeconds / 60)}m`, '--mode', 'accept-edits', '--model', cfg.model,
+        // Suffixed model names such as gemini-4-carbon-high carry their own level; agy rejects --effort for some of them.
+        ...(cfg.effort ? ['--effort', cfg.effort] : [])],
       { cwd, env, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'] });
       child.stdout.on('data', (data) => {
         stdoutBytes += Buffer.byteLength(data);

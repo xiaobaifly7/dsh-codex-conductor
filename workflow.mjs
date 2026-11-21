@@ -31,6 +31,85 @@ const executionOf = (value) => ['bridge_error', 'unknown_job', 'invalid_record']
   ? 'unknown' : value.execution_status ?? value.status;
 const verificationOf = (value) => value.verification_status ?? value.verification?.status;
 
+export function repeatedOutcome(value) {
+  if (!['completed', 'failed'].includes(executionOf(value)) ||
+      ['verified', 'accepted_deviations', 'invalid'].includes(verificationOf(value))) return;
+  const report = reportOf(value);
+  const acceptance = value.context?.acceptance;
+  if (!validReport(report) || !Array.isArray(acceptance)) return;
+  const reviewed = verificationOf(value) === 'needs_changes';
+  const rows = reviewed ? value.verification?.criteria :
+    report.criteria.map((row, position) => ({ ...row, index: position + 1 }));
+  if (!Array.isArray(rows) || rows.length !== acceptance.length || (!reviewed &&
+      rows.some(row => row.criterion.trim() !== acceptance[row.index - 1]?.trim()))) return;
+  const criteria = rows.filter(row => row.status !== 'met')
+    .filter(row => !row.historical_gap)
+    .map(({ index, status }) => [index, status]).sort(([left], [right]) => left - right);
+  if (reviewed && value.verification.report_rows?.some(row => row.status !== 'met')) return;
+  const blockers = blockingState(value).blockers.map(({ kind, id }) => `${kind}:${id}`).sort();
+  if (criteria.some(([, status]) => status === 'blocked') && !blockers.length) return;
+  if (criteria.length || blockers.length) return { criteria, blockers };
+}
+
+const requiredPath = /^(?:(?:必须|务必|请)\s*)?(?:写入|写出|输出到|生成|保存到|交付文件[：:]\s*|write to|save to|create)\s*(?:`([^`\r\n]+)`|((?:\/|[a-z]:[\\/])[^\s`，。；;]+))/iu;
+const readOnlyConstraint = /^(?:全程只读|read.only throughout|strictly read.only)(?:[。；;：:]|$)/iu;
+const stripListPrefix = (line) => line.trim().replace(/^(?:[-*]|\d+[.、)])\s*/u, '');
+
+function deliveryPaths(task) {
+  const files = [];
+  let deliverables = false;
+  for (const raw of task.split('\n')) {
+    const line = raw.trim();
+    const heading = /^(?:【([^】]+)】|#+\s+(.+))$/u.exec(line);
+    if (heading) {
+      deliverables = /^(?:交付(?:物|文件)?|输出文件)$/u.test(heading[1] ?? heading[2]);
+      continue;
+    }
+    if (!deliverables || !/^[-*]\s+/u.test(line)) continue;
+    const match = /^`([^`]+)`(?:$|[（(:：])|^([^\s（(:：`]+?\.[a-z\d]{1,8})(?:$|[（(：]|\s)/iu.exec(stripListPrefix(line));
+    const file = match?.[1] ?? match?.[2];
+    if (file && !/已有|仅引用|现有|不写|无需/u.test(line) && !/[*?<>]/u.test(file)) files.push([file, `【交付】中的 ${file}`]);
+  }
+  return files;
+}
+
+export function writeContradictions(args, cwd, resolve, includes) {
+  const clauses = [args.task, ...args.acceptance].flatMap(text => text.split(/[\n。；;]/u)).map(stripListPrefix);
+  const readOnly = clauses.find(clause => readOnlyConstraint.test(clause) &&
+    !/例外|除(?:了|外|获准)|仅允许|except/iu.test(clause) &&
+    (!/[：:]/u.test(clause) || /^(?:全程只读)[：:]\s*不写(?:任何)?文件(?:[、，,]|$)/u.test(clause)));
+  const declared = (args.required_writes ?? []).map((file, index) => [file, `required_writes[${index}]`]);
+  const literal = clauses.flatMap(clause => {
+    const match = requiredPath.exec(clause);
+    const file = match?.[1] ?? match?.[2];
+    return file && /[\\/.]/u.test(file) && !/[*?<>]/u.test(file) ? [[file, `「${clause}」`]] : [];
+  });
+  const roots = args.scope?.length ? args.scope.map(root => resolve(cwd, root)) : [];
+  return [...new Map([...deliveryPaths(args.task), ...literal, ...declared]).entries()].flatMap(([file, origin]) => [
+    ...(args.write === false ? [`write=false 与 ${origin} 的必写路径 ${file} 冲突`] : []),
+    ...(readOnly ? [`「${readOnly}」与 ${origin} 的必写路径 ${file} 冲突`] : []),
+    ...(roots.length && !roots.some(root => includes(resolve(cwd, file), root))
+      ? [`${origin} 的必写路径 ${file} 不在 scope ${JSON.stringify(args.scope)} 内`] : []),
+  ]);
+}
+
+export function withoutVerificationProduct(value) {
+  const report = reportOf(value);
+  return validReport(report) && report.criteria.some(item => item.status === 'blocked') &&
+    report.criteria.every(item => item.status !== 'met') && !report.files_changed.length &&
+    !value.files_changed?.length && !value.files_changed_total && !value.write_paths?.length &&
+    !value.diff_files && !value.output &&
+    (value.context?.write === false || Array.isArray(value.files_changed));
+}
+
+export function continuationSubmission(value, answers) {
+  const questions = blockingState(value).questions;
+  return { job_id: value.job_id, answers: questions.map(({ id }) => {
+    const supplied = Array.isArray(answers) ? answers.filter(item => item?.id === id && nonempty(item.answer)) : [];
+    return { id, answer: supplied.length === 1 ? supplied[0].answer : '<待填>' };
+  }) };
+}
+
 export function blockingState(value) {
   value = object(value) ? value : {};
   const report = reportOf(value);
@@ -111,7 +190,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (blocking.next_action === 'done' && !normalized.length && !nonempty(resolution)) return refuse('原任务已独立核验通过，没有新增信息，无需续跑。', []);
   const report = reportOf(value);
   const lost = executionOf(value) === 'failed' && value.error_kind === 'executor_lost' &&
-    value.report_status === 'missing' && report == null && nonempty(value.thread_id);
+    value.report_status === 'missing' && report == null && nonempty(value.thread_id ?? value.conversation_id);
   if ((!lost && !validReport(report)) || value.report_status === 'invalid' || verificationOf(value) === 'invalid' ||
       (object(value.verification) && Object.hasOwn(value.verification, 'blockers') && !validBlockers(value.verification.blockers))) {
     return refuse('报告无效或缺失，先查询并核实原报告，不能据此自动续跑。', []);
@@ -127,7 +206,8 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
       (options.writable_roots != null && (!strings(options.writable_roots) || options.writable_roots.length > 50 || !options.writable_roots.every(nonempty))) ||
       (options.writable_roots?.length && !context.write) ||
       (options.use_user_config !== undefined && typeof options.use_user_config !== 'boolean') ||
-      (options.effort != null && !nonempty(options.effort)) || (value.thread_id != null && !nonempty(value.thread_id))) {
+      (options.effort != null && !nonempty(options.effort)) || (value.thread_id != null && !nonempty(value.thread_id)) ||
+      (value.conversation_id != null && !nonempty(value.conversation_id))) {
     return refuse('原 scope、task_options 或 thread_id 无效，先查询完整原始记录。', []);
   }
   const continuation = { parent_job_id: value.job_id, answers: normalized, resolution };
@@ -164,8 +244,13 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (options.writable_roots != null) args.writable_roots = [...options.writable_roots];
   if (options.effort != null) args.effort = options.effort;
   if (value.thread_id != null) args.resume = value.thread_id;
+  if (value.conversation_id != null) {
+    args.conversation_id = value.conversation_id;
+    if (options.model != null) args.model = options.model;
+  }
   return { ready: true, args, task, continuation, blocking,
-    next: value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
+    next: value.conversation_id ? '计划已准备，使用原 conversation_id 续接；尚未执行。'
+      : value.thread_id ? '计划已准备，使用原 thread_id 续接；尚未执行。' : '原任务没有可续接的 thread_id，将以完整原任务 context 开新线程；尚未执行。' };
 }
 
 // codex_run 带 resume 改开新线程时，放在规划端任务前面的上轮交接内容：只用原任务记录、结构化报告和最新验收，不带旧线程对话。
@@ -173,7 +258,8 @@ export function previousRoundBrief(value) {
   value = object(value) ? value : {};
   const context = object(value.context) ? value.context : {};
   const report = reportOf(value);
-  const lines = [`## 上一轮交接（任务 ${value.job_id ?? '?'}，原线程 ${value.thread_id ?? '?'}；本轮在新线程里执行，看不到旧线程的对话）`];
+  const session = value.conversation_id ? `原 Gemini 会话 ${value.conversation_id}` : `原线程 ${value.thread_id ?? '?'}`;
+  const lines = [`## 上一轮交接（任务 ${value.job_id ?? '?'}，${session}；本轮在新线程里执行，看不到旧线程的对话）`];
   if (nonempty(context.task)) lines.push(`上一轮的任务书：\n${context.task.trim()}`);
   if (Array.isArray(context.acceptance) && context.acceptance.length) {
     lines.push(`上一轮的验收标准：\n${context.acceptance.map((item, index) => `${index + 1}. ${item}`).join('\n')}`);

@@ -14,6 +14,7 @@ const { apply, nextStep, normPath } = await import('./index.mjs');
 const schema = JSON.parse(readFileSync(new URL('./report.v2.schema.json', import.meta.url), 'utf8'));
 const exec = { agent: { id: 'verify-session', session: { header: { cwd: '/work/planner' }, log: [] } } };
 const acceptance = ['核对原任务书及产物', '逐条核实结论的原始出处'];
+const gemini = { command: 'C:\\tools\\agy.exe', model: 'gemini-4-carbon-high', effort: 'high' };
 
 function report(criteria = acceptance) {
   return { summary: '已核对结论及其出处',
@@ -97,6 +98,144 @@ test('codex_run validates, stores and prompts for must_verify indices', async ()
   }
 });
 
+const option = (argv, flag) => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined;
+
+test('Gemini verification leaves the model and effort to agy when unconfigured', async () => {
+  const h = harness({ config: { gemini: { command: gemini.command } } });
+  await h.verify();
+  assert.equal(option(h.start().argv, '--engine'), 'gemini');
+  assert.equal(option(h.start().argv, '--model'), undefined);
+  assert.equal(option(h.start().argv, '--effort'), undefined);
+});
+
+test('Gemini execution passes effort only when explicitly configured or inherited', async () => {
+  const h = harness({ config: { gemini: { command: gemini.command, model: gemini.model, forceEffort: true } } });
+  await h.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false, engine: 'gemini' }, exec);
+  assert.equal(option(h.start().argv, '--model'), gemini.model);
+  assert.equal(option(h.start().argv, '--effort'), undefined);
+  assert.match(h.tools.gemini_write.parameters.properties.effort.description, /模型名自带的档位/);
+  const source = sourceJob();
+  source.structured.criteria[0].status = 'not_met';
+  source.engine = 'gemini';
+  source.conversation_id = source.thread_id;
+  delete source.thread_id;
+  source.task_options = { ...source.task_options, model: null, effort: null };
+  const resumed = harness({ source, config: { gemini } });
+  await resumed.tools.codex_continue.execute({ job_id: source.job_id, fresh: false }, exec);
+  assert.equal(option(resumed.start().argv, '--resume'), source.conversation_id);
+  assert.equal(option(resumed.start().argv, '--model'), undefined);
+  assert.equal(option(resumed.start().argv, '--effort'), undefined);
+  const verification = harness({ source, config: { gemini: { command: gemini.command } } });
+  await verification.verify({ engine: 'gemini' });
+  assert.equal(option(verification.start().argv, '--resume'), undefined);
+  assert.equal(option(verification.start().argv, '--effort'), undefined);
+});
+
+test('Gemini provider failure tells the planner how to redispatch on Codex', async () => {
+  const failure = { status: 'failed', error_kind: 'provider_permanent', error: 'model not available',
+    task_options: { engine: 'gemini' }, structured: undefined };
+  const h = harness({ config: { gemini }, verificationResult: failure });
+  assert.match((await h.verify()).next, /codex_verify.*SOURCE-1.*engine: "codex"/);
+  const task = await h.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false, engine: 'gemini' }, exec);
+  assert.match(task.next, /codex_run.*engine: "codex"/);
+  assert.match(task.next, /model not available/);
+  assert.match(nextStep({ ...failure, error_kind: 'bad_arguments', error: 'agy rejected flag --json-schema' }),
+    /Gemini 启动参数无效.*--json-schema/);
+  assert.match(nextStep({ ...failure, error_kind: 'bad_arguments', error: 'agy requires a local Windows drive path: /home/user/project' }),
+    /不在 Windows 盘符下.*engine: "codex"/);
+});
+
+test('a fresh Codex continuation without Gemini uses the current model and service tier', async () => {
+  const source = sourceJob();
+  source.structured.criteria[0].status = 'not_met';
+  const h = harness({ source });
+  await h.tools.codex_continue.execute({ job_id: source.job_id, fresh: true }, exec);
+  assert.equal(option(h.start().argv, '--resume'), undefined);
+  assert.equal(option(h.start().argv, '--model'), 'new-default-model');
+  assert.equal(option(h.start().argv, '--service-tier'), 'new-default-tier');
+});
+
+test('codex_run uses the configured default engine and a per-task override', async () => {
+  const args = { task: 'Inspect the project layout.', acceptance, write: false };
+  for (const [requested, selected] of [[undefined, 'gemini'], ['codex', 'codex'], ['gemini', 'gemini']]) {
+    const h = harness({ config: { gemini, defaultEngine: 'gemini', maxGeminiRunningJobs: 3, defaultHostAccess: true } });
+    await h.tools.codex_run.execute({ ...args, ...(requested ? { engine: requested } : {}) }, exec);
+    const { argv } = h.start();
+    assert.equal(option(argv, '--sandbox'), 'danger-full-access');
+    assert.equal(option(argv, '--engine') ?? 'codex', selected);
+    assert.equal(option(argv, '--model'), selected === 'gemini' ? gemini.model : 'new-default-model');
+    assert.equal(option(argv, '--effort'), selected === 'gemini' ? gemini.effort : 'medium');
+    assert.equal(option(argv, '--max-engine-running'), selected === 'gemini' ? '3' : undefined);
+    assert.equal(option(argv, '--service-tier'), selected === 'gemini' ? undefined : 'new-default-tier');
+  }
+});
+
+test('codex_verify switches engines by default and starts an independent read-only session', async () => {
+  for (const [from, override, enabled, to] of [
+    ['codex', undefined, true, 'gemini'], ['gemini', undefined, true, 'codex'],
+    ['codex', 'codex', true, 'codex'], ['gemini', undefined, false, 'gemini'],
+  ]) {
+    const source = sourceJob();
+    if (from === 'gemini') {
+      source.engine = 'gemini';
+      source.conversation_id = source.thread_id;
+      delete source.thread_id;
+    }
+    const h = harness({ source, config: { gemini, crossEngineVerify: enabled } });
+    await h.verify(override ? { engine: override } : {});
+    const { argv } = h.start();
+    assert.equal(option(argv, '--engine') ?? 'codex', to);
+    assert.equal(option(argv, '--resume'), undefined);
+    assert.equal(option(argv, '--sandbox'), undefined);
+    assert.equal(h.payload().context.write, false);
+    assert.equal(h.payload().context.verification_of, 'SOURCE-1');
+    assert.equal(option(argv, '--model'), from === to ? 'original-model' : to === 'gemini' ? gemini.model : 'new-default-model');
+  }
+});
+
+test('codex_continue retains the native session and settings or starts fresh on an engine switch', async () => {
+  for (const [from, to, fresh] of [['gemini', 'gemini', false], ['gemini', 'codex', false], ['codex', 'gemini', false], ['codex', 'codex', true]]) {
+    const source = sourceJob();
+    source.structured.criteria[0].status = 'not_met';
+    if (from === 'gemini') {
+      source.engine = 'gemini';
+      source.conversation_id = source.thread_id;
+      delete source.thread_id;
+    }
+    const h = harness({ source, config: { gemini, defaultEngine: from === 'codex' ? 'gemini' : 'codex' } });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, ...(to !== from ? { engine: to } : {}), fresh }, exec);
+    const { argv } = h.start();
+    assert.equal(option(argv, '--engine') ?? 'codex', to);
+    assert.equal(option(argv, '--resume'), !fresh && from === to ? 'original-thread' : undefined);
+    assert.equal(option(argv, '--model'), from === to && !fresh ? 'original-model' : to === 'gemini' ? gemini.model : 'new-default-model');
+    assert.equal(option(argv, '--effort'), from === to ? 'low' : 'high');
+    assert.equal(option(argv, '--sandbox'), 'workspace-write');
+    assert.equal(option(argv, '--service-tier'), to === 'gemini' ? undefined : 'new-default-tier');
+    assert.match(h.payload().prompt, /上轮未满足项/);
+  }
+});
+
+test('terminal Codex failure starts Gemini only on a runner-confirmed no-write result', async () => {
+  for (const [fallbackSafe, enabled] of [[true, true], [false, true], [true, false]]) {
+    const source = { ...sourceJob(), status: 'failed', error_kind: 'upstream_rejected', fallback_safe: fallbackSafe };
+    const h = harness({ source, config: { gemini, geminiFallback: enabled } });
+    const value = await h.tools.codex_status.execute({ job_id: source.job_id }, exec);
+    if (!fallbackSafe || !enabled) {
+      assert.equal(h.start(), undefined);
+      assert.equal(value.fallback, undefined);
+      continue;
+    }
+    assert.equal(option(h.start().argv, '--engine'), 'gemini');
+    assert.equal(option(h.start().argv, '--resume'), undefined);
+    assert.equal(h.payload().context.fallback_of, source.job_id);
+    assert.equal(h.payload().context.continuation.parent_job_id, source.job_id);
+    assert.deepEqual(h.payload().context.acceptance, acceptance);
+    assert.match(h.payload().prompt, /上一轮报告摘要/);
+    assert.equal(value.fallback.job_id, 'VERIFY-1');
+    assert.match(value.next, /已转交 Gemini 任务 VERIFY-1/);
+  }
+});
+
 test('must_verify is checked before sampling and needs a matching independent result at closeout', async () => {
   const source = { ...sourceJob(), started_at: 10, finished_at: 20 };
   source.context.must_verify = [2, 1];
@@ -150,10 +289,11 @@ function backgroundJobs() {
   };
 }
 
-test('codex_verify exposes only its four inputs and sample/wait bounds', () => {
+test('codex_verify exposes engine selection and sample/wait bounds', () => {
   const { parameters } = harness().tools.codex_verify;
   assert.deepEqual(parameters.required, ['job_id']);
-  assert.deepEqual(Object.keys(parameters.properties).sort(), ['focus', 'job_id', 'samples', 'wait_seconds']);
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ['engine', 'focus', 'job_id', 'samples', 'wait_seconds']);
+  assert.deepEqual(parameters.properties.engine.enum, ['codex', 'gemini']);
   assert.equal(parameters.properties.job_id.type, 'string');
   assert.equal(parameters.properties.focus.type, 'string');
   assert.equal(parameters.properties.samples.type, 'integer');
@@ -172,7 +312,7 @@ test('dispatch descriptions keep waiting on the current runner job and accept th
       }
       assert.match(text, /wait_seconds\s*:\s*3600/, name);
       assert.match(text, /留在本轮/, name);
-      assert.match(text, /报告.*直接验收/, name);
+      assert.match(text, /先验收已收到的报告，再选一单/, name);
     }
   }
 });

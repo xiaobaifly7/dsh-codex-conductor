@@ -22,3 +22,4 @@ jobs:
           python-version: '3.12'
       - run: node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs planner.test.mjs verify.test.mjs guard.test.mjs gemini.test.mjs safeguards.test.mjs
       - run: python runner/test_codex_runner.py
+      - run: python runner/test_agy_runner.py

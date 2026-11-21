@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-当前版本为 `0.9.127`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
+候选版本为 `0.9.132-gemini.0`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 0.9.66：规划端只读产物与独立核验
 
@@ -199,14 +199,31 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 ## 功能
 
+### Gemini 执行
+
+已有 `gemini.command` 配置时，`codex_run`、`codex_continue`、`codex_verify` 可传 `engine: "gemini"`，经 Windows Antigravity 执行。`codex_status`、`codex_output`、`codex_jobs`、`codex_cancel` 和 `codex_review` 共用原 runner job ID。两种引擎都提交同一份逐条验收报告。
+
+模型名使用 `agy models` 列出的完整 ID，例如 `gemini-4-carbon-high` 或 `gemini-3.8-flash-high`。任务和 `gemini.model` 都未指定时，runner 省略 `--model`，由 agy 选择。新任务仅在显式配置 `gemini.effort` 时传 `--effort`。使用模型名指定档位时可省略 `gemini.effort`。模型不可用、额度不足或账号无权限时，任务回执提示规划端改用 `engine: "codex"` 重新派单或核验。
+
+| 配置 | 默认 | 作用 |
+| --- | --- | --- |
+| `defaultEngine` | `codex` | 新任务未指定引擎时采用此值 |
+| `crossEngineVerify` | `true` | 已配置 Gemini 时用另一引擎独立只读核验，`codex_verify` 的显式引擎优先 |
+| `geminiFallback` | `true` | Codex 因模型或上游问题失败且 runner 确认无写入时，启动关联的 Gemini 任务 |
+| `maxGeminiRunningJobs` | `2` | Gemini 运行和排队任务合计上限，`null` 表示不设单独上限 |
+
+`codex_continue` 按原任务记录恢复引擎、模型、推理强度和权限。Gemini 用准确的 `conversation_id`。显式选择另一引擎会附交接摘要、开新会话。自动接替保留原任务书、验收和范围，原回执给出接替任务号。Antigravity 每次使用订阅内额度，关闭超额 AI credits。
+
+Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。只读任务限制模型工具的文件写入、shell 和 MCP 调用。非主机任务使用 `--sandbox`。Antigravity 单独加载的本机 Hook 和插件仍属于受信任配置。当前 agy 无法经此接口建立严格限定于 `scope` 的可写隔离，因此拒绝 `write: true` 的非主机任务。主机访问仍遵循 `allowHostAccess` 和 `defaultHostAccess`。
+
 **派活工具**
 
 | 工具 | 作用 |
 | --- | --- |
-| `codex_run` | 把任务交给 WSL 里的 Codex；登记后台任务后直接返回任务号。必填 `task`、`acceptance`（至少 1 条验收标准，条数不限，每条至少 4 个字符）和 `write`（要改文件、做修复或建备份传 `true`，只读调查传 `false`）；可选 `must_verify`、`model`、`host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
-| `codex_verify` | 独立核验本会话一个已结束的任务：新线程、只读，沿用原目录和主机访问，先核对 `must_verify`，再回到出处抽查其余结论；启用 `modelAB` 时用配置默认模型，否则沿用原模型。可选 `focus`、`samples`（默认 8，1–30）、`wait_seconds`；结束后用 `codex_review` 记录原任务的验收 |
+| `codex_run` | 把任务交给 Codex 或 Gemini，登记后台任务后返回任务号。必填 `task`、`acceptance`（至少 1 条，每条至少 4 个字符）和 `write`。可选 `engine`、`must_verify`、`model`、`host_access`（需开启 `allowHostAccess`）、`scope`、`writable_roots`、`cwd`、`resume`、`use_user_config`、`effort`、`wait_seconds` |
+| `codex_verify` | 在新会话独立只读核验本会话已结束的任务，沿用原目录和主机访问，先核对 `must_verify` 再抽查。可选 `engine`、`focus`、`samples`（默认 8，1–30）、`wait_seconds`。结束后用 `codex_review` 记录原任务的验收 |
 | `codex_status` | 先派齐本批独立且不重叠的任务，再留在本轮按 runner `job_id` 并行调用，每次传一个任务号与 `wait_seconds: 3600`。120 秒内无实质变化的重复查询保留短回执，并引导本轮长等 |
-| `codex_cancel` | 取消任务，在 WSL 内结束 Codex 的整个进程树；任务已经结束时返回它的结果和下一步 |
+| `codex_cancel` | 取消任务并结束执行进程树。任务已经结束时返回结果和下一步 |
 | `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
 | `codex_output` | 按 Unicode 字符分页、可重复读取完整原始报告、结果 JSON、原任务与验收上下文或 stderr / events 日志；读取不消费结果，也不启动或恢复任务 |
 | `codex_continue` | 回答阻塞问题或提供环境恢复依据后续接原任务；保留原线程、目录、验收、write、scope 和权限，同一父任务不重复派活 |
@@ -428,6 +445,11 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `jobDiff` | `true` | 可写任务在 git 工作树内时记录本单改动的 `diff.patch`（可在面板查看和回滚）；设为 `false` 关闭 |
 | `repeatFailureGuard` | `{ enabled: true, minSeconds: 60, failures: 2, windowHours: 24 }` | 设置面板可编辑。只计用时达到 `minSeconds` 的失败，按任务目录和步骤累计。距最后一次失败不超过 `windowHours` 且计数达到 `failures` 时，runner 拦截再次执行。秒数和小时数须为正有限数字，次数须为正整数。无效字段分别告警并使用默认值。设 `enabled: false` 关闭拦截。 |
 | `closeoutGuard` | `true` | 本会话存在有问题却未复核的有效报告，或尚未结案的 `needs_changes` 时，拒绝开新工作的 `codex_run` 和规划端的 `update_goal(action=complete)`。续接、带 `resume` 的返工、核验、查询和界面操作照常。第一次加载 0.9.122 起新记的返工欠账指向最新轮次，后继轮执行完成并复核为 `verified` 或 `accepted_deviations` 才清账。旧欠账仍按有无后继轮判断。规划端完成 Goal 时，报告干净但未复核的写入任务只提醒。首次加载 0.9.103 前开始的任务不计入，记录读取失败时告警并放行。设 `false` 关闭拦截。 |
+| `convergenceGuard` | `true` | 用同归属任务的结构化验收和阻塞记录拦截连续两轮未收敛的返工。派单参数不变时，`rerun_after_change` 最多换取一次重试。 |
+| `historicalGapReview` | `true` | 允许逐条记录无法补回的历史记录。填写 `historical_gap` 和 `accepted`，保留未满足状态。必验、安全、权限及数据完整性项按原复核规则处理。 |
+| `dispatchConsistency` | `true` | 用 `required_writes` 和可确定的书面交付路径查派单读写及 scope 矛盾。 |
+| `actionableReceipts` | `true` | 收尾、复核参数和待答问题出错时，附上本会话可确认的任务和条目编号以及提交骨架。 |
+| `verificationReuse` | `true` | 跳过全部条目均未满足且无产出的受阻任务。同一任务的文件版本与核验范围均可确认未变时复用已有核验。 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
 | `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
@@ -496,13 +518,13 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
     gemini:
       command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
       proxy: 'http://127.0.0.1:7890'
-      model: gemini-4-argon
+      model: gemini-4-argon-medium
       effort: medium
       timeoutSeconds: 1800
       idleTimeoutSeconds: 600
 ```
 
-`model / effort / timeoutSeconds / idleTimeoutSeconds` 的默认值如上，两个超时均须为正有限秒数，`effort` 支持 `low / medium / high`；`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
+`model` 用 `agy models` 核对完整 ID。两个超时的默认值如上，均须为正有限秒数。`gemini_write` 仅在配置或单次传入 `effort` 时传 `--effort`，支持 `low / medium / high`；模型名已带档位（如 `gemini-4-carbon-high`）时省略 `effort`。`proxy` 可省略。agy 是 Go 程序，只读取代理环境变量：配置 `proxy` 后，插件仅为子进程覆盖大小写的 `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY`，其余环境继承 DSH。没有配置代理时，子进程沿用现有环境变量。在本机无法直连 Google、DSH 又没有代理变量时，须显式配置代理。
 
 启动与思考阶段只受 `timeoutSeconds` 总上限约束；收到非空 `agent_response.text_delta` 或 `tool/write_file` 步骤后才启用 `idleTimeoutSeconds`，之后任意 stdout 字节（含不完整 JSON）均续时，stderr 不续时。首稿与压缩共用总预算（默认 1800 秒），CLI 的 `--print-timeout` 同步总上限；超时或取消后等待子进程关闭，再保稿、回滚。回执累计记录 `stdout_bytes / event_count / event_types`，步骤类型以 `step_update:<step_type>` 计数，`last_event_type` 为最后已解析事件的同类标签，不保存事件正文；`last_progress_s` 是最后一次尝试关闭时距最后 stdout 的秒数（无输出则从启动计），`timeout_kind` 为 `idle / total / null`。本机 agy 帮助与内置发布说明确认顶层事件为 `init / step_update / result`；程序的 `DeriveStepType` 区分 `user_input / agent_response / tool / finish / subagent / system_message / checkpoint / error_message / unknown`，`PollPrintmode` 在生成文本增量前调用 `StripThoughts`，因此不能依赖思考心跳。历史 1545 字节、2 个事件的失败回执没有类型记录，无法反推那两个事件的性质。
 
@@ -568,11 +590,13 @@ python3 runner/test_codex_runner.py
 
 ## English
 
+`codex_run`, `codex_continue` and `codex_verify` accept `engine: "codex"` or `engine: "gemini"`. Gemini uses the configured Windows `agy.exe` and shares the runner's job IDs, reports, write locks and review workflow. `defaultEngine` defaults to `codex`. `geminiFallback` and `crossEngineVerify` default to `true` when Gemini is configured. `maxGeminiRunningJobs` defaults to two running or queued jobs. Continue uses the recorded session and model. Switching engines starts a new session with the handoff.
+
 `codex_run` accepts optional 1-based `must_verify` indices such as `[1, 3]`. Use it for the one to three most important criteria. `codex_continue` keeps the indices. `codex_verify` checks each marked criterion against actual observations or original run records before sampling other claims. Closing a marked criterion as `met` requires a matching independent verification result.
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-The current version is `0.9.127`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The candidate version is `0.9.132-gemini.0`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 
@@ -777,13 +801,13 @@ Use `codex_run` for source changes, investigation and material notes; use `gemin
     gemini:
       command: 'C:\Users\apple\AppData\Local\agy\bin\agy.exe'
       proxy: 'http://127.0.0.1:7890'
-      model: gemini-4-argon
+      model: gemini-4-argon-medium
       effort: medium
       timeoutSeconds: 1800
       idleTimeoutSeconds: 600
 ```
 
-The model, effort and two timeout values shown are the defaults; both timeouts accept positive finite seconds, and effort accepts `low / medium / high`. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
+Use the full model ID listed by `agy models`. The two timeout values shown are defaults and accept positive finite seconds. `gemini_write` passes `--effort` only when `effort` is configured or passed per call, and accepts `low / medium / high`; omit it when the model ID already carries a level, such as `gemini-4-carbon-high`. New runner tasks pass `--effort` only when `gemini.effort` is explicitly configured. Proxy is optional. The Go CLI uses proxy environment variables: configured `proxy` overrides uppercase/lowercase `HTTPS_PROXY / HTTP_PROXY / ALL_PROXY` only for the child, which otherwise inherits DSH's environment. Configure it explicitly when direct Google access fails and DSH has no proxy variables.
 
 Startup and thinking use only the total `timeoutSeconds` deadline; a nonempty `agent_response.text_delta` or `tool/write_file` step enables `idleTimeoutSeconds`, after which any stdout bytes, including incomplete JSON, renew it; stderr does not. Generation and compression share the total deadline (1800 seconds by default), also passed to CLI `--print-timeout`. Timeout/cancellation waits for child close before draft preservation and rollback. Receipts accumulate `stdout_bytes / event_count / event_types`, labeling steps as `step_update:<step_type>`; `last_event_type` uses the same label for the last parsed event, without saving event bodies. `last_progress_s` measures seconds since the last stdout, or launch if silent, at the last attempt's close; `timeout_kind` is `idle / total / null`. Local agy help and embedded release notes confirm `init / step_update / result` events. Its `DeriveStepType` distinguishes `user_input / agent_response / tool / finish / subagent / system_message / checkpoint / error_message / unknown`, and `PollPrintmode` calls `StripThoughts` before producing text deltas, so thinking heartbeats cannot be assumed. The historical failure receipt with 1545 bytes and two events has no event types, leaving their nature unknown.
 
@@ -848,6 +872,11 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `jobDiff` | `true` | Record each writable job's `diff.patch` when the task directory is inside a git work tree (viewable and reversible from the panel); `false` switches it off |
 | `repeatFailureGuard` | `{ enabled: true, minSeconds: 60, failures: 2, windowHours: 24 }` | Editable in the settings panel. Failed steps lasting at least `minSeconds` count per directory and step. The runner blocks a repeat once the count reaches `failures` and the last failure is within `windowHours`. Seconds and hours must be positive finite numbers, and the count must be a positive integer. Invalid fields warn and fall back individually. Set `enabled: false` to turn off blocking. |
 | `closeoutGuard` | `true` | Refuse new-work `codex_run` and planner `update_goal(action=complete)` while the session has valid flagged reports awaiting review or open `needs_changes` work. Continue, resume, verify, queries and UI actions stay available. For `needs_changes` reviews recorded since 0.9.122 was first loaded, show the latest rework round and keep the debt until a completed successor is reviewed as `verified` or `accepted_deviations`. Earlier rework reviews still need any follow-up. Goal completion warns about clean unreviewed write jobs. Jobs started before the first 0.9.103 load are excluded, and unreadable records fail open with a warning. Set `false` to disable blocking. |
+| `convergenceGuard` | `true` | Stop repeated rework after two rounds with the same criteria and blockers. With unchanged dispatch parameters, `rerun_after_change` permits one further attempt. |
+| `historicalGapReview` | `true` | Record unrecoverable historical evidence using `historical_gap` and an `accepted` reason. Required measurements, security, authorization and integrity retain their review requirements. |
+| `dispatchConsistency` | `true` | Check `required_writes` and explicit deliverable paths against the write flag, read-only constraints and scope. |
+| `actionableReceipts` | `true` | Include owned job and item IDs and submission templates in closeout, review and answer errors. |
+| `verificationReuse` | `true` | Skip blocked jobs that report no met criteria and have no products. Reuse verification when the same job's observable file version and verification scope match. |
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
 | `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |
 | `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |
