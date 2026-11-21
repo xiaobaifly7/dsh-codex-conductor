@@ -311,3 +311,28 @@ test('rewritten report rows match acceptance by position; answers to the stuck q
   assert.equal(harness.starts.length, 3);
   assert.deepEqual(harness.starts[2].context.continuation.answers, [{ id: 'pick-input', answer: '改用已授权的第二项' }]);
 });
+
+test('resubmitting the same answer to the same stuck question is still a repeat; a different answer goes through', async t => {
+  const harness = fixture(t);
+  const structured = { blockers: [question('pick-input', 'user_input')] };
+  const same = [{ id: 'pick-input', answer: '用第二项' }];
+  harness.add('q-1', { structured });
+  harness.add('q-2', { context: { continuation: { parent_job_id: 'q-1', answers: same, resolution: '' } }, structured });
+  const tools = harness.load();
+  await assert.rejects(tools.codex_continue.execute({ job_id: 'q-2', answers: same }, caller()), /q-1 → q-2 卡在/);
+  assert.equal(harness.starts.length, 0);
+  await tools.codex_continue.execute({ job_id: 'q-2', answers: [{ id: 'pick-input', answer: '改用第三项' }] }, caller());
+  assert.equal(harness.starts.length, 1);
+});
+
+test('review receipts keep a failed write\'s reason; truncated change lists still name out-of-scope files', async t => {
+  const harness = fixture(t);
+  const files = Array.from({ length: 40 }, (_, i) => ({ path: i === 35 ? 'src/evil.py' : `docs/f${i}.md`, change: 'modified' }));
+  harness.add('ask', { scope_paths: ['docs'], files_changed: files, files_changed_total: 40, files_changed_source: 'snapshot',
+    structured: { blockers: [question('q1', 'user_input')] } });
+  const tools = harness.load();
+  const failed = { status: 'failed', error_kind: 'bridge_error', error: 'runner exited 2: Invalid review: criteria[0].index 9 out of range' };
+  assert.match(tools.codex_review.output.render({}, failed)[0].text, /错误：runner exited 2: Invalid review/);
+  const value = await tools.codex_status.execute({ job_id: 'ask' }, caller());
+  assert.match(tools.codex_status.output.render({}, value)[0].text, /其中超出 scope 的：src\/evil\.py/);
+});

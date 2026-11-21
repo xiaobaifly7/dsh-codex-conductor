@@ -920,7 +920,8 @@ function details(rest) {
   const files = Array.isArray(rest.files_changed) && `改动文件（${rest.files_changed_source ?? '来源未知'}，共 ${total} 个` +
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
     (listed.map((f) => `${f.path}(${f.change})`).join('、') || '无') +
-    (shown > listed.length ? `；此处只显示前 ${listed.length} 个，完整清单用 codex_output（artifact: "result"）查看` : '');
+    (shown > listed.length ? `；此处只显示前 ${listed.length} 个，完整清单用 codex_output（artifact: "result"）查看` +
+      (rest.out_of_scope?.length ? `；其中超出 scope 的：${rest.out_of_scope.join('、')}` : '') : '');
   return [rest.cwd && `任务目录：${rest.cwd}`, files,
     rest.continuation_ready === false && 'continuation_ready=false',
     rest.context?.verification_of && `独立核验任务；核验对象：${rest.context.verification_of}`,
@@ -1003,6 +1004,7 @@ function renderReview(value) {
   return [{ type: 'text', text: [
     `${summaryLine(value ?? {})}${value?.job_id ? `  job_id: ${value.job_id}` : ''}${value?.thread_id ? `  thread_id: ${value.thread_id}` : ''}`,
     recorded, value?.verification_error && `核验记录异常：${value.verification_error}`,
+    value?.status !== 'completed' && value?.error && `错误：${value.error}`,
     ...(blockers.blockers.length ? ['--- 阻塞与待回答问题 ---', ...blockers.blockers.map((b) =>
       `${b.id} [${b.kind}] ${b.message}${b.question ? `\n需要回答：${b.question}` : ''}${b.resolution ? `\n解除条件/已有信息：${b.resolution}` : ''}`)] : []),
     ...(value?.next ? ['--- 下一步 ---', value.next, USER_REPORT] : []),
@@ -2562,8 +2564,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const outcome = repeatedOutcome(latest);
     if (!outcome || premises !== attemptPremises(earlier) ||
         JSON.stringify(outcome) !== JSON.stringify(repeatedOutcome(earlier))) return {};
-    // 这次续接回答了卡住的问题，是新输入，不算原样重派。
-    if (blockingState(latest).questions.some(({ id }) => answers.some(answer => answer.id === id))) return {};
+    // 这次续接对卡住的问题给了与上一轮不同的答复，是新输入，不算原样重派；同一答复再提交一次仍按重复处理。
+    const previous = latest.context.continuation?.answers ?? [];
+    if (blockingState(latest).questions.some(({ id }) => answers.some(answer => answer.id === id &&
+        !previous.some(old => old.id === id && old.answer.trim() === answer.answer.trim())))) return {};
     const exhausted = latest.context.routing?.convergence_override === true;
     if (!exhausted && note && note !== latest.context.routing?.change_fingerprint) return { override: true };
     const items = [...outcome.criteria.map(([index, status]) => `验收 ${index}=${status}`), ...outcome.blockers];
