@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.136` `plannerReads: products` 下，`allowCommands` 放行的命令不再被当作“读原料”拒绝；它的输入重定向和 `$(...)` 里的命令照常检查。此前这类条目只对护栏本来就认识的读取命令有效，像 `loopx quota should-run` 这样的状态管理命令写进 `allowCommands` 也照样被拒。
+
 `0.9.135` 面板打开没有写出报告的任务（多为执行失败）时，提示改看错误日志或任务书，不再显示为任务服务出错。
 
 `0.9.134` “Codex 指挥”面板支持 Gemini 执行引擎。运行状态显示默认执行端、核验是否换引擎、Codex 失败是否转 Gemini、Gemini 并发上限和账号池里下一单要用的账号，读池失败时显示原因。常用设置可以修改这四项，Gemini 思考程度可选“不设置”，由模型名决定档位。任务列表标出由 Gemini 执行或接替的任务，报告按实际执行端署名。
@@ -167,6 +169,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.136` with `plannerReads: products`, a command allowed by `allowCommands` is no longer refused as a raw-material read; its input redirections and the commands inside `$(...)` are still checked. Such entries used to work only for read commands the guard already knew, so a state command like `loopx quota should-run` stayed refused even when listed.
 
 `0.9.135` the panel tells you to check the error log or task brief when a job ended without writing its report (usually a failed run), instead of reporting a task-service failure.
 
