@@ -50,19 +50,23 @@ class AdapterTests(unittest.TestCase):
 
             command, settings = built(sandbox="danger-full-access", context={"write": False})
             self.assertEqual(command[command.index("--mode") + 1], "plan")
-            self.assertEqual(settings["permissions"]["allow"], ["command(*)", "unsandboxed(*)"])
+            self.assertEqual(settings["permissions"]["allow"], ["command(*)", "unsandboxed(*)", "read_file(*)"])
             self.assertEqual(settings["permissions"]["deny"], ["write_file(*)", "mcp(*)", "read_url(*)", "execute_url(*)"])
+            self.assertTrue(settings["allowNonWorkspaceAccess"])
             self.assertNotIn("--effort", command)
             # Headless agy denies every command that has no allow rule, so a host write task needs one to run anything.
             command, settings = built(sandbox="danger-full-access")
             self.assertEqual(command[command.index("--mode") + 1], "accept-edits")
-            self.assertEqual(settings["permissions"], {"allow": ["command(*)", "unsandboxed(*)"]})
+            # Reading or editing a file outside the workspace asks too, and a headless ask is a denial that fails the job.
+            self.assertEqual(settings["permissions"], {"allow": ["command(*)", "unsandboxed(*)", "read_file(*)", "write_file(*)"]})
+            self.assertTrue(settings["allowNonWorkspaceAccess"])
             self.assertNotIn("--sandbox", command)
             self.assertNotIn("--dangerously-skip-permissions", command)
             # Outside host access nothing is allowed to run.
             command, settings = built()
             self.assertIn("--sandbox", command)
             self.assertEqual(settings["permissions"]["allow"], [])
+            self.assertFalse(settings["allowNonWorkspaceAccess"])
             self.assertIn("command(*)", settings["permissions"]["deny"])
 
     def test_unrepresentable_paths_and_sandbox_fail_closed(self):
