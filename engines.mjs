@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 
 export const ENGINE_GUIDANCE = 'Codex 适合常规工程执行和原 Codex 线程续接。Gemini 使用 Windows Antigravity，任务目录须在 Windows 盘符下；只有主机访问任务能运行命令和写文件，沙箱内只能读文件；需配置 gemini.command。';
@@ -37,9 +38,10 @@ const samePath = (a, b) => path.win32.resolve(a).toLowerCase() === path.win32.re
 
 // 只读 DSH agy 插件的账号池：每个账号有自己的 HOME 目录和代理，换号、冷却和额度由 DSH 插件维护，这里不写回。
 // home 是续接原会话时原账号的目录：agy 会话按 HOME 分开保存，续接只能回到原账号。
-// 选号按 DSH agy-link 的 isAccountEligible：启用、未要求重新登录、未冷却、支持这个模型（额度组列了模型时须在列），
-// 额度组剩余不到 10% 或本周不到 5% 时等它重置。此前不查模型：只有一个号有 Gemini 4，换到另一个号就跑不了 Neon。
-// shortcut: 没管 DSH 进程内记的“不支持模型”名单和发现的模型目录，只看 pool.json；不符时 agy 报错，再补。
+// 选号按 DSH agy-link 的 isAccountEligible：启用、未要求重新登录、未冷却，额度组剩余不到 10% 或本周不到 5% 时等它重置。
+// 额度组列了这个模型的账号优先；没列的仍可用作后备：主账号的额度列表里没有 Gemini 4，agy 实际却能用它跑 Neon。
+// 主账号用系统用户目录（systemHome，没有 dir），HOME 取本机用户目录；此前它被整个漏掉，池里只剩一个号。
+// shortcut: 没管 DSH 进程内记的“不支持模型”名单和发现的模型目录，只看 pool.json；后备号确实不支持时 agy 报错。
 export function poolAccount(file, model, home) {
   let pool;
   try {
@@ -47,7 +49,8 @@ export function poolAccount(file, model, home) {
   } catch (error) {
     throw new Error(`读取 DSH agy 账号池失败（${file}）：${error.message}`);
   }
-  const accounts = Array.isArray(pool?.accounts) ? pool.accounts.filter((a) => typeof a?.dir === 'string' && a.dir) : [];
+  const dirOf = (a) => (typeof a?.dir === 'string' && a.dir ? a.dir : a?.systemHome === true ? homedir() : '');
+  const accounts = Array.isArray(pool?.accounts) ? pool.accounts.filter(dirOf).map((a) => ({ ...a, dir: dirOf(a) })) : [];
   if (home) {
     const account = accounts.find((a) => samePath(a.dir, home));
     if (!account) throw new Error('原 Gemini 会话所在的 agy 账号已不在 DSH 账号池里，无法续接；请用 fresh: true 开新会话');
@@ -71,11 +74,11 @@ export function poolAccount(file, model, home) {
     return (typeof q.remainingFraction === 'number' && q.remainingFraction <= 0.1 && pending(q.resetTime)) ||
       (typeof q.weeklyFraction === 'number' && q.weeklyFraction <= 0.05 && pending(q.weeklyResetTime));
   };
-  const usable = accounts.filter((a) => a.enabled === true && !a.authRequired && !(a.cooldowns?.[family]?.cooldownUntil > now) &&
-    supports(a) && !benched(a));
-  const account = [pool.activeAccountIds?.[family], pool.lastActiveAccountId].map((id) => usable.find((a) => a.id === id)).find(Boolean) ?? usable[0];
+  const usable = accounts.filter((a) => a.enabled === true && !a.authRequired && !(a.cooldowns?.[family]?.cooldownUntil > now) && !benched(a));
+  const pick = (list) => [pool.activeAccountIds?.[family], pool.lastActiveAccountId].map((id) => list.find((a) => a.id === id)).find(Boolean) ?? list[0];
+  const account = pick(usable.filter(supports)) ?? pick(usable);
   if (!account) {
-    throw new Error(`DSH agy 账号池里没有可用账号：没有能用 ${model || 'Gemini'} 的账号（已停用、需要重新登录、在冷却中、不支持这个模型或额度不足）；请先在 DSH 的 agy 插件里处理账号`);
+    throw new Error(`DSH agy 账号池里没有可用账号：没有能用 ${model || 'Gemini'} 的账号（已停用、需要重新登录、在冷却中或额度不足）；请先在 DSH 的 agy 插件里处理账号`);
   }
   return account;
 }

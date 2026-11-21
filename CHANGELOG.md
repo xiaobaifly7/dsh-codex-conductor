@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.143` Gemini 账号池用得上主账号了：用系统用户目录的账号（`systemHome`，没有 `dir`）此前被整个跳过，现在以本机用户目录作 HOME；额度列表里列了这个模型的账号优先，没列的仍可作后备（主账号的列表没有 Gemini 4，agy 实际能用它跑 Neon），只在全部停用、需重新登录、冷却或额度不足时才报没有可用账号。此前锁定 Gemini 4 Neon 时池里只有一个号可用。
+
 `0.9.142` 新增 Windows 原生执行模式（`runnerMode: native`），默认不开启：runner 改用 Windows Python 直接启动 Codex 和 agy，不经 WSL；状态、任务记录和 Codex home 分别放在三个私有目录；每次执行放进 Windows Job，取消、超时和孤儿进程统一回收；`doctor` 会预检私有 Codex 沙箱。Gemini 执行、写锁、额度熔断、失败接替和名额排队在原生模式下都能用。不配置 `runnerMode` 或配成 `wsl` 时，对 runner 的调用与之前相同。切换步骤、回退和已知限制见 `config/CUTOVER.md`。
 
 `0.9.141` 让规划端少返工、少压缩。执行端只是停下来等规划端回答时不再自动核验：报告没有 `not_met`，至少有一个阻塞且全是 `user_input` / `task_conflict`，`must_verify` 条目也都没报 `met`；补扫同样跳过，续接后的那一轮照常判断，新开关 `autoVerifySkipQuestions`（默认开启，`false` 恢复原样）。历史上 125 次核验核的是这种只在等回答的任务。防兜圈的“相同条目”在汇报条数和编号与验收标准对得上时按位置对应，不再要求原文逐字相同（2.6 万行报告条目里只有 10 行逐字相同，此前几乎不触发）；续接对上一轮卡住的问题给出与上一轮不同的答复时不算原样重派，同一答复再交一次仍按重复拦下。派单一致性检查只把像文件路径的文字当作必写文件，禁止项里的路径、限定了范围的只读句和只写文件名的交付项不再误报（历史回放 29 单误报降到 0），“【交付】写入当前 cwd：”下的文件现在也会参与检查。`codex_review` 写入后只回执结案状态、仍待回答的阻塞和下一步，不再把整份报告、改动清单和规划端刚写的证据原样回显：这部分每次 9 到 18 KB，占近期会话写入内容的 12% 到 19%，是上下文变大、频繁压缩的主要来源之一。结果文字里的改动文件只列前 30 个，其余用 `codex_output` 查看，清单被截断时，超出 scope 的改动另起一句列出。`codex_review` 写入失败（runner 拒收复核或超时）时，回执照常显示错误原因。runner 的产物登记从最新任务开始扫描，超过 10000 条上限时丢弃的是最早的产物，不再是规划端接下来要读的最新报告。带主机权限的 Gemini 任务现在也放行 agy 自己的读写文件工具（`read_file(*)`，写任务另加 `write_file(*)`）并允许访问工作区外路径；此前只放行了命令，agy 一读工作区外的文件就要请求权限，无界面模式下自动拒绝，整单失败（11 月 22 日已结束的 11 单 Gemini 任务里有 3 单因此失败）。这两条不超出 `command(*)` 已有的权限，只读任务照旧禁止写文件。
@@ -181,6 +183,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.143` The Gemini account pool can use the primary account: an account in the system user profile (`systemHome`, no `dir`) was skipped entirely and now runs with the local user profile as HOME. Accounts whose quota group lists the model come first; unlisted ones remain as a backup (the primary account's list has no Gemini 4, yet agy runs Neon on it), so "no usable account" only comes when every account is disabled, needs a new login, is cooling down or is out of quota. With Gemini 4 Neon locked, only one account was usable before.
 
 `0.9.142` adds a Windows-native runner mode (`runnerMode: native`), off by default. The runner starts Codex and agy with Windows Python instead of wsl.exe and keeps state, jobs and the Codex home in three private directories. Each attempt runs in a Windows Job, so cancellation, timeouts and orphans are reclaimed. `doctor` checks the private Codex sandbox. Gemini execution, write locks, the quota breaker, failure takeover and engine slots work in native mode. Without `runnerMode`, or with `wsl`, runner calls are unchanged. Cutover steps, rollback and known limits are in `config/CUTOVER.md`.
 

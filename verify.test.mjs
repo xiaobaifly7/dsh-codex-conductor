@@ -889,8 +889,20 @@ test('the agy pool account must support the model and have quota left', async (t
   // The pinned account has no Gemini 4, so a Neon task goes to the one whose quota lists it (any effort variant).
   assert.equal(poolAccount(file, 'gemini-4-neon-medium').id, 'new');
   assert.equal(poolAccount(file, 'gemini-2.5-pro').id, 'old');
+  // Out of quota there, so the other account backs it up: an unlisted model may still run (the primary account's list
+  // has no Gemini 4, yet agy runs Neon on it).
   writeFileSync(file, JSON.stringify(pool({ ...neon, remainingFraction: 0.05 })));
+  assert.equal(poolAccount(file, 'gemini-4-neon-medium').id, 'old');
+  const spent = pool({ ...neon, remainingFraction: 0.05 });
+  spent.accounts[0].quotas.google.remainingFraction = 0.05;
+  writeFileSync(file, JSON.stringify(spent));
   assert.throws(() => poolAccount(file, 'gemini-4-neon-medium'), /没有能用 gemini-4-neon-medium 的账号/);
   writeFileSync(file, JSON.stringify(pool({ ...neon, remainingFraction: 0.05, resetTime: new Date(Date.now() - 1000).toISOString() })));
   assert.equal(poolAccount(file, 'gemini-4-neon-medium').id, 'new');
+  // The primary account lives in the system user profile and has no dir of its own.
+  const { homedir } = await import('node:os');
+  writeFileSync(file, JSON.stringify({ activeAccountIds: { google: 'acc_primary' }, accounts: [
+    { id: 'acc_primary', systemHome: true, enabled: true }, { id: 'other', dir: 'D:\\pool\\other', enabled: true }] }));
+  assert.deepEqual([poolAccount(file, 'gemini-4-neon-medium').id, poolAccount(file, 'gemini-4-neon-medium').dir], ['acc_primary', homedir()]);
+  assert.equal(poolAccount(file, 'gemini-4-neon-medium', homedir()).id, 'acc_primary');
 });
