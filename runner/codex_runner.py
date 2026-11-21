@@ -1827,6 +1827,7 @@ def execute(args, prompt, run_dir):
 
     repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
     locks = []
+    slot = None
     before = scope = None
     event_changes = []
     writes = writer(args.sandbox, getattr(args, "context", None))
@@ -1852,6 +1853,14 @@ def execute(args, prompt, run_dir):
         return baseline is not STREAM_ONLY and baseline != fallback_snapshot()
 
     try:
+        limit = getattr(args, "max_engine_running", None) if gemini else None
+        if limit:
+            lock_timeout = getattr(args, "lock_timeout", None)
+            slot = wait_for_engine_slot(run_dir, limit, None if lock_timeout is None else time.monotonic() + lock_timeout)
+            if slot is None:
+                return {**base, "status": "failed", "error_kind": "lock_timeout",
+                        "error": f"Timed out waiting for one of {limit} Gemini slots; Gemini was not started.",
+                        "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
         if writes:
             try:
                 roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None),
@@ -2007,6 +2016,8 @@ def execute(args, prompt, run_dir):
     finally:
         for lock in reversed(locks):
             lock.close()
+        if slot is not None:
+            slot.close()
 
 
 def positive_float(value):
@@ -3253,33 +3264,38 @@ def gemini_admission(args):
             return {"status": "failed", "error_kind": "invalid_fallback", "retryable": False,
                     "error": "fallback_of must identify a fallback-safe failed Codex job owned by this task's owner."}
 
-    limit = args.max_engine_running
-    if not (parent or limit):
+    if not parent:
         return None
-    running = 0
     for job_dir in job_directories():
         try:
             task = task_record(job_dir)
             if task.get("engine") != "gemini":
                 continue
             prior = task.get("context") or {}
-            if parent and prior.get("fallback_of") == parent and prior.get("owner") == owner:
+            if prior.get("fallback_of") == parent and prior.get("owner") == owner:
                 child = job_status(job_dir.name)
                 if child.get("error_kind") != "worker_start_failed":
                     return {"job_id": job_dir.name, "status": child["status"], "deduplicated": True}
-            if limit:
-                worker_pid = job_dir / "worker.pid"
-                worker_active = not (job_dir / "result.json").exists() and (
-                    (not worker_pid.exists() and time.time() - job_dir.stat().st_ctime < LOST_AFTER)
-                    or recorded_pid(worker_pid) is not None)
-                if worker_active or recorded_pid(job_dir / "codex.pid") is not None:
-                    running += 1
         except (OSError, ValueError):
             continue
-    if limit and running >= limit:
-        return {"status": "failed", "error_kind": "engine_limit", "retryable": True,
-                "error": f"Gemini already has {running} active jobs (limit {limit})."}
     return None
+
+
+def wait_for_engine_slot(run_dir, limit, deadline):
+    """Hold one of `limit` Gemini slots for the whole job. A slot is an OS file lock, so a worker that dies frees it.
+    Jobs over the limit wait here (phase engine_wait) instead of failing at start: with every session on Gemini a
+    third parallel task used to be refused outright. Returns the held lock, or None at the deadline."""
+    # shortcut: no queue order, whoever polls first after a slot frees gets it; add a ticket file if waits get long.
+    (HOME / "locks").mkdir(parents=True, exist_ok=True)
+    waiting = False
+    while True:
+        slot = next(filter(None, (acquire_file_lock(HOME / "locks" / f"gemini-slot-{i}.lock") for i in range(limit))), None)
+        if slot is not None or (deadline is not None and time.monotonic() >= deadline):
+            return slot
+        if not waiting:
+            runner_event(run_dir, 0, "engine_wait")
+            waiting = True
+        time.sleep(1 if deadline is None else min(1, max(0, deadline - time.monotonic())))
 
 
 def start_job(args, prompt):
@@ -3701,7 +3717,7 @@ def main():
                 task = task_record(job_dir)
             if task.get("engine") == "gemini" and windows_agy(task.get("agy_command")):
                 phase = runner_activity(job_dir / "events.jsonl")["phase"]
-                if phase not in (None, "lock_wait") or (job_dir / "codex.pid").exists():
+                if phase not in (None, "lock_wait", "engine_wait") or (job_dir / "codex.pid").exists():
                     if not confirm_agy_stopped(job_dir):
                         emit({"job_id": args.job_id, "status": "monitor_failed", "error_kind": "cancel_unconfirmed",
                               "error": "The Windows Gemini process tree has not confirmed termination.", "retryable": True})

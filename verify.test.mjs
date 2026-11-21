@@ -838,3 +838,59 @@ test('a verification lists every criterion the original report marked blocked or
   await hx.verify();
   assert.equal(hx.payload().context.acceptance.at(-1), '原报告第 3 行（原报告标 not_met，未对上原验收清单）：额外抽查的一条——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。');
 });
+
+test('lockEngine runs every task, continuation and verification on Gemini with the configured model', async () => {
+  const locked = { command: gemini.command, model: 'gemini-4-neon-medium', effort: '', forceModel: true, forceEffort: true };
+  const config = { gemini: locked, defaultEngine: 'gemini', lockEngine: true, defaultHostAccess: true };
+  const geminiOnly = (argv) => [option(argv, '--engine'), option(argv, '--model'), option(argv, '--effort'), option(argv, '--resume')];
+  const run = harness({ config });
+  const value = await run.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false,
+    engine: 'codex', model: 'codex/other', effort: 'high' }, exec);
+  assert.deepEqual(geminiOnly(run.start().argv), ['gemini', 'gemini-4-neon-medium', undefined, undefined]);
+  assert.match(JSON.stringify(value), /执行端已锁定为 Gemini/);
+  assert.match(run.tools.codex_run.description, /执行端已锁定为 Gemini（gemini-4-neon-medium）/);
+  assert.match(run.tools.codex_run.parameters.properties.engine.description, /传 engine 会被忽略/);
+  await assert.rejects(run.tools.codex_run.execute({ task: 'Fix it.', acceptance, write: false, resume: 'thread-1' }, exec),
+    /锁定为 Gemini.*codex_continue/);
+
+  // A Codex job is continued on Gemini with the previous round handed over; a Gemini one keeps its conversation.
+  const codexSource = sourceJob();
+  codexSource.structured.criteria[0].status = 'not_met';
+  const moved = harness({ source: codexSource, config });
+  await moved.tools.codex_continue.execute({ job_id: codexSource.job_id, engine: 'codex', fresh: false }, exec);
+  assert.deepEqual(geminiOnly(moved.start().argv), ['gemini', 'gemini-4-neon-medium', undefined, undefined]);
+  assert.match(moved.payload().prompt, /上轮未满足项/);
+  const geminiSource = sourceJob();
+  geminiSource.structured.criteria[0].status = 'not_met';
+  geminiSource.engine = 'gemini';
+  geminiSource.conversation_id = geminiSource.thread_id;
+  delete geminiSource.thread_id;
+  geminiSource.task_options = { ...geminiSource.task_options, engine: 'gemini', model: 'gemini-4-carbon-high', effort: 'low' };
+  const kept = harness({ source: geminiSource, config });
+  await kept.tools.codex_continue.execute({ job_id: geminiSource.job_id, fresh: false }, exec);
+  assert.deepEqual(geminiOnly(kept.start().argv), ['gemini', 'gemini-4-neon-medium', undefined, geminiSource.conversation_id]);
+
+  const verified = harness({ config });
+  await verified.verify({ engine: 'codex' });
+  assert.deepEqual(geminiOnly(verified.start().argv), ['gemini', 'gemini-4-neon-medium', undefined, undefined]);
+});
+
+test('the agy pool account must support the model and have quota left', async (t) => {
+  const { poolAccount } = await import('./engines.mjs');
+  const dir = mkdtempSync(path.join(tmpdir(), 'conductor-pool-model-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const file = path.join(dir, 'pool.json');
+  const later = new Date(Date.now() + 3600e3).toISOString();
+  const neon = { remainingFraction: 0.9, resetTime: later, models: [{ modelId: 'gemini-4-neon-high' }, { modelId: 'gemini-4-carbon-low' }] };
+  const pool = (quota) => ({ activeAccountIds: { google: 'old' }, accounts: [
+    { id: 'old', dir: 'D:\pool\old', enabled: true, quotas: { google: { remainingFraction: 1, models: [{ modelId: 'gemini-2.5-pro' }] } } },
+    { id: 'new', dir: 'D:\pool\new', enabled: true, quotas: { google: quota } }] });
+  writeFileSync(file, JSON.stringify(pool(neon)));
+  // The pinned account has no Gemini 4, so a Neon task goes to the one whose quota lists it (any effort variant).
+  assert.equal(poolAccount(file, 'gemini-4-neon-medium').id, 'new');
+  assert.equal(poolAccount(file, 'gemini-2.5-pro').id, 'old');
+  writeFileSync(file, JSON.stringify(pool({ ...neon, remainingFraction: 0.05 })));
+  assert.throws(() => poolAccount(file, 'gemini-4-neon-medium'), /没有能用 gemini-4-neon-medium 的账号/);
+  writeFileSync(file, JSON.stringify(pool({ ...neon, remainingFraction: 0.05, resetTime: new Date(Date.now() - 1000).toISOString() })));
+  assert.equal(poolAccount(file, 'gemini-4-neon-medium').id, 'new');
+});

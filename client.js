@@ -322,6 +322,7 @@ window.__ModuleLoader__.load({
               '配置后可以让 Gemini 写教程和文档，也可以按单把任务交给 Gemini 执行。'),
             activeSettings?.gemini ? h('div', null,
               statusRow('新任务默认执行端', activeSettings.defaultEngine === 'gemini' ? 'Gemini' : 'Codex', '规划端派单时没有指定执行端就用它。'),
+              statusRow('锁定执行端', activeSettings.lockEngine ? '已锁定' : '未锁定', '锁定后新任务、续接和核验都用默认执行端，规划端指定的引擎不生效。'),
               statusRow('核验换另一引擎', activeSettings.crossEngineVerify ? '已开启' : '已关闭', '开启后 Codex 做的任务交给 Gemini 核验，Gemini 做的交给 Codex 核验。'),
               statusRow('Codex 失败转 Gemini', activeSettings.geminiFallback ? '已开启' : '已关闭', '开启后 Codex 失败且确认没有写入文件时，自动交给 Gemini 接着做。'),
               statusRow('Gemini 同时运行', activeSettings.maxGeminiRunningJobs ? `最多 ${activeSettings.maxGeminiRunningJobs} 单` : '不限制', '同时在跑的 Gemini 任务超过这个数时，新任务排队。'),
@@ -654,7 +655,7 @@ window.__ModuleLoader__.load({
       const executionText = { running: '运行中', completed: '已结束', failed: '执行失败', cancelled: '已取消', unknown: '状态待确认' };
       const pageJobs = jobs?.jobs ?? [];
       const verificationText = { unreviewed: '未核验', verified: '已通过', needs_changes: '待修正', accepted_deviations: '已接受偏差', invalid: '记录异常' };
-      const phaseText = { lock_wait: '排队等待目录写锁', codex_running: 'Codex 执行中', codex_reconnecting: '正在重连' };
+      const phaseText = { lock_wait: '排队等待目录写锁', engine_wait: '排队等待 Gemini 名额', codex_running: 'Codex 执行中', codex_reconnecting: '正在重连' };
       const when = (value) => new Date(value).toLocaleString('zh-CN');
 
       // 规划提示词和给 Codex 的固定要求共用这一段界面；planner 沿用原有的请求体。
@@ -792,6 +793,10 @@ window.__ModuleLoader__.load({
               h(Checkbox, { label: '未收尾时拒绝开新任务', checked: (Object.hasOwn(edits, 'closeoutGuard') ? edits.closeoutGuard : editingSettings.closeoutGuard) !== false,
                 disabled: !!busy, onChange: (value) => edit('closeoutGuard', value) }),
               h('small', null, '还有报告标出问题却没验收、或判为需修改却没返工的任务时，DeepSeek 不能开新任务，要先收尾。')),
+            settings.gemini ? h('div', { className: 'dcc-actions' },
+              h(Checkbox, { label: '锁定执行端', checked: (Object.hasOwn(edits, 'lockEngine') ? edits.lockEngine : editingSettings.lockEngine) === true,
+                disabled: !!busy, onChange: (value) => edit('lockEngine', value) }),
+              h('small', null, '新任务、续接和核验一律用上面的默认执行端，规划端传的引擎不生效；续接另一引擎的任务时附上轮交接开新会话。')) : null,
             settings.gemini ? h('div', { className: 'dcc-actions' },
               h(Checkbox, { label: '核验换另一引擎', checked: (Object.hasOwn(edits, 'crossEngineVerify') ? edits.crossEngineVerify : editingSettings.crossEngineVerify) !== false,
                 disabled: !!busy, onChange: (value) => edit('crossEngineVerify', value) }),

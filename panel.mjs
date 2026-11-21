@@ -113,7 +113,7 @@ export function panelSettings(cfg) {
     .map((key) => [key, cfg[key]]).concat([['plannerReads', cfg.plannerReads ?? 'open'],
       ['plannerReadAllowCount', cfg.plannerReadAllow?.length ?? 0],
       ['gemini', cfg.gemini ? { model: cfg.gemini.model, effort: cfg.gemini.effort, accountPool: Boolean(cfg.gemini.accountPool) } : null],
-      ['defaultEngine', cfg.defaultEngine ?? 'codex'], ['crossEngineVerify', cfg.crossEngineVerify !== false],
+      ['defaultEngine', cfg.defaultEngine ?? 'codex'], ['lockEngine', cfg.lockEngine === true], ['crossEngineVerify', cfg.crossEngineVerify !== false],
       ['geminiFallback', cfg.geminiFallback !== false], ['maxGeminiRunningJobs', cfg.maxGeminiRunningJobs ?? null],
       ...['timeoutSeconds', 'idleTimeoutSeconds', 'retries', 'maxRunningJobs'].map((key) => [key, cfg[key] ?? null]),
       ['autoResume', { enabled: cfg.autoResume?.enabled !== false }],
