@@ -5221,7 +5221,8 @@ class RunnerTests(unittest.TestCase):
         def process_observation(pid):
             start = {1: "10", 123: worker, 456: codex}[pid]
             if start is None:
-                raise ProcessLookupError(pid)
+                # What the real proc_start raises for a missing process: no /proc entry on Linux, no handle on Windows.
+                raise ProcessLookupError(pid) if os.name == "nt" else FileNotFoundError(f"/proc/{pid}/stat")
             if isinstance(start, OSError):
                 raise start
             return start
