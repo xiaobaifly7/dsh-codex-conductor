@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.139` Codex 任务默认不再加载 Codex 插件（`--disable plugins`，`use_user_config=true` 时照常加载）。此前只要 Codex 配置里启用了任何插件，失败的任务就不会自动交给 Gemini 接替，因为插件自带的 MCP 和应用随会话启动、无法按名字关掉；本机启用了 9 个，所以这条接替从未触发。631 个任务里没有一个调用过插件工具。大目录里按范围留补丁时，范围路径被 `.gitignore` 排除不再让整单没有补丁：这类路径跳过，其余照常记录。
+
 `0.9.138` 由 LoopX 续跑的会话交接后不再停住：交接时把 LoopX 的线程绑定挪给继任会话，交接单以 `/loopx` 开头送达，继任会话由 LoopX 接着按待办续跑，不重建原生目标；撤回或自动回滚时绑定挪回原会话。只在原会话最近一轮是 LoopX 续跑时生效，由原生目标循环驱动的会话照旧；没装 LoopX 或绑定挪不动时交接照常进行，结果的 `steps.loopx` 记下原因。
 
 `0.9.137` Gemini 的主机访问任务可以运行命令：写任务放行命令，只读任务放行命令但仍禁止写文件；沙箱内的 Gemini 任务照旧不能运行命令。任务目录太大、无法在时限内遍历时，Codex 失败转 Gemini 改按事件流判断：整单没有任何工具调用即可接替。Codex 报额度用完后，到回执给出的恢复时间前不再启动 Codex；没有指定引擎的新任务在可接替时改派 Gemini，其余直接拒绝并提示改传 `engine: "gemini"`，重新加载插件即解除。网关报上游账号已退出登录按永久错误处理，不再重试。配置的模型带提供方前缀时，`codex_run` 拒绝不带前缀的模型名。记录为太大的工作区里，带 `scope` 的写任务只对 scope 路径记录改动，可以查看和回滚。面板速度档增加标准档 `default`。
@@ -173,6 +175,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.139` Codex jobs no longer load Codex plugins by default (`--disable plugins`; `use_user_config=true` still loads them). Until now any enabled plugin in the Codex configuration kept a failed job from being handed to Gemini, because plugin MCP servers and apps start with the session and cannot be turned off by name; this machine has nine enabled, so that takeover never fired. None of 631 jobs called a plugin tool. A scope path excluded by `.gitignore` no longer costs a writer in a too-big tree its whole patch: such a path is skipped and the others are recorded.
 
 `0.9.138` a session driven by LoopX no longer stops after a hand-over: the hand-over moves the LoopX thread binding to the successor and delivers the brief as a `/loopx` message, so LoopX keeps working through the todos there and no native goal is rebuilt; a revert or automatic rollback moves the binding back. This applies only when the predecessor's latest loop turn came from LoopX; sessions driven by the native goal loop behave as before, and when LoopX is absent or the binding cannot be moved the hand-over proceeds and `steps.loopx` records why.
 

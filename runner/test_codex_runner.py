@@ -2135,10 +2135,12 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index(mcp[0]) - 1], "-c")
             self.assertIn("hooks", cmd)
             self.assertIn("skills.include_instructions=false", cmd)
+            self.assertEqual(cmd[cmd.index("plugins") - 1], "--disable")
             args.use_user_config = True
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
             self.assertFalse(any("mcp_servers" in part for part in cmd))
             self.assertNotIn("skills.include_instructions=false", cmd)
+            self.assertNotIn("plugins", cmd)
             args.use_user_config = False
             (home / "config.toml").write_text("not = [valid toml")
             cmd, _ = codex_runner.build_command(args, Path(self.tmp.name), None)
@@ -3157,7 +3159,8 @@ class RunnerTests(unittest.TestCase):
         user_config = Path(self.env["CODEX_HOME"]) / "config.toml"
         for settings, expected in (('[mcp_servers.ordinary]\ncommand = "unused"', True),
                                    ('[mcp_servers."dotted.name"]\ncommand = "unused"', False),
-                                   ('[plugins."test@local"]\nenabled = true', False)):
+                                   # Plugins are turned off on the command line, so one that is on does not block.
+                                   ('[plugins."test@local"]\nenabled = true', True)):
             with self.subTest(settings=settings):
                 user_config.write_text(settings, encoding="utf-8")
                 self.assertIs(self.invoke(*checked, mode="refused_turn")["fallback_safe"], expected)
@@ -5753,8 +5756,9 @@ class RunnerTests(unittest.TestCase):
         git("checkout", "-q", "--", "sub/a.txt")
         (sub / "new.txt").unlink()
         (sub / "gone.txt").unlink()
+        (sub / "noise.log").write_bytes(b"ignored\n")  # a scope path .gitignore excludes must not cost the patch
         job_id = self.invoke(*writer, "--scope", "a.txt", "--scope", "new.txt", "--scope", "gone.txt",
-                             command="start", mode="scoped_write_repo")["job_id"]
+                             "--scope", "noise.log", command="start", mode="scoped_write_repo")["job_id"]
         done = self.control("status", job_id, "--wait", "30")
         self.assertEqual((done["diff_status"], done["diff_files"]), ("captured", 3), done)
         text = self.control("output", job_id, "--artifact", "diff")["text"]

@@ -53,8 +53,10 @@ else:
 # Also off: the skills listing (39.7k characters every request; in a week of jobs it mostly led to reading
 # using-superpowers and verification-before-completion as the first tool call), and the goal and image tools
 # described inside the exec tool (one job in a week used goals, none used images).
+# Codex plugins are off as a whole: none of 631 jobs called a plugin tool, and with any plugin on, a failed job
+# could not be handed to Gemini (their MCP servers and apps start with the session and cannot be turned off by name).
 STRIP_USER_EXTRAS = ["--disable", "hooks", "-c", "skills.include_instructions=false",
-                     "--disable", "goals", "--disable", "image_generation"]
+                     "--disable", "goals", "--disable", "image_generation", "--disable", "plugins"]
 
 HOME = Path(os.environ.get("CODEX_RUNNER_HOME") or
             (Path(os.environ.get("LOCALAPPDATA", Path.home())) / "codex-runner" if IS_WIN
@@ -388,7 +390,7 @@ def local_path(path):
 
 def disable_user_mcp_servers():
     """`-c mcp_servers={}` is a no-op in Codex 0.154, so turn off each server named in config.toml.
-    Plugin-provided MCP servers are not listed there and are not covered."""
+    Plugin-provided MCP servers are not listed there; STRIP_USER_EXTRAS turns the plugins themselves off."""
     home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     try:
         servers = tomllib.loads((home / "config.toml").read_text("utf-8")).get("mcp_servers")
@@ -764,6 +766,8 @@ def fallback_read_only_event(event):
 
 
 def fallback_config_isolated(cwd):
+    """Whether everything the configuration could start is turned off by build_command. Plugins are (the feature
+    flag on the command line wins over any config file), so only MCP servers are looked at."""
     user_config = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "config.toml"
     project = Path(cwd)
     configs = {user_config: True}
@@ -777,11 +781,8 @@ def fallback_config_isolated(cwd):
             continue
         except (OSError, ValueError):
             return False
-        plugins = config.get("plugins", {})
         servers = config.get("mcp_servers", {})
-        if not isinstance(plugins, dict) or not isinstance(servers, dict):
-            return False
-        if any(not isinstance(plugin, dict) or plugin.get("enabled") is not False for plugin in plugins.values()):
+        if not isinstance(servers, dict):
             return False
         for name, server in servers.items():
             if (not user or "." in name) and (not isinstance(server, dict) or server.get("enabled") is not False):
@@ -1579,9 +1580,21 @@ def diff_tree(job_dir, base, budget):
     if missing:
         git(base["cwd"], "--literal-pathspecs", "rm", "-r", "-q", "--cached", "--ignore-unmatch", "--", *missing,
             deadline=deadline, env=env)
-    if len(missing) < len(paths):
-        git(base["cwd"], "--literal-pathspecs", "add", "-A", "--", *(p for p in paths if p not in missing),
-            deadline=deadline, env=env)
+    present = [p for p in paths if p not in missing]
+    if present and base.get("paths"):
+        # `git add` fails on a named path that .gitignore excludes; such a scope path has nothing to show.
+        try:
+            # shortcut: a name with a quote, backslash or control character comes back quoted and is not recognised
+            # (the diff then fails as before); `-z` needs --stdin, switch to that if such names turn up.
+            ignored = git(base["cwd"], "-c", "core.quotePath=false", "check-ignore", "--",
+                          *present, deadline=deadline, env=env).decode("utf-8").splitlines()
+        except ValueError as e:
+            if str(e) != "git exited 1":  # exit 1 with nothing on stderr: none of them is ignored
+                raise
+            ignored = []
+        present = [p for p in present if p not in ignored]
+    if present:
+        git(base["cwd"], "--literal-pathspecs", "add", "-A", "--", *present, deadline=deadline, env=env)
     return git(base["cwd"], "write-tree", deadline=deadline, env=env).decode("ascii").strip(), env
 
 
