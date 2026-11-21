@@ -869,12 +869,13 @@ function rgFilesOnly(args) {
   return files;
 }
 
-export function shellReadTargets(command, cwd) {
+// allow：配置的 allowCommands。匹配的那一段按“不读原料”处理，它的重定向输入和 $(...) 里的命令照常检查。
+export function shellReadTargets(command, cwd, allow = []) {
   const expansions = new Map(), braces = new Set(), targets = [];
   if (typeof command !== 'string' || command.length > MAX_COMMAND) return null;
   let unknown = false;
   const segments = splitCommand(command, (sub) => {
-    const reads = shellReadTargets(sub, cwd);
+    const reads = shellReadTargets(sub, cwd, allow);
     if (reads === null) unknown = true;
     else targets.push(...reads);
     return true;
@@ -888,6 +889,7 @@ export function shellReadTargets(command, cwd) {
       targets.push(readPath(input.path, cwd));
     }
     if (!words.length) continue;
+    if (allow.some((rx) => rx.test(raw.join(' ')) || rx.test(words.join(' ')))) continue;
     const [cmd, ...args] = words;
     if (cmd === 'cd') { cwd = ''; continue; } // shortcut: relative reads after cd are refused; use workdir until cwd control-flow parsing is needed.
     if (METADATA_COMMANDS.has(cmd)) {
@@ -1001,7 +1003,7 @@ function obsidianVaultRoot(allow) {
   return roots.size === 1 ? [...roots][0] : '';
 }
 
-export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd, plannerReadAllow = []) {
+export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd, plannerReadAllow = [], allowCommands = []) {
   const name = String(exec?.name ?? '').split('__').at(-1).toLowerCase();
   const args = exec.arguments ?? {};
   if (name === 'obsidian_list') return [];
@@ -1024,7 +1026,7 @@ export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd
   if (ops) cwd = exec?.agent?.session?.header?.cwd;
   const directory = ops ? (name === 'ops_bash' ? args.workdir : undefined) : args.workdir ?? args.cwd;
   if (directory !== undefined) cwd = readPath(directory, cwd);
-  if (SHELL_TOOLS[name]) return shellReadTargets(args.command, cwd);
+  if (SHELL_TOOLS[name]) return shellReadTargets(args.command, cwd, allowCommands);
   if (name === 'find_referencing_symbols') return null; // Referencing bodies can come from files outside the supplied path.
   const operation = name.replace(/^wsl-/, '');
   const search = SEARCH_TOOL.test(operation);
@@ -1109,7 +1111,7 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     const owner = exec?.agent?.id;
     const state = owner ? stateFor(owner) : undefined;
     if (state) recoverGemini(state, exec);
-    const targets = plannerReadTargets(exec, cwd, [...cfg.plannerReadAllow ?? [], ...state?.gemini ?? []]);
+    const targets = plannerReadTargets(exec, cwd, [...cfg.plannerReadAllow ?? [], ...state?.gemini ?? []], cfg.allowCommands);
     if (targets?.length === 0) return undefined;
     if (state?.gemini.size && targets?.some(file => [...state.gemini].some(body => under(body, file)))) return GEMINI_READ_DENY;
     if (state?.gemini.size && !targets) {

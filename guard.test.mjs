@@ -515,6 +515,26 @@ test('allowCommands entries still pass the assignment-prefix and parameter check
     'PATH=/tmp/evil ./verify.sh --check', './verify.sh --check "${ touch pwned; }"', './verify.sh --check > out'], extra);
 });
 
+test('an allowCommands segment is not a raw-material read in products mode; its inputs and substitutions still are', () => {
+  const allow = [/^(?:loopx|"?\$\{?LOOPX_BIN\}?"?)\s+(?:quota|todo)(?:\s|$)/];
+  const bash = command => call('ops_bash', { command });
+  const scope = createProductReads({ ...config('products'), allowCommands: allow }, completed);
+  for (const command of ['loopx quota should-run --goal-id g', '"$LOOPX_BIN" todo list --goal-id g',
+    "loopx todo add --text 'check a; b && c'", 'loopx quota should-run --goal-id g | head -c 2000', 'loopx quota should-run 2>&1']) {
+    assert.equal(scope.checkSync(bash(command)), undefined, command);
+  }
+  // A known raw path answers null first (product lookup pending), never undefined.
+  for (const command of ['loopx quota should-run < /repo/secret.js', 'loopx todo add --text "$(cat /repo/secret.js)"',
+    'loopx quota should-run; cat /repo/secret.js']) {
+    assert.notEqual(scope.checkSync(bash(command)), undefined, command);
+  }
+  for (const command of ['loopx update apply', 'python3 -m pytest', 'loopx quota should-run; python3 -m pytest']) {
+    assert.equal(scope.checkSync(bash(command)), denial, command);
+  }
+  // Without the entry the same command stays refused, as before.
+  assert.equal(createProductReads(config('products'), completed).checkSync(bash('loopx quota should-run --goal-id g')), denial);
+});
+
 test('every supplied path alias of a read tool is a read target', () => {
   const targets = (args) => plannerReadTargets(call('read', args), '/repo');
   assert.deepEqual(targets({ path: '/repo/ok.md' }), ['/repo/ok.md']);
