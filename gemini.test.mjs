@@ -34,7 +34,7 @@ function fixture(t, action, cfg = CFG) {
   const spawns = [];
   const launch = (_command, argv, options) => {
     const child = new EventEmitter();
-    Object.assign(child, { argv, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+    Object.assign(child, { argv, env: options.env, stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
       kill() { setImmediate(() => this.emit('close', null)); return true; } });
     spawns.push(child);
     child.stdin.resume();
@@ -48,6 +48,13 @@ function fixture(t, action, cfg = CFG) {
   return { cwd, spawns, output: path.join(cwd, 'chapter.md'),
     execute: (args = {}, options = {}) => geminiWrite(cfg, { ...WRITING, cwd, ...args }, conductor, options, launch) };
 }
+
+test('gemini_write runs agy under the pooled account HOME and proxy', async (t) => {
+  const h = fixture(t, undefined, { ...CFG, home: 'D:\\pool\\a', proxy: 'http://127.0.0.1:7894' });
+  assert.equal((await h.execute()).status, 'completed');
+  const { env } = h.spawns[0];
+  assert.deepEqual([env.HOME, env.USERPROFILE, env.HTTPS_PROXY], ['D:\\pool\\a', 'D:\\pool\\a', 'http://127.0.0.1:7894']);
+});
 
 test('gemini_write passes --effort only when an effort is configured', async (t) => {
   for (const [effort, expected] of [['low', 'low'], ['', undefined]]) await t.test(effort || 'unset', async (t) => {

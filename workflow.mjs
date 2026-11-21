@@ -247,6 +247,7 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   if (value.conversation_id != null) {
     args.conversation_id = value.conversation_id;
     if (options.model != null) args.model = options.model;
+    if (options.agy_home != null) args.agy_home = options.agy_home;
   }
   return { ready: true, args, task, continuation, blocking,
     next: value.conversation_id ? '计划已准备，使用原 conversation_id 续接；尚未执行。'

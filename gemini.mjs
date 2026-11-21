@@ -157,6 +157,8 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
     };
     const env = { ...process.env };
     if (cfg.proxy) for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) env[key] = cfg.proxy;
+    // 账号池里的账号：agy 从 HOME/USERPROFILE 读登录信息。
+    if (cfg.home) env.HOME = env.USERPROFILE = cfg.home;
     try {
       checkTimeout();
       if (settled) return;

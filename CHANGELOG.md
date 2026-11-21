@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.133` 新增 `gemini.accountPool`，指向 DSH agy 插件账号池的 `pool.json`。配置后 Gemini 任务和 `gemini_write` 改用池中当前可用的账号：以账号目录作 `HOME / USERPROFILE`，账号设了代理就用它自己的代理。选号只读，跳过停用、需要重新登录和正在冷却的账号；续接 Gemini 会话回到原账号，原账号已不在池中时拒绝续接。
+
 `0.9.132`规划端先派齐已就绪、互不冲突且护栏允许的只读调查和核验，再留在本轮逐单等待并验收已收到的报告。提示词明确同目录写锁和收尾欠账的派单条件。同一交付链连续两轮卡在相同条目且参数未变时拦截重派，提交具体变化说明最多放行一次。支持归档不可补回的历史证据、派单前检查必写路径、按回执中的编号和提交结构收尾。受阻且无可核验产出的任务先解除阻塞，同一任务的文件版本及核验范围未变时复用已有核验。
 
 同版本在通用 runner 中接入 Windows Antigravity 执行。`codex_run`、`codex_continue` 和 `codex_verify` 支持按单选引擎，共用任务记录、写锁和逐条验收。支持默认引擎、经 runner 确认无写入后的 Codex 失败接替、独立交叉核验和 Gemini 并发上限。父任务保留期间接替任务参与去重，worker 启动失败可重新派出。Gemini 执行可使用 agy 默认模型和档位，提供方错误会提示规划端改用 Codex。
@@ -161,6 +163,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.133` adds `gemini.accountPool`, the path to the DSH agy plugin's account pool `pool.json`. When set, Gemini jobs and `gemini_write` run under the pool's current usable account: its directory becomes `HOME / USERPROFILE`, and its own proxy is used when it has one. Selection is read-only and skips disabled accounts, accounts that need to sign in again and accounts in cooldown. A Gemini continuation returns to the original account and is refused when that account has left the pool.
 
 `0.9.132` asks the planner to dispatch all ready, independent read-only investigations and verifications permitted by the guards, then wait for one job at a time and review reports in the same turn. The prompts clarify the directory write lock and closeout requirements. The same delivery chain stops after two rounds with unchanged inputs and outcomes, with at most one extra attempt based on a concrete explanation of what changed. Reviews can archive unrecoverable historical evidence, dispatch checks required write paths, and closeout receipts include exact IDs and submission templates. Verification skips blocked rounds with no verifiable output and reuses results for the same job when the observed file version and verification scope match.
 
