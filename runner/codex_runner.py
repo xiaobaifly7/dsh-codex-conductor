@@ -3453,7 +3453,8 @@ def products(args):
             else:
                 truncated = True
 
-    for job_dir in job_directories():
+    # Newest first: once --limit is reached, the paths dropped are the oldest, not the reports the planner reads next.
+    for job_dir in sorted(job_directories(), key=lambda d: d.name, reverse=True):
         if job_dir.is_symlink() or not job_dir.resolve().is_relative_to((HOME / "jobs").resolve()):
             continue
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"

@@ -3715,6 +3715,15 @@ class RunnerTests(unittest.TestCase):
         self.stored_job("exact", {"status": "completed"}, context=self.sample_context("exact-owner"))
         self.assertFalse(self.control("products", "--owner", "exact-owner", "--limit", "2")["truncated"])
 
+    def test_products_keep_the_newest_jobs_when_the_limit_is_reached(self):
+        context = self.sample_context("long-owner")
+        for job_id, name in (("20261101-000000-aaaaaa", "old.md"), ("20261122-000000-cccccc", "new.md"),
+                             ("20261110-000000-bbbbbb", "mid.md")):
+            self.stored_job(job_id, {"status": "completed", "write_paths": [name]}, context=context)
+        result = self.control("products", "--owner", "long-owner", "--limit", "1")
+        self.assertTrue(result["truncated"])
+        self.assertEqual([Path(p).name for p in result["paths"]], ["new.md"])
+
     def test_products_exclude_symlinked_job_artifacts_and_resolve_product_paths(self):
         job = self.stored_job("linked", {"status": "completed", "write_paths": ["link.txt"]},
                               context=self.sample_context())

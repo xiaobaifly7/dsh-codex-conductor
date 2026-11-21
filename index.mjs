@@ -22,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 // helper 继承入口的重载 query，避免入口刷新后仍复用旧依赖。
 const reloadQuery = new URL(import.meta.url).search;
 const { validReport, blockingState, prepareContinuation, previousRoundBrief, ownerBlockerIds, resolvedBlockerIds,
-  repeatedOutcome, writeContradictions, withoutVerificationProduct, continuationSubmission } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
+  repeatedOutcome, writeContradictions, withoutVerificationProduct, continuationSubmission, sameCriteria } = await import(new URL(`./workflow.mjs${reloadQuery}`, import.meta.url));
 const { runtimeIdentity, loadedRecord, pidReused, registerRuntimeTool, queryWithTimeout, QUERY_TIMEOUT_MS,
   REPEAT_FAILURE_DEFAULTS, validRepeatFailureField } = await import(new URL(`./runtime.mjs${reloadQuery}`, import.meta.url));
 const { registerResumeRequests, registerAutoWake } = await import(new URL(`./resume.mjs${reloadQuery}`, import.meta.url));
@@ -104,6 +104,8 @@ const DEFAULTS = {
   closeoutEvidence: 'independent',
   acceptOpenEvidence: 'strict',
   autoVerify: 'flagged',
+  // 报告只是停下来等规划端回答（阻塞全是 user_input / task_conflict、没有 not_met）时不自动核验；false 照旧核验
+  autoVerifySkipQuestions: true,
   // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
   continueFreshAboveTokens: 100000,
   // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
@@ -741,15 +743,13 @@ export function withReport(value) {
   return { ...normalized, blocking: blockingState(normalized) };
 }
 
-// 汇报条数和验收标准一致、编号也对得上时，逐条汇报显示验收标准原文（Codex 几乎总会改写条目），下一步不再重复列出。
-// 编号认 1. / 1) / 1、 / 1: / 第1条，NFKC 先把全角数字和标点换成半角
-function sameCriteria(report, acceptance) {
-  const criteria = report?.criteria;
-  return Array.isArray(criteria) && criteria.length > 0 && acceptance?.length === criteria.length && criteria.every((c, i) => {
-    if (typeof c?.criterion !== 'string') return false;
-    const n = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、])/.exec(String(c.criterion ?? '').normalize('NFKC'))?.[1];
-    return n === undefined || Number(n) === i + 1;
-  });
+// 执行端只是停下来等规划端回答：阻塞全是会进 blocking.questions 的种类，没有 not_met，must_verify 条目都没报 met。
+// 这时核验只能确认“在等回答”，还会让续接等它结束。
+function awaitingAnswers(value) {
+  const { blockers, questions } = blockingState(value);
+  const rows = value.report.criteria;
+  return blockers.length > 0 && questions.length === blockers.length && rows.every(row => row.status !== 'not_met') &&
+    (value.context.must_verify ?? []).every(index => reportRowOf(value.context.acceptance, rows, index)?.status === 'blocked');
 }
 
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
@@ -985,6 +985,9 @@ function summaryLine(value) {
     ? `续接未启动：${value.next?.split('\n')[0]} · continuation_ready=false\n原任务状态：${summary}` : summary;
 }
 
+// 结果文字里列出的改动文件数上限；一单常有上百个证据文件，全列会让每次 codex_status 多出上万字
+const FILES_SHOWN = 30;
+
 // 已完成的结果只留核验用得上的：任务目录和一行改动清单；失败、取消、仍在执行的保留全部字段，便于排查。
 // 用量、日志目录等完整字段在 runner 的 result.json（runnerHome/jobs/<job_id>/）里
 function details(rest) {
@@ -994,12 +997,15 @@ function details(rest) {
       ...(value.context.verification_of ? { verification_of: value.context.verification_of } : {}) };
     return [JSON.stringify(value, null, 2)];
   }
-  // runner 最多列 300 条，总数照实给
+  // runner 最多列 300 条，总数照实给；文字里只列前 FILES_SHOWN 条，超出 scope 的改动由 outOfScope 单独列出
   const shown = rest.files_changed?.length;
   const total = rest.files_changed_total ?? shown;
+  const listed = rest.files_changed?.slice(0, FILES_SHOWN);
   const files = Array.isArray(rest.files_changed) && `改动文件（${rest.files_changed_source ?? '来源未知'}，共 ${total} 个` +
     `${total > shown ? `，只列出前 ${shown} 个，超出 scope 的检查也只看这些，其余的到任务目录里核对` : ''}）：` +
-    (rest.files_changed.map((f) => `${f.path}(${f.change})`).join('、') || '无');
+    (listed.map((f) => `${f.path}(${f.change})`).join('、') || '无') +
+    (shown > listed.length ? `；此处只显示前 ${listed.length} 个，完整清单用 codex_output（artifact: "result"）查看` +
+      (rest.out_of_scope?.length ? `；其中超出 scope 的：${rest.out_of_scope.join('、')}` : '') : '');
   return [rest.cwd && `任务目录：${rest.cwd}`, files,
     rest.continuation_ready === false && 'continuation_ready=false',
     rest.context?.verification_of && `独立核验任务；核验对象：${rest.context.verification_of}`,
@@ -1071,6 +1077,24 @@ export function turnSummary(log, turn) {
 }
 
 const OUTPUT = { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => render(value) };
+
+// codex_review 写入后的回执：规划端刚看过报告、刚写完验收，不再把整份报告、改动清单和它自己的核验证据原样回显，
+// 只留结案状态、仍待回答的阻塞和下一步。完整内容仍可用 codex_status / codex_output 读取。
+function renderReview(value) {
+  if (typeof value?.rendered === 'string') return [{ type: 'text', text: value.rendered }];
+  const blockers = value?.blocking ?? blockingState(value);
+  const recorded = value?.verification_status ? `已记录独立核验：${value.verification_status}` +
+    (value.verification?.reviewer ? `（核验人：${value.verification.reviewer}）` : '') : '';
+  return [{ type: 'text', text: [
+    `${summaryLine(value ?? {})}${value?.job_id ? `  job_id: ${value.job_id}` : ''}${value?.thread_id ? `  thread_id: ${value.thread_id}` : ''}`,
+    recorded, value?.verification_error && `核验记录异常：${value.verification_error}`,
+    value?.status !== 'completed' && value?.error && `错误：${value.error}`,
+    ...(blockers.blockers.length ? ['--- 阻塞与待回答问题 ---', ...blockers.blockers.map((b) =>
+      `${b.id} [${b.kind}] ${b.message}${b.question ? `\n需要回答：${b.question}` : ''}${b.resolution ? `\n解除条件/已有信息：${b.resolution}` : ''}`)] : []),
+    ...(value?.next ? ['--- 下一步 ---', value.next, USER_REPORT] : []),
+  ].filter(Boolean).join('\n') }];
+}
+const REVIEW_OUTPUT = { schema: OUTPUT.schema, render: (_args, value) => renderReview(value) };
 const DATA_OUTPUT = { schema: { type: 'object', additionalProperties: true },
   render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
 
@@ -1990,7 +2014,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     !job.context.verification_of && (job.execution_status ?? job.status) === 'completed' &&
     (job.verification_status == null || job.verification_status === 'unreviewed') && job.report_status !== 'invalid';
   const eligibleForAutoVerification = (value) => automaticCandidate(value) && value.verification_status === 'unreviewed' &&
-    !beforeCutoff(value, autoVerifyFrom) && validReport(value.report) && (flaggedCriteria(value).length || value.context.must_verify?.length);
+    !beforeCutoff(value, autoVerifyFrom) && validReport(value.report) && (flaggedCriteria(value).length || value.context.must_verify?.length) &&
+    !(cfg.autoVerifySkipQuestions && awaitingAnswers(value));
   const autoVerifyWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 补派自动核验失败：${error?.message ?? error}`);
 
   async function hasLaterRound(source) {
@@ -2624,7 +2649,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return matches;
   }
 
-  function convergenceDecision(tool, rounds, candidate, note) {
+  function convergenceDecision(tool, rounds, candidate, note, answers = []) {
     const [latest, earlier] = rounds;
     if (!latest) return {};
     const premises = attemptPremises(latest);
@@ -2636,6 +2661,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const outcome = repeatedOutcome(latest);
     if (!outcome || premises !== attemptPremises(earlier) ||
         JSON.stringify(outcome) !== JSON.stringify(repeatedOutcome(earlier))) return {};
+    // 这次续接对卡住的问题给了与上一轮不同的答复，是新输入，不算原样重派；同一答复再提交一次仍按重复处理。
+    const previous = latest.context.continuation?.answers ?? [];
+    if (blockingState(latest).questions.some(({ id }) => answers.some(answer => answer.id === id &&
+        !previous.some(old => old.id === id && old.answer.trim() === answer.answer.trim())))) return {};
     const exhausted = latest.context.routing?.convergence_override === true;
     if (!exhausted && note && note !== latest.context.routing?.change_fingerprint) return { override: true };
     const items = [...outcome.criteria.map(([index, status]) => `验收 ${index}=${status}`), ...outcome.blockers];
@@ -2982,7 +3011,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             sandbox: (args.host_access ?? cfg.defaultHostAccess) === true ? 'danger-full-access' : args.write ? 'workspace-write' : 'read-only',
             task_options: { writable_roots: args.writable_roots, use_user_config: args.use_user_config },
             context: { task: originalTask, acceptance: args.acceptance, write: args.write, must_verify: args.must_verify,
-              routing: { convergence_task: convergenceTask, required_writes: args.required_writes } } }, note);
+              routing: { convergence_task: convergenceTask, required_writes: args.required_writes } } }, note, continuation?.answers);
           if (refusal) throw reject(refusal);
           if (!continuation && previous?.job_id && (linked || repeatedOutcome(previous))) {
             routing = { ...routing, parent_job_id: previous.job_id };
@@ -3799,7 +3828,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         message: { type: 'string' }, question: { type: 'string' }, resolution: { type: 'string' },
       }, required: ['id', 'kind', 'message', 'question', 'resolution'] } },
     }, required: ['job_id', 'status', 'criteria'] },
-    output: OUTPUT,
+    output: REVIEW_OUTPUT,
     async execute(args, exec) {
       const owner = exec?.agent?.id;
       const noSuchJob = async message => {

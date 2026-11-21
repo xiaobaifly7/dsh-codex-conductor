@@ -31,6 +31,17 @@ const executionOf = (value) => ['bridge_error', 'unknown_job', 'invalid_record']
   ? 'unknown' : value.execution_status ?? value.status;
 const verificationOf = (value) => value.verification_status ?? value.verification?.status;
 
+// 汇报条数和验收标准一致、编号也对得上时按位置对应（Codex 几乎总会改写条目）：逐条汇报显示验收标准原文，防兜圈按位置比条目。
+// 编号认 1. / 1) / 1、 / 1: / 第1条，NFKC 先把全角数字和标点换成半角
+export function sameCriteria(report, acceptance) {
+  const criteria = report?.criteria;
+  return Array.isArray(criteria) && criteria.length > 0 && acceptance?.length === criteria.length && criteria.every((c, i) => {
+    if (typeof c?.criterion !== 'string') return false;
+    const n = /^\s*(?:第\s*)?\(?(\d+)\s*(?:条|[.):、])/.exec(String(c.criterion ?? '').normalize('NFKC'))?.[1];
+    return n === undefined || Number(n) === i + 1;
+  });
+}
+
 export function repeatedOutcome(value) {
   if (!['completed', 'failed'].includes(executionOf(value)) ||
       ['verified', 'accepted_deviations', 'invalid'].includes(verificationOf(value))) return;
@@ -41,7 +52,7 @@ export function repeatedOutcome(value) {
   const rows = reviewed ? value.verification?.criteria :
     report.criteria.map((row, position) => ({ ...row, index: position + 1 }));
   if (!Array.isArray(rows) || rows.length !== acceptance.length || (!reviewed &&
-      rows.some(row => row.criterion.trim() !== acceptance[row.index - 1]?.trim()))) return;
+      rows.some(row => row.criterion.trim() !== acceptance[row.index - 1]?.trim()) && !sameCriteria(report, acceptance))) return;
   const criteria = rows.filter(row => row.status !== 'met')
     .filter(row => !row.historical_gap)
     .map(({ index, status }) => [index, status]).sort(([left], [right]) => left - right);
@@ -54,13 +65,17 @@ export function repeatedOutcome(value) {
 const requiredPath = /^(?:(?:必须|务必|请)\s*)?(?:写入|写出|输出到|生成|保存到|交付文件[：:]\s*|write to|save to|create)\s*(?:`([^`\r\n]+)`|((?:\/|[a-z]:[\\/])[^\s`，。；;]+))/iu;
 const readOnlyConstraint = /^(?:全程只读|read.only throughout|strictly read.only)(?:[。；;：:]|$)/iu;
 const stripListPrefix = (line) => line.trim().replace(/^(?:[-*]|\d+[.、)])\s*/u, '');
+// 只认像文件路径的写法：带目录分隔符，或不含空白、以扩展名结尾；报告里的小节标题等普通文字不算。
+const pathLike = (file) => /[\\/]/u.test(file) || /^\S+\.[a-z\d]{1,8}$/iu.test(file);
+const prohibition = /禁止|不得|不许|严禁|不要/u;
 
 function deliveryPaths(task) {
   const files = [];
   let deliverables = false;
   for (const raw of task.split('\n')) {
     const line = raw.trim();
-    const heading = /^(?:【([^】]+)】|#+\s+(.+))$/u.exec(line);
+    // 「【交付】写入当前 cwd：」这类带写入位置的小节头也算交付小节。
+    const heading = /^(?:【([^】]+)】(?:写入[^：:]{0,40}[：:])?|#+\s+(.+))$/u.exec(line);
     if (heading) {
       deliverables = /^(?:交付(?:物|文件)?|输出文件)$/u.test(heading[1] ?? heading[2]);
       continue;
@@ -68,27 +83,39 @@ function deliveryPaths(task) {
     if (!deliverables || !/^[-*]\s+/u.test(line)) continue;
     const match = /^`([^`]+)`(?:$|[（(:：])|^([^\s（(:：`]+?\.[a-z\d]{1,8})(?:$|[（(：]|\s)/iu.exec(stripListPrefix(line));
     const file = match?.[1] ?? match?.[2];
-    if (file && !/已有|仅引用|现有|不写|无需/u.test(line) && !/[*?<>]/u.test(file)) files.push([file, `【交付】中的 ${file}`]);
+    if (file && pathLike(file) && !/已有|仅引用|现有|不写|无需|只读|不复制|不改/u.test(line) && !/[*?<>]/u.test(file)) {
+      files.push([file, `【交付】中的 ${file}`]);
+    }
   }
   return files;
 }
 
 export function writeContradictions(args, cwd, resolve, includes) {
-  const clauses = [args.task, ...args.acceptance].flatMap(text => text.split(/[\n。；;]/u)).map(stripListPrefix);
-  const readOnly = clauses.find(clause => readOnlyConstraint.test(clause) &&
-    !/例外|除(?:了|外|获准)|仅允许|except/iu.test(clause) &&
-    (!/[：:]/u.test(clause) || /^(?:全程只读)[：:]\s*不写(?:任何)?文件(?:[、，,]|$)/u.test(clause)));
+  const texts = [args.task, ...args.acceptance];
+  // 只读约束须独占一行；同一行后面还有句子时（如「全程只读。唯一主动写入是本轮报告文件」）多半限定了范围，不据此判冲突。
+  const readOnly = texts.flatMap(text => text.split('\n')).map(line => stripListPrefix(line).replace(/[。；;]+$/u, ''))
+    .find(line => readOnlyConstraint.test(line) && !/[。；;]/u.test(line) &&
+      !/例外|除(?:了|外|获准)|仅允许|except/iu.test(line) &&
+      (!/[：:]/u.test(line) || /^(?:全程只读)[：:]\s*不写(?:任何)?文件(?:[、，,]|$)/u.test(line)));
   const declared = (args.required_writes ?? []).map((file, index) => [file, `required_writes[${index}]`]);
-  const literal = clauses.flatMap(clause => {
+  // 同一句里「禁止…；写入 X」：禁止词之后的分句仍是禁止项。
+  const literal = texts.flatMap(text => text.split(/[\n。]/u)).flatMap(sentence => {
+    const parts = sentence.split(/[；;]/u);
+    const banned = parts.findIndex(part => prohibition.test(part));
+    return banned < 0 ? parts : [...parts.slice(0, banned), parts[banned].slice(0, parts[banned].search(prohibition))];
+  }).map(stripListPrefix).flatMap(clause => {
     const match = requiredPath.exec(clause);
     const file = match?.[1] ?? match?.[2];
-    return file && /[\\/.]/u.test(file) && !/[*?<>]/u.test(file) ? [[file, `「${clause}」`]] : [];
+    return file && pathLike(file) && !/[*?<>]/u.test(file) ? [[file, `「${clause}」`]] : [];
   });
   const roots = args.scope?.length ? args.scope.map(root => resolve(cwd, root)) : [];
+  const named = new Set(declared.map(([file]) => file));
   return [...new Map([...deliveryPaths(args.task), ...literal, ...declared]).entries()].flatMap(([file, origin]) => [
     ...(args.write === false ? [`write=false 与 ${origin} 的必写路径 ${file} 冲突`] : []),
     ...(readOnly ? [`「${readOnly}」与 ${origin} 的必写路径 ${file} 冲突`] : []),
-    ...(roots.length && !roots.some(root => includes(resolve(cwd, file), root))
+    // 任务书里只写文件名时，它多半相对于文中另写的交付目录，不按 cwd 查 scope。
+    ...(roots.length && (named.has(file) || /[\\/]/u.test(file)) &&
+      !roots.some(root => includes(resolve(cwd, file), root))
       ? [`${origin} 的必写路径 ${file} 不在 scope ${JSON.stringify(args.scope)} 内`] : []),
   ]);
 }
