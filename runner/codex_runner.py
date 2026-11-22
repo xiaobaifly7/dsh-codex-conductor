@@ -886,6 +886,11 @@ def windows_output_lines(output, proc):
     _winapi.WaitForSingleObject(process, _winapi.INFINITE)
 
 
+ACCOUNT_SWITCHES = 3  # per job, apart from --retries
+ACCOUNT_SWITCH_NOTE = ("上一个 agy 账号在任务中途额度用完，本轮换到另一个账号开了新会话，看不到上一轮的对话。"
+                       "工作区里可能留有上一轮的部分改动：先检查当前状态，再完成原任务，不要重复已经完成的工作。\n\n")
+
+
 def attempt_state(thread_id):
     return {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
             "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
@@ -906,13 +911,14 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                                     getattr(args, "agy_primary_home", None))
     except agy_runner.LeaseError as error:
         return {**attempt_state(thread_id), "engine": "gemini", "failed": True, "error": str(error),
-                "gemini_quota_kind": error.kind}
+                "gemini_quota_kind": error.kind, "lease_error": True}
     # The account that ran is the one a continuation must return to, the primary's home included.
     args.agy_home = home
     state = None
     try:
         state = run_process(argparse.Namespace(**{**vars(args), "agy_proxy": proxy, "agy_env": lease.env}), prompt,
                             run_dir, thread_id, repeat_guard)
+        state["agy_leased"] = lease.account is not None
         return state
     finally:
         ok = state is not None and state["completed"] and not state["failed"]
@@ -2412,8 +2418,10 @@ def execute(args, prompt, run_dir):
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if gemini or args.sandbox != "read-only" else args.resume
         prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
+        original_prompt = prompt
         thread_id = args.resume
         attempt = 0
+        switches = 0
         last_error_kind = None
         report_only = False
         while True:
@@ -2456,8 +2464,20 @@ def execute(args, prompt, run_dir):
                     break
                 kind, retryable = classify(state, run_dir)
             last_error_kind = kind
+            # A fresh job whose leased account ran out of quota starts over on the next account: dsh-agy-link cooled
+            # this one down on release. A continuation cannot, its conversation lives in this account's HOME; neither
+            # can a run without a lease, nor a refused lease (no_account ends the job here).
+            if (gemini and getattr(args, "agy_pool", None) and not args.resume and not report_only
+                    and kind == "provider_permanent" and state.get("gemini_quota_kind") == "provider_permanent"
+                    and state.get("agy_leased") and not state.get("lease_error") and switches < ACCOUNT_SWITCHES):
+                switches += 1
+                runner_event(run_dir, attempt, "account_switch", kind)
+                prompt = (ACCOUNT_SWITCH_NOTE + original_prompt) if state["prompt_delivered"] else original_prompt
+                thread_id = None
+                args.agy_home = None
+                continue
             # Codex read-only runs are ephemeral. Gemini resumes any conversation it started.
-            can_retry = (not report_only and retryable and attempt <= args.retries and
+            can_retry = (not report_only and retryable and attempt - switches <= args.retries and
                          (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
                 error = state.get("error") or ""
