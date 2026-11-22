@@ -864,7 +864,9 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     (value.verification_integrity === 'concurrent_changes' ? (Array.isArray(value.verification_changed_paths) && value.verification_changed_paths.length
       ? `核验期间 ${value.verification_changed_paths.join('、')}${value.verification_changed_total > value.verification_changed_paths.length ? ` 等 ${value.verification_changed_total} 个文件` : ''}` +
-        '有变化；它们核验前就已改动，也不是原任务的产物，按其他进程（如常驻程序写日志）处理，核验结论照常可用；若验收依赖这些文件，请核对对应证据。'
+        '有变化；它们核验前就已改动，也不是原任务的产物，只是被追加了内容' +
+        (value.verification_append_check === 'size' ? '（项目里改动的文件太多，这次只核对了文件变大，没有逐字核对原有内容）' : '') +
+        '，按其他进程（如常驻程序写日志）处理，核验结论照常可用；若验收依赖这些文件，请核对对应证据。'
       : '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。')
       : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
     (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个文件的内容未比对，请核对对应验收证据。` : '') +

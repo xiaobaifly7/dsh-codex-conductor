@@ -6324,7 +6324,8 @@ class RunnerTests(unittest.TestCase):
                     if result["status"] == "failed":
                         self.assertEqual(result["error_kind"], "verification_tree_changed")
                     else:
-                        self.assertEqual(result["verification_changed_paths"], ["sub/logs/watch.out"])
+                        self.assertEqual((result["verification_changed_paths"], result["verification_append_check"]),
+                                         (["sub/logs/watch.out"], "hash"))
                 finally:
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 

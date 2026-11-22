@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.163` 核验因“只是被其他进程追加了内容”而放行时，结果里多一个 verification_append_check 字段：hash 表示核对了原有内容的哈希，size 表示项目里改动的文件太多、只核对了文件变大。只按大小判的那一单，回执会说明没有逐字核对原有内容。
+
 `0.9.162` 核验期间 Git 状态、tree 和索引都没变，唯一的变化是给核验前就已改动、位于 scope 目录下、既不是原任务产物也没在 scope 里点名的文件追加内容时，这次核验照常完成，只标 concurrent_changes，回执列出这些文件，并说明按其他进程写入处理。“追加”的判定是：文件变大，并且核验开始时那部分内容的哈希没变。如果项目里有改动的文件太多、开始时只记了大小，就只能看文件是否变大。原地改写、产物文件、scope 里点名的文件、新增或删除的文件，以及 HEAD 或索引的变化，仍按 verification_tree_changed 判失败。0.9.161 记下的文件名显示，一个会话连续三次核验失败，都是因为项目里常驻的 console watcher 在往 scope 目录 10-audit 下的日志里追加内容，只要 watcher 在跑，这些核验就一定失败，任务也就收不了尾。
 
 `0.9.161` 核验因“受核验范围的文件在核验期间变化”（verification_tree_changed）失败时，runner 在结果里记下变化的文件（相对仓库根目录，最多 20 个）和总数，回执把它们列给 DeepSeek：如果只是检查自己生成的缓存、日志或构建产物，就重新核验；如果是代码改动，就等同目录的写任务结束后再核验。以前回执只让 DeepSeek“核对改动来源”，可它读不到项目，11-16 以来约 800 单核验里有 8 单这样失败，都查不出改了什么。
@@ -221,6 +223,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.163` A verification passed because files were only appended to by another process now records verification_append_check: hash when their earlier bytes were checked, size when the project had too many dirty files to hash and only their growth was checked. For size-only passes the receipt says the earlier content was not compared.
 
 `0.9.162` A verification during which Git status, tree and index stayed the same, and the only changes were appends to already-dirty files under a scope directory that are neither a product nor named in the scope, now completes with concurrent_changes and a receipt naming those files as another process's writes. An append means the file grew and the bytes it had when the check started still hash the same; in projects with more dirty files than are content-hashed only the growth can be checked. In-place rewrites, product files, files named in the scope, files that appear or disappear, and HEAD or index changes still fail with verification_tree_changed. The names recorded by 0.9.161 showed that three verifications in a row had failed because a console watcher kept appending to its log under the 10-audit scope directory, so they could never pass while it ran.
 
