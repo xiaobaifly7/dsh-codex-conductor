@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.159` 产物读取权限查询更快：runner 按目录前缀缓存 realpath，并复用同一次 lstat 判断目录，/mnt 下每个目录每次查询只解析一次。4892 个产物的对话从 10.6 秒降到 3.0 秒，结果逐条一致；此前 WSL 忙时查询超过插件 15 秒等待，DeepSeek 读自己任务产出的文件会收到“暂时无法确认读取权限”。执行端锁定为 Gemini 时，`codex_run` 的 `resume` 说明改为“不能填写，返工用 `codex_continue`”，收尾护栏的拒绝文字也不再建议“带 resume 的 codex_run”：实测 DeepSeek 把 Gemini 回执里的 conversation_id 当作 resume 传入，连续两次被拒后才改用 codex_continue。
+
 `0.9.158` `/conductor` 命令只认开关词：`/conductor on`、`/conductor off`、`/conductor status` 即可，中间写不写 `direct`、拼错（手机自动纠错打成 `diret`）都不影响，也认“开”“关”“状态”。回执去掉了界面不渲染的 `**`。
 
 `0.9.157` 长对话中途切换模式更可靠：`/conductor direct on|off` 之后的下一条用户消息会附一条说明，告诉 DeepSeek 模式已经切换、前面的做法不再适用（只附一次）；直接执行模式下系统提示词不再只是去掉规划要求，而是写明“本会话为直接执行模式”。实测中，聊过几轮后关掉直接执行，DeepSeek 仍照前面的回答说自己还在直接执行，系统提示词其实已经恢复。
@@ -213,6 +215,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.159` The product read-permission query is faster: the runner caches realpath per directory prefix and reuses the same lstat to tell directories apart, so each /mnt directory is resolved once per query. A conversation with 4892 products went from 10.6 s to 3.0 s with identical results; before, a busy WSL pushed the query past the plugin's 15 s wait and DeepSeek reading its own task outputs got "cannot confirm read permission yet". With the engine locked to Gemini, `codex_run`'s `resume` description now says it cannot be used and points to `codex_continue`, and the closeout refusal no longer suggests "codex_run with resume": DeepSeek had passed a Gemini receipt's conversation_id as resume and was refused twice before switching to codex_continue.
 
 `0.9.158` `/conductor` only looks for the switch word: `/conductor on`, `/conductor off` and `/conductor status` work, with or without `direct` and with a misspelled middle word (phone autocorrect typed `diret`); 开, 关 and 状态 work too. Receipts drop the `**` the client showed literally.
 

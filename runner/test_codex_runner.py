@@ -3760,6 +3760,25 @@ class RunnerTests(unittest.TestCase):
         (job / "result.json").symlink_to(target)
         self.assertEqual(self.control("products", "--owner", "owner-a")["status"], "failed")
 
+    def test_products_resolve_through_symlinked_directories_once_per_query(self):
+        real = self.cwd / "real"
+        (real / "deep").mkdir(parents=True)
+        try:
+            (self.cwd / "alias").symlink_to(real, target_is_directory=True)
+            (real / "deep" / "back").symlink_to(self.cwd, target_is_directory=True)
+        except OSError as e:
+            if os.name == "nt":
+                self.skipTest(f"symlinks are unavailable: {e}")
+            raise
+        self.stored_job("aliased", {"status": "completed", "write_paths": [
+            "alias/deep/a.txt", "real/deep/a.txt", "alias/deep", "alias", "alias/deep/back", "alias/deep/back/b.txt",
+            "alias/deep/../c.txt"]}, context=self.sample_context())
+        result = self.control("products", "--owner", "owner-a")
+        products = [p for p in result["paths"] if not p.startswith(str(Path(self.env["CODEX_RUNNER_HOME"]).resolve()))]
+        expected = [str((real / "deep" / "a.txt").resolve()), str((self.cwd / "b.txt").resolve()),
+                    str((real / "c.txt").resolve())]
+        self.assertEqual(sorted(products), sorted(expected))
+
     def test_must_verify_is_preserved_and_validated_in_task_context(self):
         sys.path.insert(0, str(RUNNER.parent))
         from codex_runner import task_context

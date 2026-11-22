@@ -87,7 +87,8 @@ test('close-out guard picks unreviewed flagged jobs and needs_changes without fo
   assert.deepEqual(pending, { unreviewed: ['A'], needsChanges: ['NC'] });
   const message = closeoutRefusal('codex_run', pending);
   assert.match(message, /codex_review 记录：A。/);
-  assert.match(message, /needs_changes 尚未结案，最新轮次：NC；/);
+  assert.match(message, /needs_changes 尚未结案，最新轮次：NC；用 codex_continue 或带 resume 的 codex_run 返工/);
+  assert.match(closeoutRefusal('codex_run', pending, { resume: false }), /最新轮次：NC；用 codex_continue 返工/);
   assert.equal(closeoutRefusal('codex_run', { unreviewed: [], needsChanges: [] }), '');
 });
 

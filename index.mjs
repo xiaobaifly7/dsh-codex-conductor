@@ -2812,7 +2812,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         plan.guard.parkedReview = parkedFor(owner).some(e => e.job_id === deferred.job_id);
         return '';
       }
-      let refusal = closeoutRefusal(tool, pending);
+      let refusal = closeoutRefusal(tool, pending, { resume: runEngine({ resume: true }, cfg) !== 'gemini' });
       if (refusal) logRefusal({ session: owner, tool, unreviewed: pending.unreviewed, needs_changes: pending.needsChanges });
       if (refusal && cfg.actionableReceipts) refusal += await pendingReviewReceipts(owner, pending, signal);
       return refusal;
@@ -3233,7 +3233,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         cwd: { type: 'string', description: '任务目录（Codex 在这里运行，write=true 时可写；沙箱内的额外可写目录用 writable_roots 指定），Windows 路径或 /mnt/... 都可以。' +
           '不传时：会话工作区属于配置里带 cwd 的 workspaces 条目，就用那个 cwd，否则用当前会话工作区。' +
           '只在 task 里写目标目录不会切换任务目录，要处理哪个目录就传哪个 cwd。' },
-        resume: { type: 'string', description: '仅在继续已有 Codex 会话时填写工具真实返回的 thread_id；新任务省略，不要生成编号或填写 DSH 会话号、job_id。原任务补答阻塞问题时用 codex_continue(job_id)。' },
+        resume: { type: 'string', description: runEngine({ resume: true }, cfg) === 'gemini'
+          ? '执行端已锁定为 Gemini，不能填写（Gemini 回执里的 conversation_id 也不能填）：返工、追问或补答阻塞问题都用 codex_continue(job_id)。'
+          : '仅在继续已有 Codex 会话时填写工具真实返回的 thread_id；新任务省略，不要生成编号或填写 DSH 会话号、job_id。原任务补答阻塞问题时用 codex_continue(job_id)。' },
         rerun_after_change: RERUN_AFTER_CHANGE,
         fresh: { type: 'boolean', description: '只配合 resume：不传时原线程很大就开新线程（你的任务原文前附上一轮交接内容），否则沿用原线程；true 强制开新线程，false 强制沿用。' },
         verify_previous: { type: 'string', description: '可选：一个已结束任务的 job_id，派这一单的同时只读核验它；这一单可写且写入范围与它的产物或 scope 重叠时拒绝。' },

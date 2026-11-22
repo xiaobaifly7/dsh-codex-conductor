@@ -6063,6 +6063,9 @@ test('codex_run may dispatch non-overlapping new work while the only unreviewed 
   await assert.rejects(run(harnessFor([done('A'), check('V1', 'running'), done('B')])), /未收尾.*A、B/);
   // 核验判 needs_changes 后记下：A 要先返工（codex_continue 不受护栏限制），新单被拒。
   await assert.rejects(run(harnessFor([done('A', { verification_status: 'needs_changes' }), check('V1', 'completed')])), /needs_changes 尚未结案，最新轮次：A/);
+  // 执行端锁定为 Gemini 时 resume 必被拒，拒绝文字只给 codex_continue。
+  await assert.rejects(run(harnessFor([done('A', { verification_status: 'needs_changes' }), check('V1', 'completed')],
+    { lockEngine: true, defaultEngine: 'gemini' })), /最新轮次：A；用 codex_continue 返工/);
   // 本单带 verify_previous: A：放行，同时派出核验。
   const vp = harnessFor([done('A')]);
   const viaParam = await run(vp, { verify_previous: 'A' });

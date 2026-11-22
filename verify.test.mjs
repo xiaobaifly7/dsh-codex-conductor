@@ -907,6 +907,8 @@ test('lockEngine runs every task, continuation and verification on Gemini with t
   assert.match(JSON.stringify(value), /执行端已锁定为 Gemini/);
   assert.match(run.tools.codex_run.description, /执行端已锁定为 Gemini（gemini-4-neon-medium）/);
   assert.match(run.tools.codex_run.parameters.properties.engine.description, /传 engine 会被忽略/);
+  assert.match(run.tools.codex_run.parameters.properties.resume.description, /不能填写.*conversation_id.*codex_continue/);
+  assert.match(harness({}).tools.codex_run.parameters.properties.resume.description, /^仅在继续已有 Codex 会话时/);
   await assert.rejects(run.tools.codex_run.execute({ task: 'Fix it.', acceptance, write: false, resume: 'thread-1' }, exec),
     /锁定为 Gemini.*codex_continue/);
 

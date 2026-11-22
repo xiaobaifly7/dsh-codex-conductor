@@ -3436,7 +3436,35 @@ def list_jobs(args):
 
 def products(args):
     paths, truncated = {}, False
-    resolve = cache(os.path.realpath)
+    resolve, isdir = cache(os.path.realpath), cache(os.path.isdir)
+    if not IS_WIN:
+        # Each /mnt lstat crosses into Windows, and one realpath per path took 10s of a 4k-job query, past the plugin's
+        # 15s wait once WSL was busy (2026-11-23); resolving each directory once per query keeps the same answers.
+        known = {}
+
+        def resolve(path):
+            if not os.path.isabs(path) or os.path.normpath(path) != path:
+                return os.path.realpath(path)
+            if path not in known:
+                parent, name = os.path.split(path)
+                if not name:
+                    known[path] = (path, True)
+                    return path
+                real = os.path.join(resolve(parent), name)
+                try:
+                    mode = os.lstat(real).st_mode
+                except OSError:
+                    mode = 0
+                if stat.S_ISLNK(mode):
+                    real = os.path.realpath(real)
+                    known[path] = (real, os.path.isdir(real))
+                else:
+                    known[path] = (real, stat.S_ISDIR(mode))
+                known.setdefault(real, known[path])
+            return known[path][0]
+
+        def isdir(path):
+            return known[path][1] if path in known else os.path.isdir(path)
 
     def add(cwd, path):
         nonlocal truncated
@@ -3447,7 +3475,7 @@ def products(args):
         absolute = scope_path(cwd, path, resolve=resolve)
         key = tree_key(absolute, resolve=resolve)
         # Directory grants would expose unrelated raw material beneath cwd or a write scope.
-        if os.path.isdir(absolute) or key in (tree_key(cwd, resolve=resolve), tree_key(str(HOME), resolve=resolve)):
+        if isdir(absolute) or key in (tree_key(cwd, resolve=resolve), tree_key(str(HOME), resolve=resolve)):
             return
         if key not in paths:
             if len(paths) < args.limit:
