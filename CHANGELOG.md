@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.153` 交接不再在继任会话里复活用户暂停或受阻的目标。此前只要原会话有没完成的目标，插件就在继任会话按同样的文字建一个 active 目标，发给继任会话的说明也写着“若还没有目标，按交接单里的目标创建后继续推进”，用户暂停掉的目标因此会在新会话里重新开始推进。现在只在原会话的目标交接时是 active，或是自动交接在空闲边沿自己刚暂停的那一版（请求里的 `pausedGoal`）时才重建；其余情况 `steps.successorGoal` 记 `kept_<状态>`，自检 `goal` 记 `skipped:goal_not_active`，交接单和首条消息写明不要自行创建或推进、等用户指示。撤回交接时也只恢复这次交接自己暂停的那个目标（新链接记 `goalPaused`），用户暂停的保持暂停；没有这个字段的旧链接照旧。
+
 `0.9.152` 核验只做一层：`codex_review` 和 `codex_verify` 不再接受核验任务（`verify_previous` 同样），回执指向原任务（旧版留下的多层核验链会沿链找到原任务）；核验任务的报告本来就自动算作原任务的独立依据，更深的核验并不算数。2026-11-22 有一单被这样套了 13 层、约 3.5 小时。核验结束的回执也写明要复核的原任务编号。产物读取在缓存未命中时最多等 15 秒（原 3 秒）：runner 的 products 查询实测要 3.9–9.7 秒，当天误拒了 22 次读取。Gemini 只读任务的 agy 会打印一行「`--mode plan` 不生效」的警告，这行警告曾是 stderr 里唯一的一行，盖掉了两单「agy 没给结果就退出」的失败，现在不再当作错误信息。这个参数仍然保留：实测去掉后只读任务能写进项目和项目外的文件，带上时两处写入都被拒。
 
 `0.9.151` Gemini 主机只读任务（含核验）在知道账号目录时，放行写入 agy 自己的数据目录（`<账号目录>/.gemini/antigravity-cli`，plan 模式把计划和临时脚本放在这里）。原先一律禁止写入，而禁止规则优先于放行规则，2026-11-22 有一单核验因为在这里写临时脚本被判为 `permission_denied`。项目和其他位置的写入仍会被 agy 自动拒绝，并照旧报 `permission_denied`。
@@ -201,6 +203,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.153` A hand-over no longer revives a goal the user paused, or one that was blocked, in the successor. Any unfinished goal used to be recreated there as an active goal, and the successor's message said to create the brief's goal if it had none, so a goal the user had paused started running again in the new session. The goal is now rebuilt only when it was active at hand-over time, or when it is the version the automatic hand-over itself paused at the idle edge (`pausedGoal` in the request). Otherwise `steps.successorGoal` is `kept_<phase>`, the `goal` self-check is `skipped:goal_not_active`, and the brief and first message say not to create or pursue it and to wait for the user. A revert likewise resumes only the goal this hand-over paused (new links record `goalPaused`); a goal the user paused stays paused, and older links without the field behave as before.
 
 `0.9.152` Verification is one level deep: `codex_review` and `codex_verify` (and `verify_previous`) refuse a verification job and point at the original task, following chains an older version left behind. A verification report already counts as independent evidence for the original task, and deeper verifications never counted; on 2026-11-22 one task was verified 13 levels deep over about 3.5 hours. The receipt for a finished verification now names the original task to record. A product read waits up to 15 seconds for the registry on a cache miss (was 3): the runner products query measured 3.9–9.7 seconds and 22 reads were wrongly refused that day. The warning agy prints for every Gemini read-only job (`--mode plan` "has no effect") no longer becomes the error text: as the only stderr line it hid that two failed jobs had exited without a result. The flag stays: measured without it, a read-only job wrote into the project and outside it; with it both writes were denied.
 

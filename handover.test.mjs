@@ -187,6 +187,38 @@ const userEvent = (text, time, kind = 'user') => ({
 });
 const entriesAt = (file) => JSON.parse(readFileSync(file, 'utf8'));
 
+test('a goal the user paused is not revived in the successor; the goal the automatic hand-over paused itself is rebuilt', async (t) => {
+  // 用户暂停的目标：继任会话不建目标，交接单和首条消息都说明不要自行创建或推进。
+  const h = host(t);
+  const a = h.agent('session-A');
+  h.goalsByAgent.set(a, { id: 'G1', revision: 2, phase: 'paused', objective: '用户已暂停的目标', roundsStarted: 3, maxGoalRounds: 10 });
+  const kept = await h.request({ sessionId: 'session-A' });
+  assert.deepEqual([kept.status, kept.steps.predecessorGoal, kept.steps.successorGoal, kept.checks.goal],
+    ['handed_over', 'unchanged_paused', 'kept_paused', 'skipped:goal_not_active']);
+  assert.equal(h.goalsByAgent.get(h.agents.get(kept.to)), undefined);
+  assert.equal(h.goalsByAgent.get(a).phase, 'paused');
+  assert.match(h.prompts[0].content[0].text, /没有在本会话重建；不要自行创建或推进它/);
+  assert.doesNotMatch(h.prompts[0].content[0].text, /按交接单里的目标创建/);
+  // 撤回也不替用户恢复它：只恢复交接自己暂停的目标。
+  const back = await h.request({ revert: { from: 'session-A', to: kept.to } });
+  assert.deepEqual([back.status, back.steps.predecessorGoal, h.goalsByAgent.get(a).phase], ['reverted', 'unchanged_paused', 'paused']);
+  // 自动交接在空闲边沿先暂停了这个目标并在请求里带上它：照常在继任会话重建。
+  const auto = host(t);
+  writeFileSync(auto.aliases.file, '{"links":{}}');
+  const b = auto.agent('session-B');
+  auto.goalsByAgent.set(b, { id: 'G2', revision: 5, phase: 'paused', objective: '进行中的目标', roundsStarted: 3, maxGoalRounds: 10 });
+  const rebuilt = await auto.request({ sessionId: 'session-B', origin: 'auto', pausedGoal: { id: 'G2' } });
+  assert.deepEqual([rebuilt.steps.successorGoal, rebuilt.checks.goal], ['created', 'ok']);
+  assert.deepEqual([auto.goalsByAgent.get(auto.agents.get(rebuilt.to)).objective, auto.goalsByAgent.get(auto.agents.get(rebuilt.to)).maxGoalRounds], ['进行中的目标', 7]);
+  const undo = await auto.request({ revert: { from: 'session-B', to: rebuilt.to }, force: true });
+  assert.deepEqual([undo.steps.predecessorGoal, auto.goalsByAgent.get(b).phase], ['resumed', 'active']);
+  // 请求里带的是别的目标：仍按用户暂停处理。
+  const other = host(t);
+  writeFileSync(other.aliases.file, '{"links":{}}');
+  other.goalsByAgent.set(other.agent('session-C'), { id: 'G3', revision: 1, phase: 'paused', objective: '另一个目标' });
+  assert.equal((await other.request({ sessionId: 'session-C', origin: 'auto', pausedGoal: { id: 'G-other' } })).steps.successorGoal, 'kept_paused');
+});
+
 test('the first archive preserves all original human instructions and the brief points to it', async (t) => {
   const h = host(t);
   const source = h.agent('session-12345678-1234-4321-8765-123456789abc');
@@ -890,7 +922,7 @@ test('in a goal loop auto hand-over pauses the goal at the idle edge, hands over
   const observing = auto.observe(a, big);
   assert.equal(goals.byAgent.get(a).phase, 'paused', 'paused before the first await');
   await observing;
-  assert.deepEqual(submitted.map((r) => [r.sessionId, r.origin]), [['session-A', 'auto']]);
+  assert.deepEqual(submitted.map((r) => [r.sessionId, r.origin, r.pausedGoal]), [['session-A', 'auto', { id: 'G-session-A' }]]);
   auto.settled({ from: 'session-A', requestedAt: submitted[0].requestedAt, status: 'handed_over' });
   assert.deepEqual([goals.byAgent.get(a).phase, goals.calls], ['paused', [['pause', 'session-A']]]);
   // 2. 空闲后发现有任务在跑：恢复目标（重新武装），30 分钟内不再试。

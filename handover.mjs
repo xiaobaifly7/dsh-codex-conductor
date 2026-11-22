@@ -128,7 +128,11 @@ export function validateHandoverRequest(input) {
   if (input.requestedAt !== undefined && (typeof input.requestedAt !== 'string' || input.requestedAt.length > 40 || !Number.isFinite(Date.parse(input.requestedAt)))) {
     throw new Error('requestedAt must be an ISO time');
   }
-  const meta = { origin: input.origin ?? 'file', ...(input.requestedAt ? { requestedAt: input.requestedAt } : {}), force: input.force === true };
+  if (input.pausedGoal !== undefined && (!input.pausedGoal || typeof input.pausedGoal.id !== 'string' || input.pausedGoal.id.length > 200)) {
+    throw new Error('pausedGoal must be an object with a goal id');
+  }
+  const meta = { origin: input.origin ?? 'file', ...(input.requestedAt ? { requestedAt: input.requestedAt } : {}), force: input.force === true,
+    ...(input.pausedGoal ? { pausedGoal: { id: input.pausedGoal.id } } : {}) };
   return input.revert ? { revert: input.revert, ...meta } : {
     from: input.sessionId ?? input.adopt.from, to: input.adopt?.to, note: input.note ?? '', ...meta };
 }
@@ -255,6 +259,7 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
   const hasGoal = goal && goal.phase !== 'complete' && typeof goal.objective === 'string';
   const goalSection = !hasGoal ? ['## 目标', '原会话没有进行中的目标。'] : ['## 目标',
     successorGoal === 'exists' ? '- 本会话已有自己的目标，没有用原会话的目标覆盖；以 get_goal 返回的为准。'
+      : successorGoal === 'kept' ? `- 原会话的目标交接时处于 ${goal.phase} 状态，不是在推进的目标，没有在本会话重建。不要自行创建或推进它，等用户指示。`
       : `- 目标已在本会话逐字重建${rounds ? `，上限 ${rounds} 轮` : ''}（原会话状态 ${goal.phase}，已用 ${goal.roundsStarted ?? '?'} / ${goal.maxGoalRounds ?? '?'} 轮）；以 get_goal 返回的为准。`,
     `- 目标开头：${clip(goal.objective, 200)}`];
   const instructions = context?.instructions ?? [];
@@ -314,7 +319,7 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
 }
 
 // loopx：原会话由 LoopX 续跑、绑定已挪到本会话时传入。消息以 /loopx 开头，宿主把它当作 loopx 技能调用，LoopX 由此在本会话接着续跑。
-const handoverMessage = (from, briefPath, brief, loopx) =>
+const handoverMessage = (from, briefPath, brief, loopx, keptGoal = false) =>
   (loopx ? `/loopx 这是会话交接后的续接，不是新任务：原会话 ${from} 的 LoopX 绑定（goal ${loopx.goalId}，agent ${loopx.agentId}）已挪到本会话。` +
     '不要新建 LoopX 目标，也不要创建原生目标；先用 resolve-agent-thread 核对本会话的绑定。\n' : '') +
   `[codex-conductor 交接] 本会话接手会话 ${from} 的工作；原会话的目标已暂停，` +
@@ -322,7 +327,9 @@ const handoverMessage = (from, briefPath, brief, loopx) =>
   '先调 codex_summary（session_id="current"）和 codex_jobs 看详情：本会话现在可以查看、验收、续接、核验和取消原会话的任务。' +
   '工具的 job_id 参数只填交接单里的任务号；线程号只用于 codex_run 的 resume。' +
   '收尾规则照旧：先给列出的待收尾任务做 codex_review 或返工，再派新任务。' +
-  (loopx ? '本轮只核对绑定、读完交接单并处理待收尾任务，然后结束；之后由 LoopX 按待办续跑。' : '本会话若还没有目标，按交接单里的目标创建后继续推进。') +
+  (loopx ? '本轮只核对绑定、读完交接单并处理待收尾任务，然后结束；之后由 LoopX 按待办续跑。'
+    : keptGoal ? '原会话的目标是暂停或受阻状态，没有在本会话重建；不要自行创建或推进它，处理完待收尾任务后等用户指示。'
+    : '本会话若还没有目标，按交接单里的目标创建后继续推进。') +
   '\n\n' + brief;
 
 // LoopX 跟随交接：原会话绑着 LoopX 线程时，把绑定挪给继任会话。原生目标和 LoopX 都在推进的会话也挪：绑定留在已交接的会话上，
@@ -541,6 +548,7 @@ export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, 
   if (steps.successorGoal === 'loopx') checks.goal = 'skipped:loopx';
   else if (!hasGoal) checks.goal = 'skipped:no_goal';
   else if (steps.successorGoal === 'exists') checks.goal = 'skipped:successor_had_goal';
+  else if (steps.successorGoal?.startsWith('kept_')) checks.goal = 'skipped:goal_not_active';
   else {
     const created = goals?.get(agentB);
     const rounds = Number.isSafeInteger(goal.maxGoalRounds) ? Math.max(1, goal.maxGoalRounds - (goal.roundsStarted ?? 0)) : undefined;
@@ -655,7 +663,10 @@ export async function handOver(ctx, deps, request) {
         const agent = await agentOf(id);
         const goal = goals?.get(agent);
         if (want === 'pause' && goal?.phase === 'active') { goals.pause(agent, ref(goal)); result.steps[key] = 'paused'; }
-        else if (want === 'resume' && goal?.phase === 'paused') { goals.resume(agent, ref(goal)); result.steps[key] = 'resumed'; }
+        // 只恢复这次交接自己暂停的那个目标；用户暂停的不动（旧链接没有 goalPaused，照旧恢复）。
+        else if (want === 'resume' && goal?.phase === 'paused' && (!Object.hasOwn(link, 'goalPaused') || link.goalPaused === goal.id)) {
+          goals.resume(agent, ref(goal)); result.steps[key] = 'resumed';
+        }
         else result.steps[key] = goal ? `unchanged_${goal.phase}` : 'none';
       } catch (error) { result.steps[key] = `failed: ${error.message}`; }
     }
@@ -691,6 +702,9 @@ export async function handOver(ctx, deps, request) {
   // 带任务交接（withRunningJobs）：运行中的任务随交接转给继任，结束通知由插件转投；有回合在跑时仍然拒绝。
   if (!force && !withRunningJobs && running.length) return refuse('jobs_running', { running });
   const goal = goals?.get(agentA);
+  // 只重建原会话正在推进的目标：用户暂停或受阻的目标不在继任会话复活（自动交接自己刚暂停的那一版除外）。
+  const pursued = goal?.phase === 'active' || (goal?.phase === 'paused' && goal.id === request.pausedGoal?.id);
+  const keptGoal = Boolean(goal && !pursued && goal.phase !== 'complete');
   const header = agentA.session?.header ?? {};
   let to = request.to;
   let agentB;
@@ -736,7 +750,8 @@ export async function handOver(ctx, deps, request) {
     result.steps.instructions = 'written';
   } catch (error) { result.steps.instructions = `failed:${error?.message ?? error}`; }
   const brief = buildBrief({ from, to, at, cwd: header.cwd, goal, jobs, pending, since, note, origin, requestedAt,
-    autoContinue: result.steps.autoContinue, successorGoal: existingGoal && existingGoal.phase !== 'complete' ? 'exists' : undefined,
+    autoContinue: result.steps.autoContinue,
+    successorGoal: existingGoal && existingGoal.phase !== 'complete' ? 'exists' : keptGoal ? 'kept' : undefined,
     context: sessionContext(agentA.session?.log, { autoMessage, ...(contextDeadlineMs !== undefined ? { deadlineMs: contextDeadlineMs } : {}) }),
     instructionArchive: result.instructions, instructionError: result.instructions ? undefined : result.steps.instructions.slice(7),
     sessionRead: sessionRead() });
@@ -751,8 +766,9 @@ export async function handOver(ctx, deps, request) {
     try { goals.pause(agentA, ref(goals.get(agentA))); result.steps.predecessorGoal = 'paused'; }
     catch (error) { result.steps.predecessorGoal = `failed: ${error.message}`; }
   } else result.steps.predecessorGoal = goal ? `unchanged_${goal.phase}` : 'none';
-  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed), deliverWaitMs));
+  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal), deliverWaitMs));
   if (followed) result.steps.successorGoal = 'loopx';
+  else if (keptGoal) result.steps.successorGoal = `kept_${goal.phase}`;
   else if (goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
     try {
       const existing = goals.get(agentB);
@@ -769,7 +785,8 @@ export async function handOver(ctx, deps, request) {
       ...(placed.workspaceId ? { workspaceId: placed.workspaceId } : {}), ...(placed.pin === 'pinned' ? { pinned: true } : {}),
       ...(result.steps.autoContinue ? { autoContinue: result.steps.autoContinue } : {}),
       ...(Object.hasOwn(autoContinueStep, 'previous') ? { autoContinuePrevious: autoContinueStep.previous } : {}),
-      ...(followed ? { loopx: followed } : {}) });
+      ...(followed ? { loopx: followed } : {}),
+      goalPaused: pursued && (result.steps.predecessorGoal === 'paused' || goal.phase === 'paused') ? goal.id : null });
   } catch (error) { result.steps.linkNote = `failed: ${error.message}`; }
   // 首条消息没送达，或继任会话的目标没建起来：不留一个没有交接单或没有目标的“继任”，自动撤回一次（不带 force）。
   const broken = result.steps.delivered === 'failed' ? 'delivery_failed' : result.steps.successorGoal.startsWith('failed') ? 'successor_goal_failed' : '';
@@ -1048,7 +1065,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
             if (quiet) Object.assign(record, { open: 'ask', askedAt: at, askedMessages: value.messages });
           } else if (!quiet) giveUp(agent, record, paused, agent.status === 'idle' ? '有 Codex 任务在运行' : '会话又开始了新回合', agent.status !== 'idle');
           else {
-            submit({ sessionId: id, origin: step.origin, requestedAt: at });
+            submit({ sessionId: id, origin: step.origin, requestedAt: at, ...(paused ? { pausedGoal: { id: paused.id } } : {}) });
             if (step.origin === 'auto') record.autoAt = [...(record.autoAt ?? []).filter((t) => now() - Date.parse(t) < 24 * HOUR), at];
             Object.assign(record, { open: null, approved: null, pending: { requestedAt: at, ...(paused ? { goal: paused } : {}) } });
             logger?.info?.(`[codex-conductor] 会话 ${id} 已有 ${value.messages} 条消息，已提交交接请求（${step.origin}）。`);
