@@ -808,7 +808,7 @@ test('the panel covers the Gemini engine switches, the account pool and who ran 
   const view = (value, extra = {}) => text(Status({ status: { settings: value, runtime: service.status.runtime, ...extra } }));
   let shown = view(engine, { geminiAccount: { id: 'acc_1', alias: 'work' } });
   for (const value of ['新任务默认执行端： Gemini', '核验换另一引擎： 已关闭', 'Codex 失败转 Gemini： 已开启',
-    'Gemini 同时运行： 最多 2 单', 'Gemini 账号： 账号池：work']) assert.ok(shown.includes(value), value);
+    'Gemini 同时运行： 最多 2 单', 'Gemini 账号： pool.json 首选：work']) assert.ok(shown.includes(value), value);
   shown = view(engine, { geminiAccount: { error: 'DSH agy 账号池里没有可用账号' } });
   assert.ok(shown.includes('Gemini 账号： 账号池不可用') && shown.includes('没有可用账号'));
   assert.ok(view({ ...engine, gemini: { ...engine.gemini, accountPool: false } }).includes('Gemini 账号： 本机默认登录'));

@@ -327,8 +327,8 @@ window.__ModuleLoader__.load({
               statusRow('Codex 失败转 Gemini', activeSettings.geminiFallback ? '已开启' : '已关闭', '开启后 Codex 失败且确认没有写入文件时，自动交给 Gemini 接着做。'),
               statusRow('Gemini 同时运行', activeSettings.maxGeminiRunningJobs ? `最多 ${activeSettings.maxGeminiRunningJobs} 单` : '不限制', '同时在跑的 Gemini 任务超过这个数时，新任务排队。'),
               statusRow('Gemini 账号', !activeSettings.gemini.accountPool ? '本机默认登录' : status.geminiAccount?.error ? '账号池不可用'
-                : status.geminiAccount ? `账号池：${status.geminiAccount.alias || status.geminiAccount.id}` : '未读到',
-                activeSettings.gemini.accountPool ? '使用 DSH agy 插件账号池里当前可用的账号；续接原会话时回到原来的账号。' : '使用本机默认用户目录里登录的 agy 账号。'),
+                : status.geminiAccount ? `pool.json 首选：${status.geminiAccount.alias || status.geminiAccount.id}` : '未读到',
+                activeSettings.gemini.accountPool ? 'pool.json 里当前激活、可用的账号，只作参考：每单实际用哪个账号由 DSH 的 dsh-agy-link 在启动时租出；续接原会话时回到原来的账号。' : '使用本机默认用户目录里登录的 agy 账号。'),
               status.geminiAccount?.error ? h(Message, { error: true, text: status.geminiAccount.error }) : null) : null,
             statusRow('建议交接的会话', !status.history ? '未读到' : !status.history.threshold ? '提示已关闭'
               : status.history.sessions.filter((s) => s.suggest).map((s) => `${s.sessionId}（${s.messages} 条消息）`).join('、') || '暂无',
