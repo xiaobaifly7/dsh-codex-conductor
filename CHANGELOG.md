@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.148` `autoHandover.mode` 为 `auto` 时，回合一直不结束的会话也能自动交接：到了该交接的时候（条件与空闲时相同），插件在下一个没有新消息的模型步骤之前结束这一回合（宿主记为 `blocked`），会话转为空闲后照常交接。此前只在会话转为空闲时判定，而目标或 LoopX 续跑的一个回合可以跑好几个小时（11 月 22 日一个会话单回合跑了 7.5 小时，上下文一直在 19 万 token 以上），自动交接一直等不到时机。带着新消息的步骤不截断，宿主拒绝时会丢掉这些消息。另外，交接时只要原会话绑着 LoopX 线程就把绑定挪给继任会话，不再只看最近一轮续跑来自 LoopX 还是原生目标：重启后的自动恢复会让绑着 LoopX 的会话先跑原生目标轮，绑定于是留在已交接的会话上，交接 3 秒后 LoopX 又把它拉起来空跑了一个回合。
+
 `0.9.147` Gemini 主机只读任务（含核验）设置 `PYTHONDONTWRITEBYTECODE=1` 和 `PYTEST_ADDOPTS=-p no:cacheprovider`，并经 WSLENV 传给它通过 `wsl.exe` 运行的命令：此前核验中运行 Python 会在项目里留下字节码和测试缓存，87 单 Gemini 核验里 3 单因此判为 `verification_tree_changed`（Codex 核验本来就设置这两项，307 单为 0）。
 
 `0.9.146` 热重载后，被替换的旧插件实例不再自动派核验或 Gemini 接替：它的等待循环仍会收到任务结果，此前会按过时的配置派单（2026-11-22 配置改回 Gemini Neon Medium 后，旧实例仍按 High 自动派了一单核验）。这些核验由当前实例的补扫接上（加载时，以及各会话下一次调用工具时）。
@@ -191,6 +193,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.148` With `autoHandover.mode` set to `auto`, a session whose turn never ends is handed over too: once a hand-over is due (under the same conditions as at idle), the plugin ends the turn before its next model step that carries no new messages (the host records `blocked`), and the hand-over runs when the session turns idle. The decision used to run only at the idle edge, while a goal or LoopX turn can run for hours (on 2026-11-22 one turn ran 7.5 hours with every request above 190k context tokens), so the automatic hand-over never got its moment. A step that carries new messages is never cut, since the host drops a rejected step's messages. A hand-over also moves the LoopX thread binding whenever the predecessor is bound, instead of only when its latest loop turn came from LoopX: after a restart, auto-resume runs a native goal round in a LoopX-bound session, the binding stayed on the retired session, and LoopX woke it again 3 seconds after the hand-over for a wasted turn.
 
 `0.9.147` Gemini host read-only jobs (verifications included) set `PYTHONDONTWRITEBYTECODE=1` and `PYTEST_ADDOPTS=-p no:cacheprovider`, passed through WSLENV to the commands they run via `wsl.exe`. Python bytecode and test caches written into the project made 3 of 87 Gemini verifications fail as `verification_tree_changed`; Codex verifications already set both (0 of 307).
 

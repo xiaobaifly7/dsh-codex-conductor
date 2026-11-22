@@ -6211,6 +6211,21 @@ test('a session turning idle runs the auto hand-over check: confirm asks once, o
   assert.equal(state()['session-wire-busy'].open, 'remind', 'a running Codex job only leaves a reminder, never a question');
 });
 
+test('a turn that never ends is cut at a step boundary once an automatic hand-over is due, never on a step that carries new messages', async () => {
+  const agent = { id: 'session-wire-long', status: 'running', session: { header: { cwd: '/work/w' },
+    log: [{ type: 'user/message' }, { type: 'assistant/message' }, { type: 'tool/result' }] } };
+  const user = { id: 'u1', role: 'user', content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } };
+  const step = (h, messages) => h.handlers['agent/pre-step']({ agent, messages, step: 7, signal: new AbortController().signal },
+    async () => ({ kind: 'enter', messages: [...messages] }));
+  const auto = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'auto', startupDelayMinutes: 0 } } });
+  assert.deepEqual(await step(auto, []), { kind: 'reject' });
+  assert.equal((await step(auto, [user])).kind, 'enter', 'a step with new messages is never rejected: the host would drop them');
+  const confirm = harness({ config: { handoverSuggestMessages: 2, autoHandover: { mode: 'confirm', startupDelayMinutes: 0 } } });
+  assert.equal((await step(confirm, [])).kind, 'enter', 'asking still waits for the session to stop by itself');
+  const small = harness({ config: { handoverSuggestMessages: 5, autoHandover: { mode: 'auto', startupDelayMinutes: 0 } } });
+  assert.equal((await step(small, [])).kind, 'enter');
+});
+
 test('a handed-over session gets one notice before the first step of each user message, and the refusal names the successor', async (t) => {
   const { createAliases } = await import('./handover.mjs');
   const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
