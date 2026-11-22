@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.156` 新增按会话的直接执行模式：在会话里输入 `/conductor direct on`，这个会话的 DeepSeek 不再受护栏限制，也不注入规划要求，可以自己读写文件、运行命令，派 Codex / Gemini 的工具照样可用；`/conductor direct off` 恢复只做规划，`/conductor direct status` 查看。设置记在状态目录，重启后保持，交接出的继任会话沿用；其他会话不受影响。
+
 `0.9.155` 修正 Gemini 写任务的“范围外改动”误报：Windows 上的 agy 报的是 `X:\` 路径，runner 在 WSL 里没有换算，scope 内的文件也全被算成范围外，规划端复核时只能逐条写接受理由（2026-11-22 被驳回最多的 4 单共 37 条都是这种误报）。新任务记录换算后保存，旧记录在查询时换算。派写任务时，同一目录已有写任务在跑或排队，回执会说明前面排着几单、会串行执行，提醒合并改动或等前一单结束再派（当天有 20 单等写锁超过 60 秒，最长 37 分钟）。执行端锁定 Gemini 时，Gemini 因额度或账号无法执行的回执不再建议改传 `engine: "codex"`（锁定下不生效），改为先停下向用户说明、恢复后续接。
 
 `0.9.154` `codex_jobs` 的列表变短：每个任务不再带完整核验记录（只留 `verification_status` 和 `verification_reviewer`）、值为空的字段、agy 账号目录和派单的 git revision；这类数据工具（`codex_jobs`、`codex_output`、`codex_watch`）的结果改为不缩进的 JSON。11 月 22 日三个规划会话里，核验记录约占列表的四成，一页 10–20 单常到 3–5 万字、撞上 5 万字的输出上限；按当天的 14 页实测，同样内容缩短 62%。规划端每次查列表，整页都留在上下文里直到被压缩。核验明细仍可用 `codex_status` 或 `codex_output`（`artifact: "review"`）读取。
@@ -207,6 +209,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.156` Adds a per-session direct mode: `/conductor direct on` in a session lifts the guard and drops the planner requirements from its system prompt, so DeepSeek reads, writes and runs commands itself, with the Codex / Gemini tools still available; `/conductor direct off` returns it to planning and `/conductor direct status` shows the mode. The setting is kept in the state directory across restarts and carries over to a hand-over successor; other sessions are unaffected.
 
 `0.9.155` Fixes false "out of scope" changes on Gemini write jobs: agy on Windows reports `X:\` paths, which the runner in WSL did not map, so files inside the scope were listed as outside it and every review had to accept each one (the 4 most rejected jobs on 2026-11-22 carried 37 such items). New records store mapped paths and older ones are mapped when queried. A write dispatch now says when writers in the same directory are already running or queued: it will run after them, so merge the changes or wait (that day 20 jobs waited over 60 seconds for the write lock, the longest 37 minutes). With the executor locked to Gemini, a provider failure (quota or account) no longer suggests `engine: "codex"`, which the lock ignores; it says to stop, tell the user and continue once Gemini recovers.
 

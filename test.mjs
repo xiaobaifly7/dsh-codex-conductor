@@ -1265,7 +1265,7 @@ test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissi
 });
 
 // 用假的 runner 和假的 jobs 服务装上插件；后台循环的 `status --wait 20` 由测试逐个应答
-function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGemini, plugin = apply } = {}) {
+function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGemini, plugin = apply, services = {} } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -1306,7 +1306,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   const ctx = { tools: { register: (t) => { tools[t.name] = t; }, guard: (g) => guards.push(g) },
     on: (ev, fn) => { const outer = ev === 'agent/pre-step' && handlers[ev]; handlers[ev] = outer ? (arg, next) => outer(arg, (...rest) => fn(arg, next, ...rest)) : fn; },
     logger: { warn: (text) => warnings.push(text) },
-    ...(get ? { get: (key) => ({ jobs, agents, sessionQuery })[key] } : {}) };
+    ...(get ? { get: (key) => ({ jobs, agents, sessionQuery, ...services })[key] } : {}) };
   // 收尾护栏会多一次 list 调用；只有专门测它的用例才打开。
   plugin(ctx, { workspaces: ['F:\\work\\项目'], closeoutGuard: false, autoVerify: 'off', continueFreshAboveTokens: 0, ...pluginConfig }, run, launchGemini);
   const answer = async (job, value) => {
@@ -3528,6 +3528,48 @@ test('the planner prompt file starts as a template and is injected as a system p
   assert.doesNotThrow(() => apply({ ...base, get: () => ({ section() { throw new Error('already registered'); } }) },
     { workspaces: [], plannerPromptFile: file }));
   assert.ok(tools.codex_run && tools.codex_status && tools.codex_cancel);
+});
+
+test('/conductor direct on lets one session work by itself, kept across reloads and hand-overs', async (t) => {
+  const root = mkdtempSync(path.join(tmpdir(), 'direct-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const plannerPromptFile = path.join(root, 'planner-prompt.md');
+  writeFileSync(plannerPromptFile, '只做规划，派给 Codex。');
+  const load = () => {
+    const sections = [], commands = {};
+    const h = harness({ config: { workspaces: ['*'], stateDir: root, plannerPromptFile, plannerReads: 'products' },
+      services: { systemPrompt: { section: (s) => sections.push(s) }, commands: { register: (c) => { commands[c.name] = c; } } } });
+    return { h, command: (id, rawInput) => commands.conductor.handler({ agent: { id }, rawInput }),
+      planner: (id) => sections[0].text({ scope: { id } }) };
+  };
+  const as = (id, exec) => ({ ...exec, agent: { ...agentAt('F:\\work'), id } });
+  const write = { name: 'write', arguments: { path: 'F:\\work\\a.txt', content: 'x' } };
+  const read = { name: 'read', arguments: { path: 'F:\\work\\raw.txt' } };
+  const success = { isError: false, value: {}, content: [] };
+  let { h, command, planner } = load();
+  assert.match(hostGuardReason(h, as('S1', write)), /codex-conductor/);
+  assert.match(planner('S1'), /只做规划/);
+  assert.match(command('S1', 'direct').text, /规划/);
+  assert.match(command('S1', 'direct on').text, /直接执行/);
+  assert.equal(hostGuardReason(h, as('S1', write)), undefined);
+  assert.equal(await hostExecute(h, as('S1', read), async () => success), success);
+  assert.equal(planner('S1'), '');
+  // Other sessions keep planning.
+  assert.match(hostGuardReason(h, as('S2', write)), /codex-conductor/);
+  assert.equal((await hostExecute(h, as('S2', read), async () => success)).isError, true);
+  assert.match(planner('S2'), /只做规划/);
+  assert.match(command('S1', 'what').text, /用法/);
+  assert.equal(command('', 'direct on').kind, 'error');
+  // Kept across a reload, and a hand-over successor inherits it; off clears the whole chain.
+  const { createAliases } = await import('./handover.mjs');
+  createAliases(root).link('S1', 'S3', {});
+  ({ h, command, planner } = load());
+  assert.equal(planner('S1'), '');
+  assert.equal(planner('S3'), '');
+  assert.equal(hostGuardReason(h, as('S3', write)), undefined);
+  assert.match(command('S3', 'direct off').text, /规划/);
+  assert.match(planner('S1'), /只做规划/);
+  assert.match(hostGuardReason(h, as('S3', write)), /codex-conductor/);
 });
 
 test('a completed codex_run reminds the planner of the requirements only when some are set', async (t) => {
