@@ -146,6 +146,19 @@ class AdapterTests(unittest.TestCase):
                              "agy rejected a CLI argument: flag provided but not defined: -json-schema")
 
     @unittest.skipIf(os.name == "nt", "exercises the Linux fake executable path")
+    def test_plan_mode_notice_does_not_replace_the_exit_failure(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            fake = Path(run_dir) / "fake-agy"
+            fake.write_text("#!/bin/sh\nprintf '%s\\n' 'warning: --mode plan has no effect while slash command expansion "
+                            "is disabled.' >&2\nexit 1\n")
+            fake.chmod(0o700)
+            command, env = agy_runner.build_command(args(run_dir, agy_command=fake), run_dir, None)
+            self.assertEqual(command[command.index("--mode") + 1], "plan")
+            child = subprocess.run(command, env=env, input=b"example", capture_output=True, timeout=5)
+            self.assertEqual(child.returncode, 1)
+            self.assertEqual(json.loads(child.stdout)["error"], "agy process exited with code 1")
+
+    @unittest.skipIf(os.name == "nt", "exercises the Linux fake executable path")
     def test_linux_fake_preserves_prompt_and_overrides_success_on_stderr_denial(self):
         with tempfile.TemporaryDirectory() as run_dir:
             fake = Path(run_dir) / "fake-agy"

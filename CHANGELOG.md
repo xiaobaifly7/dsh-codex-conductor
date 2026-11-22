@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.152` 核验只做一层：`codex_review` 和 `codex_verify` 不再接受核验任务（`verify_previous` 同样），回执指向原任务（旧版留下的多层核验链会沿链找到原任务）；核验任务的报告本来就自动算作原任务的独立依据，更深的核验并不算数。2026-11-22 有一单被这样套了 13 层、约 3.5 小时。核验结束的回执也写明要复核的原任务编号。产物读取在缓存未命中时最多等 15 秒（原 3 秒）：runner 的 products 查询实测要 3.9–9.7 秒，当天误拒了 22 次读取。Gemini 只读任务的 agy 会打印一行「`--mode plan` 不生效」的警告，这行警告曾是 stderr 里唯一的一行，盖掉了两单「agy 没给结果就退出」的失败，现在不再当作错误信息。这个参数仍然保留：实测去掉后只读任务能写进项目和项目外的文件，带上时两处写入都被拒。
+
 `0.9.151` Gemini 主机只读任务（含核验）在知道账号目录时，放行写入 agy 自己的数据目录（`<账号目录>/.gemini/antigravity-cli`，plan 模式把计划和临时脚本放在这里）。原先一律禁止写入，而禁止规则优先于放行规则，2026-11-22 有一单核验因为在这里写临时脚本被判为 `permission_denied`。项目和其他位置的写入仍会被 agy 自动拒绝，并照旧报 `permission_denied`。
 
 `0.9.150` 插件被热加载过之后，交接时关掉原会话“自动继续”那一步不再总是失败。宿主 HMR 用 AsyncLocalStorage 标记“正处在一次重载事务里”，带着这个标记的调用一律被拒为“HMR transactions cannot be nested”。插件热加载时建的请求监视器继承了那次事务的上下文，所以此后每次交接写设置都被拒，原会话的自动继续关不掉，自检 `predecessorFrozen` 失败。0.9.144 把它当成“前几步的事务还没结束”加了重试，其实重试多少次都一样，这次去掉；改为写设置前先用宿主的 `hmr.executing.exit()` 跳出继承的上下文，和宿主自己的配置监视器一样。11 月 22 日在桌面版上实测：热加载后的自动交接仍报这个错。
@@ -199,6 +201,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.152` Verification is one level deep: `codex_review` and `codex_verify` (and `verify_previous`) refuse a verification job and point at the original task, following chains an older version left behind. A verification report already counts as independent evidence for the original task, and deeper verifications never counted; on 2026-11-22 one task was verified 13 levels deep over about 3.5 hours. The receipt for a finished verification now names the original task to record. A product read waits up to 15 seconds for the registry on a cache miss (was 3): the runner products query measured 3.9–9.7 seconds and 22 reads were wrongly refused that day. The warning agy prints for every Gemini read-only job (`--mode plan` "has no effect") no longer becomes the error text: as the only stderr line it hid that two failed jobs had exited without a result. The flag stays: measured without it, a read-only job wrote into the project and outside it; with it both writes were denied.
 
 `0.9.151` Gemini host read-only jobs (verifications included) may write into agy's own data directory (`<account home>/.gemini/antigravity-cli`, where plan mode keeps its plan and scratch scripts) when the account home is known. They used to deny every write, and a deny rule beats any allow rule, so on 2026-11-22 a verification that wrote a scratch script there failed as `permission_denied`. Writes anywhere else, the project included, are still auto-denied by agy and reported as `permission_denied`.
 

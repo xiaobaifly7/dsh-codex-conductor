@@ -33,7 +33,7 @@ function sourceJob() {
     structured: { ...report(), files_changed: ['docs/result.md'] } };
 }
 
-function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {}, disposers } = {}) {
+function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {}, disposers, others = {} } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -52,6 +52,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
       return running ? { job_id: 'VERIFY-1', status: 'running' } : final();
     }
     if (argv[0] === 'status' && argv[1] === 'SOURCE-1') return structuredClone(source);
+    if (argv[0] === 'status' && others[argv[1]]) return structuredClone(others[argv[1]]);
     if (argv[0] === 'status' && argv[1] === 'VERIFY-1') {
       if (!running || backgroundFinished) return final();
       if (argv[3] === '20') return new Promise(resolve => {
@@ -717,6 +718,24 @@ test('verification reuses background registration, result processing and status/
   assert.equal(h.calls.filter(call => call.argv[0] === 'start').length, 1);
   assert.equal(jobs.read(job.id, exec.agent.id).result, done.result);
   assert.equal(jobs.read(job.id, exec.agent.id).result, undefined);
+});
+
+test('verification jobs are neither reviewed nor verified again; the refusal names the original task', async () => {
+  // SOURCE-1 verifies MID-1, which an older version let verify ROOT-1: the refusal follows the chain to ROOT-1.
+  const source = sourceJob();
+  source.context.verification_of = 'MID-1';
+  const mid = sourceJob();
+  Object.assign(mid, { job_id: 'MID-1' }).context.verification_of = 'ROOT-1';
+  const h = harness({ source, others: { 'MID-1': mid, 'ROOT-1': { ...sourceJob(), job_id: 'ROOT-1' } } });
+  await assert.rejects(h.verify(), /codex_verify: SOURCE-1 是核验任务（核验对象 MID-1）.*codex_review 记录原任务 ROOT-1.*对 ROOT-1 再派 codex_verify/);
+  await assert.rejects(h.tools.codex_review.execute({ job_id: 'SOURCE-1', status: 'verified', criteria: [] }, exec),
+    /codex_review: SOURCE-1 是核验任务.*原任务 ROOT-1/);
+  await assert.rejects(h.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false, verify_previous: 'SOURCE-1' }, exec),
+    /SOURCE-1 是核验任务.*原任务 ROOT-1.*未派出这一单/);
+  assert.deepEqual(h.calls.filter(call => ['start', 'review'].includes(call.argv[0])), []);
+  // The completion receipt of a verification names the original task to record.
+  assert.match(nextStep({ ...sourceJob(), job_id: 'VERIFY-1', report: report(), context: { ...sourceJob().context, verification_of: 'ROOT-1' } }),
+    /codex_review 记录原任务 ROOT-1（核验任务本身不复核、不再核验）/);
 });
 
 test('open nextStep remains the default; products points mechanical checks to codex_verify', async () => {
