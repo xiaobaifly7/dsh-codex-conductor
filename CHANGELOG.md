@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.164` 核验前后的仓库快照先算 scope 内的部分，再算整个仓库的 git status。整仓状态只用来提示“scope 外有变化”，现在放在最后、在预算结束前 2 秒放弃；放弃时 scope 内的检查照常生效，结果里记 verification_outside_scope: unchecked。以前整仓状态排在最前面：在 /mnt 下、未跟踪文件很多的仓库里，光这一步就要 39 秒，把 30 秒预算用光，整个完整性检查都记成 unavailable（某个会话今天有 6 次）。现在同一个仓库 28 秒就能完成 scope 内的检查。
+
 `0.9.163` 核验因“只是被其他进程追加了内容”而放行时，结果里多一个 verification_append_check 字段：hash 表示核对了原有内容的哈希，size 表示项目里改动的文件太多、只核对了文件变大。只按大小判的那一单，回执会说明没有逐字核对原有内容。
 
 `0.9.162` 核验期间 Git 状态、tree 和索引都没变，唯一的变化是给核验前就已改动、位于 scope 目录下、既不是原任务产物也没在 scope 里点名的文件追加内容时，这次核验照常完成，只标 concurrent_changes，回执列出这些文件，并说明按其他进程写入处理。“追加”的判定是：文件变大，并且核验开始时那部分内容的哈希没变。如果项目里有改动的文件太多、开始时只记了大小，就只能看文件是否变大。原地改写、产物文件、scope 里点名的文件、新增或删除的文件，以及 HEAD 或索引的变化，仍按 verification_tree_changed 判失败。0.9.161 记下的文件名显示，一个会话连续三次核验失败，都是因为项目里常驻的 console watcher 在往 scope 目录 10-audit 下的日志里追加内容，只要 watcher 在跑，这些核验就一定失败，任务也就收不了尾。
@@ -223,6 +225,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.164` The repository snapshot around a verification now computes the scoped part first and the whole-repository git status last. The whole status only feeds the outside-the-scope warning, so it gives up 2 s before the budget ends; the scoped check still holds and the result records verification_outside_scope: unchecked. It used to run first, and on a /mnt repository with many untracked files it took 39 s alone, used up the 30 s budget and left the whole integrity check unavailable (6 times in one session today). The same repository now gets its scoped check in 28 s.
 
 `0.9.163` A verification passed because files were only appended to by another process now records verification_append_check: hash when their earlier bytes were checked, size when the project had too many dirty files to hash and only their growth was checked. For size-only passes the receipt says the earlier content was not compared.
 

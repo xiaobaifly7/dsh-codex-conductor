@@ -1832,10 +1832,10 @@ def git(cwd, *argv, deadline, env=None, program="git"):
 
 def git_on_tree(cwd, deadline, operation, *, raise_errors=False):
     def run(directory, program):
-        def query(*argv, at=directory):
+        def query(*argv, at=directory, until=None):
             if time.monotonic() >= deadline:
                 raise subprocess.TimeoutExpired(argv, 0)
-            return git(at, *argv, deadline=deadline, program=program)
+            return git(at, *argv, deadline=min(deadline, until or deadline), program=program)
         result = operation(query)
         if time.monotonic() >= deadline:
             raise subprocess.TimeoutExpired(program, 0)
@@ -1987,22 +1987,27 @@ def verification_git_digest(cwd, paths, *, budget=30, strict=False):
 
     def digest(query):
         head = query("rev-parse", "--verify", "HEAD")
-        whole = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS)).digest()
         top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
         directory = Path(local_path(top))
         root = Path(normalized_path(str(directory)))
         relative = sorted({Path(*Path(path).parts[len(root.parts):]).as_posix()
                            for path in paths if Path(normalized_path(path)).is_relative_to(root)})
         if not relative:
-            return whole, None, set()
+            return None, None, set()
         tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
         index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
                       "HEAD", "--", *relative, at=top)
         scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
         if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
-            return whole, None, set()
+            return None, None, set()
         hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)
         checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
+        # Whole-repository status only feeds the outside-the-scope warning, so it runs last and may give up: on a /mnt
+        # repository with many untracked files it took 39 s alone and timed the scoped check out with it (2026-11-23).
+        whole = None
+        if not strict:
+            with suppress(subprocess.TimeoutExpired):
+                whole = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS, until=deadline - 2)).digest()
         return whole, (checksum, hashes), unchecked
 
     return git_on_tree(cwd, deadline, digest, raise_errors=True)
@@ -2366,8 +2371,10 @@ def execute(args, prompt, run_dir):
                 result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
                               error="Git status, index or file contents changed within the monitored verification paths.",
                               verification_changed_paths=changed[:20], verification_changed_total=len(changed))
-            elif before_whole != after_whole or scope_changed:
+            elif scope_changed or None not in (before_whole, after_whole) and before_whole != after_whole:
                 result["verification_integrity"] = "concurrent_changes"
+            if None in (before_whole, after_whole):
+                result["verification_outside_scope"] = "unchecked"
         return result
 
     repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
