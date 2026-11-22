@@ -325,18 +325,10 @@ const handoverMessage = (from, briefPath, brief, loopx) =>
   (loopx ? '本轮只核对绑定、读完交接单并处理待收尾任务，然后结束；之后由 LoopX 按待办续跑。' : '本会话若还没有目标，按交接单里的目标创建后继续推进。') +
   '\n\n' + brief;
 
-// LoopX 跟随交接：原会话最近由 LoopX 续跑（而不是原生目标循环）时，把它的线程绑定挪给继任会话。
+// LoopX 跟随交接：原会话绑着 LoopX 线程时，把绑定挪给继任会话。原生目标和 LoopX 都在推进的会话也挪：绑定留在已交接的会话上，
+// LoopX 会接着唤醒它（11-22 一次交接后 3 秒原会话就被 LoopX 拉起，空跑了一个回合）。
 // loopx(args, cwd) 运行 LoopX CLI 并返回解析后的 JSON，失败时抛出。这里的任何失败都只记在步骤里，不影响交接。
 const LOOPX_HOST = 'deepseek-harness-native';
-export function loopxDriven(log) {
-  for (let i = (log?.length ?? 0) - 1; i >= 0; i--) {
-    const kind = log[i]?.type === 'user/message' ? log[i].data?.source?.kind : undefined;
-    if (kind === 'loopx-continuation') return true;
-    if (kind === 'goal') return false;
-  }
-  return false;
-}
-
 export async function moveLoopxBinding(loopx, cwd, from, to) {
   const thread = (id) => ['--host-surface', LOOPX_HOST, '--thread-id', id];
   const run = async (args) => {
@@ -733,8 +725,8 @@ export async function handOver(ctx, deps, request) {
   if (!request.to) result.steps.title = await renameSuccessor(controller, to, successorTitle(from, titleOf(agentA)));
   const autoContinueStep = turnOffAutoContinue ? await disableAutoContinue(autoContinue, from) : {};
   if (autoContinueStep.autoContinue) result.steps.autoContinue = autoContinueStep.autoContinue;
-  // 原会话由 LoopX 续跑：绑定随交接挪给继任会话，继任会话由 LoopX 接着跑，不重建原生目标。
-  const follow = loopx && loopxDriven(agentA.session?.log) ? await moveLoopxBinding(loopx, header.cwd, from, to) : undefined;
+  // 原会话绑着 LoopX：绑定随交接挪给继任会话，继任会话由 LoopX 接着跑，不重建原生目标。
+  const follow = loopx ? await moveLoopxBinding(loopx, header.cwd, from, to) : undefined;
   if (follow) result.steps.loopx = follow.loopx;
   const followed = follow?.loopx === 'moved' ? { goalId: follow.goalId, agentId: follow.agentId } : undefined;
   const pending = pendingOf(jobs);
@@ -1073,6 +1065,13 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       }
       if (changed) save(id, record);
       return step;
+    },
+    // 回合一直不结束的会话（目标或 LoopX 续跑一个回合可以跑好几个小时）等不到空闲：此刻若空闲就会自动交接时返回 true，
+    // 由调用方在步骤边界结束这一回合，转为空闲后照上面的流程交接。只看自动交接，询问仍等会话自己停下。
+    due(agent, value) {
+      const id = agent?.id;
+      if (!file || !value?.suggest || !validSessionId(id) || checking.has(id) || agent.session?.header?.origin === 'subagent') return false;
+      return decision(id, value, read(), true).act === 'auto';
     },
     // 交接请求处理完：没成就恢复提前暂停的目标并进入重试冷却。
     settled(result) {

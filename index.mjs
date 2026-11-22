@@ -110,7 +110,7 @@ const DEFAULTS = {
   autoVerifySkipQuestions: true,
   // codex_continue（不带 answers）续接的原线程上一次请求超过这么多输入 token 时，改开新线程并附上轮交接内容；0 总是沿用原线程
   continueFreshAboveTokens: 100000,
-  // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接
+  // 标记建议交接之后怎么办：off 只标记；notify 面板提醒；confirm 空闲时在面板询问；auto 空闲时直接交接，回合一直不结束时在步骤边界结束它再交接
   autoHandover: AUTO_HANDOVER_DEFAULTS,
   autoAnswer: AUTO_ANSWER_DEFAULTS,
   maxSessionTokens: null,
@@ -4141,10 +4141,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   for (const agent of ctx.get?.('agents')?.list?.() ?? []) recoverAgent(agent);
   // 已交接出去的会话不再被任务通知唤醒，由后继会话查询这些任务。
   registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox, retired: (id) => Boolean(aliases.successor(id)) });
-  // 会话回到空闲时按 autoHandover 判定是否提醒、询问或自动交接；从不在回合进行中动手。
+  // 会话回到空闲时按 autoHandover 判定是否提醒、询问或自动交接。
   ctx.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle') return;
     try { void autoHandover.observe(agent, history.observe(agent)).catch(() => {}); } catch {}
+  });
+  // 一跑几个小时不结束的回合等不到空闲：到了该自动交接的时候，在下一个模型步骤之前结束回合（宿主记为 blocked），
+  // 会话转为空闲后由上面那个处理函数交接。带着新消息的步骤不拦：宿主拒绝时会丢掉这一步认领的消息。
+  ctx.on('agent/pre-step', async (step, next) => {
+    try {
+      if (!step.messages?.length && autoHandover.due(step.agent, history.observe(step.agent))) {
+        ctx.logger?.info?.(`[codex-conductor] 会话 ${step.agent.id} 的回合一直没有结束，已在第 ${step.step} 步之前结束它，转为空闲后自动交接。`);
+        return { kind: 'reject' };
+      }
+    } catch {}
+    return next();
   });
   // 交接出去的会话收到 Codex 任务结束通知时转给继任会话，前任这一回合不调用模型就结束。
   ctx.on('agent/pre-step', async (step, next) => {
@@ -4426,7 +4437,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 交接单里“最近的用户指令”排除重启续接的固定话术；有 session_read 工具时写上回看旧会话的用法。
       autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')),
       workspaces, onResult: (result) => autoHandover.settled(result), withRunningJobs: cfg.autoHandover.withRunningJobs,
-      // 由 LoopX 续跑的会话：交接时把 LoopX 的线程绑定挪给继任会话。只在会话日志里有 LoopX 续跑消息时才调用；没装 loopx 时调用失败，交接照常。
+      // 绑着 LoopX 线程的会话：交接时把绑定挪给继任会话。每次交接都先查绑定；没装 loopx 时调用失败，交接照常。
       loopx: (args, cwd) => new Promise((resolve, reject) => {
         execFile(process.env.LOOPX_BIN || 'loopx', ['--registry', '.loopx/registry.json', '--format', 'json', ...args],
           { cwd, timeout: 30_000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
