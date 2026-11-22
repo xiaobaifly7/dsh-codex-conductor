@@ -69,6 +69,19 @@ class AdapterTests(unittest.TestCase):
             self.assertFalse(settings["allowNonWorkspaceAccess"])
             self.assertIn("command(*)", settings["permissions"]["deny"])
 
+    def test_host_read_only_jobs_keep_python_caches_out_of_the_project(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            def env_of(**overrides):
+                return agy_runner.build_command(args(r"D:\local project", agy_command=r"C:\tools\agy.exe", **overrides),
+                                                run_dir, None)[1]
+
+            env = env_of(sandbox="danger-full-access", context={"write": False, "verification_of": "job-1"})
+            self.assertEqual((env["PYTHONDONTWRITEBYTECODE"], env["PYTEST_ADDOPTS"]), ("1", "-p no:cacheprovider"))
+            if os.name != "nt":
+                self.assertTrue({"PYTHONDONTWRITEBYTECODE", "PYTEST_ADDOPTS"} <= set(env["WSLENV"].split(":")))
+            # A writer keeps its caches: it may be meant to produce them.
+            self.assertNotEqual(env_of(sandbox="danger-full-access").get("PYTEST_ADDOPTS"), "-p no:cacheprovider")
+
     def test_unrepresentable_paths_and_sandbox_fail_closed(self):
         with tempfile.TemporaryDirectory() as run_dir:
             for overrides, error in [

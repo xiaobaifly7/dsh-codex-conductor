@@ -151,6 +151,12 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         home = _windows_path(args.agy_home) if windows else os.path.realpath(args.agy_home)
         env["HOME"] = env["USERPROFILE"] = home
         exported.extend(("HOME", "USERPROFILE"))
+    if host and readonly:
+        # Python bytecode and pytest caches written into the project failed 3 of 87 Gemini verifications as
+        # verification_tree_changed (none of 307 Codex ones, which set the same two variables). Plain values, so
+        # WSLENV also carries them into the commands Gemini runs through wsl.exe.
+        env.update(PYTHONDONTWRITEBYTECODE="1", PYTEST_ADDOPTS="-p no:cacheprovider")
+        exported.extend(("PYTHONDONTWRITEBYTECODE", "PYTEST_ADDOPTS"))
     if scratch is not None:
         tmp = Path(scratch) / "tmp"
         temp = _windows_path(tmp) if windows else str(tmp.resolve())

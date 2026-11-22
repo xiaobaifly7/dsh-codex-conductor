@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.147` Gemini 主机只读任务（含核验）设置 `PYTHONDONTWRITEBYTECODE=1` 和 `PYTEST_ADDOPTS=-p no:cacheprovider`，并经 WSLENV 传给它通过 `wsl.exe` 运行的命令：此前核验中运行 Python 会在项目里留下字节码和测试缓存，87 单 Gemini 核验里 3 单因此判为 `verification_tree_changed`（Codex 核验本来就设置这两项，307 单为 0）。
+
 `0.9.146` 热重载后，被替换的旧插件实例不再自动派核验或 Gemini 接替：它的等待循环仍会收到任务结果，此前会按过时的配置派单（2026-11-22 配置改回 Gemini Neon Medium 后，旧实例仍按 High 自动派了一单核验）。这些核验由当前实例的补扫接上（加载时，以及各会话下一次调用工具时）。
 
 `0.9.145` 新增 `handoverContextTokens`（默认 0 关闭）：会话最近 20 次请求的上下文（输入加缓存命中 token）都不低于这个值时，也标记“建议交接”，`autoHandover` 按原有规则处理，继任会话不必先涨满消息阈值。按消息数判断会漏掉这种会话：11 月 22 日 DeepSeek 规划端的有效上限是 30 万 token，强制压缩线在 24 万，一个 2400 条消息的会话压到底仍有 22 万，此后每涨几千就被强制压缩一次（每小时约 15 次）；另一个只有 776 条消息的会话，压完也已有 15 万。`history-status.json` 的会话记录多了 `floor`。
@@ -189,6 +191,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.147` Gemini host read-only jobs (verifications included) set `PYTHONDONTWRITEBYTECODE=1` and `PYTEST_ADDOPTS=-p no:cacheprovider`, passed through WSLENV to the commands they run via `wsl.exe`. Python bytecode and test caches written into the project made 3 of 87 Gemini verifications fail as `verification_tree_changed`; Codex verifications already set both (0 of 307).
 
 `0.9.146` After a hot reload, the replaced plugin instance no longer starts automatic verifications or Gemini takeovers: its wait loops still receive job results and used to dispatch on its stale configuration (after the Gemini model was set back to Neon Medium on 2026-11-22, the old instance still auto-verified one job on High). The current instance's catch-up scan picks these up, on load and on each session's next tool call.
 
