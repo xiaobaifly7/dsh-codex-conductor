@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.158` `/conductor` 命令只认开关词：`/conductor on`、`/conductor off`、`/conductor status` 即可，中间写不写 `direct`、拼错（手机自动纠错打成 `diret`）都不影响，也认“开”“关”“状态”。回执去掉了界面不渲染的 `**`。
+
 `0.9.157` 长对话中途切换模式更可靠：`/conductor direct on|off` 之后的下一条用户消息会附一条说明，告诉 DeepSeek 模式已经切换、前面的做法不再适用（只附一次）；直接执行模式下系统提示词不再只是去掉规划要求，而是写明“本会话为直接执行模式”。实测中，聊过几轮后关掉直接执行，DeepSeek 仍照前面的回答说自己还在直接执行，系统提示词其实已经恢复。
 
 `0.9.156` 新增按会话的直接执行模式：在会话里输入 `/conductor direct on`，这个会话的 DeepSeek 不再受护栏限制，也不注入规划要求，可以自己读写文件、运行命令，派 Codex / Gemini 的工具照样可用；`/conductor direct off` 恢复只做规划，`/conductor direct status` 查看。设置记在状态目录，重启后保持，交接出的继任会话沿用；其他会话不受影响。
@@ -211,6 +213,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.158` `/conductor` only looks for the switch word: `/conductor on`, `/conductor off` and `/conductor status` work, with or without `direct` and with a misspelled middle word (phone autocorrect typed `diret`); 开, 关 and 状态 work too. Receipts drop the `**` the client showed literally.
 
 `0.9.157` Switching modes in the middle of a long conversation is reliable: after `/conductor direct on|off` the next user message carries one notice telling DeepSeek the mode changed and the earlier habit no longer applies, and in direct mode the system prompt states the mode instead of only dropping the planner requirements. Measured before this change, DeepSeek kept repeating its earlier answer after the switch although its system prompt had already changed.
 

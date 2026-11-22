@@ -1558,7 +1558,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       '前面对话里自己动手的做法不再适用。',
   };
   const DIRECT_SECTION = '## 本会话为直接执行模式（用户设定）\n用户已在本会话打开直接执行：用你自己的工具读写文件、运行命令完成任务，不必派给 Codex / Gemini；' +
-    '用户明确要求派活时仍可派。用户输入 /conductor direct off 后恢复只做规划。';
+    '用户明确要求派活时仍可派。用户输入 /conductor off 后恢复只做规划。';
   const history = createHistoryTracker({ directory: stateDirectory,
     threshold: () => cfg.handoverSuggestMessages ?? 0, contextThreshold: () => cfg.handoverContextTokens ?? 0 });
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
@@ -2040,13 +2040,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
   try {
     ctx.get?.('commands')?.register({ name: 'conductor',
-      description: 'Codex 指挥：/conductor direct on 让本会话的 DeepSeek 自己动手，off 恢复只做规划，status 查看',
-      input: { hint: 'direct on|off|status' },
+      description: 'Codex 指挥：/conductor on 让本会话的 DeepSeek 自己动手，/conductor off 恢复只做规划，/conductor status 查看',
+      input: { hint: 'on|off|status' },
       handler: (invocation) => {
         const id = invocation?.agent?.id ? String(invocation.agent.id) : '';
-        const [sub, value = 'status'] = String(invocation?.rawInput ?? '').trim().split(/\s+/);
-        if (sub !== 'direct' || !['on', 'off', 'status'].includes(value)) {
-          return { kind: 'success', text: '用法：`/conductor direct on` 本会话由 DeepSeek 自己动手；`/conductor direct off` 恢复只做规划；`/conductor direct status` 查看当前模式。' };
+        // 手机输入常被自动纠错改词（2026-11-22 用户两次打成 diret on），只认开关词，其余词（direct 或拼错的）都忽略。
+        const words = String(invocation?.rawInput ?? '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+        const value = words.map(word => ({ on: 'on', off: 'off', status: 'status', 开: 'on', 开启: 'on', 打开: 'on',
+          关: 'off', 关闭: 'off', 状态: 'status' })[word]).find(Boolean) ?? (words.every(word => word === 'direct') ? 'status' : undefined);
+        if (!value) {
+          return { kind: 'success', text: '用法：/conductor on 本会话由 DeepSeek 自己动手；/conductor off 恢复只做规划；/conductor status 查看当前模式。中间写不写 direct 都可以。' };
         }
         if (!id) return { kind: 'error', text: '无法识别当前会话，请在会话里使用 /conductor。' };
         if (value !== 'status') {
@@ -2055,8 +2058,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (directMode(id) !== before) modeNotices.set(id, value);
         }
         return { kind: 'success', text: directMode(id)
-          ? '本会话是**直接执行**模式：DeepSeek 可以自己读写文件、运行命令，不再注入“只做规划”的要求，派 Codex / Gemini 的工具照样能用。从下一条消息起生效；`/conductor direct off` 恢复只做规划。'
-          : '本会话是**规划**模式：DeepSeek 只做规划，执行交给 Codex / Gemini，护栏生效。`/conductor direct on` 切到直接执行。' };
+          ? '本会话现在是「直接执行」模式：DeepSeek 可以自己读写文件、运行命令，不再注入“只做规划”的要求，派 Codex / Gemini 的工具照样能用。从下一条消息起生效；/conductor off 恢复只做规划。'
+          : '本会话现在是「规划」模式：DeepSeek 只做规划，执行交给 Codex / Gemini，护栏生效。/conductor on 切到直接执行。' };
       } });
   } catch (error) {
     ctx.logger?.warn?.(`[codex-conductor] /conductor 命令没能注册：${error?.message ?? error}`);
