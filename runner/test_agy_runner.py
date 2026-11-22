@@ -67,8 +67,12 @@ class FakeLink:
             self.count += 1
             lease = f"lease-{self.count}"
             self.leases[lease] = account["id"]
+            fields = {key: value for key, value in account.items() if key != "env"}
             return 200, {"ok": True, "leaseId": lease, "ttlMs": self.ttl_ms, "expiresAt": 0,
-                         "account": {"email": "", "alias": "", "primary": account["home"] == "", **account}}
+                         "slot": "env" not in account, "env": account.get("env", {"NO_PROXY": "localhost", **{
+                             key: account["proxyUrl"] for key in ("HTTP_PROXY", "HTTPS_PROXY") if account["proxyUrl"]}}),
+                         "account": {"email": "", "alias": "", "primary": account["home"] == "",
+                                     "isolated": "env" in account, **fields}}
         if body.get("leaseId") not in self.leases:
             return 404, {"ok": False, "code": "lease_not_found", "error": "unknown lease"}
         if route == "release":
@@ -133,6 +137,20 @@ class LeaseTests(unittest.TestCase):
         lease.release(True, "ignored")
         self.assertEqual(link.calls[-1], ("release", {"leaseId": "lease-2", "ok": True, "model": "gemini-4-neon-medium"}))
         self.assertFalse(self.log.exists())
+
+    def test_a_held_lease_carries_the_accounts_environment(self):
+        isolated = {**SECOND, "env": {"HOME": SECOND["home"], "GEMINI_CLI_HOME": SECOND["home"], "BROWSER": "none",
+                                      "BAD=NAME": "x", "ALSO:BAD": "x", "NUMBER": 1}}
+        link = FakeLink(self.tmp.name, [PRIMARY, isolated], choice="acc_b")
+        self.addCleanup(link.close)
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        self.assertEqual(lease.env, {"HOME": SECOND["home"], "GEMINI_CLI_HOME": SECOND["home"], "BROWSER": "none"})
+        lease.release(True)
+        (Path(self.tmp.name) / ".link-endpoint.json").unlink()
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        self.assertIsNone(lease.env)
 
     def test_continuations_pin_the_account_that_owns_the_conversation(self):
         link = self.link(choice="acc_primary")
@@ -225,6 +243,27 @@ class AdapterTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertTrue({"HOME", "USERPROFILE", "HTTPS_PROXY"} <= set(env["WSLENV"].split(":")))
             self.assertEqual((Path(run_dir) / agy_runner.JOB_RECORD).read_text(), command[3])
+
+    def test_leased_environment_replaces_the_runners_home_and_proxy(self):
+        leased = {"HOME": r"D:\pool\acc 1", "USERPROFILE": r"D:\pool\acc 1", "GEMINI_CLI_HOME": r"D:\pool\acc 1",
+                  "HTTPS_PROXY": "http://127.0.0.1:7894", "NO_PROXY": "localhost,127.0.0.1", "BROWSER": "none"}
+        with tempfile.TemporaryDirectory() as run_dir, \
+                mock.patch.dict(os.environ, {"WSLENV": "KEEP/u:HOME/p", "HTTP_PROXY": "http://inherited:1"}):
+            command, env = agy_runner.build_command(args(
+                r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox="danger-full-access", context={"write": False},
+                agy_proxy="http://127.0.0.1:7890", agy_home=r"D:\pool\acc 1", agy_env=leased,
+            ), run_dir, None)
+            self.assertEqual({key: env[key] for key in leased}, leased)
+            self.assertEqual(env["HTTP_PROXY"], "http://inherited:1")  # the runner's own proxy is not set on top
+            self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+            if os.name != "nt":
+                entries = env["WSLENV"].split(":")
+                self.assertTrue(set(leased) <= set(entries))  # plain names: the values are already Windows strings
+                self.assertIn("KEEP/u", entries)
+                self.assertNotIn("HOME/p", entries)
+            # The account home still scopes agy's own data directory for host read-only jobs.
+            permissions = json.loads(command[command.index("--settings") + 1])["permissions"]
+            self.assertIn("write_file(D:/pool/acc 1/.gemini/antigravity-cli)", permissions["allow"])
 
     def test_host_access_allows_commands_and_read_only_still_denies_writes(self):
         with tempfile.TemporaryDirectory() as run_dir:

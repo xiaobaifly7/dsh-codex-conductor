@@ -159,11 +159,17 @@ def build_command(args, run_dir, conversation_id, scratch=None):
 
     env = os.environ.copy()
     exported = []
-    if args.agy_proxy:
+    leased = getattr(args, "agy_env", None)
+    if leased is not None:
+        # dsh-agy-link's variables for the leased account replace the runner's own home and proxy settings. The values are
+        # already Windows paths and strings, so WSLENV carries them without translation flags.
+        env.update(leased)
+        exported.extend(leased)
+    if args.agy_proxy and leased is None:
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env[key] = env[key.lower()] = args.agy_proxy
             exported.append(key)
-    if home:
+    if home and leased is None:
         # agy reads its conversations from HOME/USERPROFILE. On Windows the login is one machine-wide credential, not per home.
         env["HOME"] = env["USERPROFILE"] = home
         exported.extend(("HOME", "USERPROFILE"))
@@ -260,13 +266,22 @@ def _link_post(pool_dir, route, body, timeout):
     return status, reply
 
 
+def _lease_env(env):
+    """The exact variables agy needs for the leased account: an isolated account (agy >= 1.5) reads its own token file
+    through them instead of the shared credential. A name WSLENV cannot carry ("=" or ":") is dropped."""
+    if not isinstance(env, dict):
+        return None
+    return {key: value for key, value in env.items()
+            if isinstance(key, str) and key and "=" not in key and ":" not in key and isinstance(value, str)}
+
+
 class AccountLease:
     """The agy sign-in leased for one agy process: acquire, renew in the background, release with the outcome."""
 
     def __init__(self, pool_file, holder, model=None, log=None):
         self.pool_file = Path(pool_file)
         self.holder, self.model, self.log = holder, model, log
-        self.lease_id = self.account = self.renewer = None
+        self.lease_id = self.account = self.renewer = self.env = None
         self.released = False
         self.lock = threading.Lock()
         self.stopped = threading.Event()
@@ -295,7 +310,7 @@ class AccountLease:
         status, reply = self._post("acquire", body, wait_ms / 1000 + LINK_TIMEOUT)
         account = reply.get("account")
         if reply.get("ok") is True and isinstance(reply.get("leaseId"), str) and isinstance(account, dict):
-            return reply["leaseId"], account, reply.get("ttlMs")
+            return reply["leaseId"], account, reply.get("ttlMs"), _lease_env(reply.get("env"))
         code = reply.get("code") or f"HTTP {status}"
         message = f"dsh-agy-link leased no agy account ({code}: {reply.get('error') or 'no reason given'}); agy was not started"
         if code == "account_not_found":
@@ -308,7 +323,7 @@ class AccountLease:
         raise LeaseError(message)
 
     def acquire(self, conversation, home, proxy, wait_ms=LEASE_WAIT_MS):
-        """Return (home, proxy) for agy; home None is the primary's own profile.
+        """Return (home, proxy) for agy; home None is the primary's own profile. A held lease also sets self.env.
 
         A conversation lives under its account's HOME, so a continuation pins that account (no home: the primary); a
         fresh run lets dsh-agy-link choose. Without the lease API a fresh run goes to the primary unleased, and a
@@ -320,7 +335,7 @@ class AccountLease:
         try:
             if pin is None:
                 raise LeaseError(f"no primary account in {self.pool_file} to continue the conversation on")
-            self.lease_id, self.account, ttl = self._acquire(pin, wait_ms)
+            self.lease_id, self.account, ttl, self.env = self._acquire(pin, wait_ms)
         except LeaseUnavailable as error:
             if conversation and home:
                 raise LeaseError(f"cannot continue a conversation of the agy account at {home} without a dsh-agy-link "
@@ -331,6 +346,7 @@ class AccountLease:
         self.renewer = threading.Thread(target=self._renew, args=(interval,), daemon=True)
         self.renewer.start()
         return self.account.get("home") or None, self.account.get("proxyUrl") or proxy
+
 
     def _renew(self, interval):
         reported = False
@@ -346,7 +362,7 @@ class AccountLease:
                     raise LeaseError(f"renew answered {reply.get('code') or status}: {reply.get('error')}")
                 # Leases live in DSH's memory, so a DSH restart forgets this one: take the same account again.
                 home = self.account.get("home")
-                renewed, account, _ = self._acquire({"accountDir": home} if home else {"accountId": self.account.get("id")},
+                renewed, account, *_ = self._acquire({"accountDir": home} if home else {"accountId": self.account.get("id")},
                                                     LINK_TIMEOUT * 1000)
             except (LeaseUnavailable, LeaseError) as error:
                 if not reported:

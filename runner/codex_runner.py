@@ -910,8 +910,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
     args.agy_home = home
     state = None
     try:
-        state = run_process(argparse.Namespace(**{**vars(args), "agy_proxy": proxy}), prompt, run_dir, thread_id,
-                            repeat_guard)
+        state = run_process(argparse.Namespace(**{**vars(args), "agy_proxy": proxy, "agy_env": lease.env}), prompt,
+                            run_dir, thread_id, repeat_guard)
         return state
     finally:
         ok = state is not None and state["completed"] and not state["failed"]

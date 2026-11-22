@@ -3115,7 +3115,8 @@ class RunnerTests(unittest.TestCase):
         home = Path(self.tmp.name) / "acc b"
         home.mkdir(exist_ok=True)
         primary = {"id": "acc_primary", "home": "", "proxyUrl": "http://primary.invalid:1"}
-        second = {"id": "acc_b", "home": str(home), "proxyUrl": "http://acc-b.invalid:2"}
+        second = {"id": "acc_b", "home": str(home), "proxyUrl": "http://acc-b.invalid:2",
+                  "env": {"HOME": str(home), "USERPROFILE": str(home), "HTTPS_PROXY": "http://acc-b.invalid:2"}}
         # The loopback lease calls must bypass the proxy agy is given.
         env = {**env, "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}
         return (*argv, "--agy-proxy", "http://configured.invalid:3"), env, call, primary, second
