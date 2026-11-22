@@ -4461,6 +4461,18 @@ test('codex_output keeps actual read failures instead of describing them as pend
   }
 });
 
+test('codex_jobs lists jobs without verification details, empty fields or executor directories', async () => {
+  const job = { job_id: 'J', status: 'completed', error_kind: null, scope: null, verification_status: 'accepted',
+    verification: { reviewer: 'planner', notes: '很长的核验说明', criteria: [{ index: 1, status: 'met', evidence: '证据' }] },
+    task_options: { model: 'm', engine: 'gemini', effort: null, agy_home: 'D:\\agy' },
+    context: { owner: null, task: '任务', dispatcher: { version: '1.0.0', revision: 'abc', pid: 7 } } };
+  const h = harness({ config: { listResult: { jobs: [job], total: 1 } } });
+  const list = await h.tools.codex_jobs.execute({ cwd: '/work' }, {});
+  assert.deepEqual(list.jobs[0], { job_id: 'J', status: 'completed', verification_status: 'accepted', verification_reviewer: 'planner',
+    task_options: { model: 'm', engine: 'gemini' }, context: { owner: null, task: '任务', dispatcher: { version: '1.0.0', pid: 7 } } });
+  assert.doesNotMatch(h.tools.codex_jobs.output.render({}, list)[0].text, /\n/);
+});
+
 test('session journal links recover old jobs after the native task table has been cleared', async () => {
   const h = harness({ config: { listResult: { jobs: [{ job_id: 'OLD', thread_id: 'T' }], total: 1 } } });
   const agent = agentAt('F:\\work\\项目', [{ type: 'job/registered', seq: 0, data: {
