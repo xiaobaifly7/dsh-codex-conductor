@@ -1880,12 +1880,13 @@ def verification_changed_names(before, after):
 
 
 def verification_only_appended(cwd, before, after):
-    """Every changed dirty file is a regular file that only grew, with its earlier bytes unchanged when they were hashed."""
+    """"hash" or "size" when every changed dirty file is a regular file that only grew, with its earlier bytes unchanged
+    when they were hashed ("size": some were too many to hash, so only their growth was checked); otherwise None."""
     changed = [name for name in before if verification_observations_changed({name: before[name]}, {name: after[name]})]
     try:
         top = Path(local_path(os.fsdecode(git(cwd, "rev-parse", "--show-toplevel", deadline=time.monotonic() + 10)).rstrip("\r\n")))
     except (OSError, ValueError, subprocess.TimeoutExpired):
-        return False
+        return None
 
     def appended(name):
         (old_size, _, old_kind), old_hash = before[name]
@@ -1900,7 +1901,9 @@ def verification_only_appended(cwd, before, after):
         except OSError:
             return False
 
-    return all(appended(name) for name in changed)
+    if not all(appended(name) for name in changed):
+        return None
+    return "size" if any(before[name][1] is None for name in changed) else "hash"
 
 
 def stat_fingerprint(info):
@@ -2356,7 +2359,7 @@ def execute(args, prompt, run_dir):
                 verification_only_appended(args.cwd, before_scope[1], after_scope[1])
             if background:
                 result.update(verification_integrity="concurrent_changes", verification_changed_paths=changed[:20],
-                              verification_changed_total=len(changed))
+                              verification_changed_total=len(changed), verification_append_check=background)
             elif scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
                 result.pop("structured", None)
                 # Named so the planner, which cannot read the project, can tell check output from a real edit (2026-11-23).

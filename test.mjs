@@ -2837,6 +2837,9 @@ test('verification_tree_changed nextStep names the changed files when the runner
     context: { verification_of: 'SRC', write: false } };
   assert.match(nextStep({ ...done, verification_changed_paths: ['10-audit/opsec-console/console-watch.log'], verification_changed_total: 1 }),
     /核验期间 10-audit\/opsec-console\/console-watch\.log有变化；它们核验前就已改动，也不是原任务的产物.*核验结论照常可用/);
+  const watched = { ...done, verification_changed_paths: ['a.log'], verification_changed_total: 1 };
+  assert.match(nextStep({ ...watched, verification_append_check: 'size' }), /只核对了文件变大，没有逐字核对原有内容/);
+  assert.doesNotMatch(nextStep({ ...watched, verification_append_check: 'hash' }), /只核对了文件变大/);
   assert.match(nextStep(done), /检测到范围外或与其他任务重叠的仓库变化/);
 });
 
