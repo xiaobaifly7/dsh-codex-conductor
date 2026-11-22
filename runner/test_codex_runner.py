@@ -6330,6 +6330,27 @@ class RunnerTests(unittest.TestCase):
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_verification_digest_keeps_the_scoped_check_when_the_whole_status_times_out(self):
+        import codex_runner
+        _, project, _ = self.git_repo("digest-whole-timeout")
+        (project / "a.txt").write_bytes(b"dirty\n")
+        real = codex_runner.git
+
+        def slow(cwd, *argv, **options):
+            if "status" in argv and "--literal-pathspecs" not in argv:
+                raise subprocess.TimeoutExpired(argv, 0)
+            return real(cwd, *argv, **options)
+
+        paths = [str(project / "a.txt")]
+        with mock.patch.object(codex_runner, "git", slow):
+            whole, scoped, _ = codex_runner.verification_git_digest(str(project), paths)
+        normal_whole, normal_scoped, _ = codex_runner.verification_git_digest(str(project), paths)
+        self.assertIsNone(whole)
+        self.assertIsNotNone(normal_whole)
+        self.assertEqual(scoped, normal_scoped)
+        self.assertIn(b"sub/a.txt", scoped[1])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_review_fix_host_verification_checks_dirty_bytes(self):
         prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
