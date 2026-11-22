@@ -2878,6 +2878,9 @@ class RunnerTests(unittest.TestCase):
             value = {"cwd": "/mnt/c/WORK/project", "scope_paths": ["/mnt/C/work/PROJECT/Src"],
                      "files_changed": [{"path": "src/File.py"}, {"path": "src-other/File.py"}]}
             self.assertEqual(codex_runner.out_of_scope_paths(value), ["src-other/File.py"])
+            # Older records kept agy's Windows paths as reported.
+            value["files_changed"] = [{"path": "C:\\Work\\Project\\src\\File.py"}, {"path": "C:\\Work\\Project\\other.txt"}]
+            self.assertEqual(codex_runner.out_of_scope_paths(value), ["C:\\Work\\Project\\other.txt"])
             self.assertTrue(self.control("forget-too-big", "--cwd", "c:\\work\\PROJECT")["removed"])
             self.assertNotIn(codex_runner.tree_key("/mnt/C/Work/Project"), codex_runner.too_big_trees())
 
@@ -2905,6 +2908,18 @@ class RunnerTests(unittest.TestCase):
                                                    {"path": "keep/new.txt", "change": "added"},
                                                    {"path": "other.txt", "change": "update"},
                                                    {"path": "single.txt", "change": "modified"}])
+
+    def test_windows_event_paths_from_gemini_map_into_the_scope(self):
+        codex_runner, root = self.big_tree()
+        codex_runner.remember_too_big(str(root))
+        before, scope = codex_runner.snapshot_before(str(root), ["keep"])
+        (root / "keep" / "a.txt").write_text("written by agy on Windows")
+        # Inside WSL local_path maps X:\ to /mnt/x/; here Z:\ stands for the test tree.
+        windows = lambda p: str(root / p[3:].replace("\\", "/")) if p.startswith("Z:\\") else p
+        with mock.patch.object(codex_runner, "local_path", windows):
+            report = codex_runner.files_changed(str(root), before, [("Z:\\keep\\a.txt", "update"), ("Z:\\other.txt", "update")], scope)
+        self.assertEqual(report["files_changed"], [{"path": "keep/a.txt", "change": "modified"},
+                                                   {"path": "other.txt", "change": "update"}])
 
     def test_full_snapshot_merges_events_outside_cwd_and_keeps_snapshot_precedence(self):
         codex_runner, root = self.big_tree()

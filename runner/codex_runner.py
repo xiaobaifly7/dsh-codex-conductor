@@ -1750,7 +1750,8 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
         after = snapshot(root, scope=scope) if before is not None else None
     except OSError:
         after = None
-    rel = lambda p: os.path.relpath(os.path.realpath(os.path.join(root, p)), root).replace(os.sep, "/")
+    # agy on Windows reports X:\ paths; unmapped, every one of them read as a change outside the scope (2026-11-22).
+    rel = lambda p: os.path.relpath(os.path.realpath(os.path.join(root, local_path(p))), root).replace(os.sep, "/")
     events = {}
     for p, k in event_changes:
         if p:
@@ -2840,7 +2841,8 @@ def out_of_scope_paths(value):
         roots = [normalized_path(p).rstrip(os.sep) + os.sep for p in value["scope_paths"]]
         for change in value.get("files_changed") or []:
             if isinstance(change, dict) and isinstance(change.get("path"), str):
-                path = normalized_path(os.path.join(value["cwd"], change["path"]))
+                # Records written before 0.9.155 kept agy's X:\ paths as they were.
+                path = normalized_path(os.path.join(value["cwd"], local_path(change["path"])))
                 if not any(path == r.rstrip(os.sep) or path.startswith(r) for r in roots):
                     outside.append(change["path"])
     return list(dict.fromkeys(outside))
