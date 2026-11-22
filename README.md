@@ -452,6 +452,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `actionableReceipts` | `true` | 收尾、复核参数和待答问题出错时，附上本会话可确认的任务和条目编号以及提交骨架。 |
 | `verificationReuse` | `true` | 跳过全部条目均未满足且无产出的受阻任务。同一任务的文件版本与核验范围均可确认未变时复用已有核验。 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
+| `handoverContextTokens` | `0` | 最近 20 次请求的上下文（输入加缓存命中 token）都不低于此值时也标记“建议交接”，`autoHandover` 照常处理；继任会话不必先涨满消息阈值。用于压缩后仍降不下来的会话，它们的消息数可能还不多；子代理会话不计；0 关闭 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
 | `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
 | `closeoutEvidence` | `independent` | 结案时自标未满足的条目记成满足所需的依据：`independent` 独立依据，`planner` 规划端自己的非照抄证据，`off` 不查 |
@@ -884,6 +885,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `actionableReceipts` | `true` | Include owned job and item IDs and submission templates in closeout, review and answer errors. |
 | `verificationReuse` | `true` | Skip blocked jobs that report no met criteria and have no products. Reuse verification when the same job's observable file version and verification scope match. |
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
+| `handoverContextTokens` | `0` | Also flag a session when each of its last 20 requests carried at least this many context tokens (input plus cache reads); `autoHandover` acts on it as usual, and a successor need not first grow by the message threshold. Meant for sessions that compression can no longer shrink, which may still have few messages; subagent sessions are not counted; 0 switches it off |
 | `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |
 | `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |
 | `closeoutEvidence` | `independent` | What supports recording a criterion the report marked unmet as met when closing: `independent` sources, `planner` own non-copied evidence, `off` no check |

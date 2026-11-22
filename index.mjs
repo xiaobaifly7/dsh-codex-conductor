@@ -97,6 +97,8 @@ const DEFAULTS = {
   maxSessionJobs: null,
   // 会话消息数超过这个值时标记“建议交接”；0 关闭（自动交接的提醒、询问也随之关闭）
   handoverSuggestMessages: 5000,
+  // 最近 20 次请求的上下文都不低于这个 token 数时也建议交接（压缩已降不下来）；0 关闭。
+  handoverContextTokens: 0,
   // 新派活的验收标准超过这么多条时，在派活回执里提醒一句（不拦截）；0 关闭
   acceptanceWarnAbove: 8,
   // 结案（verified / accepted_deviations）时，原报告自标 blocked / not_met 的条目记成 met 需要什么依据：
@@ -1155,7 +1157,7 @@ function settings(config, logger) {
       : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
       : key === 'defaultEngine' ? ENGINE_PARAMETER.enum.includes(value)
       : key === 'effortOverride' ? ['planner', 'raise-only-listed', 'config'].includes(value)
-      : ['handoverSuggestMessages', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
+      : ['handoverSuggestMessages', 'handoverContextTokens', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'mcpWriteAllow' ? Array.isArray(value) && value.every(name => typeof name === 'string' && /^mcp__/i.test(name.trim()))
@@ -1511,7 +1513,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const aliases = createAliases(stateDirectory);
   const owns = (id, owner) => Boolean(id && owner) && aliases.owners(id).includes(owner);
   const history = createHistoryTracker({ directory: stateDirectory,
-    threshold: () => cfg.handoverSuggestMessages ?? 0 });
+    threshold: () => cfg.handoverSuggestMessages ?? 0, contextThreshold: () => cfg.handoverContextTokens ?? 0 });
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
   const parkedEvaluations = hostParkedReviews.get(parkedFile) ?? new Map();
   if (parkedFile) hostParkedReviews.set(parkedFile, parkedEvaluations);
@@ -1917,7 +1919,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (hintedTurns.get(agent.id) === turn) return '';
     if (hintedTurns.size > 500) hintedTurns.clear();
     hintedTurns.set(agent.id, turn);
-    return `[建议交接] 本会话已有 ${value.messages} 条消息，超过 ${value.threshold} 条，每一步都会变慢。请在给用户的汇报里说一句：` +
+    const why = value.contextFull ? `最近 20 次请求的上下文都在 ${value.floor} token 以上（阈值 ${value.contextThreshold}），压缩已降不下来`
+      : `已有 ${value.messages} 条消息，超过 ${value.threshold} 条`;
+    return `[建议交接] 本会话${why}，每一步都会变慢。请在给用户的汇报里说一句：` +
       '操作员可以把本会话交接到新会话继续。你不要自己发起交接。';
   };
   const restrictedReads = exec => cfg.plannerReads === 'products' && inWorkspace(sessionCwd(exec), cfg.roots);
