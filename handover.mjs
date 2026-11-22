@@ -405,6 +405,16 @@ export async function restoreAutoContinue(probe, sessionId, previous) {
 // 宿主设置服务里 auto-continue 这一项（该插件的 profile 条目 id 和它自己开关写入时用的名字都是 auto-continue）。
 // 只读写 sessionModes 下这一个会话的键，与该插件自己的“设置会话模式”按钮走同一个 settings.mutate。
 export const AUTO_CONTINUE_ENTRY = 'auto-continue';
+// 交接前几步（新建会话、放进分组、改标题）发起的宿主配置事务还没结束时，写设置会被拒为“不能嵌套”；稍等再写。
+const NESTED_HMR = /HMR transactions cannot be nested/;
+export async function mutateWhenFree(settings, ns, ops, { attempts = 10, waitMs = 500 } = {}) {
+  for (let attempt = 1; ; attempt++) {
+    try { return await settings.mutate(ns, ops); } catch (error) {
+      if (attempt >= attempts || !NESTED_HMR.test(String(error?.message ?? error))) throw error;
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+  }
+}
 export function autoContinueFromSettings(settings) {
   return (sessionId) => {
     const entry = settings?.describe?.().find((form) => form.ns === AUTO_CONTINUE_ENTRY);
@@ -412,7 +422,7 @@ export function autoContinueFromSettings(settings) {
     const modes = entry.value?.sessionModes;
     const previous = modes && typeof modes === 'object' && Object.hasOwn(modes, sessionId) ? modes[sessionId] : null;
     const writable = settings.writable !== false && typeof settings.mutate === 'function';
-    return { previous, ...(writable ? { setMode: (mode) => settings.mutate(AUTO_CONTINUE_ENTRY, [mode === null
+    return { previous, ...(writable ? { setMode: (mode) => mutateWhenFree(settings, AUTO_CONTINUE_ENTRY, [mode === null
       ? { op: 'unset', path: ['sessionModes', sessionId] } : { op: 'set', path: ['sessionModes', sessionId], value: mode }]) } : {}) };
   };
 }
