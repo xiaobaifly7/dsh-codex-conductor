@@ -828,11 +828,15 @@ function failureReceipt(value, cause) {
 
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
-export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions } = {}) {
+export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions, lockEngine = false } = {}) {
   const blocking = blockingState(value);
   if (blocking.next_action === 'done') return `独立核验已记录（${value.verification_status}）。本轮已关闭；完整依据可用 codex_output artifact=review 重读。`;
   if (value.error_kind === 'provider_permanent') {
     const target = value.context?.verification_of;
+    // 执行端锁定 Gemini 时改传 engine 不生效，照旧建议换 Codex 只会让规划端接着派注定失败的 Gemini 任务。
+    if (lockEngine) return `Gemini 提供方无法执行：${String(value.error ?? '请核对账号、模型和额度').slice(0, 300)}。` +
+      '执行端已锁定为 Gemini，改传 engine 不会生效。额度或账号恢复前不要再派新任务：先向用户说明原因，' +
+      (target ? `恢复后再对原任务 ${target} 重新 codex_verify。` : `恢复后用 codex_continue ${value.job_id ?? ''} 续接，只补缺项。`);
     return `Gemini 提供方无法执行：${String(value.error ?? '请核对账号、模型和额度').slice(0, 300)}。` +
       (target ? `用 codex_verify 对 ${target} 显式传 engine: "codex" 重新核验。`
         : '先核对已有产物，再按原授权用 codex_run 显式传 engine: "codex" 重新派单，只补缺项。');
@@ -3085,6 +3089,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
       exec.signal.throwIfAborted();
     }
+    // 目录写锁让同目录的写任务串行执行；派单时说清前面排着几单，免得规划端把同一目录的改动拆成多单并行派
+    // （2026-11-22 一个会话在同一目录并行派写任务，等锁超过 60 秒的有 20 单，最长 37 分钟）。
+    let queueLine;
+    if (args.write === true && started.status === 'running' && started.job_id) {
+      const page = await conductor.list({ cwd, status: 'running', limit: 50 }, exec?.signal).catch(() => undefined);
+      const ahead = (Array.isArray(page?.jobs) ? page.jobs : []).filter(job => job.job_id !== started.job_id && job.context?.write === true);
+      const mine = ahead.filter(job => owns(exec?.agent?.id, job.context?.owner)).map(job => job.job_id);
+      if (ahead.length) queueLine = `同一目录还有 ${ahead.length} 单写任务在跑或排队${mine.length ? `（本会话的：${mine.join('、')}）` : ''}，` +
+        '目录写锁让这一单排在它们后面串行执行。同一目录的后续改动合并进一单，或等前一单结束再派，不要并行派同目录的写任务。';
+    }
     const label = `Codex ${started.job_id} · ${taskLine(args, 40)}`;
     let value;
     if (started.status === 'running' && started.job_id) {
@@ -3100,7 +3114,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
     const key = shown.rendered ? 'rendered' : 'next';
-    const lines = [standingLine, lockLine, effortLine, quotaLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
+    const lines = [standingLine, lockLine, effortLine, quotaLine, queueLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
     const renderedNext = [standingLine, ...predispatch].filter(Boolean).join('\n');
     return { ...shown, ...(shown.rendered && renderedNext ? { next: [shown.next, renderedNext].filter(Boolean).join('\n') } : {}),
       ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
@@ -3116,7 +3130,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '把任务交给 Codex 或 Gemini。' + (cfg.lockEngine ? engineGuidance(cfg) : ENGINE_GUIDANCE + ` 新任务省略 engine 时用默认 ${cfg.defaultEngine}。`) + WAIT_GUIDANCE +
       '同一任务书连续失败时不要原样重派，先读失败回执，按失败类别处理。' +
       (cfg.convergenceGuard ? '同一交付链连续两轮卡在相同条目且参数未变时，仅凭 rerun_after_change 最多再试一次。' : '') +
-      '一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单。路径、平台和参数适配在原授权内处理。' +
+      '一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单；同一目录的写任务共用目录写锁，只能串行执行。路径、平台和参数适配在原授权内处理。' +
       '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +

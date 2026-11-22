@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.155` 修正 Gemini 写任务的“范围外改动”误报：Windows 上的 agy 报的是 `X:\` 路径，runner 在 WSL 里没有换算，scope 内的文件也全被算成范围外，规划端复核时只能逐条写接受理由（2026-11-22 被驳回最多的 4 单共 37 条都是这种误报）。新任务记录换算后保存，旧记录在查询时换算。派写任务时，同一目录已有写任务在跑或排队，回执会说明前面排着几单、会串行执行，提醒合并改动或等前一单结束再派（当天有 20 单等写锁超过 60 秒，最长 37 分钟）。执行端锁定 Gemini 时，Gemini 因额度或账号无法执行的回执不再建议改传 `engine: "codex"`（锁定下不生效），改为先停下向用户说明、恢复后续接。
+
 `0.9.154` `codex_jobs` 的列表变短：每个任务不再带完整核验记录（只留 `verification_status` 和 `verification_reviewer`）、值为空的字段、agy 账号目录和派单的 git revision；这类数据工具（`codex_jobs`、`codex_output`、`codex_watch`）的结果改为不缩进的 JSON。11 月 22 日三个规划会话里，核验记录约占列表的四成，一页 10–20 单常到 3–5 万字、撞上 5 万字的输出上限；按当天的 14 页实测，同样内容缩短 62%。规划端每次查列表，整页都留在上下文里直到被压缩。核验明细仍可用 `codex_status` 或 `codex_output`（`artifact: "review"`）读取。
 
 `0.9.153` 交接不再在继任会话里复活用户暂停或受阻的目标。此前只要原会话有没完成的目标，插件就在继任会话按同样的文字建一个 active 目标，发给继任会话的说明也写着“若还没有目标，按交接单里的目标创建后继续推进”，用户暂停掉的目标因此会在新会话里重新开始推进。现在只在原会话的目标交接时是 active，或是自动交接在空闲边沿自己刚暂停的那一版（请求里的 `pausedGoal`）时才重建；其余情况 `steps.successorGoal` 记 `kept_<状态>`，自检 `goal` 记 `skipped:goal_not_active`，交接单和首条消息写明不要自行创建或推进、等用户指示。撤回交接时也只恢复这次交接自己暂停的那个目标（新链接记 `goalPaused`），用户暂停的保持暂停；没有这个字段的旧链接照旧。
@@ -205,6 +207,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.155` Fixes false "out of scope" changes on Gemini write jobs: agy on Windows reports `X:\` paths, which the runner in WSL did not map, so files inside the scope were listed as outside it and every review had to accept each one (the 4 most rejected jobs on 2026-11-22 carried 37 such items). New records store mapped paths and older ones are mapped when queried. A write dispatch now says when writers in the same directory are already running or queued: it will run after them, so merge the changes or wait (that day 20 jobs waited over 60 seconds for the write lock, the longest 37 minutes). With the executor locked to Gemini, a provider failure (quota or account) no longer suggests `engine: "codex"`, which the lock ignores; it says to stop, tell the user and continue once Gemini recovers.
 
 `0.9.154` `codex_jobs` lists are shorter: each job no longer carries the full verification record (only `verification_status` and `verification_reviewer`), null fields, the agy account directory or the dispatcher's git revision, and the data tools (`codex_jobs`, `codex_output`, `codex_watch`) return unindented JSON. In three planner sessions on November 22 the verification record was about 40% of a list, and a page of 10–20 jobs often reached 30,000–50,000 characters, hitting the 50,000-character output cap; on that day's 14 pages the same content is 62% shorter. Every list a planner reads stays in its context until compression. Verification details remain available from `codex_status` or `codex_output` (`artifact: "review"`).
 

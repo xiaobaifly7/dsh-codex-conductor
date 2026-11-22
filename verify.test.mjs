@@ -33,7 +33,7 @@ function sourceJob() {
     structured: { ...report(), files_changed: ['docs/result.md'] } };
 }
 
-function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {}, disposers, others = {} } = {}) {
+function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {}, disposers, others = {}, listed } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -60,6 +60,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
       });
       return { job_id: 'VERIFY-1', status: 'running' };
     }
+    if (argv[0] === 'list' && listed) return listed(argv);
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
     if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
@@ -260,6 +261,15 @@ test('Gemini provider failure tells the planner how to redispatch on Codex', asy
     /Gemini 启动参数无效.*--json-schema/);
   assert.match(nextStep({ ...failure, error_kind: 'bad_arguments', error: 'agy requires a local Windows drive path: /home/user/project' }),
     /不在 Windows 盘符下.*engine: "codex"/);
+  // With the executor locked to Gemini an engine switch is ignored, so the receipt says to stop and tell the user.
+  for (const verification_of of [undefined, 'SOURCE-1']) {
+    const locked = nextStep({ ...failure, job_id: 'JOB-1', context: { verification_of } }, undefined, undefined, { lockEngine: true });
+    assert.match(locked, /model not available.*执行端已锁定为 Gemini.*不要再派新任务：先向用户说明原因/);
+    assert.doesNotMatch(locked, /engine: "codex"/);
+    assert.match(locked, verification_of ? /对原任务 SOURCE-1 重新 codex_verify/ : /codex_continue JOB-1 续接/);
+  }
+  const lockedRun = harness({ config: { gemini, lockEngine: true, defaultEngine: 'gemini' }, verificationResult: failure });
+  assert.match((await lockedRun.verify()).next, /执行端已锁定为 Gemini/);
 });
 
 test('a fresh Codex continuation without Gemini uses the current model and service tier', async () => {
@@ -736,6 +746,23 @@ test('verification jobs are neither reviewed nor verified again; the refusal nam
   // The completion receipt of a verification names the original task to record.
   assert.match(nextStep({ ...sourceJob(), job_id: 'VERIFY-1', report: report(), context: { ...sourceJob().context, verification_of: 'ROOT-1' } }),
     /codex_review 记录原任务 ROOT-1（核验任务本身不复核、不再核验）/);
+});
+
+test('a write dispatch says how many writers in the same directory run ahead of it', async () => {
+  const writer = (job_id, owner) => ({ job_id, status: 'running', phase: 'lock_wait', context: { owner, write: true } });
+  for (const others of [[writer('MINE-1', exec.agent.id), writer('OTHER-1', 'other-session')], []]) {
+    const queried = [];
+    const h = harness({ running: true, listed: (argv) => {
+      if (!argv.includes('--cwd') || argv[argv.indexOf('--status') + 1] !== 'running') return { jobs: [], total: 0 };
+      queried.push(argv);
+      const jobs = [writer('VERIFY-1', exec.agent.id), ...others, { job_id: 'READ-1', status: 'running', context: { owner: exec.agent.id, write: false } }];
+      return { jobs, total: jobs.length };
+    } });
+    const result = await h.tools.codex_run.execute({ task: 'Edit docs/result.md.', acceptance, write: true, scope: ['docs'], cwd: '/work/original' }, exec);
+    assert.equal(queried.length, 1);
+    if (others.length) assert.match(result.next, /同一目录还有 2 单写任务在跑或排队（本会话的：MINE-1），目录写锁让这一单排在它们后面串行执行/);
+    else assert.doesNotMatch(result.next, /同一目录还有/);
+  }
 });
 
 test('open nextStep remains the default; products points mechanical checks to codex_verify', async () => {
