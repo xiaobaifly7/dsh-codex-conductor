@@ -113,11 +113,20 @@ def build_command(args, run_dir, conversation_id, scratch=None):
     # The file tools need their own rules: a read_file outside the workspace otherwise asks, headless agy auto-denies it
     # and the whole job fails (3 of the first 10 host jobs on 2026-11-22). They grant nothing command(*) does not.
     host = args.sandbox == "danger-full-access"
+    home = None
+    if getattr(args, "agy_home", None):
+        home = _windows_path(args.agy_home) if windows else os.path.realpath(args.agy_home)
     if readonly:
         flags += ["--mode", "plan"]
+        # Plan mode keeps its plan and scratch scripts in agy's own data directory under the account home. A deny rule
+        # beats any allow rule, so the blanket write_file(*) deny failed a host verification that wrote
+        # brain/<conversation>/scratch/verify.py there (2026-11-22). With the home known, allow only that directory and
+        # drop the blanket deny: every other write, the project's included, still asks, which headless agy auto-denies
+        # ("auto-denied", measured on agy 1.5.14) and the runner reports as permission_denied, as before.
+        own = f"write_file({home.replace(chr(92), '/')}/.gemini/antigravity-cli)" if host and home else None
         settings.update(allowNonWorkspaceAccess=host, enableTerminalSandbox=not host, permissions={
-            "allow": [*HOST_COMMANDS, "read_file(*)"] if host else [], "ask": [],
-            "deny": ["write_file(*)", *([] if host else ["command(*)", "unsandboxed(*)"]),
+            "allow": [*HOST_COMMANDS, "read_file(*)", *([own] if own else [])] if host else [], "ask": [],
+            "deny": [*([] if own else ["write_file(*)"]), *([] if host else ["command(*)", "unsandboxed(*)"]),
                      "mcp(*)", "read_url(*)", "execute_url(*)"],
         })
     else:
@@ -146,9 +155,8 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env[key] = env[key.lower()] = args.agy_proxy
             exported.append(key)
-    if getattr(args, "agy_home", None):
-        # agy reads its login and conversations from HOME/USERPROFILE; one directory per pooled account.
-        home = _windows_path(args.agy_home) if windows else os.path.realpath(args.agy_home)
+    if home:
+        # agy reads its conversations from HOME/USERPROFILE. On Windows the login is one machine-wide credential, not per home.
         env["HOME"] = env["USERPROFILE"] = home
         exported.extend(("HOME", "USERPROFILE"))
     if host and readonly:
