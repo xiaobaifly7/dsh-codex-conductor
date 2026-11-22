@@ -851,7 +851,13 @@ export function registerHandoverRequests({ ctx, directory, ...deps }) {
 // 会话历史越长每步越慢；这里只标记“建议交接”，提醒、询问和自动交接由 createAutoHandover 按配置决定。
 // 会话日志只追加，按日志数组累计，每次只数新增事件。
 const MESSAGE_TYPES = new Set(['assistant/message', 'tool/result', 'user/message', 'system/message', 'developer/message']);
-export function createHistoryTracker({ directory, threshold, now = Date.now, writeEveryMs = 30_000 }) {
+// 上下文地板：最近 FLOOR_WINDOW 次请求里最小的上下文（输入 + 缓存命中 token）。压缩后仍降不下来的会话，消息数可能还不多。
+const FLOOR_WINDOW = 20;
+const promptTokens = (event) => {
+  const usage = event?.type === 'assistant/message' ? event.data?.usage : undefined;
+  return usage && (Number(usage.inputTokens) || 0) + (Number(usage.cacheReadTokens) || 0) || undefined;
+};
+export function createHistoryTracker({ directory, threshold, contextThreshold = () => 0, now = Date.now, writeEveryMs = 30_000 }) {
   const counts = new WeakMap();
   const file = directory && path.join(directory, 'history-status.json');
   let sessions = {};
@@ -862,11 +868,15 @@ export function createHistoryTracker({ directory, threshold, now = Date.now, wri
   const count = (log) => {
     if (!Array.isArray(log)) return undefined;
     let entry = counts.get(log);
-    if (!entry || entry.scanned > log.length) entry = { scanned: 0, messages: 0 };
-    for (let i = entry.scanned; i < log.length; i++) if (MESSAGE_TYPES.has(log[i]?.type)) entry.messages++;
+    if (!entry || entry.scanned > log.length) entry = { scanned: 0, messages: 0, prompts: [] };
+    for (let i = entry.scanned; i < log.length; i++) {
+      if (MESSAGE_TYPES.has(log[i]?.type)) entry.messages++;
+      const tokens = promptTokens(log[i]);
+      if (tokens) entry.prompts = [...entry.prompts.slice(1 - FLOOR_WINDOW), tokens];
+    }
     entry.scanned = log.length;
     counts.set(log, entry);
-    return entry.messages;
+    return entry;
   };
   // 供外部看门狗读取：只有会话 ID、消息数、是否建议交接、工作目录、阈值和时间。
   const flush = () => {
@@ -884,14 +894,23 @@ export function createHistoryTracker({ directory, threshold, now = Date.now, wri
   };
   return {
     observe(agent) {
-      const messages = count(agent?.session?.log);
-      if (messages === undefined || !validSessionId(agent?.id)) return undefined;
+      const entry = count(agent?.session?.log);
+      if (entry === undefined || !validSessionId(agent?.id)) return undefined;
+      const { messages, prompts } = entry;
       const limit = threshold();
       const value = { messages, threshold: limit, suggest: limit > 0 && messages > limit };
+      const floorLimit = contextThreshold();
+      // 子代理读大文件时上下文同样会很大，但它们不交接。
+      if (floorLimit > 0 && agent.session?.header?.origin !== 'subagent') {
+        const floor = prompts.length >= FLOOR_WINDOW ? Math.min(...prompts) : undefined;
+        Object.assign(value, { floor, contextThreshold: floorLimit, contextFull: floor >= floorLimit });
+        if (value.contextFull) value.suggest = true;
+      }
       const previous = sessions[agent.id];
       const cwd = agent.session?.header?.cwd;
       if (previous?.messages !== messages || previous?.suggest !== value.suggest) {
-        sessions[agent.id] = { messages, suggest: value.suggest, ...(typeof cwd === 'string' ? { cwd } : {}), at: new Date(now()).toISOString() };
+        sessions[agent.id] = { messages, suggest: value.suggest, ...(value.floor !== undefined ? { floor: value.floor } : {}),
+          ...(typeof cwd === 'string' ? { cwd } : {}), at: new Date(now()).toISOString() };
         dirty = true;
       }
       if (now() - written >= writeEveryMs) flush();
@@ -912,12 +931,12 @@ export const AUTO_HANDOVER_DEFAULTS = { mode: 'confirm', cooldownHours: 12, remi
 
 // 纯判定：会话标了建议交接之后这一次要做什么。remind 是面板提醒；act 为 ask（confirm 模式询问）或 auto（执行交接，
 // 来源 origin 为 auto，或用户在面板同意过的 confirm / panel）。名下是否还有运行中的 Codex 任务由调用方最后再查。
-export function autoHandoverStep({ settings, record = {}, messages, threshold, suggest, idle, retired, link, now, uptimeMs,
+export function autoHandoverStep({ settings, record = {}, messages, threshold, suggest, contextFull = false, idle, retired, link, now, uptimeMs,
   linksReadable = true, depth = 0, lastAutoAt = -Infinity }) {
   const step = { remind: false, act: null };
   if (settings.mode === 'off' || !suggest || retired) return step;
   // 继任会话从交接时起再涨满一个阈值才算（自动交接出的新会话不会马上再触发）。
-  if (link && messages - (link.toMessages ?? 0) <= threshold) return step;
+  if (link && !contextFull && messages - (link.toMessages ?? 0) <= threshold) return step;
   step.remind = record.remindedMessages === undefined || messages - record.remindedMessages >= settings.remindStepMessages;
   if (!idle || now < (Date.parse(record.retryAfter) || 0)) return step;
   // 用户已在面板同意：下一个回合边界按自动交接的流程执行，不再看冷却和每日上限。
@@ -1007,6 +1026,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       if (link?.origin === 'auto') lastAutoAt = Math.max(lastAutoAt, Date.parse(link.at) || 0);
     }
     return autoHandoverStep({ settings: settings(), record: sessions[id], messages: value.messages, threshold: value.threshold, suggest: value.suggest,
+      contextFull: value.contextFull === true,
       idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(),
       linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt });
   };

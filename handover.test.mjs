@@ -1106,3 +1106,33 @@ test('switching auto-continue off waits out a host settings transaction that is 
   await assert.rejects(mutateWhenFree(other, 'auto-continue', [], { attempts: 3, waitMs: 1 }), /busy/);
   assert.equal(other.calls.length, 1);
 });
+
+test('a session whose last 20 requests all carry a large context is flagged even with few messages', async (t) => {
+  const { createHistoryTracker, autoHandoverStep, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
+  const root = dir(t);
+  let floorLimit = 190_000;
+  const tracker = createHistoryTracker({ directory: root, threshold: () => 2000, contextThreshold: () => floorLimit, writeEveryMs: 0 });
+  const request = (input, cached) => ({ type: 'assistant/message', data: { usage: { inputTokens: input, cacheReadTokens: cached } } });
+  const log = [];
+  const agent = { id: 'session-A', session: { log } };
+  for (let i = 0; i < 19; i++) log.push(request(5_000, 200_000 + i));
+  // 不满 20 次请求不下结论。
+  assert.deepEqual(tracker.observe(agent), { messages: 19, threshold: 2000, suggest: false, floor: undefined, contextThreshold: 190_000, contextFull: false });
+  log.push(request(1_000, 195_000));
+  assert.deepEqual(tracker.observe(agent), { messages: 20, threshold: 2000, suggest: true, floor: 196_000, contextThreshold: 190_000, contextFull: true });
+  // 一次压缩把上下文降下来，窗口里就有了低点。
+  log.push(request(2_000, 100_000));
+  assert.equal(tracker.observe(agent).contextFull, false);
+  tracker.flush();
+  assert.equal(JSON.parse(readFileSync(path.join(root, 'history-status.json'), 'utf8')).sessions['session-A'].floor, 102_000);
+  const sub = { id: 'session-S', session: { header: { origin: 'subagent' }, log: Array.from({ length: 20 }, () => request(1_000, 220_000)) } };
+  assert.deepEqual(tracker.observe(sub), { messages: 20, threshold: 2000, suggest: false });
+  floorLimit = 0;
+  assert.deepEqual(tracker.observe(agent), { messages: 21, threshold: 2000, suggest: false });
+  // 继任会话按消息数要从交接时起再涨满一个阈值；上下文地板触发不受这个限制。
+  const now = Date.parse('2026-11-22T06:00:00Z');
+  const base = { settings: { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' }, record: {}, messages: 800, threshold: 2000, suggest: true,
+    idle: true, retired: false, link: { toMessages: 0 }, now, uptimeMs: 3_600_000 };
+  assert.deepEqual(autoHandoverStep(base), { remind: false, act: null });
+  assert.deepEqual(autoHandoverStep({ ...base, contextFull: true }), { remind: true, act: 'auto', origin: 'auto' });
+});

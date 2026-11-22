@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.145` 新增 `handoverContextTokens`（默认 0 关闭）：会话最近 20 次请求的上下文（输入加缓存命中 token）都不低于这个值时，也标记“建议交接”，`autoHandover` 按原有规则处理，继任会话不必先涨满消息阈值。按消息数判断会漏掉这种会话：11 月 22 日 DeepSeek 规划端的有效上限是 30 万 token，强制压缩线在 24 万，一个 2400 条消息的会话压到底仍有 22 万，此后每涨几千就被强制压缩一次（每小时约 15 次）；另一个只有 776 条消息的会话，压完也已有 15 万。`history-status.json` 的会话记录多了 `floor`。
+
 `0.9.144` 交接时关掉原会话“自动继续”的那一步，遇到宿主“HMR transactions cannot be nested”会等 0.5 秒再写，最多 10 次。这个错误出在交接前几步（新建会话、放进分组、改标题）发起的配置事务还没结束时；此前直接记为失败，原会话的自动继续一直开着，11 月 20 日和 22 日的两次自动交接都是这样。撤回交接时恢复原值走同一条路。其他写入错误照旧直接失败。
 
 `0.9.143` Gemini 账号池用得上主账号了：用系统用户目录的账号（`systemHome`，没有 `dir`）此前被整个跳过，现在以本机用户目录作 HOME；额度列表里列了这个模型的账号优先，没列的仍可作后备（主账号的列表没有 Gemini 4，agy 实际能用它跑 Neon），只在全部停用、需重新登录、冷却或额度不足时才报没有可用账号。此前锁定 Gemini 4 Neon 时池里只有一个号可用。
@@ -185,6 +187,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.145` adds `handoverContextTokens` (default 0, off). A session is also flagged for hand-over when each of its last 20 requests carried at least this many context tokens (input plus cache reads); `autoHandover` handles it under the usual rules, and a successor need not first grow by the message threshold. Message counts miss these sessions: on 2026-11-22 the DeepSeek planner had an effective limit of 300k tokens and a forced compression line at 240k; a 2400-message session still sat at 220k after compressing everything it could and was forced to compress again every few thousand tokens, about 15 times an hour, while a 776-message session already sat at 150k after compressing. `history-status.json` records the session's `floor`.
 
 `0.9.144` Turning the old session's auto-continue off during a hand-over now waits 0.5 s and writes again, up to 10 times, when the host answers "HMR transactions cannot be nested". That happens while the configuration transaction started by the earlier steps (new session, workspace, title) is still running; it used to be recorded as a failure and left auto-continue on, as in the automatic hand-overs of 2026-11-20 and 2026-11-22. Restoring the value on a revert takes the same path. Other write errors still fail at once.
 
