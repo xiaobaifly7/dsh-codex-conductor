@@ -2044,8 +2044,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return false;
   }
 
+  // 热重载后，旧实例里等任务结果的循环还在。它若自己派核验或接替，就按过时的配置派单：2026-11-22 配置改回 Neon Medium 后，
+  // 旧实例仍按 High 自动派了一单核验。卸载后不再自动派单，核验由新实例的补扫（加载时和各会话下一次调用工具时）接上。
+  let disposed = false;
+  ctx.effect?.(() => () => { disposed = true; });
   async function withAutoVerification(value, exec, { source, catchup = false } = {}) {
-    if (cfg.autoVerify === 'off') return value;
+    if (cfg.autoVerify === 'off' || disposed) return value;
     const id = value.job_id;
     if (!eligibleForAutoVerification(value)) return value;
     let pending = autoVerifications.get(id);
@@ -2218,7 +2222,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const fallbacks = new Map();
   async function fallbackOnFailure(source, exec) {
     const { job_id: parent, context, task_options: options, sandbox } = source;
-    if (!cfg.gemini?.command || cfg.geminiFallback === false || source.status !== 'failed' ||
+    if (disposed || !cfg.gemini?.command || cfg.geminiFallback === false || source.status !== 'failed' ||
         source.fallback_safe !== true || jobEngine(source) !== 'codex' || !parent || !context?.owner ||
         !owns(exec?.agent?.id, context.owner)) return;
     if (fallbacks.has(parent)) return fallbacks.get(parent);
