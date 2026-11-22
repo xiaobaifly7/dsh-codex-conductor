@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.149` 手动续接请求（`resume-request.json`）遇到目标仍是 active、但目标循环已解除武装的会话时，直接重新武装目标，会话正在运行或上一轮已正常结束也一样，不发消息，由宿主在会话空闲时排下一轮。此前这种会话一律以 `running` 或 `not_interrupted` 跳过：用户中止一个不是目标轮的回合后，宿主只解除武装、目标仍是 active，之后除了在界面上 `/goal resume` 没有办法让它再进入目标循环（11 月 22 日两个会话就这样停在一轮做完之后）。自动续接和热重载续接不变。
+
 `0.9.148` `autoHandover.mode` 为 `auto` 时，回合一直不结束的会话也能自动交接：到了该交接的时候（条件与空闲时相同），插件在下一个没有新消息的模型步骤之前结束这一回合（宿主记为 `blocked`），会话转为空闲后照常交接。此前只在会话转为空闲时判定，而目标或 LoopX 续跑的一个回合可以跑好几个小时（11 月 22 日一个会话单回合跑了 7.5 小时，上下文一直在 19 万 token 以上），自动交接一直等不到时机。带着新消息的步骤不截断，宿主拒绝时会丢掉这些消息。另外，交接时只要原会话绑着 LoopX 线程就把绑定挪给继任会话，不再只看最近一轮续跑来自 LoopX 还是原生目标：重启后的自动恢复会让绑着 LoopX 的会话先跑原生目标轮，绑定于是留在已交接的会话上，交接 3 秒后 LoopX 又把它拉起来空跑了一个回合。
 
 `0.9.147` Gemini 主机只读任务（含核验）设置 `PYTHONDONTWRITEBYTECODE=1` 和 `PYTEST_ADDOPTS=-p no:cacheprovider`，并经 WSLENV 传给它通过 `wsl.exe` 运行的命令：此前核验中运行 Python 会在项目里留下字节码和测试缓存，87 单 Gemini 核验里 3 单因此判为 `verification_tree_changed`（Codex 核验本来就设置这两项，307 单为 0）。
@@ -193,6 +195,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.149` A manual resume request (`resume-request.json`) rearms a session whose goal is still active but whose goal loop was disarmed, even while the session runs or after a completed turn, without sending a message; the host queues the next round once the session is idle. Such sessions used to be skipped as `running` or `not_interrupted`: after the user stops a turn that is not a goal round, the host only disarms the loop and the goal stays active, so nothing but `/goal resume` in the UI could put it back into the loop (on 2026-11-22 two sessions stopped this way after their current round). Automatic and hot-reload resume are unchanged.
 
 `0.9.148` With `autoHandover.mode` set to `auto`, a session whose turn never ends is handed over too: once a hand-over is due (under the same conditions as at idle), the plugin ends the turn before its next model step that carries no new messages (the host records `blocked`), and the hand-over runs when the session turns idle. The decision used to run only at the idle edge, while a goal or LoopX turn can run for hours (on 2026-11-22 one turn ran 7.5 hours with every request above 190k context tokens), so the automatic hand-over never got its moment. A step that carries new messages is never cut, since the host drops a rejected step's messages. A hand-over also moves the LoopX thread binding whenever the predecessor is bound, instead of only when its latest loop turn came from LoopX: after a restart, auto-resume runs a native goal round in a LoopX-bound session, the binding stayed on the retired session, and LoopX woke it again 3 seconds after the hand-over for a wasted turn.
 
