@@ -3584,6 +3584,13 @@ test('/conductor direct on lets one session work by itself, kept across reloads 
   assert.match(planner('S1'), /只做规划/);
   assert.match(hostGuardReason(h, as('S3', write)), /codex-conductor/);
   assert.match(await step(h, 'S3'), /切回规划模式/);
+  // Phone autocorrect: the switch word is enough, whatever comes before it.
+  assert.match(command('S3', ' diret on').text, /「直接执行」模式/);
+  assert.match(command('S3', '关').text, /「规划」模式/);
+  assert.match(command('S3', 'ON').text, /「直接执行」模式/);
+  assert.match(command('S3', '').text, /「直接执行」模式/);
+  assert.match(command('S3', 'off').text, /「规划」模式/);
+  assert.doesNotMatch(command('S3', 'status').text, /\*\*/);
 });
 
 test('a completed codex_run reminds the planner of the requirements only when some are set', async (t) => {

@@ -355,7 +355,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 
 十一个 Codex 工具始终注册；`gemini_write` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
 
-需要 DeepSeek 自己动手时，在该会话里输入 `/conductor direct on`：这个会话不再受护栏限制，也不注入规划要求，派 Codex / Gemini 的工具照样可用；`/conductor direct off` 恢复，`/conductor direct status` 查看。设置按会话记在状态目录的 `direct-sessions.json`，重启后保持，交接出的继任会话沿用前任的设置；其他会话不受影响。默认是规划模式。中途切换时，切换后的下一条用户消息会附一条模式说明，直接执行模式下系统提示词也写明当前模式，长对话不会照着前面的做法继续。
+需要 DeepSeek 自己动手时，在该会话里输入 `/conductor on`（也可写成 `/conductor direct on`，中间的词拼错不影响，也认“开”“关”“状态”）：这个会话不再受护栏限制，也不注入规划要求，派 Codex / Gemini 的工具照样可用；`/conductor off` 恢复，`/conductor status` 查看。设置按会话记在状态目录的 `direct-sessions.json`，重启后保持，交接出的继任会话沿用前任的设置；其他会话不受影响。默认是规划模式。中途切换时，切换后的下一条用户消息会附一条模式说明，直接执行模式下系统提示词也写明当前模式，长对话不会照着前面的做法继续。
 
 - 拒绝直接写文件或执行任意代码的工具：`write`、`edit`、`pwsh`、`run_code`、`subagent_codex`，以及 `wsl-write`、`wsl-edit`、`wsl-term`、`wsl-bootstrap`、`actions_run`、`actions_configure`；MCP 工具按动作名拒绝（`write`、`edit`、`replace`、`insert`、`delete`、`execute` 等）。
 - Seep 的 `seep_r2_cmd` 是任意 radare2 命令入口，在受保护工作区交给 Codex 执行；`seep_r2_info`、`seep_status` 等结构化查询仍可用于只读核验。
