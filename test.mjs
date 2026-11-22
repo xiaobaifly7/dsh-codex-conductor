@@ -2833,6 +2833,11 @@ test('verification_tree_changed nextStep names the changed files when the runner
   assert.match(named, /对原任务 SRC 重新派 codex_verify/);
   assert.match(nextStep({ ...job, verification_changed_paths: [], verification_changed_total: 0 }), /变的是 Git 的 HEAD、暂存区或被删除的文件/);
   assert.match(nextStep(job), /勿使用本轮核验结论。请核对仓库改动来源和现状。$/);
+  const done = { job_id: 'V', status: 'completed', report_status: 'valid', verification_integrity: 'concurrent_changes',
+    context: { verification_of: 'SRC', write: false } };
+  assert.match(nextStep({ ...done, verification_changed_paths: ['10-audit/opsec-console/console-watch.log'], verification_changed_total: 1 }),
+    /核验期间 10-audit\/opsec-console\/console-watch\.log有变化；它们核验前就已改动，也不是原任务的产物.*核验结论照常可用/);
+  assert.match(nextStep(done), /检测到范围外或与其他任务重叠的仓库变化/);
 });
 
 test('executor_lost background failure notifies its owner without a report or close-out obligation', async () => {

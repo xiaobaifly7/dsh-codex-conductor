@@ -862,7 +862,10 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
         : '请核对仓库改动来源和现状。');
   }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
-    (value.verification_integrity === 'concurrent_changes' ? '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。'
+    (value.verification_integrity === 'concurrent_changes' ? (Array.isArray(value.verification_changed_paths) && value.verification_changed_paths.length
+      ? `核验期间 ${value.verification_changed_paths.join('、')}${value.verification_changed_total > value.verification_changed_paths.length ? ` 等 ${value.verification_changed_total} 个文件` : ''}` +
+        '有变化；它们核验前就已改动，也不是原任务的产物，按其他进程（如常驻程序写日志）处理，核验结论照常可用；若验收依赖这些文件，请核对对应证据。'
+      : '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。')
       : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
     (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个文件的内容未比对，请核对对应验收证据。` : '') +
     `先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录原任务 ${value.context.verification_of}（核验任务本身不复核、不再核验）；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。`;
