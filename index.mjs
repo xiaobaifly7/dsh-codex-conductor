@@ -852,7 +852,14 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       `先核对已有产物（codex_output artifact=diff/events），再按原任务重新派单${resume}；不要当作失败结论处理。`;
   }
   if (value.error_kind === 'verification_tree_changed') {
-    return '主机核验期间受核验范围的 Git 状态、索引或文件内容发生变化，核验失败。请核对仓库改动来源和现状，勿使用本轮核验结论。';
+    const names = Array.isArray(value.verification_changed_paths) ? value.verification_changed_paths : [];
+    const total = Number.isInteger(value.verification_changed_total) ? value.verification_changed_total : undefined;
+    const target = value.context?.verification_of ? `对原任务 ${value.context.verification_of} ` : '';
+    return '主机核验期间受核验范围的 Git 状态、索引或文件内容发生变化，核验失败，勿使用本轮核验结论。' + (names.length
+      ? `变化的文件（相对仓库根目录）：${names.join('、')}${total > names.length ? ` 等 ${total} 个` : ''}。` +
+        `若只是检查自己生成的缓存、日志或构建产物，${target}重新派 codex_verify 即可；若是代码改动，先等改动来源（同目录的写任务）结束再核验。`
+      : total === 0 ? '没有可列出的文件内容变化，变的是 Git 的 HEAD、暂存区或被删除的文件（期间有人提交、暂存或删除了文件）；确认改动来源后再核验。'
+        : '请核对仓库改动来源和现状。');
   }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     (value.verification_integrity === 'concurrent_changes' ? '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。'

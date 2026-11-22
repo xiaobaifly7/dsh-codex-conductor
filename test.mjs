@@ -2825,6 +2825,16 @@ test('executor_lost nextStep directs the planner to artifacts and the original t
   assert.doesNotMatch(nextStep({ ...job, lost_reason: 'worker_exited', thread_id: null }), /在原线程续接/);
 });
 
+test('verification_tree_changed nextStep names the changed files when the runner recorded them', () => {
+  const job = { job_id: 'V', status: 'failed', error_kind: 'verification_tree_changed', retryable: false,
+    context: { verification_of: 'SRC', write: false } };
+  const named = nextStep({ ...job, verification_changed_paths: ['sub/a.txt', 'sub/out.log'], verification_changed_total: 23 });
+  assert.match(named, /勿使用本轮核验结论。变化的文件（相对仓库根目录）：sub\/a\.txt、sub\/out\.log 等 23 个。/);
+  assert.match(named, /对原任务 SRC 重新派 codex_verify/);
+  assert.match(nextStep({ ...job, verification_changed_paths: [], verification_changed_total: 0 }), /变的是 Git 的 HEAD、暂存区或被删除的文件/);
+  assert.match(nextStep(job), /勿使用本轮核验结论。请核对仓库改动来源和现状。$/);
+});
+
 test('executor_lost background failure notifies its owner without a report or close-out obligation', async () => {
   const jobs = fakeJobs();
   const lost = { job_id: 'J1', status: 'failed', execution_status: 'failed', error_kind: 'executor_lost',
