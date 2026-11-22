@@ -1533,6 +1533,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 交接后后继会话也是前任会话任务的归属方；没有交接记录时只认本会话。
   const aliases = createAliases(stateDirectory);
   const owns = (id, owner) => Boolean(id && owner) && aliases.owners(id).includes(owner);
+  // 直接执行模式：用户在会话里用 /conductor direct on 打开后，该会话不受护栏、不注入规划要求，由 DeepSeek 自己动手。
+  // 记在状态目录里，重启后保持；交接出的继任会话沿用前任的设置。
+  const directFile = stateDirectory && path.join(stateDirectory, 'direct-sessions.json');
+  const directSessions = new Set((() => {
+    try { return JSON.parse(readFileSync(directFile, 'utf8')).sessions.filter(id => typeof id === 'string'); } catch { return []; }
+  })());
+  const directMode = (id) => Boolean(id) && aliases.owners(id).some(owner => directSessions.has(owner));
+  const setDirectMode = (id, on) => {
+    const next = new Set(directSessions);
+    for (const owner of aliases.owners(id)) next.delete(owner);
+    if (on) next.add(id);
+    if (directFile) writeJsonAtomic(directFile, { sessions: [...next] });
+    directSessions.clear();
+    for (const owner of next) directSessions.add(owner);
+  };
   const history = createHistoryTracker({ directory: stateDirectory,
     threshold: () => cfg.handoverSuggestMessages ?? 0, contextThreshold: () => cfg.handoverContextTokens ?? 0 });
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
@@ -1945,7 +1960,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return `[建议交接] 本会话${why}，每一步都会变慢。请在给用户的汇报里说一句：` +
       '操作员可以把本会话交接到新会话继续。你不要自己发起交接。';
   };
-  const restrictedReads = exec => cfg.plannerReads === 'products' && inWorkspace(sessionCwd(exec), cfg.roots);
+  const restrictedReads = exec => cfg.plannerReads === 'products' && inWorkspace(sessionCwd(exec), cfg.roots) && !directMode(exec?.agent?.id);
   const rememberJob = (value, owner = value.context?.owner) => {
     if (!owner || !value.job_id) return;
     if (productJobs.size >= 10_000) productJobs.delete(productJobs.keys().next().value);
@@ -2002,11 +2017,36 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   if (plannerFile) try {
     const engineGuide = !cfg.gemini ? '' : cfg.lockEngine ? `- ${engineGuidance(cfg)}`
       : plannerPrompt(fileURLToPath(new URL('./engine-prompt.md', import.meta.url)));
+    // 组装时 context.scope 就是当前会话的 agent；直接执行的会话不注入。
     ctx.get?.('systemPrompt')?.section({ name: 'codex-conductor:planner', order: 10100, interpolate: false,
-      text: () => plannerSection([engineGuide, plannerPrompt(plannerFile)].filter(Boolean).join('\n\n')) });
+      text: (context) => {
+        try { if (directMode(context?.scope?.id)) return ''; } catch {}
+        return plannerSection([engineGuide, plannerPrompt(plannerFile)].filter(Boolean).join('\n\n'));
+      } });
     plannerInjected = Boolean(ctx.get?.('systemPrompt'));
   } catch (error) {
     ctx.logger?.warn?.(`[codex-conductor] 规划要求没能注入系统提示词：${error?.message ?? error}`);
+  }
+  try {
+    ctx.get?.('commands')?.register({ name: 'conductor',
+      description: 'Codex 指挥：/conductor direct on 让本会话的 DeepSeek 自己动手，off 恢复只做规划，status 查看',
+      input: { hint: 'direct on|off|status' },
+      handler: (invocation) => {
+        const id = invocation?.agent?.id ? String(invocation.agent.id) : '';
+        const [sub, value = 'status'] = String(invocation?.rawInput ?? '').trim().split(/\s+/);
+        if (sub !== 'direct' || !['on', 'off', 'status'].includes(value)) {
+          return { kind: 'success', text: '用法：`/conductor direct on` 本会话由 DeepSeek 自己动手；`/conductor direct off` 恢复只做规划；`/conductor direct status` 查看当前模式。' };
+        }
+        if (!id) return { kind: 'error', text: '无法识别当前会话，请在会话里使用 /conductor。' };
+        if (value !== 'status') {
+          try { setDirectMode(id, value === 'on'); } catch (error) { return { kind: 'error', text: `没能保存设置，模式未改：${error?.message ?? error}` }; }
+        }
+        return { kind: 'success', text: directMode(id)
+          ? '本会话是**直接执行**模式：DeepSeek 可以自己读写文件、运行命令，不再注入“只做规划”的要求，派 Codex / Gemini 的工具照样能用。从下一条消息起生效；`/conductor direct off` 恢复只做规划。'
+          : '本会话是**规划**模式：DeepSeek 只做规划，执行交给 Codex / Gemini，护栏生效。`/conductor direct on` 切到直接执行。' };
+      } });
+  } catch (error) {
+    ctx.logger?.warn?.(`[codex-conductor] /conductor 命令没能注册：${error?.message ?? error}`);
   }
   // 这个 runner 任务仍在进行的 DSH 后台任务。按 DSH 任务表查而不记在插件内存里：
   // 插件热重载后旧的后台任务和它的等待循环仍在，内存记录却清空了，会重复登记、重复送回结果
@@ -4313,7 +4353,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         return { isError: true, error: { message: refusal }, content: [{ type: 'text', text: `Error: ${refusal}` }] };
       }
     }
-    if (inWorkspace(sessionCwd(exec), cfg.roots)) {
+    if (inWorkspace(sessionCwd(exec), cfg.roots) && !directMode(exec.agent?.id)) {
       let denied;
       try { denied = await productReads.check(exec, ...productReadLocation(exec)); }
       catch (error) { denied = guardError(exec, error); }
@@ -4415,6 +4455,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   if (cfg.roots.length) {
     ctx.tools.guard((exec) => {
       try {
+        if (directMode(exec?.agent?.id)) return undefined;
         const denied = decide(exec, cfg);
         if (denied || !inWorkspace(sessionCwd(exec), cfg.roots)) return denied;
         // 记下白名单模式下不会放行的工具名，面板据此提示切换前要补进 allowTools 的名字。
