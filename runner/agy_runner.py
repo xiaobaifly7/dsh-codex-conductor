@@ -1,6 +1,7 @@
 """Launch a single Antigravity turn and adapt its stream to runner events."""
 
 import base64
+from contextlib import suppress
 import json
 import ntpath
 import os
@@ -9,6 +10,8 @@ import re
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 import uuid
 
 
@@ -202,6 +205,181 @@ def _read_record(path):
         return path.read_text(encoding="ascii")
     except FileNotFoundError:
         return None
+
+
+# On Windows agy signs in through one machine-wide credential, so HOME alone never switches the account: the login is
+# whoever dsh-agy-link last put into that slot. So every pooled agy run leases the slot from dsh-agy-link, which swaps
+# the account in, keeps it there until release and settles the outcome (cooldowns, the next account).
+LINK_ENDPOINT = ".link-endpoint.json"
+LEASE_NOTE = "dsh-agy-link lease:"  # prefix of the runner's own lines in stderr.log, never an agy error
+LEASE_TTL_MS = 60_000
+LEASE_WAIT_MS = 600_000
+LINK_TIMEOUT = 5
+
+
+class LeaseUnavailable(Exception):
+    """No lease API: no discovery file, nothing listening, or a dsh-agy-link without the lease routes."""
+
+
+class LeaseError(Exception):
+    """The lease API answered without an account. kind is the attempt's quota kind (transient or provider_permanent)."""
+
+    def __init__(self, message, kind="provider_permanent"):
+        super().__init__(message)
+        self.kind = kind
+
+
+def _link_post(pool_dir, route, body, timeout):
+    # Re-read on every call: the port changes whenever DSH restarts.
+    try:
+        url = json.loads((Path(pool_dir) / LINK_ENDPOINT).read_text("utf-8"))["url"].rstrip("/")
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise LeaseUnavailable(f"no dsh-agy-link endpoint in {Path(pool_dir) / LINK_ENDPOINT} ({error})") from None
+    request = urllib.request.Request(f"{url}/lease/{route}", data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+    # Loopback: the HTTP(S)_PROXY meant for agy must not catch it.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    except (urllib.error.URLError, OSError) as error:
+        reason = getattr(error, "reason", error)
+        if isinstance(reason, TimeoutError):
+            raise LeaseError(f"dsh-agy-link /lease/{route} did not answer within {timeout:g}s", "transient") from None
+        raise LeaseUnavailable(f"dsh-agy-link at {url} is not reachable ({reason})") from None
+    try:
+        reply = json.loads(raw)
+    except ValueError:
+        reply = None
+    if not isinstance(reply, dict) or "ok" not in reply:
+        if status == 404:
+            raise LeaseUnavailable(f"dsh-agy-link has no lease API (HTTP 404 on /lease/{route})")
+        raise LeaseError(f"dsh-agy-link /lease/{route} answered HTTP {status} without a lease reply", "transient")
+    return status, reply
+
+
+class AccountLease:
+    """The agy sign-in leased for one agy process: acquire, renew in the background, release with the outcome."""
+
+    def __init__(self, pool_file, holder, model=None, log=None):
+        self.pool_file = Path(pool_file)
+        self.holder, self.model, self.log = holder, model, log
+        self.lease_id = self.account = self.renewer = None
+        self.released = False
+        self.lock = threading.Lock()
+        self.stopped = threading.Event()
+
+    def note(self, text):
+        if self.log is not None:
+            with suppress(OSError), open(self.log, "ab") as log:
+                log.write(f"{LEASE_NOTE} {text}\n".encode("utf-8"))
+
+    def primary(self):
+        try:
+            pool = json.loads(self.pool_file.read_text("utf-8"))
+            accounts = [a for a in pool.get("accounts") or [] if isinstance(a, dict)]
+        except (OSError, ValueError, AttributeError, TypeError):
+            return {}
+        return next((a for a in accounts if a.get("id") == pool.get("primaryAccountId")), None) or \
+            next((a for a in accounts if a.get("systemHome") is True), {})
+
+    def _post(self, route, body, timeout=LINK_TIMEOUT):
+        return _link_post(self.pool_file.parent, route, body, timeout)
+
+    def _acquire(self, pin, wait_ms):
+        body = {"holder": self.holder, "ttlMs": LEASE_TTL_MS, "waitMs": wait_ms, **pin}
+        if self.model:
+            body["model"] = self.model
+        status, reply = self._post("acquire", body, wait_ms / 1000 + LINK_TIMEOUT)
+        account = reply.get("account")
+        if reply.get("ok") is True and isinstance(reply.get("leaseId"), str) and isinstance(account, dict):
+            return reply["leaseId"], account, reply.get("ttlMs")
+        code = reply.get("code") or f"HTTP {status}"
+        message = f"dsh-agy-link leased no agy account ({code}: {reply.get('error') or 'no reason given'}); agy was not started"
+        if code == "account_not_found":
+            raise LeaseError(message + "; the conversation's account has left the pool, continue with fresh: true")
+        if code == "slot_timeout":
+            raise LeaseError(message, "transient")
+        delay = reply.get("retryAfterMs")
+        if code in ("no_account", "account_unavailable") and isinstance(delay, (int, float)) and delay >= 0:
+            raise LeaseError(message, _retry_kind(delay / 1000))
+        raise LeaseError(message)
+
+    def acquire(self, conversation, home, proxy, wait_ms=LEASE_WAIT_MS):
+        """Return (home, proxy) for agy; home None is the primary's own profile.
+
+        A conversation lives under its account's HOME, so a continuation pins that account (no home: the primary); a
+        fresh run lets dsh-agy-link choose. Without the lease API a fresh run goes to the primary unleased, and a
+        secondary's conversation fails rather than run as the wrong identity."""
+        primary = self.primary()
+        pin = {}
+        if conversation:
+            pin = {"accountDir": home} if home else {"accountId": primary["id"]} if primary.get("id") else None
+        try:
+            if pin is None:
+                raise LeaseError(f"no primary account in {self.pool_file} to continue the conversation on")
+            self.lease_id, self.account, ttl = self._acquire(pin, wait_ms)
+        except LeaseUnavailable as error:
+            if conversation and home:
+                raise LeaseError(f"cannot continue a conversation of the agy account at {home} without a dsh-agy-link "
+                                 f"lease, it would run as the wrong account: {error}") from None
+            self.note(f"{error}; running on the primary account without a lease")
+            return None, primary.get("proxyUrl") or proxy
+        interval = (ttl if isinstance(ttl, (int, float)) and ttl > 0 else LEASE_TTL_MS) / 3000
+        self.renewer = threading.Thread(target=self._renew, args=(interval,), daemon=True)
+        self.renewer.start()
+        return self.account.get("home") or None, self.account.get("proxyUrl") or proxy
+
+    def _renew(self, interval):
+        reported = False
+        while not self.stopped.wait(interval):
+            with self.lock:
+                lease_id = self.lease_id
+            try:
+                status, reply = self._post("renew", {"leaseId": lease_id, "ttlMs": LEASE_TTL_MS})
+                if reply.get("ok") is True:
+                    reported = False
+                    continue
+                if status != 404:
+                    raise LeaseError(f"renew answered {reply.get('code') or status}: {reply.get('error')}")
+                # Leases live in DSH's memory, so a DSH restart forgets this one: take the same account again.
+                home = self.account.get("home")
+                renewed, account, _ = self._acquire({"accountDir": home} if home else {"accountId": self.account.get("id")},
+                                                    LINK_TIMEOUT * 1000)
+            except (LeaseUnavailable, LeaseError) as error:
+                if not reported:
+                    self.note(f"renewing {lease_id} failed: {error}")
+                    reported = True
+                continue
+            with self.lock:
+                released = self.released
+                if not released:
+                    self.lease_id, self.account = renewed, account
+            if released:  # release() gave up waiting for this re-acquire, so nothing else frees the slot
+                with suppress(LeaseUnavailable, LeaseError):
+                    self._post("release", {"leaseId": renewed, "ok": True})
+                return
+            self.note(f"{lease_id} was gone after a DSH restart; re-acquired as {renewed}")
+
+    def release(self, ok, error=None):
+        self.stopped.set()
+        if self.renewer is not None:
+            self.renewer.join(timeout=3 * LINK_TIMEOUT)
+        with self.lock:
+            lease_id, self.lease_id, self.released = self.lease_id, None, True
+        if not lease_id:
+            return
+        body = {"leaseId": lease_id, "ok": bool(ok)}
+        if not ok and error:
+            body["error"] = str(error)[:4000]
+        if self.model:
+            body["model"] = self.model
+        try:
+            self._post("release", body)
+        except (LeaseUnavailable, LeaseError) as failure:
+            self.note(f"releasing {lease_id} failed: {failure}")
 
 
 def _powershell():
