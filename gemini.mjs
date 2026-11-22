@@ -415,11 +415,15 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
         const lease = cfg.accountPool ? await leaseAgyAccount(cfg.accountPool, { holder: 'dsh-codex-conductor/gemini_write',
           model: value.model, proxy: cfg.proxy, waitMs: Math.max(0, Math.min(LEASE.waitMs, deadline - performance.now())), signal }) : null;
         if (lease?.note) value.lease_note = lease.note;
+        // runGemini 不会 reject（出错也带 error resolve）；归还仍只看这一次的结果，且不让归还的错误盖掉原来的错误。
+        let attempt;
         try {
-          run = await runGemini({ ...cfg, model: value.model, effort: value.effort, ...(lease ? { env: lease.env } : {}) }, prompt,
+          attempt = await runGemini({ ...cfg, model: value.model, effort: value.effort, ...(lease ? { env: lease.env } : {}) }, prompt,
             { cwd, signal, deadline }, launch);
+          run = attempt;
         } finally {
-          await lease?.release(!run.error && run.result?.status === 'SUCCESS', run.error ?? 'agy 没有正常结束');
+          await lease?.release(!attempt?.error && attempt?.result?.status === 'SUCCESS', attempt?.error ?? 'agy 没有正常结束')
+            .catch(() => {});
         }
         value.stdout_bytes += run.stdout_bytes ?? 0;
         value.event_count += run.event_count ?? 0;
