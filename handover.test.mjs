@@ -357,14 +357,13 @@ test('a revert is refused once the successor has new turns beyond the brief, and
 });
 
 // 宿主设置服务的替身：describe 给出 auto-continue 的当前值，mutate 按 set / unset 改 sessionModes。
-function settingsService(modes, { installed = true, writable = true, fail, busyFor = 0 } = {}) {
+function settingsService(modes, { installed = true, writable = true, fail } = {}) {
   const calls = [];
   return { calls, writable,
     describe: () => (installed ? [{ ns: 'other', value: {} }, { ns: 'auto-continue', value: { sessionModes: { ...modes } } }] : [{ ns: 'other', value: {} }]),
     async mutate(ns, ops) {
       calls.push([ns, ops]);
       if (fail) throw new Error(fail);
-      if (calls.length <= busyFor) throw new Error('HMR transactions cannot be nested');
       for (const op of ops) {
         if (op.op === 'set') modes[op.path[1]] = op.value;
         else delete modes[op.path[1]];
@@ -1117,20 +1116,25 @@ test('a session bound to LoopX hands its LoopX thread binding to the successor, 
   assert.deepEqual([rolled.status, rolled.rollback.steps.loopx, [...table]], ['rolled_back', 'restored', [['session-D', pair]]]);
 });
 
-test('switching auto-continue off waits out a host settings transaction that is still running', async () => {
-  const { autoContinueFromSettings, disableAutoContinue, mutateWhenFree } = await import('./handover.mjs');
-  // 2026-11-22 的两次自动交接都在这里失败：建会话、放分组、改标题的配置事务还没结束。
+test('switching auto-continue off escapes the host reload transaction a hot-loaded watcher inherited', async () => {
+  const { AsyncLocalStorage } = await import('node:async_hooks');
+  const { autoContinueFromSettings, disableAutoContinue, outsideHmr } = await import('./handover.mjs');
+  // 宿主 HMR 的 runExclusive：调用方的异步上下文还带着“正在重载”的标记就拒绝，与真正的宿主相同。
+  const hmr = { executing: new AsyncLocalStorage() };
   const modes = {};
-  const settings = settingsService(modes, { busyFor: 2 });
-  assert.deepEqual(await disableAutoContinue(autoContinueFromSettings(settings), 'session-A'), { autoContinue: 'disabled', previous: null });
-  assert.deepEqual([settings.calls.length, modes], [3, { 'session-A': 'off' }]);
-  // 一直忙就按次数放弃，其他错误不重试。
-  const stuck = settingsService({}, { busyFor: 99 });
-  await assert.rejects(mutateWhenFree(stuck, 'auto-continue', [], { attempts: 3, waitMs: 1 }), /cannot be nested/);
-  assert.equal(stuck.calls.length, 3);
-  const other = settingsService({}, { fail: 'busy' });
-  await assert.rejects(mutateWhenFree(other, 'auto-continue', [], { attempts: 3, waitMs: 1 }), /busy/);
-  assert.equal(other.calls.length, 1);
+  const settings = { describe: () => [{ ns: 'auto-continue', value: { sessionModes: modes } }],
+    mutate: async (ns, ops) => {
+      if (hmr.executing.getStore()) throw new Error('HMR transactions cannot be nested');
+      for (const op of ops) modes[op.path[1]] = op.value;
+    } };
+  // 监视器在热加载那次事务里建好，之后的通知（这里用 setTimeout 模拟）都继承这个上下文。
+  const later = (fn) => hmr.executing.run(true, () => new Promise((resolve) => setTimeout(() => resolve(fn()), 1)));
+  assert.match((await later(() => disableAutoContinue(autoContinueFromSettings(settings), 'session-A'))).autoContinue, /^failed:HMR transactions cannot be nested/);
+  assert.deepEqual(await later(() => disableAutoContinue(autoContinueFromSettings(settings, outsideHmr(hmr)), 'session-A')),
+    { autoContinue: 'disabled', previous: null });
+  assert.deepEqual(modes, { 'session-A': 'off' });
+  // 没有 HMR 服务时照常直接写。
+  assert.deepEqual(await disableAutoContinue(autoContinueFromSettings(settings, outsideHmr(undefined)), 'session-B'), { autoContinue: 'disabled', previous: null });
 });
 
 test('a session whose last 20 requests all carry a large context is flagged even with few messages', async (t) => {

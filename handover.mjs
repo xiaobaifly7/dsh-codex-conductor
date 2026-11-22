@@ -397,25 +397,21 @@ export async function restoreAutoContinue(probe, sessionId, previous) {
 // 宿主设置服务里 auto-continue 这一项（该插件的 profile 条目 id 和它自己开关写入时用的名字都是 auto-continue）。
 // 只读写 sessionModes 下这一个会话的键，与该插件自己的“设置会话模式”按钮走同一个 settings.mutate。
 export const AUTO_CONTINUE_ENTRY = 'auto-continue';
-// 交接前几步（新建会话、放进分组、改标题）发起的宿主配置事务还没结束时，写设置会被拒为“不能嵌套”；稍等再写。
-const NESTED_HMR = /HMR transactions cannot be nested/;
-export async function mutateWhenFree(settings, ns, ops, { attempts = 10, waitMs = 500 } = {}) {
-  for (let attempt = 1; ; attempt++) {
-    try { return await settings.mutate(ns, ops); } catch (error) {
-      if (attempt >= attempts || !NESTED_HMR.test(String(error?.message ?? error))) throw error;
-      await new Promise((resolve) => setTimeout(resolve, waitMs));
-    }
-  }
+// 宿主 HMR 用 AsyncLocalStorage 标记“正处在一次重载事务里”，带着这个标记的调用一律被拒为“不能嵌套”，重试多少次都一样。
+// 插件热加载时建的请求监视器，回调继承了加载那次事务的上下文，交接里写设置因此总被拒；宿主自己的配置监视器也是先 executing.exit() 再建。
+export function outsideHmr(hmr) {
+  const store = hmr?.executing;
+  return typeof store?.exit === 'function' ? (fn) => store.exit(fn) : (fn) => fn();
 }
-export function autoContinueFromSettings(settings) {
+export function autoContinueFromSettings(settings, outside = (fn) => fn()) {
   return (sessionId) => {
     const entry = settings?.describe?.().find((form) => form.ns === AUTO_CONTINUE_ENTRY);
     if (!entry) return undefined;
     const modes = entry.value?.sessionModes;
     const previous = modes && typeof modes === 'object' && Object.hasOwn(modes, sessionId) ? modes[sessionId] : null;
     const writable = settings.writable !== false && typeof settings.mutate === 'function';
-    return { previous, ...(writable ? { setMode: (mode) => mutateWhenFree(settings, AUTO_CONTINUE_ENTRY, [mode === null
-      ? { op: 'unset', path: ['sessionModes', sessionId] } : { op: 'set', path: ['sessionModes', sessionId], value: mode }]) } : {}) };
+    return { previous, ...(writable ? { setMode: (mode) => outside(() => settings.mutate(AUTO_CONTINUE_ENTRY, [mode === null
+      ? { op: 'unset', path: ['sessionModes', sessionId] } : { op: 'set', path: ['sessionModes', sessionId], value: mode }])) } : {}) };
   };
 }
 

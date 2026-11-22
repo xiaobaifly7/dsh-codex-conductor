@@ -33,7 +33,7 @@ const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, impo
 const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
   flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS,
   HISTORICAL_GAP_KINDS, historicalCriteria } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -4433,7 +4433,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom, reworkFrom),
       disableAutoContinue: cfg.autoHandover.disableAutoContinue,
       // 交接时通过宿主设置服务关掉旧会话在 dsh-client-auto-continue 里的自动继续；没装该插件时什么都不做。
-      autoContinue: (id) => autoContinueFromSettings(ctx.get?.('settings'))(id),
+      autoContinue: (id) => autoContinueFromSettings(ctx.get?.('settings'), outsideHmr(ctx.get?.('hmr')))(id),
       // 交接单里“最近的用户指令”排除重启续接的固定话术；有 session_read 工具时写上回看旧会话的用法。
       autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')),
       workspaces, onResult: (result) => autoHandover.settled(result), withRunningJobs: cfg.autoHandover.withRunningJobs,
