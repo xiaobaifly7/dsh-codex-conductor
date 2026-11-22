@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.146` 热重载后，被替换的旧插件实例不再自动派核验或 Gemini 接替：它的等待循环仍会收到任务结果，此前会按过时的配置派单（2026-11-22 配置改回 Gemini Neon Medium 后，旧实例仍按 High 自动派了一单核验）。这些核验由当前实例的补扫接上（加载时，以及各会话下一次调用工具时）。
+
 `0.9.145` 新增 `handoverContextTokens`（默认 0 关闭）：会话最近 20 次请求的上下文（输入加缓存命中 token）都不低于这个值时，也标记“建议交接”，`autoHandover` 按原有规则处理，继任会话不必先涨满消息阈值。按消息数判断会漏掉这种会话：11 月 22 日 DeepSeek 规划端的有效上限是 30 万 token，强制压缩线在 24 万，一个 2400 条消息的会话压到底仍有 22 万，此后每涨几千就被强制压缩一次（每小时约 15 次）；另一个只有 776 条消息的会话，压完也已有 15 万。`history-status.json` 的会话记录多了 `floor`。
 
 `0.9.144` 交接时关掉原会话“自动继续”的那一步，遇到宿主“HMR transactions cannot be nested”会等 0.5 秒再写，最多 10 次。这个错误出在交接前几步（新建会话、放进分组、改标题）发起的配置事务还没结束时；此前直接记为失败，原会话的自动继续一直开着，11 月 20 日和 22 日的两次自动交接都是这样。撤回交接时恢复原值走同一条路。其他写入错误照旧直接失败。
@@ -187,6 +189,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.146` After a hot reload, the replaced plugin instance no longer starts automatic verifications or Gemini takeovers: its wait loops still receive job results and used to dispatch on its stale configuration (after the Gemini model was set back to Neon Medium on 2026-11-22, the old instance still auto-verified one job on High). The current instance's catch-up scan picks these up, on load and on each session's next tool call.
 
 `0.9.145` adds `handoverContextTokens` (default 0, off). A session is also flagged for hand-over when each of its last 20 requests carried at least this many context tokens (input plus cache reads); `autoHandover` handles it under the usual rules, and a successor need not first grow by the message threshold. Message counts miss these sessions: on 2026-11-22 the DeepSeek planner had an effective limit of 300k tokens and a forced compression line at 240k; a 2400-message session still sat at 220k after compressing everything it could and was forced to compress again every few thousand tokens, about 15 times an hour, while a 776-message session already sat at 150k after compressing. `history-status.json` records the session's `floor`.
 

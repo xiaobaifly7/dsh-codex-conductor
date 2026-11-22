@@ -75,12 +75,14 @@ function fixture(t, config = {}) {
       ...(verification ? { verification_version: version, verification_scope: request.context.routing?.verification_scope } : {}),
       structured: { criteria: request.context.acceptance.map(criterion => ({ criterion, status: 'met', evidence: '现场核对' })) } });
   };
-  const load = (overrides = {}, plugin = apply) => {
+  // disposers collects what the plugin registers with ctx.effect, so a test can unload the instance.
+  const load = (overrides = {}, plugin = apply, disposers) => {
     const tools = {};
     const previous = process.env.LOCALAPPDATA;
     process.env.LOCALAPPDATA = root;
     try {
-      plugin({ tools: { register(tool) { tools[tool.name] = tool; }, guard() {} }, on() {} },
+      const effect = disposers && ((setup) => { const dispose = setup(); if (dispose) disposers.push(dispose); });
+      plugin({ tools: { register(tool) { tools[tool.name] = tool; }, guard() {} }, on() {}, ...(effect ? { effect } : {}) },
         { autoVerify: 'off', closeoutGuard: false, continueFreshAboveTokens: 0,
           reportSchema: '/fixtures/report.v2.schema.json', ...config, ...overrides }, run);
     } finally {
@@ -255,6 +257,20 @@ test('reported met including must_verify still triggers automatic and explicit v
   const explicit = await harness.load({ autoVerify: 'off' }).codex_verify.execute({ job_id: 'explicit-mixed' }, caller());
   assert.equal(harness.records.get(explicit.job_id).context.verification_of, 'explicit-mixed');
   assert.ok(harness.starts.every(start => start.context.acceptance[0].includes('原验收第 4 条')));
+});
+
+test('an instance unloaded by a hot reload leaves automatic verification to the current one', async t => {
+  const harness = fixture(t, { autoVerify: 'flagged' });
+  const checks = ['确认条件一', '确认条件二', '复测关键结果'];
+  harness.add('finished-after-reload', { context: { acceptance: checks, must_verify: [3] }, duration_s: 44,
+    structured: { criteria: checks.map((criterion) => ({ criterion, status: 'met', evidence: '本轮实测' })) } });
+  const disposers = [];
+  const stale = harness.load({}, apply, disposers);
+  disposers.forEach((dispose) => dispose());
+  assert.equal((await stale.codex_status.execute({ job_id: 'finished-after-reload' }, caller())).auto_verify, undefined);
+  assert.equal(harness.starts.length, 0);
+  await harness.load().codex_status.execute({ job_id: 'finished-after-reload' }, caller());
+  assert.deepEqual(harness.starts.map((start) => start.context.verification_of), ['finished-after-reload']);
 });
 
 test('turning off convergence, historical gaps and verification reuse preserves the baseline runner trace', async t => {

@@ -33,7 +33,7 @@ function sourceJob() {
     structured: { ...report(), files_changed: ['docs/result.md'] } };
 }
 
-function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {} } = {}) {
+function harness({ source = sourceJob(), config = {}, running = false, jobs, verificationResult = {}, disposers } = {}) {
   const tools = {};
   const handlers = {};
   const calls = [];
@@ -69,6 +69,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
   try {
     apply({ tools: { register(tool) { tools[tool.name] = tool; }, guard(value) { guard = value; } },
       on(name, handler) { handlers[name] = handler; },
+      ...(disposers ? { effect(setup) { const dispose = setup(); if (dispose) disposers.push(dispose); } } : {}),
       get(key) { return key === 'jobs' ? jobs : undefined; } },
     { workspaces: ['/work'], allowHostAccess: true, autoVerify: 'off', waitSeconds: 0, model: 'new-default-model',
       effort: 'high', readOnlyEffort: 'medium', serviceTier: 'new-default-tier', ...config }, run);
@@ -349,6 +350,16 @@ test('terminal Codex failure starts Gemini only on a runner-confirmed no-write r
     assert.equal(value.fallback.job_id, 'VERIFY-1');
     assert.match(value.next, /已转交 Gemini 任务 VERIFY-1/);
   }
+});
+
+test('an unloaded instance does not start a Gemini takeover on its stale configuration', async () => {
+  const source = { ...sourceJob(), status: 'failed', error_kind: 'upstream_rejected', fallback_safe: true };
+  const disposers = [];
+  const h = harness({ source, config: { gemini }, disposers });
+  disposers.forEach((dispose) => dispose());
+  const value = await h.tools.codex_status.execute({ job_id: source.job_id }, exec);
+  assert.equal(h.start(), undefined);
+  assert.equal(value.fallback, undefined);
 });
 
 test('must_verify is checked before sampling and needs a matching independent result at closeout', async () => {
