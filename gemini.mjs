@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
+import { homedir } from 'node:os';
 import { lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -163,7 +164,8 @@ export async function leaseAgyAccount(pool, { holder, model, proxy, waitMs = LEA
     lease = await ask({}, waitMs);
   } catch (error) {
     if (!(error instanceof LeaseUnavailable)) throw error;
-    return { env: proxyEnv(primary.proxyUrl || proxy), note: `${error.message}；本次用主账号运行，未租用`, release: async () => {} };
+    return { env: { ...proxyEnv(primary.proxyUrl || proxy), HOME: homedir(), USERPROFILE: homedir() },
+      note: `${error.message}；本次用主账号运行，未租用`, release: async () => {} };
   }
   let leaseId = lease.leaseId, released = false;
   const account = lease.account;
@@ -183,9 +185,11 @@ export async function leaseAgyAccount(pool, { holder, model, proxy, waitMs = LEA
   };
   const timer = setInterval(renew, ttl / 3);
   timer.unref?.();
-  const env = lease.env && typeof lease.env === 'object'
+  // 主账号的 home 是本机用户目录（旧版 dsh-agy-link 给 ''，按本机用户目录算）；租约的 env 叠在上面。
+  const home = account.home || homedir();
+  const env = { HOME: home, USERPROFILE: home, ...(lease.env && typeof lease.env === 'object'
     ? Object.fromEntries(Object.entries(lease.env).filter(([key, value]) => key && typeof value === 'string'))
-    : { ...proxyEnv(account.proxyUrl || proxy), ...(account.home ? { HOME: account.home, USERPROFILE: account.home } : {}) };
+    : proxyEnv(account.proxyUrl || proxy)) };
   return { env, account, release: async (ok, error) => {
     released = true;
     clearInterval(timer);

@@ -902,11 +902,12 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
     lease = agy_runner.AccountLease(local_path(pool), f"dsh-codex-conductor/{Path(run_dir).name}", args.model,
                                     Path(run_dir) / "stderr.log")
     try:
-        home, proxy = lease.acquire(thread_id, getattr(args, "agy_home", None), args.agy_proxy)
+        home, proxy = lease.acquire(thread_id, getattr(args, "agy_home", None), args.agy_proxy,
+                                    getattr(args, "agy_primary_home", None))
     except agy_runner.LeaseError as error:
         return {**attempt_state(thread_id), "engine": "gemini", "failed": True, "error": str(error),
                 "gemini_quota_kind": error.kind}
-    # The account that ran is the one a continuation must return to; the primary has no agy_home.
+    # The account that ran is the one a continuation must return to, the primary's home included.
     args.agy_home = home
     state = None
     try:
@@ -2550,6 +2551,7 @@ def add_task_arguments(p):
     p.add_argument("--agy-proxy", help="Proxy for Antigravity")
     p.add_argument("--agy-home", help="Windows directory used as HOME/USERPROFILE for Antigravity (one pooled account)")
     p.add_argument("--agy-pool", help="DSH agy-link pool.json: lease the agy sign-in from dsh-agy-link for every agy run")
+    p.add_argument("--agy-primary-home", help="The DSH host's home directory: the primary account's HOME for agy")
     p.add_argument("--gemini-fallback-check", action="store_true", help="Check whether a failed Codex task left its worktree untouched")
     # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
@@ -4293,8 +4295,10 @@ def main():
                 parser.error("--engine gemini requires --agy-command")
             if args.gemini_fallback_check:
                 parser.error("--gemini-fallback-check is for Codex")
-        elif args.agy_command or args.agy_proxy or args.agy_home or args.agy_pool or getattr(args, "max_engine_running", None):
-            parser.error("--agy-command, --agy-proxy, --agy-home, --agy-pool and --max-engine-running require --engine gemini")
+        elif (args.agy_command or args.agy_proxy or args.agy_home or args.agy_pool or args.agy_primary_home or
+              getattr(args, "max_engine_running", None)):
+            parser.error("--agy-command, --agy-proxy, --agy-home, --agy-pool, --agy-primary-home and --max-engine-running "
+                         "require --engine gemini")
         if args.engine == "codex" and getattr(args, "model_ab", None) is not None:
             if not context or args.model is not None or args.resume or context.get("continuation") or context.get("verification_of"):
                 parser.error("--model-ab requires a new contextual task without a model override")

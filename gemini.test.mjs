@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 
@@ -115,6 +115,17 @@ test('gemini_write leases its account from dsh-agy-link, runs with the lease env
   assert.match(release[1].error, /auth failed/);
   assert.equal(link.leases.size, 0);
 
+  // A primary lease carries no HOME in env: HOME is its account.home, or this host's home directory from an older plugin.
+  for (const home of ['D:\\dsh\\data\\user', '']) {
+    link.replies.acquire = [[200, { ok: true, leaseId: `primary-${home.length}`, ttlMs: 60_000, slot: true, env: { NO_PROXY: 'localhost' },
+      account: { id: 'acc_primary', primary: true, isolated: false, home, proxyUrl: '' } }]];
+    link.leases.add(`primary-${home.length}`);
+    const primary = fixture(t, undefined, { ...CFG, accountPool: link.pool });
+    assert.equal((await primary.execute()).status, 'completed');
+    assert.deepEqual([primary.spawns[0].env.HOME, primary.spawns[0].env.USERPROFILE], Array(2).fill(home || homedir()));
+    assert.equal(primary.spawns[0].env.NO_PROXY, 'localhost');
+  }
+
   link.replies.acquire = [[503, { ok: false, code: 'no_account', error: 'every account is cooling down', retryAfterMs: 3600e3 }]];
   const refused = fixture(t, undefined, { ...CFG, accountPool: link.pool });
   const value = await refused.execute();
@@ -133,8 +144,7 @@ test('gemini_write without the lease API runs on the primary only', async (t) =>
     assert.equal(value.status, 'completed');
     assert.match(value.lease_note, /本次用主账号运行，未租用/);
     const { env } = h.spawns[0];
-    assert.equal(env.HOME, process.env.HOME);
-    assert.equal(env.USERPROFILE, process.env.USERPROFILE);
+    assert.deepEqual([env.HOME, env.USERPROFILE], [homedir(), homedir()]);
     assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:50577');
   });
 });

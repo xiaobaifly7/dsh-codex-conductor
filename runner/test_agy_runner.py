@@ -67,11 +67,11 @@ class FakeLink:
             self.count += 1
             lease = f"lease-{self.count}"
             self.leases[lease] = account["id"]
-            fields = {key: value for key, value in account.items() if key != "env"}
+            fields = {key: value for key, value in account.items() if key not in ("env", "systemHome")}
             return 200, {"ok": True, "leaseId": lease, "ttlMs": self.ttl_ms, "expiresAt": 0,
                          "slot": "env" not in account, "env": account.get("env", {"NO_PROXY": "localhost", **{
                              key: account["proxyUrl"] for key in ("HTTP_PROXY", "HTTPS_PROXY") if account["proxyUrl"]}}),
-                         "account": {"email": "", "alias": "", "primary": account["home"] == "",
+                         "account": {"email": "", "alias": "", "primary": account.get("systemHome", False),
                                      "isolated": "env" in account, **fields}}
         if body.get("leaseId") not in self.leases:
             return 404, {"ok": False, "code": "lease_not_found", "error": "unknown lease"}
@@ -91,12 +91,15 @@ def write_pool(pool_dir, accounts):
     """pool.json as dsh-agy-link writes it: the primary has no dir and lives in the system profile."""
     pool = Path(pool_dir) / "pool.json"
     pool.write_text(json.dumps({"primaryAccountId": "acc_primary", "accounts": [
-        {"id": a["id"], "dir": a["home"], "systemHome": a["home"] == "", "proxyUrl": a["proxyUrl"], "enabled": True}
+        {"id": a["id"], "dir": "" if a.get("systemHome") else a["home"], "systemHome": a.get("systemHome", False),
+         "proxyUrl": a["proxyUrl"], "enabled": True}
         for a in accounts]}), encoding="utf-8")
     return pool
 
 
-PRIMARY = {"id": "acc_primary", "home": "", "proxyUrl": "http://127.0.0.1:50577"}
+# The primary's home is the DSH host's home directory (the DSH-ASA launcher relocates it); pool.json gives it no dir.
+PRIMARY_HOME = r"D:\dsh\data\user"
+PRIMARY = {"id": "acc_primary", "home": PRIMARY_HOME, "proxyUrl": "http://127.0.0.1:50577", "systemHome": True}
 SECOND = {"id": "acc_b", "home": r"D:\pool\acc_b", "proxyUrl": ""}
 
 
@@ -133,7 +136,7 @@ class LeaseTests(unittest.TestCase):
         # The primary runs in its own profile: no HOME override, and its own proxy.
         link.choice = "acc_primary"
         lease = self.lease()
-        self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890"), (None, "http://127.0.0.1:50577"))
+        self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890", PRIMARY_HOME), (PRIMARY_HOME, "http://127.0.0.1:50577"))
         lease.release(True, "ignored")
         self.assertEqual(link.calls[-1], ("release", {"leaseId": "lease-2", "ok": True, "model": "gemini-4-neon-medium"}))
         self.assertFalse(self.log.exists())
@@ -156,10 +159,14 @@ class LeaseTests(unittest.TestCase):
         link = self.link(choice="acc_primary")
         self.assertEqual(self.lease().acquire("conv-1", SECOND["home"], None)[0], SECOND["home"])
         self.assertEqual(link.calls[-1][1]["accountDir"], SECOND["home"])
-        # No recorded home: the conversation is in the primary's profile, pinned by its id from pool.json.
-        self.assertEqual(self.lease().acquire("conv-1", None, None)[0], None)
-        self.assertEqual(link.calls[-1][1]["accountId"], "acc_primary")
-        self.assertNotIn("accountDir", link.calls[-1][1])
+        # The primary's own home (or none recorded): pinned by its id from pool.json, run in its home.
+        for recorded in (PRIMARY_HOME.lower(), None):
+            self.assertEqual(self.lease().acquire("conv-1", recorded, None, PRIMARY_HOME)[0], PRIMARY_HOME)
+            self.assertEqual(link.calls[-1][1]["accountId"], "acc_primary")
+            self.assertNotIn("accountDir", link.calls[-1][1])
+        # An older dsh-agy-link reports '' as the primary's home: the host's home directory stands in.
+        link.accounts[0] = {**PRIMARY, "home": ""}
+        self.assertEqual(self.lease().acquire(None, None, None, PRIMARY_HOME)[0], PRIMARY_HOME)
         with self.assertRaisesRegex(agy_runner.LeaseError, "fresh: true") as caught:
             self.lease().acquire("conv-1", r"D:\pool\gone", None)
         self.assertEqual(caught.exception.kind, "provider_permanent")
@@ -208,14 +215,16 @@ class LeaseTests(unittest.TestCase):
             else:
                 (Path(self.tmp.name) / ".link-endpoint.json").unlink(missing_ok=True)
             lease = self.lease()
-            self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890"), (None, "http://127.0.0.1:50577"), setup)
+            self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890", PRIMARY_HOME),
+                             (PRIMARY_HOME, "http://127.0.0.1:50577"), setup)
             lease.release(True)
             log = self.log.read_text("utf-8")
             self.assertEqual(log.count(agy_runner.LEASE_NOTE), 1, setup)
             self.assertIn("running on the primary account without a lease", log)
-            self.assertEqual(self.lease().acquire("conv-1", None, None), (None, "http://127.0.0.1:50577"), setup)
+            self.assertEqual(self.lease().acquire("conv-1", PRIMARY_HOME, None, PRIMARY_HOME),
+                             (PRIMARY_HOME, "http://127.0.0.1:50577"), setup)
             with self.assertRaisesRegex(agy_runner.LeaseError, "wrong account"):
-                self.lease().acquire("conv-1", SECOND["home"], None)
+                self.lease().acquire("conv-1", SECOND["home"], None, PRIMARY_HOME)
 
 
 class AdapterTests(unittest.TestCase):
@@ -261,6 +270,14 @@ class AdapterTests(unittest.TestCase):
                 self.assertTrue(set(leased) <= set(entries))  # plain names: the values are already Windows strings
                 self.assertIn("KEEP/u", entries)
                 self.assertNotIn("HOME/p", entries)
+            # A primary lease's env has no HOME: the account home (the host's home directory) is set under it.
+            _, primary = agy_runner.build_command(args(
+                r"D:\local project", agy_command=r"C:\tools\agy.exe", agy_home=r"D:\dsh\data\user",
+                agy_env={"NO_PROXY": "localhost"}), run_dir, None)
+            self.assertEqual((primary["HOME"], primary["USERPROFILE"], primary["NO_PROXY"]),
+                             (r"D:\dsh\data\user", r"D:\dsh\data\user", "localhost"))
+            if os.name != "nt":
+                self.assertTrue({"HOME", "USERPROFILE", "NO_PROXY"} <= set(primary["WSLENV"].split(":")))
             # The account home still scopes agy's own data directory for host read-only jobs.
             permissions = json.loads(command[command.index("--settings") + 1])["permissions"]
             self.assertIn("write_file(D:/pool/acc 1/.gemini/antigravity-cli)", permissions["allow"])

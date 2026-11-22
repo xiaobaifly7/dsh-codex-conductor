@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
 // apply() writes a planner template and runtime marker; keep both away from real DSH state.
@@ -155,6 +155,8 @@ test('Gemini leases its account from dsh-agy-link and continues under the same o
   let argv = await run();
   assert.equal(option(argv, '--agy-pool'), accountPool);
   assert.equal(option(argv, '--agy-home'), undefined);
+  // The primary's HOME is this host's home directory, for a primary lease and for running without one.
+  assert.equal(option(argv, '--agy-primary-home'), homedir());
   assert.equal(option(argv, '--agy-proxy'), 'http://127.0.0.1:7890');
 
   const source = sourceJob();
@@ -176,12 +178,12 @@ test('Gemini leases its account from dsh-agy-link and continues under the same o
   assert.equal(option(await resume({ fresh: true }), '--agy-home'), undefined);
   assert.equal(option(await resume({ engine: 'codex' }), '--agy-home'), undefined);
   assert.equal(option(await resume({ engine: 'codex' }), '--agy-pool'), undefined);
-  // A conversation without agy_home ran on the primary (system profile): the runner pins the primary, no HOME.
+  // A conversation without agy_home ran on the primary, whose conversations live under this host's home directory.
   writeFileSync(accountPool, JSON.stringify({ ...pool, accounts: [...pool.accounts, { id: 'acc_primary', dir: '', systemHome: true, enabled: true }] }));
   delete source.task_options.agy_home;
   argv = await resume({ fresh: false });
   assert.equal(option(argv, '--resume'), 'conversation-a');
-  assert.equal(option(argv, '--agy-home'), undefined);
+  assert.equal(option(argv, '--agy-home'), homedir());
   assert.equal(option(argv, '--agy-pool'), accountPool);
   source.task_options.agy_home = 'd:\POOL\a';
   writeFileSync(accountPool, JSON.stringify({ ...pool, accounts: pool.accounts.filter(a => a.id !== 'acc_a') }));

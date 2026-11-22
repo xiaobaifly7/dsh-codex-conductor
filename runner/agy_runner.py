@@ -160,19 +160,19 @@ def build_command(args, run_dir, conversation_id, scratch=None):
     env = os.environ.copy()
     exported = []
     leased = getattr(args, "agy_env", None)
-    if leased is not None:
-        # dsh-agy-link's variables for the leased account replace the runner's own home and proxy settings. The values are
-        # already Windows paths and strings, so WSLENV carries them without translation flags.
-        env.update(leased)
-        exported.extend(leased)
     if args.agy_proxy and leased is None:
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env[key] = env[key.lower()] = args.agy_proxy
             exported.append(key)
-    if home and leased is None:
-        # agy reads its conversations from HOME/USERPROFILE. On Windows the login is one machine-wide credential, not per home.
+    if home:
+        # agy reads its conversations from HOME/USERPROFILE, the primary's included (the DSH host's home directory).
         env["HOME"] = env["USERPROFILE"] = home
         exported.extend(("HOME", "USERPROFILE"))
+    if leased is not None:
+        # dsh-agy-link's variables for the leased account go on top and replace the runner's proxy settings. The values
+        # are already Windows paths and strings, so WSLENV carries them without translation flags.
+        env.update(leased)
+        exported.extend(key for key in leased if key not in exported)
     if host and readonly:
         # Python bytecode and pytest caches written into the project failed 3 of 87 Gemini verifications as
         # verification_tree_changed (none of 307 Codex ones, which set the same two variables). Plain values, so
@@ -275,6 +275,10 @@ def _lease_env(env):
             if isinstance(key, str) and key and "=" not in key and ":" not in key and isinstance(value, str)}
 
 
+def _same_dir(a, b):
+    return ntpath.normcase(ntpath.normpath(a)) == ntpath.normcase(ntpath.normpath(b))
+
+
 class AccountLease:
     """The agy sign-in leased for one agy process: acquire, renew in the background, release with the outcome."""
 
@@ -322,30 +326,34 @@ class AccountLease:
             raise LeaseError(message, _retry_kind(delay / 1000))
         raise LeaseError(message)
 
-    def acquire(self, conversation, home, proxy, wait_ms=LEASE_WAIT_MS):
-        """Return (home, proxy) for agy; home None is the primary's own profile. A held lease also sets self.env.
+    def acquire(self, conversation, home, proxy, primary_home=None, wait_ms=LEASE_WAIT_MS):
+        """Return (home, proxy) for agy. A held lease also sets self.env.
 
-        A conversation lives under its account's HOME, so a continuation pins that account (no home: the primary); a
-        fresh run lets dsh-agy-link choose. Without the lease API a fresh run goes to the primary unleased, and a
+        primary_home is the DSH host's home directory, where the primary keeps its conversations. A conversation lives
+        under its account's HOME, so a continuation pins that account (no home, or the primary's: the primary); a fresh
+        run lets dsh-agy-link choose. Without the lease API a run goes to the primary in primary_home unleased, and a
         secondary's conversation fails rather than run as the wrong identity."""
         primary = self.primary()
+        secondary = bool(home) and not (primary_home and _same_dir(home, primary_home))
         pin = {}
         if conversation:
-            pin = {"accountDir": home} if home else {"accountId": primary["id"]} if primary.get("id") else None
+            pin = ({"accountDir": home} if secondary else {"accountId": primary["id"]} if primary.get("id")
+                   else {"accountDir": home} if home else None)
         try:
             if pin is None:
                 raise LeaseError(f"no primary account in {self.pool_file} to continue the conversation on")
             self.lease_id, self.account, ttl, self.env = self._acquire(pin, wait_ms)
         except LeaseUnavailable as error:
-            if conversation and home:
+            if conversation and secondary:
                 raise LeaseError(f"cannot continue a conversation of the agy account at {home} without a dsh-agy-link "
                                  f"lease, it would run as the wrong account: {error}") from None
             self.note(f"{error}; running on the primary account without a lease")
-            return None, primary.get("proxyUrl") or proxy
+            return primary_home or None, primary.get("proxyUrl") or proxy
         interval = (ttl if isinstance(ttl, (int, float)) and ttl > 0 else LEASE_TTL_MS) / 3000
         self.renewer = threading.Thread(target=self._renew, args=(interval,), daemon=True)
         self.renewer.start()
-        return self.account.get("home") or None, self.account.get("proxyUrl") or proxy
+        # An older dsh-agy-link reports '' for the primary: its home is then the host's, as without a lease.
+        return self.account.get("home") or primary_home or None, self.account.get("proxyUrl") or proxy
 
 
     def _renew(self, interval):

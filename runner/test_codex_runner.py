@@ -3114,12 +3114,14 @@ class RunnerTests(unittest.TestCase):
         argv, env, call = self.fake_gemini(mode)
         home = Path(self.tmp.name) / "acc b"
         home.mkdir(exist_ok=True)
-        primary = {"id": "acc_primary", "home": "", "proxyUrl": "http://primary.invalid:1"}
+        primary_home = Path(self.tmp.name) / "dsh user"
+        primary_home.mkdir(exist_ok=True)
+        primary = {"id": "acc_primary", "home": str(primary_home), "proxyUrl": "http://primary.invalid:1", "systemHome": True}
         second = {"id": "acc_b", "home": str(home), "proxyUrl": "http://acc-b.invalid:2",
                   "env": {"HOME": str(home), "USERPROFILE": str(home), "HTTPS_PROXY": "http://acc-b.invalid:2"}}
         # The loopback lease calls must bypass the proxy agy is given.
         env = {**env, "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}
-        return (*argv, "--agy-proxy", "http://configured.invalid:3"), env, call, primary, second
+        return (*argv, "--agy-proxy", "http://configured.invalid:3", "--agy-primary-home", str(primary_home)), env, call, primary, second
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_leases_the_agy_account_and_continues_on_the_one_that_ran(self):
@@ -3143,14 +3145,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((resumed["status"], resumed["task_options"]["agy_home"]), ("completed", second["home"]))
         self.assertEqual(link.calls[2][1]["accountDir"], second["home"])
 
-        # The primary runs in the normal profile: no HOME override and no agy_home to return to.
+        # The primary runs in its home (the DSH host's home directory), recorded like any account's.
         fresh = self.invoke(*argv, "--agy-pool", str(pool), env=env)
-        self.assertEqual(fresh["status"], "completed")
-        self.assertNotIn("agy_home", fresh["task_options"])
+        self.assertEqual((fresh["status"], fresh["task_options"]["agy_home"]), ("completed", primary["home"]))
         received = json.loads(call.read_text("utf-8"))
-        self.assertEqual((received["home"], received["proxy"]),
-                         ([env.get("HOME", self.env.get("HOME")), self.env.get("USERPROFILE")], primary["proxyUrl"]))
-        self.invoke(*argv, "--agy-pool", str(pool), "--resume", fresh["conversation_id"], env=env)
+        self.assertEqual((received["home"], received["proxy"]), ([primary["home"]] * 2, primary["proxyUrl"]))
+        self.invoke(*argv, "--agy-pool", str(pool), "--resume", fresh["conversation_id"], "--agy-home", primary["home"], env=env)
         self.assertEqual(link.calls[-2][1]["accountId"], "acc_primary")
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
@@ -3182,11 +3182,9 @@ class RunnerTests(unittest.TestCase):
         argv, env, call, primary, second = self.pooled_gemini()
         pool, _ = self.lease_link([primary, second], endpoint=False)
         result = self.invoke(*argv, "--agy-pool", str(pool), env=env)
-        self.assertEqual(result["status"], "completed")
-        self.assertNotIn("agy_home", result["task_options"])
+        self.assertEqual((result["status"], result["task_options"]["agy_home"]), ("completed", primary["home"]))
         received = json.loads(call.read_text("utf-8"))
-        self.assertEqual(received["proxy"], primary["proxyUrl"])
-        self.assertNotEqual(received["home"][0], second["home"])
+        self.assertEqual((received["home"], received["proxy"]), ([primary["home"]] * 2, primary["proxyUrl"]))
         log = (Path(result["log_dir"]) / "stderr.log").read_text("utf-8")
         self.assertIn("running on the primary account without a lease", log)
         call.unlink()
