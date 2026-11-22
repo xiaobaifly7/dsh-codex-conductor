@@ -1627,7 +1627,8 @@ test('products middleware waits before dispatch and returns guard-equivalent err
   assert.equal((await h.handlers['tools/execute']({ ...exec('/repo/raw.js') }, async () => assert.fail('raw read dispatched'))).isError, true);
 });
 
-test('products middleware refuses failed or timed-out recovery without dispatching', { timeout: 10_000 }, async () => {
+// The timeout case waits out the real 15-second recovery bound.
+test('products middleware refuses failed or timed-out recovery without dispatching', { timeout: 30_000 }, async () => {
   for (const failure of ['failed', 'timeout']) {
     const recovery = Promise.withResolvers();
     const h = harness({ config: { workspaces: ['/repo'], plannerReads: 'products', productsResult: recovery.promise } });

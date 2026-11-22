@@ -854,7 +854,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     (value.verification_integrity === 'concurrent_changes' ? '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。'
       : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
     (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个文件的内容未比对，请核对对应验收证据。` : '') +
-    '先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录结果；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。';
+    `先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录原任务 ${value.context.verification_of}（核验任务本身不复核、不再核验）；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。`;
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers, ownerDecisions })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
     .replace('先用 git status 或对比文件确认现状', '先用 git status 核对文件列表，内容核对交给 codex_verify')
@@ -2562,6 +2562,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (unknownState(source) || !owns(exec?.agent?.id, source.context?.owner)) {
       throw new Error(`${tool}: verify_previous 的任务 ${jobId} 归属未知或不属于当前会话，未派出这一单。`);
     }
+    if (source.context.verification_of) throw new Error(`${await verificationOnlyRefusal(tool, source, exec?.signal)}未派出这一单。`);
     const overlap = args.write === true ? verificationWriteOverlap(source, args, exec) : [];
     if (overlap.length) throw new Error(verificationOverlapRefusal(jobId, overlap, tool, running));
     if (!running && cfg.verificationReuse && withoutVerificationProduct(source)) {
@@ -3338,7 +3339,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   const verifyTool = {
     name: 'codex_verify',
-    description: '独立核验本会话一个已结束的任务：新会话、只读，沿用原目录和主机访问。配置了 Gemini 时默认换另一引擎。' +
+    description: '独立核验本会话一个已结束的任务：新会话、只读，沿用原目录和主机访问。配置了 Gemini 时默认换另一引擎。核验只做一层，核验任务本身不能再核验。' +
       engineGuidance(cfg) +
       (cfg.verificationReuse ? '没有可核验产出的受阻任务不派核验。文件和核验范围都未变时复用上一份核验。' : '') +
       '回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
@@ -3363,6 +3364,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const source = automatic ?? await conductor.waitJob(args.job_id, 0, exec?.signal);
       if (unknownState(source) || !['running', 'completed', 'failed', 'cancelled'].includes(source.status)) throw new Error('codex_verify: 原任务状态未知，请先用 codex_status 确认');
       if (!owns(owner, source.context?.owner)) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
+      if (source.context.verification_of) throw new Error(await verificationOnlyRefusal('codex_verify', source, exec?.signal));
       if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
       if (cfg.verificationReuse && withoutVerificationProduct(source)) {
         throw new Error(`codex_verify: 原任务 ${source.job_id} 受阻，未记录改动或可核验结果。先处理原阻塞。`);
@@ -3401,6 +3403,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
   };
   ctx.tools.register(verifyTool);
+
+  // 核验只做一层：核验任务的报告已自动算作原任务的独立依据（criterionSupport），复核或再核验核验任务只会一层套一层，
+  // 更深的核验也不算原任务的依据（2026-11-22 一单被套了 13 层、约 3.5 小时）。
+  async function verificationOnlyRefusal(tool, source, signal) {
+    let root = source.context.verification_of;
+    // 旧版留下的核验链指向上一层核验，沿链找到原任务。
+    for (let hops = 0; hops < 20; hops++) {
+      const up = await conductor.waitJob(root, 0, signal).catch(() => undefined);
+      if (!up || unknownState(up) || !up.context?.verification_of) break;
+      root = up.context.verification_of;
+    }
+    return `${tool}: ${source.job_id} 是核验任务（核验对象 ${source.context.verification_of}）。核验只做一层：核验任务本身不复核、也不再核验，` +
+      `它的报告已自动算作原任务的独立依据。直接用 codex_review 记录原任务 ${root}；对核验结论有疑问时，对 ${root} 再派 codex_verify 并在 focus 写明要复查哪条结论。`;
+  }
 
   function dispatchVerification(source, args, exec, onStarted) {
     source = withReport(source);
@@ -3814,7 +3830,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       'verified 不能与原报告矛盾：报告自标 not_met/blocked 的条目要写你自己的核验证据；报告的未决项和阻塞须在 notes 逐项写「unresolved#N: 依据」「blocker:<id>: 依据」。' +
       'accepted_deviations 可以把核实后仍未满足的条目保留 not_met/blocked，并在该条目的 accepted 写接受原因。' +
       (cfg.historicalGapReview ? '客观无法补回的历史记录可用 historical_gap 分类，仍须在 accepted 写明原因。' : '') +
-      'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。',
+      'Codex 因正文有错把已完成核对标为 not_met 时，按原验收纠正。只能记录当前会话拥有的任务。核验任务不复核：核验结论记在原任务上。',
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `记录 Codex 核验 ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
       job_id: { type: 'string' }, status: { type: 'string', enum: ['verified', 'needs_changes', 'accepted_deviations'] },
@@ -3854,6 +3870,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         throw new Error(await noSuchJob(`codex_review: 未找到任务 ${args.job_id}；请核对本会话真实的 runner job_id。`));
       }
       if (!owns(owner, source.context?.owner)) throw new Error('codex_review: 原任务归属未知或不属于当前会话');
+      if (source.context.verification_of) throw new Error(await verificationOnlyRefusal('codex_review', source, exec?.signal));
       exec?.signal?.throwIfAborted();
       const { job_id } = args;
       const level = evidenceLevel(source);

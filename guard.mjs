@@ -1045,7 +1045,8 @@ export function plannerReadTargets(exec, cwd = exec?.agent?.session?.header?.cwd
   return targets.every(Boolean) ? targets : null;
 }
 
-export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '', refreshTimeoutMs = 3_000, handoverArchive = () => undefined } = {}) {
+// refreshTimeoutMs：runner 的 products 查询要扫全部任务目录，2026-11-22 实测 3.9–9.7 秒，原先的 3 秒上限当天误拒了 22 次读取。
+export function createProductReads(cfg, refresh, { now = Date.now, plannerFile = '', refreshTimeoutMs = 15_000, handoverArchive = () => undefined } = {}) {
   const sessions = new Map();
   const limit = 10_000;
   const stateFor = (owner) => {

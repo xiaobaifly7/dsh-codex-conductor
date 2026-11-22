@@ -30,6 +30,9 @@ DENIAL = re.compile(
 )
 INVALID_FLAG = re.compile(r"flag provided but not defined|unknown (?:flag|option)|invalid value .+ for flag", re.IGNORECASE)
 HTTP_FORBIDDEN = re.compile(r"\b403\b")
+# agy prints this for every read-only job. As the only stderr line it became the error of two failed jobs on 2026-11-22,
+# hiding that agy had exited without a result, so it never becomes the diagnostics tail.
+PLAN_MODE_NOTICE = "--mode plan has no effect while slash command expansion is disabled"
 HTTP_STATUS = re.compile(r"(?:^|HTTP\s+|status code\s+)([1-5][0-9]{2})(?=[:\s]|$)", re.I)
 MAX_RETRYABLE_DELAY_SECONDS = 300
 QUOTA_STATUS_CODES = (429, 499, 503)
@@ -117,6 +120,8 @@ def build_command(args, run_dir, conversation_id, scratch=None):
     if getattr(args, "agy_home", None):
         home = _windows_path(args.agy_home) if windows else os.path.realpath(args.agy_home)
     if readonly:
+        # Keep it despite agy's "no effect" warning: without it a headless read-only job wrote a project file and one
+        # outside the project; with it both were auto-denied (agy 1.5.14, 2026-11-22).
         flags += ["--mode", "plan"]
         # Plan mode keeps its plan and scratch scripts in agy's own data directory under the account home. A deny rule
         # beats any allow rule, so the blanket write_file(*) deny failed a host verification that wrote
@@ -308,7 +313,7 @@ def _launch(run_dir, job_id, cwd, command, flags):
                 rendered = _message(problem)
                 if isinstance(problem, dict) and rendered:
                     diagnostics_tail[0] = problem
-                elif text:
+                elif text and PLAN_MODE_NOTICE not in text:
                     previous = diagnostics_tail[0]
                     if isinstance(previous, str) and _http_status(previous) in QUOTA_STATUS_CODES and not _http_status(text):
                         diagnostics_tail[0] = f"{previous}\n{text}"[:1000]
