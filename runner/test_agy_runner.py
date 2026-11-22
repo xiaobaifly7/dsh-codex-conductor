@@ -69,6 +69,22 @@ class AdapterTests(unittest.TestCase):
             self.assertFalse(settings["allowNonWorkspaceAccess"])
             self.assertIn("command(*)", settings["permissions"]["deny"])
 
+    def test_host_read_only_jobs_may_write_only_into_agys_own_data_directory(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            def permissions(**overrides):
+                command = agy_runner.build_command(args(r"D:\local project", agy_command=r"C:\tools\agy.exe", **overrides),
+                                                   run_dir, None)[0]
+                return json.loads(command[command.index("--settings") + 1])["permissions"]
+
+            perms = permissions(sandbox="danger-full-access", context={"write": False}, agy_home=r"D:\pool\acc 1")
+            self.assertIn("write_file(D:/pool/acc 1/.gemini/antigravity-cli)", perms["allow"])
+            # A deny rule would override that allow, so the blanket one goes; other writes still ask and are auto-denied.
+            self.assertNotIn("write_file(*)", perms["deny"])
+            self.assertNotIn("write_file(*)", perms["allow"])
+            # Without a known home, or without host access, every write stays denied.
+            self.assertIn("write_file(*)", permissions(sandbox="danger-full-access", context={"write": False})["deny"])
+            self.assertIn("write_file(*)", permissions(agy_home=r"D:\pool\acc 1")["deny"])
+
     def test_host_read_only_jobs_keep_python_caches_out_of_the_project(self):
         with tempfile.TemporaryDirectory() as run_dir:
             def env_of(**overrides):

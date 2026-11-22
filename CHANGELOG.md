@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.151` Gemini 主机只读任务（含核验）在知道账号目录时，放行写入 agy 自己的数据目录（`<账号目录>/.gemini/antigravity-cli`，plan 模式把计划和临时脚本放在这里）。原先一律禁止写入，而禁止规则优先于放行规则，2026-11-22 有一单核验因为在这里写临时脚本被判为 `permission_denied`。项目和其他位置的写入仍会被 agy 自动拒绝，并照旧报 `permission_denied`。
+
 `0.9.150` 插件被热加载过之后，交接时关掉原会话“自动继续”那一步不再总是失败。宿主 HMR 用 AsyncLocalStorage 标记“正处在一次重载事务里”，带着这个标记的调用一律被拒为“HMR transactions cannot be nested”。插件热加载时建的请求监视器继承了那次事务的上下文，所以此后每次交接写设置都被拒，原会话的自动继续关不掉，自检 `predecessorFrozen` 失败。0.9.144 把它当成“前几步的事务还没结束”加了重试，其实重试多少次都一样，这次去掉；改为写设置前先用宿主的 `hmr.executing.exit()` 跳出继承的上下文，和宿主自己的配置监视器一样。11 月 22 日在桌面版上实测：热加载后的自动交接仍报这个错。
 
 `0.9.149` 手动续接请求（`resume-request.json`）遇到目标仍是 active、但目标循环已解除武装的会话时，直接重新武装目标，会话正在运行或上一轮已正常结束也一样，不发消息，由宿主在会话空闲时排下一轮。此前这种会话一律以 `running` 或 `not_interrupted` 跳过：用户中止一个不是目标轮的回合后，宿主只解除武装、目标仍是 active，之后除了在界面上 `/goal resume` 没有办法让它再进入目标循环（11 月 22 日两个会话就这样停在一轮做完之后）。自动续接和热重载续接不变。
@@ -197,6 +199,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.151` Gemini host read-only jobs (verifications included) may write into agy's own data directory (`<account home>/.gemini/antigravity-cli`, where plan mode keeps its plan and scratch scripts) when the account home is known. They used to deny every write, and a deny rule beats any allow rule, so on 2026-11-22 a verification that wrote a scratch script there failed as `permission_denied`. Writes anywhere else, the project included, are still auto-denied by agy and reported as `permission_denied`.
 
 `0.9.150` After the plugin has been hot-loaded, a hand-over no longer always fails to turn the old session's auto-continue off. Host HMR marks "inside a reload transaction" with an AsyncLocalStorage store and rejects every call carrying it as "HMR transactions cannot be nested". The request watcher the plugin creates while hot-loading inherits that transaction's context, so every later hand-over's settings write was rejected, auto-continue stayed on for the old session and the `predecessorFrozen` self-check failed. 0.9.144 read it as a transaction from earlier steps still running and retried, which can never help; that retry is removed. The write now first leaves the inherited context with the host's `hmr.executing.exit()`, as the host's own configuration watchers do. Seen on the desktop on 2026-11-22: an automatic hand-over after a hot reload still hit the error.
 
