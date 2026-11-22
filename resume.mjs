@@ -106,6 +106,18 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
     const { agent } = resolved;
     if (signal?.aborted) return skipped('unloaded');
     if (automatic) basis.agentStatus = agent.status;
+    // An operator-named session whose goal is still active but disarmed (the user stopped a turn that was not a goal
+    // round, so the round driver let go) only needs rearming: the driver queues the next round once the session is
+    // idle, so this holds while it runs or after a completed turn, and no prompt is sent.
+    if (!send && !automatic && !reload) {
+      const goals = ctx.get('goals');
+      const goal = goals?.get(agent);
+      if (goal?.phase === 'active' && goal.activation === 'disarmed' && goal.roundsStarted < goal.maxGoalRounds) {
+        method = 'goal';
+        goals.resume(agent, { id: goal.id, revision: goal.revision });
+        return result('resumed', 'goal_resumed', method);
+      }
+    }
     // queue: a running agent's followup lands in next-turn, the same path as the UI's Queue mode.
     if (agent.status === 'running' && !queue) return skipped('running');
     // Resolve first: the host closes a crashed, unterminated turn as interrupted.

@@ -161,6 +161,21 @@ test('resume: paused, blocked and disarmed active goals resume with their ID/rev
   assert.deepEqual(f.wakes, []);
 });
 
+test('resume: a named session whose active goal was disarmed is rearmed while running or after a completed turn, without a prompt', async (t) => {
+  const f = fixture(t);
+  const running = f.add('running');
+  running.status = 'running';
+  f.goalViews.set(running, goal({ phase: 'active', roundsStarted: 2, maxGoalRounds: 10 }));
+  f.goalViews.set(f.add('complete', [start(), end()]), goal({ phase: 'active', roundsStarted: 2, maxGoalRounds: 10 }));
+  f.goalViews.set(f.add('exhausted', [start(), end()]), goal({ phase: 'active', roundsStarted: 10, maxGoalRounds: 10 }));
+  f.goalViews.set(f.add('paused', [start(), end()]), goal({ phase: 'paused' }));
+  const result = await f.run({ sessions: ['running', 'complete', 'exhausted', 'paused'] });
+  assert.deepEqual(result.sessions, [row('running', 'goal_resumed', 'goal'), row('complete', 'goal_resumed', 'goal'),
+    row('exhausted', 'not_interrupted'), row('paused', 'not_interrupted')]);
+  assert.deepEqual(f.resumes.map((r) => r.agent), [f.agents.get('running'), f.agents.get('complete')]);
+  assert.deepEqual(f.messages, []);
+});
+
 test('resume: a turn rejected as blocked after a restart resumes a disarmed goal but never sends a prompt', async (t) => {
   const f = fixture(t);
   const agent = f.add('goal', [start(), interrupted(), start(), blocked()]);
