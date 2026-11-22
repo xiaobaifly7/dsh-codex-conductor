@@ -416,12 +416,13 @@ export function closeoutDeferral(jobs, { unreviewed, needsChanges }, deferFor) {
 }
 export const deferralPath = (ids) => `先对 ${ids.join('、')} 派 codex_verify（或在下一单上带 verify_previous），核验在跑时可以派不重叠的下一单`;
 
-export function closeoutRefusal(tool, { unreviewed, needsChanges }) {
+// resume=false when the engine is locked to Gemini: a codex_run with resume is then always refused.
+export function closeoutRefusal(tool, { unreviewed, needsChanges }, { resume = true } = {}) {
   if (!unreviewed.length && !needsChanges.length) return '';
   return `${tool}: 本会话还有已结束但未收尾的 Codex 任务，${tool === 'update_goal' ? '会话目标暂不能标记完成' : '未启动新任务'}。` +
     (unreviewed.length ? `报告标出问题却没有验收记录，先用 codex_review 记录：${unreviewed.join('、')}。` : '') +
     (unreviewed.length && tool === 'codex_run' ? `需要核验再记的：${deferralPath(unreviewed)}（同一时间只放行一个待验收任务，每个任务只放行一次）。` : '') +
-    (needsChanges.length ? `needs_changes 尚未结案，最新轮次：${needsChanges.join('、')}；用 codex_continue 或带 resume 的 codex_run 返工，` +
+    (needsChanges.length ? `needs_changes 尚未结案，最新轮次：${needsChanges.join('、')}；用 codex_continue${resume ? ' 或带 resume 的 codex_run' : ''} 返工，` +
       '或核实后用 codex_review 记 accepted_deviations（写明理由）或 verified。' : '') +
     'codex_continue、codex_verify、codex_review、codex_status、codex_output、codex_cancel 仍可使用。';
 }
