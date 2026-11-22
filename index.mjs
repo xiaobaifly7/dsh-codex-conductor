@@ -1548,6 +1548,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     directSessions.clear();
     for (const owner of next) directSessions.add(owner);
   };
+  // 中途切换时只换系统提示词不够：长对话里规划端会照着前面的做法继续。切换后的下一条用户消息附一条说明，只附一次。
+  // shortcut: 待附的说明只记在内存里，切换后、下一条消息前重载插件就不附了（系统提示词仍按新模式），需要时再存进 direct-sessions.json。
+  const modeNotices = new Map();
+  const MODE_NOTICE = {
+    on: '[codex-conductor] 用户刚把本会话切到直接执行模式：从现在起你可以直接用自己的工具读写文件、运行命令完成任务，不必再派给 Codex / Gemini；' +
+      '前面对话里“只做规划、执行交给 Codex”的做法不再适用。用户明确要求派活时仍可派。',
+    off: '[codex-conductor] 用户刚把本会话切回规划模式：从现在起你只做规划，执行交给 Codex / Gemini；你自己写文件、运行命令的工具会被护栏拒绝，' +
+      '前面对话里自己动手的做法不再适用。',
+  };
+  const DIRECT_SECTION = '## 本会话为直接执行模式（用户设定）\n用户已在本会话打开直接执行：用你自己的工具读写文件、运行命令完成任务，不必派给 Codex / Gemini；' +
+    '用户明确要求派活时仍可派。用户输入 /conductor direct off 后恢复只做规划。';
   const history = createHistoryTracker({ directory: stateDirectory,
     threshold: () => cfg.handoverSuggestMessages ?? 0, contextThreshold: () => cfg.handoverContextTokens ?? 0 });
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
@@ -2017,10 +2028,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   if (plannerFile) try {
     const engineGuide = !cfg.gemini ? '' : cfg.lockEngine ? `- ${engineGuidance(cfg)}`
       : plannerPrompt(fileURLToPath(new URL('./engine-prompt.md', import.meta.url)));
-    // 组装时 context.scope 就是当前会话的 agent；直接执行的会话不注入。
+    // 组装时 context.scope 就是当前会话的 agent；直接执行的会话不注入规划要求，改为说明当前模式。
     ctx.get?.('systemPrompt')?.section({ name: 'codex-conductor:planner', order: 10100, interpolate: false,
       text: (context) => {
-        try { if (directMode(context?.scope?.id)) return ''; } catch {}
+        try { if (directMode(context?.scope?.id)) return DIRECT_SECTION; } catch {}
         return plannerSection([engineGuide, plannerPrompt(plannerFile)].filter(Boolean).join('\n\n'));
       } });
     plannerInjected = Boolean(ctx.get?.('systemPrompt'));
@@ -2039,7 +2050,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         }
         if (!id) return { kind: 'error', text: '无法识别当前会话，请在会话里使用 /conductor。' };
         if (value !== 'status') {
+          const before = directMode(id);
           try { setDirectMode(id, value === 'on'); } catch (error) { return { kind: 'error', text: `没能保存设置，模式未改：${error?.message ?? error}` }; }
+          if (directMode(id) !== before) modeNotices.set(id, value);
         }
         return { kind: 'success', text: directMode(id)
           ? '本会话是**直接执行**模式：DeepSeek 可以自己读写文件、运行命令，不再注入“只做规划”的要求，派 Codex / Gemini 的工具照样能用。从下一条消息起生效；`/conductor direct off` 恢复只做规划。'
@@ -4298,6 +4311,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const text = `[codex-conductor] 本会话已于 ${at ?? '（时间未知）'} 交接给会话 ${successor}。这里的 Codex 派活、续接、核验、验收和取消工具都已停用，只能查看记录。` +
         `请直接告诉用户：到会话 ${successor} 继续这项工作，然后结束本回合，不要在这里继续推进。`;
       return { ...decision, messages: [...decision.messages, { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: `plugin:${name}` } }] };
+    } catch {
+      return decision;
+    }
+  });
+
+  ctx.on('agent/pre-step', async ({ agent, messages }, next) => {
+    const decision = await next();
+    try {
+      if (decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
+      const mode = modeNotices.get(agent?.id);
+      if (!mode || !(messages ?? []).some((m) => m?.source?.kind === 'user')) return decision;
+      modeNotices.delete(agent.id);
+      return { ...decision, messages: [...decision.messages,
+        { id: randomUUID(), role: 'user', content: [{ type: 'text', text: MODE_NOTICE[mode] }], source: { kind: `plugin:${name}` } }] };
     } catch {
       return decision;
     }

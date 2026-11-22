@@ -3546,14 +3546,27 @@ test('/conductor direct on lets one session work by itself, kept across reloads 
   const write = { name: 'write', arguments: { path: 'F:\\work\\a.txt', content: 'x' } };
   const read = { name: 'read', arguments: { path: 'F:\\work\\raw.txt' } };
   const success = { isError: false, value: {}, content: [] };
+  // The next user message after a switch carries one notice, so a long conversation does not keep its old habit.
+  const step = async (h, id) => {
+    const user = { id: `u${Math.random()}`, role: 'user', content: [{ type: 'text', text: '继续' }], source: { kind: 'user' } };
+    const decision = await h.handlers['agent/pre-step']({ agent: { id }, messages: [user] }, async () => ({ kind: 'enter', messages: [user] }));
+    return decision.messages.slice(1).map((m) => m.content[0].text).join('\n');
+  };
   let { h, command, planner } = load();
   assert.match(hostGuardReason(h, as('S1', write)), /codex-conductor/);
   assert.match(planner('S1'), /只做规划/);
   assert.match(command('S1', 'direct').text, /规划/);
+  assert.equal(await step(h, 'S1'), '');
   assert.match(command('S1', 'direct on').text, /直接执行/);
   assert.equal(hostGuardReason(h, as('S1', write)), undefined);
   assert.equal(await hostExecute(h, as('S1', read), async () => success), success);
-  assert.equal(planner('S1'), '');
+  assert.match(planner('S1'), /本会话为直接执行模式/);
+  assert.doesNotMatch(planner('S1'), /只做规划，派给 Codex/);
+  assert.match(await step(h, 'S1'), /切到直接执行模式/);
+  assert.equal(await step(h, 'S1'), '');
+  // Switching to the mode already in effect adds no notice.
+  command('S1', 'direct on');
+  assert.equal(await step(h, 'S1'), '');
   // Other sessions keep planning.
   assert.match(hostGuardReason(h, as('S2', write)), /codex-conductor/);
   assert.equal((await hostExecute(h, as('S2', read), async () => success)).isError, true);
@@ -3564,12 +3577,13 @@ test('/conductor direct on lets one session work by itself, kept across reloads 
   const { createAliases } = await import('./handover.mjs');
   createAliases(root).link('S1', 'S3', {});
   ({ h, command, planner } = load());
-  assert.equal(planner('S1'), '');
-  assert.equal(planner('S3'), '');
+  assert.match(planner('S1'), /本会话为直接执行模式/);
+  assert.match(planner('S3'), /本会话为直接执行模式/);
   assert.equal(hostGuardReason(h, as('S3', write)), undefined);
   assert.match(command('S3', 'direct off').text, /规划/);
   assert.match(planner('S1'), /只做规划/);
   assert.match(hostGuardReason(h, as('S3', write)), /codex-conductor/);
+  assert.match(await step(h, 'S3'), /切回规划模式/);
 });
 
 test('a completed codex_run reminds the planner of the requirements only when some are set', async (t) => {
