@@ -133,6 +133,14 @@ FAKE_CODEX = textwrap.dedent(r"""
         target = Path("a.txt") if mode == "verification_overwrite" else Path("../outside.txt")
         target.write_bytes(b"changed by verifier\n")
         finish()
+    elif mode in ("log_append", "log_new_file"):
+        # A watcher appending to its log under the scope directory, or a file that was not there before.
+        with Path("logs/watch.out" if mode == "log_append" else "logs/new.out").open("ab") as file:
+            file.write(b"tick\n")
+        finish()
+    elif mode == "log_rewrite":
+        Path("logs/watch.out").write_bytes(b"rewritten and longer\n")  # grows, but its first bytes changed
+        finish()
     elif mode == "verification_overwrite_large":
         target = Path("a.txt")
         info = target.stat()
@@ -6292,6 +6300,33 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual((result["status"], result.get("verification_integrity")),
                                  ("completed", "concurrent_changes"), result)
                 shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_only_warns_when_an_already_dirty_file_under_a_scope_directory_changes(self):
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for mode, scope, product, expected in (
+                ("log_append", ["logs"], "a.txt", ("completed", "concurrent_changes")),
+                ("log_append", ["logs/watch.out"], "a.txt", ("failed", None)),
+                ("log_append", ["logs"], "logs/watch.out", ("failed", None)),
+                ("log_new_file", ["logs"], "a.txt", ("failed", None)),
+                ("log_rewrite", ["logs"], "a.txt", ("failed", None))):
+            with self.subTest(mode=mode, scope=scope, product=product):
+                _, project, _ = self.git_repo(f"verification-log-{len(scope[0])}-{len(product)}-{mode}")
+                (project / "logs").mkdir()
+                (project / "logs" / "watch.out").write_bytes(b"started\n")
+                self.stored_job("SOURCE", {"status": "completed", "files_changed": [{"path": product}]},
+                                cwd=str(project), scope=scope)
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode=mode, prompt=prompt)
+                    self.assertEqual((result["status"], result.get("verification_integrity")), expected, result)
+                    if result["status"] == "failed":
+                        self.assertEqual(result["error_kind"], "verification_tree_changed")
+                    else:
+                        self.assertEqual(result["verification_changed_paths"], ["sub/logs/watch.out"])
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_review_fix_host_verification_checks_dirty_bytes(self):

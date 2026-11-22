@@ -1879,6 +1879,30 @@ def verification_changed_names(before, after):
     return sorted(os.fsdecode(name) for name in names)
 
 
+def verification_only_appended(cwd, before, after):
+    """Every changed dirty file is a regular file that only grew, with its earlier bytes unchanged when they were hashed."""
+    changed = [name for name in before if verification_observations_changed({name: before[name]}, {name: after[name]})]
+    try:
+        top = Path(local_path(os.fsdecode(git(cwd, "rev-parse", "--show-toplevel", deadline=time.monotonic() + 10)).rstrip("\r\n")))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return False
+
+    def appended(name):
+        (old_size, _, old_kind), old_hash = before[name]
+        (new_size, _, new_kind), _ = after[name]
+        if old_kind != new_kind or not stat.S_ISREG(new_kind) or new_size <= old_size:
+            return False
+        if old_hash is None:
+            return True  # shortcut: with more dirty files than are content-hashed only sizes are known; growth is all we check
+        try:
+            with open(top / os.fsdecode(name), "rb") as file:
+                return hashlib.sha256(file.read(old_size)).hexdigest() == old_hash
+        except OSError:
+            return False
+
+    return all(appended(name) for name in changed)
+
+
 def stat_fingerprint(info):
     return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
 
@@ -2321,10 +2345,21 @@ def execute(args, prompt, run_dir):
             unchecked = before_unchecked | after_unchecked
             if unchecked:
                 result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
-            if scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
+            changed = verification_changed_names(before_scope[1], after_scope[1]) if scope_changed else []
+            # Same status, tree and index, and the only changes are appends to already-dirty files under a scope directory
+            # that are neither a product nor named in the scope: another process writing there, not the verifier. A
+            # console watcher appending to its log under a "10-audit" scope failed three verifications in a row (2026-11-23).
+            pinned = [normalized_path(path).replace("\\", "/").lower() for path in declared_paths if not os.path.isdir(path)]
+            background = bool(declared_paths) and before_scope[0] == after_scope[0] and bool(changed) and \
+                before_scope[1].keys() == after_scope[1].keys() and not any(
+                    path.endswith("/" + name.lower()) for name in changed for path in pinned) and \
+                verification_only_appended(args.cwd, before_scope[1], after_scope[1])
+            if background:
+                result.update(verification_integrity="concurrent_changes", verification_changed_paths=changed[:20],
+                              verification_changed_total=len(changed))
+            elif scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
                 result.pop("structured", None)
                 # Named so the planner, which cannot read the project, can tell check output from a real edit (2026-11-23).
-                changed = verification_changed_names(before_scope[1], after_scope[1])
                 result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
                               error="Git status, index or file contents changed within the monitored verification paths.",
                               verification_changed_paths=changed[:20], verification_changed_total=len(changed))

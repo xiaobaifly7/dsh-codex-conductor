@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.162` 核验期间 Git 状态、tree 和索引都没变，唯一的变化是给核验前就已改动、位于 scope 目录下、既不是原任务产物也没在 scope 里点名的文件追加内容时，这次核验照常完成，只标 concurrent_changes，回执列出这些文件，并说明按其他进程写入处理。“追加”的判定是：文件变大，并且核验开始时那部分内容的哈希没变。如果项目里有改动的文件太多、开始时只记了大小，就只能看文件是否变大。原地改写、产物文件、scope 里点名的文件、新增或删除的文件，以及 HEAD 或索引的变化，仍按 verification_tree_changed 判失败。0.9.161 记下的文件名显示，一个会话连续三次核验失败，都是因为项目里常驻的 console watcher 在往 scope 目录 10-audit 下的日志里追加内容，只要 watcher 在跑，这些核验就一定失败，任务也就收不了尾。
+
 `0.9.161` 核验因“受核验范围的文件在核验期间变化”（verification_tree_changed）失败时，runner 在结果里记下变化的文件（相对仓库根目录，最多 20 个）和总数，回执把它们列给 DeepSeek：如果只是检查自己生成的缓存、日志或构建产物，就重新核验；如果是代码改动，就等同目录的写任务结束后再核验。以前回执只让 DeepSeek“核对改动来源”，可它读不到项目，11-16 以来约 800 单核验里有 8 单这样失败，都查不出改了什么。
 
 `0.9.160` Gemini 任务的 agy 账号改由 DSH 的 dsh-agy-link 插件租用。Windows 上 agy 的 Google 登录是全机唯一的凭据条目（`gemini:antigravity`），HOME 只决定会话存在哪里：此前插件从 `pool.json` 选了副账号、把它的目录设成 HOME，agy 实际仍以槽里的账号（通常是主账号）登录，报的是主账号的额度错误，流量却走副账号的专用代理；插件跑主账号的任务 dsh-agy-link 也看不到，可能中途把槽换成别的账号。现在配置了 `gemini.accountPool` 时，runner 在每次启动 agy 之前（排队、写锁和 Gemini 并发名额都拿到之后）向 dsh-agy-link 申请租约，agy 进程原样使用租约给出的环境变量（隔离账号的 HOME、令牌目录、代理等，agy 1.5 起据此读该账号自己的令牌文件；从 WSL 启动时这些变量都加进 WSLENV），运行中定期续约，agy 结束后带上成败和错误原文归还，由 dsh-agy-link 判断额度、登录等问题并让该账号冷却。新任务由 dsh-agy-link 选号；续接按原会话所在的账号钉住（主账号的会话钉主账号），实际用到的账号目录（主账号是本机用户目录）记进任务记录，后续续接回到它。新任务在租到的账号上因额度用完失败时，runner 换下一个账号开新会话重做（每单最多换 3 次，不占普通重试次数；续接和租不到账号时不换）。dsh-agy-link 没有租约接口（未升级、没运行）时，新任务以主账号在本机用户目录（DSH 的 HOME，主账号的会话都在这里）运行，并在 stderr 记一行说明；副账号上的会话这时拒绝续接，不以错误的身份运行。没有可用账号或等不到槽位按额度错误走原有的失败和重试流程。`gemini_write` 也一样：插件每次启动 agy 前在 DSH 里向 dsh-agy-link 租号，用租约的环境变量启动，结束后带成败归还；没有租约接口时只用主账号。设置面板的“Gemini 账号”改标为“pool.json 首选”，说明它只是池文件里当前激活、可用的账号，每单实际用哪个由租约决定。已知局限：runner 进程被强杀时来不及归还，租约要等约 1 分钟的有效期过后才释放；新任务的 runner 在副账号上运行时被强杀，任务记录里没有这次的账号目录，续接会钉到主账号并因找不到会话而失败。
@@ -219,6 +221,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.162` A verification during which Git status, tree and index stayed the same, and the only changes were appends to already-dirty files under a scope directory that are neither a product nor named in the scope, now completes with concurrent_changes and a receipt naming those files as another process's writes. An append means the file grew and the bytes it had when the check started still hash the same; in projects with more dirty files than are content-hashed only the growth can be checked. In-place rewrites, product files, files named in the scope, files that appear or disappear, and HEAD or index changes still fail with verification_tree_changed. The names recorded by 0.9.161 showed that three verifications in a row had failed because a console watcher kept appending to its log under the 10-audit scope directory, so they could never pass while it ran.
 
 `0.9.161` When a verification fails because files in its scope changed during the check (verification_tree_changed), the runner records the changed files (relative to the repository root, up to 20) and their total, and the receipt lists them for DeepSeek: re-run the verification if they are caches, logs or build output from the check itself, or wait for the writer in the same directory if they are code changes. The receipt used to ask DeepSeek to check where the change came from, which it cannot do without reading the project; 8 of about 800 verifications since 11-16 failed this way with nothing to show what changed.
 
