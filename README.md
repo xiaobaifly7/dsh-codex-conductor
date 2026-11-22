@@ -225,7 +225,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 | `codex_verify` | 在新会话独立只读核验本会话已结束的任务，沿用原目录和主机访问，先核对 `must_verify` 再抽查。可选 `engine`、`focus`、`samples`（默认 8，1–30）、`wait_seconds`。结束后用 `codex_review` 记录原任务的验收 |
 | `codex_status` | 先派齐本批独立且不重叠的任务，再留在本轮按 runner `job_id` 并行调用，每次传一个任务号与 `wait_seconds: 3600`。120 秒内无实质变化的重复查询保留短回执，并引导本轮长等 |
 | `codex_cancel` | 取消任务并结束执行进程树。任务已经结束时返回结果和下一步 |
-| `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态 |
+| `codex_jobs` | 按工作区、会话、执行状态或待关注状态分页查询任务，找回 runner job ID、Codex thread ID 和 Harness 后台任务编号；显示新任务的派单来源及可查的后台状态；列表不带核验明细（只留 `verification_status` 和 `verification_reviewer`）、空字段和 agy 账号目录，核验明细用 `codex_status` 或 `codex_output`（`artifact: "review"`）读取 |
 | `codex_output` | 按 Unicode 字符分页、可重复读取完整原始报告、结果 JSON、原任务与验收上下文或 stderr / events 日志；读取不消费结果，也不启动或恢复任务 |
 | `codex_continue` | 回答阻塞问题或提供环境恢复依据后续接原任务；保留原线程、目录、验收、write、scope 和权限，同一父任务不重复派活 |
 | `codex_review` | 保存规划端逐条独立核验的证据与结论；通过、待修正、明确接受偏差分别记录，原报告保留 |

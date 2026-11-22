@@ -1098,7 +1098,24 @@ function renderReview(value) {
 }
 const REVIEW_OUTPUT = { schema: OUTPUT.schema, render: (_args, value) => renderReview(value) };
 const DATA_OUTPUT = { schema: { type: 'object', additionalProperties: true },
-  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }] };
+  render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] };
+
+// 任务列表只用来找回编号、看状态：核验明细约占一页的四成，和空字段、执行端目录一起不放进列表，
+// 规划端每次查列表都要把整页留在上下文里。核验明细用 codex_status 或 codex_output（artifact: "review"）读取。
+export function listedJob(job) {
+  const { verification, task_options: options, context, ...rest } = job ?? {};
+  const kept = Object.fromEntries(Object.entries(rest).filter(([, v]) => v !== null));
+  if (verification?.reviewer) kept.verification_reviewer = verification.reviewer;
+  if (options) {
+    const { agy_home: _home, ...used } = options;
+    kept.task_options = Object.fromEntries(Object.entries(used).filter(([, v]) => v !== null));
+  }
+  if (context) {
+    const { dispatcher, ...task } = context;
+    kept.context = dispatcher ? { ...task, dispatcher: { version: dispatcher.version, pid: dispatcher.pid } } : task;
+  }
+  return kept;
+}
 
 // 工具卡片和任务表用的短标题：任务的第一行，截到 n 个字
 export function taskLine(args, n) {
@@ -3640,7 +3657,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const hint = handoverHint(exec?.agent);
         return { ...value, jobs: value.jobs.map((job) => {
           const bg = linked.get(job.job_id);
-          return { ...job, ...(bg ? { background_job_id: bg.id, owner: bg.owner,
+          return { ...listedJob(job), ...(bg ? { background_job_id: bg.id, owner: bg.owner,
             ...(bg.status ? { background_status: bg.status } : {}) } : {}) };
         }), ...(owner !== undefined ? { note: '无法从会话历史或任务元数据确认归属的旧任务，可用 cwd 按工作区找回；完整结果用 codex_output 读取。' } : {}),
           ...(hint ? { handover_hint: hint } : {}) };
