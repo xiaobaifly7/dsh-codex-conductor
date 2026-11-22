@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.144` 交接时关掉原会话“自动继续”的那一步，遇到宿主“HMR transactions cannot be nested”会等 0.5 秒再写，最多 10 次。这个错误出在交接前几步（新建会话、放进分组、改标题）发起的配置事务还没结束时；此前直接记为失败，原会话的自动继续一直开着，11 月 20 日和 22 日的两次自动交接都是这样。撤回交接时恢复原值走同一条路。其他写入错误照旧直接失败。
+
 `0.9.143` Gemini 账号池用得上主账号了：用系统用户目录的账号（`systemHome`，没有 `dir`）此前被整个跳过，现在以本机用户目录作 HOME；额度列表里列了这个模型的账号优先，没列的仍可作后备（主账号的列表没有 Gemini 4，agy 实际能用它跑 Neon），只在全部停用、需重新登录、冷却或额度不足时才报没有可用账号。此前锁定 Gemini 4 Neon 时池里只有一个号可用。
 
 `0.9.142` 新增 Windows 原生执行模式（`runnerMode: native`），默认不开启：runner 改用 Windows Python 直接启动 Codex 和 agy，不经 WSL；状态、任务记录和 Codex home 分别放在三个私有目录；每次执行放进 Windows Job，取消、超时和孤儿进程统一回收；`doctor` 会预检私有 Codex 沙箱。Gemini 执行、写锁、额度熔断、失败接替和名额排队在原生模式下都能用。不配置 `runnerMode` 或配成 `wsl` 时，对 runner 的调用与之前相同。切换步骤、回退和已知限制见 `config/CUTOVER.md`。
@@ -183,6 +185,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.144` Turning the old session's auto-continue off during a hand-over now waits 0.5 s and writes again, up to 10 times, when the host answers "HMR transactions cannot be nested". That happens while the configuration transaction started by the earlier steps (new session, workspace, title) is still running; it used to be recorded as a failure and left auto-continue on, as in the automatic hand-overs of 2026-11-20 and 2026-11-22. Restoring the value on a revert takes the same path. Other write errors still fail at once.
 
 `0.9.143` The Gemini account pool can use the primary account: an account in the system user profile (`systemHome`, no `dir`) was skipped entirely and now runs with the local user profile as HOME. Accounts whose quota group lists the model come first; unlisted ones remain as a backup (the primary account's list has no Gemini 4, yet agy runs Neon on it), so "no usable account" only comes when every account is disabled, needs a new login, is cooling down or is out of quota. With Gemini 4 Neon locked, only one account was usable before.
 

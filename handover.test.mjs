@@ -357,13 +357,14 @@ test('a revert is refused once the successor has new turns beyond the brief, and
 });
 
 // 宿主设置服务的替身：describe 给出 auto-continue 的当前值，mutate 按 set / unset 改 sessionModes。
-function settingsService(modes, { installed = true, writable = true, fail } = {}) {
+function settingsService(modes, { installed = true, writable = true, fail, busyFor = 0 } = {}) {
   const calls = [];
   return { calls, writable,
     describe: () => (installed ? [{ ns: 'other', value: {} }, { ns: 'auto-continue', value: { sessionModes: { ...modes } } }] : [{ ns: 'other', value: {} }]),
     async mutate(ns, ops) {
       calls.push([ns, ops]);
       if (fail) throw new Error(fail);
+      if (calls.length <= busyFor) throw new Error('HMR transactions cannot be nested');
       for (const op of ops) {
         if (op.op === 'set') modes[op.path[1]] = op.value;
         else delete modes[op.path[1]];
@@ -1088,4 +1089,20 @@ test('a session last driven by LoopX hands its LoopX thread binding to the succe
   const table = new Map([['session-D', pair]]);
   const rolled = await offline.request({ sessionId: 'session-D' }, { loopx: cli(table).loopx });
   assert.deepEqual([rolled.status, rolled.rollback.steps.loopx, [...table]], ['rolled_back', 'restored', [['session-D', pair]]]);
+});
+
+test('switching auto-continue off waits out a host settings transaction that is still running', async () => {
+  const { autoContinueFromSettings, disableAutoContinue, mutateWhenFree } = await import('./handover.mjs');
+  // 2026-11-22 的两次自动交接都在这里失败：建会话、放分组、改标题的配置事务还没结束。
+  const modes = {};
+  const settings = settingsService(modes, { busyFor: 2 });
+  assert.deepEqual(await disableAutoContinue(autoContinueFromSettings(settings), 'session-A'), { autoContinue: 'disabled', previous: null });
+  assert.deepEqual([settings.calls.length, modes], [3, { 'session-A': 'off' }]);
+  // 一直忙就按次数放弃，其他错误不重试。
+  const stuck = settingsService({}, { busyFor: 99 });
+  await assert.rejects(mutateWhenFree(stuck, 'auto-continue', [], { attempts: 3, waitMs: 1 }), /cannot be nested/);
+  assert.equal(stuck.calls.length, 3);
+  const other = settingsService({}, { fail: 'busy' });
+  await assert.rejects(mutateWhenFree(other, 'auto-continue', [], { attempts: 3, waitMs: 1 }), /busy/);
+  assert.equal(other.calls.length, 1);
 });
