@@ -134,7 +134,7 @@ export function panelSettings(cfg) {
       ['seenTools', [...(cfg.seenTools ?? [])].sort()]]));
 }
 
-// 账号池里下一单 Gemini 会用的账号；读池失败时给出原因，不显示池里的其他字段。
+// pool.json 里排在最前的可用账号（当前激活账号优先），只作参考：每单实际用的账号由 dsh-agy-link 租出时决定。读池失败时给出原因，不显示池里的其他字段。
 function geminiAccount(cfg) {
   try {
     const account = poolAccount(cfg.gemini.accountPool, cfg.gemini.executionModel ?? cfg.gemini.model);

@@ -104,13 +104,21 @@ export function geminiArgv(args, cfg) {
   const effort = cfg.gemini.forceEffort ? cfg.gemini.executionEffort : args.effort ?? (args.conversation_id ? undefined : cfg.gemini.executionEffort);
   const model = cfg.gemini.forceModel ? cfg.gemini.executionModel : args.model ?? (args.conversation_id ? undefined : cfg.gemini.executionModel);
   if (effort !== undefined && !GEMINI_EFFORTS.includes(effort)) throw new Error(`Gemini effort 必须是 ${GEMINI_EFFORTS.join('、')}`);
-  const account = cfg.gemini.accountPool
-    ? poolAccount(cfg.gemini.accountPool, model ?? cfg.gemini.executionModel, args.conversation_id ? args.agy_home : undefined) : null;
-  const proxy = account?.proxyUrl || cfg.gemini.proxy;
+  // Windows 上 agy 的登录是全机一个凭据，换 HOME 换不了号：账号由 runner 每次启动 agy 前向 dsh-agy-link 租用（--agy-pool）。
+  // 这里只预检池里还有可用账号；续接把原会话的账号目录传过去钉住，没记 agy_home 的会话在主账号的目录（本机用户目录）里。
+  // --agy-primary-home 是主账号的 HOME：没有租约时只用主账号，也在这里运行。
+  const pool = cfg.gemini.accountPool;
+  let pinned = null;
+  if (pool) {
+    const account = poolAccount(pool, model ?? cfg.gemini.executionModel, args.conversation_id ? args.agy_home || homedir() : undefined);
+    if (args.conversation_id) pinned = account.dir;
+  }
+  const proxy = cfg.gemini.proxy;
   return ['--engine', 'gemini', '--agy-command', cfg.gemini.command,
     ...(effort ? ['--effort', effort] : []),
     ...(model ? ['--model', model] : []),
-    ...(account ? ['--agy-home', account.dir] : []),
+    ...(pool ? ['--agy-pool', pool, '--agy-primary-home', homedir()] : []),
+    ...(pinned ? ['--agy-home', pinned] : []),
     ...(proxy ? ['--agy-proxy', proxy] : []),
     ...(cfg.maxGeminiRunningJobs == null ? [] : ['--max-engine-running', String(cfg.maxGeminiRunningJobs)])];
 }

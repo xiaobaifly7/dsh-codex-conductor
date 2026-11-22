@@ -4189,9 +4189,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     async execute(input, exec) {
       const { background, ...args } = input ?? {};
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
-      const account = cfg.gemini.accountPool
-        ? poolAccount(cfg.gemini.accountPool, cfg.gemini.forceModel ? cfg.gemini.model : args.model ?? cfg.gemini.model) : null;
-      const gemini = account ? { ...cfg.gemini, home: account.dir, proxy: account.proxyUrl || cfg.gemini.proxy } : cfg.gemini;
+      // 只预检池里还有可用账号；账号由 geminiWrite 每次启动 agy 前向 dsh-agy-link 租用（gemini.accountPool）。
+      if (cfg.gemini.accountPool) poolAccount(cfg.gemini.accountPool, cfg.gemini.forceModel ? cfg.gemini.model : args.model ?? cfg.gemini.model);
+      const gemini = cfg.gemini;
       const key = normPath(cwd);
       const busy = geminiWrites.has(key) ? '同一任务目录的 gemini_write 尚未结束，请先等它结束'
         : [...startingWrites].some((writer) => writer.cwd === key) ? '同一任务目录的可写 Codex 任务正在启动，请先等它结束' : '';

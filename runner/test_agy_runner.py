@@ -1,10 +1,14 @@
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
+import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import agy_runner
 
@@ -14,6 +18,213 @@ def args(cwd, /, **overrides):
                   agy_command=r"C:\tools\fake-agy.exe" if os.name == "nt" else "fake-agy",
                   agy_proxy=None, writable_roots=[], scope=[], context={})
     return SimpleNamespace(**(values | overrides))
+
+
+class FakeLink:
+    """dsh-agy-link's lease API on a loopback port, announced in .link-endpoint.json next to pool.json.
+
+    Accounts are pool-style dicts with id, home and proxyUrl; an unpinned acquire gets `choice`. Queue (status, body)
+    replies per route in `replies`; routes=False answers every route with a plain 404 (a plugin without leases)."""
+
+    def __init__(self, pool_dir, accounts, choice=None, routes=True, ttl_ms=60_000):
+        self.accounts, self.choice, self.routes, self.ttl_ms = accounts, choice or accounts[0]["id"], routes, ttl_ms
+        self.calls, self.replies, self.leases, self.count = [], {}, {}, 0
+        link = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                route = self.path.rsplit("/", 1)[-1]
+                link.calls.append((route, body))
+                status, reply = link.answer(self.path, route, body)
+                data = reply.encode() if isinstance(reply, str) else json.dumps(reply).encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.endpoint = Path(pool_dir) / ".link-endpoint.json"
+        self.endpoint.write_text(json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/plugins/agy-link",
+                                             "pid": 1, "startedAt": 0}), encoding="utf-8")
+
+    def answer(self, path, route, body):
+        if not self.routes or not path.startswith("/plugins/agy-link/lease/"):
+            return 404, "Not Found"
+        if self.replies.get(route):
+            return self.replies[route].pop(0)
+        if route == "acquire":
+            if "accountDir" in body:
+                account = next((a for a in self.accounts if a["home"] == body["accountDir"]), None)
+            else:
+                account = next((a for a in self.accounts if a["id"] == body.get("accountId", self.choice)), None)
+            if account is None:
+                return 404, {"ok": False, "code": "account_not_found", "error": "no such account"}
+            self.count += 1
+            lease = f"lease-{self.count}"
+            self.leases[lease] = account["id"]
+            fields = {key: value for key, value in account.items() if key not in ("env", "systemHome")}
+            return 200, {"ok": True, "leaseId": lease, "ttlMs": self.ttl_ms, "expiresAt": 0,
+                         "slot": "env" not in account, "env": account.get("env", {"NO_PROXY": "localhost", **{
+                             key: account["proxyUrl"] for key in ("HTTP_PROXY", "HTTPS_PROXY") if account["proxyUrl"]}}),
+                         "account": {"email": "", "alias": "", "primary": account.get("systemHome", False),
+                                     "isolated": "env" in account, **fields}}
+        if body.get("leaseId") not in self.leases:
+            return 404, {"ok": False, "code": "lease_not_found", "error": "unknown lease"}
+        if route == "release":
+            del self.leases[body["leaseId"]]
+        return 200, {"ok": True, "expiresAt": 0}
+
+    def routes_called(self):
+        return [route for route, _ in self.calls]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def write_pool(pool_dir, accounts):
+    """pool.json as dsh-agy-link writes it: the primary has no dir and lives in the system profile."""
+    pool = Path(pool_dir) / "pool.json"
+    pool.write_text(json.dumps({"primaryAccountId": "acc_primary", "accounts": [
+        {"id": a["id"], "dir": "" if a.get("systemHome") else a["home"], "systemHome": a.get("systemHome", False),
+         "proxyUrl": a["proxyUrl"], "enabled": True}
+        for a in accounts]}), encoding="utf-8")
+    return pool
+
+
+# The primary's home is the DSH host's home directory (the DSH-ASA launcher relocates it); pool.json gives it no dir.
+PRIMARY_HOME = r"D:\dsh\data\user"
+PRIMARY = {"id": "acc_primary", "home": PRIMARY_HOME, "proxyUrl": "http://127.0.0.1:50577", "systemHome": True}
+SECOND = {"id": "acc_b", "home": r"D:\pool\acc_b", "proxyUrl": ""}
+
+
+class LeaseTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.pool = write_pool(self.tmp.name, [PRIMARY, SECOND])
+        self.log = Path(self.tmp.name) / "stderr.log"
+        # The agy proxy in the environment must not catch the loopback calls.
+        environment = mock.patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def link(self, **options):
+        link = FakeLink(self.tmp.name, [PRIMARY, SECOND], **options)
+        self.addCleanup(link.close)
+        return link
+
+    def lease(self):
+        return agy_runner.AccountLease(self.pool, "dsh-codex-conductor/job-1", "gemini-4-neon-medium", self.log)
+
+    def test_fresh_runs_take_the_account_the_plugin_chooses_and_release_with_the_outcome(self):
+        link = self.link(choice="acc_b")
+        lease = self.lease()
+        # A secondary without its own proxy keeps the configured one.
+        self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890"), (SECOND["home"], "http://127.0.0.1:7890"))
+        self.assertEqual(link.calls[0], ("acquire", {"holder": "dsh-codex-conductor/job-1", "ttlMs": agy_runner.LEASE_TTL_MS,
+                                                     "waitMs": agy_runner.LEASE_WAIT_MS, "model": "gemini-4-neon-medium"}))
+        lease.release(False, "429 RESOURCE_EXHAUSTED: quota")
+        self.assertEqual(link.calls[-1], ("release", {"leaseId": "lease-1", "ok": False,
+                                                      "error": "429 RESOURCE_EXHAUSTED: quota", "model": "gemini-4-neon-medium"}))
+        self.assertEqual(link.leases, {})
+        # The primary runs in its own profile: no HOME override, and its own proxy.
+        link.choice = "acc_primary"
+        lease = self.lease()
+        self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890", PRIMARY_HOME), (PRIMARY_HOME, "http://127.0.0.1:50577"))
+        lease.release(True, "ignored")
+        self.assertEqual(link.calls[-1], ("release", {"leaseId": "lease-2", "ok": True, "model": "gemini-4-neon-medium"}))
+        self.assertFalse(self.log.exists())
+
+    def test_a_held_lease_carries_the_accounts_environment(self):
+        isolated = {**SECOND, "env": {"HOME": SECOND["home"], "GEMINI_CLI_HOME": SECOND["home"], "BROWSER": "none",
+                                      "BAD=NAME": "x", "ALSO:BAD": "x", "NUMBER": 1}}
+        link = FakeLink(self.tmp.name, [PRIMARY, isolated], choice="acc_b")
+        self.addCleanup(link.close)
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        self.assertEqual(lease.env, {"HOME": SECOND["home"], "GEMINI_CLI_HOME": SECOND["home"], "BROWSER": "none"})
+        lease.release(True)
+        (Path(self.tmp.name) / ".link-endpoint.json").unlink()
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        self.assertIsNone(lease.env)
+
+    def test_continuations_pin_the_account_that_owns_the_conversation(self):
+        link = self.link(choice="acc_primary")
+        self.assertEqual(self.lease().acquire("conv-1", SECOND["home"], None)[0], SECOND["home"])
+        self.assertEqual(link.calls[-1][1]["accountDir"], SECOND["home"])
+        # The primary's own home (or none recorded): pinned by its id from pool.json, run in its home.
+        for recorded in (PRIMARY_HOME.lower(), None):
+            self.assertEqual(self.lease().acquire("conv-1", recorded, None, PRIMARY_HOME)[0], PRIMARY_HOME)
+            self.assertEqual(link.calls[-1][1]["accountId"], "acc_primary")
+            self.assertNotIn("accountDir", link.calls[-1][1])
+        # An older dsh-agy-link reports '' as the primary's home: the host's home directory stands in.
+        link.accounts[0] = {**PRIMARY, "home": ""}
+        self.assertEqual(self.lease().acquire(None, None, None, PRIMARY_HOME)[0], PRIMARY_HOME)
+        with self.assertRaisesRegex(agy_runner.LeaseError, "fresh: true") as caught:
+            self.lease().acquire("conv-1", r"D:\pool\gone", None)
+        self.assertEqual(caught.exception.kind, "provider_permanent")
+
+    def test_renewal_keeps_the_lease_and_re_acquires_the_same_account_after_a_dsh_restart(self):
+        link = self.link(choice="acc_b", ttl_ms=30)
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        deadline = time.monotonic() + 10
+        while link.routes_called().count("renew") < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(link.calls[1], ("renew", {"leaseId": "lease-1", "ttlMs": agy_runner.LEASE_TTL_MS}))
+        link.leases.clear()  # DSH restarted and forgot every lease
+        while "lease-2" not in link.leases and time.monotonic() < deadline:
+            time.sleep(0.01)
+        reacquired = [body for route, body in link.calls if route == "acquire"][1]
+        self.assertEqual(reacquired["accountDir"], SECOND["home"])
+        lease.release(True)
+        self.assertEqual(link.calls[-1][1]["leaseId"], "lease-2")
+        self.assertEqual(link.leases, {})
+        self.assertIn("re-acquired as lease-2", self.log.read_text("utf-8"))
+
+    def test_lease_refusals_fail_with_the_quota_kind(self):
+        link = self.link()
+        for reply, kind in (((503, {"ok": False, "code": "no_account", "error": "all cooling", "retryAfterMs": 60_000}), "transient"),
+                            ((503, {"ok": False, "code": "no_account", "error": "all cooling", "retryAfterMs": 3_600_000}),
+                             "provider_permanent"),
+                            ((504, {"ok": False, "code": "slot_timeout", "error": "slot busy"}), "transient"),
+                            ((409, {"ok": False, "code": "account_unavailable", "error": "disabled"}), "provider_permanent"),
+                            ((500, "Internal Server Error"), "transient")):
+            link.replies["acquire"] = [reply]
+            with self.assertRaises(agy_runner.LeaseError) as caught:
+                self.lease().acquire(None, None, None)
+            self.assertEqual(caught.exception.kind, kind, reply)
+            if isinstance(reply[1], dict):
+                self.assertIn(f"{reply[1]['code']}: {reply[1]['error']}", str(caught.exception))
+        self.assertEqual(link.leases, {})
+
+    def test_without_the_lease_api_fresh_runs_use_the_primary_and_secondary_continuations_fail(self):
+        for setup in ("missing", "unreachable", "not upgraded"):
+            self.log.unlink(missing_ok=True)
+            if setup == "not upgraded":
+                self.link(routes=False)
+            elif setup == "unreachable":
+                self.link().close()
+            else:
+                (Path(self.tmp.name) / ".link-endpoint.json").unlink(missing_ok=True)
+            lease = self.lease()
+            self.assertEqual(lease.acquire(None, None, "http://127.0.0.1:7890", PRIMARY_HOME),
+                             (PRIMARY_HOME, "http://127.0.0.1:50577"), setup)
+            lease.release(True)
+            log = self.log.read_text("utf-8")
+            self.assertEqual(log.count(agy_runner.LEASE_NOTE), 1, setup)
+            self.assertIn("running on the primary account without a lease", log)
+            self.assertEqual(self.lease().acquire("conv-1", PRIMARY_HOME, None, PRIMARY_HOME),
+                             (PRIMARY_HOME, "http://127.0.0.1:50577"), setup)
+            with self.assertRaisesRegex(agy_runner.LeaseError, "wrong account"):
+                self.lease().acquire("conv-1", SECOND["home"], None, PRIMARY_HOME)
 
 
 class AdapterTests(unittest.TestCase):
@@ -41,6 +252,35 @@ class AdapterTests(unittest.TestCase):
             if os.name != "nt":
                 self.assertTrue({"HOME", "USERPROFILE", "HTTPS_PROXY"} <= set(env["WSLENV"].split(":")))
             self.assertEqual((Path(run_dir) / agy_runner.JOB_RECORD).read_text(), command[3])
+
+    def test_leased_environment_replaces_the_runners_home_and_proxy(self):
+        leased = {"HOME": r"D:\pool\acc 1", "USERPROFILE": r"D:\pool\acc 1", "GEMINI_CLI_HOME": r"D:\pool\acc 1",
+                  "HTTPS_PROXY": "http://127.0.0.1:7894", "NO_PROXY": "localhost,127.0.0.1", "BROWSER": "none"}
+        with tempfile.TemporaryDirectory() as run_dir, \
+                mock.patch.dict(os.environ, {"WSLENV": "KEEP/u:HOME/p", "HTTP_PROXY": "http://inherited:1"}):
+            command, env = agy_runner.build_command(args(
+                r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox="danger-full-access", context={"write": False},
+                agy_proxy="http://127.0.0.1:7890", agy_home=r"D:\pool\acc 1", agy_env=leased,
+            ), run_dir, None)
+            self.assertEqual({key: env[key] for key in leased}, leased)
+            self.assertEqual(env["HTTP_PROXY"], "http://inherited:1")  # the runner's own proxy is not set on top
+            self.assertEqual(env["PYTHONDONTWRITEBYTECODE"], "1")
+            if os.name != "nt":
+                entries = env["WSLENV"].split(":")
+                self.assertTrue(set(leased) <= set(entries))  # plain names: the values are already Windows strings
+                self.assertIn("KEEP/u", entries)
+                self.assertNotIn("HOME/p", entries)
+            # A primary lease's env has no HOME: the account home (the host's home directory) is set under it.
+            _, primary = agy_runner.build_command(args(
+                r"D:\local project", agy_command=r"C:\tools\agy.exe", agy_home=r"D:\dsh\data\user",
+                agy_env={"NO_PROXY": "localhost"}), run_dir, None)
+            self.assertEqual((primary["HOME"], primary["USERPROFILE"], primary["NO_PROXY"]),
+                             (r"D:\dsh\data\user", r"D:\dsh\data\user", "localhost"))
+            if os.name != "nt":
+                self.assertTrue({"HOME", "USERPROFILE", "NO_PROXY"} <= set(primary["WSLENV"].split(":")))
+            # The account home still scopes agy's own data directory for host read-only jobs.
+            permissions = json.loads(command[command.index("--settings") + 1])["permissions"]
+            self.assertIn("write_file(D:/pool/acc 1/.gemini/antigravity-cli)", permissions["allow"])
 
     def test_host_access_allows_commands_and_read_only_still_denies_writes(self):
         with tempfile.TemporaryDirectory() as run_dir:

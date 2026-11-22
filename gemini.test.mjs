@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 
@@ -11,7 +11,8 @@ import { PassThrough } from 'node:stream';
 const localAppData = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-gemini-local-')));
 process.env.LOCALAPPDATA = localAppData;
 after(() => rmSync(localAppData, { recursive: true, force: true }));
-const { geminiWrite, runGemini } = await import('./gemini.mjs');
+const { geminiWrite, runGemini, leaseAgyAccount } = await import('./gemini.mjs');
+const http = await import('node:http');
 const { normPath } = await import('./guard.mjs');
 
 const CFG = { command: 'C:\\fixture\\agy.exe', model: 'gemini-test', effort: 'low', timeoutSeconds: 30, idleTimeoutSeconds: 10 };
@@ -49,11 +50,118 @@ function fixture(t, action, cfg = CFG) {
     execute: (args = {}, options = {}) => geminiWrite(cfg, { ...WRITING, cwd, ...args }, conductor, options, launch) };
 }
 
-test('gemini_write runs agy under the pooled account HOME and proxy', async (t) => {
-  const h = fixture(t, undefined, { ...CFG, home: 'D:\\pool\\a', proxy: 'http://127.0.0.1:7894' });
+// dsh-agy-link's lease API on a loopback port, announced in .link-endpoint.json next to pool.json.
+// replies[route] queues [status, body] overrides; routes: false answers a plain 404 (a plugin without leases).
+async function fakeLink(t, { routes = true, ttlMs = 60_000 } = {}) {
+  const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-link-')));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const pool = path.join(dir, 'pool.json');
+  writeFileSync(pool, JSON.stringify({ primaryAccountId: 'acc_primary', accounts: [
+    { id: 'acc_primary', dir: '', systemHome: true, enabled: true, proxyUrl: 'http://127.0.0.1:50577' },
+    { id: 'acc_a', dir: 'D:\\pool\\a', enabled: true, proxyUrl: 'http://127.0.0.1:7894' }] }));
+  const link = { pool, calls: [], replies: {}, leases: new Set(), count: 0 };
+  const env = { HOME: 'D:\\pool\\a', USERPROFILE: 'D:\\pool\\a', GEMINI_CLI_HOME: 'D:\\pool\\a', HTTPS_PROXY: 'http://127.0.0.1:7894',
+    NO_PROXY: 'localhost', BROWSER: 'none' };
+  const server = http.createServer((request, response) => {
+    let text = '';
+    request.on('data', (chunk) => { text += chunk; });
+    request.on('end', () => {
+      const route = request.url.split('/').pop(), body = JSON.parse(text);
+      link.calls.push([route, body]);
+      let [status, reply] = !routes ? [404, 'Not Found'] : link.replies[route]?.shift() ?? [200, null];
+      if (!reply && route === 'acquire') {
+        const lease = `lease-${++link.count}`;
+        link.leases.add(lease);
+        reply = { ok: true, leaseId: lease, ttlMs, expiresAt: 0, slot: false, env,
+          account: { id: 'acc_a', email: '', alias: '', primary: false, isolated: true, home: 'D:\\pool\\a', proxyUrl: 'http://127.0.0.1:7894' } };
+      } else if (!reply) {
+        [status, reply] = link.leases.has(body.leaseId) ? [200, { ok: true, expiresAt: 0 }] : [404, { ok: false, code: 'lease_not_found' }];
+        if (route === 'release') link.leases.delete(body.leaseId);
+      }
+      response.writeHead(status).end(typeof reply === 'string' ? reply : JSON.stringify(reply));
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => server.close());
+  writeFileSync(path.join(dir, '.link-endpoint.json'), JSON.stringify({ url: `http://127.0.0.1:${server.address().port}/plugins/agy-link`, pid: 1, startedAt: 0 }));
+  return { ...link, env, endpoint: path.join(dir, '.link-endpoint.json'), routes: () => link.calls.map(([route]) => route) };
+}
+
+// The agy proxy in the environment must not catch the loopback lease calls.
+function proxied(t) {
+  const saved = process.env.HTTP_PROXY;
+  process.env.HTTP_PROXY = 'http://127.0.0.1:9';
+  t.after(() => { if (saved === undefined) delete process.env.HTTP_PROXY; else process.env.HTTP_PROXY = saved; });
+}
+
+test('gemini_write leases its account from dsh-agy-link, runs with the lease env and releases with the outcome', async (t) => {
+  proxied(t);
+  const link = await fakeLink(t);
+  const h = fixture(t, undefined, { ...CFG, accountPool: link.pool, proxy: 'http://configured.invalid:3' });
   assert.equal((await h.execute()).status, 'completed');
   const { env } = h.spawns[0];
-  assert.deepEqual([env.HOME, env.USERPROFILE, env.HTTPS_PROXY], ['D:\\pool\\a', 'D:\\pool\\a', 'http://127.0.0.1:7894']);
+  for (const [key, value] of Object.entries(link.env)) assert.equal(env[key], value, key);
+  assert.deepEqual(link.routes(), ['acquire', 'release']);
+  assert.equal(link.calls[0][1].holder, 'dsh-codex-conductor/gemini_write');
+  assert.equal(link.calls[0][1].model, CFG.model);
+  assert.ok(!('accountDir' in link.calls[0][1]) && !('accountId' in link.calls[0][1]));
+  assert.deepEqual(link.calls[1][1], { leaseId: 'lease-1', ok: true, model: CFG.model });
+
+  const failed = fixture(t, ({ child }) => { child.stderr.write('auth failed'); done(child, 1, null); }, { ...CFG, accountPool: link.pool });
+  assert.equal((await failed.execute()).status, 'failed');
+  const release = link.calls.at(-1);
+  assert.equal(release[0], 'release');
+  assert.equal(release[1].ok, false);
+  assert.match(release[1].error, /auth failed/);
+  assert.equal(link.leases.size, 0);
+
+  // A primary lease carries no HOME in env: HOME is its account.home, or this host's home directory from an older plugin.
+  for (const home of ['D:\\dsh\\data\\user', '']) {
+    link.replies.acquire = [[200, { ok: true, leaseId: `primary-${home.length}`, ttlMs: 60_000, slot: true, env: { NO_PROXY: 'localhost' },
+      account: { id: 'acc_primary', primary: true, isolated: false, home, proxyUrl: '' } }]];
+    link.leases.add(`primary-${home.length}`);
+    const primary = fixture(t, undefined, { ...CFG, accountPool: link.pool });
+    assert.equal((await primary.execute()).status, 'completed');
+    assert.deepEqual([primary.spawns[0].env.HOME, primary.spawns[0].env.USERPROFILE], Array(2).fill(home || homedir()));
+    assert.equal(primary.spawns[0].env.NO_PROXY, 'localhost');
+  }
+
+  link.replies.acquire = [[503, { ok: false, code: 'no_account', error: 'every account is cooling down', retryAfterMs: 3600e3 }]];
+  const refused = fixture(t, undefined, { ...CFG, accountPool: link.pool });
+  const value = await refused.execute();
+  assert.equal(value.status, 'failed');
+  assert.match(value.error, /no_account：every account is cooling down/);
+  assert.equal(refused.spawns.length, 0);
+});
+
+test('gemini_write without the lease API runs on the primary only', async (t) => {
+  proxied(t);
+  for (const setup of ['missing', 'not upgraded']) await t.test(setup, async (t) => {
+    const link = await fakeLink(t, { routes: setup !== 'not upgraded' });
+    if (setup === 'missing') rmSync(link.endpoint);
+    const h = fixture(t, undefined, { ...CFG, accountPool: link.pool, proxy: 'http://configured.invalid:3' });
+    const value = await h.execute();
+    assert.equal(value.status, 'completed');
+    assert.match(value.lease_note, /本次用主账号运行，未租用/);
+    const { env } = h.spawns[0];
+    assert.deepEqual([env.HOME, env.USERPROFILE], [homedir(), homedir()]);
+    assert.equal(env.HTTPS_PROXY, 'http://127.0.0.1:50577');
+  });
+});
+
+test('the agy lease is renewed and re-acquired on the same account after DSH forgets it', async (t) => {
+  proxied(t);
+  const link = await fakeLink(t, { ttlMs: 30 });
+  const lease = await leaseAgyAccount(link.pool, { holder: 'test', model: 'm' });
+  const until = async (check) => { for (let i = 0; i < 500 && !check(); i++) await new Promise((r) => setTimeout(r, 10)); };
+  await until(() => link.routes().includes('renew'));
+  assert.deepEqual(link.calls.find(([route]) => route === 'renew')[1], { leaseId: 'lease-1', ttlMs: 60_000 });
+  link.leases.clear();
+  await until(() => link.leases.has('lease-2'));
+  assert.equal(link.calls.filter(([route]) => route === 'acquire')[1][1].accountDir, 'D:\\pool\\a');
+  await lease.release(true);
+  assert.equal(link.calls.at(-1)[1].leaseId, 'lease-2');
+  assert.equal(link.leases.size, 0);
 });
 
 test('gemini_write passes --effort only when an effort is configured', async (t) => {

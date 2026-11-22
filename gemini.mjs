@@ -1,5 +1,7 @@
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import http from 'node:http';
+import { homedir } from 'node:os';
 import { lstatSync, mkdirSync, opendirSync, readFileSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createInterface } from 'node:readline';
@@ -104,6 +106,98 @@ const sameFile = (a, b) => {
   return x.dev === y.dev && x.ino === y.ino;
 };
 
+// Windows 上 agy 的登录是全机一个凭据，只有 dsh-agy-link 能换；每个 agy 进程都先向它租账号，结束后带成败归还。
+// 与 runner/agy_runner.py 的 AccountLease 用同一套接口：池文件同目录的 .link-endpoint.json 给出地址，每次调用都重读（DSH 重启会换端口）。
+export const LEASE = { ttlMs: 60_000, waitMs: 600_000, timeoutMs: 5000 };
+class LeaseUnavailable extends Error {}
+
+function linkPost(pool, route, body, timeoutMs, signal) {
+  let url;
+  try {
+    url = JSON.parse(readFileSync(path.join(path.dirname(pool), '.link-endpoint.json'), 'utf8')).url.replace(/\/+$/, '');
+  } catch (error) {
+    return Promise.reject(new LeaseUnavailable(`没有 dsh-agy-link 地址文件（${error.message}）`));
+  }
+  return new Promise((resolve, reject) => {
+    // node:http 不读 HTTP(S)_PROXY，回环请求不会走给 agy 的代理。
+    const request = http.request(`${url}/lease/${route}`, { method: 'POST', headers: { 'content-type': 'application/json' },
+      timeout: timeoutMs, signal }, (response) => {
+      let text = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { text += chunk; });
+      response.on('end', () => {
+        let reply = null;
+        try { reply = JSON.parse(text); } catch {}
+        if (reply && typeof reply === 'object' && 'ok' in reply) return resolve({ status: response.statusCode, reply });
+        reject(response.statusCode === 404 ? new LeaseUnavailable(`dsh-agy-link 没有租约接口（/lease/${route} 返回 404）`)
+          : new Error(`dsh-agy-link /lease/${route} 返回 HTTP ${response.statusCode}，不是租约回复`));
+      });
+    });
+    request.on('timeout', () => request.destroy(Object.assign(new Error(`dsh-agy-link /lease/${route} ${timeoutMs / 1000} 秒内没有响应`), { known: true })));
+    request.on('error', (error) => reject(error.known ? error : error.name === 'AbortError' ? new Error('Gemini 调用已被中止')
+      : new LeaseUnavailable(`dsh-agy-link（${url}）连不上：${error.message}`)));
+    request.end(JSON.stringify(body));
+  });
+}
+
+// 返回 { env, note, release(ok, error) }：env 是 agy 进程要用的环境变量（租到时原样用 dsh-agy-link 给的）。
+// 没有租约接口时只用主账号、不改 HOME，note 说明原因；租约被拒或超时抛错，agy 不启动。
+export async function leaseAgyAccount(pool, { holder, model, proxy, waitMs = LEASE.waitMs, signal } = {}) {
+  let primary = {};
+  try {
+    const file = JSON.parse(readFileSync(pool, 'utf8'));
+    const accounts = Array.isArray(file?.accounts) ? file.accounts : [];
+    primary = accounts.find((a) => a?.id === file.primaryAccountId) ?? accounts.find((a) => a?.systemHome === true) ?? {};
+  } catch {}
+  const proxyEnv = (value) => Object.fromEntries(value ? ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']
+    .map((key) => [key, value]) : []);
+  const ask = async (pin, wait) => {
+    const { status, reply } = await linkPost(pool, 'acquire', { holder, ttlMs: LEASE.ttlMs, waitMs: wait, ...pin, ...(model ? { model } : {}) },
+      wait + LEASE.timeoutMs, signal);
+    if (reply.ok === true && typeof reply.leaseId === 'string' && reply.account && typeof reply.account === 'object') return reply;
+    const code = reply.code || `HTTP ${status}`;
+    throw new Error(`dsh-agy-link 没有租出 agy 账号（${code}：${reply.error || '未说明原因'}），agy 未启动` +
+      (code === 'no_account' ? '；请先在 DSH 的 agy 插件里处理账号' : ''));
+  };
+  let lease;
+  try {
+    lease = await ask({}, waitMs);
+  } catch (error) {
+    if (!(error instanceof LeaseUnavailable)) throw error;
+    return { env: { ...proxyEnv(primary.proxyUrl || proxy), HOME: homedir(), USERPROFILE: homedir() },
+      note: `${error.message}；本次用主账号运行，未租用`, release: async () => {} };
+  }
+  let leaseId = lease.leaseId, released = false;
+  const account = lease.account;
+  const ttl = typeof lease.ttlMs === 'number' && lease.ttlMs > 0 ? lease.ttlMs : LEASE.ttlMs;
+  let renewing = false;
+  const renew = async () => {
+    if (renewing) return;
+    renewing = true;
+    try {
+      const { status, reply } = await linkPost(pool, 'renew', { leaseId, ttlMs: LEASE.ttlMs }, LEASE.timeoutMs);
+      if (reply.ok === true || status !== 404) return;
+      // DSH 重启后租约丢了：钉住同一个账号重新租一次。
+      const again = await ask(account.home ? { accountDir: account.home } : { accountId: account.id }, LEASE.timeoutMs);
+      if (released) await linkPost(pool, 'release', { leaseId: again.leaseId, ok: true }, LEASE.timeoutMs).catch(() => {});
+      else leaseId = again.leaseId;
+    } catch {} finally { renewing = false; }
+  };
+  const timer = setInterval(renew, ttl / 3);
+  timer.unref?.();
+  // 主账号的 home 是本机用户目录（旧版 dsh-agy-link 给 ''，按本机用户目录算）；租约的 env 叠在上面。
+  const home = account.home || homedir();
+  const env = { HOME: home, USERPROFILE: home, ...(lease.env && typeof lease.env === 'object'
+    ? Object.fromEntries(Object.entries(lease.env).filter(([key, value]) => key && typeof value === 'string'))
+    : proxyEnv(account.proxyUrl || proxy)) };
+  return { env, account, release: async (ok, error) => {
+    released = true;
+    clearInterval(timer);
+    await linkPost(pool, 'release', { leaseId, ok: Boolean(ok), ...(!ok && error ? { error: String(error).slice(0, 4000) } : {}),
+      ...(model ? { model } : {}) }, LEASE.timeoutMs).catch(() => {});
+  } };
+}
+
 export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now() + cfg.timeoutSeconds * 1000 } = {}, launch = spawn) {
   if (signal?.aborted) return Promise.resolve({ error: 'Gemini 调用前已被中止', write_paths: [] });
   return new Promise((resolve) => {
@@ -156,9 +250,9 @@ export function runGemini(cfg, prompt, { cwd, signal, deadline = performance.now
       else timer = setTimeout(checkTimeout, Math.min(remaining, 2 ** 31 - 1));
     };
     const env = { ...process.env };
-    if (cfg.proxy) for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) env[key] = cfg.proxy;
-    // 账号池里的账号：agy 从 HOME/USERPROFILE 读登录信息。
-    if (cfg.home) env.HOME = env.USERPROFILE = cfg.home;
+    // 租到账号时原样用 dsh-agy-link 给的环境变量（HOME、令牌目录、代理等），不再另设代理。
+    if (cfg.env) Object.assign(env, cfg.env);
+    else if (cfg.proxy) for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY', 'https_proxy', 'http_proxy', 'all_proxy']) env[key] = cfg.proxy;
     try {
       checkTimeout();
       if (settled) return;
@@ -318,7 +412,19 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
         value.reused_draft = true;
       } else {
         value.attempts++;
-        run = await runGemini({ ...cfg, model: value.model, effort: value.effort }, prompt, { cwd, signal, deadline }, launch);
+        const lease = cfg.accountPool ? await leaseAgyAccount(cfg.accountPool, { holder: 'dsh-codex-conductor/gemini_write',
+          model: value.model, proxy: cfg.proxy, waitMs: Math.max(0, Math.min(LEASE.waitMs, deadline - performance.now())), signal }) : null;
+        if (lease?.note) value.lease_note = lease.note;
+        // runGemini 不会 reject（出错也带 error resolve）；归还仍只看这一次的结果，且不让归还的错误盖掉原来的错误。
+        let attempt;
+        try {
+          attempt = await runGemini({ ...cfg, model: value.model, effort: value.effort, ...(lease ? { env: lease.env } : {}) }, prompt,
+            { cwd, signal, deadline }, launch);
+          run = attempt;
+        } finally {
+          await lease?.release(!attempt?.error && attempt?.result?.status === 'SUCCESS', attempt?.error ?? 'agy 没有正常结束')
+            .catch(() => {});
+        }
         value.stdout_bytes += run.stdout_bytes ?? 0;
         value.event_count += run.event_count ?? 0;
         for (const [type, count] of Object.entries(run.event_types ?? {})) {

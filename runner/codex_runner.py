@@ -886,15 +886,52 @@ def windows_output_lines(output, proc):
     _winapi.WaitForSingleObject(process, _winapi.INFINITE)
 
 
+ACCOUNT_SWITCHES = 3  # per job, apart from --retries
+ACCOUNT_SWITCH_NOTE = ("上一个 agy 账号在任务中途额度用完，本轮换到另一个账号开了新会话，看不到上一轮的对话。"
+                       "工作区里可能留有上一轮的部分改动：先检查当前状态，再完成原任务，不要重复已经完成的工作。\n\n")
+
+
+def attempt_state(thread_id):
+    return {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
+            "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
+            "file_changes": [], "prompt_delivered": False}
+
+
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
+    """Run one provider attempt. With a DSH agy account pool the agy sign-in is leased from dsh-agy-link first: after
+    every queue and outside process.lock, so a waiting job never holds it, and released once agy has exited."""
+    pool = getattr(args, "agy_pool", None) if getattr(args, "engine", None) == "gemini" else None
+    if not pool:
+        return run_process(args, prompt, run_dir, thread_id, repeat_guard)
+    import agy_runner
+    lease = agy_runner.AccountLease(local_path(pool), f"dsh-codex-conductor/{Path(run_dir).name}", args.model,
+                                    Path(run_dir) / "stderr.log")
+    try:
+        home, proxy = lease.acquire(thread_id, getattr(args, "agy_home", None), args.agy_proxy,
+                                    getattr(args, "agy_primary_home", None))
+    except agy_runner.LeaseError as error:
+        return {**attempt_state(thread_id), "engine": "gemini", "failed": True, "error": str(error),
+                "gemini_quota_kind": error.kind, "lease_error": True}
+    # The account that ran is the one a continuation must return to, the primary's home included.
+    args.agy_home = home
+    state = None
+    try:
+        state = run_process(argparse.Namespace(**{**vars(args), "agy_proxy": proxy, "agy_env": lease.env}), prompt,
+                            run_dir, thread_id, repeat_guard)
+        state["agy_leased"] = lease.account is not None
+        return state
+    finally:
+        ok = state is not None and state["completed"] and not state["failed"]
+        lease.release(ok, None if ok else (state and (state["error"] or state["end_reason"])) or "agy ended without a completed turn")
+
+
+def run_process(args, prompt, run_dir, thread_id, repeat_guard=None):
     """Run one provider process to a verdict, including command setup failures. A completed turn determines success."""
     scratch = getattr(args, "verification_scratch", None)
     gemini = getattr(args, "engine", None) == "gemini"
     id_field = "conversation_id" if gemini else "thread_id"
     fallback_check = getattr(args, "gemini_fallback_check", False)
-    state = {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
-             "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
-             "file_changes": [], "prompt_delivered": False}
+    state = attempt_state(thread_id)
     if gemini:
         import agy_runner
         state["engine"] = "gemini"
@@ -1265,6 +1302,8 @@ def classify(state, run_dir):
             with open(run_dir / "stderr.log", "rb") as f:
                 f.seek(max(state["stderr_offset"], f.seek(0, os.SEEK_END) - 8000))
                 text = f.read().decode("utf-8", "replace")[-2000:]
+            # The runner's own lease notes are not why agy stopped.
+            text = "\n".join(line for line in text.splitlines() if not line.startswith("dsh-agy-link lease:"))
         except OSError:
             text = ""
         engine = "Gemini" if gemini else "Codex"
@@ -2379,8 +2418,10 @@ def execute(args, prompt, run_dir):
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if gemini or args.sandbox != "read-only" else args.resume
         prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
+        original_prompt = prompt
         thread_id = args.resume
         attempt = 0
+        switches = 0
         last_error_kind = None
         report_only = False
         while True:
@@ -2396,6 +2437,8 @@ def execute(args, prompt, run_dir):
                 resumed = bool(thread_id)  # a read-only retry drops the resumed thread and starts fresh
                 runner_event(run_dir, attempt, "gemini_running" if gemini else "codex_running", last_error_kind)
                 state = run_attempt(args, prompt, run_dir, thread_id, repeat_guard)
+                if gemini:
+                    base["task_options"] = task_options(vars(args))  # the leased account replaces the requested one
                 if baseline is not None and (not state.get("fallback_stream_safe") or state["file_changes"] or
                                              tree_changed()):
                     baseline = None
@@ -2421,8 +2464,20 @@ def execute(args, prompt, run_dir):
                     break
                 kind, retryable = classify(state, run_dir)
             last_error_kind = kind
+            # A fresh job whose leased account ran out of quota starts over on the next account: dsh-agy-link cooled
+            # this one down on release. A continuation cannot, its conversation lives in this account's HOME; neither
+            # can a run without a lease, nor a refused lease (no_account ends the job here).
+            if (gemini and getattr(args, "agy_pool", None) and not args.resume and not report_only
+                    and kind == "provider_permanent" and state.get("gemini_quota_kind") == "provider_permanent"
+                    and state.get("agy_leased") and not state.get("lease_error") and switches < ACCOUNT_SWITCHES):
+                switches += 1
+                runner_event(run_dir, attempt, "account_switch", kind)
+                prompt = (ACCOUNT_SWITCH_NOTE + original_prompt) if state["prompt_delivered"] else original_prompt
+                thread_id = None
+                args.agy_home = None
+                continue
             # Codex read-only runs are ephemeral. Gemini resumes any conversation it started.
-            can_retry = (not report_only and retryable and attempt <= args.retries and
+            can_retry = (not report_only and retryable and attempt - switches <= args.retries and
                          (args.sandbox == "read-only" or thread_id or kind == "router_down"))
             if not can_retry:
                 error = state.get("error") or ""
@@ -2515,6 +2570,8 @@ def add_task_arguments(p):
     p.add_argument("--agy-command", help="Antigravity executable for Gemini")
     p.add_argument("--agy-proxy", help="Proxy for Antigravity")
     p.add_argument("--agy-home", help="Windows directory used as HOME/USERPROFILE for Antigravity (one pooled account)")
+    p.add_argument("--agy-pool", help="DSH agy-link pool.json: lease the agy sign-in from dsh-agy-link for every agy run")
+    p.add_argument("--agy-primary-home", help="The DSH host's home directory: the primary account's HOME for agy")
     p.add_argument("--gemini-fallback-check", action="store_true", help="Check whether a failed Codex task left its worktree untouched")
     # danger-full-access is for host-access runs: the Codex sandbox blocks WSL interop, so Windows programs need it.
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="read-only")
@@ -4258,8 +4315,10 @@ def main():
                 parser.error("--engine gemini requires --agy-command")
             if args.gemini_fallback_check:
                 parser.error("--gemini-fallback-check is for Codex")
-        elif args.agy_command or args.agy_proxy or args.agy_home or getattr(args, "max_engine_running", None):
-            parser.error("--agy-command, --agy-proxy, --agy-home and --max-engine-running require --engine gemini")
+        elif (args.agy_command or args.agy_proxy or args.agy_home or args.agy_pool or args.agy_primary_home or
+              getattr(args, "max_engine_running", None)):
+            parser.error("--agy-command, --agy-proxy, --agy-home, --agy-pool, --agy-primary-home and --max-engine-running "
+                         "require --engine gemini")
         if args.engine == "codex" and getattr(args, "model_ab", None) is not None:
             if not context or args.model is not None or args.resume or context.get("continuation") or context.get("verification_of"):
                 parser.error("--model-ab requires a new contextual task without a model override")

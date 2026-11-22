@@ -3098,6 +3098,163 @@ class RunnerTests(unittest.TestCase):
         resumed_argv = json.loads(call.read_text("utf-8"))["argv"]
         self.assertEqual(resumed_argv[resumed_argv.index("--conversation") + 1], conversation)
 
+    def lease_link(self, accounts, endpoint=True, **options):
+        from test_agy_runner import FakeLink, write_pool
+
+        pool_dir = Path(self.tmp.name) / "agy-accounts"
+        pool_dir.mkdir(exist_ok=True)
+        pool = write_pool(pool_dir, accounts)
+        if not endpoint:
+            return pool, None
+        link = FakeLink(pool_dir, accounts, **options)
+        self.addCleanup(link.close)
+        return pool, link
+
+    def pooled_gemini(self, mode="finish"):
+        argv, env, call = self.fake_gemini(mode)
+        home = Path(self.tmp.name) / "acc b"
+        home.mkdir(exist_ok=True)
+        primary_home = Path(self.tmp.name) / "dsh user"
+        primary_home.mkdir(exist_ok=True)
+        primary = {"id": "acc_primary", "home": str(primary_home), "proxyUrl": "http://primary.invalid:1", "systemHome": True}
+        second = {"id": "acc_b", "home": str(home), "proxyUrl": "http://acc-b.invalid:2",
+                  "env": {"HOME": str(home), "USERPROFILE": str(home), "HTTPS_PROXY": "http://acc-b.invalid:2"}}
+        # The loopback lease calls must bypass the proxy agy is given.
+        env = {**env, "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9"}
+        return (*argv, "--agy-proxy", "http://configured.invalid:3", "--agy-primary-home", str(primary_home)), env, call, primary, second
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_leases_the_agy_account_and_continues_on_the_one_that_ran(self):
+        argv, env, call, primary, second = self.pooled_gemini()
+        pool, link = self.lease_link([primary, second], choice="acc_b")
+        result = self.invoke(*argv, "--agy-pool", str(pool), env=env)
+        self.assertEqual(result["status"], "completed")
+        # The leased account is recorded, so a continuation goes back to it.
+        self.assertEqual(result["task_options"]["agy_home"], second["home"])
+        received = json.loads(call.read_text("utf-8"))
+        self.assertEqual((received["home"], received["proxy"]), ([second["home"]] * 2, second["proxyUrl"]))
+        self.assertEqual(link.routes_called(), ["acquire", "release"])
+        self.assertFalse({"accountDir", "accountId"} & set(link.calls[0][1]))
+        self.assertEqual(link.calls[0][1]["holder"], f"dsh-codex-conductor/{Path(result['log_dir']).name}")
+        self.assertEqual(link.calls[1][1], {"leaseId": "lease-1", "ok": True})
+        self.assertEqual(link.leases, {})
+
+        link.choice = "acc_primary"  # a continuation is pinned, whatever the plugin would choose
+        resumed = self.invoke(*argv, "--agy-pool", str(pool), "--resume", result["conversation_id"],
+                              "--agy-home", second["home"], env=env)
+        self.assertEqual((resumed["status"], resumed["task_options"]["agy_home"]), ("completed", second["home"]))
+        self.assertEqual(link.calls[2][1]["accountDir"], second["home"])
+
+        # The primary runs in its home (the DSH host's home directory), recorded like any account's.
+        fresh = self.invoke(*argv, "--agy-pool", str(pool), env=env)
+        self.assertEqual((fresh["status"], fresh["task_options"]["agy_home"]), ("completed", primary["home"]))
+        received = json.loads(call.read_text("utf-8"))
+        self.assertEqual((received["home"], received["proxy"]), ([primary["home"]] * 2, primary["proxyUrl"]))
+        self.invoke(*argv, "--agy-pool", str(pool), "--resume", fresh["conversation_id"], "--agy-home", primary["home"], env=env)
+        self.assertEqual(link.calls[-2][1]["accountId"], "acc_primary")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_lease_is_released_with_the_failure_and_refusals_fail_the_attempt(self):
+        argv, env, call, primary, second = self.pooled_gemini("provider_error")
+        pool, link = self.lease_link([primary, second], choice="acc_b")
+        failed = self.invoke(*argv, "--agy-pool", str(pool), env={**env, "FAKE_AGY_ERROR": json.dumps("429: weekly quota exhausted")})
+        # Every account runs out here, so the job moves to the next one three times, each time on a fresh unpinned lease.
+        self.assertEqual((failed["status"], failed["error_kind"], failed["attempts"]), ("failed", "provider_permanent", 4))
+        acquires = [body for route, body in link.calls if route == "acquire"]
+        self.assertEqual(len(acquires), 4)
+        self.assertFalse(any({"accountDir", "accountId"} & set(body) for body in acquires))
+        self.assertEqual([body["ok"] for route, body in link.calls if route == "release"], [False] * 4)
+        release = link.calls[-1]
+        self.assertEqual((release[0], release[1]["ok"]), ("release", False))
+        self.assertIn("weekly quota exhausted", release[1]["error"])
+        self.assertEqual(link.leases, {})
+
+        call.unlink()
+        env["FAKE_AGY_MODE"] = "finish"
+        link.replies["acquire"] = [(503, {"ok": False, "code": "no_account", "error": "every account is cooling down",
+                                          "retryAfterMs": 3_600_000})]
+        refused = self.invoke(*argv, "--agy-pool", str(pool), env=env)
+        self.assertEqual((refused["status"], refused["error_kind"], refused["attempts"]), ("failed", "provider_permanent", 1))
+        self.assertIn("no_account: every account is cooling down", refused["error"])
+        self.assertFalse(call.exists())
+        # A busy slot is transient: the runner's usual retry takes it once the slot frees.
+        link.replies["acquire"] = [(504, {"ok": False, "code": "slot_timeout", "error": "slot busy"})]
+        retried = self.invoke(*argv, "--agy-pool", str(pool), env=env)
+        self.assertEqual((retried["status"], retried["attempts"]), ("completed", 2))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_without_the_lease_api_runs_fresh_jobs_on_the_primary_only(self):
+        argv, env, call, primary, second = self.pooled_gemini()
+        pool, _ = self.lease_link([primary, second], endpoint=False)
+        result = self.invoke(*argv, "--agy-pool", str(pool), env=env)
+        self.assertEqual((result["status"], result["task_options"]["agy_home"]), ("completed", primary["home"]))
+        received = json.loads(call.read_text("utf-8"))
+        self.assertEqual((received["home"], received["proxy"]), ([primary["home"]] * 2, primary["proxyUrl"]))
+        log = (Path(result["log_dir"]) / "stderr.log").read_text("utf-8")
+        self.assertIn("running on the primary account without a lease", log)
+        call.unlink()
+        wrong = self.invoke(*argv, "--agy-pool", str(pool), "--resume", "conversation-b", "--agy-home", second["home"], env=env)
+        self.assertEqual((wrong["status"], wrong["error_kind"]), ("failed", "provider_permanent"))
+        self.assertIn("wrong account", wrong["error"])
+        self.assertFalse(call.exists())
+
+    def account_switch_run(self, outcomes, *extra):
+        """execute() a pooled Gemini job whose attempts end as `outcomes` says: (kind, delivered) per attempt, kind one
+        of "quota", "lease_error" or "ok". Returns the result and each attempt's (prompt, thread_id, agy_home)."""
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", "agy.exe",
+                                  "--agy-pool", r"D:\pool\pool.json", "--backoff", "0", *extra])
+        calls, homes = [], iter([r"D:\pool\a", r"D:\pool\b", r"D:\pool\c", r"D:\pool\d", r"D:\pool\e"])
+
+        def attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
+            calls.append((prompt, thread_id, args.agy_home))
+            kind, delivered = outcomes[len(calls) - 1]
+            state = {**codex_runner.attempt_state(thread_id), "engine": "gemini", "prompt_delivered": delivered}
+            if kind == "lease_error":
+                return {**state, "failed": True, "error": "dsh-agy-link leased no agy account (no_account: none)",
+                        "gemini_quota_kind": "provider_permanent", "lease_error": True}
+            args.agy_home = next(homes)  # what run_attempt records for the leased account
+            state.update(agy_leased=True, thread_id=thread_id or f"conv-{len(calls)}")
+            if kind == "ok":
+                return {**state, "completed": True, "last_text": "done"}
+            return {**state, "failed": True, "error": "429: weekly quota exhausted", "gemini_quota_kind": "provider_permanent"}
+
+        run_dir = Path(self.tmp.name) / f"switch-{len(list(Path(self.tmp.name).glob('switch-*')))}"
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "run_attempt", side_effect=attempt):
+            result = codex_runner.execute(args, "原任务", run_dir)
+        events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text("utf-8").splitlines()]
+        return result, calls, [event for event in events if event.get("phase") == "account_switch"]
+
+    def test_gemini_quota_failure_moves_a_fresh_job_to_the_next_account(self):
+        result, calls, switches = self.account_switch_run([("quota", True), ("ok", False)])
+        self.assertEqual((result["status"], result["attempts"], result["conversation_id"]), ("completed", 2, "conv-2"))
+        # The second attempt is a new conversation, pinned to nothing, with the original task and a note in front.
+        self.assertEqual(calls[1][1:], (None, None))
+        self.assertTrue(calls[1][0].startswith("上一个 agy 账号在任务中途额度用完") and calls[1][0].endswith("原任务"))
+        self.assertEqual(result["task_options"]["agy_home"], r"D:\pool\b")
+        self.assertEqual(len(switches), 1)
+        # Nothing was delivered: the original task goes as it was.
+        _, calls, _ = self.account_switch_run([("quota", False), ("ok", False)])
+        self.assertEqual(calls[1][0], "原任务")
+
+    def test_gemini_account_switch_skips_continuations_and_refused_leases_and_stops_after_three(self):
+        result, calls, switches = self.account_switch_run([("quota", True)], "--resume", "conv-0", "--agy-home", r"D:\pool\a")
+        self.assertEqual((result["status"], result["error_kind"], len(calls), switches), ("failed", "provider_permanent", 1, []))
+        result, calls, switches = self.account_switch_run([("lease_error", False)])
+        self.assertEqual((result["status"], result["error_kind"], len(calls), switches), ("failed", "provider_permanent", 1, []))
+        # A switch whose lease is then refused ends the job there.
+        result, calls, _ = self.account_switch_run([("quota", True), ("lease_error", False)])
+        self.assertEqual((result["status"], len(calls)), ("failed", 2))
+        self.assertIn("no_account", result["error"])
+        result, calls, switches = self.account_switch_run([("quota", True)] * 5)
+        self.assertEqual((result["status"], result["error_kind"], len(calls), len(switches)), ("failed", "provider_permanent", 4, 3))
+        self.assertEqual(result["task_options"]["agy_home"], r"D:\pool\d")
+
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_invalid_report_and_soft_denial(self):
         argv, env, call = self.fake_gemini(report={"summary": "incorrect format"})
