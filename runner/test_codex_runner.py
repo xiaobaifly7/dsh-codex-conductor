@@ -6272,6 +6272,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('sandbox_mode="danger-full-access"', self.calls()[-1]["argv"])
         self.assertEqual((changed["status"], changed.get("error_kind"), changed.get("retryable")),
                          ("failed", "verification_tree_changed", False))
+        self.assertEqual((changed["verification_changed_paths"], changed["verification_changed_total"]), (["sub/a.txt"], 1))
         self.assertTrue(git("status", "--porcelain"))
 
     @unittest.skipUnless(shutil.which("git"), "needs git")

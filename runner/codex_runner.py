@@ -1871,6 +1871,14 @@ def verification_observations_changed(before, after):
     return False
 
 
+def verification_changed_names(before, after):
+    """Dirty-file names (relative to the repository root) that changed, appeared or disappeared during a verification."""
+    names = before.keys() ^ after.keys()
+    names |= {name for name in before.keys() & after.keys()
+              if verification_observations_changed({name: before[name]}, {name: after[name]})}
+    return sorted(os.fsdecode(name) for name in names)
+
+
 def stat_fingerprint(info):
     return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
 
@@ -2315,8 +2323,11 @@ def execute(args, prompt, run_dir):
                 result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
             if scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
                 result.pop("structured", None)
+                # Named so the planner, which cannot read the project, can tell check output from a real edit (2026-11-23).
+                changed = verification_changed_names(before_scope[1], after_scope[1])
                 result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
-                              error="Git status, index or file contents changed within the monitored verification paths.")
+                              error="Git status, index or file contents changed within the monitored verification paths.",
+                              verification_changed_paths=changed[:20], verification_changed_total=len(changed))
             elif before_whole != after_whole or scope_changed:
                 result["verification_integrity"] = "concurrent_changes"
         return result
