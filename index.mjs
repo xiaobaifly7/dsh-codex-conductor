@@ -408,6 +408,8 @@ export function runRunner(cfg, args, opts = {}, exec = runProcess) {
 
 // Mutations retain the cold-start allowance; only background streams use the longer silence watchdog.
 const BRIDGE_TIMEOUT_MS = 120_000;
+// 整段历史一次取完：runner 每取一页都要重读全部匹配任务，按 100 条翻页时耗时随任务数平方增长（2026-11-23 派单前等 11 秒）。
+const HISTORY_PAGE = 1000;
 const BRIDGE_SLACK_MS = 60_000;
 
 const unknownState = (value) => ['bridge_error', 'unknown_job', 'invalid_record'].includes(value.error_kind) ||
@@ -1861,7 +1863,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     try {
       const jobs = new Map();
       for (let offset = 0; offset !== null;) {
-        const page = await conductor.list({ owner, also_owners: scope.slice(1), limit: 100, offset }, signal);
+        const page = await conductor.list({ owner, also_owners: scope.slice(1), limit: HISTORY_PAGE, offset }, signal);
         if (page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
         for (const job of page.jobs) jobs.set(job.job_id, job);
         offset = page.next_offset ?? null;
@@ -2348,7 +2350,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const filters = { ...(owner ? { owner, also_owners: aliases.predecessors(owner) } : {}),
       started_between: [autoVerifyFrom - 7 * 86_400, Date.now() / 1000 + 86_400] };
     for (let offset = 0; offset !== null;) {
-      const page = await conductor.list({ ...filters, limit: 100, offset });
+      const page = await conductor.list({ ...filters, limit: HISTORY_PAGE, offset });
       if (page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
       jobs.push(...page.jobs);
       offset = page.next_offset ?? null;
@@ -2794,7 +2796,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const jobs = [];
     const until = Date.now() / 1000 + 86_400;
     for (let offset = 0; offset !== null;) {
-      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [closeoutFrom, until], limit: 100, offset }, signal);
+      const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), started_between: [closeoutFrom, until], limit: HISTORY_PAGE, offset }, signal);
       if (!Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
       jobs.push(...page.jobs);
       offset = page.next_offset ?? null;

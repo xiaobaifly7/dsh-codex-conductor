@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.167` 插件扫描整段历史时（派单前的收尾检查、每次工具调用后的自动核验补派、已接受未结台账）改为一次最多取 1000 条，runner 的 list 上限相应从 100 提到 1000。runner 每取一页都要先读完全部匹配任务再截取，按 100 条翻页时总耗时随任务数平方增长：一个交接链有 714 单的会话，派单前的收尾检查要翻 8 页、约 11 秒，自动核验补派 15 页约 38 秒，台账 19 页约 55 秒；现在分别是 1 次约 1 秒、2 次约 3 秒、2 次约 3 秒，结果逐条一致。list 查询解析路径也改用 products 已有的按目录缓存的解析：/mnt 下每次 lstat 都要穿到 Windows，以前一页里一半时间花在这上面。
+
 `0.9.166` runner 按 owner、核验对象、任务或 cwd 过滤任务时，先用缓存的过滤字段跳过不匹配的任务，不再逐个解析全部任务的 args.json 和 result.json。args.json 只在任务创建时写一次，这几个字段之后不会变，缓存放在 runner 主目录的 job-filter-cache.json；缓存里没有、或 args.json 还没写好的任务照旧读原文件，查询结果不变。以前任务目录积到约 4500 个后，每次按 owner 查询要 1.1–1.7 秒，派一单的预检要串行做七八次这样的查询，codex_run 中位 15 秒、wait=0 的 codex_status 13–23 秒；现在同样的查询约 0.4 秒（scope 冲突和用量汇总约 0.9 秒）。几个 runner 同时写缓存时可能互相丢掉新条目，丢了只是下次再读一次原文件。
 
 `0.9.165` danger-full-access 的写任务现在按它声明的 scope 子树上锁，而不是整个 cwd。几个任务挂在同一个粗 cwd（比如都在 /mnt/f/渗透 下、各写不同子目录）、声明的 scope 互不重叠时，以前都挤在这个 cwd 的单一写锁上串行；一次约 11.5 小时的运行里，14 个任务因此累计白等 98 分钟（最长 18 分钟），其中只有一对真的重叠。现在没有声明 scope 时才退回按 cwd 上锁；scope 相同或嵌套的仍按重叠的根上锁、照常串行。workspace-write（由系统强制的 cwd 边界）和没有 scope 的任务不变。
@@ -229,6 +231,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.167` The plugin's whole-history scans (the close-out check before a dispatch, the auto-verification catch-up after each tool call and the accepted-open ledger) now fetch up to 1000 jobs per call, and the runner's list limit rises from 100 to 1000 to match. The runner reads every matching job before slicing a page, so paging 100 at a time cost time quadratic in the job count: for a session whose handover chain holds 714 jobs the close-out check took 8 pages and about 11 s, the auto-verification catch-up 15 pages and about 38 s, the ledger 19 pages and about 55 s; they now take 1 call and about 1 s, 2 calls and about 3 s, and 2 calls and about 3 s, with identical rows. list queries also resolve paths with the per-directory resolver products already used: every /mnt lstat crosses into Windows and took half of each page.
 
 `0.9.166` When the runner filters jobs by owner, verification target, task or cwd, it now skips non-matching jobs using cached filter fields instead of parsing every job's args.json and result.json. args.json is written once when a job starts, so those fields never change; the cache lives in job-filter-cache.json under the runner home, and a job missing from it (or whose args.json is not written yet) is read from its files as before, so results are unchanged. With about 4500 job directories each owner query took 1.1–1.7 s and a dispatch preflight runs seven or eight of them in a row, so codex_run took a median 15 s and codex_status with wait=0 13–23 s; the same queries now take about 0.4 s (scope conflicts and the usage summary about 0.9 s). Concurrent runners may drop each other's new cache entries, which only means reading the files again next time.
 

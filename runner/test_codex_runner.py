@@ -5002,7 +5002,7 @@ class RunnerTests(unittest.TestCase):
         last = self.control("list", "--offset", "4")
         self.assertTrue(last["eof"])
         self.assertIsNone(last["next_offset"])
-        for extra in (("--limit", "101"), ("--offset", "-1")):
+        for extra in (("--limit", "1001"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
     def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
@@ -5155,9 +5155,10 @@ class RunnerTests(unittest.TestCase):
             self.stored_job(f"same-cwd-{i}", {"status": "completed"}, context=self.sample_context(), scope=["src"])
         args = SimpleNamespace(command="list", owner=None, cwd=None, job_id=None,
                                status=None, needs_attention=False, offset=0, limit=20)
-        realpath = os.path.realpath
+        # Off Windows the per-query resolver lstats each directory once instead of calling realpath.
+        probe = (codex_runner.os.path, "realpath") if codex_runner.IS_WIN else (codex_runner.os, "lstat")
         with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
-                mock.patch.object(codex_runner.os.path, "realpath", wraps=realpath) as resolve:
+                mock.patch.object(*probe, wraps=getattr(*probe)) as resolve:
             def cwd_reads():
                 return sum(os.fspath(call.args[0]) == str(self.cwd) for call in resolve.call_args_list)
 
