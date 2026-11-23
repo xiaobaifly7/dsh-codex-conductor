@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.170` 查一个不存在的任务号（多半是写错或模型编的）时，`codex_status`、`codex_output`、`codex_cancel` 直接说「没有任务号 X；本会话的任务见 codex_jobs」，不再说「暂时无法确认任务属于本会话」。原来的说法像是暂时的归属故障，模型会认定归属校验有 bug 并反复重试同一个错号（2026-11-24 一次压缩后连续两次）。归属提示只留给 bridge_error、invalid_record 和状态未知的情况。
+
 `0.9.169` Gemini（agy）任务报 SUCCESS 但没有给出 structured_output 报告对象时，如果结果里有模型的文字答复（response），就保留这段文字当最终消息，交给和执行端相同的报告校验——于是落成 schema_invalid（报告格式不合格、产物仍在、可核验），而不是丢掉这段文字、记成 incomplete。两者都不缺报告时仍记 incomplete。此前同一会话的长任务多次在收尾时以文字答复结束、没填报告，产物因此被当作 incomplete 丢弃、只能重跑十几分钟的长任务。
 
 `0.9.168` runner 和 `gemini_write` 向 dsh-agy-link 租号、续约、归还时，带上 `.link-endpoint.json` 里的 `token`（`Authorization: Bearer <token>`），和地址取自同一次读文件。dsh-agy-link 正在给租约接口加鉴权：每次启动生成随机 token，只写在这个文件里，没带或不对的请求一律 401。文件里没有 token（旧版插件）时不带这个头，行为不变，所以本版可以先于插件上线。租号收到 401 和其他租号失败一样处理：任务报错，错误里有 `unauthorized`，不会打印 token。
@@ -235,6 +237,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.170` Asking about a job id that does not exist (usually a typo or one the model made up) now makes `codex_status`, `codex_output` and `codex_cancel` say plainly that there is no such job and point to codex_jobs, instead of saying ownership can't be confirmed for now. That wording read as a temporary ownership fault, so the model concluded the ownership check was broken and retried the same wrong id (twice in a row after a compaction on 2026-11-24). The ownership message remains for bridge_error, invalid_record and unknown states.
 
 `0.9.169` When a Gemini (agy) task reports SUCCESS but gives no structured_output report object, the model's prose answer (response), if present, is now kept as the final message and run through the same report check as the exec path — so it lands as schema_invalid (report malformed, work preserved, reviewable) instead of being discarded as incomplete. With neither a report nor a usable response it still records incomplete. The same conversation's long tasks had repeatedly ended with a prose answer and no filled report, so their work was thrown away as incomplete and the ~13-minute task had to be rerun.
 

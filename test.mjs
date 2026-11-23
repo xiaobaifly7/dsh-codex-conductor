@@ -3219,6 +3219,19 @@ test('reloaded native waits verify runner ownership before reading the job', asy
   assert.equal(jobs.started.length, 1);
 });
 
+test('a job id that does not exist is reported as missing, not as an ownership problem', async () => {
+  const h = harness({ config: { plannerReads: 'products' } });
+  h.finals.J404 = { job_id: 'J404', status: 'failed', error_kind: 'unknown_job', retryable: false };
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  for (const tool of ['codex_status', 'codex_output']) {
+    await assert.rejects(h.tools[tool].execute({ job_id: 'J404', wait_seconds: 0 }, exec), (err) => {
+      assert.match(err.message, new RegExp(`^${tool}: 没有任务号 J404；本会话的任务见 codex_jobs`));
+      assert.doesNotMatch(err.message, /归属|属于本会话/);
+      return true;
+    });
+  }
+});
+
 test('reattaches pending owned jobs on reload or agent creation without redispatching', async () => {
   for (const alreadyLive of [true, false]) {
     const jobs = fakeJobs();
