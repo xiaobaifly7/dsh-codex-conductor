@@ -409,7 +409,8 @@ export function runRunner(cfg, args, opts = {}, exec = runProcess) {
 // Mutations retain the cold-start allowance; only background streams use the longer silence watchdog.
 const BRIDGE_TIMEOUT_MS = 120_000;
 // 整段历史一次取完：runner 每取一页都要重读全部匹配任务，按 100 条翻页时耗时随任务数平方增长（2026-11-23 派单前等 11 秒）。
-const HISTORY_PAGE = 1000;
+// 交接链超过 1000 个任务时每次还要翻两页（2026-11-24 一条链 1134 个），上限提到 runner 的 5000。
+const HISTORY_PAGE = 5000;
 const BRIDGE_SLACK_MS = 60_000;
 
 const unknownState = (value) => ['bridge_error', 'unknown_job', 'invalid_record'].includes(value.error_kind) ||

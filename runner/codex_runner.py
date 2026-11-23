@@ -3450,6 +3450,69 @@ def save_job_filter_cache(fields):
                 os.unlink(tmp)
 
 
+LISTING_CACHE = "listing-cache"
+
+
+@cache
+def listing_version():
+    # A cached listing is only valid for the code that computed it.
+    return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+
+
+def job_signature(job_dir):
+    """Name, size and mtime of every entry in a job directory. A finished job's listing is computed from these
+    files alone, so a review, a repaired result or a rollback changes the signature."""
+    rows = []
+    with os.scandir(job_dir) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            rows.append([entry.name, info.st_size, info.st_mtime])
+    return sorted(rows)
+
+
+def signature_times(job_dir, signature):
+    """job_listing_times from a signature's mtimes; only the directory itself is stat'ed again."""
+    mtimes = {name: mtime for name, _, mtime in signature}
+    return {"job_id": job_dir.name, "started_at": mtimes.get("args.json"), "finished_at": mtimes.get("result.json"),
+            "updated_at": max([job_dir.stat().st_mtime, *(mtimes[name] for name in
+                               ("args.json", "result.json", "events.jsonl", "reviews.json") if name in mtimes)])}
+
+
+def load_listing(job_id, signature):
+    try:
+        data = json.loads((HOME / LISTING_CACHE / f"{job_id}.json").read_text("utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not (isinstance(data, dict) and data.get("version") == listing_version() and data.get("signature") == signature and
+            isinstance(data.get("value"), dict) and isinstance(data.get("changed"), dict) and
+            isinstance(data.get("dropped"), list)):
+        return None
+    details = {**data["value"], **data["changed"]}
+    for key in data["dropped"]:
+        details.pop(key, None)
+    return data["value"], details
+
+
+def save_listing(job_id, signature, value, details):
+    # Like the filter cache: a lost or failed write only means the job is computed again.
+    # shortcut: entries of deleted job directories are never pruned; add pruning if job directories start being removed.
+    value = {k: v for k, v in value.items() if k not in ("_record", "_details")}
+    # details repeats most of value; keep only the difference.
+    changed = {k: v for k, v in details.items() if k not in value or value[k] != v}
+    directory = HOME / LISTING_CACHE
+    with suppress(OSError):
+        directory.mkdir(exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{job_id}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump({"version": listing_version(), "signature": signature, "value": value, "changed": changed,
+                           "dropped": [k for k in value if k not in details]}, f)
+            os.replace(tmp, directory / f"{job_id}.json")
+        except (OSError, TypeError, ValueError):
+            with suppress(OSError):
+                os.unlink(tmp)
+
+
 def matching_jobs(args, *, page_dates=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
@@ -3509,32 +3572,48 @@ def matching_jobs(args, *, page_dates=None):
                 if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}},
                                         job_dir.name, task_hash=task_hash, check_cwd=False):
                     continue
-        try:
-            finished = result_file.exists()
-            # Only terminal jobs publish result.json.
-            if args.status == "running" and finished:
-                continue
-            task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
-            result = json.loads(result_file.read_text("utf-8")) if finished else None
-            value = {**task, **(result if result is not None else {})}
-            record = {"task": task, "result": result}
-        except (OSError, ValueError, TypeError):
-            value, record = {}, None
-        if not matches_metadata(value, job_dir.name):
+        # Only terminal jobs publish result.json.
+        finished = result_file.exists()
+        if args.status == "running" and finished:
             continue
-        if record is not None:
+        # A finished job's record and status are reused while its directory is unchanged: recomputing them took
+        # ~2 ms per job, and a 2,000-job handover chain is listed whole several times per dispatch (2026-11-24).
+        # The signature is taken before the files are read, so a change made meanwhile is recomputed next time.
+        signature = None
+        if finished:
+            with suppress(OSError):
+                signature = job_signature(job_dir)
+        listing = load_listing(job_dir.name, signature) if signature is not None else None
+        if listing is not None:
+            value, record = {**listing[0], "_details": listing[1]}, None
+            if not matches_metadata(value, job_dir.name):
+                continue
+        else:
             try:
-                record["metadata"] = job_metadata(job_dir, task=record["task"],
-                                                 finished_at=result_file.stat().st_mtime if result_file.exists() else None,
-                                                 thread_id=value.get("thread_id"),
-                                                 conversation_id=value.get("conversation_id"), resolve=resolve)
-                value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
+                task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
+                result = json.loads(result_file.read_text("utf-8")) if finished else None
+                value = {**task, **(result if result is not None else {})}
+                record = {"task": task, "result": result}
             except (OSError, ValueError, TypeError):
-                record = None
-                value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
-                value["_details"] = dict(value)
-                if not matches_metadata(value, job_dir.name):
-                    continue
+                value, record = {}, None
+            if not matches_metadata(value, job_dir.name):
+                continue
+            if record is not None:
+                try:
+                    record["metadata"] = job_metadata(job_dir, task=record["task"],
+                                                     finished_at=result_file.stat().st_mtime if result_file.exists() else None,
+                                                     thread_id=value.get("thread_id"),
+                                                     conversation_id=value.get("conversation_id"), resolve=resolve)
+                    value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
+                except (OSError, ValueError, TypeError):
+                    record = None
+                    value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
+                    value["_details"] = dict(value)
+                    if not matches_metadata(value, job_dir.name):
+                        continue
+            if signature is not None and record is not None and record["result"] is not None:
+                value["_details"] = job_status(job_dir.name, record, lost_after=getattr(args, "lost_after", LOST_AFTER))
+                save_listing(job_dir.name, signature, value, value["_details"])
         context = value.get("context") or {}
         parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
                   context.get("routing", {}).get("parent_job_id"))
@@ -3556,7 +3635,8 @@ def matching_jobs(args, *, page_dates=None):
             blocking = value["blocking"]
             if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
                 continue
-        dates = job_listing_times(job_dir, started_at) if page_dates is None else page_dates[job_dir]
+        dates = (page_dates[job_dir] if page_dates is not None else
+                 signature_times(job_dir, signature) if signature is not None else job_listing_times(job_dir, started_at))
         jobs.append({**value, "parent_job_id": parent, **dates})
     if added:
         save_job_filter_cache(cached)
@@ -4409,7 +4489,8 @@ def main():
                   "retryable": False, "rolled_back": False})
         return
     if args.command in ("list", "summary", "output"):
-        maximum = {"output": 8000, "list": 1000}.get(args.command, 100)
+        # Whole-history scans ask for everything at once: each page re-reads every matching job to sort it.
+        maximum = {"output": 8000, "list": 5000}.get(args.command, 100)
         if args.offset < 0 or not 1 <= args.limit <= maximum:
             parser.error(f"offset must be nonnegative and limit between 1 and {maximum}")
     if args.command == "summary":
