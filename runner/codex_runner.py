@@ -3426,7 +3426,7 @@ def job_filter_fields(task):
     context = task.get("context") if isinstance(task.get("context"), dict) else {}
     text = context.get("task", "")
     task_hash = hashlib.sha256(text.strip().encode("utf-8", "surrogatepass")).hexdigest() if isinstance(text, str) else None
-    return [context.get("owner"), context.get("verification_of"), task_hash, task.get("cwd")]
+    return [context.get("owner"), context.get("verification_of"), task_hash]
 
 
 def load_job_filter_cache():
@@ -3459,7 +3459,7 @@ def matching_jobs(args, *, page_dates=None):
     if getattr(args, "command", None) == "list" and not scope_conflicts:
         resolve = cache(resolve)
 
-    def matches_metadata(value, job_id, task_hash=None):
+    def matches_metadata(value, job_id, task_hash=None, check_cwd=True):
         context = value.get("context")
         # --also-owner adds predecessor sessions handed over to --owner; it never applies without --owner.
         owners = {args.owner, *(getattr(args, "also_owner", None) or [])}
@@ -3473,13 +3473,14 @@ def matching_jobs(args, *, page_dates=None):
         if task_key and (task_hash or hashlib.sha256(
                 (context or {}).get("task", "").strip().encode("utf-8", "surrogatepass")).hexdigest()) != task_key:
             return False
-        return not args.cwd or bool(value.get("cwd") and
+        return not (check_cwd and args.cwd) or bool(value.get("cwd") and
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
 
     jobs = []
-    # Owner, verification, task and cwd filters come from args.json alone: skip non-matching jobs from the cache
+    # Owner, verification and task filters come from args.json alone: skip non-matching jobs from the cache
     # instead of parsing every job's args.json and result.json (thousands of jobs made each query take seconds).
-    prefilter = bool(args.owner or getattr(args, "verification_of", None) or getattr(args, "task_key", None) or args.cwd)
+    # cwd is left to the full record: result.json's resolved cwd overrides the one in args.json.
+    prefilter = bool(args.owner or getattr(args, "verification_of", None) or getattr(args, "task_key", None))
     cached = load_job_filter_cache() if prefilter else {}
     added = False
     directories = job_directories(args.job_id if not args.owner else None) if page_dates is None else page_dates
@@ -3496,7 +3497,7 @@ def matching_jobs(args, *, page_dates=None):
         task = None
         if prefilter:
             fields = cached.get(job_dir.name)
-            if not (isinstance(fields, list) and len(fields) == 4):
+            if not (isinstance(fields, list) and len(fields) == 3):
                 fields = None
                 with suppress(OSError, ValueError, TypeError):
                     task = task_record(job_dir)
@@ -3504,9 +3505,9 @@ def matching_jobs(args, *, page_dates=None):
                         fields = cached[job_dir.name] = job_filter_fields(task)
                         added = True
             if fields is not None:
-                owner, verification_of, task_hash, cwd = fields
-                if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}, "cwd": cwd},
-                                        job_dir.name, task_hash=task_hash):
+                owner, verification_of, task_hash = fields
+                if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}},
+                                        job_dir.name, task_hash=task_hash, check_cwd=False):
                     continue
         try:
             finished = result_file.exists()
