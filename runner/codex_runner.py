@@ -604,12 +604,19 @@ def writer(sandbox, context=None):
         sandbox == "danger-full-access" and isinstance(context, dict) and context.get("write") is False)
 
 
-def write_lock_roots(cwd, sandbox, writable_roots, context=None):
+def write_lock_roots(cwd, sandbox, writable_roots, context=None, scope=None):
     if not writer(sandbox, context):
         return {}
-    roots = [cwd]
-    if sandbox == "workspace-write":
-        roots.extend(os.path.join(cwd, local_path(p)) for p in writable_roots or [])
+    # danger-full-access can't be OS-confined to cwd, so a declared scope is the job's stated write area
+    # (writes outside it are already surfaced as out_of_scope). Locking those subtrees instead of the whole
+    # cwd lets two full-access jobs that write disjoint scopes under a shared cwd run at the same time;
+    # genuinely overlapping scopes still key to overlapping roots and serialize.
+    if sandbox == "danger-full-access" and scope:
+        roots = [scope_path(cwd, p) for p in scope]
+    else:
+        roots = [cwd]
+        if sandbox == "workspace-write":
+            roots.extend(os.path.join(cwd, local_path(p)) for p in writable_roots or [])
     return {write_lock_key(p): p for p in roots}
 
 
@@ -632,7 +639,7 @@ def earlier_writer_waiting(run_dir, roots, lost_after=LOST_AFTER):
             task = task_record(job_dir)
             if not task.get("cwd"):
                 continue
-            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"), task.get("context"))
+            other_roots = write_lock_roots(task["cwd"], task.get("sandbox"), task.get("writable_roots"), task.get("context"), task.get("scope"))
             other_paths = [Path(tree_key(p)) for p in other_roots.values()]
             overlapping_roots = [root for root, path in zip(other_roots.values(), other_paths)
                                  if any(path.is_relative_to(p) or p.is_relative_to(path) for p in paths)]
@@ -2416,7 +2423,7 @@ def execute(args, prompt, run_dir):
         if writes:
             try:
                 roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None),
-                                         getattr(args, "context", None))
+                                         getattr(args, "context", None), getattr(args, "scope", None))
                 lock_timeout = getattr(args, "lock_timeout", None)
                 deadline = time.monotonic() + lock_timeout if lock_timeout is not None else None
                 waiting = False
