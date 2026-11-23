@@ -1997,6 +1997,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         (!value.context?.owner || owns(owner, value.context.owner))) productReads.add(owner, productPaths(value));
   };
   const checkJobOwner = (value, exec, tool) => {
+    // 任务号不存在（多半是写错或编的）要直说，否则模型会把它当成暂时的归属问题反复重试。
+    if (value.error_kind === 'unknown_job') throw new Error(`${tool}: 没有任务号 ${value.job_id}；本会话的任务见 codex_jobs。`);
     if (!unknownState(value)) rememberJob(value);
     if (!owns(exec?.agent?.id, value.context?.owner ?? productJobs.get(value.job_id)) || unknownState(value)) {
       throw new Error(`${tool}: 暂时无法确认任务属于本会话，不能读取它的产物；请用 codex_jobs 查本会话的任务。`);
