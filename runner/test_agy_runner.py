@@ -398,10 +398,18 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(events[0], {"type": "thread.started", "thread_id": " AbC-中文 "})
         self.assertEqual(json.loads(events[1]["item"]["text"]), {"summary": "中文"})
         self.assertEqual(events[2]["type"], "turn.completed")
-        failed = list(agy_runner.EventAdapter().events({
+        # No structured_output but a prose response: keep the text (downstream marks it
+        # schema_invalid with the work preserved) instead of losing it as a bare failure.
+        salvaged = list(agy_runner.EventAdapter().events({
             "event": "result", "result": {"status": "SUCCESS", "response": '{"summary":"plaintext"}'},
         }))
-        self.assertEqual(failed[0]["type"], "turn.failed")
+        self.assertEqual(salvaged[0]["item"]["text"], '{"summary":"plaintext"}')
+        self.assertEqual(salvaged[1]["type"], "turn.completed")
+        # Neither structured_output nor a usable response: still a failure.
+        missing = list(agy_runner.EventAdapter().events({
+            "event": "result", "result": {"status": "SUCCESS", "response": "   "},
+        }))
+        self.assertEqual(missing[0]["type"], "turn.failed")
 
     def test_structured_permission_denial_is_terminal(self):
         adapter = agy_runner.EventAdapter()
