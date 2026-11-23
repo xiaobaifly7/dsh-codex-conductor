@@ -3745,8 +3745,15 @@ def products(args):
             else:
                 truncated = True
 
+    # The list filter cache only skips other owners' jobs: an included job's owner is still read from its args.json,
+    # so a stale or edited entry can withhold a product but never grant one. Parsing every job's args.json took
+    # 0.9 s warm and 10-12 s cold with 4,500 jobs, and the planner's read guard waits for it (2026-11-24).
+    owners = {name: fields[0] for name, fields in load_job_filter_cache().items()
+              if isinstance(fields, list) and len(fields) == 3}
     # Newest first: once --limit is reached, the paths dropped are the oldest, not the reports the planner reads next.
     for job_dir in sorted(job_directories(), key=lambda d: d.name, reverse=True):
+        if owners.get(job_dir.name, args.owner) != args.owner:
+            continue
         if job_dir.is_symlink() or not job_dir.resolve().is_relative_to((HOME / "jobs").resolve()):
             continue
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
