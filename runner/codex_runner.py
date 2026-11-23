@@ -3418,6 +3418,38 @@ def job_listing_order(job):
     return (job["started_at"] or job["updated_at"], job["job_id"])
 
 
+JOB_FILTER_CACHE = "job-filter-cache.json"
+
+
+def job_filter_fields(task):
+    """The args.json fields list filters read. args.json is written once when a job starts, so they never change."""
+    context = task.get("context") if isinstance(task.get("context"), dict) else {}
+    text = context.get("task", "")
+    task_hash = hashlib.sha256(text.strip().encode("utf-8", "surrogatepass")).hexdigest() if isinstance(text, str) else None
+    return [context.get("owner"), context.get("verification_of"), task_hash, task.get("cwd")]
+
+
+def load_job_filter_cache():
+    try:
+        value = json.loads((HOME / JOB_FILTER_CACHE).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def save_job_filter_cache(fields):
+    # Concurrent writers may drop each other's new entries; a missing entry only means args.json is read again.
+    with suppress(OSError):
+        fd, tmp = tempfile.mkstemp(dir=HOME, prefix=".job-filter-cache.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(fields, f)
+            os.replace(tmp, HOME / JOB_FILTER_CACHE)
+        except (OSError, TypeError, ValueError):
+            with suppress(OSError):
+                os.unlink(tmp)
+
+
 def matching_jobs(args, *, page_dates=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
@@ -3427,7 +3459,7 @@ def matching_jobs(args, *, page_dates=None):
     if getattr(args, "command", None) == "list" and not scope_conflicts:
         resolve = cache(resolve)
 
-    def matches_metadata(value, job_id):
+    def matches_metadata(value, job_id, task_hash=None):
         context = value.get("context")
         # --also-owner adds predecessor sessions handed over to --owner; it never applies without --owner.
         owners = {args.owner, *(getattr(args, "also_owner", None) or [])}
@@ -3438,12 +3470,18 @@ def matching_jobs(args, *, page_dates=None):
         if verification_of and (context or {}).get("verification_of") != verification_of:
             return False
         task_key = getattr(args, "task_key", None)
-        if task_key and hashlib.sha256((context or {}).get("task", "").strip().encode("utf-8", "surrogatepass")).hexdigest() != task_key:
+        if task_key and (task_hash or hashlib.sha256(
+                (context or {}).get("task", "").strip().encode("utf-8", "surrogatepass")).hexdigest()) != task_key:
             return False
         return not args.cwd or bool(value.get("cwd") and
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
 
     jobs = []
+    # Owner, verification, task and cwd filters come from args.json alone: skip non-matching jobs from the cache
+    # instead of parsing every job's args.json and result.json (thousands of jobs made each query take seconds).
+    prefilter = bool(args.owner or getattr(args, "verification_of", None) or getattr(args, "task_key", None) or args.cwd)
+    cached = load_job_filter_cache() if prefilter else {}
+    added = False
     directories = job_directories(args.job_id if not args.owner else None) if page_dates is None else page_dates
     for job_dir in directories:
         args_file, result_file = job_dir / "args.json", job_dir / "result.json"
@@ -3455,12 +3493,27 @@ def matching_jobs(args, *, page_dates=None):
                 continue
             if not started_between[0] <= started_at <= started_between[1]:
                 continue
+        task = None
+        if prefilter:
+            fields = cached.get(job_dir.name)
+            if not (isinstance(fields, list) and len(fields) == 4):
+                fields = None
+                with suppress(OSError, ValueError, TypeError):
+                    task = task_record(job_dir)
+                    if task:  # args.json not written yet: leave the decision to the full record below
+                        fields = cached[job_dir.name] = job_filter_fields(task)
+                        added = True
+            if fields is not None:
+                owner, verification_of, task_hash, cwd = fields
+                if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}, "cwd": cwd},
+                                        job_dir.name, task_hash=task_hash):
+                    continue
         try:
             finished = result_file.exists()
             # Only terminal jobs publish result.json.
             if args.status == "running" and finished:
                 continue
-            task = task_record(job_dir)
+            task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
             result = json.loads(result_file.read_text("utf-8")) if finished else None
             value = {**task, **(result if result is not None else {})}
             record = {"task": task, "result": result}
@@ -3504,6 +3557,8 @@ def matching_jobs(args, *, page_dates=None):
                 continue
         dates = job_listing_times(job_dir, started_at) if page_dates is None else page_dates[job_dir]
         jobs.append({**value, "parent_job_id": parent, **dates})
+    if added:
+        save_job_filter_cache(cached)
     jobs.sort(key=job_listing_order, reverse=True)
     return jobs
 
