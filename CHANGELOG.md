@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.166` runner 按 owner、核验对象、任务或 cwd 过滤任务时，先用缓存的过滤字段跳过不匹配的任务，不再逐个解析全部任务的 args.json 和 result.json。args.json 只在任务创建时写一次，这几个字段之后不会变，缓存放在 runner 主目录的 job-filter-cache.json；缓存里没有、或 args.json 还没写好的任务照旧读原文件，查询结果不变。以前任务目录积到约 4500 个后，每次按 owner 查询要 1.1–1.7 秒，派一单的预检要串行做七八次这样的查询，codex_run 中位 15 秒、wait=0 的 codex_status 13–23 秒；现在同样的查询约 0.4 秒（scope 冲突和用量汇总约 0.9 秒）。几个 runner 同时写缓存时可能互相丢掉新条目，丢了只是下次再读一次原文件。
+
 `0.9.165` danger-full-access 的写任务现在按它声明的 scope 子树上锁，而不是整个 cwd。几个任务挂在同一个粗 cwd（比如都在 /mnt/f/渗透 下、各写不同子目录）、声明的 scope 互不重叠时，以前都挤在这个 cwd 的单一写锁上串行；一次约 11.5 小时的运行里，14 个任务因此累计白等 98 分钟（最长 18 分钟），其中只有一对真的重叠。现在没有声明 scope 时才退回按 cwd 上锁；scope 相同或嵌套的仍按重叠的根上锁、照常串行。workspace-write（由系统强制的 cwd 边界）和没有 scope 的任务不变。
 
 `0.9.164` 核验前后的仓库快照先算 scope 内的部分，再算整个仓库的 git status。整仓状态只用来提示“scope 外有变化”，现在放在最后、在预算结束前 2 秒放弃；放弃时 scope 内的检查照常生效，结果里记 verification_outside_scope: unchecked。以前整仓状态排在最前面：在 /mnt 下、未跟踪文件很多的仓库里，光这一步就要 39 秒，把 30 秒预算用光，整个完整性检查都记成 unavailable（某个会话今天有 6 次）。现在同一个仓库 28 秒就能完成 scope 内的检查。
@@ -227,6 +229,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.166` When the runner filters jobs by owner, verification target, task or cwd, it now skips non-matching jobs using cached filter fields instead of parsing every job's args.json and result.json. args.json is written once when a job starts, so those fields never change; the cache lives in job-filter-cache.json under the runner home, and a job missing from it (or whose args.json is not written yet) is read from its files as before, so results are unchanged. With about 4500 job directories each owner query took 1.1–1.7 s and a dispatch preflight runs seven or eight of them in a row, so codex_run took a median 15 s and codex_status with wait=0 13–23 s; the same queries now take about 0.4 s (scope conflicts and the usage summary about 0.9 s). Concurrent runners may drop each other's new cache entries, which only means reading the files again next time.
 
 `0.9.165` A danger-full-access writer now takes its write lock on its declared scope subtrees rather than the whole cwd. When several jobs share a coarse cwd (e.g. all rooted at /mnt/f/渗透, each writing a different subdir) but declare disjoint scopes, they used to serialize on that one cwd lock; over one ~11.5 h run this made 14 jobs wait a cumulative 98 min (max 18 min) with only one pair genuinely overlapping. Scope-less jobs still fall back to the cwd lock, and identical or nested scopes still key to overlapping roots and serialize. workspace-write (an OS-enforced cwd boundary) and scope-less jobs are unchanged.
 

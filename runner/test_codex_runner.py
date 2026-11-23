@@ -5036,6 +5036,51 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"keep", "explicit"})
         self.assertEqual(read.call_count, 2)
 
+    def test_list_filter_cache_keeps_results_and_skips_non_matching_jobs(self):
+        import hashlib
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.tmp.name) / "home"
+        done = {"status": "completed", "structured": self.sample_report()}
+        self.stored_job("a1", done, context=self.sample_context("owner-a"))
+        self.stored_job("a2", done, context={**self.sample_context("owner-a"), "task": "Other task"},
+                        cwd=str(self.cwd / "elsewhere"))
+        self.stored_job("b1", done, context={**self.sample_context("owner-b"), "verification_of": "a1"})
+        self.stored_job("legacy", {"status": "cancelled", "retryable": False})
+        (home / "jobs" / "pending").mkdir()  # args.json not written yet
+        expected = {("--owner", "owner-a"): ["a1", "a2"],
+                    ("--owner", "owner-b", "--also-owner", "owner-a"): ["a1", "a2", "b1"],
+                    ("--owner", "owner-b", "--job-id", "legacy"): ["b1", "legacy"],
+                    ("--verification-of", "a1"): ["b1"],
+                    ("--task-key", hashlib.sha256(b"Other task").hexdigest()): ["a2"],
+                    ("--owner", "owner-a", "--cwd", str(self.cwd)): ["a1"]}
+        cache_file = home / codex_runner.JOB_FILTER_CACHE
+        listed = lambda query: sorted(j["job_id"] for j in self.control("list", *query)["jobs"])
+        for state in ("cold", "warm", "corrupt", "wrong-shape"):
+            if state == "corrupt":
+                cache_file.write_text("not json", "utf-8")
+            elif state == "wrong-shape":
+                cache_file.write_text(json.dumps({"a1": ["owner-b"], "b1": "x"}), "utf-8")
+            for query, ids in expected.items():
+                with self.subTest(state=state, query=query):
+                    self.assertEqual(listed(query), ids)
+        cached = json.loads(cache_file.read_text("utf-8"))
+        self.assertEqual(set(cached) & {"a1", "a2", "b1", "legacy", "pending"}, {"a1", "a2", "b1", "legacy"})
+        # A job cached before its args.json existed would be missed; once written it is read and listed.
+        (home / "jobs" / "pending" / "args.json").write_text(
+            json.dumps({"cwd": str(self.cwd), "sandbox": "danger-full-access", "context": self.sample_context("owner-a")}),
+            "utf-8")
+        self.assertEqual(listed(("--owner", "owner-a")), ["a1", "a2", "pending"])
+        # With a warm cache only the matching jobs' records are opened.
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
+                               needs_attention=False, offset=0, limit=20)
+        with mock.patch.object(codex_runner, "HOME", home), \
+                mock.patch.object(codex_runner, "task_record", wraps=codex_runner.task_record) as read:
+            result = codex_runner.list_jobs(args)
+        self.assertEqual({j["job_id"] for j in result["jobs"]}, {"a1", "a2", "pending"})
+        self.assertEqual({c.args[0].name for c in read.call_args_list}, {"a1", "a2", "pending"})
+
     def test_recent_attention_filters_start_time_before_pagination(self):
         for job_id, started in (("old", 999), ("first", 1000), ("middle", 1500), ("last", 2000),
                                 ("future", 2001), ("unknown", None)):
