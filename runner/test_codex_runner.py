@@ -3880,6 +3880,34 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(before, {p: p.read_bytes() for p in Path(self.tmp.name).rglob("*") if p.is_file()})
 
+    def test_products_skip_other_owners_by_the_filter_cache_but_never_trust_it_to_grant(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        owned = self.stored_job("owned", {"status": "completed", "files_changed": [{"path": "owned.txt"}]},
+                                context=self.sample_context())
+        other = self.stored_job("other", {"status": "completed", "files_changed": [{"path": "other.txt"}]},
+                                context=self.sample_context("owner-b"))
+        self.control("list", "--owner", "owner-a")  # fills the filter cache
+        original = Path.read_text
+
+        def read(path, *args, **kwargs):
+            self.assertNotEqual(path.parent, other)
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner, "HOME", home), mock.patch.object(Path, "read_text", read):
+            paths = codex_runner.products(SimpleNamespace(owner="owner-a", limit=10000))["paths"]
+        self.assertIn(str((self.cwd / "owned.txt").resolve()), paths)
+        # An entry naming the wrong owner only makes args.json be read; that job's own owner decides.
+        cache_file = home / codex_runner.JOB_FILTER_CACHE
+        cache = json.loads(cache_file.read_text("utf-8"))
+        cache_file.write_text(json.dumps({**cache, "other": ["owner-a", None, None]}), "utf-8")
+        paths = self.control("products", "--owner", "owner-a")["paths"]
+        self.assertNotIn(str((self.cwd / "other.txt").resolve()), paths)
+        self.assertIn(str((self.cwd / "owned.txt").resolve()), paths)
+        self.assertTrue(owned.exists())
+
     def test_products_deduplicate_normalized_files_without_granting_directories(self):
         root = Path(self.env["CODEX_RUNNER_HOME"])
         self.stored_job("normalized", {"status": "completed", "files_changed": [

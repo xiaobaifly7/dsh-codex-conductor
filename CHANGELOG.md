@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.172` runner 的 products 查询（规划端读取护栏用来确认哪些文件是本会话产物）先用 list 已有的过滤缓存跳过别的会话的任务，不再逐个解析全部任务的 args.json。缓存只用来排除：留下的任务仍按它自己的 args.json 判断归属，所以缓存过期或被改，最多少给产物、不会多给。以前每次刷新都要解析约 4500 个 args.json，热缓存约 1 秒，冷缓存 10–12 秒；护栏要等这次刷新才回答，2026-11-24 有三次读取因此等了 10–12 秒才被拒。现在一般会话约 0.5 秒，输出逐字节一致。产物很多的会话（一个会话有 7194 个产物路径）主要耗时在逐个解析 /mnt 下的路径，这部分不变。
+
 `0.9.171` runner 列任务时，已结束任务的整理结果改为按任务目录缓存，放在 runner 主目录的 listing-cache/。目录里任何文件的名称、大小或修改时间一变（提交复核、修复结果、回滚），就重新计算；runner 代码一变，旧缓存也全部作废。正在运行的任务从不缓存。以前每列一次都要把交接链上每个已结束任务重新算一遍：读 args/result、解析 /mnt 下的路径（lstat 要穿到 Windows）、重算复核和越界状态，每个约 2 毫秒。交接链有一千多单的会话，派单前的收尾检查、自动核验补派、台账每次都要整链列一遍，一次 1.1–2.4 秒，codex_run 中位 13–15 秒（其他会话约 5 秒），codex_summary 一次 15 秒。现在同样的查询缓存命中后约 0.5 秒，summary 约 0.6 秒，输出逐字节一致。list 上限和插件整段历史的每页条数从 1000 提到 5000：一条 1134 单的交接链以前每次要取两页，每页都要重读全部匹配任务。
 
 `0.9.170` 查一个不存在的任务号（多半是写错或模型编的）时，`codex_status`、`codex_output`、`codex_cancel` 直接说「没有任务号 X；本会话的任务见 codex_jobs」，不再说「暂时无法确认任务属于本会话」。原来的说法像是暂时的归属故障，模型会认定归属校验有 bug 并反复重试同一个错号（2026-11-24 一次压缩后连续两次）。归属提示只留给 bridge_error、invalid_record 和状态未知的情况。
@@ -239,6 +241,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.172` The runner's products query (the planner read guard uses it to learn which files are this session's products) now skips other sessions' jobs with the list filter cache instead of parsing every job's args.json. The cache only excludes: an included job's owner is still read from its own args.json, so a stale or edited entry can withhold a product but never grant one. Each refresh used to parse about 4,500 args.json files, about 1 s warm and 10-12 s cold, and the guard waits for the refresh before answering; on 2026-11-24 three reads waited 10-12 s before being refused. A typical session now takes about 0.5 s, with byte-identical output. Sessions with very many products (one has 7,194 product paths) spend most of the time resolving each path under /mnt, which is unchanged.
 
 `0.9.171` The runner now caches each finished job's listing in listing-cache/ under its home. An entry is recomputed when any file in the job directory changes name, size or mtime (a review, a repaired result, a rollback), and every entry is discarded when the runner code changes. Running jobs are never cached. Each list used to recompute every finished job of a handover chain: read args/result, resolve paths under /mnt (each lstat crosses into Windows) and rebuild the review and out-of-scope state, about 2 ms per job. Sessions with a chain of over a thousand jobs list the whole chain for the close-out check, auto-verification catch-up and ledger, 1.1–2.4 s each, so codex_run took a median 13–15 s there (about 5 s elsewhere) and codex_summary 15 s. With a warm cache the same queries take about 0.5 s and summary about 0.6 s, with byte-identical output. The list limit and the plugin's whole-history page rise from 1000 to 5000: a 1134-job chain needed two pages, and each page re-reads every matching job.
 
