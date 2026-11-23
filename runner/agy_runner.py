@@ -744,6 +744,17 @@ class EventAdapter:
                 except ValueError:
                     report = None
             if not isinstance(report, dict):
+                # agy finished (SUCCESS) but answered in prose instead of the report object.
+                # Keep that text as the final message so the shared schema check marks it
+                # schema_invalid with the work preserved, rather than losing it as incomplete.
+                response = result.get("response")
+                if isinstance(response, str) and response.strip():
+                    self.finished = True
+                    yield {"type": "item.completed", "item": {
+                        "id": "agy-report", "type": "agent_message", "text": response,
+                    }}
+                    yield {"type": "turn.completed", "usage": result.get("usage")}
+                    return
                 yield self._failed("agy SUCCESS result is missing a structured_output object")
                 return
             self.finished = True

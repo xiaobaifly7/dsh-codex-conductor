@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.169` Gemini（agy）任务报 SUCCESS 但没有给出 structured_output 报告对象时，如果结果里有模型的文字答复（response），就保留这段文字当最终消息，交给和执行端相同的报告校验——于是落成 schema_invalid（报告格式不合格、产物仍在、可核验），而不是丢掉这段文字、记成 incomplete。两者都不缺报告时仍记 incomplete。此前同一会话的长任务多次在收尾时以文字答复结束、没填报告，产物因此被当作 incomplete 丢弃、只能重跑十几分钟的长任务。
+
 `0.9.168` runner 和 `gemini_write` 向 dsh-agy-link 租号、续约、归还时，带上 `.link-endpoint.json` 里的 `token`（`Authorization: Bearer <token>`），和地址取自同一次读文件。dsh-agy-link 正在给租约接口加鉴权：每次启动生成随机 token，只写在这个文件里，没带或不对的请求一律 401。文件里没有 token（旧版插件）时不带这个头，行为不变，所以本版可以先于插件上线。租号收到 401 和其他租号失败一样处理：任务报错，错误里有 `unauthorized`，不会打印 token。
 
 `0.9.167` 插件扫描整段历史时（派单前的收尾检查、每次工具调用后的自动核验补派、已接受未结台账）改为一次最多取 1000 条，runner 的 list 上限相应从 100 提到 1000。runner 每取一页都要先读完全部匹配任务再截取，按 100 条翻页时总耗时随任务数平方增长：一个交接链有 714 单的会话，派单前的收尾检查要翻 8 页、约 11 秒，自动核验补派 15 页约 38 秒，台账 19 页约 55 秒；现在分别是 1 次约 1 秒、2 次约 3 秒、2 次约 3 秒，结果逐条一致。list 查询解析路径也改用 products 已有的按目录缓存的解析：/mnt 下每次 lstat 都要穿到 Windows，以前一页里一半时间花在这上面。
@@ -233,6 +235,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.169` When a Gemini (agy) task reports SUCCESS but gives no structured_output report object, the model's prose answer (response), if present, is now kept as the final message and run through the same report check as the exec path — so it lands as schema_invalid (report malformed, work preserved, reviewable) instead of being discarded as incomplete. With neither a report nor a usable response it still records incomplete. The same conversation's long tasks had repeatedly ended with a prose answer and no filled report, so their work was thrown away as incomplete and the ~13-minute task had to be rerun.
 
 `0.9.168` The runner and `gemini_write` send the `token` from `.link-endpoint.json` as `Authorization: Bearer <token>` on every lease acquire, renew and release, read together with the url. dsh-agy-link is adding auth to its lease API: a random token per start, published only in that file, and 401 for a missing or wrong one. Without a token in the file (an older plugin) no header is sent and nothing changes, so this release can ship before the plugin. A 401 on acquire fails like any other lease failure, with `unauthorized` in the error and never the token.
 
