@@ -1553,6 +1553,36 @@ class RunnerTests(unittest.TestCase):
                 roots = codex_runner.write_lock_roots(str(self.cwd / "src"), "workspace-write", None)
                 self.assertTrue(codex_runner.earlier_writer_waiting(waiter, roots))
 
+    def test_full_access_scope_locks_let_disjoint_writers_run(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        holder = self.stored_job("holder", None)
+        waiter = self.stored_job("waiter", None)
+        os.utime(holder / "args.json", ns=(2_000_000_000, 2_000_000_000))
+        os.utime(waiter / "args.json", ns=(1_000_000_000, 1_000_000_000))
+        # (holder scope, waiter scope, waiter blocked by holder) under one shared danger-full-access cwd.
+        cases = [(["sub/a"], ["sub/b"], False),   # disjoint declared scopes -> run concurrently
+                 (["sub/a"], ["sub/a"], True),    # identical scope -> serialize
+                 (["sub"], ["sub/a"], True),      # nested scope -> serialize
+                 ([], ["sub/a"], True),           # holder without scope locks the whole cwd
+                 (["sub/a"], [], True)]           # waiter without scope locks the whole cwd
+        ctx = {"owner": None, "task": "t", "acceptance": ["a"], "write": True}
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            for hscope, wscope, blocked in cases:
+                with self.subTest(holder=hscope, waiter=wscope):
+                    (holder / "args.json").write_text(json.dumps(
+                        {"cwd": str(self.cwd), "sandbox": "danger-full-access", "scope": hscope, "context": ctx}))
+                    os.utime(holder / "args.json", ns=(2_000_000_000, 2_000_000_000))
+                    locks = [codex_runner.acquire_write_lock(p) for p in
+                             codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None, ctx, hscope).values()]
+                    try:
+                        roots = codex_runner.write_lock_roots(str(self.cwd), "danger-full-access", None, ctx, wscope)
+                        self.assertEqual(codex_runner.earlier_writer_waiting(waiter, roots), blocked)
+                    finally:
+                        for lock in locks:
+                            lock.close()
+
     def test_stale_multiple_root_record_does_not_link_independent_writers(self):
         sys.path.insert(0, str(RUNNER.parent))
         import codex_runner
