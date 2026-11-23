@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.171` runner 列任务时，已结束任务的整理结果改为按任务目录缓存，放在 runner 主目录的 listing-cache/。目录里任何文件的名称、大小或修改时间一变（提交复核、修复结果、回滚），就重新计算；runner 代码一变，旧缓存也全部作废。正在运行的任务从不缓存。以前每列一次都要把交接链上每个已结束任务重新算一遍：读 args/result、解析 /mnt 下的路径（lstat 要穿到 Windows）、重算复核和越界状态，每个约 2 毫秒。交接链有一千多单的会话，派单前的收尾检查、自动核验补派、台账每次都要整链列一遍，一次 1.1–2.4 秒，codex_run 中位 13–15 秒（其他会话约 5 秒），codex_summary 一次 15 秒。现在同样的查询缓存命中后约 0.5 秒，summary 约 0.6 秒，输出逐字节一致。list 上限和插件整段历史的每页条数从 1000 提到 5000：一条 1134 单的交接链以前每次要取两页，每页都要重读全部匹配任务。
+
 `0.9.170` 查一个不存在的任务号（多半是写错或模型编的）时，`codex_status`、`codex_output`、`codex_cancel` 直接说「没有任务号 X；本会话的任务见 codex_jobs」，不再说「暂时无法确认任务属于本会话」。原来的说法像是暂时的归属故障，模型会认定归属校验有 bug 并反复重试同一个错号（2026-11-24 一次压缩后连续两次）。归属提示只留给 bridge_error、invalid_record 和状态未知的情况。
 
 `0.9.169` Gemini（agy）任务报 SUCCESS 但没有给出 structured_output 报告对象时，如果结果里有模型的文字答复（response），就保留这段文字当最终消息，交给和执行端相同的报告校验——于是落成 schema_invalid（报告格式不合格、产物仍在、可核验），而不是丢掉这段文字、记成 incomplete。两者都不缺报告时仍记 incomplete。此前同一会话的长任务多次在收尾时以文字答复结束、没填报告，产物因此被当作 incomplete 丢弃、只能重跑十几分钟的长任务。
@@ -237,6 +239,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.171` The runner now caches each finished job's listing in listing-cache/ under its home. An entry is recomputed when any file in the job directory changes name, size or mtime (a review, a repaired result, a rollback), and every entry is discarded when the runner code changes. Running jobs are never cached. Each list used to recompute every finished job of a handover chain: read args/result, resolve paths under /mnt (each lstat crosses into Windows) and rebuild the review and out-of-scope state, about 2 ms per job. Sessions with a chain of over a thousand jobs list the whole chain for the close-out check, auto-verification catch-up and ledger, 1.1–2.4 s each, so codex_run took a median 13–15 s there (about 5 s elsewhere) and codex_summary 15 s. With a warm cache the same queries take about 0.5 s and summary about 0.6 s, with byte-identical output. The list limit and the plugin's whole-history page rise from 1000 to 5000: a 1134-job chain needed two pages, and each page re-reads every matching job.
 
 `0.9.170` Asking about a job id that does not exist (usually a typo or one the model made up) now makes `codex_status`, `codex_output` and `codex_cancel` say plainly that there is no such job and point to codex_jobs, instead of saying ownership can't be confirmed for now. That wording read as a temporary ownership fault, so the model concluded the ownership check was broken and retried the same wrong id (twice in a row after a compaction on 2026-11-24). The ownership message remains for bridge_error, invalid_record and unknown states.
 

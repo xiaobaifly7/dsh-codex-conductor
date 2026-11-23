@@ -5002,7 +5002,7 @@ class RunnerTests(unittest.TestCase):
         last = self.control("list", "--offset", "4")
         self.assertTrue(last["eof"])
         self.assertIsNone(last["next_offset"])
-        for extra in (("--limit", "1001"), ("--offset", "-1")):
+        for extra in (("--limit", "5001"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
     def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
@@ -5072,14 +5072,55 @@ class RunnerTests(unittest.TestCase):
             json.dumps({"cwd": str(self.cwd), "sandbox": "danger-full-access", "context": self.sample_context("owner-a")}),
             "utf-8")
         self.assertEqual(listed(("--owner", "owner-a")), ["a1", "a2", "pending"])
-        # With a warm cache only the matching jobs' records are opened.
+        # With a warm cache only the matching jobs' records are opened, and the finished ones not even those:
+        # their listings are reused.
         args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
                                needs_attention=False, offset=0, limit=20)
         with mock.patch.object(codex_runner, "HOME", home), \
                 mock.patch.object(codex_runner, "task_record", wraps=codex_runner.task_record) as read:
             result = codex_runner.list_jobs(args)
         self.assertEqual({j["job_id"] for j in result["jobs"]}, {"a1", "a2", "pending"})
-        self.assertEqual({c.args[0].name for c in read.call_args_list}, {"a1", "a2", "pending"})
+        self.assertEqual({c.args[0].name for c in read.call_args_list}, {"pending"})
+
+    def test_list_reuses_finished_listings_until_the_job_directory_changes(self):
+        import shutil
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        home = Path(self.tmp.name) / "home"
+        cache = home / codex_runner.LISTING_CACHE
+        self.stored_job("a1", {"status": "completed", "structured": self.sample_report()},
+                        context=self.sample_context("owner-a"))
+        self.stored_job("running", None, context=self.sample_context("owner-a"))
+        queries = (("list", "--owner", "owner-a"), ("list", "--owner", "owner-a", "--needs-attention"),
+                   ("summary", "--owner", "owner-a"))
+        def uncached():
+            shutil.rmtree(cache, ignore_errors=True)
+            return [self.control(*q) for q in queries]
+        cold = uncached()
+        self.assertEqual(sorted(p.name for p in cache.iterdir()), ["a1.json"])  # running jobs are never cached
+        self.assertEqual([self.control(*q) for q in queries], cold)
+        # A warm listing computes no status for the finished job.
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
+                               needs_attention=False, offset=0, limit=20)
+        with mock.patch.object(codex_runner, "HOME", home), \
+                mock.patch.object(codex_runner, "enriched_status", wraps=codex_runner.enriched_status) as computed:
+            self.assertEqual({j["job_id"] for j in codex_runner.list_jobs(args)["jobs"]}, {"a1", "running"})
+        self.assertEqual({c.args[0] for c in computed.call_args_list}, {"running"})
+        # A review changes the directory, so the listing is computed again.
+        self.assertEqual(self.submit_review("a1", self.sample_review())["verification_status"], "verified")
+        reviewed = [self.control(*q) for q in queries]
+        self.assertEqual(next(j for j in reviewed[0]["jobs"] if j["job_id"] == "a1")["verification_status"], "verified")
+        self.assertEqual(reviewed, uncached())
+        # Entries from another runner version, damaged ones and unreadable ones are computed again.
+        for damage in ("version", "corrupt", "shape"):
+            with self.subTest(damage=damage):
+                entry = cache / "a1.json"
+                data = json.loads(entry.read_text("utf-8"))
+                entry.write_text({"version": json.dumps({**data, "version": "other"}), "corrupt": "not json",
+                                  "shape": json.dumps({**data, "changed": []})}[damage], "utf-8")
+                self.assertEqual([self.control(*q) for q in queries], reviewed)
+                self.assertEqual(json.loads(entry.read_text("utf-8"))["version"], data["version"])
 
     def test_recent_attention_filters_start_time_before_pagination(self):
         for job_id, started in (("old", 999), ("first", 1000), ("middle", 1500), ("last", 2000),
@@ -5165,8 +5206,16 @@ class RunnerTests(unittest.TestCase):
             history = codex_runner.list_jobs(args)
             self.assertEqual(history["total"], 3)
             self.assertEqual(cwd_reads(), 1)
+            # Unchanged finished jobs come from their cached listings, so nothing is resolved again.
+            self.assertEqual(codex_runner.list_jobs(args), history)
+            self.assertEqual(cwd_reads(), 1)
+            # Without cached listings the resolver starts afresh: it is not kept across queries.
+            for cached in (Path(self.env["CODEX_RUNNER_HOME"]) / codex_runner.LISTING_CACHE).iterdir():
+                cached.unlink()
             self.assertEqual(codex_runner.list_jobs(args), history)
             self.assertEqual(cwd_reads(), 2)
+            for cached in (Path(self.env["CODEX_RUNNER_HOME"]) / codex_runner.LISTING_CACHE).iterdir():
+                cached.unlink()
             args.owner = "owner-a"
             args.cwd = str(self.cwd)
             self.assertEqual(codex_runner.list_jobs(args), history)
@@ -5181,33 +5230,40 @@ class RunnerTests(unittest.TestCase):
                                                   "structured": self.sample_report()}, context=self.sample_context())
             os.utime(jd / "args.json", (1000 + i, 1000 + i))
         read_text = Path.read_text
-        for query in ("unfiltered", "list", "summary"):
-            command = "list" if query == "unfiltered" else query
-            reads = []
+        # A finished job is enriched once, when its listing is first cached; an unfiltered page touches only its own jobs.
+        enriched = {("cold", "unfiltered"): 1, ("cold", "list"): 3, ("cold", "summary"): 0}
+        for state in ("cold", "warm"):
+            for query in ("unfiltered", "list", "summary"):
+                command = "list" if query == "unfiltered" else query
+                reads = []
 
-            def read(path, *args, **kwargs):
-                if path.name in ("args.json", "result.json"):
-                    reads.append(path)
-                return read_text(path, *args, **kwargs)
+                def read(path, *args, **kwargs):
+                    if path.name in ("args.json", "result.json"):
+                        reads.append(path)
+                    return read_text(path, *args, **kwargs)
 
-            unfiltered = query == "unfiltered"
-            args = SimpleNamespace(command=command, owner=None if unfiltered else "owner-a",
-                                   cwd=None if unfiltered else str(self.cwd), job_id=None,
-                                   status=None, needs_attention=False, offset=1, limit=1, round_limit=20)
-            with self.subTest(query=query), mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
-                    mock.patch.object(Path, "read_text", read), \
-                    mock.patch.object(codex_runner, "enriched_status", wraps=codex_runner.enriched_status) as enrich:
-                value = codex_runner.list_jobs(args) if command == "list" else codex_runner.summarize_jobs(args)
-            self.assertEqual(value["total"], 4)
-            self.assertEqual(len(reads), len(set(reads)))
-            self.assertEqual(enrich.call_count, 1)
-            if unfiltered:
-                self.assertEqual({path.parent.name for path in reads}, {"history-2"})
-                self.assertEqual(value["next_offset"], 2)
-            if command == "list":
-                self.assertEqual(value["jobs"][0]["job_id"], "history-2")
-            else:
-                self.assertEqual(value["groups"][0]["job_ids"], ["history-2"])
+                unfiltered = query == "unfiltered"
+                args = SimpleNamespace(command=command, owner=None if unfiltered else "owner-a",
+                                       cwd=None if unfiltered else str(self.cwd), job_id=None,
+                                       status=None, needs_attention=False, offset=1, limit=1, round_limit=20)
+                with self.subTest(state=state, query=query), \
+                        mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(Path, "read_text", read), \
+                        mock.patch.object(codex_runner, "enriched_status", wraps=codex_runner.enriched_status) as enrich:
+                    value = codex_runner.list_jobs(args) if command == "list" else codex_runner.summarize_jobs(args)
+                    self.assertEqual(value["total"], 4)
+                    self.assertEqual(len(reads), len(set(reads)))
+                    self.assertEqual(enrich.call_count, enriched.get((state, query), 0))
+                    if state == "warm":
+                        self.assertEqual(reads, [])
+                    elif unfiltered:
+                        self.assertEqual({path.parent.name for path in reads}, {"history-2"})
+                    if unfiltered:
+                        self.assertEqual(value["next_offset"], 2)
+                    if command == "list":
+                        self.assertEqual(value["jobs"][0]["job_id"], "history-2")
+                    else:
+                        self.assertEqual(value["groups"][0]["job_ids"], ["history-2"])
 
     def test_output_logs_use_repeatable_unicode_pages_for_running_and_finished_jobs(self):
         for status in (None, {"status": "failed", "error_kind": "incomplete"}):
