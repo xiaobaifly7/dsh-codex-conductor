@@ -52,14 +52,15 @@ function fixture(t, action, cfg = CFG) {
 
 // dsh-agy-link's lease API on a loopback port, announced in .link-endpoint.json next to pool.json.
 // replies[route] queues [status, body] overrides; routes: false answers a plain 404 (a plugin without leases).
-async function fakeLink(t, { routes = true, ttlMs = 60_000 } = {}) {
+// With a token the file carries it and every request without the matching bearer header gets 401; auth logs each header.
+async function fakeLink(t, { routes = true, ttlMs = 60_000, token } = {}) {
   const dir = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-link-')));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const pool = path.join(dir, 'pool.json');
   writeFileSync(pool, JSON.stringify({ primaryAccountId: 'acc_primary', accounts: [
     { id: 'acc_primary', dir: '', systemHome: true, enabled: true, proxyUrl: 'http://127.0.0.1:50577' },
     { id: 'acc_a', dir: 'D:\\pool\\a', enabled: true, proxyUrl: 'http://127.0.0.1:7894' }] }));
-  const link = { pool, calls: [], replies: {}, leases: new Set(), count: 0 };
+  const link = { pool, calls: [], auth: [], replies: {}, leases: new Set(), count: 0 };
   const env = { HOME: 'D:\\pool\\a', USERPROFILE: 'D:\\pool\\a', GEMINI_CLI_HOME: 'D:\\pool\\a', HTTPS_PROXY: 'http://127.0.0.1:7894',
     NO_PROXY: 'localhost', BROWSER: 'none' };
   const server = http.createServer((request, response) => {
@@ -68,7 +69,9 @@ async function fakeLink(t, { routes = true, ttlMs = 60_000 } = {}) {
     request.on('end', () => {
       const route = request.url.split('/').pop(), body = JSON.parse(text);
       link.calls.push([route, body]);
-      let [status, reply] = !routes ? [404, 'Not Found'] : link.replies[route]?.shift() ?? [200, null];
+      link.auth.push(request.headers.authorization);
+      let [status, reply] = !routes ? [404, 'Not Found'] : token && request.headers.authorization !== `Bearer ${token}`
+        ? [401, { ok: false, code: 'unauthorized', error: 'missing or wrong bearer token' }] : link.replies[route]?.shift() ?? [200, null];
       if (!reply && route === 'acquire') {
         const lease = `lease-${++link.count}`;
         link.leases.add(lease);
@@ -83,7 +86,8 @@ async function fakeLink(t, { routes = true, ttlMs = 60_000 } = {}) {
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   t.after(() => server.close());
-  writeFileSync(path.join(dir, '.link-endpoint.json'), JSON.stringify({ url: `http://127.0.0.1:${server.address().port}/plugins/agy-link`, pid: 1, startedAt: 0 }));
+  writeFileSync(path.join(dir, '.link-endpoint.json'), JSON.stringify({ url: `http://127.0.0.1:${server.address().port}/plugins/agy-link`, pid: 1, startedAt: 0,
+    ...(token ? { token } : {}) }));
   return { ...link, env, endpoint: path.join(dir, '.link-endpoint.json'), routes: () => link.calls.map(([route]) => route) };
 }
 
@@ -162,6 +166,34 @@ test('the agy lease is renewed and re-acquired on the same account after DSH for
   await lease.release(true);
   assert.equal(link.calls.at(-1)[1].leaseId, 'lease-2');
   assert.equal(link.leases.size, 0);
+});
+
+test('lease calls send the endpoint file token as a bearer token, none without one, and a 401 fails the run', async (t) => {
+  proxied(t);
+  const token = 'ab'.repeat(32);
+  const link = await fakeLink(t, { ttlMs: 30, token });
+  const lease = await leaseAgyAccount(link.pool, { holder: 'test' });
+  for (let i = 0; i < 500 && !link.routes().includes('renew'); i++) await new Promise((r) => setTimeout(r, 10));
+  await lease.release(true);
+  assert.deepEqual([...new Set(link.routes())], ['acquire', 'renew', 'release']);
+  assert.ok(link.auth.every((header) => header === `Bearer ${token}`), link.auth.join());
+  assert.equal(link.leases.size, 0);
+
+  const old = await fakeLink(t);
+  assert.equal((await fixture(t, undefined, { ...CFG, accountPool: old.pool }).execute()).status, 'completed');
+  assert.deepEqual(old.routes(), ['acquire', 'release']);
+  assert.deepEqual(old.auth, [undefined, undefined]);
+
+  for (const stale of [undefined, 'cd'.repeat(32)]) {
+    const endpoint = JSON.parse(readFileSync(link.endpoint, 'utf8'));
+    writeFileSync(link.endpoint, JSON.stringify({ ...endpoint, token: stale }));
+    const h = fixture(t, undefined, { ...CFG, accountPool: link.pool });
+    const value = await h.execute();
+    assert.equal(value.status, 'failed');
+    assert.match(value.error, /unauthorized/);
+    assert.doesNotMatch(JSON.stringify(value), new RegExp(token));
+    assert.equal(h.spawns.length, 0);
+  }
 });
 
 test('gemini_write passes --effort only when an effort is configured', async (t) => {

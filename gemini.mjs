@@ -107,21 +107,24 @@ const sameFile = (a, b) => {
 };
 
 // Windows 上 agy 的登录是全机一个凭据，只有 dsh-agy-link 能换；每个 agy 进程都先向它租账号，结束后带成败归还。
-// 与 runner/agy_runner.py 的 AccountLease 用同一套接口：池文件同目录的 .link-endpoint.json 给出地址，每次调用都重读（DSH 重启会换端口）。
+// 与 runner/agy_runner.py 的 AccountLease 用同一套接口：池文件同目录的 .link-endpoint.json 给出地址和 token，每次调用都重读（DSH 重启会换端口和 token）。
 export const LEASE = { ttlMs: 60_000, waitMs: 600_000, timeoutMs: 5000 };
 class LeaseUnavailable extends Error {}
 
 function linkPost(pool, route, body, timeoutMs, signal) {
-  let url;
+  let url, token;
   try {
-    url = JSON.parse(readFileSync(path.join(path.dirname(pool), '.link-endpoint.json'), 'utf8')).url.replace(/\/+$/, '');
+    const endpoint = JSON.parse(readFileSync(path.join(path.dirname(pool), '.link-endpoint.json'), 'utf8'));
+    url = endpoint.url.replace(/\/+$/, '');
+    token = endpoint.token;
   } catch (error) {
     return Promise.reject(new LeaseUnavailable(`没有 dsh-agy-link 地址文件（${error.message}）`));
   }
   return new Promise((resolve, reject) => {
     // node:http 不读 HTTP(S)_PROXY，回环请求不会走给 agy 的代理。
-    const request = http.request(`${url}/lease/${route}`, { method: 'POST', headers: { 'content-type': 'application/json' },
-      timeout: timeoutMs, signal }, (response) => {
+    // 旧版 dsh-agy-link 不写 token 也不校验，这时不带 authorization。
+    const headers = { 'content-type': 'application/json', ...(typeof token === 'string' && token ? { authorization: `Bearer ${token}` } : {}) };
+    const request = http.request(`${url}/lease/${route}`, { method: 'POST', headers, timeout: timeoutMs, signal }, (response) => {
       let text = '';
       response.setEncoding('utf8');
       response.on('data', (chunk) => { text += chunk; });

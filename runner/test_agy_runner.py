@@ -24,11 +24,12 @@ class FakeLink:
     """dsh-agy-link's lease API on a loopback port, announced in .link-endpoint.json next to pool.json.
 
     Accounts are pool-style dicts with id, home and proxyUrl; an unpinned acquire gets `choice`. Queue (status, body)
-    replies per route in `replies`; routes=False answers every route with a plain 404 (a plugin without leases)."""
+    replies per route in `replies`; routes=False answers every route with a plain 404 (a plugin without leases).
+    With a token the file carries it and every request without the matching bearer header gets 401; auth logs each header."""
 
-    def __init__(self, pool_dir, accounts, choice=None, routes=True, ttl_ms=60_000):
+    def __init__(self, pool_dir, accounts, choice=None, routes=True, ttl_ms=60_000, token=None):
         self.accounts, self.choice, self.routes, self.ttl_ms = accounts, choice or accounts[0]["id"], routes, ttl_ms
-        self.calls, self.replies, self.leases, self.count = [], {}, {}, 0
+        self.calls, self.auth, self.replies, self.leases, self.count = [], [], {}, {}, 0
         link = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -36,7 +37,11 @@ class FakeLink:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 route = self.path.rsplit("/", 1)[-1]
                 link.calls.append((route, body))
-                status, reply = link.answer(self.path, route, body)
+                link.auth.append(self.headers["Authorization"])
+                if token and self.headers["Authorization"] != f"Bearer {token}":
+                    status, reply = 401, {"ok": False, "code": "unauthorized", "error": "missing or wrong bearer token"}
+                else:
+                    status, reply = link.answer(self.path, route, body)
                 data = reply.encode() if isinstance(reply, str) else json.dumps(reply).encode()
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(data)))
@@ -50,7 +55,8 @@ class FakeLink:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.endpoint = Path(pool_dir) / ".link-endpoint.json"
         self.endpoint.write_text(json.dumps({"url": f"http://127.0.0.1:{self.server.server_port}/plugins/agy-link",
-                                             "pid": 1, "startedAt": 0}), encoding="utf-8")
+                                             "pid": 1, "startedAt": 0, **({"token": token} if token else {})}),
+                                 encoding="utf-8")
 
     def answer(self, path, route, body):
         if not self.routes or not path.startswith("/plugins/agy-link/lease/"):
@@ -204,6 +210,40 @@ class LeaseTests(unittest.TestCase):
             if isinstance(reply[1], dict):
                 self.assertIn(f"{reply[1]['code']}: {reply[1]['error']}", str(caught.exception))
         self.assertEqual(link.leases, {})
+
+    def test_lease_calls_send_the_endpoint_token_as_a_bearer_token_and_a_401_fails_the_run(self):
+        token = "ab" * 32
+        link = self.link(choice="acc_b", ttl_ms=30, token=token)
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        deadline = time.monotonic() + 10
+        while "renew" not in link.routes_called() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        lease.release(True)
+        self.assertEqual(sorted(set(link.routes_called())), ["acquire", "release", "renew"])
+        self.assertEqual(set(link.auth), {f"Bearer {token}"})
+        self.assertEqual(link.leases, {})
+        # A stale or missing token in the file is refused, and the refusal names the code but never the token.
+        for stale in (None, "cd" * 32):
+            endpoint = json.loads(link.endpoint.read_text("utf-8"))
+            endpoint.pop("token")
+            link.endpoint.write_text(json.dumps({**endpoint, **({"token": stale} if stale else {})}), encoding="utf-8")
+            with self.assertRaisesRegex(agy_runner.LeaseError, "unauthorized") as caught:
+                self.lease().acquire(None, None, None)
+            self.assertNotIn(token, str(caught.exception))
+            link.endpoint.write_text(json.dumps({**endpoint, "token": token}), encoding="utf-8")
+        self.assertFalse(self.log.exists() and token in self.log.read_text("utf-8"))
+
+    def test_an_endpoint_without_a_token_sends_no_authorization_header(self):
+        link = self.link(choice="acc_b", ttl_ms=30)
+        lease = self.lease()
+        lease.acquire(None, None, None)
+        deadline = time.monotonic() + 10
+        while "renew" not in link.routes_called() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        lease.release(True)
+        self.assertEqual(sorted(set(link.routes_called())), ["acquire", "release", "renew"])
+        self.assertEqual(set(link.auth), {None})
 
     def test_without_the_lease_api_fresh_runs_use_the_primary_and_secondary_continuations_fail(self):
         for setup in ("missing", "unreachable", "not upgraded"):

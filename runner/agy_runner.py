@@ -236,13 +236,18 @@ class LeaseError(Exception):
 
 
 def _link_post(pool_dir, route, body, timeout):
-    # Re-read on every call: the port changes whenever DSH restarts.
+    # Re-read on every call: the port changes whenever DSH restarts, and the token with it.
     try:
-        url = json.loads((Path(pool_dir) / LINK_ENDPOINT).read_text("utf-8"))["url"].rstrip("/")
+        endpoint = json.loads((Path(pool_dir) / LINK_ENDPOINT).read_text("utf-8"))
+        url = endpoint["url"].rstrip("/")
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
         raise LeaseUnavailable(f"no dsh-agy-link endpoint in {Path(pool_dir) / LINK_ENDPOINT} ({error})") from None
+    headers = {"Content-Type": "application/json"}
+    token = endpoint.get("token")
+    if isinstance(token, str) and token:  # an older dsh-agy-link writes no token and checks none
+        headers["Authorization"] = f"Bearer {token}"
     request = urllib.request.Request(f"{url}/lease/{route}", data=json.dumps(body).encode("utf-8"),
-                                     headers={"Content-Type": "application/json"}, method="POST")
+                                     headers=headers, method="POST")
     # Loopback: the HTTP(S)_PROXY meant for agy must not catch it.
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
