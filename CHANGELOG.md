@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.165` danger-full-access 的写任务现在按它声明的 scope 子树上锁，而不是整个 cwd。几个任务挂在同一个粗 cwd（比如都在 /mnt/f/渗透 下、各写不同子目录）、声明的 scope 互不重叠时，以前都挤在这个 cwd 的单一写锁上串行；一次约 11.5 小时的运行里，14 个任务因此累计白等 98 分钟（最长 18 分钟），其中只有一对真的重叠。现在没有声明 scope 时才退回按 cwd 上锁；scope 相同或嵌套的仍按重叠的根上锁、照常串行。workspace-write（由系统强制的 cwd 边界）和没有 scope 的任务不变。
+
 `0.9.164` 核验前后的仓库快照先算 scope 内的部分，再算整个仓库的 git status。整仓状态只用来提示“scope 外有变化”，现在放在最后、在预算结束前 2 秒放弃；放弃时 scope 内的检查照常生效，结果里记 verification_outside_scope: unchecked。以前整仓状态排在最前面：在 /mnt 下、未跟踪文件很多的仓库里，光这一步就要 39 秒，把 30 秒预算用光，整个完整性检查都记成 unavailable（某个会话今天有 6 次）。现在同一个仓库 28 秒就能完成 scope 内的检查。
 
 `0.9.163` 核验因“只是被其他进程追加了内容”而放行时，结果里多一个 verification_append_check 字段：hash 表示核对了原有内容的哈希，size 表示项目里改动的文件太多、只核对了文件变大。只按大小判的那一单，回执会说明没有逐字核对原有内容。
@@ -225,6 +227,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.165` A danger-full-access writer now takes its write lock on its declared scope subtrees rather than the whole cwd. When several jobs share a coarse cwd (e.g. all rooted at /mnt/f/渗透, each writing a different subdir) but declare disjoint scopes, they used to serialize on that one cwd lock; over one ~11.5 h run this made 14 jobs wait a cumulative 98 min (max 18 min) with only one pair genuinely overlapping. Scope-less jobs still fall back to the cwd lock, and identical or nested scopes still key to overlapping roots and serialize. workspace-write (an OS-enforced cwd boundary) and scope-less jobs are unchanged.
 
 `0.9.164` The repository snapshot around a verification now computes the scoped part first and the whole-repository git status last. The whole status only feeds the outside-the-scope warning, so it gives up 2 s before the budget ends; the scoped check still holds and the result records verification_outside_scope: unchecked. It used to run first, and on a /mnt repository with many untracked files it took 39 s alone, used up the 30 s budget and left the whole integrity check unavailable (6 times in one session today). The same repository now gets its scoped check in 28 s.
 
