@@ -3457,7 +3457,7 @@ def matching_jobs(args, *, page_dates=None):
     resolve = os.path.realpath
     # Reuse canonical paths only within this list query. Scope-conflict checks keep fresh resolution.
     if getattr(args, "command", None) == "list" and not scope_conflicts:
-        resolve = cache(resolve)
+        resolve = query_resolver()[0]
 
     def matches_metadata(value, job_id, task_hash=None, check_cwd=True):
         context = value.get("context")
@@ -3610,37 +3610,43 @@ def list_jobs(args):
             "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
 
 
+def query_resolver():
+    """realpath and isdir for one query. Off Windows each directory is resolved once: every /mnt lstat crosses into
+    Windows, and one realpath per path took 10s of a 4k-job query (2026-11-23). The answers stay the same."""
+    if IS_WIN:
+        return cache(os.path.realpath), cache(os.path.isdir)
+    known = {}
+
+    def resolve(path):
+        if not os.path.isabs(path) or os.path.normpath(path) != path:
+            return os.path.realpath(path)
+        if path not in known:
+            parent, name = os.path.split(path)
+            if not name:
+                known[path] = (path, True)
+                return path
+            real = os.path.join(resolve(parent), name)
+            try:
+                mode = os.lstat(real).st_mode
+            except OSError:
+                mode = 0
+            if stat.S_ISLNK(mode):
+                real = os.path.realpath(real)
+                known[path] = (real, os.path.isdir(real))
+            else:
+                known[path] = (real, stat.S_ISDIR(mode))
+            known.setdefault(real, known[path])
+        return known[path][0]
+
+    def isdir(path):
+        return known[path][1] if path in known else os.path.isdir(path)
+
+    return resolve, isdir
+
+
 def products(args):
     paths, truncated = {}, False
-    resolve, isdir = cache(os.path.realpath), cache(os.path.isdir)
-    if not IS_WIN:
-        # Each /mnt lstat crosses into Windows, and one realpath per path took 10s of a 4k-job query, past the plugin's
-        # 15s wait once WSL was busy (2026-11-23); resolving each directory once per query keeps the same answers.
-        known = {}
-
-        def resolve(path):
-            if not os.path.isabs(path) or os.path.normpath(path) != path:
-                return os.path.realpath(path)
-            if path not in known:
-                parent, name = os.path.split(path)
-                if not name:
-                    known[path] = (path, True)
-                    return path
-                real = os.path.join(resolve(parent), name)
-                try:
-                    mode = os.lstat(real).st_mode
-                except OSError:
-                    mode = 0
-                if stat.S_ISLNK(mode):
-                    real = os.path.realpath(real)
-                    known[path] = (real, os.path.isdir(real))
-                else:
-                    known[path] = (real, stat.S_ISDIR(mode))
-                known.setdefault(real, known[path])
-            return known[path][0]
-
-        def isdir(path):
-            return known[path][1] if path in known else os.path.isdir(path)
+    resolve, isdir = query_resolver()
 
     def add(cwd, path):
         nonlocal truncated
@@ -4403,7 +4409,7 @@ def main():
                   "retryable": False, "rolled_back": False})
         return
     if args.command in ("list", "summary", "output"):
-        maximum = 8000 if args.command == "output" else 100
+        maximum = {"output": 8000, "list": 1000}.get(args.command, 100)
         if args.offset < 0 or not 1 <= args.limit <= maximum:
             parser.error(f"offset must be nonnegative and limit between 1 and {maximum}")
     if args.command == "summary":

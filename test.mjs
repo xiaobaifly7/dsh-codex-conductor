@@ -6122,14 +6122,14 @@ test('close-out guard pages within the runner limit, sees jobs that settle betwe
   const now = Date.now() / 1000;
   const job = (job_id, extra = {}) => ({ job_id, execution_status: 'completed', report_status: 'valid', review_status: 'needs_attention',
     verification_status: 'unreviewed', finished_at: now + 60, started_at: now, ...extra });
-  // runner 每页最多 100 条：第二页里的待收尾任务也要看到。
+  // runner 每页最多 1000 条：第二页里的待收尾任务也要看到。
   const paged = harness({ config: { closeoutGuard: true, listResult: (argv) => argv.includes('--started-between')
     ? argv[argv.indexOf('--offset') + 1] === '0' ? { jobs: [job('OK', { verification_status: 'verified' })], total: 2, next_offset: 1 }
       : { jobs: [job('LATE')], total: 2, next_offset: null } : { jobs: [], total: 0 } } });
   await assert.rejects(paged.tools.codex_run.execute(RUN, { agent: agentAt('/work/original') }), /LATE/);
   const guardCalls = paged.calls.filter(argv => argv.includes('--started-between'));
   assert.equal(guardCalls.length, 2);
-  assert.ok(guardCalls.every(argv => Number(argv[argv.indexOf('--limit') + 1]) <= 100));
+  assert.ok(guardCalls.every(argv => Number(argv[argv.indexOf('--limit') + 1]) <= 1000));
   // 两次派单之间刚结束的任务：不缓存“无待收尾”，第二次照样拦。
   let current = [job('RUNNING', { execution_status: 'running', finished_at: null, review_status: 'pending' })];
   const settling = harness({ config: { closeoutGuard: true, startResult: { job_id: 'J', status: 'completed' },
