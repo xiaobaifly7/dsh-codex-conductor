@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.181` 原任务最近一次完成的核验在「每条写明核对的结论、出处、是否属实」这一行判 not_met（抽查出原报告有结论不属实）时，codex_review 记 verified 会被拒，回执给出三条路：codex_continue 返工后再核验；改记 needs_changes，或记 accepted_deviations 写明为什么接受；确认是核验误判时在 notes 写「sample:<核验号>: 误判的依据」。needs_changes 与 accepted_deviations 不受影响。以前收尾护栏只核对必验项和报告自标未满足的项，不看抽查行：2026-11-24 有 17 单核验在这一行判 not_met，规划端仍记 verified 结案、之后没有返工，其中 16 单的复核里还引用了核验号。
+
 `0.9.180` Gemini 把安全拒答写进一份不合格的报告时（摘要或阻塞项里是「Sorry, I cannot fulfill / assist」「抱歉，我无法满足 / 我不能协助」这类第一人称拒答，而报告本身没过 schema，例如 task_conflict 的 question 为空），runner 记 model_refused 终态，error 里是那句拒答，不再记 schema_invalid，也不触发 0.9.175 的补报告追问——拒答之后不再催它交报告。插件按已有的 model_refused 回执处理：终态、不重派、交由用户决定。11 月以来 12 单 Gemini schema_invalid 里有 3 单是这样的拒答（11-22 32f1ee、11-23 cbc52d、11-24 615b78），其余 9 单不受影响；格式合格的报告即使引用了类似字样也不检查。
 
 `0.9.179` 只读的 Gemini 单（write=false）写文件被 agy 拒绝时，runner 在同一会话里追问一轮：不再写任何文件，把原本要写进文件的内容放进报告，只有落盘才算完成的验收标 blocked、blockers 写 task_conflict；结果里 write_denied_followup: true。写单被拒仍照原样失败。插件的 permission_denied 失败回执也说明了原因：需要落盘的任务派 write=true 并声明 scope，只读单的 task 不要要求写文件。2026-11-24 10:45 和 11-25 01:46 各有一单只读调查（任务说明里写着要输出到某个文件）因此失败，调查结果随这次运行丢失，分别已跑 11 分钟和 2 分钟。
@@ -257,6 +259,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.181` When the original task's latest completed verification marks the row "每条写明核对的结论、出处、是否属实" not_met (its sample found untrue conclusions in the original report), codex_review rejects verified with three ways forward: rework with codex_continue and verify again; record needs_changes, or accepted_deviations with why it is accepted; or, when the verification was wrong, write "sample:<verification id>: why it was wrong" in notes. needs_changes and accepted_deviations are unaffected. The closeout guard used to check only must-verify criteria and criteria the report flagged itself, never the sample row: on 2026-11-24, 17 verifications marked that row not_met and the planner still closed the job as verified with no rework, 16 of them citing the verification in the review.
 
 `0.9.180` When Gemini puts a safety refusal into a report that fails the schema (a first-person refusal such as "Sorry, I cannot fulfill / assist" or "抱歉，我无法满足 / 我不能协助" in the summary or a blocker, with the report itself invalid, for example a task_conflict blocker with an empty question), the runner records the terminal model_refused with that sentence as the error instead of schema_invalid, and does not send 0.9.175's report follow-up: a refusal is not pressed for a report. The plugin's existing model_refused receipt applies: terminal, not redispatched, left to the user. 3 of the 12 Gemini schema_invalid jobs this month were such refusals (11-22 32f1ee, 11-23 cbc52d, 11-24 615b78); the other 9 are unaffected, and valid reports are never checked for this wording.
 

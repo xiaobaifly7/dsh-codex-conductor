@@ -820,6 +820,8 @@ function repeatBlockLine(blocks) {
   return `runner 拦下了重复运行同一个失败步骤 ${blocks.length} 次（此前已失败 ${failures} 次、约 ${minutes(seconds)} 分钟）；` +
     '依赖它的验收项应记 blocked（environment 或 user_input），不要再派同样依赖它的任务；外部情况已经改变时，下一单带 rerun_after_change 写明改变了什么。';
 }
+// 核验任务里记抽查结论是否属实的那一条验收的开头；收尾护栏按它找这一行。
+const SAMPLE_VERDICT = '每条写明核对的结论、出处、是否属实';
 const SERVICE_FAILURE = new Map([
   ['reconnect_timeout', 'Codex 重连超时'], ['router_down', 'Codex 本地路由不可达'],
   ['idle_timeout', 'Codex 执行空闲超时'], ['transient', '模型服务或连接暂时异常'],
@@ -1393,6 +1395,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       return statuses.get(id);
     };
   };
+  // 原任务最近一次完成的核验若在抽查结论一行判 not_met，返回 { job_id, row }。11-24 有 17 单这样被记 verified 结案、之后没有返工：
+  // 收尾护栏只核对必验项和自标未满足项，不看抽查行。
+  async function sampleNotMet(source, owner, signal) {
+    const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), verification_of: source.job_id, limit: 20 }, signal);
+    const latest = (Array.isArray(page?.jobs) ? page.jobs : [])
+      .filter(job => job.execution_status === 'completed' && job.finished_at > (source.finished_at ?? 0))
+      .sort((a, b) => b.finished_at - a.finished_at)[0];
+    if (!latest) return undefined;
+    const full = await conductor.waitJob(latest.job_id, 0, signal);
+    const acceptance = full?.context?.acceptance;
+    if (full?.error_kind || !validReport(full?.structured) || !Array.isArray(acceptance)) return undefined;
+    const i = acceptance.findIndex(item => typeof item === 'string' && item.startsWith(SAMPLE_VERDICT));
+    const row = i >= 0 ? reportRowOf(acceptance, full.structured.criteria, i + 1) : undefined;
+    return row?.status === 'not_met' ? { job_id: latest.job_id, row: i + 1 } : undefined;
+  }
   async function criterionSupport(source, owner, log, signal, checkOpen, strictLookup = false) {
     const flagged = flaggedCriteria(source);
     const required = mustVerifyCriteria(source);
@@ -3556,7 +3573,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return dispatch({ task: verificationTask(source, { ...args, samples }, required, excluded),
       acceptance: [...required.map(verifyCriterionItem), '读取原任务书、验收标准和已产出的文件，明确核验范围。',
         `独立抽查 ${samples} 条带出处的结论；不足时全部核对并说明实际条数。`,
-        '每条写明核对的结论、出处、是否属实；不属实时给出实际情况，无法确认时说明缺口。',
+        `${SAMPLE_VERDICT}；不属实时给出实际情况，无法确认时说明缺口。`,
         '全程保持项目和系统状态只读，测试的临时文件和缓存写入项目外。',
         // 原报告自标未满足的验收项逐条单列，核验结论可作为这些项的独立依据。
         ...flaggedCriteria(source).filter(item => !required.some(f => f.key === item.key) &&
@@ -4080,6 +4097,14 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
       const plannerDecides = cfg.ownerDecisions === 'planner' && ['accepted_deviations', 'needs_changes'].includes(args.status);
       const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, historicalGapReview: cfg.historicalGapReview, ...supports });
+      if (args.status === 'verified') {
+        const sample = await sampleNotMet(source, owner, exec?.signal).catch(() => { exec?.signal?.throwIfAborted(); });
+        if (sample && !(typeof args.notes === 'string' && args.notes.includes(`sample:${sample.job_id}`))) {
+          prepared.problems.push(`核验 ${sample.job_id} 的抽查结论一行（第 ${sample.row} 条）判 not_met：抽查出原报告有结论不属实。` +
+            `verified 前三选一：① codex_continue ${source.job_id} 返工后再核验；② 改记 needs_changes，或记 accepted_deviations 写明为什么接受；` +
+            `③ 确认是核验误判时，在 notes 写「sample:${sample.job_id}: 误判的依据」`);
+        }
+      }
       const ownerProblem = await ownerReviewProblem(source, prepared, owner, exec?.signal);
       if (ownerProblem) throw new Error(reviewRejection(job_id, source, { ...prepared, problems: [ownerProblem] }));
       const { review } = prepared;
