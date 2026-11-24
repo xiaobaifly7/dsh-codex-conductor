@@ -824,6 +824,8 @@ const SERVICE_FAILURE = new Map([
   ['reconnect_timeout', 'Codex 重连超时'], ['router_down', 'Codex 本地路由不可达'],
   ['idle_timeout', 'Codex 执行空闲超时'], ['transient', '模型服务或连接暂时异常'],
   ['timeout', 'Codex 执行达到总超时，runner 不自动重试'],
+  ['command_hung', '一条命令开着却长时间没有任何输出，runner 判定卡死并结束了这次运行、不自动重试；' +
+    '不要原样重派同一条命令，改成自带超时或放到后台，或把依赖它的验收记 blocked'],
   ['sandbox_setup_failed', 'Windows Codex 沙箱初始化失败，命令未启动'],
 ]);
 

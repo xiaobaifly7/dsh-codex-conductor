@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.178` 命令开着、连续 30 分钟（--command-idle-timeout，默认 1800 秒）没有任何事件时，runner 判定卡死（command_hung），结束这次运行；能续跑的会话再追问一轮，只要报告：卡住那一步的验收标 blocked、blockers 写明在等什么，已完成的照常汇报，结果里 command_hung: true。没有可续的会话（只读 Codex）时记 command_hung 失败，不自动重试。以前执行端在命令运行期间不发任何事件，runner 也就不算空闲超时，卡住的命令只能等满 1 小时总超时，之前做完的活也拿不到报告：11-20 到 11-24 有 5 单这样结束（Gemini 4 单、Codex 1 单），卡住的分别是嵌套 pwsh 跑的多步修复脚本、vmrun 控制虚拟机、以及拉起本地服务和桌面程序后等待的探测脚本。30 分钟高于这些命令自带的最长等待（25 分钟）；正常但安静超过 30 分钟的命令也会被结束，这时应改成后台运行或自带超时。
+
 `0.9.177` codex_status 新增可选参数 job_ids：和 job_id 一起等本批其余在跑的任务，哪单先结束先返回哪单，同时结束的一并返回，并列出其余仍在跑的单和接着等的调用。以前一次只能等一单，并行派出多单后，别的单先结束也要等手上这单回来才验收、才派下一单：2026-11-24 一个并行会话 29 单里有 6 单因此晚验收，合计约 17 分钟，最长 349 秒。落选的等待只撤销观察、不领取结果，DSH 照常把它们的完成通知送回；先全部等完再逐单整理，撤销等待不会打断已结束任务的自动核验补派。只传 job_id 时行为和调用时序不变。工具说明和派单回执改为提示多单在跑时用 job_ids 一起等。
 
 `0.9.176` gemini_write 自动压缩后仍超过 max_chars 时，失败回执写出这一稿的实际码点数，并说明：任务允许这个长度，就用 reuse_draft 传入 draft_path、max_chars 设为至少这个数，直接采用已保存的一稿，不要让 Gemini 重写；长度有硬性要求才拆章。以前回执只说「请拆章」「reuse_draft 仍须满足 max_chars」。2026-11-24 23:57 到 11-25 00:45，一个会话三次超限后都是调高上限（14000→15000→18000）再让 Gemini 从头写，每次 6–12 分钟、合计约 28 分钟，三稿全部超限；用 reuse_draft 采用已存的一稿只要几秒。
@@ -251,6 +253,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.178` When a command stays open with no event at all for 30 minutes (--command-idle-timeout, default 1800 s), the runner records command_hung and stops the run; a resumable conversation then gets one report-only follow-up: criteria that depend on the hung step go blocked with a blocker naming what it waited on, completed work is reported as usual, and the result carries command_hung: true. Without a conversation to resume (read-only Codex) the job fails as command_hung and is not retried. Engines emit nothing while a command runs, so the runner never applied its idle timeout and a hung command waited out the one-hour total timeout with the work before it unreported: 5 jobs ended that way from 11-20 to 11-24 (4 Gemini, 1 Codex), stuck in a multi-step repair script under nested pwsh, vmrun controlling a VM, and a probe script waiting after starting local services and a desktop app. 30 minutes is above the longest wait those commands set for themselves (25 minutes); a healthy command that is silent for longer is stopped too and should run in the background or carry its own timeout.
 
 `0.9.177` codex_status gains an optional job_ids parameter: it waits on those jobs together with job_id, returns whichever ends first (several that end at the same time come back together), and lists the ones still running with the call to keep waiting. It used to wait on one job only, so after dispatching several in parallel a job that ended first waited until the one being watched returned before it was reviewed and the next job dispatched: on 2026-11-24, 6 of 29 jobs in one parallel session were reviewed late this way, about 17 minutes in total and up to 349 s each. The other waits are withdrawn without claiming their results, so DSH still delivers their completion notices; results are processed only after every wait has stopped, so withdrawing one never interrupts automatic verification for a job that already ended. With job_id alone the behavior and call timing are unchanged. The tool description and dispatch receipts now suggest waiting with job_ids when several jobs are running.
 

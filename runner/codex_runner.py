@@ -67,6 +67,7 @@ EXIT_GRACE_SECONDS = 20
 WORKER_START_GRACE_SECONDS = 5
 LOST_AFTER = 300
 REPEAT_MIN_SECONDS = 60
+COMMAND_IDLE_TIMEOUT = 1800
 REPEAT_FAILURES = 2
 REPEAT_WINDOW_HOURS = 24
 REPEAT_TOTALS = {"blocked": 0, "seconds_avoided": 0}
@@ -841,7 +842,18 @@ def attempt_timeout(args, now, start, reconnecting_since, last_event, active_com
         return "timeout"
     if not active_commands and expired(now - last_event, args.idle_timeout):
         return "idle_timeout"
+    # Engines report nothing while a command runs; the hung commands of 11-20..11-24 (VM control, nested pwsh,
+    # a script waiting on a child app) sat silent until the hour-long hard timeout.
+    if active_commands and expired(now - last_event, getattr(args, "command_idle_timeout", COMMAND_IDLE_TIMEOUT)):
+        return "command_hung"
     return None
+
+
+def hung_followup(seconds):
+    return (f"runner 发现一条命令开着却连续 {seconds / 60:g} 分钟没有任何输出，判定卡死，已结束这次运行。"
+            "不要再原样运行这条命令，也不要换个写法再跑同样会卡住的步骤。现在只整理并输出最终报告："
+            "依赖这一步的验收项标 blocked，blockers 写一条 environment，说明是哪条命令、它在等什么（虚拟机、子进程、"
+            "网络服务等）；其余已完成的验收照常汇报。")
 
 
 def windows_output_pipe(name):
@@ -1108,11 +1120,15 @@ def run_process(args, prompt, run_dir, thread_id, repeat_guard=None):
                     if completed_at:
                         continue
                     state["end_reason"] = timeout_reason
+                    if timeout_reason == "command_hung":
+                        state["error"] = f"A command stayed open {getattr(args, 'command_idle_timeout', COMMAND_IDLE_TIMEOUT):g}s with no output; the run was stopped as hung"
                     if IS_WIN:
                         limit = {"timeout": args.timeout, "idle_timeout": args.idle_timeout,
-                                 "reconnect_timeout": args.reconnect_timeout}[timeout_reason]
+                                 "reconnect_timeout": args.reconnect_timeout,
+                                 "command_hung": getattr(args, "command_idle_timeout", COMMAND_IDLE_TIMEOUT)}[timeout_reason]
                         activity = {"timeout": "total execution", "idle_timeout": "without activity",
-                                    "reconnect_timeout": "reconnecting"}[timeout_reason]
+                                    "reconnect_timeout": "reconnecting",
+                                    "command_hung": "with a command open and no output"}[timeout_reason]
                         engine = "Gemini" if gemini else "Codex"
                         detail = f"{engine} timed out after {limit:g}s {activity} ({state['commands']} commands completed, {len(active_commands)} active)"
                         if state["error"]:
@@ -1312,7 +1328,7 @@ def classify(state, run_dir):
         return "timeout", False
     if state["end_reason"] in ("idle_timeout", "reconnect_timeout"):
         return state["end_reason"], True
-    if state["end_reason"] in ("spawn_failed", "bad_arguments", "model_refused", "repeated_failure", "sandbox_setup_failed",
+    if state["end_reason"] in ("command_hung", "spawn_failed", "bad_arguments", "model_refused", "repeated_failure", "sandbox_setup_failed",
                                "process_cleanup_failed"):
         return state["end_reason"], False
     gemini = state.get("engine") == "gemini"
@@ -2553,6 +2569,14 @@ def execute(args, prompt, run_dir):
                     last_error_kind = "repeat_block"
                     (run_dir / "last_message.txt").unlink(missing_ok=True)
                     continue
+                if state.get("end_reason") == "command_hung" and not report_only and followup_thread:
+                    prompt = hung_followup(getattr(args, "command_idle_timeout", COMMAND_IDLE_TIMEOUT))
+                    thread_id = followup_thread
+                    report_only = True
+                    last_error_kind = "command_hung"
+                    base["command_hung"] = True
+                    (run_dir / "last_message.txt").unlink(missing_ok=True)
+                    continue
                 if state["completed"] and not state["failed"]:
                     # Gemini sometimes ends a finished task with a prose summary instead of the report:
                     # ask once, in the same conversation, for the report alone.
@@ -2696,6 +2720,8 @@ def add_task_arguments(p):
     p.add_argument("--max-storage-mb", type=positive_float, help="Best-effort jobs/runs storage limit in MiB; omitted is unlimited")
     # The Windows sandbox setup alone was silent for about 60s, so keep this well above that.
     p.add_argument("--idle-timeout", type=float, default=600)
+    p.add_argument("--command-idle-timeout", type=positive_float, default=COMMAND_IDLE_TIMEOUT,
+                   help="Seconds a command may stay open with no event at all before the run is stopped as hung")
     p.add_argument("--reconnect-timeout", type=float, default=180)
     p.add_argument("--exit-grace", type=float, default=EXIT_GRACE_SECONDS)
     p.add_argument("--retries", type=int, default=2)
