@@ -2275,6 +2275,17 @@ def late_diff(job_dir):
             diff_end(job_dir, LATE_DIFF_BUDGET, "Recorded after the worker died: may include later changes to the tree.")
 
 
+REPORT_FOLLOWUP = ("上一条回复没有按要求给出最终报告（符合 schema 的 JSON），runner 读不到。不要再修改文件或运行命令；"
+                   "现在只根据已经完成的工作输出最终报告 JSON：逐条写验收结果和证据，列出改过的文件。")
+
+
+def report_parses(text):
+    try:
+        return valid_report(parse_final_message((text or "").strip())[0])
+    except ValueError:
+        return False
+
+
 def parse_final_message(final):
     try:
         return json.loads(final), []
@@ -2543,6 +2554,16 @@ def execute(args, prompt, run_dir):
                     (run_dir / "last_message.txt").unlink(missing_ok=True)
                     continue
                 if state["completed"] and not state["failed"]:
+                    # Gemini sometimes ends a finished task with a prose summary instead of the report:
+                    # ask once, in the same conversation, for the report alone.
+                    if (gemini and args.schema and not report_only and followup_thread
+                            and not report_parses(state["last_text"])):
+                        prompt = REPORT_FOLLOWUP
+                        thread_id = followup_thread
+                        report_only = True
+                        last_error_kind = "schema_invalid"
+                        base["report_followup"] = True
+                        continue
                     break
                 kind, retryable = classify(state, run_dir)
             last_error_kind = kind
