@@ -1042,6 +1042,18 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(codex_runner.classify(fresh, Path(self.tmp.name)), ("provider_permanent", False))
         self.assertEqual(codex_runner.release_error(fresh), error)
         self.assertEqual(codex_runner.release_error(None), "agy ended without a completed turn")
+        # 2026-11-25: the same outage failed 7 fresh jobs on an account that had run the model minutes before.
+        ran = {**fresh, "model_ran_here": True}
+        self.assertEqual(codex_runner.classify(ran, Path(self.tmp.name)), ("transient", True))
+        self.assertEqual(codex_runner.release_error(ran), codex_runner.AGY_MODEL_UNRESOLVED_RELEASE)
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name)):
+            self.assertFalse(codex_runner.model_ran_recently("acc-1|gemini-test"))
+            codex_runner.note_model_ran("acc-1|gemini-test")
+            self.assertTrue(codex_runner.model_ran_recently("acc-1|gemini-test"))
+            self.assertFalse(codex_runner.model_ran_recently("acc-2|gemini-test"))
+            stale = time.time() - (codex_runner.MODEL_RAN_HOURS + 1) * 3600
+            (Path(self.tmp.name) / codex_runner.MODEL_RAN_FILE).write_text(json.dumps({"acc-1|gemini-test": stale}))
+            self.assertFalse(codex_runner.model_ran_recently("acc-1|gemini-test"))
 
     def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
         start = time.monotonic()

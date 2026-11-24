@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.184` 全新的 Gemini 任务报「model … is not recognized as a known model」时，如果这个账号 24 小时内刚用同一模型跑成过一单，也按 0.9.173 的续跑情形处理：记 transient、在原有重试次数内重试，归还租约时报「agy 没能加载模型列表、账号并未拒绝」，dsh-agy-link 不再把账号排除。runner 在每单成功后记下「账号|模型」和时间（runner 主目录的 agy-model-ran.json）。原因：2026-11-25 06:19–07:02 访问 Google 接口拉模型列表再次失败，这次失败的都是全新任务，0.9.173 只认续跑，7 单被判 provider_permanent；dsh-agy-link 看到原话把唯一还有周额度的账号排除，之后新派的单因「没有可选账号」立即失败，一个会话的目标因此被标为 block。07:04 列表恢复后同一账号照常跑完。从没在这个账号跑成过该模型的全新任务仍照原样处理。
+
 `0.9.183` 交接后的后继会话被拒绝读取原料时，读取护栏不再每次都把整条交接链上前任会话的产物清单重查一遍：前任已交接、不再派单，查成功一次后缓存 10 分钟，本会话的清单仍每次都查。交接时仍在跑的前任任务结束后，最迟 10 分钟就能读到它的产物。以前每次刷新都要把链上每个会话各查一遍：2026-11-25 两条 6 会话的交接链上，最老的几个前任各有 7,000–10,000 个产物，整链重查要 7.7 秒，宿主里每次拒绝原料读取要等 9–12 秒，一个后继会话 2 分钟里就碰到 4 次。
 
 `0.9.182` Gemini 最后一条消息是平台过滤器的拦截提示（「This request was blocked by Gemini's filters…」）而不是报告时，runner 记 model_refused 终态、error 就是这句提示，和 0.9.180 的拒答一样不重派、交由用户决定。同时撤掉 0.9.175 的补报告追问：复查发现 11 月 12 单 Gemini schema_invalid 全部是拒答——3 单模型自己拒答、9 单是这条过滤器提示，没有一单是忘了交报告（0.9.175 里「9 单最后一条不是 JSON」的判断有误）；上线后追问触发的 2 单（11-25 05:47 3bb0ca、06:02 d4974c）都是过滤器拦截、一条命令都没跑，追问把拦截写成了 environment 阻塞，规划端会误当成环境问题。现在报告不合格时：是拒答或过滤器拦截就记 model_refused，否则照旧记 schema_invalid，不再追问。
@@ -263,6 +265,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.184` When a fresh Gemini task fails with "model … is not recognized as a known model" on an account that completed a run of the same model within the last 24 hours, the runner treats it like the 0.9.173 resumed case: transient, retried within the existing attempts, and the lease is released with "agy could not load its model list; the account did not refuse it", so dsh-agy-link no longer benches the account. After each successful run the runner records the account|model pair and time in agy-model-ran.json in its home. Why: on 2026-11-25 06:19–07:02 agy again could not fetch the model list from Google; this time the failures were fresh tasks, which 0.9.173 did not cover, so 7 runs ended provider_permanent, dsh-agy-link benched the only account with weekly quota left, later dispatches failed at once with no account available, and one conversation's goal was marked blocked. After the list came back at 07:04 the same account ran normally. A fresh task on an account that has never completed the model is handled as before.
 
 `0.9.183` When a successor session is refused a raw read, the read guard no longer re-queries the product list of every predecessor in the handover chain each time: a predecessor has handed over and dispatches no new jobs, so its list is cached for 10 minutes after one successful query, while the session's own list is still queried every time. Products of a predecessor job that was still running at handover become readable within 10 minutes of it finishing. Every refresh used to query each session in the chain: on 2026-11-25 the oldest predecessors in two 6-session chains held 7,000–10,000 products each, a full re-query took 7.7 seconds, and each refused raw read waited 9–12 seconds in the host, 4 times within 2 minutes for one successor.
 
