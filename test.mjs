@@ -1420,7 +1420,7 @@ test('repeat guard dispatch annotates standing failures and skips bridge errors'
     assert.ok(h.calls[1].includes('--task-key'));
     assert.deepEqual(h.calls[0], ['repeat-guard', '--cwd', '/work/current']);
     assert.equal(result.next.split('\n').includes(standingLine), name === 'standing');
-    assert.match(result.next, /先派齐本批获准的独立任务，再留在本轮一次等一单/);
+    assert.match(result.next, /先派齐本批获准的独立任务，再留在本轮等结果/);
     assert.deepEqual(h.warnings, []);
   });
 });
@@ -2769,6 +2769,46 @@ test('defaultHostAccess covers read, write and resume while explicit false resto
   assert.equal(off.calls.length, 0);
 });
 
+test('codex_status with job_ids returns whichever job ends first, together with any that ended at the same time', async () => {
+  const jobs = fakeJobs();
+  const { tools, answer, finals } = harness({ jobs });
+  const exec = { agent: agentAt('F:\\work\\项目') };
+  for (let i = 0; i < 5; i++) assert.equal((await tools.codex_run.execute(RUN, exec)).status, 'running');
+  const report = (id) => ({ job_id: id, status: 'completed', duration_s: 12, structured: { summary: `${id} 完成`,
+    criteria: [{ criterion: 'pytest 通过', status: 'met', evidence: 'e' }], files_changed: [], deviations: [], unresolved: [] } });
+  const running = () => jobs.list('S1').filter((j) => j.status === 'running').map((j) => j.label.split(' ')[1]);
+
+  // J2 ends first: its result comes back and the other waits are withdrawn without touching J1 and J3.
+  const first = tools.codex_status.execute({ job_id: 'J1', job_ids: ['J2', 'J3'], wait_seconds: 3600 }, exec);
+  await answer('J2', report('J2'));
+  const got = await first;
+  assert.equal(got.job_id, 'J2');
+  assert.match(got.rendered, /J2 完成/);
+  assert.match(got.rendered, /其余仍在跑：J1、J3。验收后用 codex_status\(\{"job_id":"J1","job_ids":\["J3"\],"wait_seconds":3600\}\) 接着等。/);
+  assert.deepEqual(running(), ['J1', 'J3', 'J4', 'J5']);
+  assert.equal(jobs.started.every((j) => j.waiters.size === 0), true);
+
+  // Two that ended while nobody waited are both returned by one call, each in full.
+  await answer('J1', report('J1'));
+  await answer('J3', report('J3'));
+  Object.assign(finals, { J1: report('J1'), J3: report('J3') });
+  const both = await tools.codex_status.execute({ job_id: 'J1', job_ids: ['J3'], wait_seconds: 3600 }, exec);
+  assert.deepEqual(both.finished, ['J1', 'J3']);
+  assert.match(both.rendered, /本批有 2 单同时结束：J1、J3[\s\S]*=== 1\/2 · J1 ===[\s\S]*J1 完成[\s\S]*=== 2\/2 · J3 ===[\s\S]*J3 完成/);
+  assert.doesNotMatch(both.rendered, /其余仍在跑/);
+
+  // Nothing ends before the wait runs out: the first job's status, with the batch to wait on again.
+  const late = await tools.codex_status.execute({ job_id: 'J4', job_ids: ['J5', 'J4'], wait_seconds: 1 }, exec);
+  assert.equal(late.status, 'running');
+  assert.match(late.next, /本批 2 单到点仍都在跑：J4、J5。用 codex_status\(\{"job_id":"J4","job_ids":\["J5"\],"wait_seconds":3600\}\) 接着等。/);
+  assert.deepEqual(running(), ['J4', 'J5']);
+
+  await assert.rejects(tools.codex_status.execute({ job_id: 'J4', job_ids: 'J5' }, exec), /job_ids 必须是/);
+  await assert.rejects(tools.codex_status.execute({ job_id: 'J4', job_ids: ['../x'] }, exec), /job_ids 必须是/);
+  await answer('J4', report('J4'));
+  await answer('J5', report('J5'));
+});
+
 test('dispatch with a positive wait still returns a DSH background job without waiting', async () => {
   const jobs = fakeJobs();
   const wait = jobs.wait.bind(jobs);
@@ -2782,9 +2822,9 @@ test('dispatch with a positive wait still returns a DSH background job without w
   const first = await tools.codex_run.execute({ ...RUN, wait_seconds: 600 }, exec);
   assert.equal(first.status, 'running');
   assert.equal(first.background_job_id, 'bg1');
-  assert.match(first.note, /先派齐本批获准的独立任务，再留在本轮一次等一单[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*会话空闲[\s\S]*完成通知/);
+  assert.match(first.note, /先派齐本批获准的独立任务，再留在本轮等结果[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*会话空闲[\s\S]*完成通知/);
   assert.match(first.note, /job_output 的 job_id 用 background_job_id；codex_status、codex_output 用 runner job_id/);
-  assert.match(first.next, /先派齐本批获准的独立任务，再留在本轮一次等一单[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*先验收已收到的报告[\s\S]*只有摘要、缺内容或截断[\s\S]*job_output\(\{"job_id":"bg1"\}\)[\s\S]*codex_output/);
+  assert.match(first.next, /先派齐本批获准的独立任务，再留在本轮等结果[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*先验收已收到的报告[\s\S]*只有摘要、缺内容或截断[\s\S]*job_output\(\{"job_id":"bg1"\}\)[\s\S]*codex_output/);
   assert.doesNotMatch(first.next, /等 DSH 的完成通知|结束本轮/);
   // 到点仍在执行：经任务表等，不直接等 runner；runner 只收到后台循环的查询
   assert.deepEqual(calls.filter(argv => argv[0] === 'status'), [['status', 'J1', '--wait', '20', '--follow']]);
@@ -3360,7 +3400,7 @@ test('native cancellation failures stay visible while stopping and allow another
 
 test('directory lock queue tells the planner to wait and distinguishes cancellation from partial execution', () => {
   const queued = { job_id: 'J1', status: 'running', phase: 'lock_wait', attempt: 0 };
-  assert.match(nextStep(queued), /等待写锁（写入范围与在跑的写任务重叠）[\s\S]*尚未启动 Codex[\s\S]*先派齐本批获准的独立任务，再留在本轮一次等一单[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*codex_cancel[\s\S]*只取消本任务[\s\S]*不要重复派活/);
+  assert.match(nextStep(queued), /等待写锁（写入范围与在跑的写任务重叠）[\s\S]*尚未启动 Codex[\s\S]*先派齐本批获准的独立任务，再留在本轮等结果[\s\S]*codex_status\(\{"job_id":"J1","wait_seconds":3600\}\)[\s\S]*codex_cancel[\s\S]*只取消本任务[\s\S]*不要重复派活/);
   const cancelled = nextStep({ ...queued, status: 'cancelled' });
   assert.match(cancelled, /已取消排队[\s\S]*尚未启动 Codex[\s\S]*没有取消持锁任务/);
   assert.doesNotMatch(cancelled, /可能已改|git status/);
@@ -4517,8 +4557,8 @@ test('history filters preserve session links and output reads are bounded, repea
 });
 
 test('codex_output explains pending artifacts in execute and rendered output without changing runner fields', async () => {
-  const note = '任务还在运行，报告尚未生成；先派齐本批获准的独立任务，再留在本轮一次等一单，例如 codex_status({"job_id":"J","wait_seconds":3600})。' +
-    '其余单继续跑。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
+  const note = '任务还在运行，报告尚未生成；先派齐本批获准的独立任务，再留在本轮等结果，例如 codex_status({"job_id":"J","wait_seconds":3600})；' +
+    '本批还有别的单在跑时加上 job_ids 一起等，哪单先结束先返回。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
   for (const status of [
     { status: 'pending', error_kind: 'artifact_pending', retryable: true },
     { status: 'pending' },

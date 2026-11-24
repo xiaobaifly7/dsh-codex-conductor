@@ -35,7 +35,7 @@ test('codex_run guides the planner to dispatch authorized, independently verifia
   assert.match(description, /① 派齐本批.*同一回合用 wait_seconds: 0.*只读调查（write=false）、codex_verify，以及 scope 互不重叠的写单.*② 等待与验收/);
   assert.match(description, /有依赖、写入范围重叠或改变同一真机、虚拟机、服务状态的任务须串行/);
   assert.match(description, /待收尾事项会挡住新开 codex_run，含只读单；可核验或续接/);
-  assert.match(tools.codex_status.description, /每次只等待传入 job_id 对应的 Codex 任务.*先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑/);
+  assert.match(tools.codex_status.description, /本批还有别的单在跑时，把它们放进 job_ids 一起等，哪单先结束先返回哪单.*先验收已收到的报告，再用 codex_status（wait_seconds: 3600）等：本批多单在跑时把其余单放进 job_ids 一起等/);
   assert.match(tools.codex_status.parameters.properties.wait_seconds.description, /在本轮等待，超时续等仍在跑的任务/);
   assert.match(description, /派单前核对授权。要交文件或启动会落盘的程序就用 write=true/);
   assert.match(description, /scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots/);
