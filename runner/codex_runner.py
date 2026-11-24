@@ -2295,6 +2295,11 @@ REPORT_FOLLOWUP = ("上一条回复没有按要求给出最终报告（符合 sc
                    "现在只根据已经完成的工作输出最终报告 JSON：逐条写验收结果和证据，列出改过的文件。")
 
 
+READ_ONLY_WRITE_FOLLOWUP = ("这是只读任务，写文件被拒绝了。不要再写或修改任何文件；把原本要写进文件的内容直接放进最终报告"
+                            "（summary 和各条 evidence）。只有落盘才算完成的验收项标 blocked，blockers 写一条 task_conflict，"
+                            "question 写明需要改派可写任务；其余验收照常汇报，然后输出最终报告 JSON。")
+
+
 def report_parses(text):
     try:
         return valid_report(parse_final_message((text or "").strip())[0])
@@ -2590,6 +2595,16 @@ def execute(args, prompt, run_dir):
                         continue
                     break
                 kind, retryable = classify(state, run_dir)
+                # A read-only brief that names an output file sends Gemini to write it; agy denies the write and the
+                # findings were lost with the run (twice on 11-24/25). Ask once for them in the report instead.
+                if (gemini and kind == "permission_denied" and not writes and not report_only and followup_thread
+                        and '"write_file"' in (state.get("error") or "")):
+                    prompt = READ_ONLY_WRITE_FOLLOWUP
+                    thread_id = followup_thread
+                    report_only = True
+                    last_error_kind = kind
+                    base["write_denied_followup"] = True
+                    continue
             last_error_kind = kind
             # A fresh job whose leased account ran out of quota starts over on the next account: dsh-agy-link cooled
             # this one down on release. A continuation cannot, its conversation lives in this account's HOME; neither
