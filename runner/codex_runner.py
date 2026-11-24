@@ -119,8 +119,12 @@ PROVIDER_PERMANENT = re.compile(
 # the API, 2026-11-24), resuming a conversation that already ran on the account reports the configured model as unknown.
 AGY_MODEL_UNRESOLVED = re.compile(r"is not recognized as a known model", re.I)
 # Worded so dsh-agy-link settles it as an ordinary failure: its "model X is not recognized" parser would bench the account.
-AGY_MODEL_UNRESOLVED_RELEASE = ("agy could not load its model list while resuming the conversation, so the configured "
-                                "model was unresolvable (network to the Google API); the account did not refuse it")
+AGY_MODEL_UNRESOLVED_RELEASE = ("agy could not load its model list, so the configured model was unresolvable (network to "
+                                "the Google API); the account did not refuse it and has run this model before")
+# A fresh run proves nothing about the account, but one that completed this model on it within a day does: on 11-25
+# 06:19-07:02 the same outage failed 7 fresh jobs as provider_permanent and benched the only usable account.
+MODEL_RAN_FILE = "agy-model-ran.json"
+MODEL_RAN_HOURS = 24
 
 
 def emit(obj):
@@ -925,11 +929,38 @@ def attempt_state(thread_id):
             "file_changes": [], "prompt_delivered": False, "resumed": thread_id is not None}
 
 
+def model_known(state):
+    """The account has run the model: this conversation did, or the account completed it within MODEL_RAN_HOURS."""
+    return bool(state and (state.get("resumed") or state.get("model_ran_here")))
+
+
+def model_ran_recently(key):
+    try:
+        seen = json.loads((HOME / MODEL_RAN_FILE).read_text("utf-8")).get(key)
+    except (OSError, ValueError, AttributeError):
+        return False
+    return isinstance(seen, (int, float)) and 0 <= time.time() - seen < MODEL_RAN_HOURS * 3600
+
+
+def note_model_ran(key):
+    path = HOME / MODEL_RAN_FILE
+    try:
+        seen = json.loads(path.read_text("utf-8"))
+    except (OSError, ValueError):
+        seen = {}
+    seen = seen if isinstance(seen, dict) else {}
+    seen[key] = time.time()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with suppress(OSError):  # concurrent writers may drop an entry; the next completion writes it again
+        tmp.write_text(json.dumps(seen), "utf-8")
+        os.replace(tmp, path)
+
+
 def release_error(state):
-    """The failure dsh-agy-link settles a lease on. A resumed conversation's unresolvable model is reported as such, not
-    verbatim: dsh-agy-link reads "model X is not recognized" as the account refusing the model and benches it."""
+    """The failure dsh-agy-link settles a lease on. An unresolvable model on an account that has run it is reported as
+    such, not verbatim: dsh-agy-link reads "model X is not recognized" as the account refusing the model and benches it."""
     error = (state and (state["error"] or state["end_reason"])) or "agy ended without a completed turn"
-    return AGY_MODEL_UNRESOLVED_RELEASE if state and state.get("resumed") and AGY_MODEL_UNRESOLVED.search(error) else error
+    return AGY_MODEL_UNRESOLVED_RELEASE if model_known(state) and AGY_MODEL_UNRESOLVED.search(error) else error
 
 
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
@@ -949,14 +980,19 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
                 "gemini_quota_kind": error.kind, "lease_error": True}
     # The account that ran is the one a continuation must return to, the primary's home included.
     args.agy_home = home
+    account = lease.account.get("id") if isinstance(lease.account, dict) else None
+    ran_key = f"{account or home}|{args.model}"
     state = None
     try:
         state = run_process(argparse.Namespace(**{**vars(args), "agy_proxy": proxy, "agy_env": lease.env}), prompt,
                             run_dir, thread_id, repeat_guard)
         state["agy_leased"] = lease.account is not None
+        state["model_ran_here"] = model_ran_recently(ran_key)
         return state
     finally:
         ok = state is not None and state["completed"] and not state["failed"]
+        if ok:
+            note_model_ran(ran_key)
         lease.release(ok, None if ok else release_error(state))
 
 
@@ -1354,8 +1390,8 @@ def classify(state, run_dir):
             return "bad_arguments", False
         if quota_kind := state.get("gemini_quota_kind"):
             return quota_kind, quota_kind == "transient"
-        # The conversation already ran this model on this account: an unknown model is a model list agy could not load.
-        if state.get("resumed") and AGY_MODEL_UNRESOLVED.search(text):
+        # The account already ran this model: an unknown model is a model list agy could not load.
+        if model_known(state) and AGY_MODEL_UNRESOLVED.search(text):
             return "transient", True
         if PROVIDER_PERMANENT.search(text):
             return "provider_permanent", False
