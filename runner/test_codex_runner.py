@@ -195,6 +195,11 @@ FAKE_CODEX = textwrap.dedent(r"""
             say(type="error", message="connection reset before recording input")
             sys.exit(1)
         finish()
+    elif mode == "hung_command_then_report":
+        if calls == 0:
+            say(type="item.started", item={"id": "a", "type": "command_execution", "status": "in_progress"})
+            time.sleep(300)
+        finish(os.environ["FAKE_REPORT_TEXT"])
     elif mode in ("silent_command", "parallel_commands", "completed_command_idle", "active_command_timeout"):
         say(type="item.started", item={"id": "a", "type": "command_execution", "status": "in_progress"})
         if mode == "parallel_commands":
@@ -1114,6 +1119,24 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 value = self.invoke("--idle-timeout", ".3", "--timeout", "1", "--retries", "0", mode=mode)
                 self.assertEqual(value["error_kind"], expected)
+
+    def test_a_silent_open_command_past_the_cap_is_stopped_then_asked_for_a_report(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        common = ("--command-idle-timeout", ".5", "--timeout", "30", "--retries", "0")
+        env = {"FAKE_REPORT_TEXT": json.dumps(self.sample_report())}
+        value = self.invoke("--sandbox", "workspace-write", *common, mode="hung_command_then_report", env=env)
+        self.assertEqual((value["status"], value["attempts"], value.get("command_hung")), ("completed", 2, True))
+        calls = self.calls()
+        self.assertIn("resume", calls[1]["argv"])
+        self.assertEqual(calls[1]["prompt"], codex_runner.hung_followup(0.5))
+        # A read-only Codex run has no thread to resume, so it ends as command_hung.
+        for call in self.state.glob("call-*.json"):
+            call.unlink()
+        value = self.invoke(*common, mode="hung_command_then_report", env=env)
+        self.assertEqual((value["status"], value["error_kind"], value["attempts"]), ("failed", "command_hung", 1))
+        self.assertIn("no output", value["error"])
 
     def test_pid_and_event_write_errors_reap_the_process_and_preserve_the_error(self):
         sys.path.insert(0, str(RUNNER.parent))
