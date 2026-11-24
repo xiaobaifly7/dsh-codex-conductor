@@ -1000,6 +1000,26 @@ class RunnerTests(unittest.TestCase):
         state["error"] = "stream disconnected before completion: 502 Bad Gateway"
         self.assertEqual(codex_runner.classify(state, Path(self.tmp.name)), ("transient", True))
 
+    def test_a_resumed_gemini_run_with_an_unresolvable_model_is_retried_and_not_reported_as_a_refusal(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        # 2026-11-24: TLS timeouts to the Google API ended three ~20-minute jobs. Each retry's agy could not load its model
+        # list and called the configured model unknown; reported verbatim, dsh-agy-link benched the only usable account.
+        error = ('invalid model selection (--model "gemini-4-neon-high" --effort ""): model gemini-4-neon-high is not '
+                 'recognized as a known model or custom model in settings')
+        resumed = {**codex_runner.attempt_state("conversation-1"), "engine": "gemini", "failed": True, "error": error}
+        self.assertEqual(codex_runner.classify(resumed, Path(self.tmp.name)), ("transient", True))
+        report = codex_runner.release_error(resumed)
+        # None of dsh-agy-link's refusal, quota, auth or eligibility parsers may match what it is told.
+        self.assertNotRegex(report, r"(?i)not recognized as a known model|quota|limit|exhaust|sign.?in|authenticat|eligib|"
+                                    r"location|\b429\b|RESOURCE_EXHAUSTED")
+        # A fresh run has no conversation proving the model works here: keep the refusal for dsh-agy-link to learn.
+        fresh = {**codex_runner.attempt_state(None), "engine": "gemini", "failed": True, "error": error}
+        self.assertEqual(codex_runner.classify(fresh, Path(self.tmp.name)), ("provider_permanent", False))
+        self.assertEqual(codex_runner.release_error(fresh), error)
+        self.assertEqual(codex_runner.release_error(None), "agy ended without a completed turn")
+
     def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
         start = time.monotonic()
         r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0", mode="close_stdout_then_hang")
