@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.183` 交接后的后继会话被拒绝读取原料时，读取护栏不再每次都把整条交接链上前任会话的产物清单重查一遍：前任已交接、不再派单，查成功一次后缓存 10 分钟，本会话的清单仍每次都查。交接时仍在跑的前任任务结束后，最迟 10 分钟就能读到它的产物。以前每次刷新都要把链上每个会话各查一遍：2026-11-25 两条 6 会话的交接链上，最老的几个前任各有 7,000–10,000 个产物，整链重查要 7.7 秒，宿主里每次拒绝原料读取要等 9–12 秒，一个后继会话 2 分钟里就碰到 4 次。
+
 `0.9.182` Gemini 最后一条消息是平台过滤器的拦截提示（「This request was blocked by Gemini's filters…」）而不是报告时，runner 记 model_refused 终态、error 就是这句提示，和 0.9.180 的拒答一样不重派、交由用户决定。同时撤掉 0.9.175 的补报告追问：复查发现 11 月 12 单 Gemini schema_invalid 全部是拒答——3 单模型自己拒答、9 单是这条过滤器提示，没有一单是忘了交报告（0.9.175 里「9 单最后一条不是 JSON」的判断有误）；上线后追问触发的 2 单（11-25 05:47 3bb0ca、06:02 d4974c）都是过滤器拦截、一条命令都没跑，追问把拦截写成了 environment 阻塞，规划端会误当成环境问题。现在报告不合格时：是拒答或过滤器拦截就记 model_refused，否则照旧记 schema_invalid，不再追问。
 
 `0.9.181` 原任务最近一次完成的核验在「每条写明核对的结论、出处、是否属实」这一行判 not_met（抽查出原报告有结论不属实）时，codex_review 记 verified 会被拒，回执给出三条路：codex_continue 返工后再核验；改记 needs_changes，或记 accepted_deviations 写明为什么接受；确认是核验误判时在 notes 写「sample:<核验号>: 误判的依据」。needs_changes 与 accepted_deviations 不受影响。以前收尾护栏只核对必验项和报告自标未满足的项，不看抽查行：2026-11-24 有 17 单核验在这一行判 not_met，规划端仍记 verified 结案、之后没有返工，其中 16 单的复核里还引用了核验号。
@@ -261,6 +263,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.183` When a successor session is refused a raw read, the read guard no longer re-queries the product list of every predecessor in the handover chain each time: a predecessor has handed over and dispatches no new jobs, so its list is cached for 10 minutes after one successful query, while the session's own list is still queried every time. Products of a predecessor job that was still running at handover become readable within 10 minutes of it finishing. Every refresh used to query each session in the chain: on 2026-11-25 the oldest predecessors in two 6-session chains held 7,000–10,000 products each, a full re-query took 7.7 seconds, and each refused raw read waited 9–12 seconds in the host, 4 times within 2 minutes for one successor.
 
 `0.9.182` When Gemini's last message is the platform filter's notice ("This request was blocked by Gemini's filters…") instead of a report, the runner records the terminal model_refused with that notice as the error; like 0.9.180's refusals it is not redispatched and is left to the user. The report follow-up from 0.9.175 is withdrawn: all 12 Gemini schema_invalid jobs this month turned out to be refusals, 3 written by the model and 9 this filter notice, and none was a forgotten report (0.9.175's "9 last messages were not JSON" was misread). Both follow-ups it sent in production (11-25 05:47 3bb0ca, 06:02 d4974c) hit filter blocks that had run no command, and the follow-up turned each into an environment blocker the planner would take for an environment problem. An invalid report is now model_refused when it is a refusal or filter block and schema_invalid otherwise, with no follow-up.
 

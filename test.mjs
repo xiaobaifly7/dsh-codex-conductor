@@ -1675,6 +1675,30 @@ test('products permits only the linked successor to read its exact instruction a
   assert.equal((await read(reloaded, successor)).isError, true);
 });
 
+test('a successor re-queries its predecessors\' products only after their cache expires', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  const predecessor = 'cache-predecessor', successor = 'cache-successor';
+  aliases.link(predecessor, successor);
+  t.after(() => { if (aliases.successor(predecessor)) aliases.unlink(predecessor, successor); });
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const products = { [predecessor]: ['/repo/old.md'], [successor]: ['/repo/new.md'] };
+  const h = harness({ config: { workspaces: ['/repo'], plannerReads: 'products',
+    productsResult: (argv) => ({ status: 'completed', owner: argv[2], paths: products[argv[2]] }) } });
+  const read = file => hostExecute(h, { name: 'read', arguments: { path: file }, agent: { ...agentAt('/repo'), id: successor } },
+    async () => ({ isError: false, content: [{ type: 'text', text: 'ok' }] }));
+  const queried = () => h.calls.filter(argv => argv[0] === 'products').map(argv => argv[2]);
+  assert.equal((await read('/repo/old.md')).isError, false);
+  assert.deepEqual(queried().sort(), [predecessor, successor].sort());
+  t.mock.timers.tick(30_000);
+  assert.match((await read('/repo/raw.md')).error.message, /原料/);
+  assert.deepEqual(queried().slice(2), [successor]);
+  products[predecessor] = ['/repo/old.md', '/repo/late.md'];
+  t.mock.timers.tick(10 * 60_000);
+  assert.equal((await read('/repo/late.md')).isError, false);
+  assert.deepEqual(queried().slice(3).sort(), [predecessor, successor].sort());
+});
+
 function workflowSource(kind = 'user_input') {
   return { job_id: 'PARENT', status: 'completed', thread_id: 'THREAD', cwd: '/work/original', sandbox: 'workspace-write',
     scope: ['src'], scope_paths: ['/work/original/src'],

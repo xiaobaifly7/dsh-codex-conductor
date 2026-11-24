@@ -1339,6 +1339,8 @@ function settings(config, logger) {
 const BG_WAIT = 20;
 // runner 取消后会立即写下结果，后台循环一秒内就能看到，这里只是上限
 const CANCEL_SETTLE_MS = 30_000;
+// 前任会话产物清单的缓存时长：交接时仍在跑的单结束后，最迟这么久就能读到它的产物。
+const PREDECESSOR_PRODUCTS_TTL_MS = 10 * 60_000;
 const JOB_STATUS = { completed: 'completed', cancelled: 'killed' };
 // 同一宿主内热重载后，旧的后台观察仍可能与新实例同时看到完成。
 const hostVerifications = globalThis[Symbol.for('dsh-codex-conductor.verifications')] ??= new WeakMap();
@@ -1561,8 +1563,17 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const plannerFile = cfg.plannerPromptFile ||
     (stateDirectory ? path.join(stateDirectory, 'planner-prompt.md') : '');
   // 后继会话也能读交接前任任务的产物；任一查询失败就整体按失败处理。
+  // 前任已交接、不再派单，清单只在交接时仍在跑的单结束后才会变；查成功一次后缓存，过期才重查，本会话每次都查。
+  // 2026-11-25 两条 6 会话交接链上最老的前任各有 7,000–10,000 个产物，整链重查要 7.7 秒，宿主里每次拒绝原料读取要等 9–12 秒。
+  const predecessorProducts = new Map();
   const productReads = createProductReads(cfg, async (owner) => {
-    const values = await Promise.all(aliases.owners(owner).map((id) => conductor.products(id)));
+    const values = await Promise.all(aliases.owners(owner).map(async (id, index) => {
+      const cached = index > 0 ? predecessorProducts.get(id) : undefined;
+      if (cached && Date.now() - cached.at < PREDECESSOR_PRODUCTS_TTL_MS) return cached.value;
+      const value = await conductor.products(id);
+      if (index > 0 && value?.status === 'completed' && Array.isArray(value.paths)) predecessorProducts.set(id, { at: Date.now(), value });
+      return value;
+    }));
     return values.find((v) => v?.status !== 'completed' || !Array.isArray(v.paths)) ??
       { ...values[0], owner, paths: values.flatMap((v) => v.paths) };
   }, { plannerFile, handoverArchive: (owner) => {
