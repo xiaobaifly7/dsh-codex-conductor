@@ -30,9 +30,10 @@ test('codex_run guides the planner to dispatch authorized, independently verifia
     apply({ tools: { register: tool => { tools[tool.name] = tool; }, guard() {} }, on() {} }, { allowHostAccess: true });
   } finally { if (previous === undefined) delete process.env.LOCALAPPDATA; else process.env.LOCALAPPDATA = previous; }
   const { description, parameters: { properties } } = tools.codex_run;
-  assert.match(description, /一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单/);
-  assert.match(description, /① 派齐本批.*同一回合用 wait_seconds: 0.*独立只读调查（write=false）和 codex_verify.*② 等待与验收/);
-  assert.match(description, /有依赖、写同目录或改变同一真机、虚拟机、服务状态的任务须串行/);
+  assert.match(description, /一单一个可独立验收的结果，超过 8 条按共同前置拆单；彼此独立、各自可验收的工作可以拆成多单并行/);
+  assert.match(description, /主机访问写单只锁声明的 scope，scope 互不重叠的写单可同时跑/);
+  assert.match(description, /① 派齐本批.*同一回合用 wait_seconds: 0.*只读调查（write=false）、codex_verify，以及 scope 互不重叠的写单.*② 等待与验收/);
+  assert.match(description, /有依赖、写入范围重叠或改变同一真机、虚拟机、服务状态的任务须串行/);
   assert.match(description, /待收尾事项会挡住新开 codex_run，含只读单；可核验或续接/);
   assert.match(tools.codex_status.description, /每次只等待传入 job_id 对应的 Codex 任务.*先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑/);
   assert.match(tools.codex_status.parameters.properties.wait_seconds.description, /在本轮等待，超时续等仍在跑的任务/);

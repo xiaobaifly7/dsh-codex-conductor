@@ -3362,6 +3362,27 @@ class RunnerTests(unittest.TestCase):
         self.wait_for(lambda: self.control("status", queued).get("conversation_id") == "agy-conversation-1")
         self.assertEqual(self.control("cancel", queued)["status"], "cancelled")
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_writer_queued_on_a_write_lock_leaves_its_slot_free(self):
+        import codex_runner
+
+        argv, env, _ = self.fake_gemini(mode="hang")
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])):
+            held = codex_runner.acquire_write_lock(str(self.cwd))
+        self.assertIsNotNone(held)
+        try:
+            writer = self.invoke(*argv, "--sandbox", "danger-full-access", "--no-diff", "--max-engine-running", "1",
+                                 command="start", env=env)["job_id"]
+            self.wait_for(lambda: self.control("status", writer).get("phase") == "lock_wait")
+            reader = self.invoke(*argv, "--max-engine-running", "1", command="start", env=env)["job_id"]
+            # The only slot stays free while the writer queues on the lock, so the read-only job runs.
+            self.wait_for(lambda: self.control("status", reader).get("conversation_id") == "agy-conversation-1")
+            self.assertEqual(self.control("status", writer).get("phase"), "lock_wait")
+            self.assertEqual(self.control("cancel", writer)["status"], "cancelled")
+        finally:
+            held.close()
+        self.assertEqual(self.control("cancel", reader)["status"], "cancelled")
+
     def test_gemini_slot_is_a_lock_held_until_closed(self):
         import codex_runner
 
