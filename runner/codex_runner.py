@@ -2428,14 +2428,6 @@ def execute(args, prompt, run_dir):
         return baseline is not STREAM_ONLY and baseline != fallback_snapshot()
 
     try:
-        limit = getattr(args, "max_engine_running", None) if gemini else None
-        if limit:
-            lock_timeout = getattr(args, "lock_timeout", None)
-            slot = wait_for_engine_slot(run_dir, limit, None if lock_timeout is None else time.monotonic() + lock_timeout)
-            if slot is None:
-                return {**base, "status": "failed", "error_kind": "lock_timeout",
-                        "error": f"Timed out waiting for one of {limit} Gemini slots; Gemini was not started.",
-                        "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
         if writes:
             try:
                 roots = write_lock_roots(args.cwd, args.sandbox, getattr(args, "writable_roots", None),
@@ -2472,6 +2464,17 @@ def execute(args, prompt, run_dir):
             except OSError as error:
                 return {**base, "status": "failed", "error_kind": "runner_error", "error": str(error),
                         "retryable": False, "attempts": 0, "duration_s": round(time.time() - started, 1)}
+        # The Gemini slot comes after the write locks: a job queued on a lock must not hold a slot idle
+        # (11-22 such jobs held slots for 357 slot-minutes, up to 37 min each). Slot holders never wait
+        # on a lock, so lock-then-slot cannot deadlock.
+        limit = getattr(args, "max_engine_running", None) if gemini else None
+        if limit:
+            lock_timeout = getattr(args, "lock_timeout", None)
+            slot = wait_for_engine_slot(run_dir, limit, None if lock_timeout is None else time.monotonic() + lock_timeout)
+            if slot is None:
+                return {**base, "status": "failed", "error_kind": "lock_timeout",
+                        "error": f"Timed out waiting for one of {limit} Gemini slots; Gemini was not started.",
+                        "retryable": True, "attempts": 0, "duration_s": round(time.time() - started, 1)}
         baseline = (fallback_snapshot() if fallback_check and not args.use_user_config and
                     fallback_config_isolated(args.cwd) else None)
         if writes:

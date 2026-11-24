@@ -755,9 +755,17 @@ test('verification jobs are neither reviewed nor verified again; the refusal nam
     /codex_review 记录原任务 ROOT-1（核验任务本身不复核、不再核验）/);
 });
 
-test('a write dispatch says how many writers in the same directory run ahead of it', async () => {
-  const writer = (job_id, owner) => ({ job_id, status: 'running', phase: 'lock_wait', context: { owner, write: true } });
-  for (const others of [[writer('MINE-1', exec.agent.id), writer('OTHER-1', 'other-session')], []]) {
+test('a write dispatch says how many writers with an overlapping write area run ahead of it', async () => {
+  const writer = (job_id, owner, extra = {}) => ({ job_id, status: 'running', phase: 'lock_wait', context: { owner, write: true }, ...extra });
+  // Host-access writers lock only their scope (runner write_lock_roots): a disjoint scope is not ahead, a nested one is.
+  const scoped = (job_id, path) => writer(job_id, 'other-session', { cwd: '/work/original', sandbox: 'danger-full-access', scope_paths: [path] });
+  const cases = [
+    [[writer('MINE-1', exec.agent.id), writer('OTHER-1', 'other-session')], false,
+      /有 2 单写入范围与这一单重叠的写任务在跑或排队（本会话的：MINE-1），写锁让这一单排在它们后面串行执行/],
+    [[scoped('SIDE-1', '/work/original/src'), scoped('NEST-1', '/work/original/docs/a.md')], true, /有 1 单写入范围与这一单重叠的写任务/],
+    [[scoped('SIDE-1', '/work/original/src')], true, null],
+    [[], false, null]];
+  for (const [others, hostAccess, expected] of cases) {
     const queried = [];
     const h = harness({ running: true, listed: (argv) => {
       if (!argv.includes('--cwd') || argv[argv.indexOf('--status') + 1] !== 'running') return { jobs: [], total: 0 };
@@ -765,10 +773,11 @@ test('a write dispatch says how many writers in the same directory run ahead of 
       const jobs = [writer('VERIFY-1', exec.agent.id), ...others, { job_id: 'READ-1', status: 'running', context: { owner: exec.agent.id, write: false } }];
       return { jobs, total: jobs.length };
     } });
-    const result = await h.tools.codex_run.execute({ task: 'Edit docs/result.md.', acceptance, write: true, scope: ['docs'], cwd: '/work/original' }, exec);
+    const result = await h.tools.codex_run.execute({ task: 'Edit docs/result.md.', acceptance, write: true, scope: ['docs'], cwd: '/work/original',
+      host_access: hostAccess }, exec);
     assert.equal(queried.length, 1);
-    if (others.length) assert.match(result.next, /同一目录还有 2 单写任务在跑或排队（本会话的：MINE-1），目录写锁让这一单排在它们后面串行执行/);
-    else assert.doesNotMatch(result.next, /同一目录还有/);
+    if (expected) assert.match(result.next, expected);
+    else assert.doesNotMatch(result.next ?? '', /写入范围与这一单重叠/);
   }
 });
 

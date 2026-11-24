@@ -629,6 +629,12 @@ export function outOfScope(value, cwd, scope) {
   return value.files_changed.map(f => f.path).filter(p => !roots.some(r => under(taskScopePath(cwd, p), r)));
 }
 
+// 与 runner 的 write_lock_roots 同口径：主机访问写单声明了 scope 时只锁 scope，其余写单锁整个任务目录（沙箱写单另加 writable_roots）。
+function writeLockRoots(cwd, sandbox, scope, writableRoots) {
+  if (sandbox === 'danger-full-access' && scope?.length) return scope.map(p => taskScopePath(cwd, p));
+  return [normPath(cwd), ...(sandbox === 'workspace-write' ? (writableRoots ?? []).map(p => taskScopePath(cwd, p)) : [])];
+}
+
 function widensOverlappingScope(previousCwd, original, cwd, requested) {
   if (!original?.length) return false;
   if (!requested?.length && normPath(previousCwd) === normPath(cwd)) return true;
@@ -760,10 +766,10 @@ function awaitingAnswers(value) {
 const RECORD_REVIEW = '核验后用 codex_review 按原验收标准逐条记录证据：全部通过用 verified，有明确差距用 needs_changes，逐条通过且用户明确接受已列出的偏差时用 accepted_deviations。';
 const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并在给用户的汇报里写明替用户做了哪些决定；拿不准，或回答意味着删除数据、改动用户没提过的目录时，仍然先问用户。';
 const USER_REPORT = '向用户汇报时先用大白话说明完成情况、核对结果和剩余问题，不必带任务号和内部状态名。';
-const WAIT_GUIDANCE = '① 派齐本批：同一回合用 wait_seconds: 0 派出已就绪且护栏允许的独立只读调查（write=false）和 codex_verify，记 runner job_id，能并列调用就并列。' +
-  '有依赖、写同目录或改变同一真机、虚拟机、服务状态的任务须串行。' +
+const WAIT_GUIDANCE = '① 派齐本批：同一回合用 wait_seconds: 0 派出已就绪且护栏允许的独立任务：只读调查（write=false）、codex_verify，以及 scope 互不重叠的写单，记 runner job_id，能并列调用就并列。' +
+  '有依赖、写入范围重叠或改变同一真机、虚拟机、服务状态的任务须串行。' +
   '② 等待与验收：留在本轮，先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑。报告有缺才用 job_output 或 codex_output 补读。';
-const waitForJob = (jobId) => `先派齐本批获准的独立只读调查和核验，再留在本轮一次等一单，例如 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
+const waitForJob = (jobId) => `先派齐本批获准的独立任务，再留在本轮一次等一单，例如 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
   '其余单继续跑。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
 const RERUN_AFTER_CHANGE = { type: 'string', minLength: 1,
   description: '外部条件已经改变时填写具体变化（例如用户修好了虚拟机），允许本次重新运行此前反复失败的步骤。' };
@@ -896,7 +902,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   }
   if (value.status === 'running') {
     if (value.phase === 'engine_wait') return `任务 ${value.job_id} 正在排队等 Gemini 名额（同时运行的 Gemini 任务已满），尚未启动。${waitForJob(value.job_id)}不要重复派活。`;
-    if (value.phase === 'lock_wait') return `任务 ${value.job_id} 正在等待同目录写锁，尚未启动 Codex。${waitForJob(value.job_id)}需要退出队列时用 codex_cancel，只取消本任务，不要重复派活。`;
+    if (value.phase === 'lock_wait') return `任务 ${value.job_id} 正在等待写锁（写入范围与在跑的写任务重叠），尚未启动 Codex。${waitForJob(value.job_id)}需要退出队列时用 codex_cancel，只取消本任务，不要重复派活。`;
     if (value.phase === 'codex_reconnecting') return `任务 ${value.job_id} 正在重连模型服务。${waitForJob(value.job_id)}不要重复派活。`;
     return `任务 ${value.job_id} 仍在执行。${waitForJob(value.job_id)}不要自己动手补做。`;
   }
@@ -3162,15 +3168,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (started.job_id) await conductor.cancel(started.job_id, exec.signal);
       exec.signal.throwIfAborted();
     }
-    // 目录写锁让同目录的写任务串行执行；派单时说清前面排着几单，免得规划端把同一目录的改动拆成多单并行派
-    // （2026-11-22 一个会话在同一目录并行派写任务，等锁超过 60 秒的有 20 单，最长 37 分钟）。
+    // 写入范围重叠的写任务被写锁串行执行；派单时说清前面排着几单，免得规划端把重叠的改动拆成多单并行派
+    // （2026-11-22 一个会话在同一目录并行派写任务，等锁超过 60 秒的有 20 单，最长 37 分钟）。scope 不重叠的写单不互锁，不提示。
     let queueLine;
     if (args.write === true && started.status === 'running' && started.job_id) {
       const page = await conductor.list({ cwd, status: 'running', limit: 50 }, exec?.signal).catch(() => undefined);
-      const ahead = (Array.isArray(page?.jobs) ? page.jobs : []).filter(job => job.job_id !== started.job_id && job.context?.write === true);
+      const hostAccess = args.host_access ?? (cfg.defaultHostAccess === true);
+      const roots = writeLockRoots(cwd, hostAccess ? 'danger-full-access' : 'workspace-write', args.scope, args.writable_roots);
+      const ahead = (Array.isArray(page?.jobs) ? page.jobs : []).filter(job => job.job_id !== started.job_id && job.context?.write === true &&
+        writeLockRoots(job.cwd ?? cwd, job.sandbox, job.scope_paths ?? job.scope, job.task_options?.writable_roots)
+          .some(r => roots.some(m => under(r, m) || under(m, r))));
       const mine = ahead.filter(job => owns(exec?.agent?.id, job.context?.owner)).map(job => job.job_id);
-      if (ahead.length) queueLine = `同一目录还有 ${ahead.length} 单写任务在跑或排队${mine.length ? `（本会话的：${mine.join('、')}）` : ''}，` +
-        '目录写锁让这一单排在它们后面串行执行。同一目录的后续改动合并进一单，或等前一单结束再派，不要并行派同目录的写任务。';
+      if (ahead.length) queueLine = `有 ${ahead.length} 单写入范围与这一单重叠的写任务在跑或排队${mine.length ? `（本会话的：${mine.join('、')}）` : ''}，` +
+        '写锁让这一单排在它们后面串行执行。重叠的改动合并进一单，或等前一单结束再派；要并行就把各单 scope 分到互不重叠的路径。';
     }
     const label = `Codex ${started.job_id} · ${taskLine(args, 40)}`;
     let value;
@@ -3203,7 +3213,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     description: '把任务交给 Codex 或 Gemini。' + (cfg.lockEngine ? engineGuidance(cfg) : ENGINE_GUIDANCE + ` 新任务省略 engine 时用默认 ${cfg.defaultEngine}。`) + WAIT_GUIDANCE +
       '同一任务书连续失败时不要原样重派，先读失败回执，按失败类别处理。' +
       (cfg.convergenceGuard ? '同一交付链连续两轮卡在相同条目且参数未变时，仅凭 rerun_after_change 最多再试一次。' : '') +
-      '一单一个可独立验收的结果，超过 8 条按共同前置拆单，勿为并行多拆单；同一目录的写任务共用目录写锁，只能串行执行。路径、平台和参数适配在原授权内处理。' +
+      '一单一个可独立验收的结果，超过 8 条按共同前置拆单；彼此独立、各自可验收的工作可以拆成多单并行。' +
+      '写锁按写入范围加：主机访问写单只锁声明的 scope，scope 互不重叠的写单可同时跑；scope 重叠的写单，以及没写 scope 或沙箱写单（锁整个任务目录）串行执行。路径、平台和参数适配在原授权内处理。' +
       '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
@@ -3212,7 +3223,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       (cfg.ownerDecisions === 'planner' ? '原任务有待决定阻塞时按常设授权用 codex_continue 提交 answers 或 resolution；'
         : cfg.plannerAnswers ? PLANNER_ANSWERS + '原任务有阻塞问题时用 codex_continue 提交 answers；' : '原任务需要用户回答时先询问，再用 codex_continue；') +
       (cfg.lockEngine && cfg.defaultEngine === 'gemini' ? '返工用 codex_continue(job_id)，不要传 resume。' : '其他返工可带 resume=工具真实返回的 thread_id；新任务省略 resume。') +
-      (cfg.closeoutGuard !== false ? '待收尾事项会挡住新开 codex_run，含只读单；可核验或续接。仅一单待验收、无其他返工欠账且首次核验在跑或由本单 verify_previous 发起时，容量足够且写入不重叠才放行。' : '') + '同目录写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
+      (cfg.closeoutGuard !== false ? '待收尾事项会挡住新开 codex_run，含只读单；可核验或续接。仅一单待验收、无其他返工欠账且首次核验在跑或由本单 verify_previous 发起时，容量足够且写入不重叠才放行。' : '') + '写锁被占用时会自动排队，用原 job_id 等待；codex_cancel 可取消排队，不要重复派活。' +
       '汇报格式由插件固定为 JSON，task/acceptance 里不要规定末行结论行之类的版式。' +
       'verify_previous 可在派这一单的同时只读核验上一单（写入范围重叠时拒绝）。' +
       (cfg.gemini ? '源码改动和素材笔记用 codex_run；教程、文档正文用 gemini_write，一章一章做。' : '') +
