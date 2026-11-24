@@ -322,6 +322,12 @@ FAKE_AGY = textwrap.dedent(r"""
         say(event="step_update", step_update={"step_type": "tool", "error": {
             "code": "PERMISSION_DENIED", "message": 'a tool required the "write_file" permission that headless mode cannot prompt for'}})
         sys.exit(1)
+    if mode == "refusal":
+        say(event="result", result={"status": "SUCCESS", "conversation_id": conversation, "response": json.dumps({
+            "summary": "抱歉，我无法满足您的请求。我不能协助这类操作。", "criteria": [], "files_changed": [], "deviations": [],
+            "unresolved": [], "blockers": [{"id": "safety-refusal", "kind": "task_conflict", "message": "refused",
+                                            "question": "", "resolution": ""}]}, ensure_ascii=False)})
+        sys.exit(0)
     if mode == "prose" or (mode == "prose_then_report" and "--conversation" not in argv):
         say(event="result", result={"status": "SUCCESS", "response": "done, all checks pass",
                                     "conversation_id": conversation, "usage": {"input_tokens": 5}})
@@ -3208,6 +3214,13 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(received["argv"][received["argv"].index("--conversation") + 1], "agy-conversation-1")
                 if mode == "prose_then_report":
                     self.assertEqual(result["structured"], self.sample_report())
+        # A refusal that fails the schema ends as model_refused and is not asked again.
+        argv, env, call = self.fake_gemini("refusal")
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["attempts"], result.get("report_followup")),
+                         ("failed", "model_refused", 1, None))
+        self.assertTrue(result["error"].startswith("抱歉，我无法满足"))
+        self.assertNotIn("--conversation", json.loads(call.read_text("utf-8"))["argv"])
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_read_only_write_denial_asks_for_the_findings_in_the_report(self):

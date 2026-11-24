@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.180` Gemini 把安全拒答写进一份不合格的报告时（摘要或阻塞项里是「Sorry, I cannot fulfill / assist」「抱歉，我无法满足 / 我不能协助」这类第一人称拒答，而报告本身没过 schema，例如 task_conflict 的 question 为空），runner 记 model_refused 终态，error 里是那句拒答，不再记 schema_invalid，也不触发 0.9.175 的补报告追问——拒答之后不再催它交报告。插件按已有的 model_refused 回执处理：终态、不重派、交由用户决定。11 月以来 12 单 Gemini schema_invalid 里有 3 单是这样的拒答（11-22 32f1ee、11-23 cbc52d、11-24 615b78），其余 9 单不受影响；格式合格的报告即使引用了类似字样也不检查。
+
 `0.9.179` 只读的 Gemini 单（write=false）写文件被 agy 拒绝时，runner 在同一会话里追问一轮：不再写任何文件，把原本要写进文件的内容放进报告，只有落盘才算完成的验收标 blocked、blockers 写 task_conflict；结果里 write_denied_followup: true。写单被拒仍照原样失败。插件的 permission_denied 失败回执也说明了原因：需要落盘的任务派 write=true 并声明 scope，只读单的 task 不要要求写文件。2026-11-24 10:45 和 11-25 01:46 各有一单只读调查（任务说明里写着要输出到某个文件）因此失败，调查结果随这次运行丢失，分别已跑 11 分钟和 2 分钟。
 
 `0.9.178` 命令开着、连续 30 分钟（--command-idle-timeout，默认 1800 秒）没有任何事件时，runner 判定卡死（command_hung），结束这次运行；能续跑的会话再追问一轮，只要报告：卡住那一步的验收标 blocked、blockers 写明在等什么，已完成的照常汇报，结果里 command_hung: true。没有可续的会话（只读 Codex）时记 command_hung 失败，不自动重试。以前执行端在命令运行期间不发任何事件，runner 也就不算空闲超时，卡住的命令只能等满 1 小时总超时，之前做完的活也拿不到报告：11-20 到 11-24 有 5 单这样结束（Gemini 4 单、Codex 1 单），卡住的分别是嵌套 pwsh 跑的多步修复脚本、vmrun 控制虚拟机、以及拉起本地服务和桌面程序后等待的探测脚本。30 分钟高于这些命令自带的最长等待（25 分钟）；正常但安静超过 30 分钟的命令也会被结束，这时应改成后台运行或自带超时。
@@ -255,6 +257,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.180` When Gemini puts a safety refusal into a report that fails the schema (a first-person refusal such as "Sorry, I cannot fulfill / assist" or "抱歉，我无法满足 / 我不能协助" in the summary or a blocker, with the report itself invalid, for example a task_conflict blocker with an empty question), the runner records the terminal model_refused with that sentence as the error instead of schema_invalid, and does not send 0.9.175's report follow-up: a refusal is not pressed for a report. The plugin's existing model_refused receipt applies: terminal, not redispatched, left to the user. 3 of the 12 Gemini schema_invalid jobs this month were such refusals (11-22 32f1ee, 11-23 cbc52d, 11-24 615b78); the other 9 are unaffected, and valid reports are never checked for this wording.
 
 `0.9.179` When agy denies a file write to a read-only Gemini job (write=false), the runner asks once more in the same conversation: write nothing, put what was meant for the file into the report, mark criteria that need the file blocked with a task_conflict blocker; the result carries write_denied_followup: true. A writer denied a write still fails as before. The plugin's permission_denied receipt now explains the cause: dispatch work that must land on disk with write=true and a scope, and do not ask a read-only task to write files. On 2026-11-24 10:45 and 11-25 01:46 a read-only investigation whose brief named an output file failed this way after 11 and 2 minutes, losing its findings with the run.
 

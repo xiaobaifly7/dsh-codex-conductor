@@ -99,6 +99,8 @@ PERMANENT = re.compile(
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
 # The same refusal also arrives as a failed turn with no reconnect notice ("This content was flagged for ...").
 REFUSED = re.compile(r"refused this request|safety filter|content was flagged for", re.I)
+# Gemini sometimes refuses inside a near-report that fails the schema (11-22 32f1ee, 11-23 cbc52d, 11-24 615b78).
+GEMINI_REFUSAL = re.compile(r"Sorry, I (?:can(?:no|')t|am unable to) (?:fulfill|assist|help)|I (?:can(?:no|')t|am unable to) (?:fulfill (?:this|your) request|assist with)|抱歉，我无法满足|我(?:无法|不能)(?:满足您的请求|协助)", re.I)
 SANDBOX_PROBE_TIMEOUT = 90
 SANDBOX_SETUP_FAILURE = ("Failed to create unified exec process: orchestrator_helper_incomplete: "
                          "setup helper exited successfully before setup completed")
@@ -2586,7 +2588,8 @@ def execute(args, prompt, run_dir):
                     # Gemini sometimes ends a finished task with a prose summary instead of the report:
                     # ask once, in the same conversation, for the report alone.
                     if (gemini and args.schema and not report_only and followup_thread
-                            and not report_parses(state["last_text"])):
+                            and not report_parses(state["last_text"])
+                            and not GEMINI_REFUSAL.search(state["last_text"] or "")):  # a refusal is not asked again
                         prompt = REPORT_FOLLOWUP
                         thread_id = followup_thread
                         report_only = True
@@ -2665,7 +2668,12 @@ def execute(args, prompt, run_dir):
                 message = str(error) if gemini and not isinstance(error, json.JSONDecodeError) else "Final message is not valid JSON"
                 if isinstance(error, json.JSONDecodeError):
                     message += f": {error.msg} (line {error.lineno}, column {error.colno})"
-                result.update(status="failed", error_kind="schema_invalid", error=message, retryable=False)
+                refusal = GEMINI_REFUSAL.search(final) if gemini else None
+                if refusal:
+                    result.update(status="failed", error_kind="model_refused", retryable=False,
+                                  error=final[refusal.start():refusal.start() + 300])
+                else:
+                    result.update(status="failed", error_kind="schema_invalid", error=message, retryable=False)
         return finish(result)
     finally:
         for lock in reversed(locks):
