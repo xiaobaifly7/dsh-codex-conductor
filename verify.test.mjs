@@ -406,6 +406,29 @@ test('must_verify is checked before sampling and needs a matching independent re
   assert.equal((await legacy.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria }, exec)).verification_status, 'verified');
 });
 
+test('a verified closeout must answer a verification whose sample verdict is not_met', async () => {
+  const source = { ...sourceJob(), started_at: 10, finished_at: 20 };
+  let h;
+  h = harness({ source, config: { closeoutEvidence: 'off' }, verificationResult: { execution_status: 'completed', started_at: 21, finished_at: 23,
+    get structured() {
+      const value = report(h.payload().context.acceptance);
+      value.criteria.find(c => c.criterion.startsWith('每条写明核对的结论')).status = 'not_met';
+      return value;
+    } } });
+  const criteria = acceptance.map((_, i) => ({ index: i + 1, status: 'met', evidence: 'Reviewed the original report.' }));
+  await h.verify({ samples: 1 });
+  await assert.rejects(h.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria }, exec),
+    /核验 VERIFY-1 的抽查结论一行（第 3 条）判 not_met[\s\S]*codex_continue SOURCE-1[\s\S]*sample:VERIFY-1/);
+  assert.ok(!h.calls.some(call => call.argv[0] === 'review'));
+  const noted = await h.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria,
+    notes: 'sample:VERIFY-1: 核验把已更正的结论当成旧值，docs/result.md:12 已是新值' }, exec);
+  assert.equal(noted.verification_status, 'verified');
+  // needs_changes stays open for rework and is not held up.
+  const open = await h.tools.codex_review.execute({ job_id: source.job_id, status: 'needs_changes',
+    criteria: criteria.map(c => c.index === 1 ? { ...c, status: 'not_met' } : c) }, exec);
+  assert.equal(open.verification_status, 'needs_changes');
+});
+
 function backgroundJobs() {
   const entries = [];
   const view = job => ({ id: job.id, owner: job.owner, kind: job.kind, label: job.label, status: job.status });
