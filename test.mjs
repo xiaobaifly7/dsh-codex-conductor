@@ -5348,16 +5348,20 @@ test('gemini_write detects max_chars from the file instead of the model response
   assert.equal(value.model, 'test-model');
   assert.equal(value.effort, 'low');
   assert.deepEqual(value.usage, { total_tokens: 99 });
-  assert.match(value.next, /自动压缩后仍超过 max_chars.*拆成更小的章节/);
+  assert.match(value.next, /自动压缩后仍超过 max_chars：这一稿 6 个码点，上限 5。/);
+  assert.match(value.next, /reuse_draft 传入 draft_path、max_chars 设为至少 6，直接采用这一稿.*拆成更小的章节/);
   assert.match(value.next, /不存在/);
-  assert.match(value.next, /draft_path/);
-  assert.match(value.next, /reuse_draft/);
   assert.doesNotMatch(value.next, /核对已有文件/);
   assert.equal(readFileSync(value.draft_path, 'utf8'), '汉字😀abc');
   assert.match(h.spawns[0].prompt, /不得超过 5/);
   assert.equal(h.spawns.length, 2);
   assert.throws(() => readFileSync(value.output), { code: 'ENOENT' });
-  assert.equal((await h.execute({ max_chars: 6, overwrite: true })).status, 'completed');
+  // Following the receipt adopts the saved draft without another Gemini run.
+  const reused = await h.execute({ reuse_draft: value.draft_path, max_chars: 6, overwrite: true });
+  assert.equal(reused.status, 'completed');
+  assert.equal(reused.reused_draft, true);
+  assert.equal(h.spawns.length, 2);
+  assert.equal(readFileSync(reused.output, 'utf8'), '汉字😀abc');
 });
 
 test('gemini_write restores the original output bytes when both attempts exceed max_chars', async (t) => {

@@ -543,9 +543,18 @@ export async function geminiWrite(cfg, args, conductor, { signal, busy = '', sou
       : value.target_exists === null ? '目标已回滚，但无法确认当前是否存在，请先处理 error。'
         : value.target_exists ? '目标已恢复原内容，本次生成稿未写入。' : '目标未写入，回滚后不存在。';
     if (value.out_of_scope.length) value.next += '先核实并处理范围外改动，未匹配事件的快照变化归属待核实。';
-    if (value.before_rollback.over_limit && value.attempts === 2) value.next += '自动压缩后仍超过 max_chars，请拆成更小的章节后分别写作。';
-    value.next += value.draft_path ? '可用 reuse_draft 传入 draft_path 重新校验并提交，仍须满足 max_chars；失败稿尚未判通过。'
-      : '先处理 error，再决定是否重试；没有可复用的 draft_path，请查看 draft_error（如有）。';
+    const overflow = value.before_rollback.over_limit && value.attempts === 2;
+    if (overflow) value.next += `自动压缩后仍超过 max_chars：这一稿 ${value.before_rollback.chars} 个码点，上限 ${args.max_chars}。`;
+    // 11-24/25 a planner raised max_chars and had Gemini rewrite from scratch three times (6–12 min each)
+    // when reusing the saved draft under the raised limit would have taken seconds.
+    if (overflow && value.draft_path) {
+      value.next += `任务允许这个长度时，用 reuse_draft 传入 draft_path、max_chars 设为至少 ${value.before_rollback.chars}，直接采用这一稿，` +
+        '不要让 Gemini 重写；长度有硬性要求时，拆成更小的章节后分别写作。失败稿尚未判通过。';
+    } else {
+      if (overflow) value.next += '请拆成更小的章节后分别写作。';
+      value.next += value.draft_path ? '可用 reuse_draft 传入 draft_path 重新校验并提交，仍须满足 max_chars；失败稿尚未判通过。'
+        : '先处理 error，再决定是否重试；没有可复用的 draft_path，请查看 draft_error（如有）。';
+    }
   } else value.next = value.status === 'completed' ? GEMINI_CHECK_HINT : '先处理 error 后再决定是否重试。';
   return value;
 }
