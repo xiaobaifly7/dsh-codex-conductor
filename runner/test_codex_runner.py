@@ -313,6 +313,10 @@ FAKE_AGY = textwrap.dedent(r"""
         else:
             say(event="result", result={"status": "ERROR", "error": error})
         sys.exit(1)
+    if mode == "prose" or (mode == "prose_then_report" and "--conversation" not in argv):
+        say(event="result", result={"status": "SUCCESS", "response": "done, all checks pass",
+                                    "conversation_id": conversation, "usage": {"input_tokens": 5}})
+        sys.exit(0)
     report = json.loads(os.environ["FAKE_AGY_REPORT"])
     say(event="result", result={"status": "SUCCESS", "structured_output": report,
                                 "conversation_id": conversation, "usage": {"input_tokens": 5}})
@@ -3155,6 +3159,28 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((resumed["status"], resumed["conversation_id"]), ("completed", conversation))
         resumed_argv = json.loads(call.read_text("utf-8"))["argv"]
         self.assertEqual(resumed_argv[resumed_argv.index("--conversation") + 1], conversation)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_prose_final_message_gets_one_report_followup(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        for mode, expected in (("finish", ("completed", None, 1, None)),
+                               ("prose_then_report", ("completed", None, 2, True)),
+                               ("prose", ("failed", "schema_invalid", 2, True))):
+            with self.subTest(mode=mode):
+                argv, env, call = self.fake_gemini(mode)
+                result = self.invoke(*argv, env=env)
+                self.assertEqual((result["status"], result.get("error_kind"), result["attempts"], result.get("report_followup")),
+                                 expected)
+                received = json.loads(call.read_text("utf-8"))
+                if mode == "finish":
+                    self.assertNotIn("--conversation", received["argv"])
+                    continue
+                self.assertEqual(received["prompt"], codex_runner.REPORT_FOLLOWUP)
+                self.assertEqual(received["argv"][received["argv"].index("--conversation") + 1], "agy-conversation-1")
+                if mode == "prose_then_report":
+                    self.assertEqual(result["structured"], self.sample_report())
 
     def lease_link(self, accounts, endpoint=True, **options):
         from test_agy_runner import FakeLink, write_pool

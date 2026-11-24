@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.175` Gemini 任务正常跑完、最后一条回复却不是规定格式的报告（多为一段文字总结、没有 JSON）时，runner 在同一个 agy 会话里追问一轮，只要最终报告、不许再改文件或运行命令；补出合格报告就照常完成，这一轮仍不合格才记 schema_invalid。结果里 report_followup: true 表示追问过。以前这种情况直接判 schema_invalid：活已经干完，报告却读不到，只能靠核验补报告或重派。2026-11-24 到 11-25 凌晨有 10 单这样失败（7 写 3 核验），其中 9 单最后一条根本不是 JSON、1 单是 JSON 但不合 schema，两种都会追问；最长的一单已经跑了 26 分钟。
+
 `0.9.174` Gemini 名额改为拿到写锁之后才占。以前 runner 先占 Gemini 名额再等写锁，写入范围重叠、排队等锁的单一直占着名额却什么都不做：2026-11-22 有 41 单这样空占，合计约 357 名额分钟，最长一单 37 分钟；11-23 有 27 单、约 178 名额分钟。现在排队等锁时不占名额，拿到锁后才排 Gemini 名额；拿着名额的单不会再等锁，所以先锁后名额不会互相死等。同时更新给规划端的说明：写锁从 0.9.165 起对主机访问写单只锁声明的 scope，但工具说明、等待指引和派单回执还写着「同一目录的写任务只能串行」「勿为并行多拆单」，回执也按目录而不是按写入范围提示排队，规划端因此几乎一次只派一单（11-22 以来各会话 85%–95% 的派单发出时本会话没有别的单在跑）。现在说明改为可以把彼此独立的工作拆成多单，scope 互不重叠的写单与只读调查、核验一起同一回合派出；回执只在写入范围确实重叠时提示排队。
 
 `0.9.173` Gemini 续跑（同一会话已经在这个账号上用这个模型跑过）时，agy 报「model … is not recognized as a known model」改记 transient、在原有重试次数内重试，不再判 provider_permanent 直接结束；归还 agy 账号租约时也不再原样上报这句话，改报「agy 续跑时没能加载模型列表、账号并未拒绝」。原因：agy 只能通过实时请求 Google 拿到 Gemini 4 的模型列表，2026-11-24 访问 Google 接口出现 TLS 握手超时，三个各跑了约 20 分钟的任务第一次中断，重试时又拉不到模型列表，就把配置好的模型说成不认识。dsh-agy-link 看到这句原话，会认定该账号不支持这个模型并把它排除，而另一个账号的周额度已经用完，于是之后几分钟内新派的 Gemini 任务全部因「没有可选账号」立即失败。全新任务第一次就报不认识，仍照原样处理，让 dsh-agy-link 能识别真正没有权限的账号。
@@ -245,6 +247,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.175` When a Gemini job finishes but its last message is not the required report (usually a prose summary with no JSON), the runner asks once more in the same agy conversation for the final report alone, with no further file edits or commands; a valid report completes the job as usual, and only a second miss records schema_invalid. report_followup: true in the result marks the follow-up. Such jobs used to end in schema_invalid at once: the work was done but its report was unreadable, so it had to be recovered by verification or redispatched. From 2026-11-24 to early 11-25, 10 jobs failed this way (7 writes, 3 verifications), 9 with a last message that was not JSON at all and 1 with JSON that did not match the schema, both now followed up; the longest had already run 26 minutes.
 
 `0.9.174` A Gemini job now takes its Gemini slot only after it holds its write locks. The runner used to take the slot first, so a job queued on an overlapping write lock held a slot while doing nothing: on 2026-11-22, 41 jobs did so for about 357 slot-minutes, up to 37 minutes each; on 11-23, 27 jobs for about 178 slot-minutes. A job waiting for a lock now holds no slot and queues for one once it has the lock; slot holders never wait for a lock, so lock-then-slot cannot deadlock. The planner guidance is updated to match: since 0.9.165 a host-access writer locks only its declared scope, yet the tool description, wait guidance and dispatch receipt still said writes in one directory run serially and not to split work for parallelism, and the receipt warned about queueing by directory rather than by write area, so planners dispatched almost one job at a time (85-95% of each session's dispatches since 11-22 went out with none of its own jobs running). The guidance now allows splitting independent work into several jobs and dispatching writers with disjoint scopes in the same turn alongside read-only surveys and verifications, and the receipt warns only when write areas really overlap.
 
