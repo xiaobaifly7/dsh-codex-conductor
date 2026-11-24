@@ -119,8 +119,12 @@ PROVIDER_PERMANENT = re.compile(
 # the API, 2026-11-24), resuming a conversation that already ran on the account reports the configured model as unknown.
 AGY_MODEL_UNRESOLVED = re.compile(r"is not recognized as a known model", re.I)
 # Worded so dsh-agy-link settles it as an ordinary failure: its "model X is not recognized" parser would bench the account.
-AGY_MODEL_UNRESOLVED_RELEASE = ("agy could not load its model list while resuming the conversation, so the configured "
-                                "model was unresolvable (network to the Google API); the account did not refuse it")
+AGY_MODEL_UNRESOLVED_RELEASE = ("agy could not load its model list, so the configured model was unresolvable "
+                                "(network to the Google API); the account did not refuse it")
+# A fresh conversation reports the same when the list fails to load (TLS handshake timeouts, 2026-11-25 06:19-07:04: every
+# Gemini job failed and the only Neon account was benched). An account that ran the model this recently did not lose it.
+AGY_MODEL_OK = "agy-model-ok.json"
+AGY_MODEL_OK_SECONDS = 12 * 3600
 
 
 def emit(obj):
@@ -925,11 +929,46 @@ def attempt_state(thread_id):
             "file_changes": [], "prompt_delivered": False, "resumed": thread_id is not None}
 
 
+def model_unresolved(state, text):
+    """An unknown model that is an unloaded model list: the conversation, or a recent run on this account, used it."""
+    return bool((state.get("resumed") or state.get("model_ran")) and AGY_MODEL_UNRESOLVED.search(text))
+
+
+def agy_model_seen():
+    try:
+        seen = json.loads((HOME / AGY_MODEL_OK).read_text("utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return seen if isinstance(seen, dict) else {}
+
+
+def note_agy_model_ok(home, model):
+    if not home or not model:
+        return
+    seen = agy_model_seen()
+    seen[f"{home}|{model}"] = time.time()
+    # Concurrent writers may drop each other's entry; the account's next success writes it again.
+    with suppress(OSError):
+        fd, tmp = tempfile.mkstemp(dir=HOME, prefix=".agy-model-ok.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(seen, f)
+            os.replace(tmp, HOME / AGY_MODEL_OK)
+        except (OSError, TypeError, ValueError):
+            with suppress(OSError):
+                os.unlink(tmp)
+
+
+def agy_model_ran_recently(home, model):
+    at = agy_model_seen().get(f"{home}|{model}")
+    return isinstance(at, (int, float)) and 0 <= time.time() - at < AGY_MODEL_OK_SECONDS
+
+
 def release_error(state):
-    """The failure dsh-agy-link settles a lease on. A resumed conversation's unresolvable model is reported as such, not
-    verbatim: dsh-agy-link reads "model X is not recognized" as the account refusing the model and benches it."""
+    """The failure dsh-agy-link settles a lease on. An unresolvable model that is an unloaded list is reported as such,
+    not verbatim: dsh-agy-link reads "model X is not recognized" as the account refusing the model and benches it."""
     error = (state and (state["error"] or state["end_reason"])) or "agy ended without a completed turn"
-    return AGY_MODEL_UNRESOLVED_RELEASE if state and state.get("resumed") and AGY_MODEL_UNRESOLVED.search(error) else error
+    return AGY_MODEL_UNRESOLVED_RELEASE if state and model_unresolved(state, error) else error
 
 
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
@@ -954,6 +993,10 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
         state = run_process(argparse.Namespace(**{**vars(args), "agy_proxy": proxy, "agy_env": lease.env}), prompt,
                             run_dir, thread_id, repeat_guard)
         state["agy_leased"] = lease.account is not None
+        if state["completed"] and not state["failed"]:
+            note_agy_model_ok(home, args.model)
+        elif not state.get("resumed") and AGY_MODEL_UNRESOLVED.search(state["error"] or state["end_reason"] or ""):
+            state["model_ran"] = agy_model_ran_recently(home, args.model)
         return state
     finally:
         ok = state is not None and state["completed"] and not state["failed"]
@@ -1354,8 +1397,8 @@ def classify(state, run_dir):
             return "bad_arguments", False
         if quota_kind := state.get("gemini_quota_kind"):
             return quota_kind, quota_kind == "transient"
-        # The conversation already ran this model on this account: an unknown model is a model list agy could not load.
-        if state.get("resumed") and AGY_MODEL_UNRESOLVED.search(text):
+        # The conversation, or a recent run on this account, used this model: an unknown model is a list agy could not load.
+        if model_unresolved(state, text):
             return "transient", True
         if PROVIDER_PERMANENT.search(text):
             return "provider_permanent", False

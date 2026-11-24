@@ -1043,6 +1043,31 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(codex_runner.release_error(fresh), error)
         self.assertEqual(codex_runner.release_error(None), "agy ended without a completed turn")
 
+    def test_a_fresh_gemini_run_with_an_unresolvable_model_is_retried_only_when_the_account_ran_the_model_recently(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        # 2026-11-25 06:19-07:04: TLS timeouts again, now on fresh conversations; every Gemini job failed at once.
+        error = ('invalid model selection (--model "gemini-4-neon-high" --effort ""): model gemini-4-neon-high is not '
+                 'recognized as a known model or custom model in settings')
+        home, model = r"D:\pool\acc_1", "gemini-4-neon-high"
+        with mock.patch.object(codex_runner, "HOME", Path(self.tmp.name)):
+            self.assertFalse(codex_runner.agy_model_ran_recently(home, model))
+            codex_runner.note_agy_model_ok(home, model)
+            self.assertTrue(codex_runner.agy_model_ran_recently(home, model))
+            # Another account, or another model on this one, proves nothing.
+            self.assertFalse(codex_runner.agy_model_ran_recently(r"D:\pool\primary", model))
+            self.assertFalse(codex_runner.agy_model_ran_recently(home, "gemini-4-carbon-high"))
+            with mock.patch.object(codex_runner.time, "time", return_value=time.time() + codex_runner.AGY_MODEL_OK_SECONDS + 1):
+                self.assertFalse(codex_runner.agy_model_ran_recently(home, model))
+        ran = {**codex_runner.attempt_state(None), "engine": "gemini", "failed": True, "error": error, "model_ran": True}
+        self.assertEqual(codex_runner.classify(ran, Path(self.tmp.name)), ("transient", True))
+        self.assertEqual(codex_runner.release_error(ran), codex_runner.AGY_MODEL_UNRESOLVED_RELEASE)
+        # Without a recent run the refusal stays verbatim, so dsh-agy-link still learns an account that lacks the model.
+        unproven = {**ran, "model_ran": False}
+        self.assertEqual(codex_runner.classify(unproven, Path(self.tmp.name)), ("provider_permanent", False))
+        self.assertEqual(codex_runner.release_error(unproven), error)
+
     def test_stdout_eof_does_not_stop_the_timeout_monitor(self):
         start = time.monotonic()
         r = self.invoke("--timeout", "1", "--idle-timeout", "30", "--retries", "0", mode="close_stdout_then_hang")
@@ -3285,6 +3310,29 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((received["home"], received["proxy"]), ([primary["home"]] * 2, primary["proxyUrl"]))
         self.invoke(*argv, "--agy-pool", str(pool), "--resume", fresh["conversation_id"], "--agy-home", primary["home"], env=env)
         self.assertEqual(link.calls[-2][1]["accountId"], "acc_primary")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_an_unresolvable_model_on_an_account_that_just_ran_it_is_retried_and_does_not_bench_the_account(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        argv, env, call, primary, second = self.pooled_gemini()
+        argv = (*argv, "--model", "gemini-4-neon-high")
+        pool, link = self.lease_link([primary, second], choice="acc_b")
+        error = ('invalid model selection (--model "gemini-4-neon-high" --effort ""): model gemini-4-neon-high is not '
+                 'recognized as a known model or custom model in settings')
+        unresolved = {**env, "FAKE_AGY_MODE": "stderr_error", "FAKE_AGY_ERROR": json.dumps(error)}
+        # No run on this account yet: the refusal is reported verbatim, so dsh-agy-link can bench an account lacking it.
+        unproven = self.invoke(*argv, "--agy-pool", str(pool), env=unresolved)
+        self.assertEqual((unproven["status"], unproven["error_kind"], unproven["attempts"]), ("failed", "provider_permanent", 1))
+        self.assertIn("is not recognized as a known model", link.calls[-1][1]["error"])
+        self.assertEqual(self.invoke(*argv, "--agy-pool", str(pool), env=env)["status"], "completed")
+        calls = len(link.calls)
+        failed = self.invoke(*argv, "--agy-pool", str(pool), env=unresolved)
+        self.assertEqual((failed["status"], failed["error_kind"], failed["attempts"]), ("failed", "transient", 3))
+        releases = [body for route, body in link.calls[calls:] if route == "release"]
+        self.assertEqual([body["error"] for body in releases], [codex_runner.AGY_MODEL_UNRESOLVED_RELEASE] * 3)
+        self.assertEqual(link.leases, {})
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_lease_is_released_with_the_failure_and_refusals_fail_the_attempt(self):

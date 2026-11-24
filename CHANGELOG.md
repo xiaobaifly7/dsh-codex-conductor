@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.184` 新开的 Gemini 会话报配置的模型「is not recognized as a known model」时，如果这个账号 12 小时内用同一模型成功跑过，runner 把它当作 agy 没拉到模型列表（连 Google API 的网络问题）：按临时故障在重试预算内重试，释放账号时用中性说明，dsh-agy-link 不再把账号停用。账号最近没跑过这个模型时照旧记 provider_permanent、原样上报，dsh-agy-link 仍能认出缺这个模型的账号。0.9.173 只处理了续接的会话；2026-11-25 06:19–07:04 连 daily-cloudcode-pa.googleapis.com 时 TLS 握手超时，新开的会话同样拉不到列表，7 单 Gemini 任务当场失败，唯一能跑 Neon 的账号被停用，另有 2 单因此报选不出账号；一个规划端以为执行通道断了，停止派单。
+
 `0.9.183` 交接后的后继会话被拒绝读取原料时，读取护栏不再每次都把整条交接链上前任会话的产物清单重查一遍：前任已交接、不再派单，查成功一次后缓存 10 分钟，本会话的清单仍每次都查。交接时仍在跑的前任任务结束后，最迟 10 分钟就能读到它的产物。以前每次刷新都要把链上每个会话各查一遍：2026-11-25 两条 6 会话的交接链上，最老的几个前任各有 7,000–10,000 个产物，整链重查要 7.7 秒，宿主里每次拒绝原料读取要等 9–12 秒，一个后继会话 2 分钟里就碰到 4 次。
 
 `0.9.182` Gemini 最后一条消息是平台过滤器的拦截提示（「This request was blocked by Gemini's filters…」）而不是报告时，runner 记 model_refused 终态、error 就是这句提示，和 0.9.180 的拒答一样不重派、交由用户决定。同时撤掉 0.9.175 的补报告追问：复查发现 11 月 12 单 Gemini schema_invalid 全部是拒答——3 单模型自己拒答、9 单是这条过滤器提示，没有一单是忘了交报告（0.9.175 里「9 单最后一条不是 JSON」的判断有误）；上线后追问触发的 2 单（11-25 05:47 3bb0ca、06:02 d4974c）都是过滤器拦截、一条命令都没跑，追问把拦截写成了 environment 阻塞，规划端会误当成环境问题。现在报告不合格时：是拒答或过滤器拦截就记 model_refused，否则照旧记 schema_invalid，不再追问。
@@ -263,6 +265,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.184` When a fresh Gemini conversation reports the configured model as "not recognized as a known model" on an account that ran the same model successfully within 12 hours, the runner reads it as agy failing to load its model list (network to the Google API): the attempt is retried as transient within the existing budget and the lease is released with a neutral report, so dsh-agy-link no longer benches the account. An account that has not run the model recently is still recorded provider_permanent and reported verbatim, so dsh-agy-link still learns accounts that lack it. 0.9.173 covered resumed conversations only; on 2026-11-25 06:19-07:04 TLS handshakes to daily-cloudcode-pa.googleapis.com timed out, fresh conversations could not load the list either: 7 Gemini jobs failed at once, the only account able to run Neon was benched so 2 more found no selectable account, and one planner took the execution path for broken and stopped dispatching.
 
 `0.9.183` When a successor session is refused a raw read, the read guard no longer re-queries the product list of every predecessor in the handover chain each time: a predecessor has handed over and dispatches no new jobs, so its list is cached for 10 minutes after one successful query, while the session's own list is still queried every time. Products of a predecessor job that was still running at handover become readable within 10 minutes of it finishing. Every refresh used to query each session in the chain: on 2026-11-25 the oldest predecessors in two 6-session chains held 7,000–10,000 products each, a full re-query took 7.7 seconds, and each refused raw read waited 9–12 seconds in the host, 4 times within 2 minutes for one successor.
 
