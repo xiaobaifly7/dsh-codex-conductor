@@ -111,6 +111,12 @@ PROVIDER_PERMANENT = re.compile(
     r"\b40[13]\b|unauthori[sz]ed|forbidden|not logged in|no longer signed in|log.?in required|sign.?in required"
     r"|usage limit|insufficient balance|invalid model selection|(?:unknown|unsupported) model"
     r"|model.{0,40}(not found|not supported|does not exist)", re.I)
+# agy knows Gemini 4 models only from a live model-list call to Google. When that call fails (TLS handshake timeouts to
+# the API, 2026-11-24), resuming a conversation that already ran on the account reports the configured model as unknown.
+AGY_MODEL_UNRESOLVED = re.compile(r"is not recognized as a known model", re.I)
+# Worded so dsh-agy-link settles it as an ordinary failure: its "model X is not recognized" parser would bench the account.
+AGY_MODEL_UNRESOLVED_RELEASE = ("agy could not load its model list while resuming the conversation, so the configured "
+                                "model was unresolvable (network to the Google API); the account did not refuse it")
 
 
 def emit(obj):
@@ -901,7 +907,14 @@ ACCOUNT_SWITCH_NOTE = ("上一个 agy 账号在任务中途额度用完，本轮
 def attempt_state(thread_id):
     return {"thread_id": thread_id, "completed": False, "failed": False, "error": None, "usage": None,
             "last_text": None, "commands": 0, "forced_exit": False, "end_reason": None,
-            "file_changes": [], "prompt_delivered": False}
+            "file_changes": [], "prompt_delivered": False, "resumed": thread_id is not None}
+
+
+def release_error(state):
+    """The failure dsh-agy-link settles a lease on. A resumed conversation's unresolvable model is reported as such, not
+    verbatim: dsh-agy-link reads "model X is not recognized" as the account refusing the model and benches it."""
+    error = (state and (state["error"] or state["end_reason"])) or "agy ended without a completed turn"
+    return AGY_MODEL_UNRESOLVED_RELEASE if state and state.get("resumed") and AGY_MODEL_UNRESOLVED.search(error) else error
 
 
 def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
@@ -929,7 +942,7 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
         return state
     finally:
         ok = state is not None and state["completed"] and not state["failed"]
-        lease.release(ok, None if ok else (state and (state["error"] or state["end_reason"])) or "agy ended without a completed turn")
+        lease.release(ok, None if ok else release_error(state))
 
 
 def run_process(args, prompt, run_dir, thread_id, repeat_guard=None):
@@ -1322,6 +1335,9 @@ def classify(state, run_dir):
             return "bad_arguments", False
         if quota_kind := state.get("gemini_quota_kind"):
             return quota_kind, quota_kind == "transient"
+        # The conversation already ran this model on this account: an unknown model is a model list agy could not load.
+        if state.get("resumed") and AGY_MODEL_UNRESOLVED.search(text):
+            return "transient", True
         if PROVIDER_PERMANENT.search(text):
             return "provider_permanent", False
     if REFUSED.search(text):
