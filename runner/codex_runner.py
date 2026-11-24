@@ -99,8 +99,9 @@ PERMANENT = re.compile(
 # and one job spent 21 minutes and three attempts on it before failing as reconnect_timeout.
 # The same refusal also arrives as a failed turn with no reconnect notice ("This content was flagged for ...").
 REFUSED = re.compile(r"refused this request|safety filter|content was flagged for", re.I)
-# Gemini sometimes refuses inside a near-report that fails the schema (11-22 32f1ee, 11-23 cbc52d, 11-24 615b78).
-GEMINI_REFUSAL = re.compile(r"Sorry, I (?:can(?:no|')t|am unable to) (?:fulfill|assist|help)|I (?:can(?:no|')t|am unable to) (?:fulfill (?:this|your) request|assist with)|抱歉，我无法满足|我(?:无法|不能)(?:满足您的请求|协助)", re.I)
+# Gemini sometimes refuses inside a near-report that fails the schema (11-22 32f1ee, 11-23 cbc52d, 11-24 615b78);
+# the platform filter's notice comes back as the final message instead of a report (9 jobs 11-23..25).
+GEMINI_REFUSAL = re.compile(r"This request was blocked by Gemini's filters|Sorry, I (?:can(?:no|')t|am unable to) (?:fulfill|assist|help)|I (?:can(?:no|')t|am unable to) (?:fulfill (?:this|your) request|assist with)|抱歉，我无法满足|我(?:无法|不能)(?:满足您的请求|协助)", re.I)
 SANDBOX_PROBE_TIMEOUT = 90
 SANDBOX_SETUP_FAILURE = ("Failed to create unified exec process: orchestrator_helper_incomplete: "
                          "setup helper exited successfully before setup completed")
@@ -2293,20 +2294,9 @@ def late_diff(job_dir):
             diff_end(job_dir, LATE_DIFF_BUDGET, "Recorded after the worker died: may include later changes to the tree.")
 
 
-REPORT_FOLLOWUP = ("上一条回复没有按要求给出最终报告（符合 schema 的 JSON），runner 读不到。不要再修改文件或运行命令；"
-                   "现在只根据已经完成的工作输出最终报告 JSON：逐条写验收结果和证据，列出改过的文件。")
-
-
 READ_ONLY_WRITE_FOLLOWUP = ("这是只读任务，写文件被拒绝了。不要再写或修改任何文件；把原本要写进文件的内容直接放进最终报告"
                             "（summary 和各条 evidence）。只有落盘才算完成的验收项标 blocked，blockers 写一条 task_conflict，"
                             "question 写明需要改派可写任务；其余验收照常汇报，然后输出最终报告 JSON。")
-
-
-def report_parses(text):
-    try:
-        return valid_report(parse_final_message((text or "").strip())[0])
-    except ValueError:
-        return False
 
 
 def parse_final_message(final):
@@ -2585,17 +2575,6 @@ def execute(args, prompt, run_dir):
                     (run_dir / "last_message.txt").unlink(missing_ok=True)
                     continue
                 if state["completed"] and not state["failed"]:
-                    # Gemini sometimes ends a finished task with a prose summary instead of the report:
-                    # ask once, in the same conversation, for the report alone.
-                    if (gemini and args.schema and not report_only and followup_thread
-                            and not report_parses(state["last_text"])
-                            and not GEMINI_REFUSAL.search(state["last_text"] or "")):  # a refusal is not asked again
-                        prompt = REPORT_FOLLOWUP
-                        thread_id = followup_thread
-                        report_only = True
-                        last_error_kind = "schema_invalid"
-                        base["report_followup"] = True
-                        continue
                     break
                 kind, retryable = classify(state, run_dir)
                 # A read-only brief that names an output file sends Gemini to write it; agy denies the write and the

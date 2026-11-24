@@ -322,13 +322,17 @@ FAKE_AGY = textwrap.dedent(r"""
         say(event="step_update", step_update={"step_type": "tool", "error": {
             "code": "PERMISSION_DENIED", "message": 'a tool required the "write_file" permission that headless mode cannot prompt for'}})
         sys.exit(1)
+    if mode == "filter_block":
+        say(event="result", result={"status": "SUCCESS", "conversation_id": conversation, "response":
+            "This request was blocked by Gemini's filters. They can occasionally trigger by mistake. Please try rephrasing your prompt."})
+        sys.exit(0)
     if mode == "refusal":
         say(event="result", result={"status": "SUCCESS", "conversation_id": conversation, "response": json.dumps({
             "summary": "抱歉，我无法满足您的请求。我不能协助这类操作。", "criteria": [], "files_changed": [], "deviations": [],
             "unresolved": [], "blockers": [{"id": "safety-refusal", "kind": "task_conflict", "message": "refused",
                                             "question": "", "resolution": ""}]}, ensure_ascii=False)})
         sys.exit(0)
-    if mode == "prose" or (mode == "prose_then_report" and "--conversation" not in argv):
+    if mode == "prose":
         say(event="result", result={"status": "SUCCESS", "response": "done, all checks pass",
                                     "conversation_id": conversation, "usage": {"input_tokens": 5}})
         sys.exit(0)
@@ -3194,33 +3198,22 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(resumed_argv[resumed_argv.index("--conversation") + 1], conversation)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
-    def test_gemini_prose_final_message_gets_one_report_followup(self):
-        sys.path.insert(0, str(RUNNER.parent))
-        import codex_runner
-
-        for mode, expected in (("finish", ("completed", None, 1, None)),
-                               ("prose_then_report", ("completed", None, 2, True)),
-                               ("prose", ("failed", "schema_invalid", 2, True))):
-            with self.subTest(mode=mode):
-                argv, env, call = self.fake_gemini(mode)
-                result = self.invoke(*argv, env=env)
-                self.assertEqual((result["status"], result.get("error_kind"), result["attempts"], result.get("report_followup")),
-                                 expected)
-                received = json.loads(call.read_text("utf-8"))
-                if mode == "finish":
-                    self.assertNotIn("--conversation", received["argv"])
-                    continue
-                self.assertEqual(received["prompt"], codex_runner.REPORT_FOLLOWUP)
-                self.assertEqual(received["argv"][received["argv"].index("--conversation") + 1], "agy-conversation-1")
-                if mode == "prose_then_report":
-                    self.assertEqual(result["structured"], self.sample_report())
+    def test_gemini_refusals_in_place_of_a_report_end_as_model_refused(self):
+        argv, env, call = self.fake_gemini("prose")
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["attempts"]), ("failed", "schema_invalid", 1))
+        self.assertNotIn("--conversation", json.loads(call.read_text("utf-8"))["argv"])
         # A refusal that fails the schema ends as model_refused and is not asked again.
         argv, env, call = self.fake_gemini("refusal")
         result = self.invoke(*argv, env=env)
-        self.assertEqual((result["status"], result["error_kind"], result["attempts"], result.get("report_followup")),
-                         ("failed", "model_refused", 1, None))
+        self.assertEqual((result["status"], result["error_kind"], result["attempts"]), ("failed", "model_refused", 1))
         self.assertTrue(result["error"].startswith("抱歉，我无法满足"))
         self.assertNotIn("--conversation", json.loads(call.read_text("utf-8"))["argv"])
+        # The platform filter's notice instead of a report is a refusal too.
+        argv, env, call = self.fake_gemini("filter_block")
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["attempts"]), ("failed", "model_refused", 1))
+        self.assertTrue(result["error"].startswith("This request was blocked by Gemini's filters"))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_read_only_write_denial_asks_for_the_findings_in_the_report(self):

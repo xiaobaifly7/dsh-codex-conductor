@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.182` Gemini 最后一条消息是平台过滤器的拦截提示（「This request was blocked by Gemini's filters…」）而不是报告时，runner 记 model_refused 终态、error 就是这句提示，和 0.9.180 的拒答一样不重派、交由用户决定。同时撤掉 0.9.175 的补报告追问：复查发现 11 月 12 单 Gemini schema_invalid 全部是拒答——3 单模型自己拒答、9 单是这条过滤器提示，没有一单是忘了交报告（0.9.175 里「9 单最后一条不是 JSON」的判断有误）；上线后追问触发的 2 单（11-25 05:47 3bb0ca、06:02 d4974c）都是过滤器拦截、一条命令都没跑，追问把拦截写成了 environment 阻塞，规划端会误当成环境问题。现在报告不合格时：是拒答或过滤器拦截就记 model_refused，否则照旧记 schema_invalid，不再追问。
+
 `0.9.181` 原任务最近一次完成的核验在「每条写明核对的结论、出处、是否属实」这一行判 not_met（抽查出原报告有结论不属实）时，codex_review 记 verified 会被拒，回执给出三条路：codex_continue 返工后再核验；改记 needs_changes，或记 accepted_deviations 写明为什么接受；确认是核验误判时在 notes 写「sample:<核验号>: 误判的依据」。needs_changes 与 accepted_deviations 不受影响。以前收尾护栏只核对必验项和报告自标未满足的项，不看抽查行：2026-11-24 有 17 单核验在这一行判 not_met，规划端仍记 verified 结案、之后没有返工，其中 16 单的复核里还引用了核验号。
 
 `0.9.180` Gemini 把安全拒答写进一份不合格的报告时（摘要或阻塞项里是「Sorry, I cannot fulfill / assist」「抱歉，我无法满足 / 我不能协助」这类第一人称拒答，而报告本身没过 schema，例如 task_conflict 的 question 为空），runner 记 model_refused 终态，error 里是那句拒答，不再记 schema_invalid，也不触发 0.9.175 的补报告追问——拒答之后不再催它交报告。插件按已有的 model_refused 回执处理：终态、不重派、交由用户决定。11 月以来 12 单 Gemini schema_invalid 里有 3 单是这样的拒答（11-22 32f1ee、11-23 cbc52d、11-24 615b78），其余 9 单不受影响；格式合格的报告即使引用了类似字样也不检查。
@@ -259,6 +261,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.182` When Gemini's last message is the platform filter's notice ("This request was blocked by Gemini's filters…") instead of a report, the runner records the terminal model_refused with that notice as the error; like 0.9.180's refusals it is not redispatched and is left to the user. The report follow-up from 0.9.175 is withdrawn: all 12 Gemini schema_invalid jobs this month turned out to be refusals, 3 written by the model and 9 this filter notice, and none was a forgotten report (0.9.175's "9 last messages were not JSON" was misread). Both follow-ups it sent in production (11-25 05:47 3bb0ca, 06:02 d4974c) hit filter blocks that had run no command, and the follow-up turned each into an environment blocker the planner would take for an environment problem. An invalid report is now model_refused when it is a refusal or filter block and schema_invalid otherwise, with no follow-up.
 
 `0.9.181` When the original task's latest completed verification marks the row "每条写明核对的结论、出处、是否属实" not_met (its sample found untrue conclusions in the original report), codex_review rejects verified with three ways forward: rework with codex_continue and verify again; record needs_changes, or accepted_deviations with why it is accepted; or, when the verification was wrong, write "sample:<verification id>: why it was wrong" in notes. needs_changes and accepted_deviations are unaffected. The closeout guard used to check only must-verify criteria and criteria the report flagged itself, never the sample row: on 2026-11-24, 17 verifications marked that row not_met and the planner still closed the job as verified with no rework, 16 of them citing the verification in the review.
 
