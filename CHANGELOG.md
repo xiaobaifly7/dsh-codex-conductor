@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.176` gemini_write 自动压缩后仍超过 max_chars 时，失败回执写出这一稿的实际码点数，并说明：任务允许这个长度，就用 reuse_draft 传入 draft_path、max_chars 设为至少这个数，直接采用已保存的一稿，不要让 Gemini 重写；长度有硬性要求才拆章。以前回执只说「请拆章」「reuse_draft 仍须满足 max_chars」。2026-11-24 23:57 到 11-25 00:45，一个会话三次超限后都是调高上限（14000→15000→18000）再让 Gemini 从头写，每次 6–12 分钟、合计约 28 分钟，三稿全部超限；用 reuse_draft 采用已存的一稿只要几秒。
+
 `0.9.175` Gemini 任务正常跑完、最后一条回复却不是规定格式的报告（多为一段文字总结、没有 JSON）时，runner 在同一个 agy 会话里追问一轮，只要最终报告、不许再改文件或运行命令；补出合格报告就照常完成，这一轮仍不合格才记 schema_invalid。结果里 report_followup: true 表示追问过。以前这种情况直接判 schema_invalid：活已经干完，报告却读不到，只能靠核验补报告或重派。2026-11-24 到 11-25 凌晨有 10 单这样失败（7 写 3 核验），其中 9 单最后一条根本不是 JSON、1 单是 JSON 但不合 schema，两种都会追问；最长的一单已经跑了 26 分钟。
 
 `0.9.174` Gemini 名额改为拿到写锁之后才占。以前 runner 先占 Gemini 名额再等写锁，写入范围重叠、排队等锁的单一直占着名额却什么都不做：2026-11-22 有 41 单这样空占，合计约 357 名额分钟，最长一单 37 分钟；11-23 有 27 单、约 178 名额分钟。现在排队等锁时不占名额，拿到锁后才排 Gemini 名额；拿着名额的单不会再等锁，所以先锁后名额不会互相死等。同时更新给规划端的说明：写锁从 0.9.165 起对主机访问写单只锁声明的 scope，但工具说明、等待指引和派单回执还写着「同一目录的写任务只能串行」「勿为并行多拆单」，回执也按目录而不是按写入范围提示排队，规划端因此几乎一次只派一单（11-22 以来各会话 85%–95% 的派单发出时本会话没有别的单在跑）。现在说明改为可以把彼此独立的工作拆成多单，scope 互不重叠的写单与只读调查、核验一起同一回合派出；回执只在写入范围确实重叠时提示排队。
@@ -247,6 +249,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.176` When gemini_write is still over max_chars after its automatic compression, the failure receipt now gives the draft's actual code-point count and says: if the task allows that length, pass draft_path as reuse_draft with max_chars at least that count to adopt the saved draft without another Gemini run; split into smaller chapters only when the length is a hard requirement. The receipt used to say only "split into chapters" and "reuse_draft must still meet max_chars". From 2026-11-24 23:57 to 11-25 00:45 one session hit the limit three times and each time raised it (14000→15000→18000) and had Gemini write from scratch, 6–12 minutes a run and about 28 minutes in all, every draft over the limit again; adopting the saved draft with reuse_draft takes seconds.
 
 `0.9.175` When a Gemini job finishes but its last message is not the required report (usually a prose summary with no JSON), the runner asks once more in the same agy conversation for the final report alone, with no further file edits or commands; a valid report completes the job as usual, and only a second miss records schema_invalid. report_followup: true in the result marks the follow-up. Such jobs used to end in schema_invalid at once: the work was done but its report was unreadable, so it had to be recovered by verification or redispatched. From 2026-11-24 to early 11-25, 10 jobs failed this way (7 writes, 3 verifications), 9 with a last message that was not JSON at all and 1 with JSON that did not match the schema, both now followed up; the longest had already run 26 minutes.
 
