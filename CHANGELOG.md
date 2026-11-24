@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.179` 只读的 Gemini 单（write=false）写文件被 agy 拒绝时，runner 在同一会话里追问一轮：不再写任何文件，把原本要写进文件的内容放进报告，只有落盘才算完成的验收标 blocked、blockers 写 task_conflict；结果里 write_denied_followup: true。写单被拒仍照原样失败。插件的 permission_denied 失败回执也说明了原因：需要落盘的任务派 write=true 并声明 scope，只读单的 task 不要要求写文件。2026-11-24 10:45 和 11-25 01:46 各有一单只读调查（任务说明里写着要输出到某个文件）因此失败，调查结果随这次运行丢失，分别已跑 11 分钟和 2 分钟。
+
 `0.9.178` 命令开着、连续 30 分钟（--command-idle-timeout，默认 1800 秒）没有任何事件时，runner 判定卡死（command_hung），结束这次运行；能续跑的会话再追问一轮，只要报告：卡住那一步的验收标 blocked、blockers 写明在等什么，已完成的照常汇报，结果里 command_hung: true。没有可续的会话（只读 Codex）时记 command_hung 失败，不自动重试。以前执行端在命令运行期间不发任何事件，runner 也就不算空闲超时，卡住的命令只能等满 1 小时总超时，之前做完的活也拿不到报告：11-20 到 11-24 有 5 单这样结束（Gemini 4 单、Codex 1 单），卡住的分别是嵌套 pwsh 跑的多步修复脚本、vmrun 控制虚拟机、以及拉起本地服务和桌面程序后等待的探测脚本。30 分钟高于这些命令自带的最长等待（25 分钟）；正常但安静超过 30 分钟的命令也会被结束，这时应改成后台运行或自带超时。
 
 `0.9.177` codex_status 新增可选参数 job_ids：和 job_id 一起等本批其余在跑的任务，哪单先结束先返回哪单，同时结束的一并返回，并列出其余仍在跑的单和接着等的调用。以前一次只能等一单，并行派出多单后，别的单先结束也要等手上这单回来才验收、才派下一单：2026-11-24 一个并行会话 29 单里有 6 单因此晚验收，合计约 17 分钟，最长 349 秒。落选的等待只撤销观察、不领取结果，DSH 照常把它们的完成通知送回；先全部等完再逐单整理，撤销等待不会打断已结束任务的自动核验补派。只传 job_id 时行为和调用时序不变。工具说明和派单回执改为提示多单在跑时用 job_ids 一起等。
@@ -253,6 +255,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.179` When agy denies a file write to a read-only Gemini job (write=false), the runner asks once more in the same conversation: write nothing, put what was meant for the file into the report, mark criteria that need the file blocked with a task_conflict blocker; the result carries write_denied_followup: true. A writer denied a write still fails as before. The plugin's permission_denied receipt now explains the cause: dispatch work that must land on disk with write=true and a scope, and do not ask a read-only task to write files. On 2026-11-24 10:45 and 11-25 01:46 a read-only investigation whose brief named an output file failed this way after 11 and 2 minutes, losing its findings with the run.
 
 `0.9.178` When a command stays open with no event at all for 30 minutes (--command-idle-timeout, default 1800 s), the runner records command_hung and stops the run; a resumable conversation then gets one report-only follow-up: criteria that depend on the hung step go blocked with a blocker naming what it waited on, completed work is reported as usual, and the result carries command_hung: true. Without a conversation to resume (read-only Codex) the job fails as command_hung and is not retried. Engines emit nothing while a command runs, so the runner never applied its idle timeout and a hung command waited out the one-hour total timeout with the work before it unreported: 5 jobs ended that way from 11-20 to 11-24 (4 Gemini, 1 Codex), stuck in a multi-step repair script under nested pwsh, vmrun controlling a VM, and a probe script waiting after starting local services and a desktop app. 30 minutes is above the longest wait those commands set for themselves (25 minutes); a healthy command that is silent for longer is stopped too and should run in the background or carry its own timeout.
 

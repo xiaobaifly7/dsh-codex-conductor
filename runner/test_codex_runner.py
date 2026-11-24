@@ -318,6 +318,10 @@ FAKE_AGY = textwrap.dedent(r"""
         else:
             say(event="result", result={"status": "ERROR", "error": error})
         sys.exit(1)
+    if mode == "write_denied_then_report" and "--conversation" not in argv:
+        say(event="step_update", step_update={"step_type": "tool", "error": {
+            "code": "PERMISSION_DENIED", "message": 'a tool required the "write_file" permission that headless mode cannot prompt for'}})
+        sys.exit(1)
     if mode == "prose" or (mode == "prose_then_report" and "--conversation" not in argv):
         say(event="result", result={"status": "SUCCESS", "response": "done, all checks pass",
                                     "conversation_id": conversation, "usage": {"input_tokens": 5}})
@@ -3204,6 +3208,22 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(received["argv"][received["argv"].index("--conversation") + 1], "agy-conversation-1")
                 if mode == "prose_then_report":
                     self.assertEqual(result["structured"], self.sample_report())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
+    def test_gemini_read_only_write_denial_asks_for_the_findings_in_the_report(self):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        argv, env, call = self.fake_gemini("write_denied_then_report")
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["attempts"], result.get("write_denied_followup")), ("completed", 2, True))
+        self.assertEqual(result["structured"], self.sample_report())
+        received = json.loads(call.read_text("utf-8"))
+        self.assertEqual(received["prompt"], codex_runner.READ_ONLY_WRITE_FOLLOWUP)
+        self.assertEqual(received["argv"][received["argv"].index("--conversation") + 1], "agy-conversation-1")
+        # A writer denied a write is not a read-only brief: it still fails at once.
+        result = self.invoke(*argv, "--sandbox", "danger-full-access", env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["attempts"]), ("failed", "permission_denied", 1))
 
     def lease_link(self, accounts, endpoint=True, **options):
         from test_agy_runner import FakeLink, write_pool
