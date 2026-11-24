@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.177` codex_status 新增可选参数 job_ids：和 job_id 一起等本批其余在跑的任务，哪单先结束先返回哪单，同时结束的一并返回，并列出其余仍在跑的单和接着等的调用。以前一次只能等一单，并行派出多单后，别的单先结束也要等手上这单回来才验收、才派下一单：2026-11-24 一个并行会话 29 单里有 6 单因此晚验收，合计约 17 分钟，最长 349 秒。落选的等待只撤销观察、不领取结果，DSH 照常把它们的完成通知送回；先全部等完再逐单整理，撤销等待不会打断已结束任务的自动核验补派。只传 job_id 时行为和调用时序不变。工具说明和派单回执改为提示多单在跑时用 job_ids 一起等。
+
 `0.9.176` gemini_write 自动压缩后仍超过 max_chars 时，失败回执写出这一稿的实际码点数，并说明：任务允许这个长度，就用 reuse_draft 传入 draft_path、max_chars 设为至少这个数，直接采用已保存的一稿，不要让 Gemini 重写；长度有硬性要求才拆章。以前回执只说「请拆章」「reuse_draft 仍须满足 max_chars」。2026-11-24 23:57 到 11-25 00:45，一个会话三次超限后都是调高上限（14000→15000→18000）再让 Gemini 从头写，每次 6–12 分钟、合计约 28 分钟，三稿全部超限；用 reuse_draft 采用已存的一稿只要几秒。
 
 `0.9.175` Gemini 任务正常跑完、最后一条回复却不是规定格式的报告（多为一段文字总结、没有 JSON）时，runner 在同一个 agy 会话里追问一轮，只要最终报告、不许再改文件或运行命令；补出合格报告就照常完成，这一轮仍不合格才记 schema_invalid。结果里 report_followup: true 表示追问过。以前这种情况直接判 schema_invalid：活已经干完，报告却读不到，只能靠核验补报告或重派。2026-11-24 到 11-25 凌晨有 10 单这样失败（7 写 3 核验），其中 9 单最后一条根本不是 JSON、1 单是 JSON 但不合 schema，两种都会追问；最长的一单已经跑了 26 分钟。
@@ -249,6 +251,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.177` codex_status gains an optional job_ids parameter: it waits on those jobs together with job_id, returns whichever ends first (several that end at the same time come back together), and lists the ones still running with the call to keep waiting. It used to wait on one job only, so after dispatching several in parallel a job that ended first waited until the one being watched returned before it was reviewed and the next job dispatched: on 2026-11-24, 6 of 29 jobs in one parallel session were reviewed late this way, about 17 minutes in total and up to 349 s each. The other waits are withdrawn without claiming their results, so DSH still delivers their completion notices; results are processed only after every wait has stopped, so withdrawing one never interrupts automatic verification for a job that already ended. With job_id alone the behavior and call timing are unchanged. The tool description and dispatch receipts now suggest waiting with job_ids when several jobs are running.
 
 `0.9.176` When gemini_write is still over max_chars after its automatic compression, the failure receipt now gives the draft's actual code-point count and says: if the task allows that length, pass draft_path as reuse_draft with max_chars at least that count to adopt the saved draft without another Gemini run; split into smaller chapters only when the length is a hard requirement. The receipt used to say only "split into chapters" and "reuse_draft must still meet max_chars". From 2026-11-24 23:57 to 11-25 00:45 one session hit the limit three times and each time raised it (14000→15000→18000) and had Gemini write from scratch, 6–12 minutes a run and about 28 minutes in all, every draft over the limit again; adopting the saved draft with reuse_draft takes seconds.
 

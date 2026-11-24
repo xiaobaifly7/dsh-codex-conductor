@@ -768,9 +768,9 @@ const PLANNER_ANSWERS = '按用户原始目标和已有事实自行回答，并�
 const USER_REPORT = '向用户汇报时先用大白话说明完成情况、核对结果和剩余问题，不必带任务号和内部状态名。';
 const WAIT_GUIDANCE = '① 派齐本批：同一回合用 wait_seconds: 0 派出已就绪且护栏允许的独立任务：只读调查（write=false）、codex_verify，以及 scope 互不重叠的写单，记 runner job_id，能并列调用就并列。' +
   '有依赖、写入范围重叠或改变同一真机、虚拟机、服务状态的任务须串行。' +
-  '② 等待与验收：留在本轮，先验收已收到的报告，再选一单用 codex_status（wait_seconds: 3600），其余单继续跑。报告有缺才用 job_output 或 codex_output 补读。';
-const waitForJob = (jobId) => `先派齐本批获准的独立任务，再留在本轮一次等一单，例如 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})。` +
-  '其余单继续跑。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
+  '② 等待与验收：留在本轮，先验收已收到的报告，再用 codex_status（wait_seconds: 3600）等：本批多单在跑时把其余单放进 job_ids 一起等，哪单先结束先返回，验收后接着等其余单。报告有缺才用 job_output 或 codex_output 补读。';
+const waitForJob = (jobId) => `先派齐本批获准的独立任务，再留在本轮等结果，例如 codex_status(${JSON.stringify({ job_id: jobId, wait_seconds: 3600 })})；` +
+  '本批还有别的单在跑时加上 job_ids 一起等，哪单先结束先返回。先验收已收到的报告，再等尚未完成的单，勿零等待轮询或重派。';
 const RERUN_AFTER_CHANGE = { type: 'string', minLength: 1,
   description: '外部条件已经改变时填写具体变化（例如用户修好了虚拟机），允许本次重新运行此前反复失败的步骤。' };
 const minutes = seconds => Math.round(seconds / 60);
@@ -3572,26 +3572,101 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     cfg.verificationReuse ? { verification_scope: verificationScope(source, args, excluded) } : undefined, { onStarted });
   }
 
+  // codex_status 的等待部分：解析线程号、核对归属后等这一单。stop 只撤销这一次观察，任务照常跑。
+  async function waitStatus(jobArg, seconds, exec, stop) {
+    // 普通任务号不经过 await，保持原来的调用时序。
+    const { jobId, note } = THREAD_ID.test(jobArg) ? await threadJob(jobArg, exec, 'codex_status', exec?.signal) : { jobId: jobArg };
+    let source;
+    const value = await queryWithTimeout(async (signal) => {
+      const bg = liveBackground(jobId, exec);
+      // 原生后台状态不一定带 runner 归属，热加载后的首次等待先查持久化任务。
+      if (bg && restrictedReads(exec)) {
+        source = await ensureOwnJob(jobId, exec, 'codex_status');
+        signal.throwIfAborted();
+      }
+      const waitSignal = exec?.signal || stop ? AbortSignal.any([signal, exec?.signal, stop].filter(Boolean)) : signal;
+      return collect(jobId, bg, seconds, waitSignal);
+    }, undefined, seconds * 1000 + QUERY_TIMEOUT_MS);
+    return { value, source, note };
+  }
+  // codex_status 的整理部分：结束的结果补派自动核验、登记后台通知，并压掉无变化的重复查询。
+  async function showStatus({ value, source, note }, seconds, exec) {
+    if (restrictedReads(exec) && !value.rendered) checkJobOwner(value, exec, 'codex_status');
+    const result = value.rendered ? await verifyRendered(value, exec, source) : notifyOnDone(await finishStatus(value, exec), exec, finishStatus);
+    const shown = dampenStatus(result, exec, 'codex_status', seconds) ?? result;
+    return !note ? shown : typeof shown.rendered === 'string' ? { ...shown, rendered: `${note}\n${shown.rendered}` }
+      : { ...shown, next: shown.next ? `${note}\n${shown.next}` : note };
+  }
+  const appendLine = (shown, line) => typeof shown.rendered === 'string' ? { ...shown, rendered: `${shown.rendered}\n${line}` }
+    : { ...shown, next: shown.next ? `${shown.next}\n${line}` : line };
+  // 同时等本批多单：哪单先结束先返回，同时结束的一并返回，其余继续跑。先等后整理：撤销落选的观察不会打断
+  // 已结束任务的核验补派；被撤销的观察没有领取结果，DSH 照常把它们的完成通知送回。
+  // 并行后一次只等一单，别的单先结束也要等这单回来才验收：2026-11-24 一个会话 6 次因此晚验收，合计约 17 分钟。
+  async function statusAny(ids, seconds, exec) {
+    const stops = ids.map(() => new AbortController());
+    const errors = [];
+    let stopped = false;
+    const waits = ids.map((id, i) => waitStatus(id, seconds, exec, stops[i].signal).catch((error) => {
+      if (!stopped) errors.push(`${id}：${error?.message ?? error}`);
+    }));
+    await Promise.any(waits.map((w) => w.then((r) => r && r.value.status !== 'running' ? r : Promise.reject()))).catch(() => {});
+    stopped = true;
+    stops.forEach((s) => s.abort());
+    const results = await Promise.all(waits);
+    exec?.signal?.throwIfAborted();
+    const done = results.filter((r) => r && r.value.status !== 'running');
+    const finishedIds = new Set(done.map((r) => r.value.job_id));
+    const failedIds = new Set(errors.map((e) => e.slice(0, e.indexOf('：'))));
+    const rest = ids.filter((id, i) => !finishedIds.has(results[i]?.value.job_id) && !failedIds.has(id));
+    const again = `codex_status(${JSON.stringify({ job_id: rest[0], ...(rest.length > 1 ? { job_ids: rest.slice(1) } : {}), wait_seconds: 3600 })})`;
+    const errorLine = errors.length ? `以下任务这次没能查询：${errors.join('；')}` : '';
+    if (!done.length) {
+      const first = results.find(Boolean);
+      if (!first) throw new Error(`codex_status: ${errorLine}`);
+      const shown = await showStatus(first, seconds, exec);
+      return [rest.length && `本批 ${rest.length} 单到点仍都在跑：${rest.join('、')}。用 ${again} 接着等。`, errorLine].filter(Boolean).reduce(appendLine, shown);
+    }
+    const restLine = rest.length ? `其余仍在跑：${rest.join('、')}。验收后用 ${again} 接着等。` : '';
+    const shown = [];
+    for (const item of done) shown.push(await showStatus(item, seconds, exec));
+    const notes = [restLine, errorLine].filter(Boolean);
+    if (shown.length === 1) return notes.reduce(appendLine, shown[0]);
+    const text = (s) => render(s).map((part) => part.text).join('\n');
+    return { job_id: shown[0].job_id, status: shown[0].status, finished: shown.map((s) => s.job_id),
+      rendered: [`本批有 ${shown.length} 单同时结束：${shown.map((s) => s.job_id).join('、')}，逐单列出。`,
+        ...shown.map((s, i) => `=== ${i + 1}/${shown.length} · ${s.job_id} ===\n${text(s)}`), ...notes].join('\n\n') };
+  }
+
   ctx.tools.register({
     ...PRESENT.codex_status,
     name: 'codex_status',
-    description: '每次只等待传入 job_id 对应的 Codex 任务。' + WAIT_GUIDANCE +
+    description: '等待 job_id 对应的任务；本批还有别的单在跑时，把它们放进 job_ids 一起等，哪单先结束先返回哪单（同时结束的一并返回），其余继续跑。' +
+      WAIT_GUIDANCE +
       '中止本工具或 job_output 只停止观察。取消用 codex_cancel 或后台任务的显式取消。运行中返回最近活动及距今秒数、阶段和尝试轮次。' +
       '用 codex_output 分段读取任务、验收标准和报告。',
     parameters: {
       type: 'object',
       properties: {
         job_id: { type: 'string', description: '派单返回的 runner job_id。' },
+        job_ids: { type: 'array', items: { type: 'string' }, maxItems: 20,
+          description: '可选：本批其余仍在跑的 runner job_id。和 job_id 一起等，哪单先结束先返回，同时结束的一并返回。' },
         wait_seconds: { type: 'integer', description: '传 3600 在本轮等待，超时续等仍在跑的任务。省略或 0 即时查询，勿重复轮询。中止等待不取消 Codex。' },
       },
       required: ['job_id'],
     },
     output: OUTPUT,
     async execute(args, exec) {
-      if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_status: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
+      const valid = (id) => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(id);
+      if (!valid(args?.job_id)) throw new Error('codex_status: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) {
         throw new Error('codex_status: wait_seconds 必须是非负整数');
       }
+      if (args.job_ids !== undefined && (!Array.isArray(args.job_ids) || args.job_ids.length > 20 || !args.job_ids.every(valid))) {
+        throw new Error('codex_status: job_ids 必须是最多 20 个 runner job_id 的数组');
+      }
+      const ids = [...new Set([args.job_id, ...(args.job_ids ?? [])])];
+      if (ids.length > 1) return statusAny(ids, Math.min(args.wait_seconds ?? 0, 86_400), exec);
+      // 单任务保持原来的写法和调用时序：多一层 async 中转就会和加载时的自动核验补派换先后。
       // 普通任务号不经过 await，保持原来的调用时序。
       const { jobId, note: threadNote } = THREAD_ID.test(args.job_id) ? await threadJob(args.job_id, exec, 'codex_status', exec?.signal) : { jobId: args.job_id };
       args = { ...args, job_id: jobId };
