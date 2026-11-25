@@ -2076,6 +2076,9 @@ def verification_git_digest(cwd, paths, *, budget=30, strict=False):
         index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
                       "HEAD", "--", *relative, at=top)
         scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
+        # SQLite's -shm is the shared-memory index every reader of a WAL database rewrites; it holds no data. A verifier
+        # that only queried a product database failed on it (d8778b, 2026-11-25).
+        scoped = b"\0".join(entry for entry in scoped.split(b"\0") if not entry.endswith(b"-shm"))
         if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
             return None, None, set()
         hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)

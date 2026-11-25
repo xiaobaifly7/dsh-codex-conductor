@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.190` 核验的改动检查不再把 SQLite 的 `-shm` 文件算作改动。WAL 模式的数据库只要被读取，`-shm` 共享内存索引就会被改写，里面不存数据；核验只查询了原任务产出的数据库，也会被判 verification_tree_changed。2026-11-25 17:52 核验 d8778b 就是这样失败的：唯一变动的是原任务产物 `.db-shm`，同期的三单写入都没碰到它。数据库文件本身和其他文件照旧检查。
+
 `0.9.189` codex_model 登记前按 dsh-agy-link 的模型目录核对模型名（新配置 gemini.modelCatalog，指向 model-catalog.json）：目录里没有的（例如 Carbon 没有 xhigh 档）当场拒绝，并列出可选的 Gemini 模型，不再等到派单时 agy 报「not recognized」才发现；读不到目录时照旧只查格式。codex_summary 第一行显示本对话当前的执行模型，以及它是用户为本对话指定的还是默认的，交接出去的会话显示继承来的设置。
 
 `0.9.188` 新增 codex_model：用户在某个对话里要求换执行模型时（例如「这个对话用 carbon high」），规划端调用它为本对话指定 Gemini 模型，之后这个对话的 codex_run、codex_continue 都用这个模型，forceModel 下也生效，回执写明「本单按本对话的设置使用 …」；核验不受影响，交接出去的会话沿交接链继承。插件只认用户本人最近一条消息：要写出模型的系列名和档位（carbon、neon……；high 或「高」），插件代发、看门狗补发和其他来源的消息都不算，规划端不能自己替用户换。model=default 恢复配置的默认模型。设置存在状态目录的 session-models.json。原因：四套配置都是 lockEngine + forceModel，规划端传的 model 一律被忽略，用户 2026-11-25 想让单个对话改用 gemini-4-carbon-high 时没有办法。
@@ -275,6 +277,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.190` The verification change check no longer counts SQLite `-shm` files as changes. Any reader of a WAL database rewrites its `-shm` shared-memory index, which holds no data, so a verification that only queried a database the original task produced failed as verification_tree_changed. On 2026-11-25 at 17:52 verification d8778b failed this way: the only changed file was the original task's `.db-shm` product, and none of the three concurrent writes touched it. The database file itself and all other files are still checked.
 
 `0.9.189` codex_model checks the model name against the dsh-agy-link model catalog before saving it (new setting gemini.modelCatalog, pointing at model-catalog.json). A name the catalog lacks, such as Carbon with xhigh, is refused at once with the Gemini choices listed, instead of surfacing later as agy's "not recognized" on dispatch. Without a readable catalog it still checks the format only. The first line of codex_summary shows the conversation's current execution model and whether the user set it for this conversation or it is the default. A handed-over session shows the setting it inherited.
 
