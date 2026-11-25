@@ -1444,6 +1444,33 @@ test('repeat guard summary renders the latest group standing for a handover succ
   assert.ok((await h.tools.codex_run.execute(RUN, exec)).next.split('\n').includes(standingLine));
 });
 
+test('codex_model checks the agy-link catalog, and codex_summary shows the model a handover successor inherits', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  aliases.link('S1', 'S2');
+  t.after(() => aliases.unlink('S1', 'S2'));
+  const catalog = path.join(localAppData, 'model-catalog.json');
+  writeFileSync(catalog, JSON.stringify({ current: { source: 'discovered', models: [
+    { id: 'gemini-4-neon', efforts: ['low', 'medium', 'high', 'xhigh'] }, { id: 'gemini-4-carbon', efforts: ['low', 'medium', 'high'] }] },
+    accounts: { acc: { models: [{ id: 'gemini-4-argon', efforts: ['high'] }] } } }));
+  const summary = { status: 'completed', groups: [], total: 0, total_jobs: 0 };
+  const h = harness({ config: { summaryResult: summary,
+    gemini: { command: 'C:/tools/agy.exe', model: 'gemini-4-neon-high', forceModel: true, modelCatalog: catalog } } });
+  const said = (text) => ({ type: 'user/message', time: Date.now(), data: { source: { kind: 'user' }, content: [{ type: 'text', text }] } });
+  const first = { agent: { ...agentAt('/work', [said('这个对话用 carbon xhigh')]), id: 'S1' } };
+  await assert.rejects(h.tools.codex_model.execute({ model: 'gemini-4-carbon-xhigh' }, first),
+    /模型目录里没有 gemini-4-carbon-xhigh.*gemini-4-carbon-high.*gemini-4-argon-high/);
+  const shown = async (id) => {
+    const value = await h.tools.codex_summary.execute({}, { agent: { ...agentAt('/work'), id } });
+    return [value.execution_model, h.tools.codex_summary.output.render({}, value)[0].text.split('\n')[0]];
+  };
+  assert.deepEqual(await shown('S2'), [{ model: 'gemini-4-neon-high', source: 'default' }, '本对话执行模型：gemini-4-neon-high（默认）']);
+  await h.tools.codex_model.execute({ model: 'gemini-4-carbon-high' }, { agent: { ...agentAt('/work', [said('这个对话改用 carbon high')]), id: 'S1' } });
+  assert.deepEqual(await shown('S2'), [{ model: 'gemini-4-carbon-high', source: 'conversation' }, '本对话执行模型：gemini-4-carbon-high（用户为本对话指定）']);
+  await h.tools.codex_model.execute({ model: 'default' }, { agent: { ...agentAt('/work'), id: 'S2' } });
+  assert.equal((await shown('S2'))[0].source, 'default');
+});
+
 test('repeat guard runtime counts a terminal job once across observations and hot reload', async () => {
   const result = { ...workflowSource('environment'), job_id: 'REPEAT-STATS', context: { owner: 'stats-owner' },
     repeat_guard: repeatGuardStatus };

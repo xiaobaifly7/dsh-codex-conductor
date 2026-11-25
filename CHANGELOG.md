@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.189` codex_model 登记前按 dsh-agy-link 的模型目录核对模型名（新配置 gemini.modelCatalog，指向 model-catalog.json）：目录里没有的（例如 Carbon 没有 xhigh 档）当场拒绝，并列出可选的 Gemini 模型，不再等到派单时 agy 报「not recognized」才发现；读不到目录时照旧只查格式。codex_summary 第一行显示本对话当前的执行模型，以及它是用户为本对话指定的还是默认的，交接出去的会话显示继承来的设置。
+
 `0.9.188` 新增 codex_model：用户在某个对话里要求换执行模型时（例如「这个对话用 carbon high」），规划端调用它为本对话指定 Gemini 模型，之后这个对话的 codex_run、codex_continue 都用这个模型，forceModel 下也生效，回执写明「本单按本对话的设置使用 …」；核验不受影响，交接出去的会话沿交接链继承。插件只认用户本人最近一条消息：要写出模型的系列名和档位（carbon、neon……；high 或「高」），插件代发、看门狗补发和其他来源的消息都不算，规划端不能自己替用户换。model=default 恢复配置的默认模型。设置存在状态目录的 session-models.json。原因：四套配置都是 lockEngine + forceModel，规划端传的 model 一律被忽略，用户 2026-11-25 想让单个对话改用 gemini-4-carbon-high 时没有办法。
 
 `0.9.187` 新增配置 verifyEngine 和 verifyServiceTier。verifyEngine 设为 codex 或 gemini 后，核验单（codex_verify、自动核验、verify_previous）一律用这个引擎，lockEngine 时也生效，规划端传的 engine 不生效；codex_run、codex_continue 照旧用 lockEngine 的引擎，工具说明会写明核验由哪个引擎执行。核验走 Codex 时，模型用 model，档位用 readOnlyEffort，service tier 用 verifyServiceTier（例如 fast，留空同 serviceTier）。Codex 报额度用完后，到恢复时间前的核验改派 Gemini，不会因为额度直接拒派。用户 2026-11-25 要求执行端保持 Gemini、核验改用 Codex 并开 Fast。依据是线上数据：Gemini neon-high 核验中位 309–389 秒、成功率 88–96%；Codex 6.1-sol medium 在 11-12 到 11-21 的 488 单线上核验成功率 99%、中位 129 秒，高风险重放 36 单拒答 0。
@@ -273,6 +275,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.189` codex_model checks the model name against the dsh-agy-link model catalog before saving it (new setting gemini.modelCatalog, pointing at model-catalog.json). A name the catalog lacks, such as Carbon with xhigh, is refused at once with the Gemini choices listed, instead of surfacing later as agy's "not recognized" on dispatch. Without a readable catalog it still checks the format only. The first line of codex_summary shows the conversation's current execution model and whether the user set it for this conversation or it is the default. A handed-over session shows the setting it inherited.
 
 `0.9.188` Adds codex_model. When the user asks for another execution model in a conversation ("use carbon high here"), the planner calls it to set a Gemini model for that conversation. Its codex_run and codex_continue then use that model, even under forceModel, and the receipt says so. Verifications are unaffected, and sessions handed over from it inherit the setting through the handover chain. The plugin accepts it only when the user's own latest message names the model's family and effort (carbon, neon, …; high or 高). Plugin-sent messages, watchdog nudges and other sources do not count, so the planner cannot switch on its own. model=default restores the configured model. The setting is kept in session-models.json in the state directory. Why: all four profiles use lockEngine + forceModel, which ignores the planner's model, so on 2026-11-25 the user had no way to run one conversation on gemini-4-carbon-high.
 
