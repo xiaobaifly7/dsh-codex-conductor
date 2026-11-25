@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.188` 新增 codex_model：用户在某个对话里要求换执行模型时（例如「这个对话用 carbon high」），规划端调用它为本对话指定 Gemini 模型，之后这个对话的 codex_run、codex_continue 都用这个模型，forceModel 下也生效，回执写明「本单按本对话的设置使用 …」；核验不受影响，交接出去的会话沿交接链继承。插件只认用户本人最近一条消息：要写出模型的系列名和档位（carbon、neon……；high 或「高」），插件代发、看门狗补发和其他来源的消息都不算，规划端不能自己替用户换。model=default 恢复配置的默认模型。设置存在状态目录的 session-models.json。原因：四套配置都是 lockEngine + forceModel，规划端传的 model 一律被忽略，用户 2026-11-25 想让单个对话改用 gemini-4-carbon-high 时没有办法。
+
 `0.9.187` 新增配置 verifyEngine 和 verifyServiceTier。verifyEngine 设为 codex 或 gemini 后，核验单（codex_verify、自动核验、verify_previous）一律用这个引擎，lockEngine 时也生效，规划端传的 engine 不生效；codex_run、codex_continue 照旧用 lockEngine 的引擎，工具说明会写明核验由哪个引擎执行。核验走 Codex 时，模型用 model，档位用 readOnlyEffort，service tier 用 verifyServiceTier（例如 fast，留空同 serviceTier）。Codex 报额度用完后，到恢复时间前的核验改派 Gemini，不会因为额度直接拒派。用户 2026-11-25 要求执行端保持 Gemini、核验改用 Codex 并开 Fast。依据是线上数据：Gemini neon-high 核验中位 309–389 秒、成功率 88–96%；Codex 6.1-sol medium 在 11-12 到 11-21 的 488 单线上核验成功率 99%、中位 129 秒，高风险重放 36 单拒答 0。
 
 `0.9.186` 原任务全部受阻、没有任何改动或可核验结果时，codex_review 对 accepted_deviations 的回执不再给「① 先派 codex_verify 核验后再记」这条路，只留续接、用户确认和改记 needs_changes。这种单 codex_verify 本来就拒绝核验（「原任务受阻，未记录改动或可核验结果」），回执却叫规划端先去核验：2026-11-25 12:51–13:03 ae0c16c3 结案 f76c9a（8 条全 blocked、0 文件）时，在 accepted_deviations 和 codex_verify 之间来回被拒 6 次、约 12 分钟，最后才改记 needs_changes。
@@ -271,6 +273,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.188` Adds codex_model. When the user asks for another execution model in a conversation ("use carbon high here"), the planner calls it to set a Gemini model for that conversation. Its codex_run and codex_continue then use that model, even under forceModel, and the receipt says so. Verifications are unaffected, and sessions handed over from it inherit the setting through the handover chain. The plugin accepts it only when the user's own latest message names the model's family and effort (carbon, neon, …; high or 高). Plugin-sent messages, watchdog nudges and other sources do not count, so the planner cannot switch on its own. model=default restores the configured model. The setting is kept in session-models.json in the state directory. Why: all four profiles use lockEngine + forceModel, which ignores the planner's model, so on 2026-11-25 the user had no way to run one conversation on gemini-4-carbon-high.
 
 `0.9.187` Adds the settings verifyEngine and verifyServiceTier. With verifyEngine set to codex or gemini, every verification (codex_verify, automatic verification, verify_previous) runs on that engine, even under lockEngine, and the planner's engine is ignored. codex_run and codex_continue keep the lockEngine engine, and the tool text says which engine verifies. A Codex verification uses model, readOnlyEffort and verifyServiceTier (for example fast; empty means serviceTier). After Codex reports its quota spent, verifications until the reset time move to Gemini instead of being refused. On 2026-11-25 the user asked to keep execution on Gemini and run verification on Codex with Fast. Live data: Gemini neon-high verifications took a median 309–389 s with 88–96% success; Codex 6.1-sol medium ran 488 live verifications from 11-12 to 11-21 at 99% success with a 129 s median, and refused none of 36 high-risk replays.
 

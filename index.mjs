@@ -650,6 +650,20 @@ function widensOverlappingScope(previousCwd, original, cwd, requested) {
 
 // 外部看门狗通过 send-request 补发的固定话术。
 const AUTOMATIC_TEXTS = new Set(['继续']);
+const messageText = (e) => (Array.isArray(e.data?.content) ? e.data.content : []).filter(c => c?.type === 'text').map(c => c.text).join('\n');
+// 用户本人最近一条消息的文字：不算插件代发、看门狗补发和其他来源（技能说明、记忆召回）的消息。
+export function lastUserText(log) {
+  const user = log.findLast(e => e.type === 'user/message' && e.data?.source?.kind === 'user' &&
+    e.data.source.via !== 'codex-conductor' && !AUTOMATIC_TEXTS.has(messageText(e).trim()));
+  return user ? messageText(user) : '';
+}
+const EFFORT_WORDS = { low: ['low', '低'], medium: ['medium', '中'], high: ['high', '高'], xhigh: ['xhigh', '超高'], max: ['max', '最高'] };
+// 用户的话里要有模型的系列名（carbon、neon……），带档位的还要有档位（high 或「高」）；不要求写全 gemini-4-。
+export function userNamedModel(text, model) {
+  const words = model.toLowerCase().replace(/^gemini-\d+(?:\.\d+)?-/, '').split('-').filter(Boolean);
+  const said = text.toLowerCase();
+  return words.length > 0 && words.every(word => (EFFORT_WORDS[word] ?? [word]).some(form => said.includes(form)));
+}
 export function hasUserReply(log, job, owner, autoMessage) {
   const text = (e) => (Array.isArray(e.data?.content) ? e.data.content : []).filter(c => c?.type === 'text').map(c => c.text).join('\n');
   // autoResume submits its restart notice with the user source; nobody answered anything.
@@ -2959,6 +2973,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       args = { ...args, engine, model: undefined, service_tier: undefined, use_user_config: undefined };
       quotaLine = `Codex 额度已用完（预计 ${until} 恢复），本单已改派 Gemini。`;
     }
+    let modelLine;
+    const chosen = engine === 'gemini' && !verificationOf ? sessionModel(exec?.agent?.id) : undefined;
+    if (chosen) {
+      args = { ...args, session_model: chosen };
+      modelLine = `本单按本对话的设置使用 ${chosen}（用户指定；核验不受影响）。`;
+    }
     let effortLine;
     if (engine === 'gemini' && !continuation && !verificationOf && args.effort !== undefined) {
       effortLine = cfg.gemini?.executionEffort ? `本单 Gemini 使用配置的 effort=${cfg.gemini.executionEffort}。`
@@ -3234,7 +3254,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
     const key = shown.rendered ? 'rendered' : 'next';
-    const lines = [standingLine, lockLine, effortLine, quotaLine, queueLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
+    const lines = [standingLine, lockLine, modelLine, effortLine, quotaLine, queueLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
     const renderedNext = [standingLine, ...predispatch].filter(Boolean).join('\n');
     return { ...shown, ...(shown.rendered && renderedNext ? { next: [shown.next, renderedNext].filter(Boolean).join('\n') } : {}),
       ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
@@ -4205,6 +4225,47 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
   });
 
+  // 本对话的执行模型（codex_model）：交接出去的会话沿交接链继承，最近一次设置为准，null 表示恢复默认。
+  const sessionModelsFile = stateDirectory && path.join(stateDirectory, 'session-models.json');
+  const readSessionModels = () => {
+    try { const value = JSON.parse(readFileSync(sessionModelsFile, 'utf8')); return value && typeof value === 'object' ? value : {}; } catch { return {}; }
+  };
+  function sessionModel(owner) {
+    if (!owner || !sessionModelsFile) return undefined;
+    const models = readSessionModels();
+    const id = [owner, ...aliases.predecessors(owner)].find(item => Object.hasOwn(models, item));
+    return id ? models[id]?.model ?? undefined : undefined;
+  }
+  if (cfg.gemini) ctx.tools.register({
+    name: 'codex_model',
+    description: '只在用户本人在本对话里明确要求换执行模型时调用：为本对话（含之后交接出去的会话）的 Gemini 执行和续接指定模型，例如 gemini-4-carbon-high；' +
+      '核验不受影响。用户最近一条消息里要写出这个模型（系列名和档位，如「carbon high」），否则拒绝；不要自己替用户选模型。model=default 恢复配置的默认模型。',
+    presentCall: () => ({ card: 'generic', kind: 'edit', title: '本对话的执行模型' }),
+    parameters: { type: 'object', properties: {
+      model: { type: 'string', description: 'Gemini 模型名，档位写在名字里（如 gemini-4-carbon-high）；或 default 恢复默认。' },
+    }, required: ['model'] },
+    output: DATA_OUTPUT,
+    async execute(args, exec) {
+      const owner = exec?.agent?.id;
+      const model = typeof args?.model === 'string' ? args.model.trim().toLowerCase() : '';
+      if (!owner || !sessionModelsFile) throw new Error('codex_model: 需要当前会话 ID 和插件状态目录');
+      if (model !== 'default') {
+        if (!/^gemini-[a-z0-9][a-z0-9.-]*$/.test(model)) throw new Error('codex_model: model 必须是 Gemini 模型名（如 gemini-4-carbon-high）或 default');
+        if (!userNamedModel(lastUserText(exec?.agent?.session?.log ?? []), model)) {
+          throw new Error(`codex_model: 用户最近一条消息里没有写出 ${model}，没有改模型。只有用户本人在本对话里明确要求时才能换；需要的话先问用户。`);
+        }
+      }
+      const models = readSessionModels();
+      models[owner] = { model: model === 'default' ? null : model, at: new Date().toISOString() };
+      mkdirSync(path.dirname(sessionModelsFile), { recursive: true });
+      writeJsonAtomic(sessionModelsFile, models);
+      const fallback = cfg.gemini.executionModel ?? cfg.gemini.model;
+      return model === 'default'
+        ? { status: 'ok', model: fallback, note: `本对话的执行和续接恢复配置的默认模型 ${fallback}，从下一单起生效。` }
+        : { status: 'ok', model, note: `本对话（含之后交接出去的会话）的执行和续接改用 ${model}，从下一单起生效；核验照旧。恢复默认：codex_model model=default。` };
+    },
+  });
+
   ctx.tools.register({
     name: 'codex_watch',
     description: '为当前会话登记安静的原生后台观察：attention 仅在失败、受阻、报告异常等重要变化时通知；all 也通知开始/正常完成。' +
@@ -4662,7 +4723,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
         ...(cfg.unknownConfig.length ? { unknownConfig: cfg.unknownConfig } : {}),
         tools: ['codex_run', 'codex_verify', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
-          ...(cfg.gemini ? ['gemini_write'] : [])],
+          ...(cfg.gemini ? ['gemini_write', 'codex_model'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
         ownerDecisions: cfg.ownerDecisions,
