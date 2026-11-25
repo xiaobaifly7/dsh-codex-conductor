@@ -4112,7 +4112,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const sample = await sampleNotMet(source, owner, exec?.signal).catch(() => { exec?.signal?.throwIfAborted(); });
         if (sample && !(typeof args.notes === 'string' && args.notes.includes(`sample:${sample.job_id}`))) {
           prepared.problems.push(`核验 ${sample.job_id} 的抽查结论一行（第 ${sample.row} 条）判 not_met：抽查出原报告有结论不属实。` +
-            `verified 前三选一：① codex_continue ${source.job_id} 返工后再核验；② 改记 needs_changes，或记 accepted_deviations 写明为什么接受；` +
+            `verified 前三选一：① codex_continue ${source.job_id} 返工后再核验；② 改记 needs_changes 并把不属实结论所在的验收项标 not_met，或记 accepted_deviations 写明为什么接受；` +
             `③ 确认是核验误判时，在 notes 写「sample:${sample.job_id}: 误判的依据」`);
         }
       }

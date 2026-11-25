@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.185` 0.9.181 的抽查回执第 ② 条改为「改记 needs_changes 并把不属实结论所在的验收项标 not_met」。原来只写「改记 needs_changes」，而另一条护栏规定所有验收项都 met、又没有阻塞和偏差时不能记 needs_changes，照回执做会被拒：2026-11-25 11:49 ae0c16c3 结案 f056fa 时因此多被拒两次，第三次标了 not_met 才通过。
+
 `0.9.184` 全新的 Gemini 任务报「model … is not recognized as a known model」时，如果这个账号 24 小时内刚用同一模型跑成过一单，也按 0.9.173 的续跑情形处理：记 transient、在原有重试次数内重试，归还租约时报「agy 没能加载模型列表、账号并未拒绝」，dsh-agy-link 不再把账号排除。runner 在每单成功后记下「账号|模型」和时间（runner 主目录的 agy-model-ran.json）。原因：2026-11-25 06:19–07:02 访问 Google 接口拉模型列表再次失败，这次失败的都是全新任务，0.9.173 只认续跑，7 单被判 provider_permanent；dsh-agy-link 看到原话把唯一还有周额度的账号排除，之后新派的单因「没有可选账号」立即失败，一个会话的目标因此被标为 block。07:04 列表恢复后同一账号照常跑完。从没在这个账号跑成过该模型的全新任务仍照原样处理。
 
 `0.9.183` 交接后的后继会话被拒绝读取原料时，读取护栏不再每次都把整条交接链上前任会话的产物清单重查一遍：前任已交接、不再派单，查成功一次后缓存 10 分钟，本会话的清单仍每次都查。交接时仍在跑的前任任务结束后，最迟 10 分钟就能读到它的产物。以前每次刷新都要把链上每个会话各查一遍：2026-11-25 两条 6 会话的交接链上，最老的几个前任各有 7,000–10,000 个产物，整链重查要 7.7 秒，宿主里每次拒绝原料读取要等 9–12 秒，一个后继会话 2 分钟里就碰到 4 次。
@@ -265,6 +267,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.185` Option ② of the 0.9.181 sample receipt now reads "record needs_changes and mark the item holding the untrue conclusion not_met". It used to say only "record needs_changes", but another check rejects needs_changes when every item is met with no blocker or deviation, so following the receipt was refused: on 2026-11-25 11:49 ae0c16c3 closing f056fa was rejected twice more for this and passed on the third try once it marked an item not_met.
 
 `0.9.184` When a fresh Gemini task fails with "model … is not recognized as a known model" on an account that completed a run of the same model within the last 24 hours, the runner treats it like the 0.9.173 resumed case: transient, retried within the existing attempts, and the lease is released with "agy could not load its model list; the account did not refuse it", so dsh-agy-link no longer benches the account. After each successful run the runner records the account|model pair and time in agy-model-ran.json in its home. Why: on 2026-11-25 06:19–07:02 agy again could not fetch the model list from Google; this time the failures were fresh tasks, which 0.9.173 did not cover, so 7 runs ended provider_permanent, dsh-agy-link benched the only account with weekly quota left, later dispatches failed at once with no account available, and one conversation's goal was marked blocked. After the list came back at 07:04 the same account ran normally. A fresh task on an account that has never completed the model is handled as before.
 

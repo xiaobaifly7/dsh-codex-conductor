@@ -418,7 +418,7 @@ test('a verified closeout must answer a verification whose sample verdict is not
   const criteria = acceptance.map((_, i) => ({ index: i + 1, status: 'met', evidence: 'Reviewed the original report.' }));
   await h.verify({ samples: 1 });
   await assert.rejects(h.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria }, exec),
-    /核验 VERIFY-1 的抽查结论一行（第 3 条）判 not_met[\s\S]*codex_continue SOURCE-1[\s\S]*sample:VERIFY-1/);
+    /核验 VERIFY-1 的抽查结论一行（第 3 条）判 not_met[\s\S]*codex_continue SOURCE-1[\s\S]*needs_changes 并把不属实结论所在的验收项标 not_met[\s\S]*sample:VERIFY-1/);
   assert.ok(!h.calls.some(call => call.argv[0] === 'review'));
   const noted = await h.tools.codex_review.execute({ job_id: source.job_id, status: 'verified', criteria,
     notes: 'sample:VERIFY-1: 核验把已更正的结论当成旧值，docs/result.md:12 已是新值' }, exec);
