@@ -4734,6 +4734,30 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       `${forwarded.delivered ? '' : '（继任会话不可用，未送达）'}。`);
     return forwarded?.reject ? { kind: 'reject' } : next();
   });
+  // 用户点了停止、还没再发话：只带后台任务完成通知的步骤不调用模型，免得会话被通知叫醒接着干（11-20 到 11-25 有 12 次）。
+  // 通知先存着，用户下次发话时随那一步一起交给模型，任务结果不丢。
+  const heldNotices = new Map();
+  ctx.on('agent/pre-step', async (step, next) => {
+    const id = step.agent?.id;
+    try {
+      const messages = step.messages ?? [];
+      if (messages.length && messages.every((m) => m?.source?.kind === 'tool-jobs') && history.observe(step.agent)?.userStopped) {
+        heldNotices.set(id, [...(heldNotices.get(id) ?? []), ...messages]);
+        ctx.logger?.info?.(`[codex-conductor] 会话 ${id} 已被用户停止，${messages.length} 条任务通知先存着、不叫醒会话；用户下次发话时一并交给模型。`);
+        return { kind: 'reject' };
+      }
+    } catch {}
+    const decision = await next();
+    try {
+      const held = heldNotices.get(id);
+      if (held?.length && decision?.kind === 'enter' && Array.isArray(decision.messages) &&
+          (step.messages ?? []).some((m) => m?.source?.kind === 'user' && !m.source.via)) {
+        heldNotices.delete(id);
+        return { ...decision, messages: [...decision.messages, ...held] };
+      }
+    } catch {}
+    return decision;
+  });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();

@@ -106,6 +106,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.200：用户叫停的会话不被任务通知叫醒
+
+用户点了停止之后，名下后台任务完成的通知会让宿主在会话空闲时开新回合，会话就接着干了（11-20 到 11-25 有 12 次）。现在会话最后一次被用户停止、之后用户没再发话、没有恢复或新建目标、也没有操作员通过本插件请求续接时，只带任务完成通知（`tool-jobs`）的步骤不调用模型，宿主记为 `blocked`。这些通知先存着，用户下次发话时随那一步一起交给模型，任务结果不丢。宿主关闭（`aborted/disposed`）不算用户停止。
+
 ### 0.9.198：交接后新会话不再丢上下文
 
 11-17 到 11-25 的 13 次真实自动交接里，9 次是把正在跑的回合掐断再交接，其中 4 次是用户刚发起的回合（两次在用户发话后 1 分钟内）；最近 7 份交接单有 3 份“最近的用户指令”是空的。这一版改了触发条件和交接单：
@@ -738,6 +742,10 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.200: A session the user stopped is not woken by job notices
+
+After the user pressed stop, a background job's completion notice made the host open a new turn once the session was idle, and the work went on (12 times from 11-20 to 11-25). Now, while the session's last stop came from the user and the user has not written since, no goal was resumed or created and no operator asked this plugin to resume, a step that only carries job notices (`tool-jobs`) does not call the model and the host records it as `blocked`. The notices are kept and reach the model with the user's next message, so no job result is lost. A host shutdown (`aborted/disposed`) is not a user stop.
 
 ### 0.9.198: Successors keep the context
 
