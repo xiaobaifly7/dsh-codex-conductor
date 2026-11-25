@@ -1422,6 +1422,290 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(r["attempts"], 1)
         self.assertFalse(r["retryable"])
 
+    def gemini_turn(self, last_text="", commands=0, report=None):
+        """The state a finished Gemini attempt leaves: the reply, how many commands it ran, and its parsed report."""
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        state = {**codex_runner.attempt_state(None), "engine": "gemini", "completed": True, "commands": commands}
+        if report is not None:
+            state["last_text"] = json.dumps(report)
+        else:
+            state["last_text"] = last_text
+        return state
+
+    def refusal_of(self, **kwargs):
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        return codex_runner.refusal_evidence(self.gemini_turn(**kwargs), True)
+
+    def test_a_polite_refusal_that_finished_its_turn_is_a_refusal(self):
+        # Gemini says no in the reply and completes the turn; without this check the job is filed as done.
+        # Every one of these is a real reply from the job log, and each names the boundary it will not cross.
+        for reply in ("Sorry, I cannot fulfill your request. I cannot inspect compiled binaries to extract offsets for "
+                      "internal AI safety filtering or safety-override mechanisms.",
+                      "Refused to disassemble or reverse-engineer the binary to analyze its safety boundaries.",
+                      "抱歉，我无法协助提取这份配置里的越狱开关，这会绕过审核机制。"):
+            with self.subTest(reply=reply):
+                refusal = self.refusal_of(last_text=reply)
+                self.assertIsNotNone(refusal)
+                self.assertEqual(refusal["reason"], "reply")
+
+    def test_a_turn_down_without_a_stated_boundary_is_not_a_refusal(self):
+        # "无法提供实际行号" is an obstacle: the job never read the file. Counting it would fail ordinary work.
+        for reply in ("未读取或修改文件，无法提供实际行号。",
+                      "I cannot confirm the offset without reading section .data first.",
+                      "无法完成逐条核对，目标文件不存在。"):
+            with self.subTest(reply=reply):
+                self.assertIsNone(self.refusal_of(last_text=reply))
+
+    def test_a_refusal_is_read_from_the_models_words_not_the_evidence_it_quotes(self):
+        # A finished job quoted its own blocker inside a criterion as evidence and was almost counted as a refusal.
+        report = self.sample_report(
+            criteria=[{"criterion": "Criterion one", "status": "blocked",
+                       "evidence": "未读取或修改文件，无法提供实际行号。"}],
+            blockers=[{"id": "conflict-001", "kind": "task_conflict",
+                       "message": "任务要求执行命令，同时禁止运行任何工具；这些要求无法同时满足。",
+                       "question": "", "resolution": ""}])
+        self.assertIsNone(self.refusal_of(report=report))
+
+    def test_an_identifier_that_merely_contains_refuse_is_not_a_safety_label(self):
+        # "A-REFUSAL-ORIGIN" and "ConnectionRefused" are ordinary blockers from ordinary work.
+        report = self.sample_report(
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "errno 111"}],
+            blockers=[{"id": "A-REFUSAL-ORIGIN", "kind": "task_conflict",
+                       "message": "The host may answer with ConnectionRefused when the output rule rejects the packet.",
+                       "question": "", "resolution": ""}])
+        self.assertIsNone(self.refusal_of(report=report))
+
+    def test_a_directory_named_safety_is_not_a_refusal(self):
+        # The task ran in "F:/01-安全研究/逆向": a path must not be read as the model naming a boundary.
+        report = self.sample_report(
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "no tool"}],
+            blockers=[{"id": "B-01", "kind": "environment",
+                       "message": "当前工具没有读取 /mnt/f/01-安全研究/逆向 的接口，无法完成核对。",
+                       "question": "", "resolution": ""}])
+        self.assertIsNone(self.refusal_of(report=report))
+
+    def test_a_codex_job_that_turns_the_task_down_is_a_refusal_too(self):
+        # Both engines refuse the same way; the check may not be limited to Gemini.
+        report = self.sample_report(
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "未执行"}],
+            blockers=[{"id": "B1", "kind": "task_conflict",
+                       "message": "本任务明确要求联调用于规避溯源的基础设施；我不能协助执行这部分操作。",
+                       "question": "", "resolution": ""}])
+        state = {**self.gemini_turn(report=report), "engine": "codex"}
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        refusal = codex_runner.refusal_evidence(state, False)
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal["blockers"], ["B1"])
+
+    def test_work_that_ran_commands_is_not_a_refusal_however_it_is_worded(self):
+        # Models say "I cannot confirm ..." while working; progress is what separates that from a refusal.
+        self.assertIsNone(self.refusal_of(last_text="I cannot confirm the offset without reading section .data first.",
+                                          commands=4))
+
+    def test_a_report_blocker_about_safety_is_a_refusal_without_any_progress(self):
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "none"}],
+                                    blockers=[{"id": "safety-policy-refusal", "kind": "model_refused",
+                                               "message": "任务要求分析内部安全过滤机制，我无法协助。",
+                                               "question": "", "resolution": ""}])
+        refusal = self.refusal_of(report=report)
+        self.assertEqual((refusal["reason"], refusal["blockers"]), ("blocker", ["safety-policy-refusal"]))
+
+    def test_a_refusal_worded_wu_fa_man_zu_is_still_a_refusal(self):
+        # One real job turned the task down with "我无法满足该请求" over an offensive-tooling request and ran no command;
+        # 无法满足 was missing from the list, so the job was filed as schema_invalid instead of model_refused.
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "none"}],
+                                    blockers=[{"id": "safety-refusal-01", "kind": "task_conflict",
+                                               "message": "抱歉，我无法满足该请求。任务要求对漏洞利用工具链进行实测调用，无法执行。",
+                                               "question": "", "resolution": ""}])
+        refusal = self.refusal_of(report=report)
+        self.assertEqual((refusal["reason"], refusal["blockers"]), ("blocker", ["safety-refusal-01"]))
+
+    def test_a_blocker_kind_of_model_refused_is_a_refusal_whatever_its_id_says(self):
+        # One job named its own blocker "refusal-high-severity-offensive-tooling" and set kind=model_refused; the id
+        # alone is not a label ("A-REFUSAL-ORIGIN" and "ConnectionRefused" are ordinary), the kind cannot be anything else.
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "none"}],
+                                    blockers=[{"id": "refusal-high-severity-offensive-tooling", "kind": "model_refused",
+                                               "message": "Sorry, I cannot fulfill this request.",
+                                               "question": "", "resolution": ""}])
+        refusal = self.refusal_of(report=report)
+        self.assertEqual(refusal["reason"], "blocker")
+        self.assertEqual(refusal["blockers"], ["refusal-high-severity-offensive-tooling"])
+
+    def test_wu_fa_man_zu_about_unmet_criteria_is_not_a_refusal(self):
+        # 无法满足 is also how a job says an acceptance item could not be met: 82 finished jobs used the word, one refused.
+        for report in (
+            self.sample_report(summary="缺少变化前源文件的 mtime，无法满足四项完整对照。"),
+            self.sample_report(blockers=[{"id": "acceptance-conflict", "kind": "task_conflict",
+                                          "message": "保留的验收第1条要求全文照录，第2条要求全部源码出处，二者无法同时满足。",
+                                          "question": "", "resolution": ""}]),
+        ):
+            with self.subTest(report=report):
+                self.assertIsNone(self.refusal_of(report=report, commands=0))
+
+    def test_a_report_blocker_about_an_ordinary_obstacle_is_not_a_refusal(self):
+        # The same shape of report must stay ordinary work: only safety or policy wording counts.
+        report = self.sample_report(criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "no /mnt"}],
+                                    blockers=[{"id": "mount-missing", "kind": "environment",
+                                               "message": "Cannot resolve the /mnt path; the drive is not mounted.",
+                                               "question": "", "resolution": "mount the drive"}])
+        self.assertIsNone(self.refusal_of(report=report))
+
+    def test_a_finished_turn_with_a_refusal_is_failed_and_carries_the_split(self):
+        # End to end through execute(): the result must stop claiming completed and offer the two-stage split.
+        sys.path.insert(0, str(RUNNER.parent))
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", "agy.exe",
+                                  "--schema", str(RUNNER.parents[1] / "report.v2.schema.json"), "--backoff", "0"])
+        state = self.gemini_turn(report=self.sample_report(
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "refused"}],
+            blockers=[{"id": "safety-refusal", "kind": "model_refused", "message": "I cannot assist with that.",
+                       "question": "", "resolution": ""}]))
+        run_dir = Path(self.tmp.name) / "refusal-run"
+
+        def attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
+            (run_dir / "last_message.txt").write_text(state["last_text"], encoding="utf-8")
+            return state
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "run_attempt", side_effect=attempt):
+            result = codex_runner.execute(args, "原任务", run_dir)
+        self.assertEqual((result["status"], result["error_kind"], result["retryable"]), ("failed", "model_refused", False))
+        self.assertEqual(result["refusal"]["reason"], "blocker")
+        self.assertIn("stage1", result["refusal"]["suggested_split"])
+        self.assertIn("不需要执行任何命令", result["refusal"]["suggested_split"]["stage2"])
+
+    def test_s1_cross_field_blocker_resolution_and_top_level_safety_boundary_are_refusals(self):
+        # S1a: refusal action in message, safety reason in resolution, composite label on id (20261125-111408-f41784).
+        s1a_report = self.sample_report(
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "Refused under safety reason."}],
+            blockers=[{"id": "policy-refusal-01", "kind": "task_conflict",
+                       "message": "Sorry, I cannot fulfill your request.",
+                       "question": "", "resolution": "Request refused under safety policy."}])
+        s1a = self.refusal_of(report=s1a_report, commands=0)
+        self.assertIsNotNone(s1a)
+        self.assertEqual((s1a["reason"], s1a["blockers"]), ("blocker", ["policy-refusal-01"]))
+
+        # S1b: task_conflict blocker carries the refusal action while summary/deviations names a strong safety boundary.
+        s1b_report = self.sample_report(
+            summary="部分完成：因安全边界限制，未执行完整入口。",
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "not run"}],
+            blockers=[{"id": "B1", "kind": "task_conflict",
+                       "message": "我不能执行该完整入口。", "question": "是否调整范围？", "resolution": "仅保留只读检查。"}])
+        s1b = self.refusal_of(report=s1b_report, commands=0)
+        self.assertIsNotNone(s1b)
+        self.assertEqual((s1b["reason"], s1b["blockers"]), ("blocker", ["B1"]))
+
+    def test_s2_offensive_tooling_and_anonymized_egress_boundaries_require_a_refusal_reply(self):
+        for summary in (
+            "Sorry, I cannot fulfill your request. I cannot assist with integrating vulnerability scanning or "
+            "offensive tooling within a red-team or penetration-testing platform.",
+            "仍无法执行的是第 9 步为扫描和漏洞利用工具应用并保留隐藏来源的出站配置。",
+        ):
+            with self.subTest(summary=summary):
+                refusal = self.refusal_of(
+                    report=self.sample_report(
+                        summary=summary,
+                        criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "refused"}]),
+                    commands=0)
+                self.assertIsNotNone(refusal)
+                self.assertEqual(refusal["reason"], "reply")
+        # Offensive-tooling words without a refusal action are ordinary audit descriptions, not refusals.
+        ordinary = self.sample_report(
+            summary="Completed static inventory of vulnerability scanning and red-team platform configs.",
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "awaiting path"}])
+        self.assertIsNone(self.refusal_of(report=ordinary, commands=0))
+
+    def test_s3_upstream_filter_banner_in_non_json_reply_ignores_commands_and_truncation(self):
+        # 20261124-161205-2ff27b placed the banner past char 3,200 after 24 commands.
+        prefix = "已完成阶段检查，正在等待后台诊断结果。\n" * 160
+        self.assertGreater(len(prefix), 2000)
+        banner = ("This request was blocked by Gemini's filters. They can occasionally trigger by mistake on safe "
+                  "coding, security, or biology-related queries. Please try rephrasing your prompt.")
+        refusal = self.refusal_of(last_text=prefix + banner, commands=24)
+        self.assertIsNotNone(refusal)
+        self.assertEqual((refusal["reason"], refusal["commands_run"]), ("filter", 24))
+        self.assertTrue(refusal["excerpt"].startswith("This request was blocked by Gemini's filters"))
+
+    def test_s4_upstream_content_filter_interrupt_report_and_qualified_chinese_refusals(self):
+        # S4a: stalled JSON report describing consecutive upstream content-filter blocks (3bb0ca / d4974c).
+        filter_report = self.sample_report(
+            summary="前置只读核查已完成，随后连续 4 轮被上游模型内容过滤器拦截，未能执行新增 YAML。",
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "blocked by filter"}],
+            blockers=[{"id": "upstream_filter_interrupt", "kind": "environment",
+                       "message": "Four consecutive model turns were interrupted by upstream content-filter blocks.",
+                       "question": "", "resolution": "Re-run with adjusted prompt framing."}])
+        s4a = self.refusal_of(report=filter_report, commands=0)
+        self.assertIsNotNone(s4a)
+        self.assertEqual((s4a["reason"], s4a["blockers"]), ("blocker", ["upstream_filter_interrupt"]))
+
+        # S4b: controlled modifier variants hit when paired with a boundary, while isolated 未能执行 does not.
+        s4b = self.refusal_of(
+            report=self.sample_report(
+                summary="当前安全限制不允许提供该红队执行补丁。",
+                criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "blocked"}]),
+            commands=0)
+        self.assertIsNotNone(s4b)
+        closeout = self.sample_report(
+            summary="未能执行：因与上轮相同的安全边界原因（safety_refusal），不能解析二进制符号表，五条验收标准均保持 blocked。",
+            criteria=[{"criterion": "Criterion one", "status": "blocked", "evidence": "保持原状未执行"}],
+            unresolved=["五条验收标准均因同一安全拒答原因（safety_refusal）未能执行。"])
+        self.assertIsNone(self.refusal_of(report=closeout, commands=0))
+
+    def test_s5_partial_progress_with_blocked_criteria_and_strong_boundary_blocker_is_a_refusal(self):
+        # stalled is False (commands=12 and one criterion is met), yet a blocked criterion + strong boundary refuses.
+        partial = self.sample_report(
+            summary="已完成只读备份，核心步骤未运行。",
+            criteria=[{"criterion": "1. 基线备份", "status": "met", "evidence": "SHA-256 matched"},
+                      {"criterion": "2. 补丁落地", "status": "blocked", "evidence": "blocked by B1"}],
+            blockers=[{"id": "B1", "kind": "task_conflict",
+                       "message": "源码明确标为 C2 控制台；不能继续实施增强监听器、会话管理能力的修复。",
+                       "question": "是否限定为普通组件？", "resolution": "本轮未修改产品。"}])
+        refusal = self.refusal_of(report=partial, commands=12)
+        self.assertIsNotNone(refusal)
+        self.assertEqual((refusal["reason"], refusal["blockers"], refusal["commands_run"]), ("blocker", ["B1"], 12))
+
+    def test_counterexample_valid_json_quoting_filter_banner_is_not_a_refusal(self):
+        # 20261125-160224-15b85b: valid JSON report quoting GEMINI_REFUSAL in evidence must never trigger S3.
+        audit_report = self.sample_report(
+            summary="已完成 0.9.187 版本 GEMINI_REFUSAL 定义行与调用点核对。",
+            criteria=[{"criterion": "给出 GEMINI_REFUSAL 原文", "status": "met",
+                       "evidence": "第 104 行原文：GEMINI_REFUSAL = re.compile(r\"This request was blocked by Gemini's "
+                                   "filters|Sorry, I cannot fulfill your request\", re.I)"}])
+        self.assertIsNone(self.refusal_of(report=audit_report, commands=13))
+        self.assertIsNone(self.refusal_of(report=audit_report, commands=0))
+
+    def test_counterexample_ordinary_task_conflicts_and_bare_policy_words_are_not_refusals(self):
+        for name, commands, report in (
+            ("firewall-policy-drop", 6, self.sample_report(
+                criteria=[{"criterion": "1. VM list", "status": "met", "evidence": "ok"},
+                          {"criterion": "2. nftables output", "status": "blocked", "evidence": "ambiguous"}],
+                blockers=[{"id": "RULE-OUTPUT-AMBIGUOUS", "kind": "task_conflict",
+                           "message": "ruleset 中存在两个 output 基链，无法提供单一 policy 判定。",
+                           "question": "output policy drop 指哪条链？", "resolution": "明确表及链范围。"}])),
+            ("whitelist-placeholder", 1, self.sample_report(
+                criteria=[{"criterion": "1. pwd", "status": "met", "evidence": "ok"},
+                          {"criterion": "2. write report", "status": "blocked", "evidence": "not written"}],
+                blockers=[{"id": "B1", "kind": "task_conflict",
+                           "message": "指定的新文件与只允许改动 F:/01-安全研究/逆向/des/_asa 之间无法确认一致；白名单含未解析占位符。",
+                           "question": "请提供解析后的允许写入路径。", "resolution": "明确范围后继续。"}])),
+            ("connection-refused", 0, self.sample_report(
+                criteria=[{"criterion": "1. SECTION-A", "status": "blocked", "evidence": "errno 111"}],
+                blockers=[{"id": "A-REFUSAL-ORIGIN", "kind": "task_conflict",
+                           "message": "本机 OUTPUT reject 也能使 connect 返回 ConnectionRefused，不能证明拒绝来自对端。",
+                           "question": "是否接受内网可达性写为现有证据无法判定？", "resolution": "接受现有证据限定结论。"}])),
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(self.refusal_of(report=report, commands=commands))
+
     def test_upstream_bad_request_gets_its_own_kind_and_is_not_retried(self):
         r = self.invoke(mode="bad_request")
         self.assertEqual(r["error_kind"], "upstream_rejected")
