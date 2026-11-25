@@ -142,6 +142,14 @@ test('history tracker counts messages incrementally, flags sessions over the thr
   threshold = 0;
   assert.equal(tracker.observe(agent).suggest, false);
   assert.equal(tracker.observe({ id: 'session-B', session: {} }), undefined);
+  // 人工消息：记下最后一条的时间和当前回合里有没有；插件代发、交接单和续跑插件的固定话术不算。
+  const relay = userEvent('续接', 8_000);
+  relay.data.source.via = 'codex-conductor';
+  log.push({ type: 'turn/start' }, userEvent('把第三章改完', 5_000), userEvent('[codex-conductor 交接] 交接单', 6_000),
+    userEvent('继续。宿主在你上一轮运行期间重启了; 从中断处继续', 7_000), relay);
+  assert.deepEqual([tracker.observe(agent).lastHumanAt, tracker.observe(agent).turnHuman], [5_000, true]);
+  log.push({ type: 'turn/start' });
+  assert.deepEqual([tracker.observe(agent).lastHumanAt, tracker.observe(agent).turnHuman], [5_000, undefined]);
   // 新实例（重载）接着用已有的状态文件。
   clock += 2000;
   const reloaded = createHistoryTracker({ directory: root, threshold: () => 5, now: () => clock });
@@ -170,7 +178,9 @@ function host(t, hooks = {}, root = dir(t)) {
     resolveAgent: async (id) => (agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found', message: 'no' } }),
     create: async () => { const id = `session-N${++next}`; agent(id); return { sessionId: id }; },
     prompt: async (request) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId)); },
-    rename: async (request) => { renames.push(request); if (hooks.renameError) throw new Error(hooks.renameError); },
+    // 与宿主一致：改名在会话日志里追加一条 session/title。
+    rename: async (request) => { renames.push(request); if (hooks.renameError) throw new Error(hooks.renameError);
+      agents.get(request.sessionId)?.session.log.push({ type: 'session/title', data: { title: request.title } }); },
   } })[name] };
   const aliases = createAliases(root);
   const deps = { aliases, since: 0, deliverWaitMs: 50, sessionJobs: async () => [], pendingOf: () => ({ unreviewed: [], needsChanges: [] }) };
@@ -513,8 +523,9 @@ test('the brief has every section in order, caps each section and drops whole se
   assert.match(brief, /最后一个回合：结束原因 completed，2026-11-17T09:00:00\.000Z/);
   assert.match(brief, /session_read\(sessionId="session-A", mode="summary"\)/);
   assert.match(brief, /有“下一步”时直接按它推进，不要为确认方向而向用户提问/);
-  // 任务表超过本节上限时只放最近的几单，并写明截断。
-  assert.match(brief, /（已截断，共 80 条，显示最近 \d+ 条）/);
+  // 任务表只列最近 10 单非核验任务和未结束、待处理的任务，其余用 codex_jobs 查。
+  assert.deepEqual(brief.match(/^\| J\d+ /gm).map((r) => r.slice(2, -1)), [...Array.from({ length: 10 }, (_, i) => `J0${80 - i}`), 'J050']);
+  assert.match(brief, /共 80 单，其中核验单 0 单/);
   // 没有下一步、没有回看工具、读取日志超时。
   const plain = buildBrief({ ...base, note: '', sessionRead: false, context: { timedOut: true }, jobs: briefJobs(3), pending: { unreviewed: [], needsChanges: [] } });
   assert.match(plain, /## 下一步\n未指定；按目标继续，先完成“待收尾”。/);
@@ -635,6 +646,12 @@ test('auto hand-over decisions honour mode, idleness, links, cooldown, the start
   assert.equal(step({ uptimeMs: 9 * 60_000 }).act, 'ask', 'the startup delay only holds back automatic hand-overs');
   assert.equal(step({ record: { autoAt: [hours(23)] } }, { mode: 'auto' }).act, null);
   assert.equal(step({ record: { autoAt: [hours(25)] } }, { mode: 'auto' }).act, 'auto');
+  // 用户 quietMinutes 内亲手发过消息：auto 先不交接，过了再交接；询问不受影响；0 关闭这一条。
+  assert.equal(AUTO_HANDOVER_DEFAULTS.quietMinutes, 30);
+  assert.equal(step({ lastHumanAt: now - 10 * 60_000 }, { mode: 'auto' }).act, null);
+  assert.equal(step({ lastHumanAt: now - 31 * 60_000 }, { mode: 'auto' }).act, 'auto');
+  assert.equal(step({ lastHumanAt: now - 10 * 60_000 }).act, 'ask');
+  assert.equal(step({ lastHumanAt: now - 10 * 60_000 }, { mode: 'auto', quietMinutes: 0 }).act, 'auto');
 });
 
 test('the depth limit blocks automatic hand-over, appears in state and the panel, and leaves manual hand-over available', async (t) => {
@@ -811,11 +828,14 @@ test('a successor joins the workspace of its predecessor right above it, follows
   assert.deepEqual(registry.list()[0].sessionIds, ['session-X', handed.to, 'session-A']);
   assert.deepEqual(registry.pinnedSessionIds, [handed.to, 'session-A']);
   assert.deepEqual([h.aliases.links()[handed.to].workspaceId, h.aliases.links()[handed.to].pinned], ['W1', true]);
-  assert.deepEqual(h.renames, [{ sessionId: handed.to, title: '[交接←A] 继续 AI 编程助手对话' }]);
-  assert.equal(handed.steps.title, 'set');
+  // 继任会话带来源的标题；旧会话改成 [已交接→…]，侧栏里看得出它已停用。
+  assert.deepEqual(h.renames, [{ sessionId: handed.to, title: '[交接←A] 继续 AI 编程助手对话' },
+    { sessionId: 'session-A', title: `[已交接→${handed.to.slice(8)}] 继续 AI 编程助手对话` }]);
+  assert.deepEqual([handed.steps.title, handed.steps.predecessorTitle], ['set', 'set']);
   // 撤回：移出交接放进去的工作区，撤销交接加的置顶；原会话的置顶不动。
   const reverted = await h.request({ revert: { from: 'session-A', to: handed.to } }, { workspaces });
-  assert.deepEqual([reverted.steps.workspace, reverted.steps.pin], ['detached', 'unpinned']);
+  assert.deepEqual([reverted.steps.workspace, reverted.steps.pin, reverted.steps.predecessorTitle], ['detached', 'unpinned', 'restored']);
+  assert.deepEqual(h.renames.at(-1), { sessionId: 'session-A', title: '继续 AI 编程助手对话' });
   assert.deepEqual([registry.list()[0].sessionIds, registry.pinnedSessionIds], [['session-X', 'session-A'], ['session-A']]);
   // 用户后来把继任挪到别的工作区：撤回时不动它。
   const again = await h.request({ sessionId: 'session-A' }, { workspaces });
@@ -823,11 +843,12 @@ test('a successor joins the workspace of its predecessor right above it, follows
   await registry.list()[1].attachSession(again.to);
   const moved = await h.request({ revert: { from: 'session-A', to: again.to } }, { workspaces });
   assert.deepEqual([moved.steps.workspace, registry.list()[1].sessionIds], ['unchanged', [again.to]]);
-  // 认领已有会话同样进原会话的分组，但不改它的标题。
+  // 认领已有会话同样进原会话的分组，但不改它的标题；只有旧会话改名。
   h.agent('session-C');
   const renamed = h.renames.length;
   const adopted = await h.request({ adopt: { from: 'session-A', to: 'session-C' } }, { workspaces });
-  assert.deepEqual([adopted.steps.workspace, adopted.steps.title, h.renames.length], ['attached', undefined, renamed]);
+  assert.deepEqual([adopted.steps.workspace, adopted.steps.title, h.renames.length], ['attached', undefined, renamed + 1]);
+  assert.deepEqual(h.renames.at(-1), { sessionId: 'session-A', title: '[已交接→C] 继续 AI 编程助手对话' });
   assert.deepEqual(registry.list()[0].sessionIds, ['session-X', 'session-C', 'session-A']);
 });
 
@@ -967,6 +988,7 @@ test('a running turn is due for cutting only when the session would be handed ov
   assert.equal(auto.due(running('session-A'), big), true);
   assert.equal(auto.due(running('session-A'), { ...big, suggest: false }), false);
   assert.equal(auto.due(running('session-S', 'subagent'), big), false, 'subagents never hand over');
+  assert.equal(auto.due(running('session-A'), { ...big, turnHuman: true }), false, 'a turn the user started is never cut');
   // 24 小时内已自动交接过、已交接出去、或不是 auto 模式：不截断回合。
   writeFileSync(path.join(root, 'auto-handover.json'), JSON.stringify({ sessions: { 'session-B': { autoAt: [new Date().toISOString()] } } }));
   assert.equal(auto.due(running('session-B'), big), false);
@@ -1197,4 +1219,140 @@ test('a session whose last 20 requests all carry a large context is flagged even
     idle: true, retired: false, link: { toMessages: 0 }, now, uptimeMs: 3_600_000 };
   assert.deepEqual(autoHandoverStep(base), { remind: false, act: null });
   assert.deepEqual(autoHandoverStep({ ...base, contextFull: true }), { remind: true, act: 'auto', origin: 'auto' });
+});
+
+test('the old session writes a hand-over summary in a tool-less turn after its goal is paused and before any successor exists', async (t) => {
+  const { summarizing, summaryStepRejected, SUMMARY_MAX_STEPS } = await import('./handover.mjs');
+  const h = host(t);
+  const a = h.agent('session-A');
+  h.goalsByAgent.set(a, { id: 'G1', revision: 1, phase: 'active', objective: '把迁移做完', roundsStarted: 2, maxGoalRounds: 10 });
+  a.session.log.push(userEvent('第三章用术语表里的译名', 1), { type: 'turn/start', data: { turn: 8 } },
+    { type: 'assistant/message', time: 1, data: { turn: 8, message: { content: [{ type: 'text', text: '第二章已改完' }] } } },
+    { type: 'turn/end', time: 1, data: { turn: 8, reason: { kind: 'completed' } } });
+  const sent = [];
+  a.followup = (message) => {
+    sent.push(message);
+    // 发提示时：目标已暂停、还没建继任会话和链接（等摘要时宿主重启不会留下没有交接单的继任），且记在 summarizing 里。
+    assert.deepEqual([h.goalsByAgent.get(a).phase, h.aliases.successor('session-A'), h.agents.has('session-N1'), summarizing.has('session-A')],
+      ['paused', undefined, false, true]);
+    a.session.log.push({ type: 'turn/start', data: { turn: 9 } }, { type: 'user/message', time: 2, data: { id: message.id, content: message.content, source: message.source } },
+      { type: 'assistant/message', time: 3, data: { turn: 9, message: { content: [{ type: 'text', text: '1. 用户要什么：迁移完，第三章用术语表译名。' }] } } },
+      { type: 'turn/end', time: 4, data: { turn: 9, reason: { kind: 'completed' } } });
+  };
+  const result = await h.request({ sessionId: 'session-A' }, { summaryMinutes: 1, summaryOptions: { pollMs: 5 } });
+  assert.deepEqual([result.status, result.steps.summary, summarizing.has('session-A')], ['handed_over', 'written', false]);
+  assert.deepEqual(sent[0].source, { kind: 'user', via: 'codex-conductor' });
+  assert.match(sent[0].content[0].text, /^\[codex-conductor 交接摘要\] 本会话即将交接给一个新会话/);
+  const brief = readFileSync(result.briefPath, 'utf8');
+  assert.deepEqual(brief.match(/^## .*/gm).slice(0, 3), ['## 下一步', '## 旧会话写的交接摘要', '## 目标']);
+  assert.match(brief, /## 旧会话写的交接摘要\n旧会话按它的完整上下文在交接前写成[^\n]*\n\n1\. 用户要什么：迁移完，第三章用术语表译名。/);
+  // 最后进展是摘要之前的那个回合，不是摘要回合本身。
+  assert.match(brief, /最后一个正常结束回合的助手回复[^\n]*\n\n第二章已改完/);
+  // 摘要提示不算用户指令。
+  assert.deepEqual(entriesAt(result.instructions.file).map(({ text }) => text), ['第三章用术语表里的译名']);
+
+  // 写不出来：到时限后这一回合的后续步骤被拒，交接照常进行并在交接单里注明。
+  const b = h.agent('session-B');
+  b.followup = () => { b.status = 'running'; };
+  const late = await h.request({ sessionId: 'session-B' }, { summaryMinutes: 0.0005, summaryOptions: { pollMs: 5, graceMs: 30 } });
+  assert.deepEqual([late.status, late.steps.summary], ['handed_over', 'timeout']);
+  assert.match(readFileSync(late.briefPath, 'utf8'), /旧会话没有写出交接摘要（timeout）/);
+  assert.equal(summarizing.get('session-B').expired, true, 'kept until the turn ends so its remaining steps and tools stay blocked');
+  assert.equal(summaryStepRejected('session-B'), true);
+  summarizing.delete('session-B');
+  // 步数闸门：最多放行 SUMMARY_MAX_STEPS 步。
+  summarizing.set('session-Z', { deadline: Date.now() + 60_000, steps: 0 });
+  const verdicts = Array.from({ length: SUMMARY_MAX_STEPS + 1 }, () => summaryStepRejected('session-Z'));
+  assert.deepEqual(verdicts, [...Array(SUMMARY_MAX_STEPS).fill(false), true]);
+  summarizing.delete('session-Z');
+  // 摘要回合之后会话又开始了新回合（例如用户发了话）：不交接，这里暂停的目标恢复。
+  const e = h.agent('session-E');
+  h.goalsByAgent.set(e, { id: 'GE', revision: 1, phase: 'active', objective: '另一个目标', roundsStarted: 0, maxGoalRounds: 5 });
+  e.followup = (message) => {
+    e.session.log.push({ type: 'user/message', data: { id: message.id, content: message.content } }, { type: 'turn/end', data: { reason: { kind: 'completed' } } });
+    e.status = 'running';
+  };
+  const busy = await h.request({ sessionId: 'session-E' }, { summaryMinutes: 1, summaryOptions: { pollMs: 5 } });
+  assert.deepEqual([busy.status, busy.reason, busy.steps.summary, busy.steps.predecessorGoal, h.goalsByAgent.get(e).phase, h.aliases.successor('session-E')],
+    ['refused', 'turn_running', 'empty:completed', 'resumed', 'active', undefined]);
+  e.status = 'idle';
+  summarizing.delete('session-E');
+  // 关掉（summaryMinutes 0）或宿主没有 followup：不写摘要，结果里不记这一步或记 unavailable。
+  const c = h.agent('session-C');
+  assert.equal((await h.request({ sessionId: c.id })).steps.summary, undefined);
+  assert.equal((await h.request({ sessionId: h.agent('session-D').id }, { summaryMinutes: 1 })).steps.summary, 'unavailable');
+});
+
+test('recent instructions come from the whole chain, and archives written by older versions drop hand-over briefs and restart boilerplate', async (t) => {
+  const h = host(t);
+  const a = h.agent('session-A');
+  a.session.log.push(userEvent('只用 Windows 原生工具', 1), userEvent('报告写成中文', 2));
+  const first = await h.request({ sessionId: a.id });
+  const b = h.agents.get(first.to);
+  // 继任会话里用户没打过字：只有交接单（宿主记 rpcId handover-…）和续跑插件的重启话术。
+  const delivered = userEvent('[codex-conductor 交接] 本会话接手……', 3);
+  delivered.data.source.rpcId = 'handover-1';
+  b.session.log.push(delivered, userEvent('继续。宿主在你上一轮运行期间重启了; 从中断处继续', 4));
+  // 模拟旧版本写进档案的噪声。
+  const file = first.instructions.file;
+  writeFileSync(file, JSON.stringify([...entriesAt(file), { text: '[codex-conductor 交接] 旧交接单', at: new Date(3).toISOString() },
+    { text: '继续。宿主在你上一轮运行期间重启了; 旧话术', at: new Date(4).toISOString() }]));
+  h.aliases.annotate(first.to, { instructions: { root: 'session-A', count: 4 } });
+  const second = await h.request({ sessionId: b.id });
+  assert.deepEqual(entriesAt(file).map(({ text }) => text), ['只用 Windows 原生工具', '报告写成中文']);
+  const brief = readFileSync(second.briefPath, 'utf8');
+  assert.match(brief, /## 最近的用户指令（本会话链里人工输入的消息，最近的在前）\n[^\n]*\n- [^\n]*报告写成中文\n- [^\n]*只用 Windows 原生工具/);
+  assert.doesNotMatch(brief, /（没有找到）/);
+});
+
+test('when the last turn was cut short its final assistant words are listed besides the last completed turn', async () => {
+  const { sessionContext, buildBrief } = await import('./handover.mjs');
+  const log = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'assistant/message', time: 1, data: { turn: 1, message: { content: [{ type: 'text', text: '上一轮的小结' }] } } },
+    { type: 'turn/end', time: 2, data: { turn: 1, reason: { kind: 'completed' } } },
+    { type: 'turn/start', data: { turn: 2 } },
+    { type: 'assistant/message', time: 3, data: { turn: 2, message: { content: [{ type: 'text', text: '已派出 746 单，正在等核验' }] } } },
+    { type: 'assistant/message', time: 4, data: { turn: 2, message: { content: [{ type: 'reasoning', text: '不可见' }] } } },
+    { type: 'turn/end', time: 5, data: { turn: 2, reason: { kind: 'blocked' } } },
+  ];
+  const context = sessionContext(log);
+  assert.deepEqual([context.latest.text, context.progress.text, context.lastTurn.reason], ['已派出 746 单，正在等核验', '上一轮的小结', 'blocked']);
+  const brief = buildBrief({ from: 'session-A', to: 'session-B', at: '2026-11-25T07:02:27.000Z', cwd: '/w', since: 0, goal: undefined, jobs: [],
+    pending: { unreviewed: [], needsChanges: [] }, context });
+  assert.match(brief, /最后一个回合没有正常结束，它最后的助手文字（[^）]*，前 1500 字符）：\n\n已派出 746 单，正在等核验\n[\s\S]*最后一个正常结束回合的助手回复[^\n]*\n\n上一轮的小结/);
+  // 正常结束的最后一回合不重复列。
+  assert.equal(sessionContext(log.slice(0, 3)).latest, undefined);
+});
+
+test('while the old session writes its summary every tool is refused, the retired-session notice is skipped and extra steps end the turn', async (t) => {
+  const { summarizing, SUMMARY_MAX_STEPS } = await import('./handover.mjs');
+  const appData = dir(t);
+  mkdirSync(path.join(appData, 'dsh-codex-conductor'));
+  const { apply } = await import('./index.mjs');
+  const handlers = {};
+  const previous = process.env.LOCALAPPDATA;
+  try {
+    process.env.LOCALAPPDATA = appData;
+    apply({ tools: { register() {}, guard() {} }, on(name, handler) { (handlers[name] ??= []).push(handler); } },
+      { workspaces: ['*'], autoVerify: 'off' }, async () => ({ status: 'completed', paths: [] }));
+  } finally {
+    if (previous === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previous;
+  }
+  summarizing.set('session-S', { deadline: Date.now() + 60_000, steps: 0 });
+  t.after(() => summarizing.delete('session-S'));
+  const agent = { id: 'session-S', status: 'running', session: { header: { cwd: '/w' }, log: [] } };
+  const [execute] = handlers['tools/execute'];
+  const refused = await execute({ name: 'pwsh', arguments: { command: 'dir' }, agent }, async () => ({ value: 'ran' }));
+  assert.equal(refused.isError, true);
+  assert.match(refused.error.message, /交接前的摘要回合，不调用任何工具/);
+  // 第一个 pre-step 处理器是步数闸门：前 SUMMARY_MAX_STEPS 步照常，之后结束回合。
+  const [gate] = handlers['agent/pre-step'];
+  const kinds = [];
+  for (let n = 1; n <= SUMMARY_MAX_STEPS + 1; n++) kinds.push((await gate({ agent, step: n, messages: [] }, async () => ({ kind: 'enter', messages: [] }))).kind);
+  assert.deepEqual(kinds, [...Array(SUMMARY_MAX_STEPS).fill('enter'), 'reject']);
+  // 其他会话不受影响。
+  const other = { ...agent, id: 'session-O' };
+  assert.equal((await execute({ name: 'pwsh', arguments: {}, agent: other }, async () => ({ value: 'ran' }))).value, 'ran');
 });

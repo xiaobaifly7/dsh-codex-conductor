@@ -6354,9 +6354,11 @@ test('a long session gets one hand-over suggestion per turn on codex_run and cod
 
 test('auto hand-over settings default to confirm, warn and default invalid fields one by one and list unknown sub-keys', async () => {
   const defaults = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true,
-    withRunningJobs: true, maxChainDepth: 6, minHoursBetween: 6 };
+    withRunningJobs: true, maxChainDepth: 6, minHoursBetween: 6, quietMinutes: 30, summaryMinutes: 10 };
   const cases = [
     { value: undefined, expected: defaults, warn: null },
+    { value: { quietMinutes: 0, summaryMinutes: 2.5 }, expected: { ...defaults, quietMinutes: 0, summaryMinutes: 2.5 }, warn: null },
+    ...[-1, '10'].map((value) => ({ value: { summaryMinutes: value }, expected: defaults, warn: 'autoHandover.summaryMinutes' })),
     { value: { mode: 'auto', cooldownHours: 0.5, startupDelayMinutes: 0, disableAutoContinue: false }, warn: null,
       expected: { ...defaults, mode: 'auto', cooldownHours: 0.5, startupDelayMinutes: 0, disableAutoContinue: false } },
     ...[null, 'auto', []].map((value) => ({ value, expected: defaults, warn: 'autoHandover' })),

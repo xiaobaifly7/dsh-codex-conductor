@@ -33,7 +33,7 @@ const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, impo
 const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
   flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS,
   HISTORICAL_GAP_KINDS, historicalCriteria } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath, summarizing, summaryStepRejected } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -4703,12 +4703,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 会话回到空闲时按 autoHandover 判定是否提醒、询问或自动交接。
   ctx.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle') return;
+    // 超时后仍在跑的交接摘要回合结束了：放开这个会话的工具。
+    if (summarizing.get(agent?.id)?.expired) summarizing.delete(agent.id);
     try { void autoHandover.observe(agent, history.observe(agent)).catch(() => {}); } catch {}
   });
   // 一跑几个小时不结束的回合等不到空闲：到了该自动交接的时候，在下一个模型步骤之前结束回合（宿主记为 blocked），
   // 会话转为空闲后由上面那个处理函数交接。带着新消息的步骤不拦：宿主拒绝时会丢掉这一步认领的消息。
   ctx.on('agent/pre-step', async (step, next) => {
     try {
+      // 交接摘要回合：最多放行几步，过了时限就在下一步之前结束。
+      if (summaryStepRejected(step.agent?.id)) {
+        ctx.logger?.info?.(`[codex-conductor] 会话 ${step.agent.id} 的交接摘要回合到了步数或时限，已在第 ${step.step} 步之前结束。`);
+        return { kind: 'reject' };
+      }
       if (!step.messages?.length && autoHandover.due(step.agent, history.observe(step.agent))) {
         ctx.logger?.info?.(`[codex-conductor] 会话 ${step.agent.id} 的回合一直没有结束，已在第 ${step.step} 步之前结束它，转为空闲后自动交接。`);
         return { kind: 'reject' };
@@ -4733,7 +4740,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.on('agent/turn-stopping', ({ agent, turn }) => {
     try { history.observe(agent); } catch {}
     try {
-      if (!inWorkspace(agent?.session?.header?.cwd, cfg.roots) || liveBackground(undefined, { agent })) return;
+      if (summarizing.has(agent?.id) || !inWorkspace(agent?.session?.header?.cwd, cfg.roots) || liveBackground(undefined, { agent })) return;
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
       const { text, tools } = turnSummary(agent.session.log ?? [], turn);
@@ -4790,6 +4797,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   // tools/execute 在同步 guard 之后；所有受限调用执行前重查，未恢复的登记最多等 3 秒。
   ctx.on('tools/execute', async (exec, next) => {
+    // 交接摘要回合只写文字：拒绝所有工具，免得旧会话在交接途中又去读写或派活。
+    if (summarizing.has(exec.agent?.id)) {
+      const message = `${exec.name}: 这是交接前的摘要回合，不调用任何工具。请直接用文字写交接摘要，写完结束本回合。`;
+      return { isError: true, error: { message }, content: [{ type: 'text', text: `Error: ${message}` }] };
+    }
     // 规划端用 update_goal(action=complete) 完成会话目标；与新派活同样的收尾条件下拒绝。用户在界面上完成目标不经过这里。
     // 已交接出去的会话只能读，不能再派活、验收或取消，避免两个会话同时处理同一批任务。
     if (['codex_run', 'codex_continue', 'codex_verify', 'codex_review', 'codex_cancel', 'gemini_write'].includes(exec.name)) {
@@ -5011,6 +5023,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       // 交接单里“最近的用户指令”排除重启续接的固定话术；有 session_read 工具时写上回看旧会话的用法。
       autoMessage: cfg.autoResume.message, sessionRead: () => Boolean(ctx.tools?.get?.('session_read')),
       workspaces, onResult: (result) => autoHandover.settled(result), withRunningJobs: cfg.autoHandover.withRunningJobs,
+      summaryMinutes: cfg.autoHandover.summaryMinutes,
       // 绑着 LoopX 线程的会话：交接时把绑定挪给继任会话。每次交接都先查绑定；没装 loopx 时调用失败，交接照常。
       loopx: (args, cwd) => new Promise((resolve, reject) => {
         execFile(process.env.LOOPX_BIN || 'loopx', ['--registry', '.loopx/registry.json', '--format', 'json', ...args],
