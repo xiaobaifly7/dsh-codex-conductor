@@ -203,10 +203,100 @@ export function sessionContext(log, { autoMessage, now = Date.now, deadlineMs = 
   return { instructions, lastTurn, progress, ...(latest ? { latest } : {}) };
 }
 
+// 保留小写 UUID 的旧路径，其他 ID 用独立的文件名空间，避免 Windows 折叠大小写。
+const fileId = (id) => (/^(?:session-)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id) ? id : `id-${hash(id)}`);
+
 export function instructionArchivePath(directory, root) {
-  // 保留小写 UUID 的旧路径，其他 ID 用独立的文件名空间，避免 Windows 折叠大小写。
-  const id = /^(?:session-)?[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(root) ? root : `id-${hash(root)}`;
-  return path.resolve(directory, 'handovers', `instructions-${id}.json`);
+  return path.resolve(directory, 'handovers', `instructions-${fileId(root)}.json`);
+}
+
+export function transcriptPath(directory, sessionId) {
+  return path.resolve(directory, 'handovers', `transcript-${fileId(sessionId)}.md`);
+}
+
+// 旧会话原文：交接时把会话的对话按时间导出成纯文本，继任会话缺细节时用 grep / read 回查，不靠摘要记忆。
+// 收用户原话、助手回复、插件代发的消息、交接单、任务通知、用户的审批操作、工具调用和结果的开头；
+// 不收宿主每步注入的技能、记忆召回、规则提示等上下文：那些不是对话，却占原日志的九成。
+const TRANSCRIPT_TOOL_CLIP = 300;
+// 向用户提问的问题和用户的回答保留全文。
+const ASK_TOOL = /ask_user_question/;
+export function renderTranscript(log, { sessionId, title, cwd, at }) {
+  const events = Array.isArray(log) ? log : [];
+  const asks = new Set();
+  const names = new Map();
+  const counts = { user: 0, assistant: 0, tools: 0 };
+  const entries = [];
+  let first, last;
+  const line = (text, full) => (full ? text : clip(text.replace(/\s+/g, ' '), TRANSCRIPT_TOOL_CLIP));
+  for (const event of events) {
+    const data = event?.data ?? {};
+    let entry;
+    if (event?.type === 'user/message') {
+      const source = data.source ?? {};
+      const text = textOf(data.content).trim();
+      const label = !text ? undefined
+        : source.kind === 'user' ? (String(source.rpcId ?? '').startsWith('handover-') ? '交接单（插件投递）'
+          : source.via ? `插件代发（${source.via}）` : MACHINE_USER_TEXT.test(text) ? '自动消息' : '用户')
+        : source.kind === 'tool-jobs' ? '任务通知' : source.kind === 'user-approval' ? '用户操作'
+        : String(source.kind ?? '').includes('auto-continue') ? '自动续跑' : undefined;
+      if (!label) continue;
+      if (label === '用户') counts.user++;
+      entry = `### ${timeOf(event)} ${label}\n\n${text}`;
+    } else if (event?.type === 'assistant/message') {
+      const text = textOf(data.message?.content).trim();
+      if (!text) continue;
+      counts.assistant++;
+      entry = `### ${timeOf(event)} 助手（回合 ${data.turn ?? '?'}）\n\n${text}`;
+    } else if (event?.type === 'tool/call') {
+      const args = typeof data.arguments === 'string' ? data.arguments : JSON.stringify(data.arguments ?? {});
+      const ask = ASK_TOOL.test(`${data.name} ${args}`);
+      names.set(data.callId, data.name);
+      if (ask) asks.add(data.callId);
+      counts.tools++;
+      entry = `- ${timeOf(event)} 调用 ${data.name}：${line(args, ask)}`;
+    } else if (event?.type === 'tool/result') {
+      const message = data.message ?? {};
+      entry = `- ${timeOf(event)} 结果 ${names.get(message.toolCallId) ?? '?'}${message.isError ? '（出错）' : ''}：` +
+        line(textOf(message.content), asks.has(message.toolCallId));
+    } else continue;
+    first ??= timeOf(event);
+    last = timeOf(event);
+    entries.push(entry);
+  }
+  const text = [`# 会话原文：${sessionId}`, '',
+    `- 标题：${title || '（无）'}`, `- 工作目录：${cwd ?? '（未知）'}`,
+    `- 导出时间：${at}；时间范围 ${first ?? '无'} 至 ${last ?? '无'}；用户消息 ${counts.user} 条，助手回复 ${counts.assistant} 条，工具调用 ${counts.tools} 次。`,
+    `- 按时间顺序。工具调用的参数和结果只留开头 ${TRANSCRIPT_TOOL_CLIP} 字符（向用户提问的问题和回答保留全文）；宿主注入的技能、记忆召回、规则提示等上下文不在其中。`,
+    '', ...entries.flatMap((entry) => [entry, ''])].join('\n');
+  return { text, ...counts, first: first ?? null, last: last ?? null };
+}
+
+// 交接出去的会话各导出一份原文；更早的前任没有原文的（0.9.202 之前交接的），从宿主的会话记录补一次。
+// shortcut: 前任的原文只在它交接时导出一次；用户之后再在已交接的旧会话里说话，那部分不会补进原文，需要时改成按日志长度重导。
+async function writeTranscripts({ directory, aliases, from, agentA, readSession, at }) {
+  const write = (sessionId, log, title, cwd) => {
+    const file = transcriptPath(directory, sessionId);
+    const { text, ...stats } = renderTranscript(log, { sessionId, title, cwd, at });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    writeTextAtomic(file, text);
+    return { sessionId, file, ...stats };
+  };
+  const list = [];
+  for (const id of aliases.predecessors(from).reverse()) {
+    const file = transcriptPath(directory, id);
+    if (fs.existsSync(file)) { list.push({ sessionId: id, file }); continue; }
+    try {
+      const events = (await readSession(id))?.events;
+      if (!Array.isArray(events)) throw new Error('session log unavailable');
+      const header = events.find((event) => event?.type === 'session');
+      const title = events.findLast((event) => event?.type === 'session/title')?.data?.title;
+      list.push(write(id, events, title, header?.cwd));
+    } catch (error) { list.push({ sessionId: id, error: String(error?.message ?? error) }); }
+  }
+  if (!Array.isArray(agentA.session?.log)) throw new Error(`session log unavailable: ${agentA.id}`);
+  const events = agentA.session.log.length;
+  list.push({ ...write(from, agentA.session.log.slice(0, events), titleOf(agentA), agentA.session.header?.cwd), events });
+  return list;
 }
 
 function readInstructions(file) {
@@ -262,7 +352,7 @@ const truncated = (total, shown) => (shown < total ? [`（已截断，共 ${tota
 
 // 交接单除“旧会话写的交接摘要”一节外，都用插件和 runner 已有的记录、旧会话日志机械生成，不经模型。
 export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note, origin = 'file', requestedAt = at, autoContinue,
-  successorGoal, context, instructionArchive, instructionError, sessionRead = false, summary, limit = BRIEF_LIMIT }) {
+  successorGoal, context, instructionArchive, instructionError, transcripts, transcriptError, sessionRead = false, summary, limit = BRIEF_LIMIT }) {
   const running = jobs.filter((j) => (j.execution_status ?? j.status) === 'running');
   const open = (j) => (j.execution_status ?? j.status) === 'running' || pending.unreviewed.includes(j.job_id) || pending.needsChanges.includes(j.job_id);
   // 表里只放任务号（job_id）：续接、核验、验收都靠它。线程号只列给需要带 resume 返工的任务，免得被当成任务号。
@@ -316,8 +406,17 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
           `${Number.isFinite(j.started_at) ? `（已运行 ${Math.max(0, Math.round((Date.parse(at) / 1000 - j.started_at) / 60))} 分钟）` : ''}`)]
         : ['- 仍在运行：无'])] },
     { priority: 5.5, title: '任务', lines: [taskSection()] },
-    { priority: 6, title: '如何回看旧会话', lines: ['## 如何回看旧会话', `- 旧会话 ID：${from}（已冻结，只能查看）`,
-      ...(sessionRead ? [`- 用 session_read 回查：session_read(sessionId="${from}", mode="summary") 看结构化摘要；mode="search" 加 query 搜关键词；mode="tail" 看最后若干事件。`] : []),
+    // 原文是交接后不丢上下文的底：这一节很短，与“下一步”同为 1，永不省略。
+    { priority: 1, title: '旧会话原文', lines: ['## 旧会话原文（完整对话，随时回查）',
+      '交接单和摘要只是概括，具体内容以原文为准。' + (transcripts?.length
+        ? '本会话链上每个旧会话的完整对话都导出成了文件（用户原话、助手回复、插件代发的消息、任务通知、工具调用和结果的开头），最近的在前：'
+        : `旧会话的原文没能导出（${transcriptError ?? '未知原因'}），只能用下面的工具回查。`),
+      ...[...transcripts ?? []].reverse().map((t) => (t.error ? `- ${t.sessionId}：原文没能导出（${t.error}）` + (sessionRead ? '，用 session_read 查。' : '。')
+        : `- ${t.sessionId}${t.first ? `（${t.first} 至 ${t.last}，用户消息 ${t.user} 条，助手回复 ${t.assistant} 条）` : ''}：${t.file}`)),
+      '用户提到以前说过、做过、定过的事，或者你要做的决定以前可能讨论过时：先用 grep（path 填上面的文件）搜关键词，再用 read 读命中处附近的原文核对，然后再回答或行动。' +
+        '不要凭印象作答，也不要让用户重复已经说过的话。',
+      `- 旧会话 ID：${from}（已冻结，只能查看）`,
+      ...(sessionRead ? [`- 也可以用 session_read 回查：session_read(sessionId="${from}", mode="search", query="关键词")；mode="summary" 看结构化摘要，mode="tail" 看最后若干事件。`] : []),
       '- 历史任务报告：codex_summary（session_id="current"）看总览，codex_output（job_id=任务号）看单个任务的报告。'] },
     { priority: 7, title: '接手须知', lines: ['## 接手须知',
       '- 先用 get_goal、codex_jobs（session_id="current"）核对现状；',
@@ -348,11 +447,13 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
 }
 
 // loopx：原会话由 LoopX 续跑、绑定已挪到本会话时传入。消息以 /loopx 开头，宿主把它当作 loopx 技能调用，LoopX 由此在本会话接着续跑。
-const handoverMessage = (from, briefPath, brief, loopx, keptGoal = false) =>
+const handoverMessage = (from, briefPath, brief, loopx, keptGoal = false, transcripts = false) =>
   (loopx ? `/loopx 这是会话交接后的续接，不是新任务：原会话 ${from} 的 LoopX 绑定（goal ${loopx.goalId}，agent ${loopx.agentId}）已挪到本会话。` +
     '不要新建 LoopX 目标，也不要创建原生目标；先用 resolve-agent-thread 核对本会话的绑定。\n' : '') +
   `[codex-conductor 交接] 本会话接手会话 ${from} 的工作；原会话的目标已暂停，` +
   '它不能再派活或验收。下面是插件按记录生成的交接单' + (briefPath ? `（文件：${briefPath}）` : '') + '。\n' +
+  (transcripts ? '交接单只是概括，旧会话的完整对话原文见其中“旧会话原文”一节：用户提到以前的事，或你拿不准以前怎么定的，先查原文再回答，' +
+    '不要凭印象，也不要让用户重复已经说过的话。\n' : '') +
   '先调 codex_summary（session_id="current"）和 codex_jobs 看详情：本会话现在可以查看、验收、续接、核验和取消原会话的任务。' +
   '工具的 job_id 参数只填交接单里的任务号；线程号只用于 codex_run 的 resume。' +
   '收尾规则照旧：先给列出的待收尾任务做 codex_review 或返工，再派新任务。' +
@@ -395,7 +496,7 @@ export async function moveLoopxBinding(loopx, cwd, from, to) {
 export const summarizing = new Map();
 export const SUMMARY_MAX_STEPS = 3;
 const SUMMARY_TAG = '[codex-conductor 交接摘要]';
-const summaryPrompt = () => `${SUMMARY_TAG} 本会话即将交接给一个新会话，新会话看不到这里的对话，只能看到你现在写的摘要和插件按记录生成的交接单。` +
+const summaryPrompt = () => `${SUMMARY_TAG} 本会话即将交接给一个新会话。新会话开头只看到你现在写的摘要和插件按记录生成的交接单；这里的对话原文会导出成文件，但它要自己去查，摘要里没写的它多半不知道。` +
   '请只用文字写一份交接摘要，不要调用任何工具（本回合的工具调用都会被拒绝），写完就结束本回合。按下面五节写，每节只写确有的内容，总长不超过 3000 字：\n' +
   '1. 用户要什么：总目标，以及对话里提出、仍然有效的要求、偏好和禁止事项（尽量保留用户原话）。\n' +
   '2. 已经做成的事和关键决定（附理由）。\n' +
@@ -656,7 +757,7 @@ export async function repairLinks({ registry, controller, aliases, directory, lo
 }
 
 // 交接后自检：每项 ok / failed:<原因> / skipped:<原因>。只列不一致的项名，不列可能含敏感内容的值。
-export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, pending, sessionJobs, aliases, from, to, registry, instructionArchive }) {
+export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, pending, sessionJobs, aliases, from, to, registry, instructionArchive, transcripts }) {
   const checks = {};
   const hasGoal = goal && goal.phase !== 'complete' && typeof goal.objective === 'string';
   if (steps.successorGoal === 'loopx') checks.goal = 'skipped:loopx';
@@ -688,6 +789,24 @@ export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, 
     try {
       checks.instructions = readInstructions(instructionArchive.file).length >= instructionArchive.count ? 'ok' : 'failed:count_below_brief';
     } catch (error) { checks.instructions = `failed:${error?.message ?? error}`; }
+  }
+  // 原文不缺：导出时旧会话里的每条用户原话和助手回复都能在原文文件里找到。
+  checks.transcripts = steps.transcripts ?? 'skipped';
+  const own = transcripts?.find((t) => t.sessionId === from && t.file);
+  if (own) {
+    try {
+      const text = fs.readFileSync(own.file, 'utf8');
+      const said = (agentA.session?.log ?? []).slice(0, own.events).map((event) => (event?.type === 'assistant/message'
+        ? textOf(event.data?.message?.content) : humanInstruction(event)?.text ?? '').trim()).filter(Boolean);
+      // 原文按日志顺序写，顺着往后找：长会话（上万条、数 MB）也只扫一遍。
+      let at = 0, lost = 0;
+      for (const line of said) {
+        const found = text.indexOf(line, at);
+        if (found < 0) lost++;
+        else at = found + line.length;
+      }
+      checks.transcripts = lost ? `failed:missing_${lost}_of_${said.length}` : steps.transcripts === 'written' ? 'ok' : steps.transcripts;
+    } catch (error) { checks.transcripts = `failed:${error?.message ?? error}`; }
   }
   const frozen = [];
   if (hasGoal && goals?.get(agentA)?.phase !== 'paused') frozen.push('goal_not_paused');
@@ -898,11 +1017,19 @@ export async function handOver(ctx, deps, request) {
   } catch (error) { result.steps.instructions = `failed:${error?.message ?? error}`; }
   // 最近的用户指令取整条会话链：用户没在上一个会话里打字时，更早会话里的要求照样列出。
   if (chain) context.instructions = recentInstructions(chain, autoMessage);
+  try {
+    const query = ctx.get('sessionQuery');
+    result.transcripts = await writeTranscripts({ directory, aliases, from, agentA, at,
+      readSession: async (id) => { if (typeof query?.readSession !== 'function') throw new Error('sessionQuery unavailable'); return query.readSession(id); } });
+    const missing = result.transcripts.filter((t) => t.error).length;
+    result.steps.transcripts = missing ? `partial:${missing}` : 'written';
+  } catch (error) { result.steps.transcripts = `failed:${error?.message ?? error}`; }
   const brief = buildBrief({ from, to, at, cwd: header.cwd, goal, jobs, pending, since, note, origin, requestedAt,
     autoContinue: result.steps.autoContinue,
     successorGoal: existingGoal && existingGoal.phase !== 'complete' ? 'exists' : keptGoal ? 'kept' : undefined,
     context, summary: summary.status === 'off' ? undefined : summary,
     instructionArchive: result.instructions, instructionError: result.instructions ? undefined : result.steps.instructions.slice(7),
+    transcripts: result.transcripts, transcriptError: result.transcripts ? undefined : result.steps.transcripts.slice(7),
     sessionRead: sessionRead() });
   try {
     const dir = path.join(directory, 'handovers');
@@ -910,7 +1037,7 @@ export async function handOver(ctx, deps, request) {
     result.briefPath = path.join(dir, `${at.replace(/[:.]/g, '-')}-${from}-to-${to}.md`);
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
-  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal), deliverWaitMs));
+  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs));
   if (followed) result.steps.successorGoal = 'loopx';
   else if (keptGoal) result.steps.successorGoal = `kept_${goal.phase}`;
   else if (goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
@@ -942,7 +1069,7 @@ export async function handOver(ctx, deps, request) {
     if (back.status === 'reverted') return result;
   }
   result.checks = await checkHandover({ goals, agentA, agentB, goal, steps: result.steps, jobs, pending, sessionJobs,
-    aliases, from, to, registry: workspaces(), instructionArchive: result.instructions });
+    aliases, from, to, registry: workspaces(), instructionArchive: result.instructions, transcripts: result.transcripts });
   if (Object.values(result.checks).some((value) => value.startsWith('failed'))) result.status = 'handed_over_with_issues';
   return result;
 }

@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.202` 交接时导出旧会话的完整对话原文（用户原话、助手回复全文，工具调用和结果留开头），交接单新增永不省略的“旧会话原文”一节，列出整条会话链的原文文件，要求继任会话先查原文再回答以前的事；继任会话可读自己链上前任的原文；交接后检查原文是否缺用户原话或助手回复。0.9.202 之前交接的前任在下一次交接时补写原文。
+
 `0.9.201` 老对话也能换到 worktree：以前在原目录写过东西的对话永远留在原目录，几个老对话同时改同一个仓库时彼此不隔离。现在原目录提交干净（没有未提交的改动、没有未纳入 git 的文件）、且它在原目录没有写入单在跑时，它的下一张写入单自动换到 worktree；那时它写过的都在 HEAD 里，worktree 看得到。留在原目录的对话（含因未纳入的文件过多等原因没开成的）写入时最多每 5 分钟重新判断一次。
 
 `0.9.200` 用户叫停的会话不再被后台任务完成通知叫醒：用户停止后、再次发话（或恢复、新建目标，或操作员经本插件请求续接）之前，只带任务通知的步骤不调用模型，通知先存着，用户下次发话时一并交给模型。依据：11-20 到 11-25 用户停止后有 12 次是被任务通知叫醒接着干的。
@@ -299,6 +301,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.202` Each hand-over exports the old session's full conversation (user messages and assistant replies in full, tool calls and results cut short); the brief gains a never-dropped section listing the transcripts of the whole chain and telling the successor to check them before answering about earlier work; the successor may read its chain's transcripts; the post hand-over checks confirm no user message or assistant reply is missing. Predecessors handed over before 0.9.202 get their transcript at the next hand-over.
 
 `0.9.201` Older conversations can move into a worktree too: a conversation that had written in the main checkout used to stay there for good, so several such conversations on one repository were not isolated. Now, once the main checkout is committed clean (no uncommitted changes, no untracked files) and the conversation has no write job running there, its next write job moves into a worktree; everything it wrote is in HEAD by then. Conversations left in the main checkout, including those that could not open one for another reason such as too many untracked files, are re-evaluated at most every 5 minutes when they write.
 

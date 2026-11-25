@@ -106,6 +106,12 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.202：交接后旧会话的原文随时可查
+
+交接单和旧会话写的摘要都是概括，难免漏掉细节。现在每次交接，插件把旧会话的完整对话导出成纯文本（状态目录 `handovers/transcript-<会话号>.md`）：用户原话、助手回复、插件代发的消息、交接单和任务通知保留全文，工具调用的参数和结果留开头 300 字符（向用户提问的问题和用户的回答保留全文），宿主每步注入的技能、记忆召回、规则提示不收。0.9.202 之前交接的前任没有原文，下一次交接时从宿主的会话记录补写。
+
+交接单新增“旧会话原文”一节，和“下一步”一样永不省略：列出整条会话链上每个旧会话的原文文件（最近的在前），并要求继任会话遇到以前说过、做过、定过的事，先用 grep / read 查原文核对，不凭印象回答，也不让用户重复说过的话；交接的首条消息也带这句提醒。规划端只读产物（`plannerReads: products`）时，继任会话可以读自己链上前任的原文，别的会话读不了。交接后的检查新增 `transcripts`：导出时旧会话里的每条用户原话和助手回复，都要能在原文里按顺序找到，缺了就记为 `handed_over_with_issues`。离线用 6 个真实长会话实测（最大的 8.6 万个事件，原文约 7 MB）：导出不超过 0.3 秒，缺失 0 条。
+
 ### 0.9.200：用户叫停的会话不被任务通知叫醒
 
 用户点了停止之后，名下后台任务完成的通知会让宿主在会话空闲时开新回合，会话就接着干了（11-20 到 11-25 有 12 次）。现在会话最后一次被用户停止、之后用户没再发话、没有恢复或新建目标、也没有操作员通过本插件请求续接时，只带任务完成通知（`tool-jobs`）的步骤不调用模型，宿主记为 `blocked`。这些通知先存着，用户下次发话时随那一步一起交给模型，任务结果不丢。宿主关闭（`aborted/disposed`）不算用户停止。
@@ -742,6 +748,12 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.202: The predecessor's full transcript stays readable after a hand-over
+
+The brief and the summary the old session writes are both condensed and can miss details. Each hand-over now exports the old session's whole conversation as plain text (`handovers/transcript-<session>.md` in the state directory): user messages, assistant replies, plugin-sent messages, briefs and job notices in full, tool call arguments and results cut to their first 300 characters (questions to the user and the user's answers in full), and none of the skills, memory recalls and rule notices the host injects at every step. A predecessor handed over before 0.9.202 has no transcript; the next hand-over writes it from the host's session record.
+
+The brief gains an "old sessions' transcripts" section that, like the next step, is never dropped: it lists the transcript of every session in the chain (newest first) and tells the successor to grep / read them before answering about anything said, done or decided earlier, instead of answering from memory or asking the user to repeat it; the first message repeats this. With `plannerReads: products` the successor may read the transcripts of its own chain and no other session can. The post hand-over checks gain `transcripts`: every user message and assistant reply of the old session at export time must be found, in order, in its transcript, otherwise the result is `handed_over_with_issues`. Offline on 6 real long sessions (the largest 86,000 events, about 7 MB of transcript): export under 0.3 s, nothing missing.
 
 ### 0.9.200: A session the user stopped is not woken by job notices
 
