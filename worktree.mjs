@@ -243,6 +243,14 @@ async function keepIgnored(entry) {
   return { moved: moves.map(item => item.rel) };
 }
 
+// 原目录有没有未提交的改动或未纳入 git 的文件；都没有时返回 undefined。
+export async function checkoutDirty(repo) {
+  const lines = entries(await git(repo, ['status', '--porcelain', '-z', '--untracked-files=normal'], { timeout: 600_000 }))
+    .filter(line => /^.. /.test(line));
+  const untracked = lines.filter(line => line.startsWith('?? ')).length;
+  return lines.length ? { modified: lines.length - untracked, untracked } : undefined;
+}
+
 export async function closeWorktree(entry) {
   const state = await worktreeStatus(entry);
   if (state.exists && (state.dirty || state.merging)) return { status: 'blocked', reason: 'worktree_dirty', ...state };

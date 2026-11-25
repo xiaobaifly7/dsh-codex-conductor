@@ -37,7 +37,7 @@ const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryT
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
-const { repoFor, within, relocate, relocateText, openWorktree, mergeWorktree, worktreeStatus, closeWorktree, pathKey } =
+const { repoFor, within, relocate, relocateText, openWorktree, mergeWorktree, worktreeStatus, closeWorktree, checkoutDirty, pathKey } =
   await import(new URL(`./worktree.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
@@ -4337,6 +4337,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 对话 worktree（worktree.repos）：每个对话每个仓库一条记录，交接出去的会话沿交接链继承。
   // status：open（在 worktree 里工作）、shared（留在原目录，reason 写原因）、closed（已收尾）。
   const worktreesFile = stateDirectory && path.join(stateDirectory, 'session-worktrees.json');
+  // 留在原目录的对话最多每 5 分钟重新判断一次能否换到 worktree（每次要跑一遍原目录的 git status）。
+  const SHARED_RECHECK_MS = 5 * 60_000;
   const readWorktrees = () => {
     try { const value = JSON.parse(readFileSync(worktreesFile, 'utf8')); return value && typeof value === 'object' ? value : {}; } catch { return {}; }
   };
@@ -4391,28 +4393,40 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (!repo) return undefined;
     let found = findWorktree(owner, repo);
     let line;
-    if (!found) {
+    // 留在原目录的对话，写入时隔一阵重新判断：条件满足了（原目录提交干净、未纳入的文件降下来）就换到 worktree（2026-11-26）。
+    const recheck = found?.entry.status === 'shared' && args.write === true &&
+      !(Date.now() - Date.parse(found.entry.at ?? 0) < SHARED_RECHECK_MS);
+    if (!found || recheck) {
       if (args.write !== true) return undefined;
       const key = worktreeKey(owner, repo);
       const jobs = await ownerJobs(owner, signal).catch(() => undefined);
-      // 已经在原目录里写过东西的对话留在原目录：换到 worktree 会看不到它之前写的东西。只读过的不算：
-      // 新对话常先派只读单看代码再动手，算进去就永远开不了 worktree（2026-11-26）。
-      const earlier = jobs?.some(job => job?.context?.write === true && [job.cwd, ...(job.scope_paths ?? [])]
-        .some(p => typeof p === 'string' && within(p, repo)));
+      if (!jobs && !found) return { line: `本单在原目录 ${repo} 执行：查不到本对话的派单记录，本单先在原目录执行。` };
+      const touches = (job) => [job.cwd, ...(job.scope_paths ?? [])].some(p => typeof p === 'string' && within(p, repo));
+      // 只读过的不算：新对话常先派只读单看代码再动手（0.9.197）。
+      const earlier = jobs?.some(job => job?.context?.write === true && touches(job));
+      const busy = jobs?.some(job => job?.context?.write === true && job.status === 'running' && touches(job));
       let entry;
-      if (!jobs || earlier) {
-        entry = { status: 'shared', repo, reason: jobs ? '本对话之前已在原目录里派过单，继续在原目录工作' : '查不到本对话的派单记录，本单先在原目录执行' };
-        if (!jobs) return { line: `本单在原目录 ${repo} 执行：${entry.reason}。` };
-      } else {
-        const opened = await withRepoLock(repo, () => openWorktree({ repo, root: cfg.worktree.root, owner, maxUntracked: cfg.worktree.maxUntracked }))
-          .catch(error => ({ shared: `开 worktree 失败：${error.message}` }));
-        entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened };
+      if (!jobs) entry = found.entry;
+      else if (busy) entry = { status: 'shared', repo, reason: '本对话在原目录还有写入单在跑，它结束后的写入单再换到 worktree' };
+      else {
+        // 之前在原目录写过东西的对话，只有原目录提交干净时才换过去：那时它写的都在 HEAD 里，worktree 看得到。
+        const dirty = earlier ? await checkoutDirty(repo).catch(error => ({ error: error.message })) : undefined;
+        if (dirty) {
+          entry = { status: 'shared', repo, reason: dirty.error ? `查不了原目录状态（${dirty.error}），继续在原目录工作`
+            : `本对话之前在原目录写过东西，原目录还有 ${dirty.modified} 处未提交的改动、${dirty.untracked} 处未纳入 git 的文件；` +
+              '提交干净后，本对话下一张写入单自动换到 worktree' };
+        } else {
+          const opened = await withRepoLock(repo, () => openWorktree({ repo, root: cfg.worktree.root, owner, maxUntracked: cfg.worktree.maxUntracked }))
+            .catch(error => ({ shared: `开 worktree 失败：${error.message}` }));
+          entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened };
+        }
       }
+      const before = found?.entry;
       found = { key, entry: saveWorktree(key, entry) };
       line = entry.status === 'open'
-        ? `本对话从这一单起在独立的 git worktree 里工作：${entry.path}（分支 ${entry.branch}，基于 ${entry.base_branch}），原目录 ${repo} 不受影响；` +
+        ? `${before ? '原目录已满足条件，' : ''}本对话从这一单起在独立的 git worktree 里工作：${entry.path}（分支 ${entry.branch}，基于 ${entry.base_branch}），原目录 ${repo} 不受影响；` +
           `${entry.links.length} 个忽略的资料目录${entry.hardlinks ? `和 ${entry.hardlinks} 个忽略的文件` : ''}已链接共用。写入单成功后自动提交，本对话的单全部核验通过后自动合并回 ${entry.base_branch}。`
-        : `本对话在原目录 ${repo} 工作，不开 worktree：${entry.reason}。`;
+        : before?.reason === entry.reason ? undefined : `本对话在原目录 ${repo} 工作，不开 worktree：${entry.reason}。`;
     }
     const { entry } = found;
     if (entry.status !== 'open') return line ? { line } : undefined;

@@ -1112,9 +1112,28 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     // A conversation that already wrote in the main checkout stays there; a read-only first job opens nothing.
     const old = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: base,
       scope_paths: [path.join(root, 'src')], context: { owner: 'session-0b0b0b0b-1', write: true } }], total: 1 }) });
+    writeFileSync(path.join(root, 'src', 'a.txt'), 'edited in the main checkout\n');
     const stayed = await old.tools.codex_run.execute(input, as('session-0b0b0b0b-1'));
     assert.equal(option(old.start().argv, '--cwd'), root);
-    assert.match(JSON.stringify(stayed), /本对话在原目录/);
+    assert.match(JSON.stringify(stayed), /本对话在原目录.*1 处未提交的改动.*提交干净后/);
+    // Once the main checkout is committed clean, its next write (after the recheck interval) moves it into a worktree:
+    // everything it wrote before is in HEAD, so nothing is lost.
+    git(root, 'checkout', '--', 'src/a.txt');
+    const state = path.join(localAppData, 'dsh-codex-conductor', 'session-worktrees.json');
+    const saved = JSON.parse(readFileSync(state, 'utf8'));
+    for (const key of Object.keys(saved)) if (key.startsWith('session-0b0b0b0b')) saved[key].at = new Date(Date.now() - 6 * 60_000).toISOString();
+    writeFileSync(state, JSON.stringify(saved));
+    const again = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: base,
+      scope_paths: [path.join(root, 'src')], context: { owner: 'session-0b0b0b0b-1', write: true } }], total: 1 }) });
+    const moved = await again.tools.codex_run.execute(input, as('session-0b0b0b0b-1'));
+    assert.equal(option(again.start().argv, '--cwd'), path.join(base, 'conversation-worktrees', 'repo', '0b0b0b0b'));
+    assert.match(JSON.stringify(moved), /原目录已满足条件，本对话从这一单起在独立的 git worktree/);
+    // A conversation whose write job is still running in the main checkout waits for it before moving.
+    const busy = harness({ config, listed: () => ({ jobs: [{ job_id: 'RUN-1', status: 'running', cwd: root,
+      context: { owner: 'session-0e0e0e0e-1', write: true } }], total: 1 }) });
+    const waited = await busy.tools.codex_run.execute(input, as('session-0e0e0e0e-1'));
+    assert.equal(option(busy.start().argv, '--cwd'), root);
+    assert.match(JSON.stringify(waited), /还有写入单在跑/);
     const reader = harness({ config });
     await reader.tools.codex_run.execute({ ...input, write: false }, as('session-0c0c0c0c-1'));
     assert.equal(option(reader.start().argv, '--cwd'), root);

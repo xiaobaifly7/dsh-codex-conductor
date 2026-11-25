@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.201` 老对话也能换到 worktree：以前在原目录写过东西的对话永远留在原目录，几个老对话同时改同一个仓库时彼此不隔离。现在原目录提交干净（没有未提交的改动、没有未纳入 git 的文件）、且它在原目录没有写入单在跑时，它的下一张写入单自动换到 worktree；那时它写过的都在 HEAD 里，worktree 看得到。留在原目录的对话（含因未纳入的文件过多等原因没开成的）写入时最多每 5 分钟重新判断一次。
+
 `0.9.200` 用户叫停的会话不再被后台任务完成通知叫醒：用户停止后、再次发话（或恢复、新建目标，或操作员经本插件请求续接）之前，只带任务通知的步骤不调用模型，通知先存着，用户下次发话时一并交给模型。依据：11-20 到 11-25 用户停止后有 12 次是被任务通知叫醒接着干的。
 
 `0.9.199` 自动代答新增 `whenRisky`：默认 `wait` 照旧把高风险和 `[owner_only]` 提问留给用户；设为 `defer` 时，超时后对这几问选「跳过 / 暂不 / 保留」类选项（没有就不选），附说明「这一步不执行，记为待用户确认，继续做其他工作」，同批其余问题照常选推荐项。用户睡觉时会话不再卡在这类提问上，也不会替用户执行删除、花钱、对外发送、真实目标这类操作。
@@ -297,6 +299,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.201` Older conversations can move into a worktree too: a conversation that had written in the main checkout used to stay there for good, so several such conversations on one repository were not isolated. Now, once the main checkout is committed clean (no uncommitted changes, no untracked files) and the conversation has no write job running there, its next write job moves into a worktree; everything it wrote is in HEAD by then. Conversations left in the main checkout, including those that could not open one for another reason such as too many untracked files, are re-evaluated at most every 5 minutes when they write.
 
 `0.9.200` A session the user stopped is no longer woken by job completion notices: until the user writes again (or a goal is resumed or created, or an operator asks this plugin to resume), a step that only carries job notices does not call the model, and the notices reach the model with the user's next message. Basis: from 11-20 to 11-25, 12 user stops were followed by a turn woken by a job notice.
 
