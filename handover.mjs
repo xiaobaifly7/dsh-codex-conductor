@@ -413,8 +413,9 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
         : `旧会话的原文没能导出（${transcriptError ?? '未知原因'}），只能用下面的工具回查。`),
       ...[...transcripts ?? []].reverse().map((t) => (t.error ? `- ${t.sessionId}：原文没能导出（${t.error}）` + (sessionRead ? '，用 session_read 查。' : '。')
         : `- ${t.sessionId}${t.first ? `（${t.first} 至 ${t.last}，用户消息 ${t.user} 条，助手回复 ${t.assistant} 条）` : ''}：${t.file}`)),
-      '用户提到以前说过、做过、定过的事，或者你要做的决定以前可能讨论过时：先用 grep（path 填上面的文件）搜关键词，再用 read 读命中处附近的原文核对，然后再回答或行动。' +
-        '不要凭印象作答，也不要让用户重复已经说过的话。',
+      '用户提到以前说过、做过、定过的事，或者你要做的决定以前可能讨论过时：先用 grep 搜关键词，path 逐个填上面的文件' +
+        `（例如 grep(pattern="关键词", path="${[...transcripts ?? []].reverse().find((t) => t.file)?.file ?? '上面的文件'}")；整个 handovers 目录不能搜），` +
+        '再用 read 读命中处附近的原文核对，然后再回答或行动。不要凭印象作答，也不要让用户重复已经说过的话；这些文件你自己就能读，不必派任务去读。',
       `- 旧会话 ID：${from}（已冻结，只能查看）`,
       ...(sessionRead ? [`- 也可以用 session_read 回查：session_read(sessionId="${from}", mode="search", query="关键词")；mode="summary" 看结构化摘要，mode="tail" 看最后若干事件。`] : []),
       '- 历史任务报告：codex_summary（session_id="current"）看总览，codex_output（job_id=任务号）看单个任务的报告。'] },

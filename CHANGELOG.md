@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.203` 规划端搜或读整个交接目录时，拒绝说明列出本会话链能读的原文和指令档案，让它按文件重试；交接单写上回查原文的调用示例，并说明不必派任务去读。依据：11-26 实测一次回查因搜整个目录被拒，改派 4 单任务、用了 5 分钟。
+
 `0.9.202` 交接时导出旧会话的完整对话原文（用户原话、助手回复全文，工具调用和结果留开头），交接单新增永不省略的“旧会话原文”一节，列出整条会话链的原文文件，要求继任会话先查原文再回答以前的事；继任会话可读自己链上前任的原文；交接后检查原文是否缺用户原话或助手回复。0.9.202 之前交接的前任在下一次交接时补写原文。
 
 `0.9.201` 老对话也能换到 worktree：以前在原目录写过东西的对话永远留在原目录，几个老对话同时改同一个仓库时彼此不隔离。现在原目录提交干净（没有未提交的改动、没有未纳入 git 的文件）、且它在原目录没有写入单在跑时，它的下一张写入单自动换到 worktree；那时它写过的都在 HEAD 里，worktree 看得到。留在原目录的对话（含因未纳入的文件过多等原因没开成的）写入时最多每 5 分钟重新判断一次。
@@ -301,6 +303,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.203` A planner read or search of the whole hand-over folder is refused with the list of files its chain may read, so it retries on those; the brief gives a call example for transcript lookups and says no job is needed. Basis: in the 11-26 live test one lookup searched the whole folder, was refused, and took 4 jobs and 5 minutes.
 
 `0.9.202` Each hand-over exports the old session's full conversation (user messages and assistant replies in full, tool calls and results cut short); the brief gains a never-dropped section listing the transcripts of the whole chain and telling the successor to check them before answering about earlier work; the successor may read its chain's transcripts; the post hand-over checks confirm no user message or assistant reply is missing. Predecessors handed over before 0.9.202 get their transcript at the next hand-over.
 

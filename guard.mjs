@@ -1123,8 +1123,14 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     if (cfg.plannerReads === 'open') return undefined;
     if (targets) {
       // 交接链的用户指令档案和每个前任的原文。
-      const archives = [handoverArchive(owner) ?? []].flat().map(file => readPath(file)).filter(Boolean);
+      const given = [handoverArchive(owner) ?? []].flat().filter(Boolean);
+      const archives = given.map(file => readPath(file)).filter(Boolean);
       if (targets.every(file => archives.includes(file) || allowed(file, state, directories))) return undefined;
+      // 整个交接目录读不得（里面还有别的会话链的记录）；直接告诉它能读的那几个文件，免得它改派任务去读（11-26 实测一次回查派了 4 单、5 分钟）。
+      const folders = new Set(archives.map(file => file.slice(0, file.lastIndexOf('/'))));
+      if (targets.some(file => [...folders].some(folder => under(file, folder)))) {
+        return `[codex-conductor] 交接记录目录不能整体读或搜。本会话链的旧会话原文和用户指令档案只能按文件读：grep / read 的 path 逐个填下面的文件，直接重试即可。\n${given.join('\n')}`;
+      }
     }
     if (targets && state && !state.pending && now() - state.refreshed >= 25_000) {
       state.refreshed = now();

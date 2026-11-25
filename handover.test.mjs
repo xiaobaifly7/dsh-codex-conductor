@@ -286,6 +286,13 @@ test('case-variant chain roots get separate archives and successor read permissi
   // 前任的原文只有它自己链上的继任会话能读。
   assert.equal((await read(a.to, a.transcripts.at(-1).file)).value, 'read');
   assert.equal((await read(b.to, a.transcripts.at(-1).file)).isError, true);
+  // 整个交接目录搜不得；拒绝时列出本链能读的文件，别的链的不列。
+  const folder = await execute({ name: 'grep', arguments: { pattern: '指令', path: path.dirname(a.instructions.file) }, agent: h.agents.get(a.to) },
+    async () => ({ value: 'read' }));
+  assert.equal(folder.isError, true);
+  assert.match(folder.error.message, /交接记录目录不能整体读或搜/);
+  assert.ok(folder.error.message.includes(a.transcripts.at(-1).file) && folder.error.message.includes(a.instructions.file));
+  assert.ok(!folder.error.message.includes(b.transcripts.at(-1).file));
   assert.notEqual(a.instructions.file.toLowerCase(), b.instructions.file.toLowerCase());
   assert.deepEqual(entriesAt(a.instructions.file).map(({ text }) => text), ['大写链指令']);
   assert.deepEqual(entriesAt(b.instructions.file).map(({ text }) => text), ['小写链指令']);
@@ -1463,7 +1470,8 @@ test('every predecessor in the chain gets a full transcript the brief points to,
   // 交接单列出整条链的原文（最近的在前），首条消息提醒先查原文。
   const brief = readFileSync(second.briefPath, 'utf8');
   assert.ok(brief.indexOf(second.transcripts[1].file) < brief.indexOf(second.transcripts[0].file));
-  assert.match(brief, /## 旧会话原文[\s\S]*先用 grep（path 填上面的文件）搜关键词/);
+  assert.match(brief, /## 旧会话原文[\s\S]*先用 grep 搜关键词，path 逐个填上面的文件/);
+  assert.ok(brief.includes(`grep(pattern="关键词", path="${second.transcripts[1].file}")`));
   assert.match(h.prompts.at(-1).content[0].text, /先查原文再回答/);
   // 已有原文的前任不重读。
   const c = h.agents.get(second.to);
