@@ -2,7 +2,7 @@
 // 合并沿用 dsh-worktree-space 的做法：先试合并，冲突留在 worktree 里解决，原目录有重叠的未提交改动就不合并。
 // 被 .gitignore 忽略的资料不进 worktree：忽略的目录用目录联接（junction）接进来，忽略的单个文件用硬链接，都与原目录共用。
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { link, rmdir, symlink, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -118,7 +118,9 @@ async function linkIgnored(top, worktree) {
 // 为一个对话开 worktree。原目录不满足条件时返回 { shared: 原因 }，本对话就留在原目录工作。
 export async function openWorktree({ repo, root, owner, maxUntracked = 200 }) {
   const top = (await git(repo, ['rev-parse', '--show-toplevel'])).trim();
-  if (pathKey(top) !== pathKey(repo)) return { shared: `${repo} 不是 git 仓库的根目录（根目录是 ${top}）` };
+  // 比较真实路径：Windows 上同一目录可能写成 8.3 短名（C:\Users\RUNNER~1）或长名，字符串对不上。
+  const real = (p) => { try { return pathKey(realpathSync.native(p)); } catch { return pathKey(p); } };
+  if (real(top) !== real(repo)) return { shared: `${repo} 不是 git 仓库的根目录（根目录是 ${top}）` };
   const branch = (await gitRun(repo, ['symbolic-ref', '--quiet', '--short', 'HEAD'])).stdout.trim();
   if (!branch) return { shared: '原目录处于分离 HEAD，没有当前分支可以合并回去' };
   const untracked = entries(await git(repo, ['ls-files', '-z', '--others', '--exclude-standard'], { timeout: 600_000 }));
@@ -127,7 +129,8 @@ export async function openWorktree({ repo, root, owner, maxUntracked = 200 }) {
       '补全 .gitignore 或提交后，新对话才会用 worktree' };
   }
   const tag = ownerTag(owner);
-  const parent = path.join(root || path.join(path.dirname(top), 'worktree-space'), path.basename(top));
+  // 以下沿用配置里的写法（已确认与根目录是同一处），worktree 路径才和派单里的 cwd、scope 对得上。
+  const parent = path.join(root || path.join(path.dirname(repo), 'worktree-space'), path.basename(repo));
   let worktree = path.join(parent, tag);
   let name = `conv/${tag}`;
   for (let n = 2; existsSync(worktree) || (await gitRun(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`])).code === 0; n++) {
@@ -137,7 +140,7 @@ export async function openWorktree({ repo, root, owner, maxUntracked = 200 }) {
   mkdirSync(parent, { recursive: true });
   await git(repo, ['worktree', 'add', '-b', name, worktree, 'HEAD'], { timeout: 600_000 });
   const base = (await git(repo, ['rev-parse', 'HEAD'])).trim();
-  return { path: worktree, branch: name, base_branch: branch, base, ...(await linkIgnored(top, worktree)) };
+  return { path: worktree, branch: name, base_branch: branch, base, ...(await linkIgnored(repo, worktree)) };
 }
 
 // 合并回原分支。返回 status：merged | nothing | conflict | blocked | error。
