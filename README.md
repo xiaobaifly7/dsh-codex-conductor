@@ -106,6 +106,17 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.198：交接后新会话不再丢上下文
+
+11-17 到 11-25 的 13 次真实自动交接里，9 次是把正在跑的回合掐断再交接，其中 4 次是用户刚发起的回合（两次在用户发话后 1 分钟内）；最近 7 份交接单有 3 份“最近的用户指令”是空的。这一版改了触发条件和交接单：
+
+- **不打断用户**：用户亲手发消息开始的回合不再在步骤边界被掐断；`autoHandover.quietMinutes`（默认 30，0 关闭）分钟内用户发过消息时，`auto` 模式先不交接。只看人工消息：本插件代发的（`via: codex-conductor`）、交接单（宿主记 `rpcId: handover-…`）和 dsh-client-auto-continue 的默认重启话术不算。
+- **旧会话先写交接摘要**：建好链接、暂停原会话目标之后，插件在旧会话里开一个摘要回合，让它按完整上下文写“用户要什么、做成了什么、进行到哪、下一步、注意事项”，写成后放在交接单“下一步”之后的“旧会话写的交接摘要”一节。这一回合的工具调用一律拒绝，最多 3 步，限时 `autoHandover.summaryMinutes`（默认 10，0 不写）；超时后下一步之前结束，交接照常进行，交接单标题区写明没写出摘要的原因。结果的 `steps.summary` 记 `written` / `timeout` / `timeout_partial` / `empty:<结束原因>` / `unavailable` / `turn_running`。
+- **最近的用户指令取整条会话链**：从完整用户指令档案里取最近 12 条（同样排除“继续”开头等固定话术），用户没在上一个会话里打字时也能列出更早的要求；日志读取超时时照样列出。档案不再收交接单和续跑插件的重启话术，旧档案在下一次交接时剔除这两类条目。
+- **最后进展包括被掐断的回合**：最后一个回合没有正常结束时，另列它最后的助手文字，正常结束回合的回复照旧。
+- **任务表只列要紧的**：未结束、待验收、需修改的任务和最近 10 单非核验任务，标题写明总数和核验单数，其余用 `codex_jobs` 查。
+- **旧会话改名**：交接出去的会话改名为 `[已交接→<继任短 id>] <原标题>`（原来没有标题的不改），撤回时若标题没被用户改过就改回原名，结果记 `steps.predecessorTitle`。已有的交接链不回头改名。
+
 ### 0.9.128：完整用户指令档案与自动交接限制
 
 - 每条会话链在状态目录的 `handovers/` 保存所有非空白人工消息的原文和时间，按来源排除自动续接、系统和插件消息。再次交接补入新增指令。小写 UUID 链沿用 `instructions-<链首会话 ID>.json`，其他 ID 使用含原始 ID 哈希的文件名，区分仅大小写不同的链。交接单给出路径、条数和时间范围，并保留最近指令小节。`plannerReads: products` 下，当前链接所授权的继任会话可读取本链档案。自检核对文件存在且条数不少于交接单所列。档案失败时仍交接，并在结果和自检中报告。
@@ -726,6 +737,17 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.198: Successors keep the context
+
+Of the 13 real automatic hand-overs from 11-17 to 11-25, 9 cut a running turn short, 4 of them a turn the user had just started (twice within a minute of the user's message), and 3 of the latest 7 briefs had an empty "recent user instructions" section. This version changes when it triggers and what the brief holds:
+
+- **The user is not interrupted**: a turn started by a message the user typed is never cut at a step boundary, and `auto` mode waits while the user wrote within `autoHandover.quietMinutes` (default 30, 0 disables). Only human messages count: the plugin's own messages (`via: codex-conductor`), delivered briefs (the host records `rpcId: handover-…`) and dsh-client-auto-continue's default restart text do not.
+- **The old session writes a summary first**: after the link is made and the old goal paused, the plugin opens a summary turn in the old session that writes, from its full context, what the user wants, what was done, where the work stands, the next step and pitfalls. It goes into the brief as "旧会话写的交接摘要" right after "下一步". Every tool call in that turn is refused, it gets at most 3 steps and `autoHandover.summaryMinutes` (default 10, 0 disables); on timeout it ends before its next step and the hand-over proceeds, with the reason in the brief header. `steps.summary` records `written` / `timeout` / `timeout_partial` / `empty:<end reason>` / `unavailable` / `turn_running`.
+- **Recent user instructions span the chain**: the latest 12 entries of the full instruction archive (with the same filter for boilerplate such as messages starting with "继续"), so earlier requirements still show when the user typed nothing in the last session, even if reading the log timed out. The archive no longer records briefs or the auto-continue restart text, and older archives drop those entries at the next hand-over.
+- **Last progress includes a cut-short turn**: when the last turn did not complete, its final assistant words are listed besides the last completed reply.
+- **The task table lists what matters**: running, unreviewed and needs-changes jobs plus the latest 10 non-verification jobs; the heading gives the total and the number of verifications, and `codex_jobs` lists the rest.
+- **The old session is renamed** `[已交接→<successor short id>] <original title>` (untitled sessions are left alone); a revert restores the title unless the user renamed it since, recorded in `steps.predecessorTitle`. Existing chains are not renamed retroactively.
 
 ### 0.9.128: Full user instruction archives and automatic hand-over limits
 

@@ -147,11 +147,26 @@ export const BRIEF_LIMIT = 16_000;
 // 近期摘要沿用对自动续接等固定话术的筛选，完整档案以来源标记为准。
 const AUTOMATED_USER_TEXT = /^\s*(?:\[codex-conductor|(?:继续|continue|продолжай)(?:[\s。.!！,，;；:：]|$)|[（(](?:上一步工具|检测到你可能陷入循环))/i;
 
+// 以用户身份提交、却不是人打的固定文本：本插件投递的交接单（宿主记 rpcId handover-…，档案里只剩正文开头），
+// dsh-client-auto-continue 未开 usePluginSource 时的重启续跑默认话术（中、英、俄）。
+const MACHINE_USER_TEXT = /^\s*(?:\[codex-conductor 交接\]|\/loopx 这是会话交接后的续接|继续。宿主在你上一轮运行期间重启了|Continue\. The harness was restarted while your previous turn|Продолжай\. Хост перезапустился)/;
+
 function humanInstruction(event) {
   if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return;
-  if (event.data.source.via === 'codex-conductor') return;
+  if (event.data.source.via === 'codex-conductor' || String(event.data.source.rpcId ?? '').startsWith('handover-')) return;
   const text = textOf(event.data.content);
-  if (text.trim()) return { text, at: timeOf(event) };
+  if (text.trim() && !MACHINE_USER_TEXT.test(text)) return { text, at: timeOf(event) };
+}
+
+// 交接单的“最近的用户指令”：取整条会话链档案里最近 12 条，排除自动续接等固定话术（与 sessionContext 同一筛选）。
+export function recentInstructions(entries, autoMessage) {
+  const kept = [];
+  for (let i = entries.length - 1; i >= 0 && kept.length < 12; i--) {
+    const { text, at } = entries[i] ?? {};
+    if (typeof text !== 'string' || !text.trim() || text.trim() === autoMessage || AUTOMATED_USER_TEXT.test(text) || MACHINE_USER_TEXT.test(text)) continue;
+    kept.push({ text: clip(text, 600), at });
+  }
+  return kept;
 }
 
 // 从旧会话的内存日志里倒着找最近的人工指令和最后一个正常结束回合的小结；超过 deadlineMs 就放弃这两节。
@@ -159,16 +174,24 @@ export function sessionContext(log, { autoMessage, now = Date.now, deadlineMs = 
   const events = Array.isArray(log) ? log : [];
   const deadline = now() + deadlineMs;
   const instructions = [];
-  let lastTurn, completedTurn, progress;
+  let lastTurn, lastTurnNo, completedTurn, progress, latest;
   for (let i = events.length - 1; i >= 0; i--) {
     if (i % 500 === 0 && now() > deadline) return { timedOut: true };
     const event = events[i];
     if (event?.type === 'turn/end') {
-      lastTurn ??= { reason: event.data?.reason?.kind ?? '未知', at: timeOf(event) };
+      if (!lastTurn) {
+        lastTurn = { reason: event.data?.reason?.kind ?? '未知', at: timeOf(event) };
+        lastTurnNo = event.data?.turn;
+      }
       if (completedTurn === undefined && event.data?.reason?.kind === 'completed') completedTurn = event.data?.turn;
-    } else if (event?.type === 'assistant/message' && completedTurn !== undefined && !progress && event.data?.turn === completedTurn) {
-      const text = textOf(event.data?.message?.content).trim();
-      if (text) progress = { text: clip(text, 1500), at: timeOf(event) };
+    } else if (event?.type === 'assistant/message') {
+      // 最后一个回合没正常结束（被交接掐断、报错、中断）时，它最后说的话才是最新进展；正常结束回合的小结照旧另列。
+      const turn = event.data?.turn;
+      const wanted = (!latest && lastTurn && lastTurn.reason !== 'completed' && turn === lastTurnNo) ||
+        (!progress && completedTurn !== undefined && turn === completedTurn);
+      const text = wanted ? textOf(event.data?.message?.content).trim() : '';
+      if (text && turn === completedTurn) progress = { text: clip(text, 1500), at: timeOf(event) };
+      else if (text) latest = { text: clip(text, 1500), at: timeOf(event) };
     } else if (instructions.length < 12) {
       const item = humanInstruction(event);
       if (item && item.text.trim() !== autoMessage && !AUTOMATED_USER_TEXT.test(item.text)) {
@@ -177,7 +200,7 @@ export function sessionContext(log, { autoMessage, now = Date.now, deadlineMs = 
     }
     if (instructions.length >= 12 && lastTurn && progress) break;
   }
-  return { instructions, lastTurn, progress };
+  return { instructions, lastTurn, progress, ...(latest ? { latest } : {}) };
 }
 
 export function instructionArchivePath(directory, root) {
@@ -213,12 +236,15 @@ async function archiveInstructions({ directory, aliases, from, agentA, agentOf }
   if (!entries || previous.count !== entries.length) {
     entries = [];
     for (const id of predecessors.reverse()) append(await agentOf(id));
+  } else {
+    // 0.9.198 之前的档案把交接单和重启续跑话术也记成了用户指令，读出时剔除。
+    entries = entries.filter((entry) => !MACHINE_USER_TEXT.test(String(entry?.text ?? '')));
   }
   append(agentA);
   entries.sort((a, b) => (Date.parse(a.at) || 0) - (Date.parse(b.at) || 0));
   fs.mkdirSync(path.dirname(file), { recursive: true });
   writeJsonAtomic(file, entries);
-  return { root, file, count: entries.length, first: entries[0]?.at ?? null, last: entries.at(-1)?.at ?? null };
+  return { root, file, count: entries.length, first: entries[0]?.at ?? null, last: entries.at(-1)?.at ?? null, entries };
 }
 
 // 按优先顺序（最要紧的在前）放进 cap 字符以内，至少放一条。
@@ -234,9 +260,9 @@ function fit(items, cap) {
 }
 const truncated = (total, shown) => (shown < total ? [`（已截断，共 ${total} 条，显示最近 ${shown} 条）`] : []);
 
-// 交接单只用插件和 runner 已有的记录、旧会话日志机械生成，不经模型。
+// 交接单除“旧会话写的交接摘要”一节外，都用插件和 runner 已有的记录、旧会话日志机械生成，不经模型。
 export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note, origin = 'file', requestedAt = at, autoContinue,
-  successorGoal, context, instructionArchive, instructionError, sessionRead = false, limit = BRIEF_LIMIT }) {
+  successorGoal, context, instructionArchive, instructionError, sessionRead = false, summary, limit = BRIEF_LIMIT }) {
   const running = jobs.filter((j) => (j.execution_status ?? j.status) === 'running');
   const open = (j) => (j.execution_status ?? j.status) === 'running' || pending.unreviewed.includes(j.job_id) || pending.needsChanges.includes(j.job_id);
   // 表里只放任务号（job_id）：续接、核验、验收都靠它。线程号只列给需要带 resume 返工的任务，免得被当成任务号。
@@ -244,14 +270,17 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
     `${j.review_status === 'needs_attention' ? '有标记' : '-'} | ${j.parent_job_id ?? '-'} | ${j.cwd ?? '-'} | ` +
     `${j.diff_status ?? '-'} | ${firstLine(j.context?.task).replace(/\|/g, '/')} |`;
   const threads = jobs.filter((j) => pending.needsChanges.includes(j.job_id) && j.thread_id);
-  const taskSection = (compact) => {
-    // jobs 按开始时间从新到旧；紧张时只留未结束、待验收、需修改的任务和最近 10 单。
-    const chosen = compact ? jobs.filter((j, i) => i < 10 || open(j)) : jobs;
+  const taskSection = () => {
+    // jobs 按开始时间从新到旧；只列未结束、待验收、需修改的任务和最近 10 单非核验任务，其余用 codex_jobs 查。
+    let recent = 0;
+    const chosen = jobs.filter((j) => (!j.context?.verification_of && recent++ < 10) || open(j));
+    const checks = jobs.filter((j) => j.context?.verification_of).length;
     const rows = fit(chosen.map(row), 8000);
-    return [`## 任务（收尾截止时间 ${new Date(since * 1000).toISOString()} 之后开始，共 ${jobs.length} 单）`, '',
+    return [`## 任务（收尾截止时间 ${new Date(since * 1000).toISOString()} 之后开始，共 ${jobs.length} 单，其中核验单 ${checks} 单）`, '',
+      '这里只列未结束、待验收、需修改的任务和最近 10 单非核验任务；完整列表用 codex_jobs（session_id="current"）。',
       '任务号（job_id）用于 codex_status、codex_output、codex_review、codex_verify、codex_continue 的 job_id 参数。', '',
       '| 任务号 job_id | 执行 | 验收 | 报告 | 续接自（任务号） | 目录 | diff | 任务首行 |', '|---|---|---|---|---|---|---|---|',
-      ...rows, ...truncated(jobs.length, rows.length),
+      ...rows, ...truncated(chosen.length, rows.length),
       ...(threads.length ? ['', '### 返工用的线程号', '线程号（thread_id）不是任务号，只用于 codex_run 的 resume 参数；不要传给其他工具的 job_id。', '',
         ...threads.map((j) => `- 任务 ${j.job_id} 的线程号：${j.thread_id}`)] : [])].join('\n');
   };
@@ -266,15 +295,18 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
   const items = fit(instructions.map((m) => `- ${m.at}：${m.text.replace(/\n/g, '\n  ')}`), 8000);
   const sections = [
     { priority: 1, title: '下一步', lines: ['## 下一步', note ? note : '未指定；按目标继续，先完成“待收尾”。'] },
+    ...(summary?.text ? [{ priority: 1.5, title: '旧会话写的交接摘要', lines: ['## 旧会话写的交接摘要',
+      `旧会话按它的完整上下文在交接前写成（${summary.at ?? at}）；与任务记录或用户指令冲突时，以记录和用户原话为准。`, '', clip(summary.text, 6000)] }] : []),
     { priority: 2, title: '目标', lines: goalSection },
-    ...(context && !context.timedOut ? [
-      { priority: 3, title: '最近的用户指令', lines: ['## 最近的用户指令（旧会话里人工输入的消息，最近的在前）',
+    // 日志读取超时时，档案里的指令照样能列；进展只能从日志读，随之省略。
+    ...(context && (!context.timedOut || context.instructions) ? [
+      { priority: 3, title: '最近的用户指令', lines: ['## 最近的用户指令（本会话链里人工输入的消息，最近的在前）',
         '以下是用户亲手输入的要求，仍然有效，除非与“下一步”或更新的指令冲突。',
-        ...(items.length ? [...items, ...truncated(instructions.length, items.length)] : ['（没有找到）'])] },
-      ...(context.progress || context.lastTurn ? [{ priority: 4, title: '旧会话最后的进展', lines: ['## 旧会话最后的进展',
-        ...(context.lastTurn ? [`- 最后一个回合：结束原因 ${context.lastTurn.reason}，${context.lastTurn.at}`] : []),
-        ...(context.progress ? [`- 最后一个正常结束回合的助手回复（${context.progress.at}，前 1500 字符）：`, '', context.progress.text] : [])] }] : []),
-    ] : []),
+        ...(items.length ? [...items, ...truncated(instructions.length, items.length)] : ['（没有找到）'])] }] : []),
+    ...(context && !context.timedOut && (context.progress || context.lastTurn) ? [{ priority: 4, title: '旧会话最后的进展', lines: ['## 旧会话最后的进展',
+      ...(context.lastTurn ? [`- 最后一个回合：结束原因 ${context.lastTurn.reason}，${context.lastTurn.at}`] : []),
+      ...(context.latest ? [`- 最后一个回合没有正常结束，它最后的助手文字（${context.latest.at}，前 1500 字符）：`, '', context.latest.text, ''] : []),
+      ...(context.progress ? [`- 最后一个正常结束回合的助手回复（${context.progress.at}，前 1500 字符）：`, '', context.progress.text] : [])] }] : []),
     // 待收尾很短却是接手时最要紧的，与“下一步”同为 1，永不省略。
     { priority: 1, title: '待收尾', lines: ['## 待收尾',
       `- 报告有标记、尚未 codex_review：${fit(pending.unreviewed, 1000).join('、') || '无'}`,
@@ -283,7 +315,7 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
         ...running.map((j) => `  - ${j.job_id}：${firstLine(j.context?.task, 60).replace(/\|/g, '/') || '（无标题）'}` +
           `${Number.isFinite(j.started_at) ? `（已运行 ${Math.max(0, Math.round((Date.parse(at) / 1000 - j.started_at) / 60))} 分钟）` : ''}`)]
         : ['- 仍在运行：无'])] },
-    { priority: 5.5, title: '任务', key: 'tasks', lines: [taskSection(false)] },
+    { priority: 5.5, title: '任务', lines: [taskSection()] },
     { priority: 6, title: '如何回看旧会话', lines: ['## 如何回看旧会话', `- 旧会话 ID：${from}（已冻结，只能查看）`,
       ...(sessionRead ? [`- 用 session_read 回查：session_read(sessionId="${from}", mode="summary") 看结构化摘要；mode="search" 加 query 搜关键词；mode="tail" 看最后若干事件。`] : []),
       '- 历史任务报告：codex_summary（session_id="current"）看总览，codex_output（job_id=任务号）看单个任务的报告。'] },
@@ -299,15 +331,12 @@ export function buildBrief({ from, to, at, cwd, goal, jobs, pending, since, note
     ...(instructionArchive ? [`- 完整用户指令档案：${instructionArchive.file}，共 ${instructionArchive.count} 条，时间范围 ${instructionArchive.count ? `${instructionArchive.first} 至 ${instructionArchive.last}` : '无'}。早于最近 12 条的指令仍然有效，需要时读取该文件。`] : []),
     ...(instructionError ? [`- 完整用户指令档案未能保存（${instructionError}）。`] : []),
     ...(autoContinue === 'manual_required' ? [`- 请操作员在界面把原会话 ${from} 的“自动继续”开关关掉（插件无法替你关闭），免得它被自动续接继续推进。`] : []),
-    ...(context?.timedOut ? ['- 读取旧会话日志超时，省略了“最近的用户指令”和“旧会话最后的进展”。'] : []),
+    ...(context?.timedOut ? [`- 读取旧会话日志超时，省略了${context.instructions ? '' : '“最近的用户指令”和'}“旧会话最后的进展”。`] : []),
+    ...(summary && !summary.text ? [`- 旧会话没有写出交接摘要（${summary.status}），以下各节由插件按记录生成。`] : []),
     ...(omitted.length ? [`- 本单超过 ${limit} 字符，省略了：${omitted.join('、')}。`] : [])].join('\n');
   const render = (list, omitted) => [header(omitted), ...list.map((s) => s.lines.join('\n'))].join('\n\n') + '\n';
   let kept = sections;
   let text = render(kept, []);
-  if (text.length > limit) {
-    kept = kept.map((s) => (s.key === 'tasks' ? { ...s, lines: [taskSection(true)] } : s));
-    text = render(kept, []);
-  }
   const omitted = [];
   while (text.length > limit && kept.some((s) => s.priority > 1)) {
     const lowest = kept.reduce((a, b) => (b.priority > a.priority ? b : a));
@@ -360,6 +389,83 @@ export async function moveLoopxBinding(loopx, cwd, from, to) {
 }
 
 // 首条消息走 sessionController.prompt（与界面发送相同的路径）；它可能等到整轮结束才返回，8 秒内没回执就当作已投递。
+// 交接前让旧会话按它的完整上下文写交接摘要。此时目标已暂停，链接还没建（等摘要时宿主重启也不会留下没有交接单的继任会话）。
+// index.mjs 据 summarizing 拒绝这一回合的所有工具调用、最多放行 SUMMARY_MAX_STEPS 步、不发防虚报提醒，自动交接也不掐断它；
+// 过了时限，这一回合在下一步之前结束。
+export const summarizing = new Map();
+export const SUMMARY_MAX_STEPS = 3;
+const SUMMARY_TAG = '[codex-conductor 交接摘要]';
+const summaryPrompt = () => `${SUMMARY_TAG} 本会话即将交接给一个新会话，新会话看不到这里的对话，只能看到你现在写的摘要和插件按记录生成的交接单。` +
+  '请只用文字写一份交接摘要，不要调用任何工具（本回合的工具调用都会被拒绝），写完就结束本回合。按下面五节写，每节只写确有的内容，总长不超过 3000 字：\n' +
+  '1. 用户要什么：总目标，以及对话里提出、仍然有效的要求、偏好和禁止事项（尽量保留用户原话）。\n' +
+  '2. 已经做成的事和关键决定（附理由）。\n' +
+  '3. 进行到哪：被打断时正在做什么、做到哪一步，哪些任务还在跑或待验收（写任务号）。\n' +
+  '4. 下一步：接下来该做什么，先做哪件。\n' +
+  '5. 注意事项：踩过的坑、走不通的路、需要等用户决定的事。';
+
+function summaryReply(log, id) {
+  const events = Array.isArray(log) ? log : [];
+  // 宿主一般沿用提交时的消息 id；万一换了 id，按固定开头认。
+  const start = events.findLastIndex((e) => e?.type === 'user/message' &&
+    (e.data?.id === id || textOf(e.data?.content).startsWith(SUMMARY_TAG)));
+  if (start < 0) return {};
+  const texts = [];
+  let at;
+  for (let i = start + 1; i < events.length; i++) {
+    const event = events[i];
+    if (event?.type === 'assistant/message') {
+      const text = textOf(event.data?.message?.content).trim();
+      if (text) { texts.push(text); at = timeOf(event); }
+    } else if (event?.type === 'turn/end') return { ended: true, reason: event.data?.reason?.kind ?? '未知', text: texts.join('\n\n'), at };
+  }
+  return { text: texts.join('\n\n'), at };
+}
+
+// 返回 { status, text?, at? }：written / timeout_partial 带摘要；off、unavailable、turn_running、empty:<结束原因>、timeout、failed:<原因> 不带。
+export async function requestSummary(agent, { timeoutMs, pollMs = 1_000, graceMs = 60_000, now = Date.now } = {}) {
+  if (!(timeoutMs > 0)) return { status: 'off' };
+  if (typeof agent?.followup !== 'function') return { status: 'unavailable' };
+  if (agent.status === 'running') return { status: 'turn_running' };
+  const id = randomUUID();
+  const entry = { id, deadline: now() + timeoutMs, steps: 0 };
+  summarizing.set(agent.id, entry);
+  let outcome;
+  let ended = false;
+  try {
+    // via 标出插件代发：不算用户指令，不进档案。
+    agent.followup({ id, role: 'user', content: [{ type: 'text', text: summaryPrompt() }], source: { kind: 'user', via: 'codex-conductor' } });
+    for (;;) {
+      const found = summaryReply(agent.session?.log, id);
+      if (found.ended) {
+        ended = true;
+        outcome = found.text ? { status: 'written', text: found.text, at: found.at } : { status: `empty:${found.reason}` };
+        break;
+      }
+      if (now() > entry.deadline) entry.expired = true;
+      if (now() > entry.deadline + graceMs) {
+        outcome = found.text ? { status: 'timeout_partial', text: found.text, at: found.at } : { status: 'timeout' };
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
+    }
+  } catch (error) {
+    outcome = { status: `failed:${error?.message ?? error}` };
+  } finally {
+    // 摘要回合还没结束就留着（已过期）记录，会话转为空闲时由 index.mjs 清掉。
+    if (!ended && agent.status === 'running') entry.expired = true;
+    else summarizing.delete(agent.id);
+  }
+  return outcome;
+}
+
+// 摘要回合的步骤闸门（index.mjs 的 pre-step 调用）：过期或超过步数时返回 true，表示结束这一回合。
+export function summaryStepRejected(agentId, now = Date.now) {
+  const entry = summarizing.get(agentId);
+  if (!entry) return false;
+  entry.steps++;
+  return Boolean(entry.expired || now() > entry.deadline || entry.steps > SUMMARY_MAX_STEPS);
+}
+
 async function deliver(controller, sessionId, text, waitMs) {
   try {
     const call = controller.prompt({ requestId: `handover-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
@@ -492,14 +598,22 @@ export function successorTitle(fromId, fromTitle) {
   let base = String(fromTitle ?? '').trim();
   // 旧版本的交接会话标题是首条交接消息的开头，不是有意义的原标题。
   if (base.startsWith(LEGACY_HANDOVER_TITLE)) base = '';
-  base = [...base.replace(/^\[交接←[^\]]*\]\s*/, '')].slice(0, 40).join('').trim();
+  base = [...base.replace(/^\[已交接→[^\]]*\]\s*/, '').replace(/^\[交接←[^\]]*\]\s*/, '')].slice(0, 40).join('').trim();
   return base ? `[交接←${short}] ${base}` : `[交接←${short}]`;
 }
 
-async function renameSuccessor(controller, to, title) {
+// 交接出去的旧会话：[已交接→<继任短 id>] <原标题前 40 字符>，侧栏里一眼能看出它已停用；撤回时改回原标题。
+export function retiredTitle(toId, fromTitle) {
+  const short = String(toId).replace(/^session-/, '').slice(0, 8);
+  const base = [...String(fromTitle ?? '').trim().replace(/^\[已交接→[^\]]*\]\s*/, '').replace(/^\[交接←[^\]]*\]\s*/, '')]
+    .slice(0, 40).join('').trim();
+  return base ? `[已交接→${short}] ${base}` : `[已交接→${short}]`;
+}
+
+async function renameSession(controller, sessionId, title) {
   if (typeof controller?.rename !== 'function') return 'unavailable';
   try {
-    await controller.rename({ sessionId: to, title });
+    await controller.rename({ sessionId, title });
     return 'set';
   } catch (error) { return `failed:${error?.message ?? error}`; }
 }
@@ -525,7 +639,7 @@ export async function repairLinks({ registry, controller, aliases, directory, lo
         marks.titleRepaired = entry.at;
         const resolve = async (id) => (await controller?.resolveAgent?.(id))?.agent;
         if (titleOf(await resolve(to))?.trim().startsWith(LEGACY_HANDOVER_TITLE)) {
-          entry.title = await renameSuccessor(controller, to, successorTitle(link.from, titleOf(await resolve(link.from))));
+          entry.title = await renameSession(controller, to, successorTitle(link.from, titleOf(await resolve(link.from))));
         }
       }
       if (entry.placement || entry.title) entry.status = [entry.placement, entry.title].some((v) => v?.startsWith('failed')) ? 'failed' : 'repaired';
@@ -624,7 +738,7 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
 export async function handOver(ctx, deps, request) {
   const { aliases, sessionJobs, pendingOf, since, directory, deliverWaitMs = 8_000, autoContinue,
     disableAutoContinue: turnOffAutoContinue = true, autoMessage, sessionRead = () => false, contextDeadlineMs, workspaces = () => undefined, withRunningJobs = false,
-    loopx } = deps;
+    loopx, summaryMinutes, summaryOptions } = deps;
   const result = { status: 'refused', from: request.from ?? request.revert?.from, to: request.to ?? request.revert?.to ?? null, steps: {} };
   const refuse = (reason, extra = {}) => Object.assign(result, { reason, ...extra });
   const controller = ctx.get('sessionController');
@@ -682,6 +796,13 @@ export async function handOver(ctx, deps, request) {
     if (link.autoContinue === 'disabled' && Object.hasOwn(link, 'autoContinuePrevious')) {
       result.steps.autoContinue = await restoreAutoContinue(autoContinue, from, link.autoContinuePrevious);
     }
+    // 交接时改成 [已交接→…] 的旧会话标题改回原名；用户之后自己改过的不动。
+    if (link.retiredTitle) {
+      try {
+        result.steps.predecessorTitle = titleOf(await agentOf(from)) === link.retiredTitle
+          ? (await renameSession(controller, from, link.fromTitle) === 'set' ? 'restored' : 'restore_failed') : 'unchanged';
+      } catch (error) { result.steps.predecessorTitle = `failed: ${error.message}`; }
+    }
     result.sessions = [
       { sessionId: from, state: 'restored', goal: result.steps.predecessorGoal, note: '原会话恢复：可以继续派活、验收和续接。' },
       { sessionId: to, state: 'detached', goal: result.steps.successorGoal, newTurns,
@@ -706,6 +827,26 @@ export async function handOver(ctx, deps, request) {
   const pursued = goal?.phase === 'active' || (goal?.phase === 'paused' && goal.id === request.pausedGoal?.id);
   const keptGoal = Boolean(goal && !pursued && goal.phase !== 'complete');
   const header = agentA.session?.header ?? {};
+  // 先停原会话的目标，再写摘要、让新会话开工，避免两边同时推进。摘要写在建链接之前：
+  // 等摘要时宿主若重启，旧会话只是目标暂停、历史都在，不会留下一个没收到交接单的继任会话。
+  if (goal?.phase === 'active') {
+    try { goals.pause(agentA, ref(goals.get(agentA))); result.steps.predecessorGoal = 'paused'; }
+    catch (error) { result.steps.predecessorGoal = `failed: ${error.message}`; }
+  } else result.steps.predecessorGoal = goal ? `unchanged_${goal.phase}` : 'none';
+  // 摘要之后没交接成：把这里暂停的目标恢复（自动交接提前暂停的那一版由 settled 恢复）。
+  const giveBack = (reason, extra) => {
+    if (result.steps.predecessorGoal === 'paused') {
+      try { goals.resume(agentA, ref(goals.get(agentA))); result.steps.predecessorGoal = 'resumed'; }
+      catch (error) { result.steps.predecessorGoal = `failed: ${error.message}`; }
+    }
+    return refuse(reason, extra);
+  };
+  // 旧会话的进展在摘要回合之前读：否则摘要回合会成了“最后一个正常结束的回合”。
+  const context = sessionContext(agentA.session?.log, { autoMessage, ...(contextDeadlineMs !== undefined ? { deadlineMs: contextDeadlineMs } : {}) });
+  const summary = await requestSummary(agentA, { timeoutMs: (summaryMinutes ?? 0) * 60_000, ...summaryOptions });
+  if (summary.status !== 'off') result.steps.summary = summary.status;
+  // 摘要之后会话又开了新回合（用户发话等）就不交接；超时还没停的摘要回合不算，它下一步之前就会被结束，工具也都被拒。
+  if (!force && agentA.status === 'running' && !summarizing.get(agentA.id)?.expired) return giveBack('turn_running');
   let to = request.to;
   let agentB;
   try {
@@ -718,13 +859,13 @@ export async function handOver(ctx, deps, request) {
     } else result.steps.session = 'adopted';
     result.to = to;
     agentB = await agentOf(to);
-  } catch (error) { return refuse('successor_unavailable', { error: String(error?.message ?? error) }); }
-  if (request.to && !force && agentB.status === 'running') return refuse('successor_turn_running');
+  } catch (error) { return giveBack('successor_unavailable', { error: String(error?.message ?? error) }); }
+  if (request.to && !force && agentB.status === 'running') return giveBack('successor_turn_running');
   // 记下继任会话此刻的消息数和回合数：撤回保护和自动交接的再次触发都以它为基数。
   const base = logCounts(agentB.session?.log);
   const { origin, requestedAt } = request;
   try { aliases.link(from, to, { origin, requestedAt, toMessages: base.messages, toTurns: base.turns }); }
-  catch (error) { return refuse('alias_failed', { error: error.message }); }
+  catch (error) { return giveBack('alias_failed', { error: error.message }); }
   result.status = 'handed_over';
   result.steps.alias = 'linked';
   // 继任会话进原会话的分组、排在它上方；新建的继任会话改成能看出来源的标题（在交接单送达前设，免得被自动标题覆盖）。
@@ -732,7 +873,11 @@ export async function handOver(ctx, deps, request) {
   result.steps.workspace = placed.workspace;
   if (placed.workspaceId) result.steps.workspaceId = placed.workspaceId;
   if (placed.pin) result.steps.pin = placed.pin;
-  if (!request.to) result.steps.title = await renameSuccessor(controller, to, successorTitle(from, titleOf(agentA)));
+  if (!request.to) result.steps.title = await renameSession(controller, to, successorTitle(from, titleOf(agentA)));
+  // 旧会话改名 [已交接→…]，免得用户在侧栏里看不出来、接着在旧会话里说话；没有标题的不改（撤回时无从改回）。
+  const fromTitle = titleOf(agentA);
+  const retired = typeof fromTitle === 'string' && fromTitle.trim() ? retiredTitle(to, fromTitle) : undefined;
+  if (retired) result.steps.predecessorTitle = await renameSession(controller, from, retired);
   const autoContinueStep = turnOffAutoContinue ? await disableAutoContinue(autoContinue, from) : {};
   if (autoContinueStep.autoContinue) result.steps.autoContinue = autoContinueStep.autoContinue;
   // 原会话绑着 LoopX：绑定随交接挪给继任会话，继任会话由 LoopX 接着跑，不重建原生目标。
@@ -743,16 +888,20 @@ export async function handOver(ctx, deps, request) {
   Object.assign(result, { pending, running });
   const at = new Date().toISOString();
   const existingGoal = goals?.get(agentB);
+  let chain;
   try {
-    const archive = await archiveInstructions({ directory, aliases, from, agentA, agentOf });
+    const { entries, ...archive } = await archiveInstructions({ directory, aliases, from, agentA, agentOf });
+    chain = entries;
     aliases.annotate(to, { instructions: { root: archive.root, count: archive.count } });
     result.instructions = archive;
     result.steps.instructions = 'written';
   } catch (error) { result.steps.instructions = `failed:${error?.message ?? error}`; }
+  // 最近的用户指令取整条会话链：用户没在上一个会话里打字时，更早会话里的要求照样列出。
+  if (chain) context.instructions = recentInstructions(chain, autoMessage);
   const brief = buildBrief({ from, to, at, cwd: header.cwd, goal, jobs, pending, since, note, origin, requestedAt,
     autoContinue: result.steps.autoContinue,
     successorGoal: existingGoal && existingGoal.phase !== 'complete' ? 'exists' : keptGoal ? 'kept' : undefined,
-    context: sessionContext(agentA.session?.log, { autoMessage, ...(contextDeadlineMs !== undefined ? { deadlineMs: contextDeadlineMs } : {}) }),
+    context, summary: summary.status === 'off' ? undefined : summary,
     instructionArchive: result.instructions, instructionError: result.instructions ? undefined : result.steps.instructions.slice(7),
     sessionRead: sessionRead() });
   try {
@@ -761,11 +910,6 @@ export async function handOver(ctx, deps, request) {
     result.briefPath = path.join(dir, `${at.replace(/[:.]/g, '-')}-${from}-to-${to}.md`);
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
-  // 先停原会话的目标，再让新会话开工，避免两边同时推进。
-  if (goal?.phase === 'active') {
-    try { goals.pause(agentA, ref(goals.get(agentA))); result.steps.predecessorGoal = 'paused'; }
-    catch (error) { result.steps.predecessorGoal = `failed: ${error.message}`; }
-  } else result.steps.predecessorGoal = goal ? `unchanged_${goal.phase}` : 'none';
   Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal), deliverWaitMs));
   if (followed) result.steps.successorGoal = 'loopx';
   else if (keptGoal) result.steps.successorGoal = `kept_${goal.phase}`;
@@ -786,6 +930,7 @@ export async function handOver(ctx, deps, request) {
       ...(result.steps.autoContinue ? { autoContinue: result.steps.autoContinue } : {}),
       ...(Object.hasOwn(autoContinueStep, 'previous') ? { autoContinuePrevious: autoContinueStep.previous } : {}),
       ...(followed ? { loopx: followed } : {}),
+      ...(result.steps.predecessorTitle === 'set' ? { fromTitle, retiredTitle: retired } : {}),
       goalPaused: pursued && (result.steps.predecessorGoal === 'paused' || goal.phase === 'paused') ? goal.id : null });
   } catch (error) { result.steps.linkNote = `failed: ${error.message}`; }
   // 首条消息没送达，或继任会话的目标没建起来：不留一个没有交接单或没有目标的“继任”，自动撤回一次（不带 force）。
@@ -878,6 +1023,12 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       if (MESSAGE_TYPES.has(log[i]?.type)) entry.messages++;
       const tokens = promptTokens(log[i]);
       if (tokens) entry.prompts = [...entry.prompts.slice(1 - FLOOR_WINDOW), tokens];
+      // 自动交接据此避开用户正在对话的时候：最后一条人工消息的时间，以及当前回合里是否有人工消息。
+      if (log[i]?.type === 'turn/start') entry.turnHuman = false;
+      else if (humanInstruction(log[i])) {
+        entry.turnHuman = true;
+        if (Number.isFinite(log[i].time)) entry.lastHumanAt = log[i].time;
+      }
     }
     entry.scanned = log.length;
     counts.set(log, entry);
@@ -903,7 +1054,8 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       if (entry === undefined || !validSessionId(agent?.id)) return undefined;
       const { messages, prompts } = entry;
       const limit = threshold();
-      const value = { messages, threshold: limit, suggest: limit > 0 && messages > limit };
+      const value = { messages, threshold: limit, suggest: limit > 0 && messages > limit,
+        ...(entry.lastHumanAt !== undefined ? { lastHumanAt: entry.lastHumanAt } : {}), ...(entry.turnHuman ? { turnHuman: true } : {}) };
       const floorLimit = contextThreshold();
       // 子代理读大文件时上下文同样会很大，但它们不交接。
       if (floorLimit > 0 && agent.session?.header?.origin !== 'subagent') {
@@ -931,13 +1083,14 @@ const HOUR = 3_600_000;
 // 自动交接没成之后过这么久才再试，免得每个回合都暂停再恢复目标；撞上新回合（turn_running）时下一个回合边界就再试。
 export const RETRY_COOLDOWN_MS = 30 * 60_000;
 export const TURN_RETRY_COOLDOWN_MS = 2 * 60_000;
+// quietMinutes：用户这么多分钟内亲手发过消息就不自动交接（他可能还在对话）；summaryMinutes：交接前等旧会话写交接摘要的时限，0 不写。
 export const AUTO_HANDOVER_DEFAULTS = { mode: 'confirm', cooldownHours: 12, remindStepMessages: 2000, startupDelayMinutes: 10, disableAutoContinue: true,
-  withRunningJobs: true, maxChainDepth: 6, minHoursBetween: 6 };
+  withRunningJobs: true, maxChainDepth: 6, minHoursBetween: 6, quietMinutes: 30, summaryMinutes: 10 };
 
 // 纯判定：会话标了建议交接之后这一次要做什么。remind 是面板提醒；act 为 ask（confirm 模式询问）或 auto（执行交接，
 // 来源 origin 为 auto，或用户在面板同意过的 confirm / panel）。名下是否还有运行中的 Codex 任务由调用方最后再查。
 export function autoHandoverStep({ settings, record = {}, messages, threshold, suggest, contextFull = false, idle, retired, link, now, uptimeMs,
-  linksReadable = true, depth = 0, lastAutoAt = -Infinity }) {
+  linksReadable = true, depth = 0, lastAutoAt = -Infinity, lastHumanAt = -Infinity }) {
   const step = { remind: false, act: null };
   if (settings.mode === 'off' || !suggest || retired) return step;
   // 继任会话从交接时起再涨满一个阈值才算（自动交接出的新会话不会马上再触发）。
@@ -956,6 +1109,8 @@ export function autoHandoverStep({ settings, record = {}, messages, threshold, s
     if (settings.minHoursBetween > 0 && now < until) {
       return { ...step, blocked: `同一会话链自动交接至少间隔 ${settings.minHoursBetween} 小时，还需等待 ${Math.ceil((until - now) / 60_000)} 分钟。` };
     }
+    // 用户刚说过话：等他停下这么久再交接，免得对话进行到一半被换到新会话。
+    if (settings.quietMinutes > 0 && now - lastHumanAt < settings.quietMinutes * 60_000) return step;
   }
   // 拒绝、点了“知道了”或询问后没人理，都在冷却期内不再询问或自动交接。
   const quiet = Math.max(Date.parse(record.askedAt) || 0, Date.parse(record.declinedAt) || 0);
@@ -1033,7 +1188,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     return autoHandoverStep({ settings: settings(), record: sessions[id], messages: value.messages, threshold: value.threshold, suggest: value.suggest,
       contextFull: value.contextFull === true,
       idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(),
-      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt });
+      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt });
   };
   return {
     // value 是 history.observe(agent) 的结果；会话每次转为空闲时同步调用（第一个 await 之前的部分与 goal 排下一轮同属这次事件）。
@@ -1081,9 +1236,10 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     },
     // 回合一直不结束的会话（目标或 LoopX 续跑一个回合可以跑好几个小时）等不到空闲：此刻若空闲就会自动交接时返回 true，
     // 由调用方在步骤边界结束这一回合，转为空闲后照上面的流程交接。只看自动交接，询问仍等会话自己停下。
+    // 用户亲手发消息开始的回合从不掐断（11-24、11-25 各有一次在用户发话后 1 分钟内被掐断）。
     due(agent, value) {
       const id = agent?.id;
-      if (!file || !value?.suggest || !validSessionId(id) || checking.has(id) || agent.session?.header?.origin === 'subagent') return false;
+      if (!file || !value?.suggest || value.turnHuman || summarizing.has(id) || !validSessionId(id) || checking.has(id) || agent.session?.header?.origin === 'subagent') return false;
       return decision(id, value, read(), true).act === 'auto';
     },
     // 交接请求处理完：没成就恢复提前暂停的目标并进入重试冷却。
