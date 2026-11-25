@@ -2,7 +2,7 @@
 // 合并沿用 dsh-worktree-space 的做法：先试合并，冲突留在 worktree 里解决，原目录有重叠的未提交改动就不合并。
 // 被 .gitignore 忽略的资料不进 worktree：忽略的目录用目录联接（junction）接进来，忽略的单个文件用硬链接，都与原目录共用。
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { cp, link, rename, rm, rmdir, symlink, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -145,7 +145,13 @@ export async function openWorktree({ repo, root, owner, maxUntracked = 200 }) {
   mkdirSync(parent, { recursive: true });
   await git(repo, ['worktree', 'add', '-b', name, worktree, 'HEAD'], { timeout: 600_000 });
   const base = (await git(repo, ['rev-parse', 'HEAD'])).trim();
-  return { path: worktree, branch: name, base_branch: branch, base, ...(await linkIgnored(repo, worktree)) };
+  const linked = await linkIgnored(repo, worktree);
+  // git in WSL sees the junctions as symlinks, which a directory pattern such as vm/ does not ignore, so add -A committed
+  // them; the runner points core.excludesFile at this list for git in WSL. It goes away with the worktree's git dir.
+  const gitDir = (await git(worktree, ['rev-parse', '--absolute-git-dir'])).trim();
+  writeFileSync(path.join(gitDir, 'conversation-links.exclude'),
+    linked.links.map(rel => `/${rel.replace(/[*?[\\]/g, '\\$&').replace(/ $/, '\\ ')}\n`).join(''));
+  return { path: worktree, branch: name, base_branch: branch, base, ...linked };
 }
 
 // 合并回原分支。返回 status：merged | nothing | conflict | blocked | error。

@@ -2157,7 +2157,15 @@ def linked_worktree_git_env(cwd):
             match = re.fullmatch(r"gitdir:\s*([A-Za-z]):[\\/](.*)", text)
             if not match:
                 return {}
-            return {"GIT_DIR": f"/mnt/{match[1].lower()}/" + match[2].replace("\\", "/"), "GIT_WORK_TREE": str(top)}
+            git_dir = f"/mnt/{match[1].lower()}/" + match[2].replace("\\", "/")
+            env = {"GIT_DIR": git_dir, "GIT_WORK_TREE": str(top)}
+            # The plugin's links to shared material are junctions: Linux git sees symlinks, which a directory pattern
+            # such as vm/ does not ignore, so add -A committed them and the merge then stopped (2026-11-26). The plugin
+            # lists the links in the worktree's own exclude file; git in WSL reads it, Windows git needs nothing.
+            links = git_dir + "/conversation-links.exclude"
+            if os.path.isfile(links):
+                env.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="core.excludesFile", GIT_CONFIG_VALUE_0=links)
+            return env
     return {}
 
 

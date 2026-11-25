@@ -6950,6 +6950,11 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(codex_runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, b"", b"")) as run:
             codex_runner.git(str(worktree / "deep"), "status", deadline=time.monotonic() + 5)
         self.assertEqual({key: run.call_args.kwargs["env"].get(key) for key in expected}, expected)
+        if not codex_runner.IS_WIN:
+            listed = lambda p: str(p).endswith("/worktrees/w/conversation-links.exclude")
+            with mock.patch.object(codex_runner.os.path, "isfile", side_effect=listed):
+                self.assertEqual(codex_runner.linked_worktree_git_env(str(worktree)), {**expected, "GIT_CONFIG_COUNT": "1",
+                    "GIT_CONFIG_KEY_0": "core.excludesFile", "GIT_CONFIG_VALUE_0": expected["GIT_DIR"] + "/conversation-links.exclude"})
         (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/w\n", "utf-8")
         self.assertEqual(codex_runner.linked_worktree_git_env(str(worktree)), {})
 
