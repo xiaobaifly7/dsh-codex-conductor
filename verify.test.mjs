@@ -935,6 +935,45 @@ test('a verification lists every criterion the original report marked blocked or
   assert.equal(hx.payload().context.acceptance.at(-1), '原报告第 3 行（原报告标 not_met，未对上原验收清单）：额外抽查的一条——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。');
 });
 
+test('codex_model sets this conversation\'s Gemini model only when the user named it, and leaves verification alone', async () => {
+  const locked = { command: gemini.command, model: 'gemini-4-neon-high', effort: '', forceModel: true, forceEffort: true };
+  const config = { gemini: locked, defaultEngine: 'gemini', lockEngine: true, defaultHostAccess: true, verifyEngine: 'codex', model: 'codex/gpt-6.1-sol' };
+  const said = (text, source = { kind: 'user' }) => ({ type: 'user/message', time: Date.now(), data: { source, content: [{ type: 'text', text }] } });
+  const caller = (...log) => ({ agent: { id: 'model-session', session: { header: { cwd: '/work/planner' }, log } } });
+  const input = { task: 'Inspect the project layout.', acceptance, write: false };
+  const h = harness({ config });
+  // The planner cannot pick a model the user did not ask for, nor take it from a plugin-sent or other-source message.
+  await assert.rejects(h.tools.codex_model.execute({ model: 'gemini-4-carbon-high' }, caller(said('继续推进'))), /没有写出 gemini-4-carbon-high/);
+  await assert.rejects(h.tools.codex_model.execute({ model: 'gemini-4-carbon-high' },
+    caller(said('这个对话改用 carbon high'), said('carbon high', { kind: 'user', via: 'codex-conductor' }), said('别的话'))), /没有写出/);
+  await assert.rejects(h.tools.codex_model.execute({ model: 'carbon' }, caller(said('carbon'))), /必须是 Gemini 模型名/);
+  const set = await h.tools.codex_model.execute({ model: 'gemini-4-carbon-high' }, caller(said('这个对话改用 Gemini carbon high')));
+  assert.equal(set.model, 'gemini-4-carbon-high');
+  const run = await h.tools.codex_run.execute(input, caller());
+  assert.equal(option(h.start().argv, '--model'), 'gemini-4-carbon-high');
+  assert.match(JSON.stringify(run), /本单按本对话的设置使用 gemini-4-carbon-high/);
+  // Another conversation keeps the configured model; this one's verification stays on its own engine.
+  const other = harness({ config });
+  await other.tools.codex_run.execute(input, exec);
+  assert.equal(option(other.start().argv, '--model'), 'gemini-4-neon-high');
+  const owner = { agent: { ...exec.agent, session: { ...exec.agent.session, log: [said('这个对话用 carbon high')] } } };
+  for (const [settings, model] of [[config, 'codex/gpt-6.1-sol'], [{ ...config, verifyEngine: '' }, 'gemini-4-neon-high']]) {
+    const source = sourceJob();
+    Object.assign(source, { engine: 'gemini', cwd: 'D:/work/project', sandbox: 'danger-full-access' });
+    source.task_options = { ...source.task_options, engine: 'gemini', model: 'gemini-4-neon-high' };
+    const verified = harness({ source, config: settings });
+    await verified.tools.codex_model.execute({ model: 'gemini-4-carbon-high' }, owner);
+    await verified.verify();
+    assert.equal(option(verified.start().argv, '--model'), model);
+  }
+  await harness({ config }).tools.codex_model.execute({ model: 'default' }, owner);
+  // default goes back to the configured model.
+  await h.tools.codex_model.execute({ model: 'default' }, caller());
+  const back = harness({ config });
+  await back.tools.codex_run.execute(input, caller());
+  assert.equal(option(back.start().argv, '--model'), 'gemini-4-neon-high');
+});
+
 test('verifyEngine sends verifications to Codex with verifyServiceTier while lockEngine keeps the rest on Gemini', async () => {
   const locked = { command: gemini.command, model: 'gemini-4-neon-high', effort: '', forceModel: true, forceEffort: true };
   const config = { gemini: locked, defaultEngine: 'gemini', lockEngine: true, defaultHostAccess: true, verifyEngine: 'codex',

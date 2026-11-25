@@ -235,6 +235,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 | `codex_watch` | 安静观察当前会话的原生 Codex 后台任务，首次重要变化时通知；停止观察不会取消 Codex |
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效；`action=doctor` 检查 Python、Codex、登录文件和路由；WSL 额外检查 bash，Windows 原生模式预检私有 Codex 沙箱。两种模式均不调用模型 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
+| `codex_model` | 配置 `gemini` 后才注册；用户在某个对话里要求换执行模型时，规划端用它为本对话（含交接出去的会话）的 Gemini 执行和续接指定模型（如 `gemini-4-carbon-high`），`forceModel` 下也生效；核验不受影响。用户最近一条亲自发的消息里要写出系列名和档位（如「carbon high」），否则拒绝；`default` 恢复默认。设置存在状态目录的 `session-models.json` |
 
 ### 任务生命周期
 
@@ -355,7 +356,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 
 ### 工作区护栏
 
-十一个 Codex 工具始终注册；`gemini_write` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
+十一个 Codex 工具始终注册；`gemini_write` 和 `codex_model` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
 
 需要 DeepSeek 自己动手时，在该会话里输入 `/conductor on`（也可写成 `/conductor direct on`，中间的词拼错不影响，也认“开”“关”“状态”）：这个会话不再受护栏限制，也不注入规划要求，派 Codex / Gemini 的工具照样可用；`/conductor off` 恢复，`/conductor status` 查看。设置按会话记在状态目录的 `direct-sessions.json`，重启后保持，交接出的继任会话沿用前任的设置；其他会话不受影响。默认是规划模式。中途切换时，切换后的下一条用户消息会附一条模式说明，直接执行模式下系统提示词也写明当前模式，长对话不会照着前面的做法继续。
 
