@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.195` 对话 worktree 默认建在仓库旁的 `conversation-worktrees` 目录，不再用 `worktree-space`：已安装的 dsh-worktree-space 插件的容器也叫 `worktree-space`，F:\渗透 这种盘根下一层的仓库两边会落进同一个 `F:\worktree-space`。两个插件互不相干，目录分开免得混淆。
+
 `0.9.194` 核验不再在跑不完全仓库 `git status` 的仓库上白等。核验前后各有一次全仓库状态检查，只用来提示核验范围外有没有改动，时间预算 30 秒。F:/渗透 文件太多，2026-11-25 下午的 46 单核验每一单都超时放弃，开工前白等约 31 秒、收尾又白等约 28 秒，结果都是「范围外未检查」。现在开工前超时后，收尾不再跑这一步；并把这个仓库记进 runner 的 snapshot-too-big.json（前缀 `whole:`，7 天），之后的核验两头都直接跳过。范围内的检查不变，核验结论和「范围外未检查」的标注与原来一致，每单省下约 1 分钟。
 
 `0.9.193` 对话 worktree 收尾不再丢文件：`git worktree remove` 会连同被忽略的文件一起删（实测），`close` 现在先把只在 worktree 里的被忽略文件（扫描结果、日志等）移回原目录同一位置；原目录那里已有另一份（如硬链接被工具整个替换）时不覆盖，收尾停下并列出（`ignored_clash`）。只因文件规则（如 `*.bin`）被忽略的目录，git 会把目录和里面的文件都列出来，以前目录先被建成普通目录、联接失败、文件逐个硬链接，对话在里面新建的文件不共用；现在整个目录接成联接（opsec 实测 548 个目录条目里 298 个是顶层，硬链接从 64,509 降到 47,990）。
@@ -285,6 +287,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.195` Conversation worktrees now default to a `conversation-worktrees` directory beside the repository instead of `worktree-space`: the installed dsh-worktree-space plugin's container has that name too, and for a repository one level below a drive root (F:\渗透) both landed in the same `F:\worktree-space`. The two plugins are unrelated; separate directories keep them apart.
 
 `0.9.194` Verifications no longer wait on a whole-repository `git status` that cannot finish. The status runs before and after each verification with a 30 s budget and only feeds the outside-the-scope warning. On F:/渗透 it timed out on every one of 46 verifications on the afternoon of 2026-11-25: about 31 s lost before and 28 s after, each time ending as "outside scope unchecked". When it times out before, the after-check now skips it, and the repository is remembered in the runner's snapshot-too-big.json (prefix `whole:`, 7 days) so later verifications skip it at both ends. The in-scope check is unchanged; results and the "unchecked" marker are the same as before, about a minute sooner per verification.
 

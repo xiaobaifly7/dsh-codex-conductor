@@ -42,7 +42,7 @@ test('a conversation worktree shares ignored material, merges back after a trial
   const first = await openWorktree({ repo: root, owner: 'session-aaaa1111-0000', maxUntracked: 10 });
   assert.equal(first.branch, 'conv/aaaa1111');
   assert.equal(first.base_branch, 'main');
-  assert.equal(first.path, path.join(tmp, 'flow', 'worktree-space', 'repo', 'aaaa1111'));
+  assert.equal(first.path, path.join(tmp, 'flow', 'conversation-worktrees', 'repo', 'aaaa1111'));
   assert.deepEqual(first.links, ['vm']);
   assert.equal(first.hardlinks, 1);
   // Material is shared, not copied: a write through the link lands in the main checkout.

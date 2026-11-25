@@ -1094,7 +1094,7 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     const input = { task: `修改 ${path.join(root, 'src', 'a.txt')} 并补测试`, acceptance, write: true, scope: ['src'] };
     const h = harness({ config });
     const run = await h.tools.codex_run.execute(input, as('session-0a0a0a0a-1'));
-    const wt = path.join(base, 'worktree-space', 'repo', '0a0a0a0a');
+    const wt = path.join(base, 'conversation-worktrees', 'repo', '0a0a0a0a');
     assert.equal(option(h.start().argv, '--cwd'), wt);
     assert.deepEqual([h.payload().context.routing.worktree_path, h.payload().context.routing.worktree_branch, h.payload().context.routing.worktree_repo], [wt, 'conv/0a0a0a0a', root]);
     assert.ok(h.payload().prompt.includes(path.join(wt, 'src', 'a.txt')) && !h.payload().prompt.includes(path.join(root, 'src', 'a.txt')));
