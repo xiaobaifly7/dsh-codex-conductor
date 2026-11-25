@@ -110,3 +110,29 @@ test('a main checkout full of untracked files, a detached HEAD or another branch
   assert.deepEqual((await mergeWorktree({ repo: root, ...opened })).reason, 'worktree_dirty');
   assert.equal((await closeWorktree({ repo: root, ...opened })).reason, 'worktree_dirty');
 });
+
+test('closing moves output only the worktree holds back into the main checkout, and stops rather than overwrite a different copy', async () => {
+  const root = repo('keep');
+  const opened = await openWorktree({ repo: root, owner: 'session-eeee5555-0', maxUntracked: 10 });
+  // git worktree remove deletes ignored files with the worktree; these exist only there.
+  writeFileSync(path.join(opened.path, 'src', 'scan.bin'), 'scan output\n');
+  mkdirSync(path.join(opened.path, 'src', 'dump'));
+  writeFileSync(path.join(opened.path, 'src', 'dump', 'one.bin'), 'dump\n');
+  const closed = await closeWorktree({ repo: root, ...opened });
+  assert.deepEqual([closed.status, closed.moved_back], ['closed', 2]);
+  assert.equal(readFileSync(path.join(root, 'src', 'scan.bin'), 'utf8'), 'scan output\n');
+  assert.equal(readFileSync(path.join(root, 'src', 'dump', 'one.bin'), 'utf8'), 'dump\n');
+  assert.equal(readFileSync(path.join(root, 'src', 'blob.bin'), 'utf8'), 'ignored file\n', 'the untouched hard link is the same file');
+
+  // A tool that rewrites the hard-linked file by replacing it leaves two different copies: keep both, close nothing.
+  const other = await openWorktree({ repo: root, owner: 'session-ffff6666-0', maxUntracked: 10 });
+  assert.ok(lstatSync(path.join(other.path, 'src', 'dump')).isSymbolicLink(), 'a directory ignored by a file rule is linked whole');
+  rmSync(path.join(other.path, 'src', 'blob.bin'));
+  writeFileSync(path.join(other.path, 'src', 'blob.bin'), 'rewritten in the worktree\n');
+  const blocked = await closeWorktree({ repo: root, ...other });
+  assert.deepEqual([blocked.status, blocked.reason, blocked.files], ['blocked', 'ignored_clash', ['src/blob.bin']]);
+  assert.equal(readFileSync(path.join(other.path, 'src', 'blob.bin'), 'utf8'), 'rewritten in the worktree\n');
+  assert.equal(readFileSync(path.join(root, 'src', 'blob.bin'), 'utf8'), 'ignored file\n');
+  rmSync(path.join(other.path, 'src', 'blob.bin'));
+  assert.equal((await closeWorktree({ repo: root, ...other })).status, 'closed');
+});

@@ -573,7 +573,7 @@ worktree:
 - 被 `.gitignore` 忽略的资料不进 worktree：忽略的目录用目录联接（junction）、忽略的单个文件用硬链接接进来，与原目录共用、不复制。所以先把工具、虚拟机磁盘、数据库、依赖和大件产出写进 `.gitignore`，再把要协作的代码和笔记提交进 git。
 - 写入单成功后，runner 在 worktree 里自动提交。Codex 在 WSL 里核验时，runner 设好 `GIT_DIR` 和 `GIT_WORK_TREE`，WSL 的 git 才认得 Windows 建的 worktree。
 - 本对话在这个 worktree 里没有在跑的单、完成的写入单都记为 verified 或 accepted_deviations 后，`codex_review` 结案时自动合并回原分支：先用 `git merge-tree` 试合并；有冲突就把冲突放进本对话的 worktree，派单解决后再核验、再合并，原目录不动；原目录不在原分支、暂存区有改动，或有与这次合并重叠的未提交文件时不合并，回执说明怎么处理。合并用 `--no-ff`，合并后 worktree 快进到最新。
-- 收尾用 `codex_worktree action=close`：先合并，再拆链接、`git worktree remove`（不加 `--force`）、`git branch -d`。插件从不运行 `git worktree prune`，也不替用户放弃改动。
+- 收尾用 `codex_worktree action=close`：先合并，再把只在 worktree 里的被忽略文件（扫描结果、日志等，`git worktree remove` 会连它们一起删）移回原目录同一位置，再拆链接、`git worktree remove`（不加 `--force`）、`git branch -d`。原目录同一位置已有另一份时不覆盖，收尾停下并列出这些文件（`ignored_clash`）。只因文件规则（如 `*.bin`）被忽略的目录整个接成联接。插件从不运行 `git worktree prune`，也不替用户放弃改动。
 
 ## 单独使用 runner
 
@@ -878,7 +878,7 @@ worktree:
 - Material ignored by `.gitignore` is not copied: ignored directories are linked in with directory junctions and ignored single files with hard links, shared with the main checkout. So put tools, VM disks, databases, dependencies and bulky output in `.gitignore` first, and commit the code and notes you work on together.
 - After a write job completes, the runner commits in the worktree. When Codex verifies from WSL, the runner sets `GIT_DIR` and `GIT_WORK_TREE`, because WSL git cannot follow a worktree that Windows git created.
 - Once the conversation has no running job in the worktree and its completed write jobs are recorded verified or accepted_deviations, closing a `codex_review` merges back automatically. It trial-merges with `git merge-tree` first. A conflict goes into the conversation's worktree to be resolved by a job, verified and merged again, leaving the main checkout untouched. The merge does not happen while the main checkout is on another branch, has staged changes, or has uncommitted files that overlap the merge; the receipt says what to do. It merges with `--no-ff` and fast-forwards the worktree afterwards.
-- `codex_worktree action=close` finishes: merge, remove the links, `git worktree remove` (no `--force`), `git branch -d`. The plugin never runs `git worktree prune` and never discards changes for the user.
+- `codex_worktree action=close` finishes: merge, move ignored files that exist only in the worktree (scan output, logs; `git worktree remove` deletes them) back to the same place in the main checkout, remove the links, `git worktree remove` (no `--force`), `git branch -d`. When the main checkout already holds a different copy there, nothing is overwritten and close stops with the list (`ignored_clash`). A directory ignored only by a file rule (such as `*.bin`) is linked whole. The plugin never runs `git worktree prune` and never discards changes for the user.
 
 ### Task lifecycle
 
