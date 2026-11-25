@@ -4395,8 +4395,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (args.write !== true) return undefined;
       const key = worktreeKey(owner, repo);
       const jobs = await ownerJobs(owner, signal).catch(() => undefined);
-      // 已经在原目录里干过活的对话留在原目录：换到 worktree 会看不到它之前写的东西。
-      const earlier = jobs?.some(job => typeof job.cwd === 'string' && within(job.cwd, repo));
+      // 已经在原目录里写过东西的对话留在原目录：换到 worktree 会看不到它之前写的东西。只读过的不算：
+      // 新对话常先派只读单看代码再动手，算进去就永远开不了 worktree（2026-11-26）。
+      const earlier = jobs?.some(job => job?.context?.write === true && [job.cwd, ...(job.scope_paths ?? [])]
+        .some(p => typeof p === 'string' && within(p, repo)));
       let entry;
       if (!jobs || earlier) {
         entry = { status: 'shared', repo, reason: jobs ? '本对话之前已在原目录里派过单，继续在原目录工作' : '查不到本对话的派单记录，本单先在原目录执行' };

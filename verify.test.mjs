@@ -1109,14 +1109,20 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     assert.equal(option(rework.start().argv, '--cwd'), path.join(wt, 'src'));
     assert.equal(rework.payload().context.routing.worktree_path, wt);
 
-    // A conversation that already worked in the main checkout stays there; a read-only first job opens nothing.
-    const old = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: path.join(root, 'src'), context: { owner: 'session-0b0b0b0b-1' } }], total: 1 }) });
+    // A conversation that already wrote in the main checkout stays there; a read-only first job opens nothing.
+    const old = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: base,
+      scope_paths: [path.join(root, 'src')], context: { owner: 'session-0b0b0b0b-1', write: true } }], total: 1 }) });
     const stayed = await old.tools.codex_run.execute(input, as('session-0b0b0b0b-1'));
     assert.equal(option(old.start().argv, '--cwd'), root);
     assert.match(JSON.stringify(stayed), /本对话在原目录/);
     const reader = harness({ config });
     await reader.tools.codex_run.execute({ ...input, write: false }, as('session-0c0c0c0c-1'));
     assert.equal(option(reader.start().argv, '--cwd'), root);
+    // Only earlier writes keep a conversation in the main checkout: reading the repository first still opens a worktree.
+    const looked = harness({ config, listed: () => ({ jobs: [{ job_id: 'READ-1', status: 'completed', cwd: root,
+      context: { owner: 'session-0d0d0d0d-1', write: false } }], total: 1 }) });
+    await looked.tools.codex_run.execute(input, as('session-0d0d0d0d-1'));
+    assert.equal(option(looked.start().argv, '--cwd'), path.join(base, 'conversation-worktrees', 'repo', '0d0d0d0d'));
 
     // Merge gate: nothing merges while a job in the worktree runs or a completed write is not verified.
     writeFileSync(path.join(wt, 'src', 'a.txt'), 'changed in the worktree\n');
