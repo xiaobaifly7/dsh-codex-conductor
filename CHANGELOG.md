@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.186` 原任务全部受阻、没有任何改动或可核验结果时，codex_review 对 accepted_deviations 的回执不再给「① 先派 codex_verify 核验后再记」这条路，只留续接、用户确认和改记 needs_changes。这种单 codex_verify 本来就拒绝核验（「原任务受阻，未记录改动或可核验结果」），回执却叫规划端先去核验：2026-11-25 12:51–13:03 ae0c16c3 结案 f76c9a（8 条全 blocked、0 文件）时，在 accepted_deviations 和 codex_verify 之间来回被拒 6 次、约 12 分钟，最后才改记 needs_changes。
+
 `0.9.185` 0.9.181 的抽查回执第 ② 条改为「改记 needs_changes 并把不属实结论所在的验收项标 not_met」。原来只写「改记 needs_changes」，而另一条护栏规定所有验收项都 met、又没有阻塞和偏差时不能记 needs_changes，照回执做会被拒：2026-11-25 11:49 ae0c16c3 结案 f056fa 时因此多被拒两次，第三次标了 not_met 才通过。
 
 `0.9.184` 全新的 Gemini 任务报「model … is not recognized as a known model」时，如果这个账号 24 小时内刚用同一模型跑成过一单，也按 0.9.173 的续跑情形处理：记 transient、在原有重试次数内重试，归还租约时报「agy 没能加载模型列表、账号并未拒绝」，dsh-agy-link 不再把账号排除。runner 在每单成功后记下「账号|模型」和时间（runner 主目录的 agy-model-ran.json）。原因：2026-11-25 06:19–07:02 访问 Google 接口拉模型列表再次失败，这次失败的都是全新任务，0.9.173 只认续跑，7 单被判 provider_permanent；dsh-agy-link 看到原话把唯一还有周额度的账号排除，之后新派的单因「没有可选账号」立即失败，一个会话的目标因此被标为 block。07:04 列表恢复后同一账号照常跑完。从没在这个账号跑成过该模型的全新任务仍照原样处理。
@@ -267,6 +269,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.186` When the original task is blocked with no change or verifiable result, the codex_review receipt for accepted_deviations no longer offers "① run codex_verify first, then record", leaving continuation, user confirmation and needs_changes. codex_verify refuses such a job ("blocked, no change or verifiable result recorded"), yet the receipt sent the planner there: on 2026-11-25 12:51–13:03 ae0c16c3 closing f76c9a (8 rows blocked, no files) bounced between accepted_deviations and codex_verify 6 times over about 12 minutes before recording needs_changes.
 
 `0.9.185` Option ② of the 0.9.181 sample receipt now reads "record needs_changes and mark the item holding the untrue conclusion not_met". It used to say only "record needs_changes", but another check rejects needs_changes when every item is met with no blocker or deviation, so following the receipt was refused: on 2026-11-25 11:49 ae0c16c3 closing f056fa was rejected twice more for this and passed on the third try once it marked an item not_met.
 

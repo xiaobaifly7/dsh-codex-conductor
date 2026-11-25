@@ -247,7 +247,8 @@ export function prepareReview(args, source) {
       const where = c.row ? `报告第 ${c.row} 行（对不上验收清单）` : `报告第 ${c.index} 条`;
       const running = source.runningVerification ? `核验 ${source.runningVerification} 正在跑，等它结束再记；` : '';
       problems.push(running + `Codex ${where}为 ${original ?? c.status}，accepted_deviations 接受它未满足需要依据（规划端判断不算）：` +
-        `① ${deferralPath([source.job_id])}，核验看过这一条后再记；` +
+        // codex_verify refuses a blocked job with nothing to verify, so do not offer it there.
+        (source.noVerification ? '' : `① ${deferralPath([source.job_id])}，核验看过这一条后再记；`) +
         (strict ? '' : `② codex_continue ${source.job_id} 再试一次这一条；`) +
         '③ 作业结束后用户的确认；④ 改记 needs_changes');
     }

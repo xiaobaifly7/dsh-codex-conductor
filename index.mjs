@@ -4107,7 +4107,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         try { supports = await criterionSupport(source, owner, log, exec?.signal, checkOpen); } catch { exec?.signal?.throwIfAborted(); }
       }
       const plannerDecides = cfg.ownerDecisions === 'planner' && ['accepted_deviations', 'needs_changes'].includes(args.status);
-      const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, historicalGapReview: cfg.historicalGapReview, ...supports });
+      const prepared = prepareReview(args, { ...source, evidenceLevel: level, openLevel, historicalGapReview: cfg.historicalGapReview, ...supports,
+        noVerification: cfg.verificationReuse && withoutVerificationProduct(source) });
       if (args.status === 'verified') {
         const sample = await sampleNotMet(source, owner, exec?.signal).catch(() => { exec?.signal?.throwIfAborted(); });
         if (sample && !(typeof args.notes === 'string' && args.notes.includes(`sample:${sample.job_id}`))) {

@@ -8689,3 +8689,14 @@ test('watchdog top-ups, plugin-sent messages and auto-answers are not a user rep
     assert.equal(hasUserReply([at(data)], job, 'S1', '自动续接'), false, JSON.stringify(data));
   }
 });
+
+test('the accepted-open receipt offers codex_verify only when the blocked job left something to verify', async (t) => {
+  const { source, review, setup, exec } = decisionFixture(t, 'environment');
+  const submit = () => setup({ ownerDecisions: 'owner', plannerAnswers: true, acceptOpenEvidence: 'relaxed' }).tools.codex_review.execute(review, exec);
+  // 2026-11-25 f76c9a: all rows blocked, no files; the receipt sent the planner to codex_verify, which refused it three times.
+  Object.assign(source, { files_changed: [], files_changed_total: 0, structured: { ...source.structured, files_changed: [] } });
+  await assert.rejects(submit(), error => /接受它未满足需要依据/.test(error.message) && !/派 codex_verify/.test(error.message) &&
+    /④ 改记 needs_changes/.test(error.message));
+  Object.assign(source, { files_changed: [{ path: 'docs/a.md' }], files_changed_total: 1, structured: { ...source.structured, files_changed: ['docs/a.md'] } });
+  await assert.rejects(submit(), /接受它未满足需要依据（规划端判断不算）：① 先对 \S+ 派 codex_verify/);
+});
