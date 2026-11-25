@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.190` 在 runner 的 completed 出口移植 v2 拒答检测判据（新增 `REFUSED_REPLY`、`REFUSAL_REASON`、`REFUSAL_PATH`、`REFUSAL_LABEL`、`REFUSAL_SPLIT` 与 `refusal_evidence` 函数，支持 `model_refused` 阻塞项、安全边界措辞、报告字段共现与失败错误二次判定并附带两阶段拆单建议），继续补充 S1–S5 五类拒答判据（跨字段阻塞与强安全边界词、攻击性工具与隐藏来源出站边界词、`UPSTREAM_FILTER_BANNER` 非 JSON 上游过滤器横幅全文检测、上游内容过滤器连续拦截自述与受控修饰变体、非 stalled 下 `blocked` 验收项与强安全边界阻塞项判定）并经全库回测确认零误报，同时保留 `GEMINI_REFUSAL` 旧兜底与补齐拒答测试。
+
 `0.9.189` codex_model 登记前按 dsh-agy-link 的模型目录核对模型名（新配置 gemini.modelCatalog，指向 model-catalog.json）：目录里没有的（例如 Carbon 没有 xhigh 档）当场拒绝，并列出可选的 Gemini 模型，不再等到派单时 agy 报「not recognized」才发现；读不到目录时照旧只查格式。codex_summary 第一行显示本对话当前的执行模型，以及它是用户为本对话指定的还是默认的，交接出去的会话显示继承来的设置。
 
 `0.9.188` 新增 codex_model：用户在某个对话里要求换执行模型时（例如「这个对话用 carbon high」），规划端调用它为本对话指定 Gemini 模型，之后这个对话的 codex_run、codex_continue 都用这个模型，forceModel 下也生效，回执写明「本单按本对话的设置使用 …」；核验不受影响，交接出去的会话沿交接链继承。插件只认用户本人最近一条消息：要写出模型的系列名和档位（carbon、neon……；high 或「高」），插件代发、看门狗补发和其他来源的消息都不算，规划端不能自己替用户换。model=default 恢复配置的默认模型。设置存在状态目录的 session-models.json。原因：四套配置都是 lockEngine + forceModel，规划端传的 model 一律被忽略，用户 2026-11-25 想让单个对话改用 gemini-4-carbon-high 时没有办法。
@@ -275,6 +277,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.190` Ports the v2 refusal-detection criteria to the runner's completed exit (`REFUSED_REPLY`, `REFUSAL_REASON`, `REFUSAL_PATH`, `REFUSAL_LABEL`, `REFUSAL_SPLIT` and `refusal_evidence`), catching turns that finish politely with a `model_refused` blocker, safety-boundary wording, report-field co-occurrence or a refusal in a failed run's error and attaching the two-stage `REFUSAL_SPLIT` guidance while keeping the `GEMINI_REFUSAL` fallback. Adds S1–S5 gap coverage for five missed refusal shapes — cross-field blockers paired with top-level safety-boundary wording (S1), offensive-tooling and anonymized-egress boundary terms (S2), full-text `UPSTREAM_FILTER_BANNER` checks on non-JSON upstream filter replies (S3), self-reported consecutive upstream content-filter blocks and qualified Chinese refusal variants (S4), and non-stalled runs that still carry `blocked` criteria with a `model_refused` or strong safety-boundary blocker (S5) — verified with zero false positives across finished jobs, together with the matching refusal and counterexample tests.
 
 `0.9.189` codex_model checks the model name against the dsh-agy-link model catalog before saving it (new setting gemini.modelCatalog, pointing at model-catalog.json). A name the catalog lacks, such as Carbon with xhigh, is refused at once with the Gemini choices listed, instead of surfacing later as agy's "not recognized" on dispatch. Without a readable catalog it still checks the format only. The first line of codex_summary shows the conversation's current execution model and whether the user set it for this conversation or it is the default. A handed-over session shows the setting it inherited.
 
