@@ -1356,3 +1356,58 @@ test('while the old session writes its summary every tool is refused, the retire
   const other = { ...agent, id: 'session-O' };
   assert.equal((await execute({ name: 'pwsh', arguments: {}, agent: other }, async () => ({ value: 'ran' }))).value, 'ran');
 });
+
+test('the history tracker remembers that the user stopped a session until the user speaks, a goal is resumed or created, or the operator asks to resume', async (t) => {
+  const { createHistoryTracker } = await import('./handover.mjs');
+  const tracker = createHistoryTracker({ directory: dir(t), threshold: () => 0 });
+  const log = [{ type: 'turn/start' }, { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }];
+  const agent = { id: 'session-S', session: { log } };
+  assert.equal(tracker.observe(agent).userStopped, true);
+  // 任务通知和宿主关闭都不算用户的意思。
+  log.push({ type: 'turn/start' }, userEvent('任务完成', 1, 'tool-jobs'), { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'disposed' } } } });
+  assert.equal(tracker.observe(agent).userStopped, true);
+  log.push({ type: 'goal/change', data: { operation: 'resume' } });
+  assert.equal(tracker.observe(agent).userStopped, undefined);
+  log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }, userEvent('接着做', 2));
+  assert.equal(tracker.observe(agent).userStopped, undefined);
+  const relay = userEvent('继续', 3);
+  relay.data.source.via = 'codex-conductor';
+  log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }, relay);
+  assert.equal(tracker.observe(agent).userStopped, undefined);
+});
+
+test('after the user stops a session, job notices alone do not wake it; they reach the model with the next human message', async (t) => {
+  const appData = dir(t);
+  mkdirSync(path.join(appData, 'dsh-codex-conductor'));
+  const { apply } = await import('./index.mjs');
+  const handlers = {};
+  const previous = process.env.LOCALAPPDATA;
+  try {
+    process.env.LOCALAPPDATA = appData;
+    apply({ tools: { register() {}, guard() {} }, on(name, handler) { (handlers[name] ??= []).push(handler); } },
+      { workspaces: ['*'], autoVerify: 'off' }, async () => ({ status: 'completed', paths: [] }));
+  } finally {
+    if (previous === undefined) delete process.env.LOCALAPPDATA;
+    else process.env.LOCALAPPDATA = previous;
+  }
+  // 按注册顺序串起全部 pre-step 处理器，末端照宿主默认放行。
+  const preStep = (agent, messages) => {
+    const run = (i) => (i < handlers['agent/pre-step'].length
+      ? handlers['agent/pre-step'][i]({ agent, step: 1, messages }, () => run(i + 1))
+      : Promise.resolve({ kind: 'enter', messages }));
+    return run(0);
+  };
+  const notice = { id: 'n1', role: 'user', content: [{ type: 'text', text: '后台任务 J1 已完成' }], source: { kind: 'tool-jobs', form: 'notice' } };
+  const stopped = { id: 'session-S', status: 'running', session: { header: { cwd: '/w' },
+    log: [{ type: 'turn/start' }, { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }, { type: 'turn/start' }] } };
+  assert.equal((await preStep(stopped, [notice])).kind, 'reject');
+  const human = { id: 'h1', role: 'user', content: [{ type: 'text', text: '现在什么情况' }], source: { kind: 'user' } };
+  const entered = await preStep(stopped, [human]);
+  assert.equal(entered.kind, 'enter');
+  assert.deepEqual(entered.messages.map((m) => m.id), ['h1', 'n1']);
+  assert.deepEqual((await preStep(stopped, [{ ...human, id: 'h2' }])).messages.map((m) => m.id), ['h2'], 'delivered once');
+  // 没被用户停止的会话照常被通知叫醒。
+  const idle = { id: 'session-I', status: 'running', session: { header: { cwd: '/w' },
+    log: [{ type: 'turn/start' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } }, { type: 'turn/start' }] } };
+  assert.equal((await preStep(idle, [notice])).kind, 'enter');
+});

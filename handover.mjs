@@ -1024,11 +1024,18 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       const tokens = promptTokens(log[i]);
       if (tokens) entry.prompts = [...entry.prompts.slice(1 - FLOOR_WINDOW), tokens];
       // 自动交接据此避开用户正在对话的时候：最后一条人工消息的时间，以及当前回合里是否有人工消息。
-      if (log[i]?.type === 'turn/start') entry.turnHuman = false;
-      else if (humanInstruction(log[i])) {
+      const event = log[i];
+      if (event?.type === 'turn/start') entry.turnHuman = false;
+      // 用户点了停止：直到他再发话、恢复或新建目标、或操作员明确请求续接，这个会话都算“用户叫停的”。
+      else if (event?.type === 'turn/end') {
+        if (event.data?.reason?.kind === 'aborted' && event.data.reason.reason?.kind === 'user') entry.userStopped = true;
+      } else if (event?.type === 'goal/change') {
+        if (['resume', 'create'].includes(event.data?.operation)) entry.userStopped = false;
+      } else if (humanInstruction(event)) {
         entry.turnHuman = true;
-        if (Number.isFinite(log[i].time)) entry.lastHumanAt = log[i].time;
-      }
+        entry.userStopped = false;
+        if (Number.isFinite(event.time)) entry.lastHumanAt = event.time;
+      } else if (event?.type === 'user/message' && event.data?.source?.via === 'codex-conductor') entry.userStopped = false;
     }
     entry.scanned = log.length;
     counts.set(log, entry);
@@ -1055,7 +1062,8 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       const { messages, prompts } = entry;
       const limit = threshold();
       const value = { messages, threshold: limit, suggest: limit > 0 && messages > limit,
-        ...(entry.lastHumanAt !== undefined ? { lastHumanAt: entry.lastHumanAt } : {}), ...(entry.turnHuman ? { turnHuman: true } : {}) };
+        ...(entry.lastHumanAt !== undefined ? { lastHumanAt: entry.lastHumanAt } : {}), ...(entry.turnHuman ? { turnHuman: true } : {}),
+        ...(entry.userStopped ? { userStopped: true } : {}) };
       const floorLimit = contextThreshold();
       // 子代理读大文件时上下文同样会很大，但它们不交接。
       if (floorLimit > 0 && agent.session?.header?.origin !== 'subagent') {
