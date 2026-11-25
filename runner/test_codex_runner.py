@@ -6993,6 +6993,48 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(b"sub/a.txt", scoped[1])
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_verification_digest_can_skip_the_whole_status(self):
+        import codex_runner
+        _, project, _ = self.git_repo("digest-whole-skip")
+        (project / "a.txt").write_bytes(b"dirty\n")
+        real = codex_runner.git
+
+        def no_whole(cwd, *argv, **options):
+            if "status" in argv and "--literal-pathspecs" not in argv:
+                raise AssertionError("whole-repository status ran")
+            return real(cwd, *argv, **options)
+
+        paths = [str(project / "a.txt")]
+        with mock.patch.object(codex_runner, "git", no_whole):
+            whole, scoped, _ = codex_runner.verification_git_digest(str(project), paths, whole=False)
+        self.assertIsNone(whole)
+        self.assertEqual(scoped, codex_runner.verification_git_digest(str(project), paths)[1])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_skips_a_whole_status_known_to_time_out(self):
+        import codex_runner
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        home.mkdir(parents=True, exist_ok=True)
+        for known_slow in (False, True):
+            with self.subTest(known_slow=known_slow):
+                _, project, _ = self.git_repo(f"verification-whole-{known_slow}")
+                key = codex_runner.WHOLE_TOO_SLOW + codex_runner.tree_key(str(project))
+                (home / codex_runner.TOO_BIG_FILE).write_text(json.dumps({key: time.time()} if known_slow else {}))
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode="warnings_then_ok", prompt=prompt)
+                finally:
+                    shutil.rmtree(home / "jobs" / "SOURCE")
+                self.assertEqual(result["status"], "completed", result)
+                # A small repository answers the whole status at both ends unless it is marked as too slow for it.
+                self.assertEqual(result.get("verification_outside_scope"), "unchecked" if known_slow else None, result)
+                cache = json.loads((home / codex_runner.TOO_BIG_FILE).read_text())
+                self.assertEqual(key in cache, known_slow, cache)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_review_fix_host_verification_checks_dirty_bytes(self):
         prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})

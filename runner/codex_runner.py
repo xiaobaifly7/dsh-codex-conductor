@@ -1575,6 +1575,9 @@ TOO_BIG_TTL = 7 * 86400
 # Hashing a tree for a diff can exceed its budget where the stat-only snapshot does not, so it has its own entry.
 DIFF_TOO_BIG = "diff:"
 SCOPE_TOO_BIG = "scope:"
+# A verification's whole-repository status that ran out of its budget: later verifications there skip it at both ends.
+# On F:/渗透 it timed out on every one of 46 verifications (2026-11-25 afternoon), 28-31 s at each end for no result.
+WHOLE_TOO_SLOW = "whole:"
 SCOPE_SLOW_S = 5  # a scope entry that alone takes longer than this to walk is skipped on later jobs
 DIFF_BUDGET = 20
 LATE_DIFF_BUDGET = 4  # per step, twice per late diff: a status query must stay quick
@@ -1936,7 +1939,7 @@ def forget_too_big(cwd):
     # Scope paths under the tree are remembered under both prefixes.
     keys = [k for k in data if k == root or any(
         k.startswith(prefix) and (k[len(prefix):] == root or k[len(prefix):].startswith(root.rstrip(os.sep) + os.sep))
-        for prefix in (SCOPE_TOO_BIG, DIFF_TOO_BIG))]
+        for prefix in (SCOPE_TOO_BIG, DIFF_TOO_BIG, WHOLE_TOO_SLOW))]
     if not keys:
         return had_index
     for key in keys:
@@ -2283,7 +2286,7 @@ def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
     return hashes, unchecked
 
 
-def verification_git_digest(cwd, paths, *, budget=30, strict=False):
+def verification_git_digest(cwd, paths, *, budget=30, strict=False, whole=True):
     deadline = time.monotonic() + budget
 
     def digest(query):
@@ -2308,11 +2311,11 @@ def verification_git_digest(cwd, paths, *, budget=30, strict=False):
         checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
         # Whole-repository status only feeds the outside-the-scope warning, so it runs last and may give up: on a /mnt
         # repository with many untracked files it took 39 s alone and timed the scoped check out with it (2026-11-23).
-        whole = None
-        if not strict:
+        status = None
+        if not strict and whole:
             with suppress(subprocess.TimeoutExpired):
-                whole = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS, until=deadline - 2)).digest()
-        return whole, (checksum, hashes), unchecked
+                status = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS, until=deadline - 2)).digest()
+        return status, (checksum, hashes), unchecked
 
     return git_on_tree(cwd, deadline, digest, raise_errors=True)
 
@@ -2630,9 +2633,11 @@ def execute(args, prompt, run_dir):
     declared_paths = verification_paths(context, args.cwd) if host_verification else []
     paths = declared_paths or [args.cwd]
 
-    def take_snapshot(stage):
+    whole_known_slow = host_verification and WHOLE_TOO_SLOW + tree_key(args.cwd) in too_big_trees()
+
+    def take_snapshot(stage, whole):
         try:
-            digest = verification_git_digest(args.cwd, paths)
+            digest = verification_git_digest(args.cwd, paths, whole=whole)
         except subprocess.TimeoutExpired:
             return None, f"{stage}_timeout"
         except (OSError, ValueError):
@@ -2641,7 +2646,9 @@ def execute(args, prompt, run_dir):
             return None, f"{stage}_error"
         return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
 
-    before_digest, before_reason = take_snapshot("before") if host_verification else (None, None)
+    before_digest, before_reason = take_snapshot("before", not whole_known_slow) if host_verification else (None, None)
+    if before_digest is not None and before_digest[0] is None and not whole_known_slow:
+        remember_too_big(args.cwd, WHOLE_TOO_SLOW)  # a usable before-digest without a whole status means it timed out
     verification_scope = (context.get("routing") or {}).get("verification_scope") if verification else None
     version_source = job_status(context["verification_of"]) if isinstance(verification_scope, str) else None
     before_version = verification_version(version_source) if version_source else None
@@ -2651,7 +2658,9 @@ def execute(args, prompt, run_dir):
             result.update(verification_version=before_version, verification_scope=verification_scope)
         if not host_verification:
             return result
-        after_digest, reason = take_snapshot("after") if before_digest is not None else (None, before_reason)
+        # Without a whole status from before there is nothing to compare one from after with.
+        after_digest, reason = take_snapshot("after", before_digest[0] is not None) if before_digest is not None \
+            else (None, before_reason)
         if reason:
             result.update(verification_integrity="unavailable", verification_integrity_reason=reason)
         else:
