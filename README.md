@@ -106,6 +106,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.203：查旧会话原文一步到位
+
+11-26 实测交接后问继任会话以前的细节，它答对了，但先去搜整个交接目录被护栏当原料拒绝，转而派了 4 单任务去读、核验，用了 5 分钟。现在规划端搜或读交接目录时，拒绝说明直接列出本会话链能读的原文和用户指令档案（别的会话链的不列），让它按文件重试；交接单“旧会话原文”一节写上调用示例（`grep(pattern="关键词", path="<最近的原文文件>")`），并说明这些文件自己就能读，不必派任务。
+
 ### 0.9.202：交接后旧会话的原文随时可查
 
 交接单和旧会话写的摘要都是概括，难免漏掉细节。现在每次交接，插件把旧会话的完整对话导出成纯文本（状态目录 `handovers/transcript-<会话号>.md`）：用户原话、助手回复、插件代发的消息、交接单和任务通知保留全文，工具调用的参数和结果留开头 300 字符（向用户提问的问题和用户的回答保留全文），宿主每步注入的技能、记忆召回、规则提示不收。0.9.202 之前交接的前任没有原文，下一次交接时从宿主的会话记录补写。
@@ -748,6 +752,10 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.203: Looking up the predecessor's transcript takes one step
+
+In the 11-26 live test the successor answered questions about earlier details correctly, but it first searched the whole hand-over folder, was refused as raw material, and sent 4 jobs to read and verify instead, taking 5 minutes. Now a planner read or search of the hand-over folder is refused with the list of files its own chain may read (the instruction archive and every predecessor's transcript, nothing from other chains), so it retries on those files; the brief's transcript section gives a call example (`grep(pattern="keyword", path="<newest transcript>")`) and says the files can be read directly, without a job.
 
 ### 0.9.202: The predecessor's full transcript stays readable after a hand-over
 
