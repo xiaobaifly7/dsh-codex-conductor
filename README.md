@@ -236,6 +236,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效；`action=doctor` 检查 Python、Codex、登录文件和路由；WSL 额外检查 bash，Windows 原生模式预检私有 Codex 沙箱。两种模式均不调用模型 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 | `codex_model` | 配置 `gemini` 后才注册；用户在某个对话里要求换执行模型时，规划端用它为本对话（含交接出去的会话）的 Gemini 执行和续接指定模型（如 `gemini-4-carbon-high`），`forceModel` 下也生效；核验不受影响。用户最近一条亲自发的消息里要写出系列名和档位（如「carbon high」），否则拒绝；`default` 恢复默认。配置了 `gemini.modelCatalog` 时只接受模型目录里的模型。`codex_summary` 第一行显示本对话当前的执行模型。设置存在状态目录的 `session-models.json` |
+| `codex_worktree` | 配置 `worktree.repos` 后才注册。平时不用调用：新对话在这些仓库里的写入单自动放进本对话专用的 worktree，核验通过后自动合并（见「对话 worktree」）。`status` 查看本对话的 worktree、未合并的提交和上次合并结果；`merge` 在冲突解决或原目录处理好后重试合并；`close` 在本对话收尾时先合并，再拆资料链接、删除 worktree 和已合并的分支。记录存在状态目录的 `session-worktrees.json` |
 
 ### 任务生命周期
 
@@ -356,7 +357,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 
 ### 工作区护栏
 
-十一个 Codex 工具始终注册；`gemini_write` 和 `codex_model` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
+十一个 Codex 工具始终注册；`gemini_write` 和 `codex_model` 仅在配置 `gemini` 后注册，并作为受控写入通道在护栏内放行；`codex_worktree` 仅在配置 `worktree.repos` 后注册。`workspaces` 只控制护栏。会话工作区在配置范围内时，以下规则生效。Linux 原生路径也受支持，`workspaces: ["/"]` 覆盖原生 Linux 根目录及其子目录，`scope` 也可使用 `/`；Windows 盘符及 `/mnt/<盘符>/...` 仍按 Windows 路径匹配。
 
 需要 DeepSeek 自己动手时，在该会话里输入 `/conductor on`（也可写成 `/conductor direct on`，中间的词拼错不影响，也认“开”“关”“状态”）：这个会话不再受护栏限制，也不注入规划要求，派 Codex / Gemini 的工具照样可用；`/conductor off` 恢复，`/conductor status` 查看。设置按会话记在状态目录的 `direct-sessions.json`，重启后保持，交接出的继任会话沿用前任的设置；其他会话不受影响。默认是规划模式。中途切换时，切换后的下一条用户消息会附一条模式说明，直接执行模式下系统提示词也写明当前模式，长对话不会照着前面的做法继续。
 
@@ -555,6 +556,24 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 成功与拒读提示统一为：“该正文由 gemini_write 写出，规划端不读取。下一步派一单 codex_run（write=true，scope 只含该正文文件），在同一单里核对事实与可读性、就地修正写法问题和句子级错误，报告问题位置和改动；不要另派只读核对或清理单，也不要换工具、搜索或命令绕读。”任务须对照本次 `output` 与本次 `sources` 及原验收要求。对旧素材任务重跑 `codex_verify` 不能替代本次正文核对；已有核对结果且正文未变、没有新证据时，不再为了核验核对报告另派任务。`gemini_write` 是前台调用，不对它使用 `codex_status`；核对用的 Codex 任务遵循上述本轮长等规则。
 
 向用户用大白话说明完成内容、核对结果和剩余问题；执行结束尚未验收时说“已经做完，正在核对”。无需附任务号、线程号或内部状态名，用户要求排查时再提供。
+
+### 对话 worktree（默认关闭）
+
+几个对话同时改同一个仓库时，可以让每个新对话在自己的 git worktree 里工作，做完再合并回去：
+
+```yaml
+worktree:
+  repos:
+    - 'D:\work\opsec'
+  root: ''          # 留空时建在仓库旁的 worktree-space 目录：D:\work\worktree-space\opsec\<会话号>
+  maxUntracked: 200 # 原目录里既没纳入 git 也没被忽略的文件超过这个数时，不开 worktree
+```
+
+- 新对话第一次往这些仓库派写入单时，插件从原目录当前分支开一个 worktree（分支 `conv/<会话号>`），之后本对话的单都在那里执行和核验。任务书照常写原仓库路径，插件把 cwd、scope、writable_roots 和任务书里的路径换成 worktree 路径。只读单不会开 worktree；已经在原目录里派过单的对话继续留在原目录。
+- 被 `.gitignore` 忽略的资料不进 worktree：忽略的目录用目录联接（junction）、忽略的单个文件用硬链接接进来，与原目录共用、不复制。所以先把工具、虚拟机磁盘、数据库、依赖和大件产出写进 `.gitignore`，再把要协作的代码和笔记提交进 git。
+- 写入单成功后，runner 在 worktree 里自动提交。Codex 在 WSL 里核验时，runner 设好 `GIT_DIR` 和 `GIT_WORK_TREE`，WSL 的 git 才认得 Windows 建的 worktree。
+- 本对话在这个 worktree 里没有在跑的单、完成的写入单都记为 verified 或 accepted_deviations 后，`codex_review` 结案时自动合并回原分支：先用 `git merge-tree` 试合并；有冲突就把冲突放进本对话的 worktree，派单解决后再核验、再合并，原目录不动；原目录不在原分支、暂存区有改动，或有与这次合并重叠的未提交文件时不合并，回执说明怎么处理。合并用 `--no-ff`，合并后 worktree 快进到最新。
+- 收尾用 `codex_worktree action=close`：先合并，再拆链接、`git worktree remove`（不加 `--force`）、`git branch -d`。插件从不运行 `git worktree prune`，也不替用户放弃改动。
 
 ## 单独使用 runner
 
@@ -842,6 +861,24 @@ In guarded workspaces, successful generated and reused prose is registered by se
 Success and read-denial guidance both delegate one `codex_run` task with `write=true` and `scope` containing only the prose file; the planner does not read it. In that same task, check this invocation's output against its sources and original acceptance criteria for facts and readability, fix wording and sentence-level errors in place, and report locations and changes. Do not dispatch separate read-only checks or cleanup tasks, or bypass the read guard with other tools, searches or commands. Re-running `codex_verify` on an old material job cannot replace checking the new prose. Once that check exists, do not dispatch another task merely to verify its report unless the prose changes or new evidence appears. `gemini_write` is a foreground call, so do not use `codex_status` for Gemini itself; its Codex checking task follows the same-turn waiting rules below.
 
 Explain completed work, check results and remaining gaps in plain language. If execution has finished but acceptance is pending, say “The work is finished; I am checking it.” Job IDs, thread IDs and internal state names are unnecessary unless the user asks for diagnostics.
+
+### Conversation worktrees (off by default)
+
+When several conversations change the same repository, each new conversation can work in its own git worktree and merge back when done:
+
+```yaml
+worktree:
+  repos:
+    - 'D:\work\opsec'
+  root: ''          # empty: next to the repository, D:\work\worktree-space\opsec\<session>
+  maxUntracked: 200 # more untracked, non-ignored files than this in the main checkout: no worktree
+```
+
+- A new conversation's first write job in one of these repositories opens a worktree from the checked-out branch (branch `conv/<session>`); the conversation's later jobs run and are verified there. Task text keeps naming the repository; the plugin moves cwd, scope, writable_roots and the paths in the task text into the worktree. Read-only jobs open no worktree, and a conversation that already dispatched in the main checkout stays there.
+- Material ignored by `.gitignore` is not copied: ignored directories are linked in with directory junctions and ignored single files with hard links, shared with the main checkout. So put tools, VM disks, databases, dependencies and bulky output in `.gitignore` first, and commit the code and notes you work on together.
+- After a write job completes, the runner commits in the worktree. When Codex verifies from WSL, the runner sets `GIT_DIR` and `GIT_WORK_TREE`, because WSL git cannot follow a worktree that Windows git created.
+- Once the conversation has no running job in the worktree and its completed write jobs are recorded verified or accepted_deviations, closing a `codex_review` merges back automatically. It trial-merges with `git merge-tree` first. A conflict goes into the conversation's worktree to be resolved by a job, verified and merged again, leaving the main checkout untouched. The merge does not happen while the main checkout is on another branch, has staged changes, or has uncommitted files that overlap the merge; the receipt says what to do. It merges with `--no-ff` and fast-forwards the worktree afterwards.
+- `codex_worktree action=close` finishes: merge, remove the links, `git worktree remove` (no `--force`), `git branch -d`. The plugin never runs `git worktree prune` and never discards changes for the user.
 
 ### Task lifecycle
 

@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.191` 新增对话 worktree（配置 `worktree.repos`，默认关闭）。几个对话同时改同一个仓库时，新对话第一次往配置的仓库派写入单，插件就为它开一个专用的 git worktree（分支 `conv/<会话号>`），之后本对话的单都在那里执行和核验；cwd、scope 和任务书里的原仓库路径自动换成 worktree 路径。被 `.gitignore` 忽略的资料用目录联接和硬链接共用，不复制。写入单成功后 runner 在 worktree 里自动提交（合并冲突的标记没清干净时不提交）；Codex 在 WSL 里核验时设好 `GIT_DIR`/`GIT_WORK_TREE`。本对话的单全部核验通过后，`codex_review` 结案时自动合并回原分支：先 `git merge-tree` 试合并，冲突放进本对话的 worktree 解决，原目录不在原分支、有暂存改动或与合并重叠的未提交文件时不合并并说明原因。新工具 `codex_worktree`（status / merge / close）。已在原目录里干过活的对话、只读单都不开 worktree。不跑 `git worktree prune`。合并做法借鉴 DSH 市场的 dsh-worktree-space。原因：2026-11-22 以来 F:\渗透 有 6 个对话、默认工作区有 6 个对话在同一目录同时写，用户要求同一份源码开多个互不相干的对话、做完自动合并。
+
 `0.9.190` 核验的改动检查不再把 SQLite 的 `-shm` 文件算作改动。WAL 模式的数据库只要被读取，`-shm` 共享内存索引就会被改写，里面不存数据；核验只查询了原任务产出的数据库，也会被判 verification_tree_changed。2026-11-25 17:52 核验 d8778b 就是这样失败的：唯一变动的是原任务产物 `.db-shm`，同期的三单写入都没碰到它。数据库文件本身和其他文件照旧检查。
 
 `0.9.189` codex_model 登记前按 dsh-agy-link 的模型目录核对模型名（新配置 gemini.modelCatalog，指向 model-catalog.json）：目录里没有的（例如 Carbon 没有 xhigh 档）当场拒绝，并列出可选的 Gemini 模型，不再等到派单时 agy 报「not recognized」才发现；读不到目录时照旧只查格式。codex_summary 第一行显示本对话当前的执行模型，以及它是用户为本对话指定的还是默认的，交接出去的会话显示继承来的设置。
@@ -277,6 +279,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.191` New conversation worktrees (setting `worktree.repos`, off by default). When several conversations change the same repository, a new conversation's first write job in a configured repository opens a dedicated git worktree for it (branch `conv/<session>`), and the conversation's later jobs run and are verified there; cwd, scope and repository paths in the task text move into the worktree. Material ignored by `.gitignore` is shared through directory junctions and hard links, not copied. After a write job completes, the runner commits in the worktree (not while merge-conflict markers remain), and sets `GIT_DIR`/`GIT_WORK_TREE` when Codex verifies from WSL. Once all of the conversation's jobs are verified, closing a `codex_review` merges back automatically: a `git merge-tree` trial first, conflicts resolved inside the conversation's worktree, and no merge while the main checkout is on another branch, has staged changes or has uncommitted files overlapping the merge, with the reason stated. New tool `codex_worktree` (status / merge / close). Conversations that already worked in the main checkout, and read-only jobs, open no worktree. No `git worktree prune`. The merge approach follows dsh-worktree-space from the DSH market. Why: since 2026-11-22 six conversations wrote in F:\渗透 and six in the default workspace at the same time, and the user asked for independent conversations on the same source that merge back automatically.
 
 `0.9.190` The verification change check no longer counts SQLite `-shm` files as changes. Any reader of a WAL database rewrites its `-shm` shared-memory index, which holds no data, so a verification that only queried a database the original task produced failed as verification_tree_changed. On 2026-11-25 at 17:52 verification d8778b failed this way: the only changed file was the original task's `.db-shm` product, and none of the three concurrent writes touched it. The database file itself and all other files are still checked.
 

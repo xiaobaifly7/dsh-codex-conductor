@@ -141,6 +141,9 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "log_rewrite":
         Path("logs/watch.out").write_bytes(b"rewritten and longer\n")  # grows, but its first bytes changed
         finish()
+    elif mode == "write_file":
+        Path("new.txt").write_bytes(b"written by the job\n")
+        finish()
     elif mode in ("sqlite_read", "sqlite_write"):
         # Reading a WAL database rewrites its -shm index; writing changes the database itself.
         Path("data.db-shm" if mode == "sqlite_read" else "data.db").write_bytes(b"rewritten by the verifier\n")
@@ -6620,6 +6623,48 @@ class RunnerTests(unittest.TestCase):
                                          (["sub/logs/watch.out"], "hash"))
                 finally:
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_completed_write_job_commits_in_its_conversation_worktree_but_not_over_conflict_markers(self):
+        root, _, git = self.git_repo("convwt")
+        worktree = Path(self.tmp.name).resolve() / "convwt-space" / "w"
+        git("worktree", "add", "-q", "-b", "conv/w", str(worktree))
+        in_tree = lambda *argv: subprocess.run(["git", "-C", str(worktree), "-c", "user.name=t", "-c", "user.email=t@t", *argv],
+                                               check=True, capture_output=True, text=True).stdout
+        prompt = json.dumps({"prompt": "Write a file", "context": {"owner": "S1", "task": "Write new.txt for the report",
+            "acceptance": ["write it"], "write": True, "routing": {"worktree_path": str(worktree), "worktree_branch": "conv/w"}}})
+        args = ("--context-json", "--cwd", str(worktree / "sub"), "--sandbox", "workspace-write")
+        result = self.invoke(*args, mode="write_file", prompt=prompt)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["worktree_commit"], in_tree("rev-parse", "HEAD").strip())
+        self.assertEqual(in_tree("show", "--name-only", "--format=%s", "HEAD").split(),
+                         [Path(result["log_dir"]).name + ":", "Write", "new.txt", "for", "the", "report", "sub/new.txt"])
+        self.assertEqual(in_tree("status", "--porcelain"), "")
+        # A conflict left for resolution is not committed while its markers remain, and is once they are gone.
+        (root / "sub" / "a.txt").write_bytes(b"main side\n")
+        git("commit", "-qam", "main side")
+        (worktree / "sub" / "a.txt").write_bytes(b"conversation side\n")
+        in_tree("commit", "-qam", "conversation side")
+        main = git("rev-parse", "--abbrev-ref", "HEAD").strip()
+        subprocess.run(["git", "-C", str(worktree), "-c", "user.name=t", "-c", "user.email=t@t", "merge", "--no-ff", "--no-commit", main],
+                       capture_output=True)
+        refused = self.invoke(*args, mode="write_file", prompt=prompt)
+        self.assertEqual(refused["status"], "completed", refused)
+        self.assertIn("conflict markers remain in sub/a.txt", refused["worktree_commit_error"])
+        self.assertNotIn("worktree_commit", refused)
+        (worktree / "sub" / "a.txt").write_bytes(b"both sides\n")
+        resolved = self.invoke(*args, mode="write_file", prompt=prompt)
+        self.assertEqual(len(in_tree("rev-list", "--parents", "-n", "1", resolved["worktree_commit"]).split()), 3)
+
+    def test_wsl_git_variables_follow_a_worktree_that_windows_git_created(self):
+        import codex_runner
+        worktree = Path(self.tmp.name).resolve() / "wt-from-windows"
+        (worktree / "deep").mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: C:/Users/me/repo/.git/worktrees/w\n", "utf-8")
+        expected = {} if codex_runner.IS_WIN else {"GIT_DIR": "/mnt/c/Users/me/repo/.git/worktrees/w", "GIT_WORK_TREE": str(worktree)}
+        self.assertEqual(codex_runner.linked_worktree_git_env(str(worktree / "deep")), expected)
+        (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/w\n", "utf-8")
+        self.assertEqual(codex_runner.linked_worktree_git_env(str(worktree)), {})
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_host_verification_ignores_the_sqlite_index_a_reader_rewrites(self):

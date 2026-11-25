@@ -59,11 +59,15 @@ test('entry reload queries re-evaluate helper modules', async () => {
       writeFileSync(path.join(dir, 'guard.mjs'),
         `globalThis[${JSON.stringify(traceKey)}].push('guard-${version}');\n` +
         readFileSync(new URL('./guard.mjs', import.meta.url), 'utf8'));
+      writeFileSync(path.join(dir, 'worktree.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('worktree-${version}');\n` +
+        'export const repoFor = () => undefined, within = () => false, relocate = (p) => p, relocateText = (t) => t, pathKey = (p) => p, ' +
+        'openWorktree = async () => ({}), mergeWorktree = async () => ({}), worktreeStatus = async () => ({}), closeWorktree = async () => ({});\n');
       const entry = pathToFileURL(path.join(dir, 'index.mjs'));
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'engines-new', 'engines-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'engines-new', 'engines-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old', 'worktree-new', 'worktree-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });

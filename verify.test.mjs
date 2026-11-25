@@ -1075,3 +1075,64 @@ test('the agy pool account must support the model and have quota left', async (t
   assert.deepEqual([poolAccount(file, 'gemini-4-neon-medium').id, poolAccount(file, 'gemini-4-neon-medium').dir], ['acc_primary', homedir()]);
   assert.equal(poolAccount(file, 'gemini-4-neon-medium', homedir()).id, 'acc_primary');
 });
+
+test('conversation worktree: a new conversation writes in its own worktree and merges back once its writes are verified; earlier work and reads stay put', async () => {
+  const { execFileSync } = await import('node:child_process');
+  const { mkdirSync, realpathSync } = await import('node:fs');
+  const base = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-convwt-')));
+  const git = (dir, ...args) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { encoding: 'utf8' });
+  const root = path.join(base, 'repo');
+  mkdirSync(path.join(root, 'src'), { recursive: true });
+  writeFileSync(path.join(root, 'src', 'a.txt'), 'a\n');
+  git(root, 'init', '-q', '-b', 'main');
+  git(root, 'add', '-A');
+  git(root, 'commit', '-q', '-m', 'base');
+  try {
+    const config = { workspaces: [base], closeoutGuard: false, worktree: { repos: [root], maxUntracked: 10 } };
+    const as = id => ({ agent: { id, session: { header: { cwd: root }, log: [] } } });
+    const input = { task: `修改 ${path.join(root, 'src', 'a.txt')} 并补测试`, acceptance, write: true, scope: ['src'] };
+    const h = harness({ config });
+    const run = await h.tools.codex_run.execute(input, as('session-0a0a0a0a-1'));
+    const wt = path.join(base, 'worktree-space', 'repo', '0a0a0a0a');
+    assert.equal(option(h.start().argv, '--cwd'), wt);
+    assert.deepEqual([h.payload().context.routing.worktree_path, h.payload().context.routing.worktree_branch, h.payload().context.routing.worktree_repo], [wt, 'conv/0a0a0a0a', root]);
+    assert.ok(h.payload().prompt.includes(path.join(wt, 'src', 'a.txt')) && !h.payload().prompt.includes(path.join(root, 'src', 'a.txt')));
+    assert.match(JSON.stringify(run), /独立的 git worktree/);
+    // The next job of the same conversation goes to the same worktree without a second checkout.
+    const next = harness({ config });
+    await next.tools.codex_run.execute(input, as('session-0a0a0a0a-1'));
+    assert.equal(option(next.start().argv, '--cwd'), wt);
+    // A rework that already names the worktree as cwd still carries it, so the runner commits its changes.
+    const rework = harness({ config });
+    await rework.tools.codex_run.execute({ ...input, cwd: path.join(wt, 'src') }, as('session-0a0a0a0a-1'));
+    assert.equal(option(rework.start().argv, '--cwd'), path.join(wt, 'src'));
+    assert.equal(rework.payload().context.routing.worktree_path, wt);
+
+    // A conversation that already worked in the main checkout stays there; a read-only first job opens nothing.
+    const old = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: path.join(root, 'src'), context: { owner: 'session-0b0b0b0b-1' } }], total: 1 }) });
+    const stayed = await old.tools.codex_run.execute(input, as('session-0b0b0b0b-1'));
+    assert.equal(option(old.start().argv, '--cwd'), root);
+    assert.match(JSON.stringify(stayed), /本对话在原目录/);
+    const reader = harness({ config });
+    await reader.tools.codex_run.execute({ ...input, write: false }, as('session-0c0c0c0c-1'));
+    assert.equal(option(reader.start().argv, '--cwd'), root);
+
+    // Merge gate: nothing merges while a job in the worktree runs or a completed write is not verified.
+    writeFileSync(path.join(wt, 'src', 'a.txt'), 'changed in the worktree\n');
+    git(wt, 'add', '-A');
+    git(wt, 'commit', '-q', '-m', 'job work');
+    const job = (extra) => ({ jobs: [{ job_id: 'W-1', cwd: wt, context: { owner: 'session-0a0a0a0a-1', write: true }, ...extra }], total: 1 });
+    const merge = (listed) => harness({ config, listed }).tools.codex_worktree.execute({ action: 'merge' }, as('session-0a0a0a0a-1'));
+    assert.match((await merge(() => job({ status: 'running' }))).worktrees[0].note, /还有单在跑（W-1）/);
+    assert.match((await merge(() => job({ status: 'completed', verification_status: 'needs_changes' }))).worktrees[0].note, /没核验通过（W-1）/);
+    const merged = (await merge(() => job({ status: 'completed', verification_status: 'verified' }))).worktrees[0];
+    assert.equal(merged.status, 'merged');
+    assert.equal(readFileSync(path.join(root, 'src', 'a.txt'), 'utf8'), 'changed in the worktree\n');
+    const closed = (await harness({ config, listed: () => job({ status: 'completed', verification_status: 'verified' }) })
+      .tools.codex_worktree.execute({ action: 'close' }, as('session-0a0a0a0a-1'))).worktrees[0];
+    assert.deepEqual([closed.action, closed.status], ['close', 'closed']);
+    assert.equal(harness({ config: {} }).tools.codex_worktree, undefined);
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
+});
