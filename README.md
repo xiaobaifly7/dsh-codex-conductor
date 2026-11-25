@@ -565,7 +565,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 worktree:
   repos:
     - 'D:\work\opsec'
-  root: ''          # 留空时建在仓库旁的 worktree-space 目录：D:\work\worktree-space\opsec\<会话号>
+  root: ''          # 留空时建在仓库旁的 conversation-worktrees 目录：D:\work\conversation-worktrees\opsec\<会话号>（与 dsh-worktree-space 插件的 worktree-space 容器分开）
   maxUntracked: 200 # 原目录里既没纳入 git 也没被忽略的文件超过这个数时，不开 worktree
 ```
 
@@ -870,7 +870,7 @@ When several conversations change the same repository, each new conversation can
 worktree:
   repos:
     - 'D:\work\opsec'
-  root: ''          # empty: next to the repository, D:\work\worktree-space\opsec\<session>
+  root: ''          # empty: next to the repository, D:\work\conversation-worktrees\opsec\<session> (apart from the dsh-worktree-space plugin's worktree-space container)
   maxUntracked: 200 # more untracked, non-ignored files than this in the main checkout: no worktree
 ```
 

@@ -134,7 +134,8 @@ export async function openWorktree({ repo, root, owner, maxUntracked = 200 }) {
   }
   const tag = ownerTag(owner);
   // 以下沿用配置里的写法（已确认与根目录是同一处），worktree 路径才和派单里的 cwd、scope 对得上。
-  const parent = path.join(root || path.join(path.dirname(repo), 'worktree-space'), path.basename(repo));
+  // 不用 worktree-space：dsh-worktree-space 插件的容器也叫这个名字（F:\渗透 时两边都落在 F:\worktree-space）。
+  const parent = path.join(root || path.join(path.dirname(repo), 'conversation-worktrees'), path.basename(repo));
   let worktree = path.join(parent, tag);
   let name = `conv/${tag}`;
   for (let n = 2; existsSync(worktree) || (await gitRun(repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${name}`])).code === 0; n++) {

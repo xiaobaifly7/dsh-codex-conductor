@@ -80,7 +80,7 @@ const DEFAULTS = {
   maxGeminiRunningJobs: 2,
   modelAB: { enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 },
   // 对话 worktree：repos 里的仓库，新对话的写入单放进本对话专用的 git worktree，核验通过后合并回原分支。
-  // root 留空时 worktree 建在仓库旁的 worktree-space 目录；原目录未纳入也未忽略的文件超过 maxUntracked 时不开 worktree。
+  // root 留空时 worktree 建在仓库旁的 conversation-worktrees 目录；原目录未纳入也未忽略的文件超过 maxUntracked 时不开 worktree。
   worktree: { repos: [], root: '', maxUntracked: 200 },
   effort: '',
   effortOverride: 'planner',
