@@ -3,7 +3,7 @@
 // 被 .gitignore 忽略的资料不进 worktree：忽略的目录用目录联接（junction）接进来，忽略的单个文件用硬链接，都与原目录共用。
 import { execFile } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
-import { link, rmdir, symlink, unlink } from 'node:fs/promises';
+import { cp, link, rename, rm, rmdir, symlink, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
 const GIT_TIMEOUT_MS = 120_000;
@@ -24,6 +24,7 @@ async function git(dir, args, options) {
 }
 
 const entries = (text) => text.split('\0').filter(Boolean);
+const inside = (rel, dirs) => dirs.some(dir => rel.startsWith(`${dir}/`));
 
 // 本机没有全局提交身份；仓库自己也没配时，合并提交用一个固定身份，免得 git 拒绝提交。
 async function identity(repo) {
@@ -85,7 +86,10 @@ export function ownerTag(owner) {
 
 // 忽略的目录建联接、忽略的单个文件建硬链接，与原目录共用，不复制。返回建好的联接（相对路径），收尾时据此拆除。
 async function linkIgnored(top, worktree) {
-  const listed = entries(await git(top, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory']));
+  const all = entries(await git(top, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory']));
+  // 只因文件规则（如 *.bin）被忽略的目录，git 会把目录和里面的文件都列出来；整个目录接成联接，里面的不再单独硬链接。
+  const dirs = all.filter(entry => entry.endsWith('/')).map(entry => entry.slice(0, -1));
+  const listed = all.filter(entry => !inside(entry.replace(/\/$/, ''), dirs));
   const links = [];
   let hardlinks = 0;
   const skipped = [];
@@ -195,11 +199,55 @@ export async function worktreeStatus(entry) {
 
 // 收尾：先拆联接（rmdir 对联接只删链接本身；对真目录只会删空目录），再 git worktree remove（不加 --force），最后 branch -d。
 // 不跑 git worktree prune：在 Windows 上 prune 会把 WSL 那边建的 worktree 登记一起删掉。
+// git worktree remove 会把 worktree 里被忽略的文件一起删掉（实测）。对话在 worktree 里新产出的忽略文件（扫描结果、日志等）
+// 收尾前移回原目录同一位置；原目录那里已有另一份时不覆盖，整个收尾停下来交给用户。
+async function keepIgnored(entry) {
+  const listed = entries(await git(entry.path, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], { timeout: 600_000 }));
+  const linked = new Set(entry.links ?? []);
+  const moves = [];
+  const clashes = [];
+  const all = listed.map(item => item.replace(/\/$/, '')).sort();
+  const skip = [...linked];
+  for (const rel of all) {
+    // 联接里的东西本来就在原目录；整个移走的目录，里面的不再单独处理。
+    if (linked.has(rel) || inside(rel, skip)) continue;
+    const at = path.join(entry.path, ...rel.split('/'));
+    const home = path.join(entry.repo, ...rel.split('/'));
+    let mine;
+    try { mine = lstatSync(at, { bigint: true }); } catch { continue; }
+    if (mine.isSymbolicLink()) continue;
+    let theirs;
+    try { theirs = lstatSync(home, { bigint: true }); } catch { moves.push({ rel, at, home }); skip.push(rel); continue; }
+    // 开 worktree 时建的硬链接没被替换过，原目录就是同一份。
+    if (mine.isFile() && theirs.isFile() && mine.ino === theirs.ino && mine.dev === theirs.dev) continue;
+    // 两边都是目录、git 也列出了里面的文件时，逐个文件处理；没列出里面的就不知道有什么，按冲突处理。
+    if (mine.isDirectory() && theirs.isDirectory() && all.some(other => other.startsWith(`${rel}/`))) continue;
+    clashes.push(rel);
+  }
+  if (clashes.length) return { clashes };
+  for (const { at, home } of moves) {
+    mkdirSync(path.dirname(home), { recursive: true });
+    await rename(at, home).catch(async (error) => {
+      if (error.code !== 'EXDEV') throw error;
+      await cp(at, home, { recursive: true, errorOnExist: true, force: false });
+      await rm(at, { recursive: true, force: true });
+    });
+  }
+  return { moved: moves.map(item => item.rel) };
+}
+
 export async function closeWorktree(entry) {
   const state = await worktreeStatus(entry);
   if (state.exists && (state.dirty || state.merging)) return { status: 'blocked', reason: 'worktree_dirty', ...state };
   if (state.exists && state.ahead) return { status: 'blocked', reason: 'not_merged', ...state };
+  let kept = {};
   if (state.exists) {
+    const { clashes, moved } = await keepIgnored(entry);
+    if (clashes) {
+      return { status: 'blocked', reason: 'ignored_clash', count: clashes.length, files: clashes.slice(0, 20),
+        note: '这些被忽略的文件 worktree 里和原目录里各有一份且不是同一份，收尾会删掉 worktree 那份，所以没有收尾；请用户决定留哪份后再 close。' };
+    }
+    if (moved.length) kept = { moved_back: moved.length, moved_examples: moved.slice(0, 10) };
     for (const rel of entry.links ?? []) {
       const at = path.join(entry.path, ...rel.split('/'));
       let info;
@@ -211,5 +259,5 @@ export async function closeWorktree(entry) {
     if (removed.code) return { status: 'error', message: `git worktree remove 失败：${removed.stderr}` };
   }
   const deleted = await gitRun(entry.repo, ['branch', '-d', entry.branch]);
-  return { status: 'closed', branch_deleted: deleted.code === 0, ...(deleted.code ? { branch_note: deleted.stderr } : {}) };
+  return { status: 'closed', ...kept, branch_deleted: deleted.code === 0, ...(deleted.code ? { branch_note: deleted.stderr } : {}) };
 }
