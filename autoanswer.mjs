@@ -7,6 +7,8 @@ const MINUTE = 60_000;
 const RELOAD_GRACE = 30_000;
 const HISTORY_LIMIT = 300;
 const RECOMMENDED = /recommended|推荐/i;
+// 用户不在时代答高风险提问：优先选这类「先不做」的选项。
+const DEFERRING = /跳过|暂不|先不|稍后|以后再|不执行|不要|保留|保持现状|取消|skip|later|defer|cancel|keep/i;
 const PRIVATE = /密码|密钥|口令|凭据|token|secret|passw[o]rd|credentials?|bearer|api[ _-]?key|PRIVATE KEY-----|\b(?:sk-|gh[pousr]_)[\w-]{12,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+/i;
 const PENDING = Symbol.for('dsh-codex-conductor.auto-answer.pending');
 
@@ -17,6 +19,8 @@ export const AUTO_ANSWER_DEFAULTS = {
   riskyPattern: '删除|清空|不可恢复|不可逆|覆盖|格式化|卸载|重置|drop |truncate|rm -rf|force.?push|付款|支付|购买|转账|充值|密码|密钥|口令|凭据|token|secret|发布到|上线到生产|生产环境|对外发送|发邮件|真实目标|授权范围',
   subagents: true,
   excludeSessions: [],
+  // wait：高风险和只能由用户决定的提问留给用户；defer：超时后答「这一步先不做，记为待确认，继续其他工作」，会话不卡住。
+  whenRisky: 'wait',
 };
 
 const validators = {
@@ -29,6 +33,7 @@ const validators = {
   },
   subagents: (v) => typeof v === 'boolean',
   excludeSessions: (v) => Array.isArray(v) && v.every(validSessionId),
+  whenRisky: (v) => v === 'wait' || v === 'defer',
 };
 
 export function normalizeAutoAnswer(value, unknownConfig, logger) {
@@ -55,6 +60,15 @@ function recommendation(question, freeText, notice) {
     reason: marked.length ? 'marked_recommended' : selected.length ? 'first_option' : 'free_text',
   };
 }
+
+function deferral(question, notice) {
+  const option = (question.options ?? []).find((o) => DEFERRING.test(o.label) || DEFERRING.test(o.description ?? ''));
+  return { answer: { id: question.id, selected: option ? [option.label] : [], custom: notice }, reason: 'deferred' };
+}
+
+const deferNotice = (afterMinutes) => '（用户超过 ' + afterMinutes + ' 分钟未回答。这一问涉及高风险或只能由用户决定的操作' +
+  '（删除或覆盖、花钱、对外发送或发布、真实目标或授权范围等），用户不在时不执行这一步：把它记为待用户确认，' +
+  '继续做不依赖它的其他工作，并在回复里列出等用户回来决定的事项。）';
 
 const preview = (text, max) => PRIVATE.test(text) ? '[敏感内容已隐藏]' : Array.from(text).slice(0, max).join('');
 const minutes = (ms) => Math.max(0, Math.round(ms / 6_000) / 10);
@@ -112,11 +126,12 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
       clearTimeout(item.timer);
       if (pending.get(item.id) === item) pending.delete(item.id);
     }
+    const risky = (q) => Boolean(risk) && [q.question, q.header, q.detail,
+      ...(q.options ?? []).flatMap((o) => [o.label, o.description])].some((value) => value && risk.test(value));
     function block(item) {
       if (item.questions.some(q => q.question?.startsWith('[owner_only]'))) return 'owner_only';
       if (item.manual || (item.key && (!manual || manual.has(item.key)))) return 'manual';
-      if (risk && item.questions.some((q) => [q.question, q.header, q.detail,
-        ...(q.options ?? []).flatMap((o) => [o.label, o.description])].some((value) => value && risk.test(value)))) return 'risky';
+      if (item.questions.some(risky)) return 'risky';
       if (settings.excludeSessions.includes(item.agent.id) || (settings.subagents === false && item.agent.session.header?.origin === 'subagent') ||
           item.questions.some((q) => q.intent)) return 'excluded';
       return item.failed ? 'failed' : null;
@@ -152,7 +167,8 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
       if (item.answering || pending.get(item.id) !== item) return false;
       if (!live(item)) { forget(item); return false; }
       const reason = block(item);
-      if (reason) {
+      const defer = !immediate && settings.whenRisky === 'defer' && ['risky', 'owner_only'].includes(reason);
+      if (reason && !defer) {
         if (!immediate && ['risky', 'excluded', 'owner_only'].includes(reason)) record(item, null, 'skipped_' + reason);
         return false;
       }
@@ -160,7 +176,11 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
       item.answering = true;
       const notice = immediate ? '（已按用户在面板的请求选择推荐项。）'
         : '（用户超过 ' + settings.afterMinutes + ' 分钟未回答，已自动选择推荐项；用户回来后可能会修正。）';
-      const choices = item.questions.map((q, i) => recommendation(q, settings.freeText, i === 0 ? notice : ''));
+      // 一批里只有触发风险的那几问按「先不做」答，其余照常选推荐项。
+      const flagged = (q) => reason === 'owner_only' ? q.question?.startsWith('[owner_only]') : risky(q);
+      const choices = item.questions.map((q, i) => defer && flagged(q)
+        ? { ...deferral(q, deferNotice(settings.afterMinutes)), reason: 'deferred_' + reason }
+        : recommendation(q, settings.freeText, i === 0 ? notice : ''));
       const result = { answers: choices.map(({ answer }) => answer) };
       try {
         const accepted = item.respond ? await item.respond(result) : service.answer(item.agent, item.callId, result);

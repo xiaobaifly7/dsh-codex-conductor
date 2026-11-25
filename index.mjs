@@ -4988,7 +4988,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         autoHandover: cfg.autoHandover,
         autoAnswer: { enabled: cfg.autoAnswer.enabled, afterMinutes: cfg.autoAnswer.afterMinutes, subagents: cfg.autoAnswer.subagents,
           excludeCount: cfg.autoAnswer.excludeSessions.length, riskyPatternEnabled: cfg.autoAnswer.riskyPattern !== '',
-          customFreeText: cfg.autoAnswer.freeText !== AUTO_ANSWER_DEFAULTS.freeText },
+          customFreeText: cfg.autoAnswer.freeText !== AUTO_ANSWER_DEFAULTS.freeText, whenRisky: cfg.autoAnswer.whenRisky },
         plannerReads: cfg.plannerReads, plannerReadAllowCount: cfg.plannerReadAllow.length,
         toolPolicy: cfg.toolPolicy, mcpWriteAllow: cfg.mcpWriteAllow, jobDiff: cfg.jobDiff !== false, closeoutGuard: cfg.closeoutGuard !== false,
         serviceTier: cfg.serviceTier || null, ...loadedGateway(cfg),

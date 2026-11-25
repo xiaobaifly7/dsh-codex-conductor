@@ -164,6 +164,23 @@ test('a risky option blocks the whole batch and only records a skip if the deadl
   await pending.result;
 });
 
+test('whenRisky defer answers risky and owner-only questions with a deferral after the wait, the rest as usual', async (t) => {
+  const tick = clock(t), h = host(t, { settings: { whenRisky: 'defer' } }), panel = h.load();
+  const batch = h.open([question(), question([choice('删除旧目录'), choice('先不删，保留', '稍后再说')], { id: 'risky' })]);
+  const bare = h.session('session-b');
+  const owner = h.open([question([choice('删除全部记录（推荐）'), choice('另存一份')], { question: '[owner_only] 怎么处理？' })], { owner: bare });
+  tick();
+  const answered = await batch.result;
+  assert.deepEqual(answered.answers[0].selected, ['方案 A']);
+  assert.deepEqual(answered.answers[1].selected, ['先不删，保留']);
+  assert.match(answered.answers[1].custom, /不执行这一步/);
+  const ownerOnly = (await owner.result).answers[0];
+  assert.deepEqual([ownerOnly.selected, /不执行这一步/.test(ownerOnly.custom)], [[], true]);
+  await flush();
+  assert.deepEqual(panel.snapshot().recent.map(({ reason }) => reason).sort(),
+    ['deferred_owner_only', 'deferred_risky', 'first_option'].sort());
+});
+
 test('a custom risk pattern applies to question text and an empty pattern disables risk matching', async (t) => {
   const tick = clock(t);
   const guarded = host(t, { settings: { riskyPattern: '风险示例' } }), guardedPanel = guarded.load();
@@ -372,13 +389,13 @@ test('apply warns for invalid or unknown autoAnswer configuration and writes nor
     return JSON.parse(readFileSync(path.join(directory, 'dsh-codex-conductor', 'loaded.json'), 'utf8'));
   };
   const loaded = inspect({ enabled: 'false', afterMinutes: 0, freeText: ' ', riskyPattern: '(', subagents: null,
-    excludeSessions: ['bad id'], afterMinute: 2 });
+    excludeSessions: ['bad id'], whenRisky: 'maybe', afterMinute: 2 });
   assert.deepEqual(loaded.autoAnswer, { enabled: true, afterMinutes: 10, subagents: true, excludeCount: 0,
-    riskyPatternEnabled: true, customFreeText: false });
+    riskyPatternEnabled: true, customFreeText: false, whenRisky: 'wait' });
   assert.deepEqual(loaded.unknownConfig, ['autoAnswer.afterMinute']);
   for (const key of Object.keys(AUTO_ANSWER_DEFAULTS)) assert.ok(warnings.some((w) => w.includes('autoAnswer.' + key)));
   assert.deepEqual(inspect([]).autoAnswer, loaded.autoAnswer);
   assert.ok(warnings.some((w) => w.includes('无效的配置 autoAnswer，')));
   assert.deepEqual(inspect({ enabled: false, afterMinutes: 2.5, riskyPattern: '', excludeSessions: ['session-a'], freeText: '继续。' }).autoAnswer,
-    { enabled: false, afterMinutes: 2.5, subagents: true, excludeCount: 1, riskyPatternEnabled: false, customFreeText: true });
+    { enabled: false, afterMinutes: 2.5, subagents: true, excludeCount: 1, riskyPatternEnabled: false, customFreeText: true, whenRisky: 'wait' });
 });

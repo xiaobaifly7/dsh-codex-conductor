@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.199` 自动代答新增 `whenRisky`：默认 `wait` 照旧把高风险和 `[owner_only]` 提问留给用户；设为 `defer` 时，超时后对这几问选「跳过 / 暂不 / 保留」类选项（没有就不选），附说明「这一步不执行，记为待用户确认，继续做其他工作」，同批其余问题照常选推荐项。用户睡觉时会话不再卡在这类提问上，也不会替用户执行删除、花钱、对外发送、真实目标这类操作。
+
 `0.9.198` 交接后新会话不再丢上下文。自动交接不再掐断用户亲手发起的回合，用户 `autoHandover.quietMinutes`（默认 30）分钟内发过消息时先不自动交接；交接前在旧会话开一个不许调工具、限时 `autoHandover.summaryMinutes`（默认 10）分钟的摘要回合，让它按完整上下文写交接摘要，放进交接单；“最近的用户指令”改取整条会话链的档案，档案不再收交接单和续跑插件的重启话术（旧档案下次交接时剔除）；最后进展另列被掐断回合最后的助手文字；任务表只列未结束、待处理和最近 10 单非核验任务；交接出去的旧会话改名 `[已交接→…]`，撤回时改回。依据：11-17 到 11-25 的 13 次真实自动交接里 9 次掐断了正在跑的回合（4 次是用户刚发起的），最近 7 份交接单有 3 份没有任何用户指令，用户在旧会话里继续说话、再把回复手动粘到新会话。
 
 `0.9.197` 对话 worktree 只因之前的写入单把对话留在原目录：以前只要本对话之前在仓库里派过任何单（包括只读单）就判为留在原目录，而新对话常先派只读单看代码再动手，于是永远开不了 worktree。现在只看之前的写入单，按其 cwd 与 scope 路径判断是否落在仓库里。
@@ -293,6 +295,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.199` Auto-answer gains `whenRisky`: the default `wait` still leaves risky and `[owner_only]` questions to the user; `defer` answers them after the wait with a skip / not-now / keep option (none if there is none) and a note to leave the step undone, record it for the user and carry on, while the rest of the batch gets the recommended choice. A session no longer stalls on such a question overnight, and nothing deletes, spends, sends out or touches a real target on the user's behalf.
 
 `0.9.198` Successors keep the context. Automatic hand-over no longer cuts a turn the user started and waits while the user wrote within `autoHandover.quietMinutes` (default 30); before the brief is built, the old session gets a tool-less summary turn limited to `autoHandover.summaryMinutes` (default 10) and writes a hand-over summary from its full context into the brief; recent user instructions come from the whole chain's archive, which no longer records briefs or the auto-continue restart text (older archives drop them at the next hand-over); last progress also lists a cut-short turn's final words; the task table keeps running, pending and the latest 10 non-verification jobs; the old session is renamed `[已交接→…]` and a revert restores its title. Basis: of 13 real automatic hand-overs from 11-17 to 11-25, 9 cut a running turn (4 of them just started by the user), 3 of the latest 7 briefs had no user instruction at all, and the user kept talking in the old session and pasted its reply into the new one by hand.
 
