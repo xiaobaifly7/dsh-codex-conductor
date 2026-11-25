@@ -657,6 +657,22 @@ export function lastUserText(log) {
     e.data.source.via !== 'codex-conductor' && !AUTOMATIC_TEXTS.has(messageText(e).trim()));
   return user ? messageText(user) : '';
 }
+// dsh-agy-link 模型目录里的模型名：每个模型本身，加上「模型-档位」；读不到时返回 null，不拦。
+export function catalogModels(file) {
+  try {
+    const catalog = JSON.parse(readFileSync(file, 'utf8'));
+    const lists = [catalog?.current?.models, ...Object.values(catalog?.accounts ?? {}).map(account => account?.models)];
+    const names = new Set();
+    for (const model of lists.flat()) {
+      if (typeof model?.id !== 'string') continue;
+      names.add(model.id);
+      for (const effort of Array.isArray(model.efforts) ? model.efforts : []) names.add(`${model.id}-${effort}`);
+    }
+    return names.size ? names : null;
+  } catch {
+    return null;
+  }
+}
 const EFFORT_WORDS = { low: ['low', '低'], medium: ['medium', '中'], high: ['high', '高'], xhigh: ['xhigh', '超高'], max: ['max', '最高'] };
 // 用户的话里要有模型的系列名（carbon、neon……），带档位的还要有档位（high 或「高」）；不要求写全 gemini-4-。
 export function userNamedModel(text, model) {
@@ -1317,6 +1333,11 @@ function settings(config, logger) {
       if (gemini.accountPool !== undefined) {
         if (typeof gemini.accountPool === 'string' && path.isAbsolute(gemini.accountPool.trim())) config.gemini.accountPool = gemini.accountPool.trim();
         else logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.accountPool，必须是 DSH agy 账号池 pool.json 的绝对路径');
+      }
+      // dsh-agy-link's model-catalog.json: codex_model refuses a model name it does not list.
+      if (gemini.modelCatalog !== undefined) {
+        if (typeof gemini.modelCatalog === 'string' && path.isAbsolute(gemini.modelCatalog.trim())) config.gemini.modelCatalog = gemini.modelCatalog.trim();
+        else logger?.warn?.('[codex-conductor] 忽略无效的配置 gemini.modelCatalog，必须是 dsh-agy-link model-catalog.json 的绝对路径');
       }
       // Applied when a call omits max_chars, so length stays capped even if the planner forgets it.
       if (gemini.defaultMaxChars !== undefined) {
@@ -4200,7 +4221,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       offset: { type: 'integer', minimum: 0, description: '从第几组开始，默认 0；下一页用 next_offset。' },
     } },
     output: { schema: DATA_OUTPUT.schema, render: (_args, value) => [{ type: 'text', text: Array.isArray(value.groups)
-      ? [`Codex 汇总：${value.total} 组，${value.total_jobs} 轮；本页 ${value.groups.length} 组。` +
+      ? [...(value.execution_model ? [`本对话执行模型：${value.execution_model.model}（${value.execution_model.source === 'conversation' ? '用户为本对话指定' : '默认'}）`] : []),
+        `Codex 汇总：${value.total} 组，${value.total_jobs} 轮；本页 ${value.groups.length} 组。` +
         (value.next_offset == null ? '' : `沿用筛选和每页条数，传 offset=${value.next_offset} 查看下一页。`) +
         '执行结束与独立验收分别显示。',
         `错误分类（全部匹配任务）：${value.error_kinds ? Object.entries(value.error_kinds).map(([kind, count]) => `${kind}=${count}`).join('、') || '无' : '未知'}`,
@@ -4221,7 +4243,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const [summary, ledger] = await Promise.all([
         conductor.summary(filters, exec?.signal), acceptedOpenLedger(exec?.agent?.id, exec?.signal),
       ]);
-      return { ...summary, accepted_open_ledger: ledger, owner_decisions: sessionOwnerDecisions(exec?.agent?.id) };
+      return { ...summary, accepted_open_ledger: ledger, owner_decisions: sessionOwnerDecisions(exec?.agent?.id), ...executionModel(exec?.agent?.id) };
     },
   });
 
@@ -4235,6 +4257,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const models = readSessionModels();
     const id = [owner, ...aliases.predecessors(owner)].find(item => Object.hasOwn(models, item));
     return id ? models[id]?.model ?? undefined : undefined;
+  }
+  // codex_summary 显示本对话的执行模型：用户为本对话指定的，或配置的默认模型。
+  function executionModel(owner) {
+    if (!cfg.gemini) return {};
+    const chosen = sessionModel(owner);
+    return { execution_model: chosen ? { model: chosen, source: 'conversation' } : { model: cfg.gemini.executionModel ?? cfg.gemini.model, source: 'default' } };
   }
   if (cfg.gemini) ctx.tools.register({
     name: 'codex_model',
@@ -4251,6 +4279,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!owner || !sessionModelsFile) throw new Error('codex_model: 需要当前会话 ID 和插件状态目录');
       if (model !== 'default') {
         if (!/^gemini-[a-z0-9][a-z0-9.-]*$/.test(model)) throw new Error('codex_model: model 必须是 Gemini 模型名（如 gemini-4-carbon-high）或 default');
+        const known = cfg.gemini.modelCatalog && catalogModels(cfg.gemini.modelCatalog);
+        if (known && !known.has(model)) {
+          throw new Error(`codex_model: 模型目录里没有 ${model}，没有改模型。可选：${[...known].filter(name => name.startsWith('gemini-')).join('、')}`);
+        }
         if (!userNamedModel(lastUserText(exec?.agent?.session?.log ?? []), model)) {
           throw new Error(`codex_model: 用户最近一条消息里没有写出 ${model}，没有改模型。只有用户本人在本对话里明确要求时才能换；需要的话先问用户。`);
         }
