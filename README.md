@@ -72,7 +72,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 宿主的 `ask_user_question` 等满 10 分钟后，conductor 会逐题选择有推荐标记的选项，找不到标记时选首项。多选题会选中所有带推荐标记的项，自由文本题使用配置的说明。答案会附上代答说明。热重载保留原提出时间，宿主恢复的待答提问也按原时间计时，已超时的再给用户 30 秒。
 
-题目或任一选项触发高风险正则时，整批由用户回答。排除会话、按设置排除的子代理会话、宿主权限审批和计划审核、conductor 的交接确认都留给用户。宿主提供提问服务时，“Codex 指挥 → 自动代答”会显示待答提问和最近 10 条记录。可以现在按推荐提交，或为某条提问取消代答。宿主能恢复的提问会保留人工接管选择。
+题目或任一选项触发高风险正则时，整批由用户回答；设 `whenRisky: defer` 时改为超时后对触发的那几问答「先不做」（见上表），其余照常选推荐项，记录原因为 `deferred_risky` / `deferred_owner_only`。排除会话、按设置排除的子代理会话、宿主权限审批和计划审核、conductor 的交接确认都留给用户。宿主提供提问服务时，“Codex 指挥 → 自动代答”会显示待答提问和最近 10 条记录。可以现在按推荐提交，或为某条提问取消代答。宿主能恢复的提问会保留人工接管选择。
 
 本机记录在 `%LOCALAPPDATA%\dsh-codex-conductor\auto-answer-history.jsonl`，保留最近 300 行，仅保存提问和所选标签的短摘要与判断依据。已恢复提问的人工接管标记保存在同目录的 `auto-answer-manual.json`。
 
@@ -516,6 +516,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `autoAnswer.riskyPattern` | 见“自动代答宿主提问” | 匹配题目和选项，设为 `''` 关闭正则跳过 |
 | `autoAnswer.subagents` | `true` | 也处理宿主允许提问的子代理来源会话。0.2.2-rc.3 会拒绝 `origin: subagent` 的提问和续答 |
 | `autoAnswer.excludeSessions` | `[]` | 由用户亲自回答的会话 ID |
+| `autoAnswer.whenRisky` | `wait` | `wait`：高风险和 `[owner_only]` 提问留给用户；`defer`：超时后对这几问选「跳过 / 暂不 / 保留」这类选项（没有就不选），并说明这一步不执行、记为待用户确认、继续其他工作，会话不会卡住 |
 | `plannerPromptFile` | `%LOCALAPPDATA%\dsh-codex-conductor\planner-prompt.md` | 规划要求文件（Markdown，HTML 注释不算内容），注入 agent 的系统提示词（见上文） |
 | `executorPromptFile` | 规划要求文件同目录的 `executor-prompt.md` | 给 Codex 的固定要求（Markdown，HTML 注释不算内容）：附在每一单任务书的执行约束后面，Codex 每单都会看到；不增加权限，与任务、验收或执行约束冲突时以后者为准。保存后下一单生效，也可在设置的“Codex 指挥”面板里编辑 |
 | `runtimeProfileFile` | 空 | 当前 Harness 实例实际使用的 `cordis.patch.yml` 完整 Windows 路径；用于版本匹配与明确请求的热重载，留空时不能自动重载 |
@@ -939,6 +940,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `autoAnswer.riskyPattern` | See the Chinese section above | Case-insensitive pattern for question and option text. Set to `''` to disable pattern matching |
 | `autoAnswer.subagents` | `true` | Include subagent-origin sessions that can ask questions in the Host. Host 0.2.2-rc.3 rejects `origin: subagent` |
 | `autoAnswer.excludeSessions` | `[]` | Session IDs reserved for human answers |
+| `autoAnswer.whenRisky` | `wait` | `wait`: risky and `[owner_only]` questions wait for the user; `defer`: after the wait those questions get a skip / not-now / keep option (none if there is no such option) and a note to leave that step undone, record it for the user and carry on, so the session does not stall |
 | `autoResume.reloadDelaySeconds` | `20` | Seconds after a same-process reload before rechecking interrupted turns. `0` disables recovery after hot reload |
 | `modelAB` | `{ enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 }` | When enabled, assign new threads deterministically by job ID. `share` gives the first model's fraction from 0 to 1. Continuations keep the recorded thread model. An explicit `codex_run.model` takes precedence. Explicit initial picks and one-off switches to a different model do not enter the comparison. Verification uses the configured default model. Invalid values warn and fall back to defaults, and unknown sub-keys go to `unknownConfig`. |
 | `lockTimeoutSeconds` | Empty (unlimited) | Positive finite seconds waiting for directory write locks; expiry returns retryable `lock_timeout` before Codex starts. Null, empty or omitted passes no flag. |
