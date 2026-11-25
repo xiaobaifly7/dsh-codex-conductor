@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.197` 对话 worktree 只因之前的写入单把对话留在原目录：以前只要本对话之前在仓库里派过任何单（包括只读单）就判为留在原目录，而新对话常先派只读单看代码再动手，于是永远开不了 worktree。现在只看之前的写入单，按其 cwd 与 scope 路径判断是否落在仓库里。
+
 `0.9.196` 对话 worktree 的资料联接不再被提交：WSL 里的 git 把联接看成符号链接，`vm/` 这种目录规则不忽略它，runner 自动提交的 `git add -A` 把它们一并提交，合并随后因 worktree 不干净停下（线上版本实测，原目录未受影响）。开 worktree 时把建的联接写进本 worktree 的 `conversation-links.exclude`，runner 给 WSL 里的 git 设 `core.excludesFile` 指向它（经 `GIT_CONFIG_*`，执行器的 git 同样生效），不改仓库配置和 `.gitignore`。修复后实测：写入单只提交真实改动、核验后自动合并、收尾把被忽略的产出移回原目录。
 
 `0.9.195` 对话 worktree 默认建在仓库旁的 `conversation-worktrees` 目录，不再用 `worktree-space`：已安装的 dsh-worktree-space 插件的容器也叫 `worktree-space`，F:\渗透 这种盘根下一层的仓库两边会落进同一个 `F:\worktree-space`。两个插件互不相干，目录分开免得混淆。
@@ -289,6 +291,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.197` Only earlier write jobs keep a conversation in the main checkout: any earlier job in the repository used to count, read-only ones included, and a new conversation usually reads the code before it writes, so it never got a worktree. Now only earlier write jobs count, by their cwd and scope paths.
 
 `0.9.196` A conversation worktree's material junctions are no longer committed: git in WSL sees a junction as a symlink, which a directory rule such as `vm/` does not ignore, so the runner's `git add -A` committed them and the merge then stopped on a dirty worktree (seen on the live version; the main checkout was untouched). Opening a worktree now lists its junctions in the worktree's `conversation-links.exclude`, and the runner points `core.excludesFile` at it for git in WSL (through `GIT_CONFIG_*`, so the executors' git honours it too), without touching repository config or `.gitignore`. Tested after the fix: the write job commits only real changes, merges after review, and close moves ignored output back.
 
