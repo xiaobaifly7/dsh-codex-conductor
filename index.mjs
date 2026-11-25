@@ -37,6 +37,8 @@ const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryT
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
+const { repoFor, within, relocate, relocateText, openWorktree, mergeWorktree, worktreeStatus, closeWorktree, pathKey } =
+  await import(new URL(`./worktree.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
 const loadedIdentity = runtimeIdentity(import.meta.url);
@@ -77,6 +79,9 @@ const DEFAULTS = {
   verifyEngine: '',
   maxGeminiRunningJobs: 2,
   modelAB: { enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 },
+  // 对话 worktree：repos 里的仓库，新对话的写入单放进本对话专用的 git worktree，核验通过后合并回原分支。
+  // root 留空时 worktree 建在仓库旁的 worktree-space 目录；原目录未纳入也未忽略的文件超过 maxUntracked 时不开 worktree。
+  worktree: { repos: [], root: '', maxUntracked: 200 },
   effort: '',
   effortOverride: 'planner',
   // 只读任务的推理强度，留空与 effort 相同
@@ -1244,7 +1249,7 @@ function settings(config, logger) {
       : key === 'allowTools' ? Array.isArray(value) && value.every(name => typeof name === 'string' && name.trim())
       : key === 'mcpWriteAllow' ? Array.isArray(value) && value.every(name => typeof name === 'string' && /^mcp__/i.test(name.trim()))
       : key === 'plannerReadAllow' ? Array.isArray(value) && value.every(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\\\\)/.test(p))
-      : ['autoResume', 'autoHandover', 'autoAnswer', 'modelAB', 'repeatFailureGuard'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
+      : ['autoResume', 'autoHandover', 'autoAnswer', 'modelAB', 'repeatFailureGuard', 'worktree'].includes(key) ? value !== null && typeof value === 'object' && !Array.isArray(value)
       : ['codexRoute', 'gemini'].includes(key) ? value === null || (typeof value === 'object' && !Array.isArray(value))
         : Array.isArray(fallback) ? Array.isArray(value)
           : typeof value === typeof fallback && (typeof value !== 'number' || Number.isFinite(value));
@@ -1291,6 +1296,21 @@ function settings(config, logger) {
           value[0].trim() !== value[1].trim();
     if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 modelAB.${key}，使用默认值`);
     return [key, valid ? (key === 'models' ? value.map(model => model.trim()) : value) : fallback];
+  }));
+  const worktree = config.worktree;
+  for (const key of Object.keys(worktree)) {
+    if (Object.hasOwn(DEFAULTS.worktree, key)) continue;
+    unknownConfig.push(`worktree.${key}`);
+    logger?.warn?.(`[codex-conductor] 未知配置项 worktree.${key} 已忽略，请核对拼写`);
+  }
+  const absolute = (p) => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/)/.test(p.trim());
+  config.worktree = Object.fromEntries(Object.entries(DEFAULTS.worktree).map(([key, fallback]) => {
+    const value = worktree[key];
+    const valid = key === 'repos' ? Array.isArray(value) && value.every(absolute)
+      : key === 'root' ? value === '' || absolute(value)
+        : Number.isSafeInteger(value) && value >= 0;
+    if (value !== undefined && !valid) logger?.warn?.(`[codex-conductor] 忽略无效的配置 worktree.${key}，使用默认值`);
+    return [key, valid ? (key === 'repos' ? value.map(p => p.trim()) : typeof value === 'string' ? value.trim() : value) : fallback];
   }));
   const repeat = config.repeatFailureGuard;
   for (const key of Object.keys(repeat)) {
@@ -3024,8 +3044,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if ((args.host_access ?? cfg.defaultHostAccess) === true && cfg.allowHostAccess !== true) {
       throw reject('codex_run: 插件配置没有开启 allowHostAccess，不能传 host_access=true；Codex 只能在沙箱里运行，启动不了 Windows 程序');
     }
-    const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
+    let cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
     if (!cwd) throw reject('codex_run: 当前会话没有工作区，请传 cwd');
+    let worktreeLine;
+    // 没配置 worktree 时不多 await 一拍：派单的调用时序和加载时的自动核验补派有先后约束。
+    if (!verificationOf && cfg.worktree.repos.length) {
+      const placed = await conversationWorktree(args, cwd, exec?.agent?.id, exec?.signal);
+      exec?.signal?.throwIfAborted();
+      worktreeLine = placed?.line;
+      if (placed?.worktree) {
+        ({ args, cwd } = placed);
+        originalTask = relocateText(originalTask, placed.repo, placed.worktree.path);
+        // runner 的 routing 只收字符串、数字、布尔和字符串列表，所以拆成三个字段。
+        routing = { ...routing, worktree_path: placed.worktree.path, worktree_branch: placed.worktree.branch, worktree_repo: placed.repo };
+      }
+    }
     const tool = continuation ? 'codex_continue' : 'codex_run';
     if (cfg.dispatchConsistency && !verificationOf) {
       const conflicts = writeContradictions({ ...args, task: originalTask }, cwd, taskScopePath, under);
@@ -3275,7 +3308,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     const shown = value.rendered ? await verifyRendered(value, exec) : notifyOnDone(await finish(value), exec, finish);
     const key = shown.rendered ? 'rendered' : 'next';
-    const lines = [standingLine, lockLine, modelLine, effortLine, quotaLine, queueLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
+    const lines = [standingLine, lockLine, worktreeLine, modelLine, effortLine, quotaLine, queueLine, ...predispatch].filter(line => line && !shown[key]?.includes(line));
     const renderedNext = [standingLine, ...predispatch].filter(Boolean).join('\n');
     return { ...shown, ...(shown.rendered && renderedNext ? { next: [shown.next, renderedNext].filter(Boolean).join('\n') } : {}),
       ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
@@ -3293,6 +3326,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       (cfg.convergenceGuard ? '同一交付链连续两轮卡在相同条目且参数未变时，仅凭 rerun_after_change 最多再试一次。' : '') +
       '一单一个可独立验收的结果，超过 8 条按共同前置拆单；彼此独立、各自可验收的工作可以拆成多单并行。' +
       '写锁按写入范围加：主机访问写单只锁声明的 scope，scope 互不重叠的写单可同时跑；scope 重叠的写单，以及没写 scope 或沙箱写单（锁整个任务目录）串行执行。路径、平台和参数适配在原授权内处理。' +
+      (cfg.worktree.repos.length ? `在 ${cfg.worktree.repos.join('、')} 里，新对话的第一单写入会开一个本对话专用的 git worktree，之后本对话的单都在那里执行：` +
+        '任务书照常写原仓库路径，插件换成 worktree 路径；忽略的资料目录已链接共用。写入单成功后自动提交，本对话的单全部核验通过后自动合并回原分支，结果写在 codex_review 回执里。' : '') +
       '一单最关键、必须实测的 1–3 条写进 must_verify。' +
       '派单前核对授权。要交文件或启动会落盘的程序就用 write=true。scope 列全写入路径，沙箱模式下把 cwd 外的可写目录列入 writable_roots。' +
       '真机、网络和宿主能力列入前置条件，需主机访问时按配置和授权设置 host_access。' +
@@ -4203,8 +4238,9 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const value = withReport(result);
       const fixed = appended && prepared.fixed.length;
       const fixedLine = fixed ? `插件已按你的意图修正后写入：${prepared.fixed.join('；')}。` : '';
+      const merged = closing ? await afterReview(owner, source, exec?.signal) : undefined;
       return { ...value, ...(fixed ? { review_fixes: prepared.fixed } : {}),
-        next: [fixedLine, nextStep(value, undefined, undefined, cfg), ledgerWarning, askOwner].filter(Boolean).join('\n') };
+        next: [fixedLine, nextStep(value, undefined, undefined, cfg), ledgerWarning, askOwner, merged].filter(Boolean).join('\n') };
     },
   });
 
@@ -4295,6 +4331,179 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       return model === 'default'
         ? { status: 'ok', model: fallback, note: `本对话的执行和续接恢复配置的默认模型 ${fallback}，从下一单起生效。` }
         : { status: 'ok', model, note: `本对话（含之后交接出去的会话）的执行和续接改用 ${model}，从下一单起生效；核验照旧。恢复默认：codex_model model=default。` };
+    },
+  });
+
+  // 对话 worktree（worktree.repos）：每个对话每个仓库一条记录，交接出去的会话沿交接链继承。
+  // status：open（在 worktree 里工作）、shared（留在原目录，reason 写原因）、closed（已收尾）。
+  const worktreesFile = stateDirectory && path.join(stateDirectory, 'session-worktrees.json');
+  const readWorktrees = () => {
+    try { const value = JSON.parse(readFileSync(worktreesFile, 'utf8')); return value && typeof value === 'object' ? value : {}; } catch { return {}; }
+  };
+  const worktreeKey = (owner, repo) => `${owner}::${pathKey(repo)}`;
+  function findWorktree(owner, repo) {
+    const all = readWorktrees();
+    for (const id of [owner, ...aliases.predecessors(owner)]) {
+      const key = worktreeKey(id, repo);
+      if (all[key]) return { key, entry: all[key] };
+    }
+    return undefined;
+  }
+  function saveWorktree(key, entry) {
+    const all = readWorktrees();
+    all[key] = { ...entry, at: new Date().toISOString() };
+    mkdirSync(path.dirname(worktreesFile), { recursive: true });
+    writeJsonAtomic(worktreesFile, all);
+    return all[key];
+  }
+  function openWorktrees(owner) {
+    const all = readWorktrees();
+    const ids = new Set([owner, ...aliases.predecessors(owner)]);
+    return Object.entries(all).filter(([key, entry]) => ids.has(key.slice(0, key.indexOf('::'))) && entry.status === 'open')
+      .map(([key, entry]) => ({ key, entry }));
+  }
+  const repoLocks = new Map();
+  // 同一仓库的建 worktree 与合并在本进程里串行，免得两个对话同时动原目录的 index。
+  function withRepoLock(repo, work) {
+    const key = pathKey(repo);
+    const next = (repoLocks.get(key) ?? Promise.resolve()).catch(() => {}).then(work);
+    repoLocks.set(key, next.catch(() => {}));
+    return next;
+  }
+  async function ownerJobs(owner, signal, pages = 5) {
+    const jobs = [];
+    for (let offset = 0, page = 0; offset !== null && page < pages; page++) {
+      const history = await conductor.list({ owner, also_owners: aliases.predecessors(owner), limit: 100, offset }, signal);
+      if (!Array.isArray(history.jobs)) return undefined;
+      jobs.push(...history.jobs);
+      offset = history.next_offset ?? null;
+    }
+    return jobs;
+  }
+  // 派单前：本对话在配置的仓库里写东西时，换到本对话的 worktree；第一单写入时才建。
+  async function conversationWorktree(args, cwd, owner, signal) {
+    if (!cfg.worktree.repos.length || !owner || !worktreesFile) return undefined;
+    // 续接、返工的单 cwd 已经在本对话的 worktree 里：不用换路径，但要带上 worktree，runner 才会提交。
+    const inside = openWorktrees(owner).find(({ entry }) => within(cwd, entry.path));
+    if (inside) return { args, cwd, worktree: inside.entry, repo: inside.entry.repo, line: `本单在本对话的 worktree ${inside.entry.path} 里执行。` };
+    const scoped = (args.scope ?? []).filter(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/)/.test(p));
+    const repo = repoFor(cfg.worktree.repos, [cwd, ...scoped]);
+    if (!repo) return undefined;
+    let found = findWorktree(owner, repo);
+    let line;
+    if (!found) {
+      if (args.write !== true) return undefined;
+      const key = worktreeKey(owner, repo);
+      const jobs = await ownerJobs(owner, signal).catch(() => undefined);
+      // 已经在原目录里干过活的对话留在原目录：换到 worktree 会看不到它之前写的东西。
+      const earlier = jobs?.some(job => typeof job.cwd === 'string' && within(job.cwd, repo));
+      let entry;
+      if (!jobs || earlier) {
+        entry = { status: 'shared', repo, reason: jobs ? '本对话之前已在原目录里派过单，继续在原目录工作' : '查不到本对话的派单记录，本单先在原目录执行' };
+        if (!jobs) return { line: `本单在原目录 ${repo} 执行：${entry.reason}。` };
+      } else {
+        const opened = await withRepoLock(repo, () => openWorktree({ repo, root: cfg.worktree.root, owner, maxUntracked: cfg.worktree.maxUntracked }))
+          .catch(error => ({ shared: `开 worktree 失败：${error.message}` }));
+        entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened };
+      }
+      found = { key, entry: saveWorktree(key, entry) };
+      line = entry.status === 'open'
+        ? `本对话从这一单起在独立的 git worktree 里工作：${entry.path}（分支 ${entry.branch}，基于 ${entry.base_branch}），原目录 ${repo} 不受影响；` +
+          `${entry.links.length} 个忽略的资料目录${entry.hardlinks ? `和 ${entry.hardlinks} 个忽略的文件` : ''}已链接共用。写入单成功后自动提交，本对话的单全部核验通过后自动合并回 ${entry.base_branch}。`
+        : `本对话在原目录 ${repo} 工作，不开 worktree：${entry.reason}。`;
+    }
+    const { entry } = found;
+    if (entry.status !== 'open') return line ? { line } : undefined;
+    if (!existsSync(entry.path)) return { line: `本对话的 worktree ${entry.path} 已不存在，本单在原目录执行；用 codex_worktree 查看。` };
+    const move = (p) => relocate(p, repo, entry.path);
+    const rewritten = { ...args, ...(args.cwd ? { cwd: move(args.cwd) } : {}), task: relocateText(args.task, repo, entry.path),
+      ...(args.scope ? { scope: args.scope.map(move) } : {}),
+      ...(args.writable_roots ? { writable_roots: args.writable_roots.map(move) } : {}),
+      ...(args.required_writes ? { required_writes: args.required_writes.map(move) } : {}) };
+    return { args: rewritten, cwd: move(cwd), worktree: entry, repo,
+      line: line ?? `本单在本对话的 worktree ${entry.path} 里执行。` };
+  }
+  const mergeLine = (entry, result) => {
+    const files = (r) => `${r.files.join('、')}${r.count > r.files.length ? ` 等 ${r.count} 个` : ''}`;
+    switch (result.status) {
+      case 'merged': return `已把本对话 worktree 的 ${result.commits} 个提交合并回 ${entry.repo}（${entry.base_branch}，合并提交 ${result.commit.slice(0, 8)}）` +
+        (result.synced ? '；worktree 已同步到合并后的最新状态。' : '；worktree 没能快进到最新，下次合并时一并处理。');
+      case 'nothing': return '';
+      case 'conflict': return `合并回 ${entry.base_branch} 有冲突：${files(result)}。冲突已放在本对话的 worktree ${entry.path} 里，原目录没动。` +
+        '派一单 codex_run 在 worktree 里解决冲突（保留双方意图、去掉冲突标记），runner 成功后会提交；核验通过后自动再合并。';
+      case 'blocked': return {
+        worktree_dirty: `worktree ${entry.path} 里有 ${result.count} 个未提交的改动（${files(result)}），没有合并：多半来自失败或中断的单。处理后用 codex_worktree action=merge 重试。`,
+        target_not_checked_out: `原目录当前在 ${result.current}，不是 ${result.target}，没有合并；请用户切回 ${result.target} 后用 codex_worktree action=merge 重试。`,
+        staged_changes: '原目录暂存区有未提交的改动，git 不允许这时合并，没有合并；请用户提交或撤下暂存后用 codex_worktree action=merge 重试。',
+        checkout_dirty_overlap: `原目录里这些文件有未提交的改动或同名的未跟踪文件，和本次合并重叠，没有合并：${files(result)}。请用户提交或移走后用 codex_worktree action=merge 重试。`,
+      }[result.reason] ?? `没有合并：${result.reason}`;
+      default: return `合并没有完成：${result.message}`;
+    }
+  };
+  // 合并闸门：本对话在这个 worktree 里没有在跑的单，完成的写入单都已记为 verified 或 accepted_deviations。
+  async function mergeGate(owner, entry, signal) {
+    const jobs = await ownerJobs(owner, signal);
+    if (!jobs) return '查不到本对话的派单记录，暂不合并；稍后用 codex_worktree action=merge 重试。';
+    const mine = jobs.filter(job => typeof job.cwd === 'string' && within(job.cwd, entry.path) && !job.context?.verification_of);
+    const running = mine.filter(job => job.status === 'running').map(job => job.job_id);
+    if (running.length) return `本对话 worktree 里还有单在跑（${running.join('、')}），全部核验通过后自动合并。`;
+    const open = mine.filter(job => job.context?.write === true && job.status === 'completed' &&
+      !['verified', 'accepted_deviations'].includes(job.verification_status)).map(job => job.job_id);
+    if (open.length) return `本对话 worktree 里还有写入单没核验通过（${open.join('、')}），全部通过后自动合并。`;
+    return undefined;
+  }
+  async function mergeConversation(owner, found, signal) {
+    const waiting = await mergeGate(owner, found.entry, signal);
+    if (waiting) return { line: waiting };
+    const result = await withRepoLock(found.entry.repo, () => mergeWorktree(found.entry)).catch(error => ({ status: 'error', message: error.message }));
+    if (result.status !== 'nothing') saveWorktree(found.key, { ...found.entry, last_merge: { ...result, at: new Date().toISOString() } });
+    return { result, line: mergeLine(found.entry, result) };
+  }
+  // codex_review 记为结案后调用：被审的单在本对话的某个 worktree 里时，满足闸门就合并。
+  async function afterReview(owner, source, signal) {
+    if (!cfg.worktree.repos.length || !owner || typeof source.cwd !== 'string') return undefined;
+    const found = openWorktrees(owner).find(({ entry }) => within(source.cwd, entry.path));
+    if (!found) return undefined;
+    return (await mergeConversation(owner, found, signal).catch(error => ({ line: `自动合并出错：${error.message}` }))).line;
+  }
+  if (cfg.worktree.repos.length) ctx.tools.register({
+    name: 'codex_worktree',
+    description: `本对话的 git worktree（仓库：${cfg.worktree.repos.join('、')}）。新对话在这些仓库里的写入单自动放进本对话专用的 worktree，核验通过后自动合并回原分支，平时不用调用。` +
+      'status 查看本对话的 worktree、未合并的提交和上次合并结果；merge 在冲突解决或原目录处理好之后重试合并（闸门照旧：没有在跑的单、写入单都已核验通过）；' +
+      'close 在本对话的工作全部结束时收尾：先合并，再拆资料链接、删除 worktree 和已合并的分支。放弃本对话的改动只能由用户决定，不在这里做。',
+    presentCall: (a) => ({ card: 'generic', kind: a?.action === 'status' ? 'read' : 'execute', title: `本对话的 worktree · ${a?.action ?? 'status'}` }),
+    parameters: { type: 'object', additionalProperties: false, properties: {
+      action: { type: 'string', enum: ['status', 'merge', 'close'] },
+      repo: { type: 'string', description: '只处理这个仓库的 worktree；省略时处理本对话全部的。' },
+    }, required: ['action'] },
+    output: DATA_OUTPUT,
+    async execute(args, exec) {
+      const owner = exec?.agent?.id;
+      if (!owner || !worktreesFile) throw new Error('codex_worktree: 需要当前会话 ID 和插件状态目录');
+      const all = readWorktrees();
+      const ids = new Set([owner, ...aliases.predecessors(owner)]);
+      const mine = Object.entries(all).filter(([key, entry]) => ids.has(key.slice(0, key.indexOf('::'))) &&
+        (!args.repo || pathKey(entry.repo) === pathKey(args.repo))).map(([key, entry]) => ({ key, entry }));
+      if (!mine.length) return { status: 'none', note: '本对话没有 worktree 记录：它还没在配置的仓库里派过写入单，或者在原目录工作。' };
+      const items = [];
+      for (const found of mine) {
+        const { entry } = found;
+        if (args.action === 'status' || entry.status !== 'open') {
+          items.push({ repo: entry.repo, status: entry.status, ...(entry.reason ? { reason: entry.reason } : {}),
+            ...(entry.status === 'open' ? { path: entry.path, branch: entry.branch, base_branch: entry.base_branch, ...(await worktreeStatus(entry)) } : {}),
+            ...(entry.last_merge ? { last_merge: entry.last_merge } : {}) });
+          continue;
+        }
+        const merged = await mergeConversation(owner, found, exec?.signal);
+        if (args.action === 'merge' || !merged.result || !['merged', 'nothing'].includes(merged.result.status)) {
+          items.push({ repo: entry.repo, action: 'merge', ...(merged.result ?? {}), note: merged.line || '没有需要合并的提交。' });
+          continue;
+        }
+        const closed = await withRepoLock(entry.repo, () => closeWorktree(entry)).catch(error => ({ status: 'error', message: error.message }));
+        if (closed.status === 'closed') saveWorktree(found.key, { ...entry, status: 'closed' });
+        items.push({ repo: entry.repo, action: 'close', merge: merged.line || '没有需要合并的提交。', ...closed });
+      }
+      return { status: 'ok', worktrees: items };
     },
   });
 
@@ -4755,7 +4964,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       JSON.stringify({ ...loadedIdentity, loadedAt: new Date().toISOString(), pid: process.pid, module: import.meta.url, workspaces: cfg.roots,
         ...(cfg.unknownConfig.length ? { unknownConfig: cfg.unknownConfig } : {}),
         tools: ['codex_run', 'codex_verify', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output', 'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime',
-          ...(cfg.gemini ? ['gemini_write', 'codex_model'] : [])],
+          ...(cfg.gemini ? ['gemini_write', 'codex_model'] : []), ...(cfg.worktree.repos.length ? ['codex_worktree'] : [])],
         allowHostAccess: cfg.allowHostAccess === true, defaultHostAccess: cfg.defaultHostAccess === true,
         plannerAnswers: cfg.plannerAnswers === true,
         ownerDecisions: cfg.ownerDecisions,

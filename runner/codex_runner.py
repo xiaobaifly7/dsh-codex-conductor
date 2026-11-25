@@ -855,6 +855,11 @@ def build_command(args, run_dir, thread_id, scratch=None):
     elif args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
         cmd += ["-c", "sandbox_workspace_write.writable_roots=" +
                 json.dumps([local_path(p) for p in args.writable_roots], ensure_ascii=False)]
+    git_env = linked_worktree_git_env(getattr(args, "cwd", None))
+    if git_env:
+        env.update(git_env)
+        for key, value in git_env.items():
+            cmd += ["-c", f"shell_environment_policy.set.{key}={json.dumps(value, ensure_ascii=False)}"]
     if args.schema:
         cmd += ["--output-schema", args.schema]
     if args.sandbox == "read-only":
@@ -2053,9 +2058,11 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
 
 
 def git(cwd, *argv, deadline, env=None, program="git"):
+    # Diff, digest and commit all go through here, so a worktree Windows git created works for every one of them.
+    linked = linked_worktree_git_env(os.fsdecode(cwd)) if program == "git" else {}
     p = subprocess.run([program, "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=max(0.1, deadline - time.monotonic()),
-                       creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
+                       creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **linked, **(env or {})})
     if p.returncode:
         raise ValueError(p.stderr.decode("utf-8", "replace").strip() or f"git exited {p.returncode}")
     return p.stdout
@@ -2086,6 +2093,69 @@ def git_on_tree(cwd, deadline, operation, *, raise_errors=False):
         if raise_errors:
             raise
         return None
+
+
+CONFLICT_MARKER = re.compile(rb"^(?:<{7} |>{7} |={7}\r?$)", re.M)
+
+
+def commit_worktree(context, run_dir, result):
+    """Commit a completed write job's changes in its conversation worktree so the merge back sees them (2026-11-25).
+    A merge in progress (conflict resolution) is committed only once its conflicted files carry no conflict markers."""
+    worktree = ((context or {}).get("routing") or {}).get("worktree_path")
+    if not isinstance(worktree, str) or not worktree.strip():
+        return
+    title = " ".join(str((context or {}).get("task") or "").split())[:72]
+
+    def commit(query):
+        top = Path(local_path(os.fsdecode(query("rev-parse", "--show-toplevel")).strip()))
+        try:
+            query("rev-parse", "--quiet", "--verify", "MERGE_HEAD")
+            merging = True
+        except ValueError:
+            merging = False
+        if merging:
+            unmerged = [os.fsdecode(n) for n in query("diff", "--name-only", "-z", "--diff-filter=U").split(b"\0") if n]
+            marked = [n for n in unmerged if (top / n).is_file() and CONFLICT_MARKER.search((top / n).read_bytes())]
+            if marked:
+                return {"worktree_commit_error": "conflict markers remain in " + ", ".join(marked[:10])}
+        # shortcut: stages everything in the worktree, so leftovers of an earlier failed job ride along; per-job staging if that bites.
+        query("add", "-A")
+        if not merging and not query("diff", "--cached", "--name-only", "-z"):
+            return {}
+        try:
+            named = bool(query("config", "user.email").strip())
+        except ValueError:
+            named = False
+        identity = () if named else ("-c", "user.name=codex-conductor", "-c", "user.email=codex-conductor@localhost")
+        query(*identity, "commit", "-q", "--no-edit", *(() if merging else ("-m", f"{run_dir.name}: {title}" if title else run_dir.name)))
+        return {"worktree_commit": os.fsdecode(query("rev-parse", "HEAD")).strip()}
+
+    try:
+        result.update(git_on_tree(local_path(worktree), time.monotonic() + 120, commit, raise_errors=True) or {})
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        result["worktree_commit_error"] = str(error)[:300]
+
+
+def linked_worktree_git_env(cwd):
+    """GIT_DIR/GIT_WORK_TREE for WSL git inside a worktree that Windows git created: its .git file points at a Windows
+    path (gitdir: C:/...), which Linux git cannot follow, so Codex verifying there saw no repository (2026-11-25)."""
+    if IS_WIN or not cwd:
+        return {}
+    start = Path(cwd)
+    for top in (start, *start.parents):
+        marker = top / ".git"
+        if marker.is_dir():
+            return {}
+        if marker.is_file():
+            try:
+                text = marker.read_text("utf-8", "replace").strip()
+            except OSError:
+                return {}
+            match = re.fullmatch(r"gitdir:\s*([A-Za-z]):[\\/](.*)", text)
+            if not match:
+                return {}
+            return {"GIT_DIR": f"/mnt/{match[1].lower()}/" + match[2].replace("\\", "/"), "GIT_WORK_TREE": str(top)}
+    return {}
 
 
 def observations_changed(before, after):
@@ -2855,6 +2925,8 @@ def execute(args, prompt, run_dir):
                                   error=final[refusal.start():refusal.start() + 300])
                 else:
                     result.update(status="failed", error_kind="schema_invalid", error=message, retryable=False)
+        if result["status"] == "completed" and writer(args.sandbox, context):
+            commit_worktree(context, run_dir, result)
         return finish(result)
     finally:
         for lock in reversed(locks):
