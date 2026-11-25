@@ -1122,8 +1122,9 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     }
     if (cfg.plannerReads === 'open') return undefined;
     if (targets) {
-      const archive = readPath(handoverArchive(owner));
-      if (targets.every(file => file === archive || allowed(file, state, directories))) return undefined;
+      // 交接链的用户指令档案和每个前任的原文。
+      const archives = [handoverArchive(owner) ?? []].flat().map(file => readPath(file)).filter(Boolean);
+      if (targets.every(file => archives.includes(file) || allowed(file, state, directories))) return undefined;
     }
     if (targets && state && !state.pending && now() - state.refreshed >= 25_000) {
       state.refreshed = now();

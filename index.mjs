@@ -33,7 +33,7 @@ const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, impo
 const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
   flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS,
   HISTORICAL_GAP_KINDS, historicalCriteria } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath, summarizing, summaryStepRejected } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath, transcriptPath, summarizing, summaryStepRejected } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -1638,8 +1638,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }, { plannerFile, handoverArchive: (owner) => {
     if (!stateDirectory || !owner) return;
     const links = aliases.links();
-    const root = aliases.predecessors(owner, links).at(-1);
-    if (root && links[owner]?.instructions?.root === root) return instructionArchivePath(stateDirectory, root);
+    const predecessors = aliases.predecessors(owner, links);
+    const root = predecessors.at(-1);
+    return [...(root && links[owner]?.instructions?.root === root ? [instructionArchivePath(stateDirectory, root)] : []),
+      ...predecessors.map((id) => transcriptPath(stateDirectory, id))];
   } });
   const productJobs = new Map();
   // 交接后后继会话也是前任会话任务的归属方；没有交接记录时只认本会话。

@@ -89,7 +89,7 @@ test('hand-over request creates the successor, links it, pauses the old goal, de
   assert.equal(result.status, 'handed_over');
   assert.equal(result.to, 'session-B');
   assert.deepEqual(created, [{ cwd: '/work/project', agentPreset: 'planner' }]);
-  assert.deepEqual(result.steps, { session: 'created', alias: 'linked', workspace: 'unavailable', title: 'unavailable', autoContinue: 'not_installed', instructions: 'written', predecessorGoal: 'paused', delivered: 'prompted', successorGoal: 'created' });
+  assert.deepEqual(result.steps, { session: 'created', alias: 'linked', workspace: 'unavailable', title: 'unavailable', autoContinue: 'not_installed', instructions: 'written', transcripts: 'written', predecessorGoal: 'paused', delivered: 'prompted', successorGoal: 'created' });
   assert.deepEqual(result.pending, { unreviewed: ['J1'], needsChanges: [] });
   assert.deepEqual(aliases.owners('session-B'), ['session-B', 'session-A']);
   assert.equal(goalsByAgent.get(a).phase, 'paused');
@@ -174,7 +174,7 @@ function host(t, hooks = {}, root = dir(t)) {
     resume: (x) => goalsByAgent.set(x, { ...goalsByAgent.get(x), phase: 'active' }),
     create: (x, request) => { hooks.goalCreate?.(x, request); goalsByAgent.set(x, { id: 'G', revision: 1, phase: 'active', ...request, ...hooks.goalPatch }); },
   };
-  const ctx = { get: (name) => ({ goals, sessionController: {
+  const ctx = { get: (name) => ({ goals, sessionQuery: hooks.readSession && { readSession: hooks.readSession }, sessionController: {
     resolveAgent: async (id) => (agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found', message: 'no' } }),
     create: async () => { const id = `session-N${++next}`; agent(id); return { sessionId: id }; },
     prompt: async (request) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId)); },
@@ -283,6 +283,9 @@ test('case-variant chain roots get separate archives and successor read permissi
   assert.equal((await read(b.to, b.instructions.file)).value, 'read');
   assert.equal((await read(a.to, b.instructions.file)).isError, true);
   assert.equal((await read(b.to, a.instructions.file)).isError, true);
+  // 前任的原文只有它自己链上的继任会话能读。
+  assert.equal((await read(a.to, a.transcripts.at(-1).file)).value, 'read');
+  assert.equal((await read(b.to, a.transcripts.at(-1).file)).isError, true);
   assert.notEqual(a.instructions.file.toLowerCase(), b.instructions.file.toLowerCase());
   assert.deepEqual(entriesAt(a.instructions.file).map(({ text }) => text), ['大写链指令']);
   assert.deepEqual(entriesAt(b.instructions.file).map(({ text }) => text), ['小写链指令']);
@@ -513,7 +516,7 @@ test('the brief has every section in order, caps each section and drops whole se
     jobs: briefJobs(80), pending: { unreviewed: ['J080', 'J079'], needsChanges: ['J078'] }, context: sessionContext(log), sessionRead: true };
   const brief = buildBrief({ ...base, note: '先把 J058 返工，再派第四章' });
   const titles = brief.match(/^## .*/gm);
-  assert.deepEqual(titles.map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 目标', '## 最近的用户指令', '## 旧会话最后的进展', '## 待收尾', '## 任务', '## 如何回看旧会话', '## 接手须知']);
+  assert.deepEqual(titles.map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 目标', '## 最近的用户指令', '## 旧会话最后的进展', '## 待收尾', '## 任务', '## 旧会话原文', '## 接手须知']);
   assert.ok(brief.length <= BRIEF_LIMIT, String(brief.length));
   assert.match(brief, /## 下一步\n先把 J058 返工，再派第四章/);
   assert.match(brief, /目标已在本会话逐字重建，上限 6 轮（原会话状态 active，已用 4 \/ 10 轮）；以 get_goal 返回的为准/);
@@ -521,7 +524,7 @@ test('the brief has every section in order, caps each section and drops whole se
   assert.equal((brief.match(/^- 2026-11-17T08:00:00\.00\dZ：第 \d 条用户要求/gm) ?? []).length, 10);
   assert.match(brief, /## 最近的用户指令[^\n]*\n以下是用户亲手输入的要求，仍然有效，除非与“下一步”或更新的指令冲突。/);
   assert.match(brief, /最后一个回合：结束原因 completed，2026-11-17T09:00:00\.000Z/);
-  assert.match(brief, /session_read\(sessionId="session-A", mode="summary"\)/);
+  assert.match(brief, /session_read\(sessionId="session-A", mode="search", query="关键词"\)/);
   assert.match(brief, /有“下一步”时直接按它推进，不要为确认方向而向用户提问/);
   // 任务表只列最近 10 单非核验任务和未结束、待处理的任务，其余用 codex_jobs 查。
   assert.deepEqual(brief.match(/^\| J\d+ /gm).map((r) => r.slice(2, -1)), [...Array.from({ length: 10 }, (_, i) => `J0${80 - i}`), 'J050']);
@@ -535,14 +538,14 @@ test('the brief has every section in order, caps each section and drops whole se
   // 总长度紧张：任务表先缩成未结束、待处理和最近 10 单，再从优先级最低的节开始整节省略；下一步、待收尾从不省略。
   const tight = buildBrief({ ...base, note: '下一步', limit: 6000 });
   assert.ok(tight.length <= 6000 || tight.match(/^## /gm).length === 2, String(tight.length));
-  assert.match(tight, /本单超过 6000 字符，省略了：接手须知、如何回看旧会话/);
+  assert.match(tight, /本单超过 6000 字符，省略了：接手须知、任务/);
   assert.ok(tight.includes('## 下一步'));
   const compact = buildBrief({ ...base, note: '', limit: 12_500 });
   const rows = compact.match(/^\| J\d+ /gm) ?? [];
   assert.ok(rows.length <= 13 && rows.some((r) => r.includes('J050')), rows.join(''));
   const smallest = buildBrief({ ...base, note: 'x', limit: 100 });
-  assert.deepEqual(smallest.match(/^## .*/gm), ['## 下一步', '## 待收尾']);
-  assert.match(smallest, /本单超过 100 字符，省略了：接手须知、如何回看旧会话、任务、旧会话最后的进展、最近的用户指令、目标。/);
+  assert.deepEqual(smallest.match(/^## .*/gm).map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 待收尾', '## 旧会话原文']);
+  assert.match(smallest, /本单超过 100 字符，省略了：接手须知、任务、旧会话最后的进展、最近的用户指令、目标。/);
 });
 
 test('in an extremely long brief the next step, pending close-out and archive reference still survive', async () => {
@@ -552,7 +555,7 @@ test('in an extremely long brief the next step, pending close-out and archive re
     goal: { phase: 'active', objective: '目标'.repeat(50_000), roundsStarted: 1, maxGoalRounds: 3 }, jobs: briefJobs(2000),
     pending: { unreviewed: ['J2000', 'J1999'], needsChanges: ['J1998'] }, context: sessionContext(log), note: `先返工 J1998。${'说明'.repeat(8000)}`,
     instructionArchive: { file: '/state/handovers/instructions-session-A.json', count: 50, first: new Date(0).toISOString(), last: new Date(49).toISOString() } });
-  assert.deepEqual(brief.match(/^## .*/gm).map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 待收尾']);
+  assert.deepEqual(brief.match(/^## .*/gm).map((title) => title.replace(/（.*$/, '')), ['## 下一步', '## 待收尾', '## 旧会话原文']);
   assert.match(brief, /## 下一步\n先返工 J1998/);
   assert.match(brief, /尚未 codex_review：J2000、J1999/);
   assert.match(brief, /needs_changes 尚未结案，最新轮次：J1998/);
@@ -567,7 +570,7 @@ test('after a hand-over the plugin checks goal, settings, jobs, delivery and the
   const deps = { sessionJobs: async (owner) => (owner === 'session-A' || h.aliases.predecessors(owner).includes('session-A') ? jobsA : []),
     pendingOf: () => ({ unreviewed: ['J1'], needsChanges: [] }) };
   const ok = await h.request({ sessionId: 'session-A' }, deps);
-  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', instructions: 'ok', predecessorFrozen: 'ok', workspace: 'skipped:unavailable' }]);
+  assert.deepEqual([ok.status, ok.checks], ['handed_over', { goal: 'ok', settings: 'ok', jobs: 'ok', delivered: 'ok', instructions: 'ok', transcripts: 'ok', predecessorFrozen: 'ok', workspace: 'skipped:unavailable' }]);
   // 目标没有逐字接上、轮数不对、模型路由不同、新会话查不到待验收任务：如实报告，不回滚。
   const g = host(t, { goalPatch: { objective: '完成迁移', maxGoalRounds: 3 } });
   const b = g.agent('session-B');
@@ -1410,4 +1413,77 @@ test('after the user stops a session, job notices alone do not wake it; they rea
   const idle = { id: 'session-I', status: 'running', session: { header: { cwd: '/w' },
     log: [{ type: 'turn/start' }, { type: 'turn/end', data: { reason: { kind: 'completed' } } }, { type: 'turn/start' }] } };
   assert.equal((await preStep(idle, [notice])).kind, 'enter');
+});
+
+test('the transcript keeps every word of the conversation and leaves out what the host injects', async () => {
+  const { renderTranscript } = await import('./handover.mjs');
+  const at = (time, type, data) => ({ type, time, data });
+  const relay = userEvent('插件代发的消息', 1003);
+  relay.data.source.via = 'codex-conductor';
+  const brief = userEvent('[codex-conductor 交接] 交接单正文', 1000);
+  brief.data.source.rpcId = 'handover-1';
+  const { text, user, assistant, tools } = renderTranscript([
+    { type: 'session', cwd: '/w' }, brief,
+    userEvent('第一条：端口用 48213，\n不要动 legacy 目录', 1001), userEvent('技能目录（宿主注入）', 1002, 'skill-catalog'),
+    relay, userEvent('后台任务 J1 已完成', 1004, 'tool-jobs'),
+    at(1005, 'assistant/message', { turn: 1, message: { content: [{ type: 'text', text: '好的，端口 48213。' }, { type: 'tool-call', name: 'codex_run' }] } }),
+    at(1006, 'tool/call', { callId: 'c1', name: 'codex_run', arguments: JSON.stringify({ task: 'x'.repeat(1000) }) }),
+    at(1007, 'tool/result', { message: { toolCallId: 'c1', isError: true, content: [{ type: 'text', text: 'y'.repeat(1000) }] } }),
+    at(1008, 'tool/call', { callId: 'c2', name: 'ask_user_question', arguments: JSON.stringify({ question: 'q'.repeat(400) }) }),
+    at(1009, 'tool/result', { message: { toolCallId: 'c2', content: [{ type: 'text', text: `{"selected":["${'a'.repeat(400)}"]}` }] } }),
+  ], { sessionId: 'session-A', title: '迁移', cwd: '/w', at: 'now' });
+  for (const part of ['# 会话原文：session-A', '- 标题：迁移', '交接单（插件投递）\n\n[codex-conductor 交接] 交接单正文',
+    '1970-01-01T00:00:01.001Z 用户\n\n第一条：端口用 48213，\n不要动 legacy 目录', '插件代发（codex-conductor）\n\n插件代发的消息',
+    '任务通知\n\n后台任务 J1 已完成', '助手（回合 1）\n\n好的，端口 48213。', '结果 codex_run（出错）：', 'q'.repeat(400), 'a'.repeat(400)]) {
+    assert.ok(text.includes(part), part);
+  }
+  assert.ok(!text.includes('技能目录'));
+  // 普通工具的参数和结果只留开头。
+  assert.ok(text.includes('x'.repeat(250)) && !text.includes('x'.repeat(400)) && !text.includes('y'.repeat(400)));
+  assert.deepEqual([user, assistant, tools], [1, 1, 2]);
+});
+
+test('every predecessor in the chain gets a full transcript the brief points to, older ones backfilled from the session record', async (t) => {
+  const reads = [];
+  const h = host(t, { readSession: async (id) => { reads.push(id); return { events: h.agents.get(id).session.log }; } });
+  const a = h.agent('session-A');
+  a.session.log.push(userEvent('早期要求：端口用 48213', 1), { type: 'assistant/message', time: 2, data: { turn: 1, message: { content: [{ type: 'text', text: '记下了，48213。' }] } } });
+  const first = await h.request({ sessionId: a.id });
+  assert.deepEqual([first.steps.transcripts, first.checks.transcripts, first.transcripts.map((x) => x.sessionId)], ['written', 'ok', ['session-A']]);
+  // 0.9.202 之前交接的前任没有原文：下一次交接从宿主的会话记录补写。
+  rmSync(first.transcripts[0].file);
+  const b = h.agents.get(first.to);
+  b.session.log.push(userEvent('新会话里的要求', 3));
+  const second = await h.request({ sessionId: b.id });
+  assert.deepEqual(reads, ['session-A']);
+  assert.deepEqual([second.steps.transcripts, second.checks.transcripts], ['written', 'ok']);
+  assert.deepEqual(second.transcripts.map((x) => [x.sessionId, x.user]), [['session-A', 1], [b.id, 1]]);
+  assert.ok(readFileSync(second.transcripts[0].file, 'utf8').includes('早期要求：端口用 48213'));
+  assert.ok(readFileSync(second.transcripts[1].file, 'utf8').includes('新会话里的要求'));
+  // 交接单列出整条链的原文（最近的在前），首条消息提醒先查原文。
+  const brief = readFileSync(second.briefPath, 'utf8');
+  assert.ok(brief.indexOf(second.transcripts[1].file) < brief.indexOf(second.transcripts[0].file));
+  assert.match(brief, /## 旧会话原文[\s\S]*先用 grep（path 填上面的文件）搜关键词/);
+  assert.match(h.prompts.at(-1).content[0].text, /先查原文再回答/);
+  // 已有原文的前任不重读。
+  const c = h.agents.get(second.to);
+  await h.request({ sessionId: c.id });
+  assert.deepEqual(reads, ['session-A']);
+  // 补写不成时照样交接，交接单写明哪一个没导出。
+  const bare = host(t);
+  const x = bare.agent('session-X');
+  const one = await bare.request({ sessionId: x.id });
+  rmSync(one.transcripts[0].file);
+  const two = await bare.request({ sessionId: one.to });
+  assert.deepEqual([two.status, two.steps.transcripts, two.checks.transcripts], ['handed_over', 'partial:1', 'partial:1']);
+  assert.match(readFileSync(two.briefPath, 'utf8'), /session-X：原文没能导出（sessionQuery unavailable）/);
+});
+
+test('the transcript section survives when the brief is cut to its limit', async () => {
+  const { buildBrief } = await import('./handover.mjs');
+  const brief = buildBrief({ from: 'A', to: 'B', at: 'now', cwd: '/w', goal: null, since: 0, note: '', limit: 200,
+    jobs: Array.from({ length: 30 }, (_, i) => ({ job_id: `J${i}`, context: { task: '任务'.repeat(50) } })), pending: { unreviewed: [], needsChanges: [] },
+    transcripts: [{ sessionId: 'A', file: '/state/handovers/transcript-A.md', user: 3, assistant: 4, first: 't1', last: 't2' }] });
+  assert.match(brief, /省略了：/);
+  assert.ok(brief.includes('- A（t1 至 t2，用户消息 3 条，助手回复 4 条）：/state/handovers/transcript-A.md'));
 });
