@@ -141,6 +141,10 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "log_rewrite":
         Path("logs/watch.out").write_bytes(b"rewritten and longer\n")  # grows, but its first bytes changed
         finish()
+    elif mode in ("sqlite_read", "sqlite_write"):
+        # Reading a WAL database rewrites its -shm index; writing changes the database itself.
+        Path("data.db-shm" if mode == "sqlite_read" else "data.db").write_bytes(b"rewritten by the verifier\n")
+        finish()
     elif mode == "verification_overwrite_large":
         target = Path("a.txt")
         info = target.stat()
@@ -6898,6 +6902,24 @@ class RunnerTests(unittest.TestCase):
                     else:
                         self.assertEqual((result["verification_changed_paths"], result["verification_append_check"]),
                                          (["sub/logs/watch.out"], "hash"))
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_ignores_the_sqlite_index_a_reader_rewrites(self):
+        prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
+            "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
+        for mode, expected in (("sqlite_read", ("completed", None)), ("sqlite_write", ("failed", ["sub/data.db"]))):
+            with self.subTest(mode=mode):
+                _, project, _ = self.git_repo(f"verification-{mode}")
+                (project / "data.db").write_bytes(b"rows\n")
+                (project / "data.db-shm").write_bytes(b"index\n")
+                self.stored_job("SOURCE", {"status": "completed", "files_changed": [{"path": "data.db"}, {"path": "data.db-shm"}]},
+                                cwd=str(project), scope=[])
+                try:
+                    result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
+                                         mode=mode, prompt=prompt)
+                    self.assertEqual((result["status"], result.get("verification_changed_paths")), expected, result)
                 finally:
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
