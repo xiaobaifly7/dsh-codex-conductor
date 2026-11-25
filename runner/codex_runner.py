@@ -1905,9 +1905,11 @@ def files_changed(root, before, event_changes, scope=None, ignore=None):
 
 
 def git(cwd, *argv, deadline, env=None, program="git"):
+    # Diff, digest and commit all go through here, so a worktree Windows git created works for every one of them.
+    linked = linked_worktree_git_env(os.fsdecode(cwd)) if program == "git" else {}
     p = subprocess.run([program, "-C", cwd, "-c", "core.fsmonitor=false", "-c", "core.splitIndex=false", *argv],
                        stdin=subprocess.DEVNULL, capture_output=True, timeout=max(0.1, deadline - time.monotonic()),
-                       creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **(env or {})})
+                       creationflags=NO_WINDOW, env={**os.environ, "LC_ALL": "C", "GIT_OPTIONAL_LOCKS": "0", **linked, **(env or {})})
     if p.returncode:
         raise ValueError(p.stderr.decode("utf-8", "replace").strip() or f"git exited {p.returncode}")
     return p.stdout
