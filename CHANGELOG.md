@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.187` 新增配置 verifyEngine 和 verifyServiceTier。verifyEngine 设为 codex 或 gemini 后，核验单（codex_verify、自动核验、verify_previous）一律用这个引擎，lockEngine 时也生效，规划端传的 engine 不生效；codex_run、codex_continue 照旧用 lockEngine 的引擎，工具说明会写明核验由哪个引擎执行。核验走 Codex 时，模型用 model，档位用 readOnlyEffort，service tier 用 verifyServiceTier（例如 fast，留空同 serviceTier）。Codex 报额度用完后，到恢复时间前的核验改派 Gemini，不会因为额度直接拒派。用户 2026-11-25 要求执行端保持 Gemini、核验改用 Codex 并开 Fast。依据是线上数据：Gemini neon-high 核验中位 309–389 秒、成功率 88–96%；Codex 6.1-sol medium 在 11-12 到 11-21 的 488 单线上核验成功率 99%、中位 129 秒，高风险重放 36 单拒答 0。
+
 `0.9.186` 原任务全部受阻、没有任何改动或可核验结果时，codex_review 对 accepted_deviations 的回执不再给「① 先派 codex_verify 核验后再记」这条路，只留续接、用户确认和改记 needs_changes。这种单 codex_verify 本来就拒绝核验（「原任务受阻，未记录改动或可核验结果」），回执却叫规划端先去核验：2026-11-25 12:51–13:03 ae0c16c3 结案 f76c9a（8 条全 blocked、0 文件）时，在 accepted_deviations 和 codex_verify 之间来回被拒 6 次、约 12 分钟，最后才改记 needs_changes。
 
 `0.9.185` 0.9.181 的抽查回执第 ② 条改为「改记 needs_changes 并把不属实结论所在的验收项标 not_met」。原来只写「改记 needs_changes」，而另一条护栏规定所有验收项都 met、又没有阻塞和偏差时不能记 needs_changes，照回执做会被拒：2026-11-25 11:49 ae0c16c3 结案 f056fa 时因此多被拒两次，第三次标了 not_met 才通过。
@@ -269,6 +271,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.187` Adds the settings verifyEngine and verifyServiceTier. With verifyEngine set to codex or gemini, every verification (codex_verify, automatic verification, verify_previous) runs on that engine, even under lockEngine, and the planner's engine is ignored. codex_run and codex_continue keep the lockEngine engine, and the tool text says which engine verifies. A Codex verification uses model, readOnlyEffort and verifyServiceTier (for example fast; empty means serviceTier). After Codex reports its quota spent, verifications until the reset time move to Gemini instead of being refused. On 2026-11-25 the user asked to keep execution on Gemini and run verification on Codex with Fast. Live data: Gemini neon-high verifications took a median 309–389 s with 88–96% success; Codex 6.1-sol medium ran 488 live verifications from 11-12 to 11-21 at 99% success with a 129 s median, and refused none of 36 high-risk replays.
 
 `0.9.186` When the original task is blocked with no change or verifiable result, the codex_review receipt for accepted_deviations no longer offers "① run codex_verify first, then record", leaving continuation, user confirmation and needs_changes. codex_verify refuses such a job ("blocked, no change or verifiable result recorded"), yet the receipt sent the planner there: on 2026-11-25 12:51–13:03 ae0c16c3 closing f76c9a (8 rows blocked, no files) bounced between accepted_deviations and codex_verify 6 times over about 12 minutes before recording needs_changes.
 

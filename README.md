@@ -210,6 +210,8 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 | `defaultEngine` | `codex` | 新任务未指定引擎时采用此值 |
 | `lockEngine` | `false` | `true` 时新任务、续接和核验一律用 `defaultEngine`，规划端传的 `engine` 不生效；续接另一引擎的任务时附上轮交接开新会话，锁定 Gemini 时 `codex_run` 不接受 `resume` |
 | `crossEngineVerify` | `true` | 已配置 Gemini 时用另一引擎独立只读核验，`codex_verify` 的显式引擎优先 |
+| `verifyEngine` | 空 | `codex` 或 `gemini`：核验单一律用这个引擎，`lockEngine` 时也生效，规划端传的 `engine` 不生效；Codex 额度用完时核验改派 Gemini。留空按 `lockEngine` / `crossEngineVerify` |
+| `verifyServiceTier` | 空 | Codex 核验单的 service tier，例如 `fast`；留空同 `serviceTier` |
 | `geminiFallback` | `true` | Codex 因模型或上游问题失败且 runner 确认无写入时，启动关联的 Gemini 任务 |
 | `maxGeminiRunningJobs` | `2` | 同时运行的 Gemini 任务上限；超出的任务排队（`phase: engine_wait`）直到有名额，最多等 `lockTimeoutSeconds`，`null` 表示不设单独上限 |
 

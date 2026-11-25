@@ -73,6 +73,8 @@ const DEFAULTS = {
   lockEngine: false,
   geminiFallback: true,
   crossEngineVerify: true,
+  // 核验单的引擎（codex/gemini），lockEngine 时也生效；留空按 lockEngine / crossEngineVerify
+  verifyEngine: '',
   maxGeminiRunningJobs: 2,
   modelAB: { enabled: false, models: ['codex/gpt-6.1-sol', 'codex/gpt-6.2-sol'], share: 0.5 },
   effort: '',
@@ -80,6 +82,8 @@ const DEFAULTS = {
   // 只读任务的推理强度，留空与 effort 相同
   readOnlyEffort: '',
   serviceTier: '',
+  // Codex 核验单的 service tier（如 fast），留空同 serviceTier
+  verifyServiceTier: '',
   waitSeconds: 0,
   autoWakeBlockedInbox: true,
   // delaySeconds > 0：宿主启动后等这么久再续接，只补那些到时仍没有新回合的会话（让 auto-continue 先扫）；0 立即续接
@@ -448,7 +452,7 @@ export function createConductor(cfg, run = runRunner) {
       throw new Error('Windows 原生模式使用独立的 Codex home，不支持 use_user_config=true。请改用默认精简配置，或在 WSL 模式使用原用户配置。');
     }
     const argv = ['start', '--cwd', cwd];
-    const engine = runEngine(args, cfg);
+    const engine = runEngine(args, cfg, Boolean(context?.verification_of));
     const repeat = cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS;
     argv.push('--repeat-guard', repeat.enabled ? 'on' : 'off', '--repeat-min-seconds', String(repeat.minSeconds),
       '--repeat-failures', String(repeat.failures), '--repeat-window-hours', String(repeat.windowHours));
@@ -1203,7 +1207,7 @@ function settings(config, logger) {
       : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
       : key === 'ownerDecisions' ? ['planner', 'owner'].includes(value)
       : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
-      : key === 'defaultEngine' ? ENGINE_PARAMETER.enum.includes(value)
+      : ['defaultEngine', 'verifyEngine'].includes(key) ? ENGINE_PARAMETER.enum.includes(value)
       : key === 'effortOverride' ? ['planner', 'raise-only-listed', 'config'].includes(value)
       : ['handoverSuggestMessages', 'handoverContextTokens', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
       : key === 'runnerAgentsMd' ? typeof value === 'string' && (['none', 'bundled'].includes(value) || /^(?:[A-Za-z]:[\\/]|\/)[^\r\n]*$/.test(value))
@@ -2935,7 +2939,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       args = { ...args, expect_blocked: [...new Set(args.expect_blocked)] };
       routing = { ...routing, expect_blocked_count: args.expect_blocked.length };
     }
-    let engine = runEngine(args, cfg);
+    let engine = runEngine(args, cfg, Boolean(verificationOf));
     let quotaLine;
     const lockLine = cfg.lockEngine && args.engine !== undefined && args.engine !== engine
       ? `执行端已锁定为 ${engine === 'gemini' ? 'Gemini' : 'Codex'}，本单没有按 engine=${args.engine} 执行。` : undefined;
@@ -2946,7 +2950,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const takeover = cfg.gemini?.command && cfg.geminiFallback !== false && cfg.allowHostAccess === true &&
         (args.host_access ?? cfg.defaultHostAccess) === true &&
         /^(?:[A-Za-z]:[\\/]|\/mnt\/[A-Za-z]\/)/.test(taskCwd(args, sessionCwd(exec), cfg.workspaces) ?? '');
-      if (!takeover || args.engine !== undefined || args.resume) {
+      // A configured verifyEngine is not the planner's choice, so its verifications may still move to Gemini.
+      if (!takeover || (args.engine !== undefined && !(verificationOf && cfg.verifyEngine)) || args.resume) {
         throw reject(`${continuation ? 'codex_continue' : 'codex_run'}: Codex 额度已用完，预计 ${until} 恢复，这期间不再派 Codex，未启动任务。` +
           (cfg.gemini?.command ? '改传 engine: "gemini" 交给 Gemini。' : '') + '额度提前恢复时，在“Codex 指挥”面板重新加载插件即可解除。');
       }
@@ -3597,7 +3602,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       ...(engine === 'codex' ? {
         effort: cfg.readOnlyEffort || (same ? options.effort : cfg.effort) || undefined,
         model: cfg.modelAB.enabled || !same ? cfg.model : options.model ?? '',
-        service_tier: same ? options.service_tier ?? '' : cfg.serviceTier,
+        service_tier: cfg.verifyServiceTier || (same ? options.service_tier ?? '' : cfg.serviceTier),
       } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
     }, exec, undefined, undefined, source.job_id, undefined,
