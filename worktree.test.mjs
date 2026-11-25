@@ -61,9 +61,17 @@ test('a conversation worktree shares ignored material, merges back after a trial
   const second = await openWorktree({ repo: root, owner: 'session-bbbb2222-0000', maxUntracked: 10 });
   writeFileSync(path.join(second.path, 'src', 'a.txt'), 'one\nzwei\n');
   commitAll(second.path, 'other work');
+  const before = git(root, 'rev-parse', 'HEAD').trim();
+  const tip = git(root, 'rev-parse', first.branch).trim();
   const merged = await mergeWorktree({ repo: root, ...first });
   assert.equal(merged.status, 'merged');
   assert.equal(merged.commits, 1);
+  // A real merge commit (built from the trial tree, then fast-forwarded to): the old main first, the conversation second.
+  assert.equal(git(root, 'rev-parse', 'HEAD').trim(), merged.commit);
+  assert.deepEqual(git(root, 'rev-list', '--parents', '-n', '1', 'HEAD').trim().split(' ').slice(1),
+    [before, tip]);
+  assert.equal(git(root, 'log', '-1', '--format=%s').trim(), '合并对话 worktree conv/aaaa1111（1 个提交）');
+  assert.equal(git(root, 'status', '--porcelain').trim(), '', 'index and files follow the merge');
   assert.equal(readFileSync(path.join(root, 'src', 'new.txt'), 'utf8'), 'new\n');
   assert.equal(merged.synced, true);
   const conflict = await mergeWorktree({ repo: root, ...second });
