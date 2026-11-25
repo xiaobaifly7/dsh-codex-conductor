@@ -1085,6 +1085,7 @@ test('conversation worktree: a new conversation writes in its own worktree and m
   mkdirSync(path.join(root, 'src'), { recursive: true });
   writeFileSync(path.join(root, 'src', 'a.txt'), 'a\n');
   git(root, 'init', '-q', '-b', 'main');
+  git(root, 'config', 'core.autocrlf', 'false'); // Windows CI 的全局 autocrlf=true 会让合并检出的文件变成 CRLF
   git(root, 'add', '-A');
   git(root, 'commit', '-q', '-m', 'base');
   try {
