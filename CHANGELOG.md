@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.191` 在 runner 的 completed 出口移植 v2 拒答检测判据（新增 `REFUSED_REPLY`、`REFUSAL_REASON`、`REFUSAL_PATH`、`REFUSAL_LABEL`、`REFUSAL_SPLIT` 与 `refusal_evidence` 函数，支持 `model_refused` 阻塞项、安全边界措辞、报告字段共现与失败错误二次判定并附带两阶段拆单建议），继续补充 S1–S5 五类拒答判据（跨字段阻塞与强安全边界词、攻击性工具与隐藏来源出站边界词、`UPSTREAM_FILTER_BANNER` 非 JSON 上游过滤器横幅全文检测、上游内容过滤器连续拦截自述与受控修饰变体、非 stalled 下 `blocked` 验收项与强安全边界阻塞项判定）并经全库回测确认零误报，同时保留 `GEMINI_REFUSAL` 旧兜底与补齐拒答测试。
+
 `0.9.190` 核验的改动检查不再把 SQLite 的 `-shm` 文件算作改动。WAL 模式的数据库只要被读取，`-shm` 共享内存索引就会被改写，里面不存数据；核验只查询了原任务产出的数据库，也会被判 verification_tree_changed。2026-11-25 17:52 核验 d8778b 就是这样失败的：唯一变动的是原任务产物 `.db-shm`，同期的三单写入都没碰到它。数据库文件本身和其他文件照旧检查。
 
 `0.9.189` codex_model 登记前按 dsh-agy-link 的模型目录核对模型名（新配置 gemini.modelCatalog，指向 model-catalog.json）：目录里没有的（例如 Carbon 没有 xhigh 档）当场拒绝，并列出可选的 Gemini 模型，不再等到派单时 agy 报「not recognized」才发现；读不到目录时照旧只查格式。codex_summary 第一行显示本对话当前的执行模型，以及它是用户为本对话指定的还是默认的，交接出去的会话显示继承来的设置。
@@ -277,6 +279,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.191` Ports the v2 refusal-detection criteria to the runner's completed exit (`REFUSED_REPLY`, `REFUSAL_REASON`, `REFUSAL_PATH`, `REFUSAL_LABEL`, `REFUSAL_SPLIT` and `refusal_evidence`), catching turns that finish politely with a `model_refused` blocker, safety-boundary wording, report-field co-occurrence or a refusal in a failed run's error and attaching the two-stage `REFUSAL_SPLIT` guidance while keeping the `GEMINI_REFUSAL` fallback. Adds S1–S5 gap coverage for five missed refusal shapes — cross-field blockers paired with top-level safety-boundary wording (S1), offensive-tooling and anonymized-egress boundary terms (S2), full-text `UPSTREAM_FILTER_BANNER` checks on non-JSON upstream filter replies (S3), self-reported consecutive upstream content-filter blocks and qualified Chinese refusal variants (S4), and non-stalled runs that still carry `blocked` criteria with a `model_refused` or strong safety-boundary blocker (S5) — verified with zero false positives across finished jobs, together with the matching refusal and counterexample tests.
 
 `0.9.190` The verification change check no longer counts SQLite `-shm` files as changes. Any reader of a WAL database rewrites its `-shm` shared-memory index, which holds no data, so a verification that only queried a database the original task produced failed as verification_tree_changed. On 2026-11-25 at 17:52 verification d8778b failed this way: the only changed file was the original task's `.db-shm` product, and none of the three concurrent writes touched it. The database file itself and all other files are still checked.
 
