@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.196` 对话 worktree 的资料联接不再被提交：WSL 里的 git 把联接看成符号链接，`vm/` 这种目录规则不忽略它，runner 自动提交的 `git add -A` 把它们一并提交，合并随后因 worktree 不干净停下（线上版本实测，原目录未受影响）。开 worktree 时把建的联接写进本 worktree 的 `conversation-links.exclude`，runner 给 WSL 里的 git 设 `core.excludesFile` 指向它（经 `GIT_CONFIG_*`，执行器的 git 同样生效），不改仓库配置和 `.gitignore`。修复后实测：写入单只提交真实改动、核验后自动合并、收尾把被忽略的产出移回原目录。
+
 `0.9.195` 对话 worktree 默认建在仓库旁的 `conversation-worktrees` 目录，不再用 `worktree-space`：已安装的 dsh-worktree-space 插件的容器也叫 `worktree-space`，F:\渗透 这种盘根下一层的仓库两边会落进同一个 `F:\worktree-space`。两个插件互不相干，目录分开免得混淆。
 
 `0.9.194` 核验不再在跑不完全仓库 `git status` 的仓库上白等。核验前后各有一次全仓库状态检查，只用来提示核验范围外有没有改动，时间预算 30 秒。F:/渗透 文件太多，2026-11-25 下午的 46 单核验每一单都超时放弃，开工前白等约 31 秒、收尾又白等约 28 秒，结果都是「范围外未检查」。现在开工前超时后，收尾不再跑这一步；并把这个仓库记进 runner 的 snapshot-too-big.json（前缀 `whole:`，7 天），之后的核验两头都直接跳过。范围内的检查不变，核验结论和「范围外未检查」的标注与原来一致，每单省下约 1 分钟。
@@ -287,6 +289,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.196` A conversation worktree's material junctions are no longer committed: git in WSL sees a junction as a symlink, which a directory rule such as `vm/` does not ignore, so the runner's `git add -A` committed them and the merge then stopped on a dirty worktree (seen on the live version; the main checkout was untouched). Opening a worktree now lists its junctions in the worktree's `conversation-links.exclude`, and the runner points `core.excludesFile` at it for git in WSL (through `GIT_CONFIG_*`, so the executors' git honours it too), without touching repository config or `.gitignore`. Tested after the fix: the write job commits only real changes, merges after review, and close moves ignored output back.
 
 `0.9.195` Conversation worktrees now default to a `conversation-worktrees` directory beside the repository instead of `worktree-space`: the installed dsh-worktree-space plugin's container has that name too, and for a repository one level below a drive root (F:\渗透) both landed in the same `F:\worktree-space`. The two plugins are unrelated; separate directories keep them apart.
 

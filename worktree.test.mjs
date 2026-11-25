@@ -44,6 +44,10 @@ test('a conversation worktree shares ignored material, merges back after a trial
   assert.equal(first.base_branch, 'main');
   assert.equal(first.path, path.join(tmp, 'flow', 'conversation-worktrees', 'repo', 'aaaa1111'));
   assert.deepEqual(first.links, ['vm']);
+  // The links are listed for git in WSL, which sees a junction as a symlink that vm/ does not ignore.
+  const excludes = path.join(root, '.git', 'worktrees', 'aaaa1111', 'conversation-links.exclude');
+  assert.equal(readFileSync(excludes, 'utf8'), '/vm\n');
+  git(first.path, '-c', `core.excludesFile=${excludes}`, 'check-ignore', '-q', 'vm');
   assert.equal(first.hardlinks, 1);
   // Material is shared, not copied: a write through the link lands in the main checkout.
   writeFileSync(path.join(first.path, 'vm', 'out.log'), 'from the worktree\n');
