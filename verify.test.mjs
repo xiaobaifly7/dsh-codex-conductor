@@ -935,6 +935,38 @@ test('a verification lists every criterion the original report marked blocked or
   assert.equal(hx.payload().context.acceptance.at(-1), '原报告第 3 行（原报告标 not_met，未对上原验收清单）：额外抽查的一条——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。');
 });
 
+test('verifyEngine sends verifications to Codex with verifyServiceTier while lockEngine keeps the rest on Gemini', async () => {
+  const locked = { command: gemini.command, model: 'gemini-4-neon-high', effort: '', forceModel: true, forceEffort: true };
+  const config = { gemini: locked, defaultEngine: 'gemini', lockEngine: true, defaultHostAccess: true, verifyEngine: 'codex',
+    verifyServiceTier: 'fast', serviceTier: 'default', model: 'codex/gpt-6.1-sol', readOnlyEffort: 'medium' };
+  const geminiSource = () => {
+    const source = sourceJob();
+    Object.assign(source, { engine: 'gemini', cwd: 'D:/work/project', sandbox: 'danger-full-access' });
+    source.task_options = { ...source.task_options, engine: 'gemini', model: 'gemini-4-neon-high' };
+    return source;
+  };
+  const codexOnly = (argv) => [option(argv, '--engine'), option(argv, '--model'), option(argv, '--effort'), option(argv, '--service-tier')];
+  const h = harness({ source: geminiSource(), config });
+  await h.verify({ engine: 'gemini' });
+  assert.deepEqual(codexOnly(h.start().argv), [undefined, 'codex/gpt-6.1-sol', 'medium', 'fast']);
+  assert.match(h.tools.codex_verify.parameters.properties.engine.description, /codex_continue 由它执行，codex_verify 由 Codex 执行/);
+  const run = harness({ config });
+  await run.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false }, exec);
+  assert.deepEqual(codexOnly(run.start().argv), ['gemini', 'gemini-4-neon-high', undefined, undefined]);
+
+  // Once Codex reports its quota spent, the next verification moves to Gemini instead of being refused.
+  const limited = { status: 'failed', error_kind: 'permanent', structured: undefined,
+    error: 'You’ve hit your usage limit. Visit the usage page or try again at Jan 2nd, 2099 1:00 AM.' };
+  const spent = harness({ source: geminiSource(), config, verificationResult: limited });
+  await spent.verify();
+  const moved = await spent.verify();
+  const starts = spent.calls.filter(call => call.argv[0] === 'start');
+  assert.equal(starts.length, 2);
+  assert.equal(option(starts[1].argv, '--engine'), 'gemini');
+  assert.ok(!starts[1].argv.includes('--service-tier'));
+  assert.match(JSON.stringify(moved), /本单已改派 Gemini/);
+});
+
 test('lockEngine runs every task, continuation and verification on Gemini with the configured model', async () => {
   const locked = { command: gemini.command, model: 'gemini-4-neon-medium', effort: '', forceModel: true, forceEffort: true };
   const config = { gemini: locked, defaultEngine: 'gemini', lockEngine: true, defaultHostAccess: true };

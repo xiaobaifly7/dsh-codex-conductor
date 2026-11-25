@@ -14,19 +14,22 @@ export function checkEngine(engine) {
 
 export const jobEngine = (job) => job?.engine ?? job?.task_options?.engine ?? 'codex';
 // lockEngine: every task, continuation and verification runs on defaultEngine, whatever the planner passes.
-export const runEngine = (args, cfg) => cfg.lockEngine ? cfg.defaultEngine ?? 'codex'
-  : args.engine ?? (args.resume ? 'codex' : cfg.defaultEngine ?? 'codex');
+// verifyEngine overrides it for verifications; their args.engine then only carries a Codex-quota takeover to Gemini.
+export const runEngine = (args, cfg, verification = false) => verification && cfg.verifyEngine ? args.engine ?? cfg.verifyEngine
+  : cfg.lockEngine ? cfg.defaultEngine ?? 'codex' : args.engine ?? (args.resume ? 'codex' : cfg.defaultEngine ?? 'codex');
 
 // The text planners see for engine choice: the general guidance, or which engine and model every task now uses.
 export function engineGuidance(cfg) {
   if (!cfg.lockEngine) return ENGINE_GUIDANCE;
   const gemini = (cfg.defaultEngine ?? 'codex') === 'gemini';
-  return `执行端已锁定为 ${gemini ? `Gemini（${cfg.gemini?.executionModel ?? cfg.gemini?.model}）` : 'Codex'}：codex_run、codex_continue、` +
-    'codex_verify 都由它执行，传 engine 会被忽略。' + (gemini ? '返工用 codex_continue(job_id)，不要传 resume；续接原 Codex 任务时插件自动转给 Gemini 并附上轮交接。' +
+  const verify = cfg.verifyEngine && cfg.verifyEngine !== (cfg.defaultEngine ?? 'codex') ? cfg.verifyEngine : '';
+  return `执行端已锁定为 ${gemini ? `Gemini（${cfg.gemini?.executionModel ?? cfg.gemini?.model}）` : 'Codex'}：codex_run、codex_continue` +
+    (verify ? ` 由它执行，codex_verify 由 ${verify === 'codex' ? 'Codex' : 'Gemini'} 执行` : '、codex_verify 都由它执行') + '，传 engine 会被忽略。' + (gemini ? '返工用 codex_continue(job_id)，不要传 resume；续接原 Codex 任务时插件自动转给 Gemini 并附上轮交接。' +
     '任务目录须在 Windows 盘符下；只有主机访问任务能运行命令和写文件。' : '');
 }
 
 export function verifyEngine(requested, source, cfg) {
+  if (cfg.verifyEngine) return cfg.verifyEngine;
   if (cfg.lockEngine) return cfg.defaultEngine ?? 'codex';
   const engine = jobEngine(source);
   if (requested !== undefined) return requested;
