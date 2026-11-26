@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.208` 对话 worktree 的合并被核验记为 needs_changes 的写入单挡住时，回执点名这些单并说明怎么处理：在原线程用 codex_continue 修正后重新核验，或者已由后续单修正的，对原单记 accepted_deviations 并写明由哪一单修正。以前只说“还有写入单没核验通过”，规划端改派新单补完后不回头处理原单，合并一直卡住（11-26 d70d85ff 14:35 起 7 个提交没合回 F:\渗透）。合并条件本身不变。
+
 `0.9.207` Google 在提交阶段拦下提示词时（“The prompt could not be submitted. The prompt contains sensitive words that violate Google's … policy”），这段固定提示会作为 Gemini 的最终回复回来。以前它被记成 schema_invalid（回复不是 JSON），规划端于是把同一个会被拦的提示词原样再派一次（11-26 d70d85ff 连续两单）。现在它和 “blocked by Gemini's filters” 一样记为 model_refused，回执按拒绝处理：不原样重派。
 
 `0.9.206` 重启续接遇到用户停下的目标（用户最后一次停止比最后一次目标恢复更新）不再重新武装，只用续接消息接上被打断的回合。依据：11-26 用户停下会话后，后续回合出错，目标被自动续跑重新武装，目标轮又跑了起来；重启续接有同样的漏洞。
@@ -311,6 +313,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.208` When writes booked needs_changes hold back a conversation worktree's merge, the receipt names them and says what clears each: fix it on its own thread with codex_continue and verify again, or, when a later job already fixed it, book the original accepted_deviations naming that job. It used to say only that writes were not yet verified; the planner fixed things in new jobs, never came back to the originals, and the merge stayed blocked (d70d85ff on 11-26: 7 commits unmerged since 14:35). The merge condition is unchanged.
 
 `0.9.207` When Google stops a prompt before the model sees it ("The prompt could not be submitted. The prompt contains sensitive words that violate Google's … policy"), that fixed notice comes back as Gemini's final message. It used to be booked schema_invalid (the reply is not JSON), so the planner sent the same blocked prompt again (two jobs in a row on 11-26). It is now booked model_refused like "blocked by Gemini's filters", and the receipt treats it as a refusal: do not resend it unchanged.
 
