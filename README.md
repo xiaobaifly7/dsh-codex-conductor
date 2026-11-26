@@ -106,6 +106,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.206：用户停下的目标，重启续接不再重新武装
+
+宿主在两种情况下把进行中的目标置为“未武装”：重启，以及用户停掉一个不是目标轮的回合。只有后一种是用户要它等着。原先重启续接只看最后一个回合是不是用户停的：用户停下、再发一条消息、这条消息的回合被重启打断，续接就把目标重新武装，目标轮又跑起来。现在读日志，用户最后一次停止比最后一次目标恢复或新建更新时，目标不动，只用续接消息接上被打断的那个回合；最后一个回合已经正常结束的不再续。结果里带 `goalStoppedByUser`。
+
 ### 0.9.205：重启续接的时间窗按上次最后的活动算
 
 `autoResume.maxAgeHours` 原先比的是会话文件的修改时间，可宿主启动时会往每个会话文件补写记录（如 `session/end-seed`），修改时间就成了重启那一刻，窗口形同虚设。11-26 10:56 重启后，两个凌晨 4 点多因服务商 502 停下、6 小时没动的会话被续上，用户 24 秒后就去停了其中一个。现在文件修改时间仍先用来跳过确实很久没动的会话（不读日志）；其余会话读出日志后，按宿主这次启动之前最后一个事件的时间判断，超出窗口记为 `too_old`，结果里带 `lastActiveAt`。
@@ -756,6 +760,10 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.206: Restart recovery leaves a goal the user stopped disarmed
+
+The host disarms an active goal on a restart and when the user stops a turn that is not a goal round; only the stop means wait. Restart recovery only checked whether the last turn was a user stop, so stop, send a message, have that turn cut off by a restart, and recovery re-armed the goal and goal rounds ran again. Now, when the last user stop in the log is newer than the last goal resume or create, the goal is left alone and only the cut-off turn is continued by message; a session whose last turn finished is not continued. The basis carries `goalStoppedByUser`.
 
 ### 0.9.205: The restart window counts from the last activity before the restart
 

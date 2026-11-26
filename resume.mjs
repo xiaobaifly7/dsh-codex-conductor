@@ -13,6 +13,16 @@ const RECENT_ACTIVITY_MS = 600_000;
 const lastTurnEvent = (events) => events?.findLast(event => event.type === 'turn/start' || event.type === 'turn/end');
 const userStopped = (event) => event?.type === 'turn/end' && event.data?.reason?.kind === 'aborted' && event.data.reason.reason?.kind === 'user';
 const turnKey = (event) => `${event.data?.turn}:${event.time}`;
+// A restart and a user stop of a turn that is not a goal round both leave an active goal disarmed; only the stop is a
+// decision to wait. The newer of the last user stop and the last goal resume or create decides.
+const goalStoppedByUser = (events) => {
+  for (let index = (events?.length ?? 0) - 1; index >= 0; index -= 1) {
+    const event = events[index];
+    if (event?.type === 'goal/change' && ['resume', 'create'].includes(event.data?.operation)) return false;
+    if (userStopped(event)) return true;
+  }
+  return false;
+};
 
 function validSessionId(id) {
   return typeof id === 'string' && id.length >= 1 && id.length <= 100 && !/[^A-Za-z0-9_-]/.test(id);
@@ -140,22 +150,25 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
       if (!automatic && ended !== 'interrupted' && ended !== 'blocked') return skipped('not_interrupted');
       const goals = ctx.get('goals');
       const goal = goals?.get(agent);
+      // A goal the user switched off stays off: only a cut-off turn is continued, by message.
+      const goalHeld = Boolean(automatic && goal?.phase === 'active' && goal.activation === 'disarmed' && goalStoppedByUser(events));
       if (automatic) {
         Object.assign(basis, { lastTurn: automatic.lastTurn, loadedLastTurn: ended ?? 'none',
           cancelCause: automatic.cancelCause, shutdownPending: automatic.shutdownPending,
           goalPhase: goal?.phase ?? null, goalActivation: goal?.activation ?? null });
         if (automatic.lastTurn === 'aborted' && automatic.cancelCause === 'user') return skipped('user_stopped');
+        if (goalHeld) basis.goalStoppedByUser = true;
         if (goal?.phase === 'paused' || goal?.phase === 'blocked') return skipped(`goal_${goal.phase}`);
         // An armed goal is already owned by the native round driver; never add a competing prompt.
         if (goal?.phase === 'active' && goal.activation === 'armed') return skipped('native_goal_driver');
         if (goal?.phase === 'active' && goal.roundsStarted >= goal.maxGoalRounds) return skipped('goal_round_limit');
-        if (goal?.phase !== 'active' && automatic.lastTurn !== 'unterminated' && automatic.lastTurn !== 'error' &&
+        if ((goal?.phase !== 'active' || goalHeld) && automatic.lastTurn !== 'unterminated' && automatic.lastTurn !== 'error' &&
             !reload && !(automatic.shutdownPending && (automatic.lastTurn === 'interrupted' ||
               (automatic.lastTurn === 'aborted' && ['disposed', 'parent'].includes(automatic.cancelCause))))) {
           return skipped(['interrupted', 'aborted'].includes(automatic.lastTurn) ? 'interrupted_without_shutdown_marker' : 'not_interrupted');
         }
       }
-      if (goal && ['active', 'paused', 'blocked'].includes(goal.phase) &&
+      if (goal && !goalHeld && ['active', 'paused', 'blocked'].includes(goal.phase) &&
           (goal.phase !== 'active' || goal.activation === 'disarmed') && goal.roundsStarted < goal.maxGoalRounds) {
         method = 'goal';
         // The native goal driver submits the next round; a user prompt here would duplicate it.
