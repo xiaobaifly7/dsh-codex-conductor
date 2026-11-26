@@ -436,7 +436,9 @@ test('rollback cancels its matching handover after a completed human turn during
 });
 
 test('rollback keeps genuine human input in the same turn as its current handover brief', async (t) => {
-  for (const [human, first] of [[userEvent('人工追问', 2), false], [userEvent('带 RPC 的人工追问', 2), false], [userEvent('排在交接单前的人工追问', 2), true]]) await t.test(human.data.content[0].text, async (t) => {
+  for (const [human, first] of [[userEvent('人工追问', 2), false], [userEvent('带 RPC 的人工追问', 2), false], [userEvent('排在交接单前的人工追问', 2), true],
+    [userEvent('请把这句提示翻译成英文：(上一步工具「compress」已完成, 结果: ok; 不要重复执行, 直接继续)', 2), true],
+    [userEvent('继续 (上一步工具「compress」可能未完成, 先确认状态再继续, 不要重复执行) 这句是什么意思？', 2), true]]) await t.test(human.data.content[0].text, async (t) => {
     if (human.data.content[0].text.startsWith('带')) human.data.source.rpcId = 'human-steer';
     const cancel = t.mock.fn();
     const h = host(t, { cancel, prompt: async (request, target) => {
