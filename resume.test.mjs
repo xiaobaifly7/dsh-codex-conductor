@@ -1875,3 +1875,19 @@ test('reload resume falls back to recent interrupted rounds when a same-process 
     next.dispose();
   });
 });
+
+test('auto resume: a goal the user stopped is not rearmed; a cut-off turn after the stop is continued by message', async (t) => {
+  const f = fixture(t, 'autoresume');
+  const userStop = { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } };
+  const goalResumed = { type: 'goal/change', data: { operation: 'resume' } };
+  for (const [name, history] of [['cut-off', [start(), userStop, start()]], ['finished', [start(), userStop, start(), end()]],
+    ['resumed-by-user', [start(), userStop, goalResumed, start(), end()]]]) {
+    f.goalViews.set(f.add(`session-${name}`, history), goal({ phase: 'active' }));
+  }
+  const result = await processAutoResume(f);
+  assert.deepEqual(result.sessions.map(({ basis, ...entry }) => entry), [row('session-cut-off', 'message_submitted', 'message'),
+    row('session-finished', 'not_interrupted'), row('session-resumed-by-user', 'goal_resumed', 'goal')]);
+  assert.deepEqual(result.sessions.map(entry => entry.basis.goalStoppedByUser ?? false), [true, true, false]);
+  assert.deepEqual(f.messages.map(({ id }) => id), ['session-cut-off']);
+  assert.deepEqual(f.resumes, [{ agent: f.agents.get('session-resumed-by-user'), value: { id: 'goal-1', revision: 7 } }]);
+});
