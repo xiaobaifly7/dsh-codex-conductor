@@ -8765,19 +8765,19 @@ function stoppedNoticeFixture() {
 
 test('f9886d30: pre-stop completions stay held after status questions and arrive with the next human turn', async () => {
   const f = stoppedNoticeFixture();
-  const first = f.notice('20261127-001442-bd0000', '14:42');
-  f.stop('16:43');
-  await f.human('16:55');
+  const first = f.notice('20261127-001442-bd0000', '14:42.200');
+  f.stop('16:43.157');
+  await f.human('16:55.455');
   f.log.push({ type: 'turn/end', time: f.at('17:03'), data: { reason: { kind: 'completed' } } });
-  assert.equal((await f.step([first])).kind, 'reject', '00:18:00 old execution must not start a model step');
-  const verification = f.notice('20261127-001801-cd0000', '18:01');
-  f.stop('18:02');
-  const question = await f.human('18:48', '你准备如何设计？');
-  assert.deepEqual(question.messages.map(m => m.id), ['human-18:48', first.id]);
+  assert.equal((await f.step([first])).kind, 'reject', '00:18:01.388 old execution must not start a model step');
+  const verification = f.notice('20261127-001801-cd0000', '18:00.666');
+  f.stop('18:02.407');
+  const question = await f.human('18:48.342', '你准备如何设计？');
+  assert.deepEqual(question.messages.map(m => m.id), ['human-18:48.342', first.id]);
   f.log.push({ type: 'turn/end', time: f.at('19:00'), data: { reason: { kind: 'completed' } } });
-  assert.equal((await f.step([verification])).kind, 'reject', '00:19:57 pre-second-stop verification must stay held');
-  f.stop('20:16');
-  assert.deepEqual((await f.human('21:22')).messages.map(m => m.id), ['human-21:22', verification.id]);
+  assert.equal((await f.step([verification])).kind, 'reject', '00:19:58.649 pre-second-stop verification must stay held');
+  f.stop('20:16.500');
+  assert.deepEqual((await f.human('21:22.429')).messages.map(m => m.id), ['human-21:22.429', verification.id]);
   assert.deepEqual((await f.human('22:00')).messages.map(m => m.id), ['human-22:00'], 'delivered once');
 });
 
@@ -8900,16 +8900,16 @@ test('forwarding uses the latest task stop across the full handover chain, inclu
   const h = make({}, { agents: new Map([[original.id, original], [target.id, target]]), jobs: { list: () => jobs },
     sessionQuery: { readSession: async id => { reads.push(id); assert.equal(id, 'middle'); return { events: stoppedLog(4000) }; } } });
   const notices = jobs.map(job => ({ id: `notice-${job.id}`, source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job.id} completed` }] }));
-  await h.handlers['agent/pre-step']({ agent: original, messages: notices }, () => assert.fail('retired owner must not enter'));
+  await h.handlers['agent/pre-step']({ agent: original, messages: [...notices] }, () => assert.fail('retired owner must not enter'));
   assert.equal(received.length, 1);
   assert.match(received[0].content[0].text, /bg-5000 completed/);
   assert.doesNotMatch(received[0].content[0].text, /bg-(1000|3000) completed/);
   assert.ok(reads.includes('middle'));
   const human = { id: 'last-human', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
   const entered = await h.handlers['agent/pre-step']({ agent: target, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
-  assert.equal(entered.messages.length, 2);
+  assert.deepEqual(entered.messages.map(message => message.id), [human.id, notices[0].id, notices[1].id]);
   assert.match(entered.messages[1].content[0].text, /bg-1000 completed/);
-  assert.match(entered.messages[1].content[0].text, /bg-3000 completed/);
+  assert.match(entered.messages[2].content[0].text, /bg-3000 completed/);
 });
 
 test('a successor stop while loading predecessor history holds forwarded notices despite a later question', async (t) => {
@@ -9031,4 +9031,304 @@ test('a human continue restores context-floor automatic handover while pre-stop 
   const notice = { id: 'old-completion', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job old-bg completed' }] };
   const decision = await h.handlers['agent/pre-step']({ agent, step: 1, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
   assert.equal(decision.kind, 'reject', 'the old task still cannot wake a model step');
+});
+
+// Review #134b: querying an inherited result must retain every predecessor's task stop boundary.
+for (const kind of ['verification', 'Gemini fallback']) {
+  test(`automatic ${kind} respects task stop boundaries across the handover chain`, async (t) => {
+    const { createAliases } = await import('./handover.mjs');
+    for (const scenario of ['stopped predecessor', 'stopped intermediate', 'fresh task', 'unloaded predecessor', 'unreadable predecessor', 'chain changes before final dispatch']) {
+      await t.test(scenario, async (t) => {
+        const { make, state } = acceptedFixtureHarness(t);
+        const aliases = createAliases(state);
+        aliases.link('original', 'middle');
+        aliases.link('middle', 'successor');
+        const stoppedLog = time => [
+          { type: 'turn/end', time, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+          { type: 'user/message', time: time + 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '状态如何' }] } },
+        ];
+        const original = { ...agentAt('/work/original', ['stopped intermediate', 'chain changes before final dispatch'].includes(scenario) ? [] : stoppedLog(2000)), id: 'original' };
+        const middle = { ...agentAt('/work/original', scenario === 'stopped intermediate' || scenario === 'fresh task' ? stoppedLog(4000) : []), id: 'middle' };
+        const successor = { ...agentAt('/work/original'), id: 'successor' };
+        const agents = new Map([[original.id, original], [middle.id, middle], [successor.id, successor]]);
+        if (['unloaded predecessor', 'unreadable predecessor', 'chain changes before final dispatch'].includes(scenario)) agents.delete(original.id);
+        let reads = 0;
+        const h = make({ autoVerify: kind === 'verification' ? 'flagged' : 'off', gemini: { command: 'C:\\tools\\agy.exe' },
+          startResult: { job_id: 'FOLLOWUP', status: 'completed' } }, { agents,
+          sessionQuery: { readSession: async id => {
+            assert.equal(id, original.id);
+            if (scenario === 'chain changes before final dispatch' && ++reads === (kind === 'verification' ? 3 : 2)) {
+              aliases.link(successor.id, 'next');
+              agents.set('next', { ...agentAt('/work/original', stoppedLog(6000)), id: 'next' });
+            }
+            return ['unloaded predecessor', 'chain changes before final dispatch'].includes(scenario) ? { events: original.session.log } : undefined;
+          } } });
+        const source = { ...autoSource('CHAIN-SOURCE'), started_at: scenario === 'fresh task' ? 5 : 1,
+          finished_at: Date.now() / 1000 + 1, files_changed: [{ path: 'src/result.js' }],
+          ...(kind === 'Gemini fallback' ? { status: 'failed', execution_status: 'failed', fallback_safe: true, error_kind: 'upstream_rejected' } : {}) };
+        source.context = { ...source.context, owner: original.id };
+        h.finals[source.job_id] = source;
+        await queryStatus(h, source.job_id, successor);
+        const starts = h.calls.filter(([name]) => name === 'start');
+        assert.equal(starts.length, scenario === 'fresh task' ? 1 : 0, 'only work dispatched after all chain stops may spawn an automatic follow-up');
+        if (scenario === 'fresh task') {
+          const context = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin).context;
+          assert.equal(kind === 'verification' ? context.verification_of : context.fallback_of, source.job_id);
+        }
+      });
+    }
+  });
+}
+
+test('failed successor notification delivery persists the result through reload for the next human turn', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  for (const status of ['idle', 'running']) await t.test(status, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    createAliases(state).link('original', 'successor');
+    const original = { ...agentAt('/work/original'), id: 'original' };
+    const refuse = () => { throw new Error('host rejected notification'); };
+    const successor = { ...agentAt('/work/original'), id: 'successor', status, followup: refuse, inject: refuse };
+    const native = { id: 'bg-delivery-failure', owner: original.id, kind: 'codex', label: 'Codex DELIVERY-FAILURE', startedAt: 1000 };
+    const options = { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } };
+    const h = make({}, options);
+    const notice = { id: 'delivery-failure-notice', role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
+      content: [{ type: 'text', text: 'background job bg-delivery-failure completed' }] };
+    const result = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, () => assert.fail('do not restart the retired owner'));
+    assert.equal(result.kind, 'reject');
+    const reloaded = make({}, options);
+    const human = { id: 'human-after-failure', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+    const entered = await reloaded.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+    assert.equal(entered.messages.length, 2, 'a rejected original step must leave a durable result in the successor');
+    assert.match(entered.messages[1].content[0].text, /background job bg-delivery-failure completed/);
+    successor.session.log.push(...entered.messages.map(data => ({ type: 'user/message', data })));
+    const next = await reloaded.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+    assert.equal(next.messages.length, 1, 'the result is not delivered twice');
+  });
+});
+
+test('failed forwarding keeps the original notice when durable retention cannot be written', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor', status: 'idle', followup: () => { throw new Error('host rejected followup'); } };
+  const native = { id: 'bg-unwritable', owner: original.id, kind: 'codex', label: 'Codex UNWRITABLE', startedAt: 1000 };
+  const h = make({}, { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } });
+  mkdirSync(path.join(state, 'held-notices.json'));
+  const notice = { id: 'unwritable-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job bg-unwritable completed' }] };
+  const result = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
+  assert.equal(result.kind, 'enter', 'do not consume the original when the successor cannot durably retain it');
+  assert.deepEqual(result.messages, [notice]);
+  assert.ok(h.warnings.some(message => /保存暂存通知失败/.test(message)));
+});
+
+test('failed durable forwarding does not deliver again from successor memory', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor', status: 'idle',
+    followup: () => { throw new Error('host rejected followup'); } };
+  const native = { id: 'bg-duplicate', owner: original.id, kind: 'codex', label: 'Codex DUPLICATE', startedAt: 1000 };
+  const h = make({}, { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } });
+  mkdirSync(path.join(state, 'held-notices.json'));
+  const notice = { id: 'notice-duplicate', source: { kind: 'tool-jobs', form: 'notice' },
+    content: [{ type: 'text', text: 'background job bg-duplicate completed' }] };
+  const result = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
+  assert.equal(result.kind, 'enter');
+  original.session.log.push(...result.messages.map(data => ({ type: 'user/message', data })));
+  const human = { id: 'human', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+  const second = await h.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+  assert.equal(second.messages.length, 1, 'already delivered to original; a failed durable hold must not leak an in-memory second delivery');
+});
+
+for (const kind of ['verification', 'Gemini fallback']) test(`automatic ${kind} rechecks a predecessor loaded during its history read`, async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor' };
+  const agents = new Map([[successor.id, successor]]);
+  let reads = 0;
+  const h = make({ autoVerify: kind === 'verification' ? 'flagged' : 'off', gemini: { command: 'C:\\tools\\agy.exe' },
+    startResult: { job_id: 'FOLLOWUP', status: 'completed' } }, { agents, sessionQuery: { readSession: async id => {
+      assert.equal(id, original.id);
+      // Load and stop the predecessor during the final dispatch guard, after capturing the old snapshot.
+      const events = original.session.log.slice();
+      if (++reads === (kind === 'verification' ? 3 : 2)) {
+        agents.set(original.id, original);
+        original.session.log.push({ type: 'turn/end', time: 2000,
+          data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+      }
+      return { events };
+  }}});
+  const source = { ...autoSource('SOURCE-LOAD-RACE'), started_at: 1, finished_at: Date.now() / 1000 + 1,
+    files_changed: [{ path: 'src/result.js' }], ...(kind === 'Gemini fallback' ? {
+      status: 'failed', execution_status: 'failed', fallback_safe: true, error_kind: 'upstream_rejected' } : {}) };
+  source.context = { ...source.context, owner: original.id };
+  h.finals[source.job_id] = source;
+  await queryStatus(h, source.job_id, successor);
+  assert.equal(h.calls.filter(([name]) => name === 'start').length, 0,
+    'a loaded live predecessor was stopped before dispatch; its historical snapshot must not authorize automatic work');
+});
+
+test('retrying a failed durable hold retains one original notice after reload', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor', status: 'idle',
+    followup: () => { throw new Error('host rejected followup'); } };
+  const native = { id: 'bg-retry', owner: original.id, kind: 'codex', label: 'Codex RETRY', startedAt: 1000 };
+  const options = { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } };
+  const h = make({}, options);
+  const heldFile = path.join(state, 'held-notices.json');
+  mkdirSync(heldFile);
+  const notice = { id: 'notice-retry', source: { kind: 'tool-jobs', form: 'notice' },
+    content: [{ type: 'text', text: 'background job bg-retry completed' }] };
+  const first = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
+  assert.equal(first.kind, 'enter');
+  // The host aborts before logging this result; retrying the unconsumed original is legitimate.
+  rmSync(heldFile, { recursive: true });
+  const retry = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, () => assert.fail('now retained'));
+  assert.equal(retry.kind, 'reject');
+  const reloaded = make({}, options);
+  const human = { id: 'human-retry', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+  const entered = await reloaded.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+  assert.equal(entered.messages.length, 2, 'one human plus exactly one result; failed hold left a ghost copy that was persisted on retry');
+});
+
+test('forwarded holds deduplicate overlapping batches by original notice ID', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor', status: 'idle', followup: () => { throw new Error('host rejected followup'); } };
+  const jobs = ['A', 'B', 'C'].map(id => ({ id: `bg-${id}`, owner: original.id, kind: 'codex', label: `Codex ${id}`, startedAt: 1000 }));
+  const options = { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => jobs } };
+  const h = make({}, options);
+  const notices = jobs.map(job => ({ id: `notice-${job.id}`, source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job.id} completed` }] }));
+  for (const messages of [notices.slice(0, 2), notices.slice(1)]) {
+    assert.equal((await h.handlers['agent/pre-step']({ agent: original, messages }, () => assert.fail('retained'))).kind, 'reject');
+  }
+  const reloaded = make({}, options);
+  const human = { id: 'human-batches', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+  const entered = await reloaded.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+  assert.deepEqual(entered.messages.map(message => message.id), [human.id, ...notices.map(notice => notice.id)]);
+});
+
+test('failed durable forwarding restores previously held notices without adding a second delivery', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor', status: 'idle', followup: () => { throw new Error('host rejected followup'); } };
+  const jobs = ['prior', 'failed'].map(id => ({ id: `bg-${id}`, owner: original.id, kind: 'codex', label: `Codex ${id}`, startedAt: 1000 }));
+  const h = make({}, { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => jobs } });
+  const notices = jobs.map(job => ({ id: `notice-${job.id}`, source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job.id} completed` }] }));
+  await h.handlers['agent/pre-step']({ agent: original, messages: [notices[0]] }, () => assert.fail('prior retained'));
+  const file = path.join(state, 'held-notices.json');
+  rmSync(file);
+  mkdirSync(file);
+  const fallback = await h.handlers['agent/pre-step']({ agent: original, messages: [notices[1]] }, async () => ({ kind: 'enter', messages: [notices[1]] }));
+  assert.equal(fallback.kind, 'enter');
+  const human = { id: 'human-prior', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+  const entered = await h.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+  assert.equal(entered.messages.length, 2);
+  assert.match(entered.messages[1].content[0].text, /background job bg-prior completed/);
+  assert.doesNotMatch(entered.messages[1].content[0].text, /background job bg-failed completed/);
+});
+
+test('revoked handover prompts are removed at admission while human and other messages survive', async (t) => {
+  for (const scenario of ['before pure', 'before mixed', 'during pure', 'during mixed', 'reload', 'unrelated session']) await t.test(scenario, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    let h = make({});
+    const agent = { ...agentAt('/work/original'), id: scenario === 'unrelated session' ? 'unrelated' : 'successor' };
+    const brief = { id: 'revoked-brief', role: 'user', source: { kind: 'user', rpcId: 'handover-revoked-test' }, content: [{ type: 'text', text: '[codex-conductor 交接] 已撤回' }] };
+    const human = { id: 'human-protected', source: { kind: 'user', rpcId: 'human-request' }, content: [{ type: 'text', text: '先回答我的问题' }] };
+    const other = { id: 'other-protected', source: { kind: 'plugin:other' }, content: [{ type: 'text', text: '其他通知' }] };
+    const mixed = scenario.includes('mixed') || scenario === 'unrelated session';
+    const messages = mixed ? [brief, human, other] : [brief];
+    const revoke = () => writeFileSync(path.join(state, 'revoked-handovers.json'), JSON.stringify({ sessions: { successor: [brief.source.rpcId] } }));
+    if (!scenario.startsWith('during')) revoke();
+    if (scenario === 'reload') h = make({});
+    const decision = await h.handlers['agent/pre-step']({ agent, messages }, async () => {
+      if (scenario.startsWith('during')) { await tick(); revoke(); }
+      return { kind: 'enter', messages: [...messages] };
+    });
+    if (scenario === 'unrelated session') assert.deepEqual(decision.messages.map(message => message.id), [brief.id, human.id, other.id]);
+    else if (mixed) assert.deepEqual(decision.messages.map(message => message.id), [human.id, other.id]);
+    else assert.equal(decision.kind, 'reject', 'a withdrawn brief alone must never enter a model step');
+  });
+});
+
+test('late handover revocation cannot start a step from appended context or release held results', async (t) => {
+  for (const mixed of [false, true]) await t.test(mixed ? 'keep other original input' : 'reject withdrawn input alone', async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    const pending = { id: 'pending-result', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'old result' }] };
+    writeFileSync(path.join(state, 'held-notices.json'), JSON.stringify({ successor: [pending] }));
+    const h = make({});
+    const agent = { ...agentAt('/work/original'), id: 'successor' };
+    const brief = { id: 'late-revoked-brief', source: { kind: 'user', rpcId: 'handover-late-revoked' }, content: [{ type: 'text', text: '[codex-conductor 交接] 旧任务' }] };
+    const other = { id: 'other-input', source: { kind: 'plugin:other' }, content: [{ type: 'text', text: '其他消息' }] };
+    const context = { id: 'appended-context', source: { kind: 'plugin:context' }, content: [{ type: 'text', text: '上下文' }] };
+    const messages = mixed ? [brief, other] : [brief];
+    const decision = await h.handlers['agent/pre-step']({ agent, messages }, async () => {
+      await tick();
+      writeFileSync(path.join(state, 'revoked-handovers.json'), JSON.stringify({ sessions: { successor: [brief.source.rpcId] } }));
+      return { kind: 'enter', messages: [...messages, context] };
+    });
+    if (mixed) assert.deepEqual(decision.messages.map(message => message.id), [other.id, context.id]);
+    else assert.equal(decision.kind, 'reject');
+    const human = { id: 'actual-human', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+    const delivered = await h.handlers['agent/pre-step']({ agent, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+    assert.deepEqual(delivered.messages.map(message => message.id), [human.id, pending.id], 'keep the durable result for actual human input');
+  });
+});
+
+test('unrelated human sessions survive invalid revocation storage with one warning', async (t) => {
+  for (const mode of ['malformed JSON', 'invalid schema', 'read failure']) await t.test(mode, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    const h = make({});
+    const file = path.join(state, 'revoked-handovers.json');
+    if (mode === 'read failure') mkdirSync(file);
+    else writeFileSync(file, mode === 'malformed JSON' ? '{"sessions":' : '{"sessions":{"other":null}}');
+    const warnings = h.warnings.length;
+    for (const id of ['unrelated-A', 'unrelated-B']) {
+      const agent = { ...agentAt('/work/original'), id };
+      const messages = [{ id: `human-${id}`, source: { kind: 'user', rpcId: `human-${id}` }, content: [{ type: 'text', text: '回答我的问题' }] }];
+      for (let i = 0; i < 2; i++) {
+        const decision = await h.handlers['agent/pre-step']({ agent, messages }, async () => ({ kind: 'enter', messages }));
+        assert.equal(decision.kind, 'enter');
+        assert.deepEqual(decision.messages, messages);
+      }
+    }
+    assert.equal(h.warnings.length - warnings, 1, 'a persistent read failure must not warn at every model step');
+  });
+});
+
+test('forwarded or held task notices never reach the original mixed human step twice', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  for (const status of ['idle', 'running']) for (const held of [false, true]) await t.test(`${status} ${held ? 'retained' : 'forwarded'}`, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    createAliases(state).link('original', 'successor');
+    const original = { ...agentAt('/work/original'), id: 'original' };
+    const received = [];
+    const deliver = message => { if (held) throw new Error('host rejected delivery'); received.push(message); };
+    const successor = { ...agentAt('/work/original'), id: 'successor', status, followup: deliver, inject: deliver };
+    const native = { id: 'bg-mixed', owner: original.id, kind: 'codex', label: 'Codex MIXED', startedAt: 1000 };
+    const h = make({}, { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } });
+    const human = { id: 'original-question', source: { kind: 'user' }, content: [{ type: 'text', text: '状态如何' }] };
+    const notice = { id: 'mixed-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job bg-mixed completed' }] };
+    const messages = [human, notice];
+    const originalStep = await h.handlers['agent/pre-step']({ agent: original, messages }, async () => ({ kind: 'enter', messages }));
+    assert.equal(originalStep.kind, 'enter');
+    assert.ok(originalStep.messages.some(message => message.id === human.id));
+    assert.ok(!originalStep.messages.some(message => message.content?.some(item => /background job bg-mixed completed/.test(item.text ?? ''))));
+    const question = { id: 'successor-question', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+    const successorStep = await h.handlers['agent/pre-step']({ agent: successor, messages: [question] }, async () => ({ kind: 'enter', messages: [question] }));
+    const deliveries = [...originalStep.messages, ...received, ...successorStep.messages]
+      .filter(message => message.content?.some(item => /background job bg-mixed completed/.test(item.text ?? '')));
+    assert.equal(deliveries.length, 1, 'transfer the result exactly once while preserving both human questions');
+  });
 });

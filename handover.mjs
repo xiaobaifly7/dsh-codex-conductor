@@ -17,6 +17,66 @@ export function writeTextAtomic(file, text) {
 
 export const writeJsonAtomic = (file, value) => writeTextAtomic(file, JSON.stringify(value, null, 2) + '\n');
 
+const revokedHandoverStates = globalThis[Symbol.for('dsh-codex-conductor.revoked-handovers')] ??= new Map();
+const recentRevocations = ids => [...new Set(ids)].slice(-50);
+
+function warnRevocations(state, logger, operation, error) {
+  const failure = `${operation}:${error.code ?? error.name}`;
+  if (state.warnings.has(failure)) return;
+  state.warnings.add(failure);
+  (logger ?? console).warn?.(`[codex-conductor] ${operation}撤销交接记录失败，保留进程内记录：${error.message}`);
+}
+
+function readRevokedHandovers(directory, logger) {
+  const key = path.resolve(directory);
+  let state = revokedHandoverStates.get(key);
+  if (!state) {
+    state = { sessions: {}, pending: {}, warnings: new Set() };
+    revokedHandoverStates.set(key, state);
+  }
+  try {
+    const { sessions } = JSON.parse(fs.readFileSync(path.join(directory, 'revoked-handovers.json'), 'utf8'));
+    if (!sessions || typeof sessions !== 'object' || Array.isArray(sessions) ||
+        !Object.values(sessions).every(ids => Array.isArray(ids) && ids.every(id => typeof id === 'string'))) {
+      throw new Error('invalid revoked handover records');
+    }
+    state.sessions = Object.fromEntries(Object.entries(sessions).map(([id, ids]) => [id, recentRevocations(ids)]));
+    for (const [id, ids] of Object.entries(state.pending)) {
+      state.sessions[id] = recentRevocations([...(state.sessions[id] ?? []), ...ids]);
+    }
+    state.readFailure = undefined;
+  } catch (error) {
+    state.readFailure = error.code === 'ENOENT' ? undefined : error;
+    if (state.readFailure) warnRevocations(state, logger, '读取', error);
+  }
+  return state;
+}
+
+function revokeHandover(directory, agentId, requestId, logger) {
+  const state = readRevokedHandovers(directory, logger);
+  const ids = state.sessions[agentId] ?? [];
+  if (ids.includes(requestId)) return state.pending[agentId]?.includes(requestId) ? state.writeFailure : undefined;
+  state.sessions[agentId] = recentRevocations([...ids, requestId]);
+  state.pending[agentId] = recentRevocations([...(state.pending[agentId] ?? []), requestId]);
+  try {
+    if (state.readFailure) throw state.readFailure;
+    fs.mkdirSync(directory, { recursive: true });
+    writeJsonAtomic(path.join(directory, 'revoked-handovers.json'), { sessions: state.sessions });
+    state.pending = {};
+    state.writeFailure = undefined;
+  } catch (error) {
+    state.writeFailure = `failed: ${error.message}`;
+    if (!state.readFailure) warnRevocations(state, logger, '写入', error);
+  }
+  return state.writeFailure;
+}
+
+export function filterRevokedHandovers(directory, agentId, messages, logger) {
+  if (!directory) return messages;
+  const revoked = readRevokedHandovers(directory, logger).sessions[agentId];
+  return revoked?.length ? messages.filter(message => !revoked.includes(message.source?.rpcId)) : messages;
+}
+
 // 交接请求的发起来源；外部直接写请求文件、没带来源时记为 file。
 export const ORIGINS = ['panel', 'auto', 'confirm', 'tool', 'file'];
 const LINKS_UNREADABLE = '交接链接状态不可读，暂停自动交接。';
@@ -149,7 +209,20 @@ const AUTOMATED_USER_TEXT = /^\s*(?:\[codex-conductor|(?:继续|continue|про�
 
 // 以用户身份提交、却不是人打的固定文本：本插件投递的交接单（宿主记 rpcId handover-…，档案里只剩正文开头），
 // dsh-client-auto-continue 未开 usePluginSource 时的重启续跑默认话术（中、英、俄）。
-const MACHINE_USER_TEXT = /^\s*(?:\[codex-conductor 交接\]|\/loopx 这是会话交接后的续接|继续。宿主在你上一轮运行期间重启了|Continue\. The harness was restarted while your previous turn|Продолжай\. Хост перезапустился)/;
+// dsh-client-auto-continue sends these with a bare { kind: 'user' } source (lib/index.js default texts, zh/en/ru): distinctive
+// texts match by prefix; a bare continue word plus " " plus one whole guard template must be the entire message, as the plugin builds it.
+const AUTO_CONTINUE_GUARDS = ['(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)', '(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)',
+  '(The previous tool "{tool}" may not have completed. Check its state before continuing and do not run it again.)',
+  '(The previous tool "{tool}" completed successfully. Result: {result}; do not run it again. Continue from there.)',
+  '(Предыдущий инструмент «{tool}», возможно, не завершился. Проверь его состояние перед продолжением и не запускай его повторно.)',
+  '(Предыдущий инструмент «{tool}» завершился успешно. Результат: {result}; не запускай его повторно, продолжай с этого места.)']
+  .map(text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\{tool\\}', '[^\\n]*?').replace('\\{result\\}', '[\\s\\S]*?')).join('|');
+const MACHINE_USER_TEXT = new RegExp('^\\s*(?:\\[codex-conductor 交接\\]|\\/loopx 这是会话交接后的续接|继续。宿主在你上一轮运行期间重启了|' +
+  'Continue\\. The harness was restarted while your previous turn|Продолжай\\. Хост перезапустился|这是宿主重启后插件自动发送的消息|' +
+  'This message was sent automatically by the plugin after a harness restart|Это сообщение плагин отправил автоматически|' +
+  '继续。你上一轮只输出了内部推理|Continue\\. Your previous turn ended with internal reasoning only|Продолжай\\. Предыдущий ход закончился только внутренним|' +
+  '\\(检测到你可能陷入循环|\\(You may be stuck in a loop|\\(Похоже, ты застрял в цикле|' +
+  `(?:继续|Continue|Продолжай) (?:${AUTO_CONTINUE_GUARDS})\\s*$)`);
 
 function humanInstruction(event) {
   if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return;
@@ -568,10 +641,10 @@ export function summaryStepRejected(agentId, now = Date.now) {
   return Boolean(entry.expired || now() > entry.deadline || entry.steps > SUMMARY_MAX_STEPS);
 }
 
-async function deliver(controller, sessionId, text, waitMs) {
+async function deliver(controller, sessionId, text, waitMs, requestId, signal) {
   try {
-    const call = controller.prompt({ requestId: `handover-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
-      new AbortController().signal);
+    const call = controller.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
+      signal);
     call.catch(() => {});
     let timer;
     const outcome = await Promise.race([call.then(() => 'prompted', (error) => ({ error })),
@@ -827,7 +900,10 @@ export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, 
 // 链路末端的继任会话：A→B→C 时 A、B 都解析到 C。
 export function lastSuccessor(aliases, id) {
   let to = aliases.successor(id);
-  for (const seen = new Set([id]); to && !seen.has(to) && aliases.successor(to); seen.add(to)) to = aliases.successor(to);
+  for (const seen = new Set([id]); to && !seen.has(to) && aliases.successor(to);) {
+    seen.add(to);
+    to = aliases.successor(to);
+  }
   return to;
 }
 
@@ -841,7 +917,7 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
   const notices = messages.filter((m) => m?.source?.kind === 'tool-jobs' && m.source.form === 'notice' &&
     codex.has(/^background job (\S+)(?:\s|$)/.exec(textOf(m.content))?.[1]));
   if (!notices.length) return undefined;
-  let delivered = false;
+  const forwarded = new Set();
   try {
     const target = await resolve(successor);
     if (target) {
@@ -850,19 +926,38 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
         const job = codex.get(/^background job (\S+)(?:\s|$)/.exec(textOf(notice.content))?.[1]);
         groups[await allowed(target, job) ? 0 : 1].push(notice);
       }
+      const wrap = (group, id) => ({ id, role: 'user', content: [{ type: 'text', text:
+        `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
+        group.map(notice => textOf(notice.content)).join('\n\n') }], source: { kind: 'plugin:codex-conductor' } });
+      const retain = async (group) => {
+        for (const notice of group) {
+          try {
+            await hold(target, wrap([notice], notice.id));
+            forwarded.add(notice);
+          } catch {}
+        }
+      };
       for (const [deferred, group] of groups.entries()) {
         if (!group.length) continue;
-        const text = `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
-          group.map(notice => textOf(notice.content)).join('\n\n');
-        const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin:codex-conductor' } };
-        if (deferred && hold) hold(target, message);
-        else if (target.status === 'idle' && !deferred) target.followup(message);
-        else target.inject(message);
+        if (deferred) {
+          if (hold) await retain(group);
+          continue;
+        }
+        const message = wrap(group, randomUUID());
+        try {
+          if (target.status === 'idle') await target.followup(message);
+          else await target.inject(message);
+          for (const notice of group) forwarded.add(notice);
+        } catch { if (hold) await retain(group); }
       }
-      delivered = true;
     }
   } catch {}
-  return { successor, delivered, forwarded: notices.length, reject: notices.length === messages.length };
+  const delivered = forwarded.size === notices.length;
+  // Only inputs not delivered to the successor may enter the original session.
+  if (forwarded.size) {
+    for (let i = messages.length - 1; i >= 0; i--) if (forwarded.has(messages[i])) messages.splice(i, 1);
+  }
+  return { successor, delivered, forwarded: forwarded.size, reject: delivered && messages.length === 0 };
 }
 
 export async function handOver(ctx, deps, request) {
@@ -897,6 +992,10 @@ export async function handOver(ctx, deps, request) {
           message: `继任会话已有 ${newTurns} 个新回合${successorRunning ? '且正在运行' : ''}，撤回会造成两个会话并行；确需撤回请带 force: true。` });
       }
       result.warning = 'parallel_sessions';
+    }
+    if (link.deliveryRequestId) {
+      const failure = revokeHandover(directory, to, link.deliveryRequestId, ctx.logger);
+      if (failure) result.steps.revocation = failure;
     }
     aliases.unlink(from, to);
     result.status = 'reverted';
@@ -1065,7 +1164,30 @@ export async function handOver(ctx, deps, request) {
     result.briefPath = path.join(dir, `${at.replace(/[:.]/g, '-')}-${from}-to-${to}.md`);
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
+  let deliveryRequestId;
+  const deliveryController = new AbortController();
   const rollbackStopped = async () => {
+    if (deliveryRequestId) {
+      const failure = revokeHandover(directory, to, deliveryRequestId, ctx.logger);
+      if (failure) result.steps.revocation = failure;
+      deliveryController.abort();
+    }
+    const log = agentB.session?.log ?? [];
+    const currentTurn = log.slice(log.findLastIndex(event => event.type === 'turn/start'));
+    const briefIndex = deliveryRequestId ? currentTurn.findIndex(event => event.type === 'user/message' &&
+      event.data?.source?.rpcId === deliveryRequestId) : -1;
+    const handoverTurn = briefIndex >= 0 && !currentTurn.some(event => event.type === 'turn/end');
+    if (agentB.status === 'running' && handoverTurn) {
+      const successorGoal = goals?.get(agentB);
+      if (successorGoal?.phase === 'active') goals.pause(agentB, ref(successorGoal));
+      // The host may admit a steered human message before or after the brief; restart notices are not human input.
+      const humanInput = currentTurn.some(humanInstruction);
+      if (humanInput) result.steps.successorTurn = 'kept_human_input';
+      else {
+        agentB.cancel({ kind: 'user' }, { keepInbox: true });
+        result.steps.successorTurn = 'cancel_requested';
+      }
+    }
     // A later human question must not restore the goal paused by this stopped handover.
     const back = await handOver(ctx, { ...deps, allowed: agent => agent.id !== from && allowed(agent) },
       { revert: { from, to }, rollback: true, force: true });
@@ -1074,7 +1196,9 @@ export async function handOver(ctx, deps, request) {
     return giveBack('user_stopped');
   };
   if (stopped()) return rollbackStopped();
-  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs));
+  deliveryRequestId = `handover-${randomUUID()}`;
+  aliases.annotate(to, { deliveryRequestId });
+  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs, deliveryRequestId, deliveryController.signal));
   if (stopped()) return rollbackStopped();
   if (stoppedSince(agentB, successorLogStart)) result.steps.successorGoal = 'user_stopped';
   else if (followed) result.steps.successorGoal = 'loopx';
