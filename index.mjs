@@ -2040,7 +2040,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   // 工作区（侧栏分组）、目标和会话都是可选的宿主服务，取不到时相应步骤降级。
   const workspaces = () => ctx.get?.('workspaceRegistry');
   const autoHandover = createAutoHandover({ directory: stateDirectory, settings: () => cfg.autoHandover, aliases, logger: ctx.logger,
-    allowed: (agent) => history.allowsAutomatic(agent),
+    allowed: (agent) => !history.observe(agent)?.userStopped,
     goals: () => ctx.get?.('goals'), agentOf: (id) => ctx.get?.('agents')?.get?.(id), workspaces,
     runningJobs: async (owner) => {
       const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), status: 'running', limit: 1 });
@@ -4854,8 +4854,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const nudged = new Set();
   ctx.on('agent/turn-stopping', ({ agent, turn }) => {
     try {
-      // An unbacked dispatch claim has no originating job timestamp, so it cannot lift a user stop.
-      if (!history.allowsAutomatic(agent)) return;
+      if (history.observe(agent)?.userStopped) return;
       if (summarizing.has(agent?.id) || !inWorkspace(agent?.session?.header?.cwd, cfg.roots) || liveBackground(undefined, { agent })) return;
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
@@ -5132,7 +5131,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       retired: (id) => Boolean(aliases.successor(id)),
       archived: (id) => Boolean(ctx.get?.('workspaceRegistry')?.archivedSessionIds?.includes?.(id)) });
     registerHandoverRequests({ ctx: resumeCtx, directory: stateDirectory, aliases, since: closeoutFrom,
-      allowed: (agent) => history.allowsAutomatic(agent),
+      allowed: (agent) => !history.observe(agent)?.userStopped,
       sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom, reworkFrom),
       disableAutoContinue: cfg.autoHandover.disableAutoContinue,
       // 交接时通过宿主设置服务关掉旧会话在 dsh-client-auto-continue 里的自动继续；没装该插件时什么都不做。

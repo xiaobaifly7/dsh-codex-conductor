@@ -8808,14 +8808,19 @@ test('a recovered monitor keeps the original runner dispatch time and held notic
   await f.step([]);
 });
 
-test('a post-stop status answer does not get a dispatch reminder that continues old work', async () => {
+test('a human continue restores dispatch reminders while pre-stop completion notices remain held', async () => {
   const f = stoppedNoticeFixture();
+  const old = f.notice('BEFORE-CONTINUE', '14:42');
   f.stop('16:43');
-  await f.human('16:55');
   f.log.push({ type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } });
+  const agent = { ...f.agent, session: { ...f.agent.session, header: { cwd: 'F:\\work\\项目' } } };
   const count = nudges.length;
-  f.handlers['agent/turn-stopping']({ agent: { ...f.agent, session: { ...f.agent.session, header: { cwd: 'F:\\work\\项目' } } }, turn: 7 });
-  assert.equal(nudges.length, count);
+  f.handlers['agent/turn-stopping']({ agent, turn: 7 });
+  assert.equal(nudges.length, count, 'a user stop still suppresses the reminder');
+  await f.human('16:55', '继续');
+  f.handlers['agent/turn-stopping']({ agent, turn: 7 });
+  assert.equal(nudges.length, count + 1, 'human input restores session-level reminders');
+  assert.equal((await f.step([old])).kind, 'reject', 'the task-level stop boundary remains');
 });
 
 
@@ -8897,4 +8902,36 @@ test('holding an old local notice preserves other messages in the same step', as
   assert.equal(result.kind, 'enter');
   assert.deepEqual(result.messages.map(m => m.id), [other.id]);
   assert.deepEqual((await f.human('18:48')).messages.map(m => m.id), ['human-18:48', old.id]);
+});
+
+
+test('a human continue restores context-floor automatic handover while pre-stop completion notices remain held', async (t) => {
+  const { make, state } = acceptedFixtureHarness(t);
+  const stoppedAt = Date.now() - 3 * 3600_000;
+  const log = [];
+  const compressedWindow = () => {
+    log.push({ type: 'compaction/end', data: {} });
+    for (let i = 0; i < 20; i++) log.push({ type: 'assistant/message', data: { usage: { inputTokens: 200000 } } });
+  };
+  compressedWindow();
+  log.push({ type: 'turn/end', time: stoppedAt, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  const agent = { ...agentAt('/work/original', log), id: 'session-continue-handover', status: 'idle' };
+  const jobs = { list: () => [{ id: 'old-bg', owner: agent.id, kind: 'codex', label: 'Codex OLD', startedAt: stoppedAt - 60000 }] };
+  writeFileSync(path.join(state, 'handover.json'), JSON.stringify({ links: {} }));
+  const h = make({ handoverSuggestMessages: 0, handoverContextTokens: 190000,
+    autoHandover: { mode: 'auto', startupDelayMinutes: 0 } }, { jobs });
+  const request = path.join(state, 'handover-request.json');
+  h.handlers['agent/status']({ agent, status: 'idle' });
+  await tick();
+  assert.equal(fs.existsSync(request), false, 'stopped sessions do not hand over');
+  log.push({ type: 'user/message', time: stoppedAt + 60000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '继续' }] } },
+    { type: 'turn/start' });
+  compressedWindow();
+  h.handlers['agent/status']({ agent, status: 'idle' });
+  await tick();
+  assert.equal(fs.existsSync(request), true, 'three hours later the compressed context floor can trigger handover');
+  assert.equal(JSON.parse(readFileSync(request, 'utf8')).sessionId, agent.id);
+  const notice = { id: 'old-completion', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job old-bg completed' }] };
+  const decision = await h.handlers['agent/pre-step']({ agent, step: 1, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
+  assert.equal(decision.kind, 'reject', 'the old task still cannot wake a model step');
 });

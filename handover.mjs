@@ -1373,7 +1373,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     return autoHandoverStep({ settings: settings(), record: sessions[id], messages: value.messages, threshold: value.threshold, suggest: value.suggest,
       contextFull: value.contextFull === true,
       idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(),
-      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt, userStopped: value.userStopped === true || value.lastUserStopAt !== undefined });
+      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt, userStopped: value.userStopped === true });
   };
   return {
     // value 是 history.observe(agent) 的结果；会话每次转为空闲时同步调用（第一个 await 之前的部分与 goal 排下一轮同属这次事件）。
