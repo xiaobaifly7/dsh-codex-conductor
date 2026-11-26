@@ -11,7 +11,8 @@ const GIT_TIMEOUT_MS = 120_000;
 // git -C <dir> ...：返回 { code, stdout, stderr }，不抛错，由调用方判断。
 export function gitRun(dir, args, { timeout = GIT_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
-    execFile('git', ['-C', dir, ...args], { timeout, maxBuffer: 256 * 1024 * 1024, windowsHide: true, encoding: 'utf8' },
+    // DSH 给的 HOME 不是用户目录，读不到全局的 core.longpaths；worktree 路径更深，不开它会因 260 字符上限检出失败。
+    execFile('git', ['-c', 'core.longpaths=true', '-C', dir, ...args], { timeout, maxBuffer: 256 * 1024 * 1024, windowsHide: true, encoding: 'utf8' },
       (error, stdout, stderr) => resolve({ code: error ? (typeof error.code === 'number' ? error.code : 1) : 0,
         stdout: stdout ?? '', stderr: String(stderr || (error && !Number.isInteger(error.code) ? error.message : '')).trim() }));
   });
@@ -143,7 +144,12 @@ export async function openWorktree({ repo, root, owner, maxUntracked = 200 }) {
     name = `conv/${tag}-${n}`;
   }
   mkdirSync(parent, { recursive: true });
-  await git(repo, ['worktree', 'add', '-b', name, worktree, 'HEAD'], { timeout: 600_000 });
+  const added = await gitRun(repo, ['worktree', 'add', '-b', name, worktree, 'HEAD'], { timeout: 600_000 });
+  if (added.code) {
+    // 检出失败时 git 撤掉了 worktree，分支却留着；上面挑名字时它还不存在，删掉不会碰到别人的分支。
+    await gitRun(repo, ['branch', '-D', name]);
+    throw new Error(`git worktree 失败：${added.stderr || `退出码 ${added.code}`}`);
+  }
   const base = (await git(repo, ['rev-parse', 'HEAD'])).trim();
   const linked = await linkIgnored(repo, worktree);
   // git in WSL sees the junctions as symlinks, which a directory pattern such as vm/ does not ignore, so add -A committed
@@ -171,26 +177,32 @@ export async function mergeWorktree(entry) {
     await gitRun(worktree, ['merge', '--ff-only', '--quiet', target]);
     return { status: 'nothing' };
   }
+  const head = (await git(repo, ['rev-parse', 'HEAD'])).trim();
+  const tip = (await git(repo, ['rev-parse', branch])).trim();
   // 试合并：不动任何工作区；有冲突就把它放进本对话的 worktree 里解决。
-  const trial = await gitRun(repo, ['merge-tree', '--write-tree', '--name-only', '--no-messages', target, branch]);
+  const trial = await gitRun(repo, ['merge-tree', '--write-tree', '--name-only', '--no-messages', head, tip]);
   if (trial.code === 1) {
     const files = trial.stdout.split('\n').slice(1).map(s => s.trim()).filter(Boolean);
-    await gitRun(worktree, [...await identity(repo), 'merge', '--no-ff', '--no-commit', target]);
+    const started = await gitRun(worktree, [...await identity(repo), 'merge', '--no-ff', '--no-commit', target]);
+    if (started.code && (await gitRun(worktree, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD'])).code) {
+      return { status: 'error', message: `冲突没能放进 worktree：${started.stderr || started.stdout.trim()}` };
+    }
     return { status: 'conflict', files: files.slice(0, 10), count: files.length };
   }
   if (trial.code) return { status: 'error', message: `试合并失败：${trial.stderr}` };
   if ((await gitRun(repo, ['diff', '--cached', '--quiet'])).code) return { status: 'blocked', reason: 'staged_changes' };
-  const base = (await git(repo, ['merge-base', target, branch])).trim();
-  const incoming = new Set(entries(await git(repo, ['diff', '--name-only', '-z', base, branch])));
+  const base = (await git(repo, ['merge-base', head, tip])).trim();
+  const incoming = new Set(entries(await git(repo, ['diff', '--name-only', '-z', base, tip])));
   const local = entries(await git(repo, ['status', '--porcelain', '-z', '--untracked-files=all', '--no-renames'], { timeout: 600_000 }))
     .map(e => e.slice(3)).filter(p => incoming.has(p));
   if (local.length) return { status: 'blocked', reason: 'checkout_dirty_overlap', files: local.slice(0, 10), count: local.length };
-  const merged = await gitRun(repo, [...await identity(repo), 'merge', '--no-ff', '--no-edit', '-m', `合并对话 worktree ${branch}（${ahead} 个提交）`, branch]);
-  if (merged.code) {
-    if ((await gitRun(repo, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD'])).code === 0) await gitRun(repo, ['merge', '--abort']);
-    return { status: 'error', message: `合并没有完成，已撤回：${merged.stderr || merged.stdout.trim()}` };
-  }
-  const commit = (await git(repo, ['rev-parse', 'HEAD'])).trim();
+  // 不用 git merge --no-ff：它先跑 git stash create 存一份现场，原目录里有服务正在写的已跟踪文件（日志）时这一步会
+  // 无提示退出，合并报 "stash failed"。改为拿试合并得到的树建合并提交，再快进过去；快进同样不覆盖本地改动。
+  const tree = trial.stdout.split('\n')[0].trim();
+  const commit = (await git(repo, [...await identity(repo), 'commit-tree', tree, '-p', head, '-p', tip,
+    '-m', `合并对话 worktree ${branch}（${ahead} 个提交）`])).trim();
+  const merged = await gitRun(repo, ['merge', '--ff-only', '--quiet', commit]);
+  if (merged.code) return { status: 'error', message: `合并没有完成，原目录没动：${merged.stderr || merged.stdout.trim()}` };
   // 合并后本对话的分支是目标分支的祖先，快进到最新，之后的单也能看到别的对话合并进来的改动。
   const synced = (await gitRun(worktree, ['merge', '--ff-only', '--quiet', target])).code === 0;
   return { status: 'merged', commit, commits: ahead, synced };
