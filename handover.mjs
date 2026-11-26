@@ -1129,7 +1129,7 @@ export function registerHandoverRequests({ ctx, directory, ...deps }) {
 // 会话历史越长每步越慢；这里只标记“建议交接”，提醒、询问和自动交接由 createAutoHandover 按配置决定。
 // 会话日志只追加，按日志数组累计，每次只数新增事件。
 const MESSAGE_TYPES = new Set(['assistant/message', 'tool/result', 'user/message', 'system/message', 'developer/message']);
-// 上下文地板：最近 FLOOR_WINDOW 次请求里最小的上下文（输入 + 缓存命中 token）。压缩后仍降不下来的会话，消息数可能还不多。
+// 上下文地板：最近 FLOOR_WINDOW 次请求的最小上下文（输入 + 缓存命中 token），且窗口内有压缩成功或输入收缩信号。
 const FLOOR_WINDOW = 20;
 const promptTokens = (event) => {
   const usage = event?.type === 'assistant/message' ? event.data?.usage : undefined;
@@ -1146,13 +1146,24 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
   const count = (log) => {
     if (!Array.isArray(log)) return undefined;
     let entry = counts.get(log);
-    if (!entry || entry.scanned > log.length) entry = { scanned: 0, messages: 0, prompts: [] };
+    if (!entry || entry.scanned > log.length) entry = { scanned: 0, messages: 0, prompts: [], compressCalls: new Set() };
     for (let i = entry.scanned; i < log.length; i++) {
-      if (MESSAGE_TYPES.has(log[i]?.type)) entry.messages++;
-      const tokens = promptTokens(log[i]);
-      if (tokens) entry.prompts = [...entry.prompts.slice(1 - FLOOR_WINDOW), tokens];
-      // 自动交接据此避开用户正在对话的时候：最后一条人工消息的时间，以及当前回合里是否有人工消息。
       const event = log[i];
+      if (MESSAGE_TYPES.has(event?.type)) entry.messages++;
+      if (event?.type === 'tool/call' && event.data?.name === 'compress') entry.compressCalls.add(event.data.callId);
+      else if (event?.type === 'tool/result') {
+        const message = event.data?.message;
+        if (entry.compressCalls.delete(message?.toolCallId) && !message?.isError &&
+          /^\[Compressed [^\r\n]* → [1-9]\d* block\(s\), ~[1-9]\d* tokens saved\./.test(textOf(message?.content))) entry.compressed = true;
+      } else if (event?.type === 'compaction/end' && event.data && !event.data.error) entry.compressed = true;
+      const tokens = promptTokens(event);
+      if (tokens) {
+        // 输入下降兼容无宿主事件的 bili preflight 压缩，也可能来自紧急截断等变化；信号随下降后的请求滑出窗口。
+        entry.prompts = [...entry.prompts.slice(1 - FLOOR_WINDOW), { tokens,
+          compressed: entry.compressed === true || tokens < entry.prompts.at(-1)?.tokens }];
+        entry.compressed = false;
+      }
+      // 自动交接据此避开用户正在对话的时候：最后一条人工消息的时间，以及当前回合里是否有人工消息。
       if (event?.type === 'turn/start') entry.turnHuman = false;
       // 用户点了停止：直到他再发话、恢复或新建目标、或操作员明确请求续接，这个会话都算“用户叫停的”。
       else if (event?.type === 'turn/end') {
@@ -1195,8 +1206,8 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       const floorLimit = contextThreshold();
       // 子代理读大文件时上下文同样会很大，但它们不交接。
       if (floorLimit > 0 && agent.session?.header?.origin !== 'subagent') {
-        const floor = prompts.length >= FLOOR_WINDOW ? Math.min(...prompts) : undefined;
-        Object.assign(value, { floor, contextThreshold: floorLimit, contextFull: floor >= floorLimit });
+        const floor = prompts.length >= FLOOR_WINDOW ? Math.min(...prompts.map((p) => p.tokens)) : undefined;
+        Object.assign(value, { floor, contextThreshold: floorLimit, contextFull: floor >= floorLimit && prompts.some((p) => p.compressed) });
         if (value.contextFull) value.suggest = true;
       }
       const previous = sessions[agent.id];

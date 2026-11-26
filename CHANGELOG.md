@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.210` bili decompress 默认导出的原文可直接 read / grep：真实路径必须是 os.tmpdir() 真实目录直属的普通文件，文件名符合 bili 的块/范围 ID 加 UUID 规则；穿越、链接逃逸、其他临时文件及整个目录仍拒绝，其他原料与 Gemini 正文规则不变。上下文地板交接还须最近 20 次请求窗口内有成功 compress 回执、成功原生 compaction 或相邻输入下降；下降信号覆盖不写工具事件的 bili 发送前强制压缩，也会把紧急截断工具输出等其他收缩计入，不能当作一定执行过 compress 的证明。窗口、阈值和其他交接条件不变。依据：11-26 session-92c2e37b 解压 b2 的 99891 字符后被原料守卫拒绝；原地板规则会在从未压缩、连续 20 次高于 19 万时抢先交接。
+
 `0.9.209` 用户点了停止、还没再发话的会话不再被自动交接（自动交接会在新会话里恢复目标接着干）；提醒、询问和面板同意过的交接照常。依据：11-26 排查用户停止后会话又跑起来的所有路径，自动交接在会话转为空闲时判定，只看用户 30 分钟内有没有发过消息，不看用户刚点了停止。
 
 `0.9.208` 对话 worktree 的合并被核验记为 needs_changes 的写入单挡住时，回执点名这些单并说明怎么处理：在原线程用 codex_continue 修正后重新核验，或者已由后续单修正的，对原单记 accepted_deviations 并写明由哪一单修正。以前只说“还有写入单没核验通过”，规划端改派新单补完后不回头处理原单，合并一直卡住（11-26 d70d85ff 14:35 起 7 个提交没合回 F:\渗透）。合并条件本身不变。
@@ -315,6 +317,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.210` Planners can read or grep bili decompress default exports: a regular file directly inside the real os.tmpdir(), matching bili's block/range ID plus UUID filename. Traversal, escaping links, other temporary files and directory-wide reads remain refused; other raw-material and Gemini-prose rules are unchanged. Context-floor hand-over also requires a successful compress receipt, successful native compaction or adjacent-input decrease within its last 20 requests. A decrease covers bili preflight compression, which emits no session tool event, but also counts emergency output truncation and other input contractions; it does not prove compress ran. The window, threshold and other conditions are unchanged. Basis: the 11-26 session-92c2e37b export of b2's 99891 characters was refused as raw material, while the old floor rule could hand over after 20 high-input requests without any compression.
 
 `0.9.209` A session the user stopped and has not written to since is no longer handed over automatically (a hand-over resumes the goal in the successor and carries on); reminders, the question and panel-approved hand-overs are unchanged. Basis: an 11-26 review of every path that restarts a stopped session found that automatic hand-over, decided when a session turns idle, checked only whether the user wrote in the last 30 minutes, not whether they had just pressed stop.
 
