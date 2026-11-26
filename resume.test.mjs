@@ -874,16 +874,22 @@ test('auto resume: metadata mtime filters old sessions before any raw/query read
   const now = Date.now(), old = now - 13 * 3600_000;
   f.add('session-old', [{ ...start(), time: now }]);
   f.modified('session-old', old);
-  f.add('session-fresh', [{ ...start(), time: old }]);
+  f.add('session-fresh', [{ ...start(), time: performance.timeOrigin - 60_000 }]);
   f.modified('session-fresh', now);
   f.headers.get('session-fresh').createdAt = old;
   f.add('session-empty-old', []);
   f.modified('session-empty-old', old);
   f.add('session-empty-fresh', []);
+  // 宿主启动时补写的记录让文件看起来是新的；上次运行里最后的事件早于窗口，照样算太旧。
+  f.add('session-seeded', [{ ...start(), time: old }, { type: 'turn/end', time: old + 1, data: { reason: { kind: 'error' } } },
+    { type: 'session/end-seed', time: performance.timeOrigin + 1, data: {} }]);
+  f.modified('session-seeded', now);
   const result = await processAutoResume(f);
   assert.deepEqual(result.sessions.map(({ sessionId, reason }) => [sessionId, reason]), [
     ['session-old', 'too_old'], ['session-fresh', 'message_submitted'],
-    ['session-empty-old', 'too_old'], ['session-empty-fresh', 'not_interrupted']]);
+    ['session-empty-old', 'too_old'], ['session-empty-fresh', 'not_interrupted'], ['session-seeded', 'too_old']]);
+  assert.equal(result.sessions[4].basis.lastActiveAt, old + 1);
+  assert.equal(f.messages.some(({ id }) => id === 'session-seeded'), false);
   for (const entry of result.sessions) assert.equal(entry.basis.updatedAt, fs.statSync(f.artifact(entry.sessionId)).mtimeMs);
   for (const id of ['session-old', 'session-empty-old']) {
     assert.deepEqual(f.calls.filter(([, sessionId]) => sessionId === id), [['locate', id]],

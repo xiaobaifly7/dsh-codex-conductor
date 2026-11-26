@@ -327,6 +327,16 @@ export async function processAutoResume({ ctx, directory, autoResume, signal, de
               result.sessions.push(skipped('resumed_after_start', { updatedAt }));
               continue;
             }
+            // 宿主启动时会往会话文件补写记录（session/end-seed 等），修改时间因此变新；按上次运行里最后一个事件的时间判断。
+            // 11-26 重启后，6 小时前因服务商 502 停下的会话就因为这个被当成刚中断续上了。
+            const lastActiveAt = events.reduce((latest, event) => {
+              const time = Number(event?.time);
+              return time < hostStart && time > latest ? time : latest;
+            }, 0);
+            if (lastActiveAt && lastActiveAt < cutoff) {
+              result.sessions.push(skipped('too_old', { updatedAt, lastActiveAt, cutoff }));
+              continue;
+            }
             const lastTurn = lastTurnEvent(events);
             const automatic = { lastTurn: lastTurn?.type === 'turn/start' ? 'unterminated' : lastTurn?.data?.reason?.kind ?? 'none',
               cancelCause: lastTurn?.data?.reason?.reason?.kind ?? null,

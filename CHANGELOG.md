@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.205` 重启续接的时间窗改按宿主这次启动之前最后一个事件的时间算，不再用会话文件的修改时间（宿主启动时会补写记录，修改时间总是新的）。依据：11-26 重启后续上了两个 6 小时前因 502 停下的会话。
+
 `0.9.204` 对话 worktree 两处修复。合并回原目录不再用 `git merge --no-ff`：它先跑 `git stash create` 存现场，原目录里有服务正在写的已跟踪文件（日志）时这一步无提示退出，合并报 “stash failed” 没做成（F:\渗透 实际碰到）；现在拿试合并得到的树建合并提交，原目录快进过去，提交的两个父提交和说明与以前一样，原目录有冲突的本地改动时同样不动。另外 DSH 给的 HOME 不是用户目录，读不到全局的 `core.longpaths`，worktree 路径比原目录深，opsec 开 worktree 时检出因 260 字符上限失败；插件调用 git 时都带上 `core.longpaths=true`，检出失败留下的空分支也会删掉，不再每次重试多出一个 `conv/<会话>-2`。冲突没能放进 worktree 时如实报错，不再报成冲突。
 
 `0.9.203` 规划端搜或读整个交接目录时，拒绝说明列出本会话链能读的原文和指令档案，让它按文件重试；交接单写上回查原文的调用示例，并说明不必派任务去读。依据：11-26 实测一次回查因搜整个目录被拒，改派 4 单任务、用了 5 分钟。
@@ -305,6 +307,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.205` The restart window now counts from the last event before this host start instead of the session file's modification time, which the host refreshes at start-up. Basis: the 11-26 restart resumed two sessions that had stopped on a 502 six hours earlier.
 
 `0.9.204` Two conversation-worktree fixes. Merging back no longer uses `git merge --no-ff`: it first runs `git stash create`, which exits silently when the main checkout has a tracked file a running service keeps writing (a log), so the merge failed with "stash failed" (seen in F:\渗透). The merge commit is now built from the trial merge's tree and the main checkout fast-forwards to it; parents and message are as before, and conflicting local changes still leave the main checkout alone. Also, DSH sets a HOME that is not the user's, so the global `core.longpaths` was not read; worktree paths are deeper than the main checkout's, and opening one for opsec failed on the 260-character limit. Every git call from the plugin now passes `core.longpaths=true`, and the empty branch a failed checkout leaves behind is deleted, so a retry no longer adds `conv/<conversation>-2`. A conflict that could not be placed in the worktree is reported as an error, not as a conflict.
 
