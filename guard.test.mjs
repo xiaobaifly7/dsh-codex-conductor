@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { createProductReads, plannerReadTargets, readPath, readOnlyCommand, decide, normPath, inWorkspace, knownTool,
   PRODUCT_HINT, PRODUCT_DENY_HINT, GEMINI_READ_DENY, GEMINI_UNKNOWN_DENY, GEMINI_CHECK_HINT, RUN_CODE_DENY } from './guard.mjs';
 
@@ -735,4 +736,80 @@ test('pwsh test scripts with absolute or parent paths must stay inside the sessi
   }
   assert.equal(decide(call('wsl', { command: 'pwsh -NoProfile -File /repo/tests/a.ps1' }), config('open')), undefined);
   assert.match(decide(call('wsl', { command: 'pwsh -NoProfile -File /other/tests/a.ps1' }), config('open')), /不放行的是「pwsh/);
+});
+
+test('bili default decompress exports are readable through every guarded read family', async (t) => {
+  const files = ['b2', 'b2-m00001-m00020', 'block_with-sanitized-id'].map(id =>
+    path.join(tmpdir(), `acp-decompress-${id}-${randomUUID()}.txt`));
+  for (const file of files) writeFileSync(file, 'recovered detail');
+  t.after(() => files.forEach(file => rmSync(file, { force: true })));
+  const scope = createProductReads(config('products'), completed);
+  const readers = ['read', 'read_file', 'read_files', 'read_many_files', 'read_multiple_files', 'read_image',
+    'view_image', 'read_text_file', 'read_media_file', 'inspect_local_file', 'read_pdf', 'read_docx', 'read_table', 'diff',
+    'grep', 'search', 'search_files', 'search_for_pattern', 'find_symbol', 'get_symbols_overview'];
+  for (const file of files) {
+    for (const reader of readers) for (const name of [reader, `ops_${reader}`, `wsl-${reader}`, `mcp__files__${reader}`]) {
+      const exec = call(name, { path: file });
+      assert.equal(scope.checkSync(exec), undefined, name);
+      assert.equal(await scope.check(exec), undefined, name);
+    }
+    const literal = file.replaceAll('\\', '/');
+    for (const command of [`cat '${literal}'`, `grep detail '${literal}'`, `rg detail '${literal}'`,
+      `head -c 100 '${literal}'`, `cat < '${literal}'`]) {
+      for (const name of ['wsl', 'bash', 'ops_bash']) {
+        const exec = call(name, { command });
+        assert.equal(decide(exec, config('products')), undefined, command);
+        assert.equal(scope.checkSync(exec), undefined, command);
+        assert.equal(await scope.check(exec), undefined, command);
+      }
+    }
+    if (process.platform === 'win32') {
+      const mount = literal.replace(/^([A-Za-z]):/, (_, drive) => `/mnt/${drive.toLowerCase()}`);
+      assert.equal(await scope.check(call('read', { path: mount })), undefined, 'WSL mount spelling');
+    }
+  }
+});
+
+test('bili export exception refuses other files, traversal, links and mixed reads', async (t) => {
+  const outside = mkdtempSync(path.join(tmpdir(), 'conductor-bili-outside-'));
+  const name = `acp-decompress-b2-${randomUUID()}.txt`;
+  const exported = path.join(tmpdir(), name);
+  const raw = path.join(outside, name);
+  const other = path.join(tmpdir(), `conductor-raw-${randomUUID()}.txt`);
+  const directory = path.join(tmpdir(), `acp-decompress-b2-${randomUUID()}.txt`);
+  const junction = path.join(tmpdir(), `conductor-bili-link-${randomUUID()}`);
+  const link = path.join(tmpdir(), `acp-decompress-b2-${randomUUID()}.txt`);
+  const malformed = path.join(tmpdir(), `acp-decompress-b2-${randomUUID()}-invalid.txt`);
+  for (const file of [exported, raw, other, malformed]) writeFileSync(file, 'detail');
+  mkdirSync(directory);
+  symlinkSync(outside, junction, process.platform === 'win32' ? 'junction' : 'dir');
+  t.after(() => {
+    for (const file of [exported, other, malformed, link]) rmSync(file, { force: true });
+    for (const file of [junction, directory, outside]) rmSync(file, { recursive: true, force: true });
+  });
+  const scope = createProductReads(config('products'), completed);
+  const targets = [other, raw, malformed, path.join(junction, name), directory,
+    `${tmpdir()}/../${path.basename(tmpdir())}/${path.basename(outside)}/${name}`,
+    path.join(tmpdir(), 'acp-decompress-b2-not-a-uuid.txt'),
+    path.join(tmpdir(), `acp-decompress-b2-${randomUUID()}.txt`), `${exported}:stream`];
+  for (const file of targets) {
+    assert.notEqual(scope.checkSync(call('read', { path: file })), undefined, file);
+    assert.equal(await scope.check(call('read', { path: file })), denial, file);
+    assert.equal(await scope.check(call('grep', { path: file, pattern: 'detail' })), denial, file);
+  }
+  await t.test('file symlink cannot export an outside file', async (st) => {
+    try { symlinkSync(raw, link, 'file'); } catch (error) {
+      if (process.platform === 'win32' && error.code === 'EPERM') return st.skip('Windows file symlinks require privilege');
+      throw error;
+    }
+    assert.equal(await scope.check(call('read', { path: link })), denial);
+  });
+  for (const [name, args] of [
+    ['read_files', { paths: [exported, raw] }], ['read', { path: exported, file_path: raw }],
+    ['grep', { path: tmpdir(), pattern: 'detail' }],
+    ['wsl', { command: `cat '${exported.replaceAll('\\', '/')}' '${raw.replaceAll('\\', '/')}'` }],
+    ['wsl', { command: `grep detail '${tmpdir().replaceAll('\\', '/')}'/*` }],
+  ]) assert.equal(await scope.check(call(name, args)), denial, name);
+  scope.addGemini('S1', [exported]);
+  assert.equal(await scope.check(call('read', { path: exported })), GEMINI_READ_DENY);
 });

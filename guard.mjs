@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { tmpdir } from 'node:os';
 import { realpathSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
@@ -812,6 +813,17 @@ export function readPath(file, cwd = '') {
   try { return normPath(realpathSync(native)); } catch { return normPath(absolute); }
 }
 
+// bili 0.1.216 uses os.tmpdir(), a sanitized block/range ID and crypto.randomUUID().
+function biliDecompressFile(file) {
+  const native = process.platform === 'win32' ? file : file.replace(/^([a-z]):(?=\/|$)/i, '/mnt/$1');
+  try {
+    const resolved = realpathSync(native);
+    return normPath(path.dirname(resolved)) === normPath(realpathSync(tmpdir())) &&
+      /^acp-decompress-[a-zA-Z0-9_-]+-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.txt$/.test(path.basename(resolved)) &&
+      statSync(resolved).isFile();
+  } catch { return false; }
+}
+
 const METADATA_COMMANDS = new Set(['pwd', 'ls', 'stat', 'du', 'df', 'basename', 'dirname', 'realpath', 'readlink',
   'which', 'echo', 'printf', 'true', 'test', '[', '[[', 'read', 'exit', ':', 'continue', 'for',
   'ps', 'pgrep', 'uname', 'whoami', 'id', 'tasklist', 'netstat', 'reg', 'icacls', 'tree', 'command']);
@@ -1071,7 +1083,7 @@ export function createProductReads(cfg, refresh, { now = Date.now, plannerFile =
     }
   };
   const allowed = (file, state, directories) => {
-    if (state?.paths.has(file) || (plannerFile && file === readPath(plannerFile))) return true;
+    if (state?.paths.has(file) || (plannerFile && file === readPath(plannerFile)) || biliDecompressFile(file)) return true;
     return [...cfg.plannerReadAllow ?? [], ...directories].some(root => {
       const key = readPath(root);
       if (file === key) return true;
