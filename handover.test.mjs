@@ -456,9 +456,14 @@ test('rollback keeps genuine human input in the same turn as its current handove
   });
 });
 
-test('rollback still cancels a hand-over turn whose only other user-kind input is a restart notice', async (t) => {
-  // dsh-auto-continue without usePluginSource sends this with a bare { kind: 'user' } source (session-4f205cf7, 11-26).
-  const restart = userEvent('继续。宿主在你上一轮运行期间重启了，请接着做。', 2);
+test('rollback still cancels a hand-over turn whose only other user-kind input is an auto-continue message', async (t) => {
+  // dsh-client-auto-continue without usePluginSource sends these with a bare { kind: 'user' } source
+  // (restart: session-4f205cf7 events[293]; tool guards: session-b851d718 events[13297], [13350], [13396]).
+  for (const text of ['继续。宿主在你上一轮运行期间重启了，请接着做。', '继续 (上一步工具「tool_call」可能未完成, 先确认状态再继续, 不要重复执行)',
+    '继续 (上一步工具「compress」可能未完成, 先确认状态再继续, 不要重复执行)', '继续 (上一步工具「codex_continue」已完成, 结果: ok; 不要重复执行, 直接继续)',
+    'Continue (The previous tool "tool_call" may not have completed. Check its state before continuing and do not run it again.)',
+    '(检测到你可能陷入循环, 请停止重复刚才的动作, 换一种方式继续)']) await t.test(text, async (t) => {
+  const restart = userEvent(text, 2);
   const cancel = t.mock.fn();
   const h = host(t, { cancel, prompt: async (request, target) => {
     target.status = 'running';
@@ -472,6 +477,7 @@ test('rollback still cancels a hand-over turn whose only other user-kind input i
   assert.equal(cancel.mock.callCount(), 1);
   assert.equal(result.steps.successorTurn, 'cancel_requested');
   assert.equal(result.rollback.status, 'reverted');
+  });
 });
 
 test('forwarding removes every delivered notice from a mixed original human batch', async (t) => {

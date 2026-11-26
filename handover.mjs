@@ -209,7 +209,13 @@ const AUTOMATED_USER_TEXT = /^\s*(?:\[codex-conductor|(?:继续|continue|про�
 
 // 以用户身份提交、却不是人打的固定文本：本插件投递的交接单（宿主记 rpcId handover-…，档案里只剩正文开头），
 // dsh-client-auto-continue 未开 usePluginSource 时的重启续跑默认话术（中、英、俄）。
-const MACHINE_USER_TEXT = /^\s*(?:\[codex-conductor 交接\]|\/loopx 这是会话交接后的续接|继续。宿主在你上一轮运行期间重启了|Continue\. The harness was restarted while your previous turn|Продолжай\. Хост перезапустился)/;
+// dsh-client-auto-continue sends these with a bare { kind: 'user' } source; its continue texts may carry a tool-state guard suffix
+// (lib/index.js continueTextQuestion / loopText / guardPendingText / guardDoneText, zh/en/ru).
+const MACHINE_USER_TEXT = new RegExp('^\\s*(?:\\[codex-conductor 交接\\]|\\/loopx 这是会话交接后的续接|继续。宿主在你上一轮运行期间重启了|' +
+  'Continue\\. The harness was restarted while your previous turn|Продолжай\\. Хост перезапустился|这是宿主重启后插件自动发送的消息|' +
+  'This message was sent automatically by the plugin after a harness restart|Это сообщение плагин отправил автоматически|' +
+  '\\(检测到你可能陷入循环|\\(You may be stuck in a loop|\\(Похоже, ты застрял в цикле)' +
+  '|\\((?:上一步工具「[^」]*」(?:可能未完成|已完成)|The previous tool "[^"]*" (?:may not have completed|completed successfully)|Предыдущий инструмент «[^»]*»)');
 
 function humanInstruction(event) {
   if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return;
