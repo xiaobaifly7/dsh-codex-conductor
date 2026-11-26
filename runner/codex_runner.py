@@ -101,7 +101,7 @@ PERMANENT = re.compile(
 REFUSED = re.compile(r"refused this request|safety filter|content was flagged for", re.I)
 # Gemini sometimes refuses inside a near-report that fails the schema (11-22 32f1ee, 11-23 cbc52d, 11-24 615b78);
 # the platform filter's notice comes back as the final message instead of a report (9 jobs 11-23..25).
-GEMINI_REFUSAL = re.compile(r"This request was blocked by Gemini's filters|Sorry, I (?:can(?:no|')t|am unable to) (?:fulfill|assist|help)|I (?:can(?:no|')t|am unable to) (?:fulfill (?:this|your) request|assist with)|抱歉，我无法满足|我(?:无法|不能)(?:满足您的请求|协助)", re.I)
+GEMINI_REFUSAL = re.compile(r"This request was blocked by Gemini's filters|The prompt could not be submitted\. The prompt contains sensitive words|Sorry, I (?:can(?:no|')t|am unable to) (?:fulfill|assist|help)|I (?:can(?:no|')t|am unable to) (?:fulfill (?:this|your) request|assist with)|抱歉，我无法满足|我(?:无法|不能)(?:满足您的请求|协助)", re.I)
 # Codex reports a refusal on its error stream with the three phrasings above. Gemini does not: it answers politely in
 # the reply, in whichever language the task was written, and the turn then completes normally.
 REFUSED_REPLY = re.compile(
@@ -132,7 +132,10 @@ REFUSAL_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/mnt/|/home/|~/)\S*")
 REFUSAL_LABEL = re.compile(
     r"safety|guardrail|jailbreak|censor|越狱|审核"
     r"|(?:policy|content|upstream|egress)[-_ ]*(?:refus\w*|filter\w*|boundary)", re.I)
-UPSTREAM_FILTER_BANNER = re.compile(r"This request was blocked by Gemini's filters", re.I)
+# Google also stops a prompt before the model sees it (11-26 d70d85ff 809b8a, 53acd0: the same 1272-character notice
+# twice); it came back as the final message and was booked schema_invalid, so the same prompt went out again.
+UPSTREAM_FILTER_BANNER = re.compile(
+    r"This request was blocked by Gemini's filters|The prompt could not be submitted\. The prompt contains sensitive words", re.I)
 UPSTREAM_FILTER_REPORT = re.compile(
     r"(?:blocked|interrupted) by (?:the )?upstream (?:model )?content[- ]filter|被上游(?:模型)?内容过滤器拦截", re.I)
 REFUSAL_CROSS_BOUNDARY = re.compile(

@@ -1635,6 +1635,16 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((refusal["reason"], refusal["commands_run"]), ("filter", 24))
         self.assertTrue(refusal["excerpt"].startswith("This request was blocked by Gemini's filters"))
 
+    def test_google_prompt_filter_notice_is_a_refusal_not_a_schema_failure(self):
+        # 20261126-152201-809b8a / 152303-53acd0: Google stopped the prompt before the model saw it, and this notice
+        # came back as the final message; it was booked schema_invalid and the same prompt was sent again.
+        notice = ("The prompt could not be submitted. The prompt contains sensitive words that violate Google's "
+                  "[Generative AI Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy).")
+        refusal = self.refusal_of(last_text=notice, commands=3)
+        self.assertEqual((refusal["reason"], refusal["commands_run"]), ("filter", 3))
+        import codex_runner
+        self.assertEqual(codex_runner.GEMINI_REFUSAL.search(notice).start(), 0)
+
     def test_s4_upstream_content_filter_interrupt_report_and_qualified_chinese_refusals(self):
         # S4a: stalled JSON report describing consecutive upstream content-filter blocks (3bb0ca / d4974c).
         filter_report = self.sample_report(

@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.207` Google 在提交阶段拦下提示词时（“The prompt could not be submitted. The prompt contains sensitive words that violate Google's … policy”），这段固定提示会作为 Gemini 的最终回复回来。以前它被记成 schema_invalid（回复不是 JSON），规划端于是把同一个会被拦的提示词原样再派一次（11-26 d70d85ff 连续两单）。现在它和 “blocked by Gemini's filters” 一样记为 model_refused，回执按拒绝处理：不原样重派。
+
 `0.9.206` 重启续接遇到用户停下的目标（用户最后一次停止比最后一次目标恢复更新）不再重新武装，只用续接消息接上被打断的回合。依据：11-26 用户停下会话后，后续回合出错，目标被自动续跑重新武装，目标轮又跑了起来；重启续接有同样的漏洞。
 
 `0.9.205` 重启续接的时间窗改按宿主这次启动之前最后一个事件的时间算，不再用会话文件的修改时间（宿主启动时会补写记录，修改时间总是新的）。依据：11-26 重启后续上了两个 6 小时前因 502 停下的会话。
@@ -309,6 +311,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.207` When Google stops a prompt before the model sees it ("The prompt could not be submitted. The prompt contains sensitive words that violate Google's … policy"), that fixed notice comes back as Gemini's final message. It used to be booked schema_invalid (the reply is not JSON), so the planner sent the same blocked prompt again (two jobs in a row on 11-26). It is now booked model_refused like "blocked by Gemini's filters", and the receipt treats it as a refusal: do not resend it unchanged.
 
 `0.9.206` Restart recovery no longer re-arms a goal the user stopped (the last user stop is newer than the last goal resume); it only continues the cut-off turn by message. Basis: on 11-26 a stopped session's goal was re-armed by auto-continue after a later turn failed, and restart recovery had the same gap.
 
