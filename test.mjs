@@ -7863,7 +7863,7 @@ function autoVerifyFixture(t) {
       const job_id = `CHECK-${starts.length}`;
       await startBarrier;
       return runner[job_id] = { job_id, status: 'completed', execution_status: 'completed', context };
-    }, ...config }, options);
+    }, ...config }, { agents: { get: (id) => ({ ...agentAt('/work/original'), id }) }, ...options });
     Object.assign(h.finals, runner);
     return h;
   };
@@ -8511,7 +8511,7 @@ test('release C: overlapping finish observers and manual verification dispatch o
 test('release C: a background completion after handover dispatches its check for the last successor', async (t) => {
   const { make, state } = acceptedFixtureHarness(t);
   const jobs = fakeJobs();
-  const h = make({ autoVerify: 'flagged' }, { jobs });
+  const h = make({ autoVerify: 'flagged' }, { jobs, agents: { get: (id) => ({ ...agentAt('/work/original'), id }) } });
   const original = autoSource('J1');
   const started = await h.tools.codex_run.execute({ ...RUN, write: true }, { agent: agentAt('/work/original') });
   assert.ok(started.background_job_id);
@@ -8732,4 +8732,169 @@ test('the accepted-open receipt offers codex_verify only when the blocked job le
     /④ 改记 needs_changes/.test(error.message));
   Object.assign(source, { files_changed: [{ path: 'docs/a.md' }], files_changed_total: 1, structured: { ...source.structured, files_changed: ['docs/a.md'] } });
   await assert.rejects(submit(), /接受它未满足需要依据（规划端判断不算）：① 先对 \S+ 派 codex_verify/);
+});
+
+
+// 11-27 session-f9886d30: a status question is not permission to resume old work.
+function stoppedNoticeFixture() {
+  const at = (clock) => Date.parse(`2026-11-26T16:${clock}Z`);
+  const log = [];
+  const agent = { ...agentAt('/work/current', log), id: 'session-f9886d30-6315-4b6c-ae17-ef2eff64b0d8' };
+  const jobs = [];
+  const h = harness({ jobs: { list: () => jobs } });
+  const stop = (clock) => log.push({ type: 'turn/end', time: at(clock), data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  const human = async (clock, text = '目前是什么情况了先告诉我') => {
+    const message = { id: `human-${clock}`, role: 'user', source: { kind: 'user' }, content: [{ type: 'text', text }] };
+    log.push({ type: 'turn/start', time: at(clock) }, { type: 'user/message', time: at(clock), data: message });
+    return step([message]);
+  };
+  const notice = (id, clock, extra = {}) => {
+    jobs.push({ id: `bg-${id}`, owner: agent.id, kind: 'codex', label: `Codex ${id} · test`, status: 'completed', startedAt: at(clock), ...extra });
+    return { id: `notice-${id}`, role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
+      content: [{ type: 'text', text: `background job bg-${id} (codex: Codex ${id}) finished` }] };
+  };
+  const step = async (messages) => {
+    const decision = await h.handlers['agent/pre-step']({ agent, step: 1, messages }, async () => ({ kind: 'enter', messages }));
+    if (decision.kind === 'enter') log.push(...decision.messages.map(message => ({ type: 'user/message', data: message })));
+    return decision;
+  };
+  return { ...h, agent, log, jobs, at, stop, human, notice, step };
+}
+
+test('f9886d30: pre-stop completions stay held after status questions and arrive with the next human turn', async () => {
+  const f = stoppedNoticeFixture();
+  const first = f.notice('20261127-001442-bd0000', '14:42');
+  f.stop('16:43');
+  await f.human('16:55');
+  f.log.push({ type: 'turn/end', time: f.at('17:03'), data: { reason: { kind: 'completed' } } });
+  assert.equal((await f.step([first])).kind, 'reject', '00:18:00 old execution must not start a model step');
+  const verification = f.notice('20261127-001801-cd0000', '18:01');
+  f.stop('18:02');
+  const question = await f.human('18:48', '你准备如何设计？');
+  assert.deepEqual(question.messages.map(m => m.id), ['human-18:48', first.id]);
+  f.log.push({ type: 'turn/end', time: f.at('19:00'), data: { reason: { kind: 'completed' } } });
+  assert.equal((await f.step([verification])).kind, 'reject', '00:19:57 pre-second-stop verification must stay held');
+  f.stop('20:16');
+  assert.deepEqual((await f.human('21:22')).messages.map(m => m.id), ['human-21:22', verification.id]);
+  assert.deepEqual((await f.human('22:00')).messages.map(m => m.id), ['human-22:00'], 'delivered once');
+});
+
+test('a new job dispatched for a post-stop human question can wake while older or unknown notices stay held', async () => {
+  const f = stoppedNoticeFixture();
+  const old = f.notice('OLD', '14:42');
+  f.stop('16:43');
+  await f.human('16:55');
+  const fresh = f.notice('NEW', '17:00');
+  const unknown = { ...old, id: 'unknown', content: [{ type: 'text', text: 'unmatched job completed' }] };
+  const entered = await f.step([old, fresh, unknown]);
+  assert.equal(entered.kind, 'enter');
+  assert.deepEqual(entered.messages.map(m => m.id), [fresh.id]);
+  assert.deepEqual((await f.human('18:48')).messages.map(m => m.id), ['human-18:48', old.id, unknown.id]);
+});
+
+
+test('a recovered monitor keeps the original runner dispatch time and held notices survive plugin reload', async () => {
+  const f = stoppedNoticeFixture();
+  const notice = f.notice('RECOVERED', '17:00');
+  f.log.push({ type: 'job/registered', time: f.at('14:42'), data: { owner: f.agent.id, kind: 'codex', label: 'Codex RECOVERED · old work' } });
+  f.stop('16:43');
+  await f.human('16:55');
+  assert.equal((await f.step([notice])).kind, 'reject');
+  const h = harness({ jobs: { list: () => f.jobs } });
+  const message = { id: 'human-after-reload', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+  const decision = await h.handlers['agent/pre-step']({ agent: f.agent, messages: [message] }, async () => ({ kind: 'enter', messages: [message] }));
+  assert.deepEqual(decision.messages.map(m => m.id), [message.id, notice.id]);
+  f.log.push(...decision.messages.map(message => ({ type: 'user/message', data: message })));
+  await f.step([]);
+});
+
+test('a post-stop status answer does not get a dispatch reminder that continues old work', async () => {
+  const f = stoppedNoticeFixture();
+  f.stop('16:43');
+  await f.human('16:55');
+  f.log.push({ type: 'assistant/message', data: { turn: 7, message: { content: [{ type: 'text', text: 'Codex 正在做' }] } } });
+  const count = nudges.length;
+  f.handlers['agent/turn-stopping']({ agent: { ...f.agent, session: { ...f.agent.session, header: { cwd: 'F:\\work\\项目' } } }, turn: 7 });
+  assert.equal(nudges.length, count);
+});
+
+
+test('old completions cannot automatically spawn verification or fallback jobs, but explicit verification is allowed', async () => {
+  const f = stoppedNoticeFixture();
+  f.stop('16:43');
+  await f.human('16:55');
+  const source = { ...autoSource('STOPPED-SOURCE'), started_at: f.at('14:42') / 1000 };
+  source.context.owner = f.agent.id;
+  const h = harness({ config: { autoVerify: 'flagged', gemini: { command: 'agy' },
+    startResult: { job_id: 'CHECK', status: 'completed' } } });
+  h.finals[source.job_id] = source;
+  await queryStatus(h, source.job_id, f.agent);
+  assert.equal(h.calls.filter(([name]) => name === 'start').length, 0, 'no automatic verification of stopped work');
+  await h.tools.codex_verify.execute({ job_id: source.job_id }, { agent: f.agent });
+  assert.equal(h.calls.filter(([name]) => name === 'start').length, 1, 'explicit verification still runs');
+  h.finals.FAILED = { ...source, job_id: 'FAILED', status: 'failed', execution_status: 'failed',
+    fallback_safe: true, error_kind: 'upstream_rejected' };
+  await queryStatus(h, 'FAILED', f.agent);
+  assert.equal(h.calls.filter(([name]) => name === 'start').length, 1, 'no automatic fallback of stopped work');
+});
+
+test('forwarding an old owner notice holds it for the stopped successor instead of opening a turn', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const aliases = createAliases(path.join(localAppData, 'dsh-codex-conductor'));
+  const f = stoppedNoticeFixture();
+  aliases.link('session-stopped-predecessor', f.agent.id);
+  t.after(() => aliases.unlink('session-stopped-predecessor', f.agent.id));
+  f.stop('16:43');
+  await f.human('16:55');
+  const native = { id: 'bg-forward-old', owner: 'session-stopped-predecessor', kind: 'codex', label: 'Codex FORWARD-OLD', startedAt: f.at('14:42') };
+  const h = harness({ jobs: { list: () => [native] }, agents: { get: (id) => id === f.agent.id ? f.agent : undefined } });
+  f.agent.status = 'idle';
+  f.agent.followup = () => assert.fail('stopped successor must not wake');
+  f.agent.inject = () => assert.fail('hold rather than mix into another automatic turn');
+  const notice = { id: 'forward-old-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job bg-forward-old completed' }] };
+  const decision = await h.handlers['agent/pre-step']({ agent: { id: native.owner }, messages: [notice] }, () => assert.fail('retired predecessor must not enter'));
+  assert.equal(decision.kind, 'reject');
+  const human = { id: 'next-human', source: { kind: 'user' }, content: [{ type: 'text', text: '任务结果呢' }] };
+  const entered = await h.handlers['agent/pre-step']({ agent: f.agent, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+  assert.equal(entered.messages.length, 2);
+  assert.match(entered.messages[1].content[0].text, /background job bg-forward-old completed/);
+  f.log.push(...entered.messages.map(message => ({ type: 'user/message', data: message })));
+  await h.handlers['agent/pre-step']({ agent: f.agent, messages: [] }, async () => ({ kind: 'enter', messages: [] }));
+});
+
+
+test('an entered but unlogged human step does not consume a held notification', async () => {
+  const f = stoppedNoticeFixture();
+  const notice = f.notice('UNLOGGED', '14:42');
+  f.stop('16:43');
+  await f.step([notice]);
+  const human = { id: 'aborted-human', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+  const admitted = await f.handlers['agent/pre-step']({ agent: f.agent, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+  assert.deepEqual(admitted.messages.map(m => m.id), [human.id, notice.id]);
+  // The host aborts after pre-step, before logging the admitted messages.
+  assert.deepEqual((await f.human('18:48')).messages.map(m => m.id), ['human-18:48', notice.id]);
+  assert.deepEqual((await f.human('19:00')).messages.map(m => m.id), ['human-19:00']);
+});
+
+
+test('automatic verification catch-up defers an unloaded owner instead of assuming it was not stopped', async (t) => {
+  const f = autoVerifyFixture(t);
+  f.completed('UNLOADED');
+  const h = f.load({}, { agents: { get: () => undefined } });
+  await settleAutoVerify();
+  assert.equal(f.starts.length, 0);
+  // A real human invocation supplies the now-loaded history and explicit tools remain usable.
+  await h.tools.codex_verify.execute({ job_id: 'UNLOADED' }, { agent: agentAt('/work/original') });
+  assert.equal(f.starts.length, 1);
+});
+
+test('holding an old local notice preserves other messages in the same step', async () => {
+  const f = stoppedNoticeFixture();
+  f.stop('16:43');
+  const old = f.notice('MIXED', '14:42');
+  const other = { id: 'fresh-plugin', source: { kind: 'plugin:codex-conductor' }, content: [{ type: 'text', text: 'new task completed' }] };
+  const result = await f.step([old, other]);
+  assert.equal(result.kind, 'enter');
+  assert.deepEqual(result.messages.map(m => m.id), [other.id]);
+  assert.deepEqual((await f.human('18:48')).messages.map(m => m.id), ['human-18:48', old.id]);
 });

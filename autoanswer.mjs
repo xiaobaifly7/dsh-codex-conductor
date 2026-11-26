@@ -87,7 +87,7 @@ function readOptional(file) {
   try { return fs.readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return ''; throw error; }
 }
 
-export function registerAutoAnswer({ ctx, settings, directory, now = Date.now }) {
+export function registerAutoAnswer({ ctx, settings, directory, now = Date.now, allowed = () => true }) {
   const status = { enabled: settings.enabled, afterMinutes: settings.afterMinutes, available: false, pending: [], recent: [] };
   const panel = { snapshot: () => status, act: () => false };
   if (!settings.enabled) return panel;
@@ -128,7 +128,8 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
     }
     const risky = (q) => Boolean(risk) && [q.question, q.header, q.detail,
       ...(q.options ?? []).flatMap((o) => [o.label, o.description])].some((value) => value && risk.test(value));
-    function block(item) {
+    function block(item, immediate = false) {
+      if (!immediate && !allowed(item.agent, item.askedAt)) return 'user_stopped';
       if (item.questions.some(q => q.question?.startsWith('[owner_only]'))) return 'owner_only';
       if (item.manual || (item.key && (!manual || manual.has(item.key)))) return 'manual';
       if (item.questions.some(risky)) return 'risky';
@@ -166,10 +167,10 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now })
     async function answer(item, immediate = false) {
       if (item.answering || pending.get(item.id) !== item) return false;
       if (!live(item)) { forget(item); return false; }
-      const reason = block(item);
+      const reason = block(item, immediate);
       const defer = !immediate && settings.whenRisky === 'defer' && ['risky', 'owner_only'].includes(reason);
       if (reason && !defer) {
-        if (!immediate && ['risky', 'excluded', 'owner_only'].includes(reason)) record(item, null, 'skipped_' + reason);
+        if (!immediate && ['risky', 'excluded', 'owner_only', 'user_stopped'].includes(reason)) record(item, null, 'skipped_' + reason);
         return false;
       }
       clearTimeout(item.timer);

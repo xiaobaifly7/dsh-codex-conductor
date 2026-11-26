@@ -153,7 +153,7 @@ const MACHINE_USER_TEXT = /^\s*(?:\[codex-conductor 交接\]|\/loopx 这是会�
 
 function humanInstruction(event) {
   if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return;
-  if (event.data.source.via === 'codex-conductor' || String(event.data.source.rpcId ?? '').startsWith('handover-')) return;
+  if (event.data.source.via?.startsWith('codex-conductor') || String(event.data.source.rpcId ?? '').startsWith('handover-')) return;
   const text = textOf(event.data.content);
   if (text.trim() && !MACHINE_USER_TEXT.test(text)) return { text, at: timeOf(event) };
 }
@@ -535,7 +535,7 @@ export async function requestSummary(agent, { timeoutMs, pollMs = 1_000, graceMs
   let ended = false;
   try {
     // via 标出插件代发：不算用户指令，不进档案。
-    agent.followup({ id, role: 'user', content: [{ type: 'text', text: summaryPrompt() }], source: { kind: 'user', via: 'codex-conductor' } });
+    agent.followup({ id, role: 'user', content: [{ type: 'text', text: summaryPrompt() }], source: { kind: 'user', via: 'codex-conductor-handover-summary' } });
     for (;;) {
       const found = summaryReply(agent.session?.log, id);
       if (found.ended) {
@@ -833,10 +833,10 @@ export function lastSuccessor(aliases, id) {
 // 宿主 tool-jobs 在任务结束时把通知发给任务属主（交接前派出的任务属主仍是前任）：属主空闲就直接开一个新回合。
 // 交接出去的会话收到 Codex 任务的结束通知时，在回合第一步之前把通知转给链路末端的继任会话；本回合只有这些通知时
 // 返回 reject，前任以 blocked 结束这一回合，不调用模型。撤回后前任不再有继任，通知照常留给它自己。
-export async function forwardRetiredNotices({ agent, messages, aliases, jobs, resolve }) {
+export async function forwardRetiredNotices({ agent, messages, aliases, jobs, resolve, allowed = () => true, hold }) {
   const successor = lastSuccessor(aliases, agent?.id);
   if (!successor || !Array.isArray(messages)) return undefined;
-  const codex = new Set((jobs?.list?.(agent.id) ?? []).filter((job) => job.kind === 'codex' && /^Codex /.test(job.label ?? '')).map((job) => job.id));
+  const codex = new Map((jobs?.list?.(agent.id) ?? []).filter((job) => job.kind === 'codex' && /^Codex /.test(job.label ?? '')).map((job) => [job.id, job]));
   const notices = messages.filter((m) => m?.source?.kind === 'tool-jobs' && m.source.form === 'notice' &&
     codex.has(/^background job (\S+)(?:\s|$)/.exec(textOf(m.content))?.[1]));
   if (!notices.length) return undefined;
@@ -844,11 +844,20 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
   try {
     const target = await resolve(successor);
     if (target) {
-      const text = `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
-        notices.map((m) => textOf(m.content)).join('\n\n');
-      const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin:codex-conductor' } };
-      if (target.status === 'idle') target.followup(message);
-      else target.inject(message);
+      const groups = [[], []];
+      for (const notice of notices) {
+        const job = codex.get(/^background job (\S+)(?:\s|$)/.exec(textOf(notice.content))?.[1]);
+        groups[allowed(target, job) ? 0 : 1].push(notice);
+      }
+      for (const [deferred, group] of groups.entries()) {
+        if (!group.length) continue;
+        const text = `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
+          group.map(notice => textOf(notice.content)).join('\n\n');
+        const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin:codex-conductor' } };
+        if (deferred && hold) hold(target, message);
+        else if (target.status === 'idle' && !deferred) target.followup(message);
+        else target.inject(message);
+      }
       delivered = true;
     }
   } catch {}
@@ -858,9 +867,9 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
 export async function handOver(ctx, deps, request) {
   const { aliases, sessionJobs, pendingOf, since, directory, deliverWaitMs = 8_000, autoContinue,
     disableAutoContinue: turnOffAutoContinue = true, autoMessage, sessionRead = () => false, contextDeadlineMs, workspaces = () => undefined, withRunningJobs = false,
-    loopx, summaryMinutes, summaryOptions } = deps;
+    loopx, summaryMinutes, summaryOptions, allowed = () => true } = deps;
   const result = { status: 'refused', from: request.from ?? request.revert?.from, to: request.to ?? request.revert?.to ?? null, steps: {} };
-  const refuse = (reason, extra = {}) => Object.assign(result, { reason, ...extra });
+  const refuse = (reason, extra = {}) => Object.assign(result, { status: 'refused', reason, ...extra });
   const controller = ctx.get('sessionController');
   const goals = ctx.get('goals');
   const agentOf = async (id) => {
@@ -898,7 +907,7 @@ export async function handOver(ctx, deps, request) {
         const goal = goals?.get(agent);
         if (want === 'pause' && goal?.phase === 'active') { goals.pause(agent, ref(goal)); result.steps[key] = 'paused'; }
         // 只恢复这次交接自己暂停的那个目标；用户暂停的不动（旧链接没有 goalPaused，照旧恢复）。
-        else if (want === 'resume' && goal?.phase === 'paused' && (!Object.hasOwn(link, 'goalPaused') || link.goalPaused === goal.id)) {
+        else if (want === 'resume' && (!request.rollback || allowed(agent)) && goal?.phase === 'paused' && (!Object.hasOwn(link, 'goalPaused') || link.goalPaused === goal.id)) {
           goals.resume(agent, ref(goal)); result.steps[key] = 'resumed';
         }
         else result.steps[key] = goal ? `unchanged_${goal.phase}` : 'none';
@@ -934,6 +943,8 @@ export async function handOver(ctx, deps, request) {
   if (request.origin === 'auto' && aliases.links(null) === null) return refuse('links_unreadable', { error: LINKS_UNREADABLE });
   let agentA;
   try { agentA = await agentOf(from); } catch (error) { return refuse(error.code === 'session/not-found' ? 'session_not_found' : 'session_unavailable', { error: error.message }); }
+  const stopped = () => request.origin === 'auto' && !allowed(agentA);
+  if (stopped()) return refuse('user_stopped');
   const taken = aliases.successor(from);
   if (taken) return refuse('already_handed_over', { successor: taken });
   if (!force && agentA.status === 'running') return refuse('turn_running');
@@ -942,6 +953,7 @@ export async function handOver(ctx, deps, request) {
   const running = jobs.filter((j) => (j.execution_status ?? j.status) === 'running').map((j) => j.job_id);
   // 带任务交接（withRunningJobs）：运行中的任务随交接转给继任，结束通知由插件转投；有回合在跑时仍然拒绝。
   if (!force && !withRunningJobs && running.length) return refuse('jobs_running', { running });
+  if (stopped()) return refuse('user_stopped');
   const goal = goals?.get(agentA);
   // 只重建原会话正在推进的目标：用户暂停或受阻的目标不在继任会话复活（自动交接自己刚暂停的那一版除外）。
   const pursued = goal?.phase === 'active' || (goal?.phase === 'paused' && goal.id === request.pausedGoal?.id);
@@ -955,7 +967,7 @@ export async function handOver(ctx, deps, request) {
   } else result.steps.predecessorGoal = goal ? `unchanged_${goal.phase}` : 'none';
   // 摘要之后没交接成：把这里暂停的目标恢复（自动交接提前暂停的那一版由 settled 恢复）。
   const giveBack = (reason, extra) => {
-    if (result.steps.predecessorGoal === 'paused') {
+    if (result.steps.predecessorGoal === 'paused' && !stopped()) {
       try { goals.resume(agentA, ref(goals.get(agentA))); result.steps.predecessorGoal = 'resumed'; }
       catch (error) { result.steps.predecessorGoal = `failed: ${error.message}`; }
     }
@@ -964,6 +976,7 @@ export async function handOver(ctx, deps, request) {
   // 旧会话的进展在摘要回合之前读：否则摘要回合会成了“最后一个正常结束的回合”。
   const context = sessionContext(agentA.session?.log, { autoMessage, ...(contextDeadlineMs !== undefined ? { deadlineMs: contextDeadlineMs } : {}) });
   const summary = await requestSummary(agentA, { timeoutMs: (summaryMinutes ?? 0) * 60_000, ...summaryOptions });
+  if (stopped()) return giveBack('user_stopped');
   if (summary.status !== 'off') result.steps.summary = summary.status;
   // 摘要之后会话又开了新回合（用户发话等）就不交接；超时还没停的摘要回合不算，它下一步之前就会被结束，工具也都被拒。
   if (!force && agentA.status === 'running' && !summarizing.get(agentA.id)?.expired) return giveBack('turn_running');
@@ -1008,6 +1021,15 @@ export async function handOver(ctx, deps, request) {
   Object.assign(result, { pending, running });
   const at = new Date().toISOString();
   const existingGoal = goals?.get(agentB);
+  try {
+    aliases.annotate(to, {
+      ...(placed.workspaceId ? { workspaceId: placed.workspaceId } : {}), ...(placed.pin === 'pinned' ? { pinned: true } : {}),
+      ...(result.steps.autoContinue ? { autoContinue: result.steps.autoContinue } : {}),
+      ...(Object.hasOwn(autoContinueStep, 'previous') ? { autoContinuePrevious: autoContinueStep.previous } : {}),
+      ...(followed ? { loopx: followed } : {}),
+      ...(result.steps.predecessorTitle === 'set' ? { fromTitle, retiredTitle: retired } : {}),
+      goalPaused: pursued && (result.steps.predecessorGoal === 'paused' || goal.phase === 'paused') ? goal.id : null });
+  } catch (error) { result.steps.linkNote = `failed: ${error.message}`; }
   let chain;
   try {
     const { entries, ...archive } = await archiveInstructions({ directory, aliases, from, agentA, agentOf });
@@ -1038,10 +1060,16 @@ export async function handOver(ctx, deps, request) {
     result.briefPath = path.join(dir, `${at.replace(/[:.]/g, '-')}-${from}-to-${to}.md`);
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
+  if (stopped()) {
+    const back = await handOver(ctx, deps, { revert: { from, to }, rollback: true, force: true });
+    result.rollback = { status: back.status, steps: back.steps };
+    if (back.status !== 'reverted') return Object.assign(result, { status: 'handed_over_with_issues', reason: 'user_stopped' });
+    return giveBack('user_stopped');
+  }
   Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs));
   if (followed) result.steps.successorGoal = 'loopx';
   else if (keptGoal) result.steps.successorGoal = `kept_${goal.phase}`;
-  else if (goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
+  else if (!stopped() && goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
     try {
       const existing = goals.get(agentB);
       if (existing && existing.phase !== 'complete') result.steps.successorGoal = 'exists';
@@ -1052,15 +1080,8 @@ export async function handOver(ctx, deps, request) {
       }
     } catch (error) { result.steps.successorGoal = `failed: ${error.message}`; }
   } else result.steps.successorGoal = 'none';
-  try {
-    aliases.annotate(to, { delivered: result.steps.delivered !== 'failed',
-      ...(placed.workspaceId ? { workspaceId: placed.workspaceId } : {}), ...(placed.pin === 'pinned' ? { pinned: true } : {}),
-      ...(result.steps.autoContinue ? { autoContinue: result.steps.autoContinue } : {}),
-      ...(Object.hasOwn(autoContinueStep, 'previous') ? { autoContinuePrevious: autoContinueStep.previous } : {}),
-      ...(followed ? { loopx: followed } : {}),
-      ...(result.steps.predecessorTitle === 'set' ? { fromTitle, retiredTitle: retired } : {}),
-      goalPaused: pursued && (result.steps.predecessorGoal === 'paused' || goal.phase === 'paused') ? goal.id : null });
-  } catch (error) { result.steps.linkNote = `failed: ${error.message}`; }
+  try { aliases.annotate(to, { delivered: result.steps.delivered !== 'failed' }); }
+  catch (error) { result.steps.linkNote = `failed: ${error.message}`; }
   // 首条消息没送达，或继任会话的目标没建起来：不留一个没有交接单或没有目标的“继任”，自动撤回一次（不带 force）。
   const broken = result.steps.delivered === 'failed' ? 'delivery_failed' : result.steps.successorGoal.startsWith('failed') ? 'successor_goal_failed' : '';
   if (broken) {
@@ -1167,14 +1188,23 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       if (event?.type === 'turn/start') entry.turnHuman = false;
       // 用户点了停止：直到他再发话、恢复或新建目标、或操作员明确请求续接，这个会话都算“用户叫停的”。
       else if (event?.type === 'turn/end') {
-        if (event.data?.reason?.kind === 'aborted' && event.data.reason.reason?.kind === 'user') entry.userStopped = true;
+        if (event.data?.reason?.kind === 'aborted' && event.data.reason.reason?.kind === 'user') {
+          entry.userStopped = true;
+          entry.lastUserStopAt = Number.isFinite(event.time) ? event.time : Infinity;
+        }
       } else if (event?.type === 'goal/change') {
-        if (['resume', 'create'].includes(event.data?.operation)) entry.userStopped = false;
+        if (['resume', 'create'].includes(event.data?.operation)) {
+          entry.userStopped = false;
+          delete entry.lastUserStopAt;
+        }
       } else if (humanInstruction(event)) {
         entry.turnHuman = true;
         entry.userStopped = false;
         if (Number.isFinite(event.time)) entry.lastHumanAt = event.time;
-      } else if (event?.type === 'user/message' && event.data?.source?.via === 'codex-conductor') entry.userStopped = false;
+      } else if (event?.type === 'user/message' && event.data?.source?.via === 'codex-conductor') {
+        entry.userStopped = false;
+        delete entry.lastUserStopAt;
+      }
     }
     entry.scanned = log.length;
     counts.set(log, entry);
@@ -1202,7 +1232,8 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       const limit = threshold();
       const value = { messages, threshold: limit, suggest: limit > 0 && messages > limit,
         ...(entry.lastHumanAt !== undefined ? { lastHumanAt: entry.lastHumanAt } : {}), ...(entry.turnHuman ? { turnHuman: true } : {}),
-        ...(entry.userStopped ? { userStopped: true } : {}) };
+        ...(entry.userStopped ? { userStopped: true } : {}),
+        ...(entry.lastUserStopAt !== undefined ? { lastUserStopAt: entry.lastUserStopAt } : {}) };
       const floorLimit = contextThreshold();
       // 子代理读大文件时上下文同样会很大，但它们不交接。
       if (floorLimit > 0 && agent.session?.header?.origin !== 'subagent') {
@@ -1220,6 +1251,11 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       if (now() - written >= writeEveryMs) flush();
       else if (dirty && !timer) { timer = setTimeout(flush, writeEveryMs - (now() - written)); timer.unref?.(); }
       return value;
+    },
+    allowsAutomatic(agent, startedAt) {
+      const stop = this.observe(agent)?.lastUserStopAt;
+      // Unknown jobs/timestamps cannot prove they were dispatched after the user's stop.
+      return stop === undefined || (Number.isFinite(startedAt) && startedAt > stop);
     },
     snapshot: () => ({ threshold: threshold(), sessions: Object.entries(sessions).map(([sessionId, value]) => ({ sessionId, ...value })) }),
     flush,
@@ -1275,7 +1311,7 @@ export function autoHandoverStep({ settings, record = {}, messages, threshold, s
 // 目标循环里回合一结束 goal 就会排下一轮：宿主在会话转为空闲时异步落盘后才排，这里在同一个“空闲”事件里同步暂停目标，
 // 抢在下一轮之前；交接没成就把这次暂停的目标恢复（resume 会重新武装，goal 循环随之继续）。
 export function createAutoHandover({ directory, settings, aliases, runningJobs, submit = (request) => submitHandoverRequest(directory, request),
-  goals = () => undefined, agentOf = () => undefined, workspaces = () => undefined, now = Date.now, uptime = () => process.uptime() * 1000, logger }) {
+  goals = () => undefined, agentOf = () => undefined, workspaces = () => undefined, now = Date.now, uptime = () => process.uptime() * 1000, logger, allowed = () => true }) {
   const file = directory && path.join(directory, 'auto-handover.json');
   const read = () => {
     try {
@@ -1319,7 +1355,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     }
   };
   const giveUp = (agent, record, paused, why, turn = false) => {
-    const resumed = resumeGoal(agent, paused);
+    const resumed = allowed(agent) && resumeGoal(agent, paused);
     const wait = turn ? TURN_RETRY_COOLDOWN_MS : RETRY_COOLDOWN_MS;
     record.retryAfter = new Date(now() + wait).toISOString();
     delete record.pending;
@@ -1337,7 +1373,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     return autoHandoverStep({ settings: settings(), record: sessions[id], messages: value.messages, threshold: value.threshold, suggest: value.suggest,
       contextFull: value.contextFull === true,
       idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(),
-      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt, userStopped: value.userStopped === true });
+      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt, userStopped: value.userStopped === true || value.lastUserStopAt !== undefined });
   };
   return {
     // value 是 history.observe(agent) 的结果；会话每次转为空闲时同步调用（第一个 await 之前的部分与 goal 排下一轮同属这次事件）。
@@ -1365,6 +1401,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
           const carry = settings().withRunningJobs !== false;
           const jobsQuiet = carry || await runningJobs(id) === 0;
           const quiet = jobsQuiet && agent.status === 'idle';
+          if (step.origin === 'auto' && !allowed(agent)) return { ...step, act: null };
           if (step.act === 'ask') {
             if (quiet) Object.assign(record, { open: 'ask', askedAt: at, askedMessages: value.messages });
           } else if (!quiet) giveUp(agent, record, paused, agent.status === 'idle' ? '有 Codex 任务在运行' : '会话又开始了新回合', agent.status !== 'idle');

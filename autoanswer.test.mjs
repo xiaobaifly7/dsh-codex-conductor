@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { AUTO_ANSWER_DEFAULTS, registerAutoAnswer } from './autoanswer.mjs';
+import { createHistoryTracker } from './handover.mjs';
 import { apply } from './index.mjs';
 import { createPanelApi, PANEL_PATH } from './panel.mjs';
 
@@ -22,7 +23,7 @@ const humanAnswer = { answers: [{ id: 'choice', selected: ['方案 B'] }] };
 const flush = () => new Promise(setImmediate);
 
 function host(t, options = {}) {
-  const { directory = fixtureDirectory(t), settings = {}, serviceAvailable = true, allowSubagents = false } = options;
+  const { directory = fixtureDirectory(t), settings = {}, serviceAvailable = true, allowSubagents = false, allowed } = options;
   const listeners = new Map();
   const agents = new Map();
   const projections = new Map();
@@ -57,7 +58,7 @@ function host(t, options = {}) {
   }) };
   function unload() { dispose?.(); dispose = undefined; listeners.clear(); }
   t.after(unload);
-  const load = (module = registerAutoAnswer) => module({ ctx, settings: { ...AUTO_ANSWER_DEFAULTS, afterMinutes: 1, ...settings }, directory });
+  const load = (module = registerAutoAnswer) => module({ ctx, settings: { ...AUTO_ANSWER_DEFAULTS, afterMinutes: 1, ...settings }, directory, allowed });
   function emit(event, ...args) { return listeners.get(event)?.fn(...args); }
   function session(id = 'session-a', origin = 'new') {
     const session = { id, header: { origin }, log: [] };
@@ -322,6 +323,64 @@ test('a queued human reply or a stopped turn cancels continued-question automati
   tick();
   assert.equal(h.service.answer.mock.callCount(), 0);
   assert.equal(existsSync(h.file), false);
+});
+
+for (const restored of [false, true]) test(`${restored ? 'restored' : 'continued'} earlier-turn questions stay stopped after a later human message`, async (t) => {
+  const tick = clock(t);
+  const history = createHistoryTracker({ threshold: () => 0 });
+  t.after(() => history.flush());
+  const h = host(t, { settings: { whenRisky: 'defer' }, allowed: (agent, askedAt) => history.allowsAutomatic(agent, askedAt) });
+  let panel = restored ? undefined : h.load();
+  h.continued('call-earlier', epoch, { turn: 1 });
+  tick(10_000);
+  h.publish(h.agent, 'turn/end', { turn: 2, reason: { kind: 'aborted', reason: { kind: 'user' } } });
+  tick(10_000);
+  h.publish(h.agent, 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: '现在进展如何？' }] });
+  panel ??= h.load();
+  assert.equal(history.observe(h.agent).userStopped, undefined);
+  assert.equal(panel.snapshot().pending[0].reason, 'user_stopped');
+  h.continued('call-fresh', Date.now(), { turn: 3 });
+  tick();
+  await flush();
+  assert.deepEqual(h.service.answer.mock.calls.map(({ arguments: args }) => args[1]), ['call-fresh']);
+  assert.equal(panel.snapshot().pending[0].reason, 'user_stopped');
+  assert.ok(panel.snapshot().recent.some(({ reason }) => reason === 'skipped_user_stopped'));
+  assert.equal(await panel.act(panel.snapshot().pending[0].id, 'answer'), true);
+  assert.deepEqual(h.service.answer.mock.calls.map(({ arguments: args }) => args[1]), ['call-fresh', 'call-earlier']);
+});
+
+test('a foreground wait checks its original tool-call time and still accepts an explicit panel answer', async (t) => {
+  const tick = clock(t), allowed = t.mock.fn((agent, askedAt) => askedAt > epoch);
+  const h = host(t, { allowed }), panel = h.load();
+  h.publish(h.agent, 'tool/call', { name: 'ask_user_question', callId: 'call-earlier', turn: 1 }, epoch);
+  tick(20_000);
+  const pending = h.open([question()], { wait: { callId: 'call-earlier' } });
+  tick();
+  await flush();
+  assert.equal(pending.providerSignal.aborted, false);
+  assert.ok(allowed.mock.calls.length > 0);
+  for (const call of allowed.mock.calls) assert.deepEqual(call.arguments, [h.agent, epoch]);
+  assert.equal(await panel.act(panel.snapshot().pending[0].id, 'answer'), true);
+  assert.match((await pending.result).answers[0].custom, /按用户在面板的请求/);
+});
+
+test('explicit panel answers to stopped questions retain owner-only, risky and manual restrictions', async (t) => {
+  const tick = clock(t), h = host(t, { allowed: () => false, settings: { whenRisky: 'defer' } }), panel = h.load();
+  const pending = [
+    h.open([question(undefined, { question: '[owner_only] 请选择。' })]),
+    h.open([question([choice('删除旧目录')])]),
+    h.open(),
+  ];
+  const items = panel.snapshot().pending;
+  assert.equal(panel.act(items[2].id, 'manual'), true);
+  tick();
+  await flush();
+  for (let i = 0; i < pending.length; i++) {
+    assert.equal(pending[i].providerSignal.aborted, false);
+    assert.equal(await panel.act(items[i].id, 'answer'), false);
+    pending[i].submit(humanAnswer);
+    assert.equal(await pending[i].result, humanAnswer);
+  }
 });
 
 test('panel POST actions submit immediately or leave a question for the human', async (t) => {
