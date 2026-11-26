@@ -333,6 +333,11 @@ FAKE_AGY = textwrap.dedent(r"""
         say(event="result", result={"status": "SUCCESS", "conversation_id": conversation, "response":
             "This request was blocked by Gemini's filters. They can occasionally trigger by mistake. Please try rephrasing your prompt."})
         sys.exit(0)
+    if mode == "prompt_blocked":
+        say(event="result", result={"status": "SUCCESS", "conversation_id": conversation, "response":
+            "The prompt could not be submitted. The prompt contains sensitive words that violate Google's [Generative AI "
+            "Prohibited Use policy](https://policies.google.com/terms/generative-ai/use-policy). Try rephrasing the prompt."})
+        sys.exit(0)
     if mode == "refusal":
         say(event="result", result={"status": "SUCCESS", "conversation_id": conversation, "response": json.dumps({
             "summary": "抱歉，我无法满足您的请求。我不能协助这类操作。", "criteria": [], "files_changed": [], "deviations": [],
@@ -3517,6 +3522,11 @@ class RunnerTests(unittest.TestCase):
         result = self.invoke(*argv, env=env)
         self.assertEqual((result["status"], result["error_kind"], result["attempts"]), ("failed", "model_refused", 1))
         self.assertTrue(result["error"].startswith("This request was blocked by Gemini's filters"))
+        # So is Google's notice that the prompt was not submitted at all.
+        argv, env, call = self.fake_gemini("prompt_blocked")
+        result = self.invoke(*argv, env=env)
+        self.assertEqual((result["status"], result["error_kind"], result["attempts"]), ("failed", "model_refused", 1))
+        self.assertTrue(result["error"].startswith("The prompt could not be submitted"))
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_read_only_write_denial_asks_for_the_findings_in_the_report(self):
