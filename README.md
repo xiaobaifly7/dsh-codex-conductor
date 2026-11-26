@@ -106,6 +106,10 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.209：用户叫停的会话不再被自动交接
+
+自动交接在会话每次转为空闲时判定，用户点停止后会话也是空闲的。原先只看用户 `quietMinutes` 分钟内有没有发过消息，不看他是不是刚点了停止：目标轮跑了几个小时、用户回来点停止，这时上下文已满、最后一条人工消息早过了 30 分钟，自动交接就会在停止的同一刻开出新会话、恢复目标，在新会话里接着干。现在用户停止后、再次发话（或恢复、新建目标，或操作员经本插件请求续接）之前不自动交接，和 0.9.200 的任务通知保持同一个判定；面板提醒、confirm 模式的询问和用户在面板同意过的交接照常。
+
 ### 0.9.206：用户停下的目标，重启续接不再重新武装
 
 宿主在两种情况下把进行中的目标置为“未武装”：重启，以及用户停掉一个不是目标轮的回合。只有后一种是用户要它等着。原先重启续接只看最后一个回合是不是用户停的：用户停下、再发一条消息、这条消息的回合被重启打断，续接就把目标重新武装，目标轮又跑起来。现在读日志，用户最后一次停止比最后一次目标恢复或新建更新时，目标不动，只用续接消息接上被打断的那个回合；最后一个回合已经正常结束的不再续。结果里带 `goalStoppedByUser`。
@@ -760,6 +764,10 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.209: A session the user stopped is not handed over automatically
+
+Automatic hand-over is decided each time a session turns idle, and a session the user just stopped is idle. It only checked whether the user had written within `quietMinutes`, not whether they had just pressed stop: after hours of goal rounds the user comes back and stops, the context is full and the last human message is older than 30 minutes, so the hand-over opened a successor at the moment of the stop, resumed the goal there and carried on. Now nothing is handed over automatically after a user stop until the user writes again (or resumes or creates a goal, or an operator asks through this plugin to continue), the same hold 0.9.200 applies to task notices. Panel reminders, the confirm-mode question and hand-overs the user approved in the panel are unchanged.
 
 ### 0.9.206: Restart recovery leaves a goal the user stopped disarmed
 

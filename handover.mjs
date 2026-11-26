@@ -1226,7 +1226,7 @@ export const AUTO_HANDOVER_DEFAULTS = { mode: 'confirm', cooldownHours: 12, remi
 // 纯判定：会话标了建议交接之后这一次要做什么。remind 是面板提醒；act 为 ask（confirm 模式询问）或 auto（执行交接，
 // 来源 origin 为 auto，或用户在面板同意过的 confirm / panel）。名下是否还有运行中的 Codex 任务由调用方最后再查。
 export function autoHandoverStep({ settings, record = {}, messages, threshold, suggest, contextFull = false, idle, retired, link, now, uptimeMs,
-  linksReadable = true, depth = 0, lastAutoAt = -Infinity, lastHumanAt = -Infinity }) {
+  linksReadable = true, depth = 0, lastAutoAt = -Infinity, lastHumanAt = -Infinity, userStopped = false }) {
   const step = { remind: false, act: null };
   if (settings.mode === 'off' || !suggest || retired) return step;
   // 继任会话从交接时起再涨满一个阈值才算（自动交接出的新会话不会马上再触发）。
@@ -1247,6 +1247,8 @@ export function autoHandoverStep({ settings, record = {}, messages, threshold, s
     }
     // 用户刚说过话：等他停下这么久再交接，免得对话进行到一半被换到新会话。
     if (settings.quietMinutes > 0 && now - lastHumanAt < settings.quietMinutes * 60_000) return step;
+    // 用户点了停止、还没再发话：交接会让新会话接着干，所以不自动交接；提醒、询问和面板同意过的照常。
+    if (userStopped) return step;
   }
   // 拒绝、点了“知道了”或询问后没人理，都在冷却期内不再询问或自动交接。
   const quiet = Math.max(Date.parse(record.askedAt) || 0, Date.parse(record.declinedAt) || 0);
@@ -1324,7 +1326,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
     return autoHandoverStep({ settings: settings(), record: sessions[id], messages: value.messages, threshold: value.threshold, suggest: value.suggest,
       contextFull: value.contextFull === true,
       idle, retired: Boolean(aliases.successor(id, links)), link: links[id], now: now(), uptimeMs: uptime(),
-      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt });
+      linksReadable: storedLinks !== null, depth: predecessors.length, lastAutoAt, lastHumanAt: value.lastHumanAt, userStopped: value.userStopped === true });
   };
   return {
     // value 是 history.observe(agent) 的结果；会话每次转为空闲时同步调用（第一个 await 之前的部分与 goal 排下一轮同属这次事件）。
