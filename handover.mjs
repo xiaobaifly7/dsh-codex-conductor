@@ -210,14 +210,19 @@ const AUTOMATED_USER_TEXT = /^\s*(?:\[codex-conductor|(?:继续|continue|про�
 // 以用户身份提交、却不是人打的固定文本：本插件投递的交接单（宿主记 rpcId handover-…，档案里只剩正文开头），
 // dsh-client-auto-continue 未开 usePluginSource 时的重启续跑默认话术（中、英、俄）。
 // dsh-client-auto-continue sends these with a bare { kind: 'user' } source (lib/index.js default texts, zh/en/ru): distinctive
-// texts match by prefix; a bare continue word plus its " (tool guard)" suffix must be the whole message, so quoting a guard is not.
+// texts match by prefix; a bare continue word plus " " plus one whole guard template must be the entire message, as the plugin builds it.
+const AUTO_CONTINUE_GUARDS = ['(上一步工具「{tool}」可能未完成, 先确认状态再继续, 不要重复执行)', '(上一步工具「{tool}」已完成, 结果: {result}; 不要重复执行, 直接继续)',
+  '(The previous tool "{tool}" may not have completed. Check its state before continuing and do not run it again.)',
+  '(The previous tool "{tool}" completed successfully. Result: {result}; do not run it again. Continue from there.)',
+  '(Предыдущий инструмент «{tool}», возможно, не завершился. Проверь его состояние перед продолжением и не запускай его повторно.)',
+  '(Предыдущий инструмент «{tool}» завершился успешно. Результат: {result}; не запускай его повторно, продолжай с этого места.)']
+  .map(text => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace('\\{tool\\}', '[^\\n]*?').replace('\\{result\\}', '[\\s\\S]*?')).join('|');
 const MACHINE_USER_TEXT = new RegExp('^\\s*(?:\\[codex-conductor 交接\\]|\\/loopx 这是会话交接后的续接|继续。宿主在你上一轮运行期间重启了|' +
   'Continue\\. The harness was restarted while your previous turn|Продолжай\\. Хост перезапустился|这是宿主重启后插件自动发送的消息|' +
   'This message was sent automatically by the plugin after a harness restart|Это сообщение плагин отправил автоматически|' +
   '继续。你上一轮只输出了内部推理|Continue\\. Your previous turn ended with internal reasoning only|Продолжай\\. Предыдущий ход закончился только внутренним|' +
   '\\(检测到你可能陷入循环|\\(You may be stuck in a loop|\\(Похоже, ты застрял в цикле|' +
-  '(?:继续|Continue|Продолжай) \\((?:上一步工具「[^」]*」(?:可能未完成|已完成)|The previous tool "[^"]*" (?:may not have completed|completed successfully)|' +
-  'Предыдущий инструмент «[^»]*»)[\\s\\S]*\\)\\s*$)');
+  `(?:继续|Continue|Продолжай) (?:${AUTO_CONTINUE_GUARDS})\\s*$)`);
 
 function humanInstruction(event) {
   if (event?.type !== 'user/message' || event.data?.source?.kind !== 'user') return;
