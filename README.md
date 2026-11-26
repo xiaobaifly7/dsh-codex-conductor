@@ -116,6 +116,8 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 自动交接与 `turn-stopping` 时的派单/收尾提醒属于会话级动作，沿用 0.9.209 的 `userStopped` 判定：用户停止后先不自动推进，普通人工消息（包括“继续”）即可恢复这些动作，但不会解除停止前具体任务的截止线。
 
+自动交接投递交接单后、建立继任目标前，再检查原会话与继任在本次交接期间的用户停止；即使随后又问了状态也有效。原会话被停就按现有逻辑撤回，且不恢复它的目标；继任被停则保留已收到的交接单和链接，不新建或恢复继任目标，避免撤销用户正在查看的会话。交接前任务的转交通知按整条交接链的停止边界与原始派单时间比较，前任或中间会话的停止不会被新继任绕过；被拦结果留在最终继任，等它下一次人工回合。
+
 自动续接和交接摘要使用独立的 `via`，保留停止截止时间；消息来源中只有操作员使用的 `codex-conductor` via 会清除它，显式恢复或新建 Goal 也会清除。操作员 `send-request` 仍可推进会话，后台任务结果仍可查询。重启或意外中断后的恢复保持原有行为，不额外阻止停止后由用户发起、随后被中断的合法回合续接。
 
 ### 0.9.210：解压原文可读，只在压缩仍降不下地板时交接
@@ -794,6 +796,8 @@ In session f9886d30 on 11-27, the user stopped at 00:16:43 and only asked for st
 Held completion notices are persisted in `stateDirectory/held-notices.json` and accompany the next human message, surviving rejected steps, plugin reloads and host restarts. Concrete task completions and their blocked-inbox wakes, automatic verification, failure fallback, auto-answer, and notice forwarding check provenance against `lastUserStopAt`; a fresh child job or forwarded notice cannot bypass that cutoff.
 
 Automatic hand-over and dispatch/finish reminders at `turn-stopping` are session-level actions. They retain 0.9.209's `userStopped` behavior: a user stop holds them, and ordinary human input, including “继续” (“continue”), restores them without clearing the cutoff for pre-stop tasks.
+
+After delivering an automatic hand-over prompt and before creating the successor goal, recheck both sessions for user stops during that hand-over, even if followed by a status question. A predecessor stop rolls back the hand-over without restoring its goal. A successor stop preserves the delivered brief and link but creates or resumes no successor goal, avoiding reversal of the session the user is viewing. Forwarded task notices compare original dispatch time against stop boundaries across the full hand-over chain, including intermediate predecessors; held results accompany the final successor’s next human turn.
 
 Automatic recovery and hand-over summaries use separate `via` values and retain the stop cutoff. Among message sources, only the operator's `codex-conductor` via clears it; explicit Goal resume/create also clears it. Operator `send-request` remains available, and background results remain queryable. Recovery after a restart or accidental interruption keeps its existing behavior, without an extra stop gate on legitimate interrupted human turns initiated after the stop.
 

@@ -1677,7 +1677,7 @@ test('forwarded notices on both sides of a successor stop are delivered separate
   const target = { id: 'session-new', status: 'idle', followup: message => sent.push(message) };
   await forwardRetiredNotices({ agent: { id: 'session-old' }, messages: notices, jobs,
     aliases: { successor: id => id === 'session-old' ? target.id : undefined }, resolve: async () => target,
-    allowed: (_agent, job) => job.startedAt > 2000, hold: (_agent, message) => held.push(message) });
+    allowed: async (_agent, job) => job.startedAt > 2000, hold: (_agent, message) => held.push(message) });
   assert.equal(sent.length, 1);
   assert.match(sent[0].content[0].text, /background job new completed/);
   assert.doesNotMatch(sent[0].content[0].text, /background job old completed/);
@@ -1704,4 +1704,70 @@ test('a stop during automatic handover archives rolls back recorded changes with
   assert.equal(h.goalsByAgent.get(agent).phase, 'paused');
   assert.equal(agent.session.log.filter(event => event.type === 'session/title').at(-1).data.title, '原来的标题');
   assert.equal(mode, 'on');
+});
+
+test('stopping the predecessor during delivery must roll back the automatic handover', async (t) => {
+  const { createAutoHandover, createHistoryTracker } = await import('./handover.mjs');
+  for (const afterHuman of [false, true]) await t.test(afterHuman ? 'stop followed by a human question' : 'stop', async (t) => {
+    const history = createHistoryTracker({ threshold: () => 0 });
+    t.after(() => history.flush());
+    const h = host(t, { prompt: async (_request, target) => {
+      source.session.log.push({ type: 'turn/end', time: 4000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+      if (afterHuman) source.session.log.push(userEvent('目前如何？', 5000));
+      target.session.log.push({ type: 'turn/start', time: 3000 });
+      target.status = 'running';
+    } });
+    const source = h.agent('session-original');
+    source.session.log.push({ type: 'turn/end', time: 1000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+      userEvent('交接这项工作', 2000));
+    writeFileSync(h.aliases.file, '{"links":{}}');
+    h.goalsByAgent.set(source, { id: 'G1', revision: 1, phase: 'active', objective: 'continue work' });
+    const requestedAt = '2026-11-27T00:00:00.000Z';
+    const stateFile = path.join(h.root, 'auto-handover.json');
+    writeFileSync(stateFile, JSON.stringify({ sessions: { [source.id]: { autoAt: [requestedAt],
+      pending: { requestedAt, goal: { id: 'G1', revision: 1 } } } } }));
+    const allowed = agent => !history.observe(agent)?.userStopped;
+    const result = await h.request({ sessionId: source.id, origin: 'auto', requestedAt }, { allowed });
+    assert.equal(h.aliases.successor(source.id), undefined, 'a stop during delivery must detach the successor');
+    assert.equal(result.reason, 'user_stopped');
+    assert.equal(result.status, 'refused');
+    assert.equal(result.rollback.status, 'reverted');
+    assert.equal(h.goalsByAgent.get(source).phase, 'paused', 'a later question must not restore the old goal');
+    assert.equal(h.goalsByAgent.get(h.agents.get(result.to)), undefined);
+    assert.equal(history.observe(source).userStopped, afterHuman ? undefined : true);
+    const resume = t.mock.fn(agent => h.goalsByAgent.set(agent, { ...h.goalsByAgent.get(agent), phase: 'active' }));
+    const auto = createAutoHandover({ directory: h.root, allowed, agentOf: id => h.agents.get(id),
+      goals: () => ({ get: agent => h.goalsByAgent.get(agent), resume }) });
+    auto.settled(result);
+    assert.equal(resume.mock.callCount(), 0, 'settling the stopped handover must not restore its pending goal');
+    assert.equal(h.goalsByAgent.get(source).phase, 'paused');
+    assert.equal(entriesAt(stateFile).sessions[source.id].pending, undefined);
+  });
+});
+
+test('stopping the successor while its handover prompt is running must not create an active goal', async (t) => {
+  const { createHistoryTracker } = await import('./handover.mjs');
+  for (const afterHuman of [false, true]) await t.test(afterHuman ? 'stop followed by a human question' : 'stop', async (t) => {
+    const history = createHistoryTracker({ threshold: () => 0 });
+    t.after(() => history.flush());
+    const h = host(t, { prompt: async (_request, target) => {
+      target.session.log.push({ type: 'turn/start', time: 3000 },
+        { type: 'turn/end', time: 4000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+      if (afterHuman) target.session.log.push(userEvent('目前如何？', 5000));
+      target.status = 'idle';
+    } });
+    const source = h.agent('session-original');
+    writeFileSync(h.aliases.file, '{"links":{}}');
+    h.goalsByAgent.set(source, { id: 'G1', revision: 1, phase: 'active', objective: 'continue work' });
+    const result = await h.request({ sessionId: source.id, origin: 'auto' }, { allowed: agent => !history.observe(agent)?.userStopped });
+    const target = h.agents.get(result.to);
+    assert.equal(h.goalsByAgent.get(target), undefined, 'the stopped successor must not get a new active goal');
+    assert.equal(h.goalsByAgent.get(source).phase, 'paused');
+    assert.equal(h.aliases.successor(source.id), target.id);
+    assert.equal(result.status, 'handed_over');
+    assert.equal(result.steps.successorGoal, 'user_stopped');
+    assert.equal(result.checks.goal, 'skipped:user_stopped');
+    assert.match(readFileSync(result.briefPath, 'utf8'), /continue work/);
+    assert.equal(history.observe(target).userStopped, afterHuman ? undefined : true);
+  });
 });

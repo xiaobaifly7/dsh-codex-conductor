@@ -761,7 +761,8 @@ export async function repairLinks({ registry, controller, aliases, directory, lo
 export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, pending, sessionJobs, aliases, from, to, registry, instructionArchive, transcripts }) {
   const checks = {};
   const hasGoal = goal && goal.phase !== 'complete' && typeof goal.objective === 'string';
-  if (steps.successorGoal === 'loopx') checks.goal = 'skipped:loopx';
+  if (steps.successorGoal === 'user_stopped') checks.goal = 'skipped:user_stopped';
+  else if (steps.successorGoal === 'loopx') checks.goal = 'skipped:loopx';
   else if (!hasGoal) checks.goal = 'skipped:no_goal';
   else if (steps.successorGoal === 'exists') checks.goal = 'skipped:successor_had_goal';
   else if (steps.successorGoal?.startsWith('kept_')) checks.goal = 'skipped:goal_not_active';
@@ -847,7 +848,7 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
       const groups = [[], []];
       for (const notice of notices) {
         const job = codex.get(/^background job (\S+)(?:\s|$)/.exec(textOf(notice.content))?.[1]);
-        groups[allowed(target, job) ? 0 : 1].push(notice);
+        groups[await allowed(target, job) ? 0 : 1].push(notice);
       }
       for (const [deferred, group] of groups.entries()) {
         if (!group.length) continue;
@@ -943,7 +944,10 @@ export async function handOver(ctx, deps, request) {
   if (request.origin === 'auto' && aliases.links(null) === null) return refuse('links_unreadable', { error: LINKS_UNREADABLE });
   let agentA;
   try { agentA = await agentOf(from); } catch (error) { return refuse(error.code === 'session/not-found' ? 'session_not_found' : 'session_unavailable', { error: error.message }); }
-  const stopped = () => request.origin === 'auto' && !allowed(agentA);
+  const stoppedSince = (agent, offset) => agent.session?.log?.slice(offset).some(event => event?.type === 'turn/end' &&
+    event.data?.reason?.kind === 'aborted' && event.data.reason.reason?.kind === 'user');
+  const originalLogStart = agentA.session?.log?.length ?? 0;
+  const stopped = () => stoppedSince(agentA, originalLogStart) || (request.origin === 'auto' && !allowed(agentA));
   if (stopped()) return refuse('user_stopped');
   const taken = aliases.successor(from);
   if (taken) return refuse('already_handed_over', { successor: taken });
@@ -993,6 +997,7 @@ export async function handOver(ctx, deps, request) {
     result.to = to;
     agentB = await agentOf(to);
   } catch (error) { return giveBack('successor_unavailable', { error: String(error?.message ?? error) }); }
+  const successorLogStart = agentB.session?.log?.length ?? 0;
   if (request.to && !force && agentB.status === 'running') return giveBack('successor_turn_running');
   // 记下继任会话此刻的消息数和回合数：撤回保护和自动交接的再次触发都以它为基数。
   const base = logCounts(agentB.session?.log);
@@ -1060,14 +1065,19 @@ export async function handOver(ctx, deps, request) {
     result.briefPath = path.join(dir, `${at.replace(/[:.]/g, '-')}-${from}-to-${to}.md`);
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
-  if (stopped()) {
-    const back = await handOver(ctx, deps, { revert: { from, to }, rollback: true, force: true });
-    result.rollback = { status: back.status, steps: back.steps };
+  const rollbackStopped = async () => {
+    // A later human question must not restore the goal paused by this stopped handover.
+    const back = await handOver(ctx, { ...deps, allowed: agent => agent.id !== from && allowed(agent) },
+      { revert: { from, to }, rollback: true, force: true });
+    result.rollback = { status: back.status, ...(back.reason ? { refused: back.reason } : {}), steps: back.steps };
     if (back.status !== 'reverted') return Object.assign(result, { status: 'handed_over_with_issues', reason: 'user_stopped' });
     return giveBack('user_stopped');
-  }
+  };
+  if (stopped()) return rollbackStopped();
   Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs));
-  if (followed) result.steps.successorGoal = 'loopx';
+  if (stopped()) return rollbackStopped();
+  if (stoppedSince(agentB, successorLogStart)) result.steps.successorGoal = 'user_stopped';
+  else if (followed) result.steps.successorGoal = 'loopx';
   else if (keptGoal) result.steps.successorGoal = `kept_${goal.phase}`;
   else if (!stopped() && goal && goal.phase !== 'complete' && typeof goal.objective === 'string') {
     try {
@@ -1437,7 +1447,7 @@ export function createAutoHandover({ directory, settings, aliases, runningJobs, 
       else {
         // 没交接成的尝试不占“24 小时一次”的名额。
         record.autoAt = (record.autoAt ?? []).filter((at) => at !== record.pending.requestedAt);
-        giveUp(agentOf(id), record, record.pending.goal, `交接${result.status}${result.reason ? `：${result.reason}` : ''}`,
+        giveUp(agentOf(id), record, result.reason === 'user_stopped' ? undefined : record.pending.goal, `交接${result.status}${result.reason ? `：${result.reason}` : ''}`,
           result.reason === 'turn_running');
       }
       save(id, record);

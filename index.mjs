@@ -4785,10 +4785,30 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
   // 交接出去的会话收到 Codex 任务结束通知时转给继任会话，前任这一回合不调用模型就结束。
   ctx.on('agent/pre-step', async (step, next) => {
-    let forwarded;
+    let forwarded, chain;
     try {
       forwarded = await forwardRetiredNotices({ agent: step.agent, messages: step.messages, aliases, jobs: ctx.get?.('jobs'),
-        allowed: (agent, job) => history.allowsAutomatic(agent, backgroundStartedAt(step.agent, job)),
+        allowed: async (target, job) => {
+          if (!chain) {
+            const owners = [];
+            for (const id of aliases.owners(target.id)) {
+              let owner = id === step.agent.id ? step.agent : id === target.id ? target : ctx.get?.('agents')?.get?.(id);
+              if (!Array.isArray(owner?.session?.log)) {
+                try {
+                  const session = await ctx.get?.('sessionQuery')?.readSession?.(id);
+                  owner = { id, session: { log: session?.events } };
+                } catch { return false; }
+              }
+              // Missing predecessor history cannot prove the task postdates its stop; retain the notice.
+              if (!Array.isArray(owner?.session?.log)) return false;
+              owners.push(owner);
+            }
+            chain = owners;
+          }
+          // Recheck live logs after all reads; a user may stop the successor while a predecessor is loading.
+          const startedAt = backgroundStartedAt(step.agent, job);
+          return chain.every(owner => history.allowsAutomatic(owner, startedAt));
+        },
         hold: (agent, message) => holdNotices(agent.id, [message]),
         resolve: async (id) => ctx.get?.('agents')?.get?.(id) ?? (await ctx.get?.('sessionController')?.resolveAgent?.(id))?.agent });
     } catch (error) { ctx.logger?.warn?.(`[codex-conductor] 转交任务通知失败：${error?.message ?? error}`); }
