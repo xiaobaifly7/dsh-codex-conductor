@@ -33,7 +33,7 @@ const { registerPanel } = await import(new URL(`./panel.mjs${reloadQuery}`, impo
 const { prepareReview, reviewRejection, reviewSkeleton, pendingCloseout, closeoutRefusal, closeoutDeferral, closeoutSince,
   flaggedCriteria, mustVerifyCriteria, verifyCriterionItem, verificationItemKey, reportRowOf, OWNER_ONLY_REASONS,
   HISTORICAL_GAP_KINDS, historicalCriteria } = await import(new URL(`./closeout.mjs${reloadQuery}`, import.meta.url));
-const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, instructionArchivePath, transcriptPath, summarizing, summaryStepRejected } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
+const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryTracker, createAutoHandover, AUTO_HANDOVER_DEFAULTS, autoContinueFromSettings, outsideHmr, repairLinks, lastSuccessor, forwardRetiredNotices, filterRevokedHandovers, instructionArchivePath, transcriptPath, summarizing, summaryStepRejected } = await import(new URL(`./handover.mjs${reloadQuery}`, import.meta.url));
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
@@ -1415,6 +1415,22 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
   const cfg = settings(config, ctx.logger);
   const stateDirectory = cfg.stateDir || (process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, 'dsh-codex-conductor'));
+  // Revocation may happen while another pre-step hook waits; check again at model admission.
+  ctx.on('agent/pre-step', async (step, next) => {
+    const incoming = step.messages ?? [];
+    const original = [...incoming];
+    const messages = filterRevokedHandovers(stateDirectory, step.agent?.id, incoming);
+    if (messages.length !== incoming.length) {
+      incoming.splice(0, incoming.length, ...messages);
+      if (!messages.length) return { kind: 'reject' };
+    }
+    const decision = await next();
+    if (decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
+    if (original.length && !filterRevokedHandovers(stateDirectory, step.agent?.id, original).length) return { kind: 'reject' };
+    const admitted = filterRevokedHandovers(stateDirectory, step.agent?.id, decision.messages);
+    if (admitted.length === decision.messages.length) return decision;
+    return admitted.length ? { ...decision, messages: admitted } : { kind: 'reject' };
+  });
   const canAnswer = (log, job, owner) => cfg.plannerAnswers === true || hasUserReply(log, job, owner, cfg.autoResume.message);
   const conductor = createConductor(cfg, run);
   let dispatching = 0;
@@ -1696,7 +1712,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     // A handover during the reads invalidates this snapshot; defer rather than approve an unchecked successor.
     const current = aliases.owners(lastSuccessor(aliases, agent.id) ?? agent.id);
     return ids.length === current.length && ids.every((id, index) => id === current[index]) &&
-      chain.every(owner => history.allowsAutomatic(owner, startedAt));
+      chain.every((owner, index) => {
+        const live = ctx.get?.('agents')?.get?.(ids[index]);
+        return history.allowsAutomatic(Array.isArray(live?.session?.log) ? live : owner, startedAt);
+      });
   };
   const automaticJobAllowed = (agent, job) => automaticChainAllowed(agent,
     dispatchTimes.get(job?.job_id) ?? (Number.isFinite(job?.started_at) ? job.started_at * 1000 : undefined));
@@ -4814,7 +4833,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       forwarded = await forwardRetiredNotices({ agent: step.agent, messages: step.messages, aliases, jobs: ctx.get?.('jobs'),
         allowed: (target, job) => automaticChainAllowed(target, backgroundStartedAt(step.agent, job), chain),
         hold: (agent, message) => {
-          if (!holdNotices(agent.id, [message])) throw new Error('暂存通知未落盘，保留原会话消息。');
+          // A failed transfer leaves the original available, so roll back its successor copy.
+          const prior = heldNotices.get(agent.id);
+          if (holdNotices(agent.id, [message])) return;
+          if (prior === undefined) heldNotices.delete(agent.id);
+          else heldNotices.set(agent.id, prior);
+          throw new Error('暂存通知未落盘，保留原会话消息。');
         },
         resolve: async (id) => ctx.get?.('agents')?.get?.(id) ?? (await ctx.get?.('sessionController')?.resolveAgent?.(id))?.agent });
     } catch (error) { ctx.logger?.warn?.(`[codex-conductor] 转交任务通知失败：${error?.message ?? error}`); }
@@ -4835,7 +4859,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (!heldFile) return false;
     try { writeJsonAtomic(heldFile, Object.fromEntries(heldNotices)); return true; }
     catch (error) {
-      ctx.logger?.warn?.(`[codex-conductor] 保存暂存通知失败，通知仍在内存中：${error.message}`);
+      ctx.logger?.warn?.(`[codex-conductor] 保存暂存通知失败：${error.message}`);
       return false;
     }
   };
@@ -4857,7 +4881,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         saveHeldNotices();
       }
     }
-    const human = messages.some(m => m?.source?.kind === 'user' && !m.source.via);
+    const human = messages.some(m => m?.source?.kind === 'user' && !m.source.via && !String(m.source.rpcId ?? '').startsWith('handover-'));
     const notices = messages.filter(m => m?.source?.kind === 'tool-jobs');
     const held = human ? [] : notices.filter(message => !noticeAllowed(step.agent, message));
     if (held.length) {

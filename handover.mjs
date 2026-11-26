@@ -17,6 +17,33 @@ export function writeTextAtomic(file, text) {
 
 export const writeJsonAtomic = (file, value) => writeTextAtomic(file, JSON.stringify(value, null, 2) + '\n');
 
+function readRevokedHandovers(directory) {
+  try {
+    const { sessions } = JSON.parse(fs.readFileSync(path.join(directory, 'revoked-handovers.json'), 'utf8'));
+    if (!sessions || typeof sessions !== 'object' || Array.isArray(sessions) ||
+        !Object.values(sessions).every(ids => Array.isArray(ids) && ids.every(id => typeof id === 'string'))) {
+      throw new Error('invalid revoked handover records');
+    }
+    return sessions;
+  } catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+}
+
+function revokeHandover(directory, agentId, requestId) {
+  const sessions = readRevokedHandovers(directory);
+  const ids = sessions[agentId] ?? [];
+  if (ids.includes(requestId)) return;
+  fs.mkdirSync(directory, { recursive: true });
+  writeJsonAtomic(path.join(directory, 'revoked-handovers.json'), {
+    sessions: { ...sessions, [agentId]: [...ids, requestId] },
+  });
+}
+
+export function filterRevokedHandovers(directory, agentId, messages) {
+  if (!directory) return messages;
+  const revoked = readRevokedHandovers(directory)[agentId];
+  return revoked?.length ? messages.filter(message => !revoked.includes(message.source?.rpcId)) : messages;
+}
+
 // 交接请求的发起来源；外部直接写请求文件、没带来源时记为 file。
 export const ORIGINS = ['panel', 'auto', 'confirm', 'tool', 'file'];
 const LINKS_UNREADABLE = '交接链接状态不可读，暂停自动交接。';
@@ -568,10 +595,10 @@ export function summaryStepRejected(agentId, now = Date.now) {
   return Boolean(entry.expired || now() > entry.deadline || entry.steps > SUMMARY_MAX_STEPS);
 }
 
-async function deliver(controller, sessionId, text, waitMs, requestId) {
+async function deliver(controller, sessionId, text, waitMs, requestId, signal) {
   try {
     const call = controller.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
-      new AbortController().signal);
+      signal);
     call.catch(() => {});
     let timer;
     const outcome = await Promise.race([call.then(() => 'prompted', (error) => ({ error })),
@@ -853,24 +880,29 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
         const job = codex.get(/^background job (\S+)(?:\s|$)/.exec(textOf(notice.content))?.[1]);
         groups[await allowed(target, job) ? 0 : 1].push(notice);
       }
+      const wrap = (group, id) => ({ id, role: 'user', content: [{ type: 'text', text:
+        `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
+        group.map(notice => textOf(notice.content)).join('\n\n') }], source: { kind: 'plugin:codex-conductor' } });
+      const retain = async (group) => {
+        for (const notice of group) {
+          try {
+            await hold(target, wrap([notice], notice.id));
+            forwarded.add(notice);
+          } catch {}
+        }
+      };
       for (const [deferred, group] of groups.entries()) {
         if (!group.length) continue;
-        const text = `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
-          group.map(notice => textOf(notice.content)).join('\n\n');
-        const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin:codex-conductor' } };
+        if (deferred) {
+          if (hold) await retain(group);
+          continue;
+        }
+        const message = wrap(group, randomUUID());
         try {
-          if (deferred && hold) await hold(target, message);
-          else {
-            try {
-              if (target.status === 'idle' && !deferred) await target.followup(message);
-              else await target.inject(message);
-            } catch (error) {
-              if (!hold) throw error;
-              await hold(target, message);
-            }
-          }
+          if (target.status === 'idle') await target.followup(message);
+          else await target.inject(message);
           for (const notice of group) forwarded.add(notice);
-        } catch {}
+        } catch { if (hold) await retain(group); }
       }
     }
   } catch {}
@@ -915,6 +947,7 @@ export async function handOver(ctx, deps, request) {
       }
       result.warning = 'parallel_sessions';
     }
+    if (link.deliveryRequestId) revokeHandover(directory, to, link.deliveryRequestId);
     aliases.unlink(from, to);
     result.status = 'reverted';
     result.steps.alias = 'removed';
@@ -1083,7 +1116,12 @@ export async function handOver(ctx, deps, request) {
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
   let deliveryRequestId;
+  const deliveryController = new AbortController();
   const rollbackStopped = async () => {
+    if (deliveryRequestId) {
+      revokeHandover(directory, to, deliveryRequestId);
+      deliveryController.abort();
+    }
     const log = agentB.session?.log ?? [];
     const currentTurn = log.slice(log.findLastIndex(event => event.type === 'turn/start'));
     const handoverTurn = deliveryRequestId && !currentTurn.some(event => event.type === 'turn/end') &&
@@ -1103,7 +1141,8 @@ export async function handOver(ctx, deps, request) {
   };
   if (stopped()) return rollbackStopped();
   deliveryRequestId = `handover-${randomUUID()}`;
-  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs, deliveryRequestId));
+  aliases.annotate(to, { deliveryRequestId });
+  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs, deliveryRequestId, deliveryController.signal));
   if (stopped()) return rollbackStopped();
   if (stoppedSince(agentB, successorLogStart)) result.steps.successorGoal = 'user_stopped';
   else if (followed) result.steps.successorGoal = 'loopx';

@@ -190,7 +190,7 @@ function host(t, hooks = {}, root = dir(t)) {
   const ctx = { get: (name) => ({ goals, sessionQuery: hooks.readSession && { readSession: hooks.readSession }, sessionController: {
     resolveAgent: async (id) => (agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found', message: 'no' } }),
     create: async () => { const id = `session-N${++next}`; agent(id); return { sessionId: id }; },
-    prompt: async (request) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId)); },
+    prompt: async (request, signal) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId), signal); },
     // 与宿主一致：改名在会话日志里追加一条 session/title。
     rename: async (request) => { renames.push(request); if (hooks.renameError) throw new Error(hooks.renameError);
       agents.get(request.sessionId)?.session.log.push({ type: 'session/title', data: { title: request.title } }); },
@@ -209,6 +209,136 @@ const userEvent = (text, time, kind = 'user') => ({
   type: 'user/message', time, data: { content: [{ type: 'text', text }], ...(kind ? { source: { kind } } : {}) },
 });
 const entriesAt = (file) => JSON.parse(readFileSync(file, 'utf8'));
+
+// FIFO input is claimed before an awaited pre-step, and logged only after admission.
+function queuedHostAgent(agent, { beforeStep, filter, onMessage }) {
+  const queue = [];
+  let running = false, activity = Promise.resolve(), turn = 0;
+  agent.followup = message => {
+    queue.push(message);
+    if (running) return;
+    running = true;
+    activity = Promise.resolve().then(async () => {
+      while (queue.length) {
+        agent.status = 'running';
+        agent.session.log.push({ type: 'turn/start', data: { turn: ++turn } });
+        const messages = queue.splice(0, 1);
+        messages.splice(0, messages.length, ...filter(messages));
+        await beforeStep(messages);
+        const entered = filter(messages);
+        for (const message of entered) agent.session.log.push({ type: 'user/message', data: message });
+        if (entered.length) await onMessage(entered);
+        agent.session.log.push({ type: 'turn/end', data: { turn, reason: { kind: entered.length ? 'completed' : 'blocked' } } });
+      }
+      agent.status = 'idle';
+      running = false;
+    });
+  };
+  agent.whenIdle = () => activity;
+}
+
+for (const scenario of ['queued behind human', 'handover pre-step still loading']) test(`revoked handover ${scenario} cannot enter after rollback and reload`, async (t) => {
+  let module = await import('./handover.mjs');
+  const humanDone = Promise.withResolvers(), humanEntered = Promise.withResolvers();
+  const stepDone = Promise.withResolvers(), stepEntered = Promise.withResolvers();
+  const executed = [];
+  let deliverySignal;
+  const cancel = t.mock.fn();
+  const h = host(t, { cancel, prompt: async (request, target, signal) => {
+    deliverySignal = signal;
+    queuedHostAgent(target, {
+      filter: messages => module.filterRevokedHandovers?.(h.root, target.id, messages) ?? messages,
+      beforeStep: async messages => {
+        if (scenario === 'handover pre-step still loading' && messages.some(message => message.source.rpcId === request.requestId)) {
+          stepEntered.resolve(); await stepDone.promise;
+        }
+      },
+      onMessage: async messages => {
+        for (const message of messages) {
+          executed.push(message.source.rpcId);
+          if (message.source.rpcId === 'human-request') { humanEntered.resolve(); await humanDone.promise; }
+        }
+      },
+    });
+    if (scenario === 'queued behind human') {
+      target.followup({ id: 'human-1', role: 'user', source: { kind: 'user', rpcId: 'human-request' }, content: [{ type: 'text', text: '先回答我的问题' }] });
+      await humanEntered.promise;
+    }
+    target.followup({ id: 'handover-1', role: 'user', source: { kind: 'user', rpcId: request.requestId }, content: request.content });
+    if (scenario === 'handover pre-step still loading') await stepEntered.promise;
+    source.session.log.push({ type: 'turn/end', time: Date.now(), data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  } });
+  const source = h.agent('session-original');
+  writeFileSync(h.aliases.file, '{"links":{}}');
+  h.goalsByAgent.set(source, { id: 'G1', revision: 1, phase: 'active', objective: 'continue work' });
+  const result = await h.request({ sessionId: source.id, origin: 'auto' });
+  const target = h.agents.get(result.to);
+  assert.equal(result.rollback.status, 'reverted');
+  assert.equal(h.aliases.successor(source.id), undefined);
+  assert.equal(cancel.mock.callCount(), 0, 'request abort must not cancel a human or an unlogged turn');
+  module = await import('./handover.mjs?revocation-reloaded');
+  humanDone.resolve(); stepDone.resolve();
+  await target.whenIdle();
+  assert.equal(executed.filter(id => id.startsWith('handover-')).length, 0, 'a revoked queued or unlogged handover must not enter the model');
+  assert.equal(deliverySignal.aborted, true);
+  assert.deepEqual(executed, scenario === 'queued behind human' ? ['human-request'] : []);
+  const requestId = h.prompts[0].requestId;
+  const other = { id: 'other', source: { kind: 'user', rpcId: 'other-request' } };
+  const revoked = { id: 'revoked', source: { kind: 'user', rpcId: requestId } };
+  assert.deepEqual(module.filterRevokedHandovers(h.root, target.id, [revoked, other]), [other]);
+  assert.deepEqual(module.filterRevokedHandovers(h.root, source.id, [revoked, other]), [revoked, other]);
+});
+
+test('manual revert persistently revokes its recorded handover RPC after reload', async (t) => {
+  const h = host(t);
+  const source = h.agent('session-original');
+  const result = await h.request({ sessionId: source.id });
+  const requestId = h.prompts[0].requestId;
+  const reverted = await h.request({ revert: { from: source.id, to: result.to } });
+  assert.equal(reverted.status, 'reverted');
+  const module = await import('./handover.mjs?manual-revert-reloaded');
+  const message = { id: 'queued-handover', source: { kind: 'user', rpcId: requestId } };
+  assert.deepEqual(module.filterRevokedHandovers?.(h.root, result.to, [message]) ?? [message], []);
+});
+
+test('held forwarding wrappers retain each original notice ID across overlapping batches', async (t) => {
+  const { forwardRetiredNotices } = await import('./handover.mjs');
+  for (const deferred of [false, true]) await t.test(deferred ? 'deferred' : 'failed live forwarding', async () => {
+    const held = new Map();
+    const target = { id: 'session-new', status: 'idle', followup: () => { throw new Error('host rejected'); } };
+    const deps = { agent: { id: 'session-old' }, aliases: { successor: id => id === 'session-old' ? target.id : undefined },
+      jobs: { list: () => ['A', 'B', 'C'].map(id => ({ id, kind: 'codex', label: `Codex ${id}` })) },
+      resolve: async () => target, allowed: () => !deferred, hold: (_target, message) => held.set(message.id, message) };
+    for (const batch of [['A', 'B'], ['B', 'C']]) {
+      const result = await forwardRetiredNotices({ ...deps, messages: batch.map(id => ({ id, source: { kind: 'tool-jobs', form: 'notice' },
+        content: [{ type: 'text', text: `background job ${id} completed` }] })) });
+      assert.equal(result.reject, true);
+    }
+    assert.deepEqual([...held.keys()], ['A', 'B', 'C']);
+    for (const [id, message] of held) {
+      assert.match(message.content[0].text, new RegExp(`background job ${id} completed`));
+      assert.equal((message.content[0].text.match(/background job/g) ?? []).length, 1);
+    }
+  });
+});
+
+test('each held notice is marked forwarded before another notice fails to persist', async () => {
+  const { forwardRetiredNotices } = await import('./handover.mjs');
+  const messages = ['A', 'B', 'C'].map(id => ({ id, source: { kind: 'tool-jobs', form: 'notice' },
+    content: [{ type: 'text', text: `background job ${id} completed` }] }));
+  const held = [], target = { id: 'session-new' };
+  const result = await forwardRetiredNotices({ agent: { id: 'session-old' }, messages,
+    aliases: { successor: id => id === 'session-old' ? target.id : undefined },
+    jobs: { list: () => ['A', 'B', 'C'].map(id => ({ id, kind: 'codex', label: `Codex ${id}` })) },
+    resolve: async () => target, allowed: () => false, hold: (_target, message) => {
+      if (message.id === 'B') throw new Error('disk unavailable');
+      held.push(message.id);
+    } });
+  assert.deepEqual(held, ['A', 'C']);
+  assert.deepEqual(messages.map(message => message.id), ['B']);
+  assert.equal(result.forwarded, 2);
+  assert.equal(result.reject, false);
+});
 
 test('a goal the user paused is not revived in the successor; the goal the automatic hand-over paused itself is rebuilt', async (t) => {
   // 用户暂停的目标：继任会话不建目标，交接单和首条消息都说明不要自行创建或推进。
@@ -1508,8 +1638,8 @@ test('while the old session writes its summary every tool is refused, the retire
   const refused = await execute({ name: 'pwsh', arguments: { command: 'dir' }, agent }, async () => ({ value: 'ran' }));
   assert.equal(refused.isError, true);
   assert.match(refused.error.message, /交接前的摘要回合，不调用任何工具/);
-  // 第一个 pre-step 处理器是步数闸门：前 SUMMARY_MAX_STEPS 步照常，之后结束回合。
-  const [gate] = handlers['agent/pre-step'];
+  // 按宿主 waterfall 顺序运行：撤销过滤之后仍须执行摘要步数闸门。
+  const gate = (step, next) => handlers['agent/pre-step'].reduceRight((next, handler) => () => handler(step, next), next)();
   const kinds = [];
   for (let n = 1; n <= SUMMARY_MAX_STEPS + 1; n++) kinds.push((await gate({ agent, step: n, messages: [] }, async () => ({ kind: 'enter', messages: [] }))).kind);
   assert.deepEqual(kinds, [...Array(SUMMARY_MAX_STEPS).fill('enter'), 'reject']);
