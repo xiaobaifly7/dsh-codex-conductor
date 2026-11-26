@@ -4466,9 +4466,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const running = mine.filter(job => job.status === 'running').map(job => job.job_id);
     if (running.length) return `本对话 worktree 里还有单在跑（${running.join('、')}），全部核验通过后自动合并。`;
     const open = mine.filter(job => job.context?.write === true && job.status === 'completed' &&
-      !['verified', 'accepted_deviations'].includes(job.verification_status)).map(job => job.job_id);
-    if (open.length) return `本对话 worktree 里还有写入单没核验通过（${open.join('、')}），全部通过后自动合并。`;
-    return undefined;
+      !['verified', 'accepted_deviations'].includes(job.verification_status));
+    const ids = (status) => open.filter(job => (job.verification_status === 'needs_changes') === status).map(job => job.job_id);
+    const [flagged, waiting] = [ids(true), ids(false)];
+    // 11-26 d70d85ff：几单记了 needs_changes 后改派新单补，原单一直挡着合并，规划端看不出要做什么。
+    return [
+      waiting.length && `本对话 worktree 里还有写入单没核验通过（${waiting.join('、')}），全部通过后自动合并。`,
+      flagged.length && `这些写入单核验记为 needs_changes，挡着合并回 ${entry.base_branch}：${flagged.join('、')}。` +
+        '逐单处理：在原线程用 codex_continue 修正后重新核验；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，' +
+        '写明由哪一单修正和那一单的核验依据。处理完才会自动合并。',
+    ].filter(Boolean).join('') || undefined;
   }
   async function mergeConversation(owner, found, signal) {
     const waiting = await mergeGate(owner, found.entry, signal);

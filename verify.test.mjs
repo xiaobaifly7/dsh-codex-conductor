@@ -1150,7 +1150,11 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     const job = (extra) => ({ jobs: [{ job_id: 'W-1', cwd: wt, context: { owner: 'session-0a0a0a0a-1', write: true }, ...extra }], total: 1 });
     const merge = (listed) => harness({ config, listed }).tools.codex_worktree.execute({ action: 'merge' }, as('session-0a0a0a0a-1'));
     assert.match((await merge(() => job({ status: 'running' }))).worktrees[0].note, /还有单在跑（W-1）/);
-    assert.match((await merge(() => job({ status: 'completed', verification_status: 'needs_changes' }))).worktrees[0].note, /没核验通过（W-1）/);
+    assert.match((await merge(() => job({ status: 'completed', verification_status: 'unreviewed' }))).worktrees[0].note, /没核验通过（W-1）/);
+    // A write booked needs_changes is named with what clears it, not reported as merely unverified.
+    const flagged = (await merge(() => job({ status: 'completed', verification_status: 'needs_changes' }))).worktrees[0].note;
+    assert.match(flagged, /needs_changes，挡着合并回 main：W-1。.*codex_continue.*accepted_deviations/);
+    assert.doesNotMatch(flagged, /没核验通过/);
     const merged = (await merge(() => job({ status: 'completed', verification_status: 'verified' }))).worktrees[0];
     assert.equal(merged.status, 'merged');
     assert.equal(readFileSync(path.join(root, 'src', 'a.txt'), 'utf8'), 'changed in the worktree\n');
