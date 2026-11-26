@@ -435,14 +435,14 @@ test('rollback cancels its matching handover after a completed human turn during
   assert.equal(target.status, 'idle');
 });
 
-test('rollback keeps genuine human input following its current handover brief', async (t) => {
-  for (const human of [userEvent('人工追问', 2), userEvent('带 RPC 的人工追问', 2)]) await t.test(human.data.content[0].text, async (t) => {
+test('rollback keeps genuine human input in the same turn as its current handover brief', async (t) => {
+  for (const [human, first] of [[userEvent('人工追问', 2), false], [userEvent('带 RPC 的人工追问', 2), false], [userEvent('排在交接单前的人工追问', 2), true]]) await t.test(human.data.content[0].text, async (t) => {
     if (human.data.content[0].text.startsWith('带')) human.data.source.rpcId = 'human-steer';
     const cancel = t.mock.fn();
     const h = host(t, { cancel, prompt: async (request, target) => {
       target.status = 'running';
-      target.session.log.push({ type: 'turn/start', data: { turn: 1 } },
-        { type: 'user/message', data: { source: { kind: 'user', rpcId: request.requestId } } }, human);
+      const brief = { type: 'user/message', data: { source: { kind: 'user', rpcId: request.requestId } } };
+      target.session.log.push({ type: 'turn/start', data: { turn: 1 } }, ...(first ? [human, brief] : [brief, human]));
       h.goalsByAgent.set(target, { id: 'G2', revision: 1, phase: 'active', objective: 'work' });
       source.session.log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
     } });
