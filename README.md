@@ -108,6 +108,12 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.212：交接后的后续派单沿用停止边界，撤回会取消继任回合
+
+PR #134 第二轮独立复现发现三处缺口：A 派单后被用户停止，追问状态并交接到 B，B 查询旧结果仍会自动派核验或 Gemini 接替；投递交接单期间停止 A，撤回虽报成功，B 的交接回合却仍在运行；继任拒收转交通知时，原通知已被消费却没有留副本。
+
+自动核验、Gemini 失败接替和通知转交现在共用整条交接链的停止判定，按原始派单时间比较每个会话的最近停止；前任历史不可读时按停止前任务处理；超过两次交接也会跟到链路末端。停止后发过普通消息不解除旧任务限制，晚于链上停止的新任务照常处理，明确派单仍可用。因原会话停止而撤回时，先暂停继任目标，再用宿主取消入口停止本次交接单开启的回合，避免它继续派活或由目标另开一轮。转交的 followup / inject 失败时，结果复用 `held-notices.json` 暂存到继任，重载后仍随继任下一次人工回合交付，不再唤醒前任处理旧结果；若落盘也失败，保留原通知，不直接消费。
+
 ### 0.9.211：普通追问不解除停止前任务的自动唤醒限制
 
 11-27 的 f9886d30 会话中，用户 00:16:43 点停止，00:16:55 只追问状态，停止前派出的任务却在 00:18:00 完成后叫醒会话；随后一单核验在 00:18:01 派出，用户 00:18:02 再次停止，核验结束又在 00:19:57 叫醒会话。具体任务使用最后一次用户停止时间 `lastUserStopAt` 作为截止线，普通人工消息不清除它：只有能匹配到任务、且派发时间严格晚于这次停止的任务才可自动唤醒；无法匹配或缺少派发时间的通知按停止前任务处理。
@@ -788,6 +794,12 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.212: Keep stop boundaries for inherited follow-ups and cancel rolled-back hand-over turns
+
+The second independent review of PR #134 reproduced three gaps: after A dispatched work, was stopped, answered a status question and handed over to B, querying the old result in B still started automatic verification or Gemini fallback; stopping A during hand-over delivery reported a successful rollback while B's hand-over turn kept running; and a rejected forwarded notice was consumed without retaining a copy.
+
+Automatic verification, Gemini failure fallback and notice forwarding now share one full-chain stop check against the original dispatch time. Unreadable predecessor history counts as pre-stop work, and chains longer than two hand-overs are followed to their final successor. Ordinary questions do not release earlier work; tasks dispatched after the chain's stops and explicit dispatch remain available. Rollback after a predecessor stop pauses the successor goal and uses the host cancellation entry to stop the turn started by that hand-over prompt, preventing further work or a new goal round. If forwarding via followup or inject fails, retain the result in the successor's existing `held-notices.json`; it survives reload and accompanies the next human turn there, keeping old results from waking the retired predecessor. If durable retention also fails, leave the original notice available instead of consuming it.
 
 ### 0.9.211: Ordinary follow-up questions keep the stop boundary for earlier jobs
 

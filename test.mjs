@@ -8765,19 +8765,19 @@ function stoppedNoticeFixture() {
 
 test('f9886d30: pre-stop completions stay held after status questions and arrive with the next human turn', async () => {
   const f = stoppedNoticeFixture();
-  const first = f.notice('20261127-001442-bd0000', '14:42');
-  f.stop('16:43');
-  await f.human('16:55');
+  const first = f.notice('20261127-001442-bd0000', '14:42.200');
+  f.stop('16:43.157');
+  await f.human('16:55.455');
   f.log.push({ type: 'turn/end', time: f.at('17:03'), data: { reason: { kind: 'completed' } } });
-  assert.equal((await f.step([first])).kind, 'reject', '00:18:00 old execution must not start a model step');
-  const verification = f.notice('20261127-001801-cd0000', '18:01');
-  f.stop('18:02');
-  const question = await f.human('18:48', '你准备如何设计？');
-  assert.deepEqual(question.messages.map(m => m.id), ['human-18:48', first.id]);
+  assert.equal((await f.step([first])).kind, 'reject', '00:18:01.388 old execution must not start a model step');
+  const verification = f.notice('20261127-001801-cd0000', '18:00.666');
+  f.stop('18:02.407');
+  const question = await f.human('18:48.342', '你准备如何设计？');
+  assert.deepEqual(question.messages.map(m => m.id), ['human-18:48.342', first.id]);
   f.log.push({ type: 'turn/end', time: f.at('19:00'), data: { reason: { kind: 'completed' } } });
-  assert.equal((await f.step([verification])).kind, 'reject', '00:19:57 pre-second-stop verification must stay held');
-  f.stop('20:16');
-  assert.deepEqual((await f.human('21:22')).messages.map(m => m.id), ['human-21:22', verification.id]);
+  assert.equal((await f.step([verification])).kind, 'reject', '00:19:58.649 pre-second-stop verification must stay held');
+  f.stop('20:16.500');
+  assert.deepEqual((await f.human('21:22.429')).messages.map(m => m.id), ['human-21:22.429', verification.id]);
   assert.deepEqual((await f.human('22:00')).messages.map(m => m.id), ['human-22:00'], 'delivered once');
 });
 
@@ -9031,4 +9031,93 @@ test('a human continue restores context-floor automatic handover while pre-stop 
   const notice = { id: 'old-completion', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job old-bg completed' }] };
   const decision = await h.handlers['agent/pre-step']({ agent, step: 1, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
   assert.equal(decision.kind, 'reject', 'the old task still cannot wake a model step');
+});
+
+// Review #134b: querying an inherited result must retain every predecessor's task stop boundary.
+for (const kind of ['verification', 'Gemini fallback']) {
+  test(`automatic ${kind} respects task stop boundaries across the handover chain`, async (t) => {
+    const { createAliases } = await import('./handover.mjs');
+    for (const scenario of ['stopped predecessor', 'stopped intermediate', 'fresh task', 'unloaded predecessor', 'unreadable predecessor', 'chain changes before final dispatch']) {
+      await t.test(scenario, async (t) => {
+        const { make, state } = acceptedFixtureHarness(t);
+        const aliases = createAliases(state);
+        aliases.link('original', 'middle');
+        aliases.link('middle', 'successor');
+        const stoppedLog = time => [
+          { type: 'turn/end', time, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+          { type: 'user/message', time: time + 1, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '状态如何' }] } },
+        ];
+        const original = { ...agentAt('/work/original', ['stopped intermediate', 'chain changes before final dispatch'].includes(scenario) ? [] : stoppedLog(2000)), id: 'original' };
+        const middle = { ...agentAt('/work/original', scenario === 'stopped intermediate' || scenario === 'fresh task' ? stoppedLog(4000) : []), id: 'middle' };
+        const successor = { ...agentAt('/work/original'), id: 'successor' };
+        const agents = new Map([[original.id, original], [middle.id, middle], [successor.id, successor]]);
+        if (['unloaded predecessor', 'unreadable predecessor', 'chain changes before final dispatch'].includes(scenario)) agents.delete(original.id);
+        let reads = 0;
+        const h = make({ autoVerify: kind === 'verification' ? 'flagged' : 'off', gemini: { command: 'C:\\tools\\agy.exe' },
+          startResult: { job_id: 'FOLLOWUP', status: 'completed' } }, { agents,
+          sessionQuery: { readSession: async id => {
+            assert.equal(id, original.id);
+            if (scenario === 'chain changes before final dispatch' && ++reads === (kind === 'verification' ? 3 : 2)) {
+              aliases.link(successor.id, 'next');
+              agents.set('next', { ...agentAt('/work/original', stoppedLog(6000)), id: 'next' });
+            }
+            return ['unloaded predecessor', 'chain changes before final dispatch'].includes(scenario) ? { events: original.session.log } : undefined;
+          } } });
+        const source = { ...autoSource('CHAIN-SOURCE'), started_at: scenario === 'fresh task' ? 5 : 1,
+          finished_at: Date.now() / 1000 + 1, files_changed: [{ path: 'src/result.js' }],
+          ...(kind === 'Gemini fallback' ? { status: 'failed', execution_status: 'failed', fallback_safe: true, error_kind: 'upstream_rejected' } : {}) };
+        source.context = { ...source.context, owner: original.id };
+        h.finals[source.job_id] = source;
+        await queryStatus(h, source.job_id, successor);
+        const starts = h.calls.filter(([name]) => name === 'start');
+        assert.equal(starts.length, scenario === 'fresh task' ? 1 : 0, 'only work dispatched after all chain stops may spawn an automatic follow-up');
+        if (scenario === 'fresh task') {
+          const context = JSON.parse(h.requests.find(({ argv }) => argv[0] === 'start').stdin).context;
+          assert.equal(kind === 'verification' ? context.verification_of : context.fallback_of, source.job_id);
+        }
+      });
+    }
+  });
+}
+
+test('failed successor notification delivery persists the result through reload for the next human turn', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  for (const status of ['idle', 'running']) await t.test(status, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    createAliases(state).link('original', 'successor');
+    const original = { ...agentAt('/work/original'), id: 'original' };
+    const refuse = () => { throw new Error('host rejected notification'); };
+    const successor = { ...agentAt('/work/original'), id: 'successor', status, followup: refuse, inject: refuse };
+    const native = { id: 'bg-delivery-failure', owner: original.id, kind: 'codex', label: 'Codex DELIVERY-FAILURE', startedAt: 1000 };
+    const options = { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } };
+    const h = make({}, options);
+    const notice = { id: 'delivery-failure-notice', role: 'user', source: { kind: 'tool-jobs', form: 'notice' },
+      content: [{ type: 'text', text: 'background job bg-delivery-failure completed' }] };
+    const result = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, () => assert.fail('do not restart the retired owner'));
+    assert.equal(result.kind, 'reject');
+    const reloaded = make({}, options);
+    const human = { id: 'human-after-failure', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+    const entered = await reloaded.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+    assert.equal(entered.messages.length, 2, 'a rejected original step must leave a durable result in the successor');
+    assert.match(entered.messages[1].content[0].text, /background job bg-delivery-failure completed/);
+    successor.session.log.push(...entered.messages.map(data => ({ type: 'user/message', data })));
+    const next = await reloaded.handlers['agent/pre-step']({ agent: successor, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
+    assert.equal(next.messages.length, 1, 'the result is not delivered twice');
+  });
+});
+
+test('failed forwarding keeps the original notice when durable retention cannot be written', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  const { make, state } = acceptedFixtureHarness(t);
+  createAliases(state).link('original', 'successor');
+  const original = { ...agentAt('/work/original'), id: 'original' };
+  const successor = { ...agentAt('/work/original'), id: 'successor', status: 'idle', followup: () => { throw new Error('host rejected followup'); } };
+  const native = { id: 'bg-unwritable', owner: original.id, kind: 'codex', label: 'Codex UNWRITABLE', startedAt: 1000 };
+  const h = make({}, { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } });
+  mkdirSync(path.join(state, 'held-notices.json'));
+  const notice = { id: 'unwritable-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job bg-unwritable completed' }] };
+  const result = await h.handlers['agent/pre-step']({ agent: original, messages: [notice] }, async () => ({ kind: 'enter', messages: [notice] }));
+  assert.equal(result.kind, 'enter', 'do not consume the original when the successor cannot durably retain it');
+  assert.deepEqual(result.messages, [notice]);
+  assert.ok(h.warnings.some(message => /保存暂存通知失败/.test(message)));
 });

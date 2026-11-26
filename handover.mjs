@@ -568,9 +568,9 @@ export function summaryStepRejected(agentId, now = Date.now) {
   return Boolean(entry.expired || now() > entry.deadline || entry.steps > SUMMARY_MAX_STEPS);
 }
 
-async function deliver(controller, sessionId, text, waitMs) {
+async function deliver(controller, sessionId, text, waitMs, requestId) {
   try {
-    const call = controller.prompt({ requestId: `handover-${randomUUID()}`, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
+    const call = controller.prompt({ requestId, sessionId, mode: 'queue', content: [{ type: 'text', text }] },
       new AbortController().signal);
     call.catch(() => {});
     let timer;
@@ -827,7 +827,10 @@ export async function checkHandover({ goals, agentA, agentB, goal, steps, jobs, 
 // 链路末端的继任会话：A→B→C 时 A、B 都解析到 C。
 export function lastSuccessor(aliases, id) {
   let to = aliases.successor(id);
-  for (const seen = new Set([id]); to && !seen.has(to) && aliases.successor(to); seen.add(to)) to = aliases.successor(to);
+  for (const seen = new Set([id]); to && !seen.has(to) && aliases.successor(to);) {
+    seen.add(to);
+    to = aliases.successor(to);
+  }
   return to;
 }
 
@@ -841,7 +844,7 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
   const notices = messages.filter((m) => m?.source?.kind === 'tool-jobs' && m.source.form === 'notice' &&
     codex.has(/^background job (\S+)(?:\s|$)/.exec(textOf(m.content))?.[1]));
   if (!notices.length) return undefined;
-  let delivered = false;
+  const forwarded = new Set();
   try {
     const target = await resolve(successor);
     if (target) {
@@ -855,14 +858,28 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
         const text = `[codex-conductor] 原会话 ${agent.id} 交接前派出的任务已结束，通知转到本会话；用 codex_status / codex_output 查看并验收：\n\n` +
           group.map(notice => textOf(notice.content)).join('\n\n');
         const message = { id: randomUUID(), role: 'user', content: [{ type: 'text', text }], source: { kind: 'plugin:codex-conductor' } };
-        if (deferred && hold) hold(target, message);
-        else if (target.status === 'idle' && !deferred) target.followup(message);
-        else target.inject(message);
+        try {
+          if (deferred && hold) await hold(target, message);
+          else {
+            try {
+              if (target.status === 'idle' && !deferred) await target.followup(message);
+              else await target.inject(message);
+            } catch (error) {
+              if (!hold) throw error;
+              await hold(target, message);
+            }
+          }
+          for (const notice of group) forwarded.add(notice);
+        } catch {}
       }
-      delivered = true;
     }
   } catch {}
-  return { successor, delivered, forwarded: notices.length, reject: notices.length === messages.length };
+  const delivered = forwarded.size === notices.length;
+  // A partial failure leaves only unsent originals for the caller, so successful groups cannot be resent.
+  if (!delivered && forwarded.size) {
+    for (let i = messages.length - 1; i >= 0; i--) if (forwarded.has(messages[i])) messages.splice(i, 1);
+  }
+  return { successor, delivered, forwarded: forwarded.size, reject: delivered && notices.length === messages.length };
 }
 
 export async function handOver(ctx, deps, request) {
@@ -1065,7 +1082,18 @@ export async function handOver(ctx, deps, request) {
     result.briefPath = path.join(dir, `${at.replace(/[:.]/g, '-')}-${from}-to-${to}.md`);
     fs.writeFileSync(result.briefPath, brief);
   } catch (error) { result.steps.brief = `failed: ${error.message}`; delete result.briefPath; }
+  let deliveryRequestId;
   const rollbackStopped = async () => {
+    const log = agentB.session?.log ?? [];
+    const currentTurn = log.slice(log.findLastIndex(event => event.type === 'turn/start'));
+    const handoverTurn = deliveryRequestId && !currentTurn.some(event => event.type === 'turn/end') &&
+      currentTurn.some(event => event.type === 'user/message' && event.data?.source?.rpcId === deliveryRequestId);
+    if (agentB.status === 'running' && logCounts(log).turns === base.turns + 1 && handoverTurn) {
+      const successorGoal = goals?.get(agentB);
+      if (successorGoal?.phase === 'active') goals.pause(agentB, ref(successorGoal));
+      agentB.cancel({ kind: 'user' }, { keepInbox: true });
+      result.steps.successorTurn = 'cancel_requested';
+    }
     // A later human question must not restore the goal paused by this stopped handover.
     const back = await handOver(ctx, { ...deps, allowed: agent => agent.id !== from && allowed(agent) },
       { revert: { from, to }, rollback: true, force: true });
@@ -1074,7 +1102,8 @@ export async function handOver(ctx, deps, request) {
     return giveBack('user_stopped');
   };
   if (stopped()) return rollbackStopped();
-  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs));
+  deliveryRequestId = `handover-${randomUUID()}`;
+  Object.assign(result.steps, await deliver(controller, to, handoverMessage(from, result.briefPath, brief, followed, keptGoal, Boolean(result.transcripts)), deliverWaitMs, deliveryRequestId));
   if (stopped()) return rollbackStopped();
   if (stoppedSince(agentB, successorLogStart)) result.steps.successorGoal = 'user_stopped';
   else if (followed) result.steps.successorGoal = 'loopx';
