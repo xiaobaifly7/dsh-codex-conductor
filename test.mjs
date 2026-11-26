@@ -8900,7 +8900,7 @@ test('forwarding uses the latest task stop across the full handover chain, inclu
   const h = make({}, { agents: new Map([[original.id, original], [target.id, target]]), jobs: { list: () => jobs },
     sessionQuery: { readSession: async id => { reads.push(id); assert.equal(id, 'middle'); return { events: stoppedLog(4000) }; } } });
   const notices = jobs.map(job => ({ id: `notice-${job.id}`, source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: `background job ${job.id} completed` }] }));
-  await h.handlers['agent/pre-step']({ agent: original, messages: notices }, () => assert.fail('retired owner must not enter'));
+  await h.handlers['agent/pre-step']({ agent: original, messages: [...notices] }, () => assert.fail('retired owner must not enter'));
   assert.equal(received.length, 1);
   assert.match(received[0].content[0].text, /bg-5000 completed/);
   assert.doesNotMatch(received[0].content[0].text, /bg-(1000|3000) completed/);
@@ -9283,5 +9283,52 @@ test('late handover revocation cannot start a step from appended context or rele
     const human = { id: 'actual-human', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
     const delivered = await h.handlers['agent/pre-step']({ agent, messages: [human] }, async () => ({ kind: 'enter', messages: [human] }));
     assert.deepEqual(delivered.messages.map(message => message.id), [human.id, pending.id], 'keep the durable result for actual human input');
+  });
+});
+
+test('unrelated human sessions survive invalid revocation storage with one warning', async (t) => {
+  for (const mode of ['malformed JSON', 'invalid schema', 'read failure']) await t.test(mode, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    const h = make({});
+    const file = path.join(state, 'revoked-handovers.json');
+    if (mode === 'read failure') mkdirSync(file);
+    else writeFileSync(file, mode === 'malformed JSON' ? '{"sessions":' : '{"sessions":{"other":null}}');
+    const warnings = h.warnings.length;
+    for (const id of ['unrelated-A', 'unrelated-B']) {
+      const agent = { ...agentAt('/work/original'), id };
+      const messages = [{ id: `human-${id}`, source: { kind: 'user', rpcId: `human-${id}` }, content: [{ type: 'text', text: '回答我的问题' }] }];
+      for (let i = 0; i < 2; i++) {
+        const decision = await h.handlers['agent/pre-step']({ agent, messages }, async () => ({ kind: 'enter', messages }));
+        assert.equal(decision.kind, 'enter');
+        assert.deepEqual(decision.messages, messages);
+      }
+    }
+    assert.equal(h.warnings.length - warnings, 1, 'a persistent read failure must not warn at every model step');
+  });
+});
+
+test('forwarded or held task notices never reach the original mixed human step twice', async (t) => {
+  const { createAliases } = await import('./handover.mjs');
+  for (const status of ['idle', 'running']) for (const held of [false, true]) await t.test(`${status} ${held ? 'retained' : 'forwarded'}`, async (t) => {
+    const { make, state } = acceptedFixtureHarness(t);
+    createAliases(state).link('original', 'successor');
+    const original = { ...agentAt('/work/original'), id: 'original' };
+    const received = [];
+    const deliver = message => { if (held) throw new Error('host rejected delivery'); received.push(message); };
+    const successor = { ...agentAt('/work/original'), id: 'successor', status, followup: deliver, inject: deliver };
+    const native = { id: 'bg-mixed', owner: original.id, kind: 'codex', label: 'Codex MIXED', startedAt: 1000 };
+    const h = make({}, { agents: new Map([[original.id, original], [successor.id, successor]]), jobs: { list: () => [native] } });
+    const human = { id: 'original-question', source: { kind: 'user' }, content: [{ type: 'text', text: '状态如何' }] };
+    const notice = { id: 'mixed-notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job bg-mixed completed' }] };
+    const messages = [human, notice];
+    const originalStep = await h.handlers['agent/pre-step']({ agent: original, messages }, async () => ({ kind: 'enter', messages }));
+    assert.equal(originalStep.kind, 'enter');
+    assert.ok(originalStep.messages.some(message => message.id === human.id));
+    assert.ok(!originalStep.messages.some(message => message.content?.some(item => /background job bg-mixed completed/.test(item.text ?? ''))));
+    const question = { id: 'successor-question', source: { kind: 'user' }, content: [{ type: 'text', text: '结果呢' }] };
+    const successorStep = await h.handlers['agent/pre-step']({ agent: successor, messages: [question] }, async () => ({ kind: 'enter', messages: [question] }));
+    const deliveries = [...originalStep.messages, ...received, ...successorStep.messages]
+      .filter(message => message.content?.some(item => /background job bg-mixed completed/.test(item.text ?? '')));
+    assert.equal(deliveries.length, 1, 'transfer the result exactly once while preserving both human questions');
   });
 });

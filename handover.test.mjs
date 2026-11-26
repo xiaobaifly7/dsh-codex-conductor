@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import fs from 'node:fs';
 import { createAliases, instructionArchivePath } from './handover.mjs';
 
 const dir = (t) => {
@@ -187,7 +188,7 @@ function host(t, hooks = {}, root = dir(t)) {
     resume: (x) => goalsByAgent.set(x, { ...goalsByAgent.get(x), phase: 'active' }),
     create: (x, request) => { hooks.goalCreate?.(x, request); goalsByAgent.set(x, { id: 'G', revision: 1, phase: 'active', ...request, ...hooks.goalPatch }); },
   };
-  const ctx = { get: (name) => ({ goals, sessionQuery: hooks.readSession && { readSession: hooks.readSession }, sessionController: {
+  const ctx = { logger: hooks.logger, get: (name) => ({ goals, sessionQuery: hooks.readSession && { readSession: hooks.readSession }, sessionController: {
     resolveAgent: async (id) => (agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found', message: 'no' } }),
     create: async () => { const id = `session-N${++next}`; agent(id); return { sessionId: id }; },
     prompt: async (request, signal) => { prompts.push(request); await hooks.prompt?.(request, agents.get(request.sessionId), signal); },
@@ -338,6 +339,142 @@ test('each held notice is marked forwarded before another notice fails to persis
   assert.deepEqual(messages.map(message => message.id), ['B']);
   assert.equal(result.forwarded, 2);
   assert.equal(result.reject, false);
+});
+
+test('revocation read failures warn once and preserve cached revocations across module reloads', async (t) => {
+  for (const mode of ['malformed JSON', 'invalid schema', 'read failure']) await t.test(mode, async (t) => {
+    const root = dir(t), file = path.join(root, 'revoked-handovers.json');
+    const module = await import('./handover.mjs');
+    const warn = t.mock.fn(), logger = { warn };
+    const revoked = { source: { kind: 'user', rpcId: 'handover-cached' } };
+    const human = { source: { kind: 'user', rpcId: 'human' } };
+    writeFileSync(file, JSON.stringify({ sessions: { owner: ['handover-cached'] } }));
+    assert.deepEqual(module.filterRevokedHandovers(root, 'owner', [revoked, human], logger), [human]);
+    if (mode === 'read failure') { rmSync(file); mkdirSync(file); }
+    else writeFileSync(file, mode === 'malformed JSON' ? '{' : '{"sessions":{"other":null}}');
+    for (const id of ['unrelated-A', 'unrelated-B']) {
+      assert.deepEqual(module.filterRevokedHandovers(root, id, [human], logger), [human]);
+    }
+    const reloaded = await import('./handover.mjs?read-failure-reloaded');
+    assert.deepEqual(reloaded.filterRevokedHandovers(root, 'owner', [revoked, human], logger), [human]);
+    assert.equal(warn.mock.callCount(), 1);
+  });
+});
+
+test('revocation write failure preserves stop cleanup and shared in-memory filtering', async (t) => {
+  const warn = t.mock.fn(), logger = { warn };
+  let signal;
+  const cancel = t.mock.fn(target => assert.equal(h.goalsByAgent.get(target).phase, 'paused'));
+  const h = host(t, { logger, cancel, prompt: async (request, target, deliverySignal) => {
+    signal = deliverySignal;
+    target.status = 'running';
+    target.session.log.push({ type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { source: { kind: 'user', rpcId: request.requestId } } });
+    h.goalsByAgent.set(target, { id: 'G2', revision: 1, phase: 'active', objective: 'work' });
+    source.session.log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  } });
+  const source = h.agent('session-original');
+  writeFileSync(h.aliases.file, '{"links":{}}');
+  h.goalsByAgent.set(source, { id: 'G1', revision: 1, phase: 'active', objective: 'work' });
+  const target = h.agent('session-target');
+  const oldIds = Array.from({ length: 50 }, (_, index) => `handover-old-${index}`);
+  const registryFile = path.join(h.root, 'revoked-handovers.json');
+  writeFileSync(registryFile, JSON.stringify({ sessions: { [target.id]: oldIds } }));
+  const write = fs.writeFileSync;
+  t.mock.method(fs, 'writeFileSync', (file, ...args) => {
+    if (String(file).includes('revoked-handovers.json.')) throw Object.assign(new Error('disk write denied'), { code: 'EACCES' });
+    return write(file, ...args);
+  });
+  const result = await h.request({ adopt: { from: source.id, to: target.id }, origin: 'auto' });
+  assert.equal(signal.aborted, true);
+  assert.equal(cancel.mock.callCount(), 1);
+  assert.equal(result.rollback.status, 'reverted');
+  assert.equal(result.reason, 'user_stopped');
+  assert.match(result.steps.revocation, /^failed:/);
+  assert.equal(h.aliases.successor(source.id), undefined);
+  assert.equal(h.goalsByAgent.get(source).phase, 'paused');
+  const reloaded = await import('./handover.mjs?write-failure-reloaded');
+  const message = { source: { kind: 'user', rpcId: h.prompts[0].requestId } };
+  const evicted = { source: { kind: 'user', rpcId: oldIds[0] } };
+  assert.deepEqual(reloaded.filterRevokedHandovers(h.root, result.to, [message, evicted], logger), [evicted]);
+  assert.deepEqual(entriesAt(registryFile).sessions[target.id], oldIds, 'a still-valid old disk snapshot must not evict the failed latest revocation from memory');
+  assert.equal(warn.mock.callCount(), 1);
+});
+
+test('revocations retain only the latest fifty IDs per agent without clearing on unlink', async (t) => {
+  const h = host(t), source = h.agent('session-original');
+  const target = h.agent('session-target');
+  const ids = Array.from({ length: 50 }, (_, index) => `handover-${index}`);
+  writeFileSync(path.join(h.root, 'revoked-handovers.json'), JSON.stringify({ sessions: { [target.id]: ids, other: ['handover-other'] } }));
+  const result = await h.request({ adopt: { from: source.id, to: target.id } });
+  await h.request({ revert: { from: source.id, to: result.to } });
+  const stored = entriesAt(path.join(h.root, 'revoked-handovers.json')).sessions;
+  assert.equal(stored[target.id].length, 50);
+  assert.deepEqual(stored[target.id], [...ids.slice(1), h.prompts[0].requestId]);
+  assert.deepEqual(stored.other, ['handover-other']);
+});
+
+test('rollback cancels its matching handover after a completed human turn during archives', async (t) => {
+  const cancel = t.mock.fn();
+  const h = host(t, { cancel, readSession: async () => {
+    if (!target.session.log.some(event => event.type === 'turn/start')) target.session.log.push(
+      { type: 'turn/start', data: { turn: 1 } }, userEvent('先回答我的问题', 1),
+      { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } });
+    return { events: [] };
+  }, prompt: async (request, target) => {
+    target.status = 'running';
+    target.session.log.push({ type: 'turn/start', data: { turn: 2 } },
+      { type: 'user/message', data: { source: { kind: 'user', rpcId: request.requestId } } });
+    source.session.log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  } });
+  const source = h.agent('session-original'), target = h.agent('session-target');
+  h.agent('session-older'); h.aliases.link('session-older', source.id);
+  const result = await h.request({ adopt: { from: source.id, to: target.id }, origin: 'auto' });
+  assert.equal(cancel.mock.callCount(), 1);
+  assert.equal(result.rollback.status, 'reverted');
+  assert.equal(target.status, 'idle');
+});
+
+test('rollback keeps genuine human input following its current handover brief', async (t) => {
+  for (const human of [userEvent('人工追问', 2), userEvent('带 RPC 的人工追问', 2)]) await t.test(human.data.content[0].text, async (t) => {
+    if (human.data.content[0].text.startsWith('带')) human.data.source.rpcId = 'human-steer';
+    const cancel = t.mock.fn();
+    const h = host(t, { cancel, prompt: async (request, target) => {
+      target.status = 'running';
+      target.session.log.push({ type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: { source: { kind: 'user', rpcId: request.requestId } } }, human);
+      h.goalsByAgent.set(target, { id: 'G2', revision: 1, phase: 'active', objective: 'work' });
+      source.session.log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+    } });
+    const source = h.agent('session-original');
+    writeFileSync(h.aliases.file, '{"links":{}}');
+    const result = await h.request({ sessionId: source.id, origin: 'auto' });
+    assert.equal(cancel.mock.callCount(), 0);
+    assert.equal(result.steps.successorTurn, 'kept_human_input');
+    assert.equal(h.goalsByAgent.get(h.agents.get(result.to)).phase, 'paused');
+    assert.equal(result.rollback.status, 'reverted');
+  });
+});
+
+test('forwarding removes every delivered notice from a mixed original human batch', async (t) => {
+  const { forwardRetiredNotices } = await import('./handover.mjs');
+  for (const retained of [false, true]) await t.test(retained ? 'held' : 'live forwarded', async () => {
+    const human = { id: 'human', source: { kind: 'user' } };
+    const notice = { id: 'notice', source: { kind: 'tool-jobs', form: 'notice' }, content: [{ type: 'text', text: 'background job J completed' }] };
+    const messages = [human, notice], received = [];
+    const target = { id: 'successor', status: 'idle', followup: message => {
+      if (retained) throw new Error('rejected');
+      received.push(message);
+    } };
+    const result = await forwardRetiredNotices({ agent: { id: 'original' }, messages,
+      aliases: { successor: id => id === 'original' ? target.id : undefined },
+      jobs: { list: () => [{ id: 'J', kind: 'codex', label: 'Codex J' }] }, resolve: async () => target,
+      hold: (_target, message) => received.push(message) });
+    assert.deepEqual(messages, [human]);
+    assert.equal(result.reject, false);
+    assert.equal(result.forwarded, 1);
+    assert.equal(received.length, 1);
+  });
 });
 
 test('a goal the user paused is not revived in the successor; the goal the automatic hand-over paused itself is rebuilt', async (t) => {

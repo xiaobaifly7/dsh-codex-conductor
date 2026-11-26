@@ -17,30 +17,63 @@ export function writeTextAtomic(file, text) {
 
 export const writeJsonAtomic = (file, value) => writeTextAtomic(file, JSON.stringify(value, null, 2) + '\n');
 
-function readRevokedHandovers(directory) {
+const revokedHandoverStates = globalThis[Symbol.for('dsh-codex-conductor.revoked-handovers')] ??= new Map();
+const recentRevocations = ids => [...new Set(ids)].slice(-50);
+
+function warnRevocations(state, logger, operation, error) {
+  const failure = `${operation}:${error.code ?? error.name}`;
+  if (state.warnings.has(failure)) return;
+  state.warnings.add(failure);
+  (logger ?? console).warn?.(`[codex-conductor] ${operation}撤销交接记录失败，保留进程内记录：${error.message}`);
+}
+
+function readRevokedHandovers(directory, logger) {
+  const key = path.resolve(directory);
+  let state = revokedHandoverStates.get(key);
+  if (!state) {
+    state = { sessions: {}, pending: {}, warnings: new Set() };
+    revokedHandoverStates.set(key, state);
+  }
   try {
     const { sessions } = JSON.parse(fs.readFileSync(path.join(directory, 'revoked-handovers.json'), 'utf8'));
     if (!sessions || typeof sessions !== 'object' || Array.isArray(sessions) ||
         !Object.values(sessions).every(ids => Array.isArray(ids) && ids.every(id => typeof id === 'string'))) {
       throw new Error('invalid revoked handover records');
     }
-    return sessions;
-  } catch (error) { if (error.code === 'ENOENT') return {}; throw error; }
+    state.sessions = Object.fromEntries(Object.entries(sessions).map(([id, ids]) => [id, recentRevocations(ids)]));
+    for (const [id, ids] of Object.entries(state.pending)) {
+      state.sessions[id] = recentRevocations([...(state.sessions[id] ?? []), ...ids]);
+    }
+    state.readFailure = undefined;
+  } catch (error) {
+    state.readFailure = error.code === 'ENOENT' ? undefined : error;
+    if (state.readFailure) warnRevocations(state, logger, '读取', error);
+  }
+  return state;
 }
 
-function revokeHandover(directory, agentId, requestId) {
-  const sessions = readRevokedHandovers(directory);
-  const ids = sessions[agentId] ?? [];
-  if (ids.includes(requestId)) return;
-  fs.mkdirSync(directory, { recursive: true });
-  writeJsonAtomic(path.join(directory, 'revoked-handovers.json'), {
-    sessions: { ...sessions, [agentId]: [...ids, requestId] },
-  });
+function revokeHandover(directory, agentId, requestId, logger) {
+  const state = readRevokedHandovers(directory, logger);
+  const ids = state.sessions[agentId] ?? [];
+  if (ids.includes(requestId)) return state.pending[agentId]?.includes(requestId) ? state.writeFailure : undefined;
+  state.sessions[agentId] = recentRevocations([...ids, requestId]);
+  state.pending[agentId] = recentRevocations([...(state.pending[agentId] ?? []), requestId]);
+  try {
+    if (state.readFailure) throw state.readFailure;
+    fs.mkdirSync(directory, { recursive: true });
+    writeJsonAtomic(path.join(directory, 'revoked-handovers.json'), { sessions: state.sessions });
+    state.pending = {};
+    state.writeFailure = undefined;
+  } catch (error) {
+    state.writeFailure = `failed: ${error.message}`;
+    if (!state.readFailure) warnRevocations(state, logger, '写入', error);
+  }
+  return state.writeFailure;
 }
 
-export function filterRevokedHandovers(directory, agentId, messages) {
+export function filterRevokedHandovers(directory, agentId, messages, logger) {
   if (!directory) return messages;
-  const revoked = readRevokedHandovers(directory)[agentId];
+  const revoked = readRevokedHandovers(directory, logger).sessions[agentId];
   return revoked?.length ? messages.filter(message => !revoked.includes(message.source?.rpcId)) : messages;
 }
 
@@ -907,11 +940,11 @@ export async function forwardRetiredNotices({ agent, messages, aliases, jobs, re
     }
   } catch {}
   const delivered = forwarded.size === notices.length;
-  // A partial failure leaves only unsent originals for the caller, so successful groups cannot be resent.
-  if (!delivered && forwarded.size) {
+  // Only inputs not delivered to the successor may enter the original session.
+  if (forwarded.size) {
     for (let i = messages.length - 1; i >= 0; i--) if (forwarded.has(messages[i])) messages.splice(i, 1);
   }
-  return { successor, delivered, forwarded: forwarded.size, reject: delivered && notices.length === messages.length };
+  return { successor, delivered, forwarded: forwarded.size, reject: delivered && messages.length === 0 };
 }
 
 export async function handOver(ctx, deps, request) {
@@ -947,7 +980,10 @@ export async function handOver(ctx, deps, request) {
       }
       result.warning = 'parallel_sessions';
     }
-    if (link.deliveryRequestId) revokeHandover(directory, to, link.deliveryRequestId);
+    if (link.deliveryRequestId) {
+      const failure = revokeHandover(directory, to, link.deliveryRequestId, ctx.logger);
+      if (failure) result.steps.revocation = failure;
+    }
     aliases.unlink(from, to);
     result.status = 'reverted';
     result.steps.alias = 'removed';
@@ -1119,18 +1155,26 @@ export async function handOver(ctx, deps, request) {
   const deliveryController = new AbortController();
   const rollbackStopped = async () => {
     if (deliveryRequestId) {
-      revokeHandover(directory, to, deliveryRequestId);
+      const failure = revokeHandover(directory, to, deliveryRequestId, ctx.logger);
+      if (failure) result.steps.revocation = failure;
       deliveryController.abort();
     }
     const log = agentB.session?.log ?? [];
     const currentTurn = log.slice(log.findLastIndex(event => event.type === 'turn/start'));
-    const handoverTurn = deliveryRequestId && !currentTurn.some(event => event.type === 'turn/end') &&
-      currentTurn.some(event => event.type === 'user/message' && event.data?.source?.rpcId === deliveryRequestId);
-    if (agentB.status === 'running' && logCounts(log).turns === base.turns + 1 && handoverTurn) {
+    const briefIndex = deliveryRequestId ? currentTurn.findIndex(event => event.type === 'user/message' &&
+      event.data?.source?.rpcId === deliveryRequestId) : -1;
+    const handoverTurn = briefIndex >= 0 && !currentTurn.some(event => event.type === 'turn/end');
+    if (agentB.status === 'running' && handoverTurn) {
       const successorGoal = goals?.get(agentB);
       if (successorGoal?.phase === 'active') goals.pause(agentB, ref(successorGoal));
-      agentB.cancel({ kind: 'user' }, { keepInbox: true });
-      result.steps.successorTurn = 'cancel_requested';
+      const humanInput = currentTurn.slice(briefIndex + 1).some(event => event.type === 'user/message' &&
+        event.data?.source?.kind === 'user' && !event.data.source.via &&
+        !String(event.data.source.rpcId ?? '').startsWith('handover-'));
+      if (humanInput) result.steps.successorTurn = 'kept_human_input';
+      else {
+        agentB.cancel({ kind: 'user' }, { keepInbox: true });
+        result.steps.successorTurn = 'cancel_requested';
+      }
     }
     // A later human question must not restore the goal paused by this stopped handover.
     const back = await handOver(ctx, { ...deps, allowed: agent => agent.id !== from && allowed(agent) },

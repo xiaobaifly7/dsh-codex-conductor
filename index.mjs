@@ -1419,15 +1419,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.on('agent/pre-step', async (step, next) => {
     const incoming = step.messages ?? [];
     const original = [...incoming];
-    const messages = filterRevokedHandovers(stateDirectory, step.agent?.id, incoming);
+    const messages = filterRevokedHandovers(stateDirectory, step.agent?.id, incoming, ctx.logger);
     if (messages.length !== incoming.length) {
       incoming.splice(0, incoming.length, ...messages);
       if (!messages.length) return { kind: 'reject' };
     }
     const decision = await next();
     if (decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
-    if (original.length && !filterRevokedHandovers(stateDirectory, step.agent?.id, original).length) return { kind: 'reject' };
-    const admitted = filterRevokedHandovers(stateDirectory, step.agent?.id, decision.messages);
+    if (original.length && !filterRevokedHandovers(stateDirectory, step.agent?.id, original, ctx.logger).length) return { kind: 'reject' };
+    const admitted = filterRevokedHandovers(stateDirectory, step.agent?.id, decision.messages, ctx.logger);
     if (admitted.length === decision.messages.length) return decision;
     return admitted.length ? { ...decision, messages: admitted } : { kind: 'reject' };
   });
