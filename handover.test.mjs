@@ -456,6 +456,24 @@ test('rollback keeps genuine human input in the same turn as its current handove
   });
 });
 
+test('rollback still cancels a hand-over turn whose only other user-kind input is a restart notice', async (t) => {
+  // dsh-auto-continue without usePluginSource sends this with a bare { kind: 'user' } source (session-4f205cf7, 11-26).
+  const restart = userEvent('继续。宿主在你上一轮运行期间重启了，请接着做。', 2);
+  const cancel = t.mock.fn();
+  const h = host(t, { cancel, prompt: async (request, target) => {
+    target.status = 'running';
+    target.session.log.push({ type: 'turn/start', data: { turn: 1 } }, restart,
+      { type: 'user/message', data: { source: { kind: 'user', rpcId: request.requestId } } });
+    source.session.log.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  } });
+  const source = h.agent('session-original');
+  writeFileSync(h.aliases.file, '{"links":{}}');
+  const result = await h.request({ sessionId: source.id, origin: 'auto' });
+  assert.equal(cancel.mock.callCount(), 1);
+  assert.equal(result.steps.successorTurn, 'cancel_requested');
+  assert.equal(result.rollback.status, 'reverted');
+});
+
 test('forwarding removes every delivered notice from a mixed original human batch', async (t) => {
   const { forwardRetiredNotices } = await import('./handover.mjs');
   for (const retained of [false, true]) await t.test(retained ? 'held' : 'live forwarded', async () => {

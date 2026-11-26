@@ -1167,10 +1167,8 @@ export async function handOver(ctx, deps, request) {
     if (agentB.status === 'running' && handoverTurn) {
       const successorGoal = goals?.get(agentB);
       if (successorGoal?.phase === 'active') goals.pause(agentB, ref(successorGoal));
-      // The host may admit a steered human message before or after the brief in the same turn.
-      const humanInput = currentTurn.some(event => event.type === 'user/message' &&
-        event.data?.source?.kind === 'user' && !event.data.source.via &&
-        !String(event.data.source.rpcId ?? '').startsWith('handover-'));
+      // The host may admit a steered human message before or after the brief; restart notices are not human input.
+      const humanInput = currentTurn.some(humanInstruction);
       if (humanInput) result.steps.successorTurn = 'kept_human_input';
       else {
         agentB.cancel({ kind: 'user' }, { keepInbox: true });
