@@ -1389,7 +1389,7 @@ test('the old session writes a hand-over summary in a tool-less turn after its g
   };
   const result = await h.request({ sessionId: 'session-A' }, { summaryMinutes: 1, summaryOptions: { pollMs: 5 } });
   assert.deepEqual([result.status, result.steps.summary, summarizing.has('session-A')], ['handed_over', 'written', false]);
-  assert.deepEqual(sent[0].source, { kind: 'user', via: 'codex-conductor' });
+  assert.deepEqual(sent[0].source, { kind: 'user', via: 'codex-conductor-handover-summary' });
   assert.match(sent[0].content[0].text, /^\[codex-conductor 交接摘要\] 本会话即将交接给一个新会话/);
   const brief = readFileSync(result.briefPath, 'utf8');
   assert.deepEqual(brief.match(/^## .*/gm).slice(0, 3), ['## 下一步', '## 旧会话写的交接摘要', '## 目标']);
@@ -1539,11 +1539,13 @@ test('after the user stops a session, job notices alone do not wake it; they rea
     else process.env.LOCALAPPDATA = previous;
   }
   // 按注册顺序串起全部 pre-step 处理器，末端照宿主默认放行。
-  const preStep = (agent, messages) => {
+  const preStep = async (agent, messages) => {
     const run = (i) => (i < handlers['agent/pre-step'].length
       ? handlers['agent/pre-step'][i]({ agent, step: 1, messages }, () => run(i + 1))
       : Promise.resolve({ kind: 'enter', messages }));
-    return run(0);
+    const decision = await run(0);
+    if (decision.kind === 'enter') agent.session.log.push(...decision.messages.map(message => ({ type: 'user/message', data: message })));
+    return decision;
   };
   const notice = { id: 'n1', role: 'user', content: [{ type: 'text', text: '后台任务 J1 已完成' }], source: { kind: 'tool-jobs', form: 'notice' } };
   const stopped = { id: 'session-S', status: 'running', session: { header: { cwd: '/w' },
@@ -1632,4 +1634,140 @@ test('the transcript section survives when the brief is cut to its limit', async
     transcripts: [{ sessionId: 'A', file: '/state/handovers/transcript-A.md', user: 3, assistant: 4, first: 't1', last: 't2' }] });
   assert.match(brief, /省略了：/);
   assert.ok(brief.includes('- A（t1 至 t2，用户消息 3 条，助手回复 4 条）：/state/handovers/transcript-A.md'));
+});
+
+
+test('the automatic stop boundary survives human questions and automatic prompts, and only explicit continuation resets it', async (t) => {
+  const { createHistoryTracker } = await import('./handover.mjs');
+  const tracker = createHistoryTracker({ directory: dir(t), threshold: () => 0 });
+  const log = [];
+  const agent = { id: 'session-stop-boundary', session: { log } };
+  const stop = () => log.push({ type: 'turn/end', time: 2000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  stop();
+  log.push(userEvent('现在是什么情况', 3000));
+  assert.equal(tracker.observe(agent).userStopped, undefined);
+  assert.equal(tracker.observe(agent).lastUserStopAt, 2000);
+  for (const via of ['codex-conductor-auto-resume', 'codex-conductor-handover-summary']) {
+    const message = userEvent('自动提示', 4000);
+    message.data.source.via = via;
+    log.push(message);
+    assert.equal(tracker.allowsAutomatic(agent, 1000), false);
+  }
+  for (const time of [undefined, NaN, 1000, 2000]) assert.equal(tracker.allowsAutomatic(agent, time), false);
+  assert.equal(tracker.allowsAutomatic(agent, 2001), true);
+  for (const operation of ['resume', 'create']) {
+    log.push({ type: 'goal/change', data: { operation } });
+    assert.equal(tracker.allowsAutomatic(agent), true);
+    stop();
+  }
+  const operator = userEvent('操作员要求继续', 5000);
+  operator.data.source.via = 'codex-conductor';
+  log.push(operator);
+  assert.equal(tracker.allowsAutomatic(agent), true);
+});
+
+
+test('forwarded notices on both sides of a successor stop are delivered separately', async () => {
+  const { forwardRetiredNotices } = await import('./handover.mjs');
+  const notices = ['old', 'new'].map(id => ({ id, source: { kind: 'tool-jobs', form: 'notice' },
+    content: [{ type: 'text', text: `background job ${id} completed` }] }));
+  const jobs = { list: () => [{ id: 'old', kind: 'codex', label: 'Codex OLD', startedAt: 1000 },
+    { id: 'new', kind: 'codex', label: 'Codex NEW', startedAt: 3000 }] };
+  const sent = [], held = [];
+  const target = { id: 'session-new', status: 'idle', followup: message => sent.push(message) };
+  await forwardRetiredNotices({ agent: { id: 'session-old' }, messages: notices, jobs,
+    aliases: { successor: id => id === 'session-old' ? target.id : undefined }, resolve: async () => target,
+    allowed: async (_agent, job) => job.startedAt > 2000, hold: (_agent, message) => held.push(message) });
+  assert.equal(sent.length, 1);
+  assert.match(sent[0].content[0].text, /background job new completed/);
+  assert.doesNotMatch(sent[0].content[0].text, /background job old completed/);
+  assert.equal(held.length, 1);
+  assert.match(held[0].content[0].text, /background job old completed/);
+});
+
+test('a stop during automatic handover archives rolls back recorded changes without resuming the goal', async (t) => {
+  let allowed = true;
+  const h = host(t, { readSession: async () => { allowed = false; return { events: [] }; } });
+  h.agent('session-older');
+  const agent = h.agent('session-A');
+  agent.session.log.push({ type: 'session/title', data: { title: '原来的标题' } });
+  h.aliases.link('session-older', agent.id);
+  h.goalsByAgent.set(agent, { id: 'G1', revision: 1, phase: 'active', objective: '做任务', roundsStarted: 1, maxGoalRounds: 10 });
+  let mode = 'on';
+  const result = await h.request({ sessionId: agent.id, origin: 'auto' }, { allowed: () => allowed,
+    autoContinue: async () => ({ previous: mode, setMode: async value => { mode = value; } }) });
+  assert.equal(result.reason, 'user_stopped');
+  assert.equal(result.status, 'refused');
+  assert.equal(result.rollback.status, 'reverted');
+  assert.equal(h.prompts.length, 0);
+  assert.equal(h.aliases.successor(agent.id), undefined);
+  assert.equal(h.goalsByAgent.get(agent).phase, 'paused');
+  assert.equal(agent.session.log.filter(event => event.type === 'session/title').at(-1).data.title, '原来的标题');
+  assert.equal(mode, 'on');
+});
+
+test('stopping the predecessor during delivery must roll back the automatic handover', async (t) => {
+  const { createAutoHandover, createHistoryTracker } = await import('./handover.mjs');
+  for (const afterHuman of [false, true]) await t.test(afterHuman ? 'stop followed by a human question' : 'stop', async (t) => {
+    const history = createHistoryTracker({ threshold: () => 0 });
+    t.after(() => history.flush());
+    const h = host(t, { prompt: async (_request, target) => {
+      source.session.log.push({ type: 'turn/end', time: 4000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+      if (afterHuman) source.session.log.push(userEvent('目前如何？', 5000));
+      target.session.log.push({ type: 'turn/start', time: 3000 });
+      target.status = 'running';
+    } });
+    const source = h.agent('session-original');
+    source.session.log.push({ type: 'turn/end', time: 1000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } },
+      userEvent('交接这项工作', 2000));
+    writeFileSync(h.aliases.file, '{"links":{}}');
+    h.goalsByAgent.set(source, { id: 'G1', revision: 1, phase: 'active', objective: 'continue work' });
+    const requestedAt = '2026-11-27T00:00:00.000Z';
+    const stateFile = path.join(h.root, 'auto-handover.json');
+    writeFileSync(stateFile, JSON.stringify({ sessions: { [source.id]: { autoAt: [requestedAt],
+      pending: { requestedAt, goal: { id: 'G1', revision: 1 } } } } }));
+    const allowed = agent => !history.observe(agent)?.userStopped;
+    const result = await h.request({ sessionId: source.id, origin: 'auto', requestedAt }, { allowed });
+    assert.equal(h.aliases.successor(source.id), undefined, 'a stop during delivery must detach the successor');
+    assert.equal(result.reason, 'user_stopped');
+    assert.equal(result.status, 'refused');
+    assert.equal(result.rollback.status, 'reverted');
+    assert.equal(h.goalsByAgent.get(source).phase, 'paused', 'a later question must not restore the old goal');
+    assert.equal(h.goalsByAgent.get(h.agents.get(result.to)), undefined);
+    assert.equal(history.observe(source).userStopped, afterHuman ? undefined : true);
+    const resume = t.mock.fn(agent => h.goalsByAgent.set(agent, { ...h.goalsByAgent.get(agent), phase: 'active' }));
+    const auto = createAutoHandover({ directory: h.root, allowed, agentOf: id => h.agents.get(id),
+      goals: () => ({ get: agent => h.goalsByAgent.get(agent), resume }) });
+    auto.settled(result);
+    assert.equal(resume.mock.callCount(), 0, 'settling the stopped handover must not restore its pending goal');
+    assert.equal(h.goalsByAgent.get(source).phase, 'paused');
+    assert.equal(entriesAt(stateFile).sessions[source.id].pending, undefined);
+  });
+});
+
+test('stopping the successor while its handover prompt is running must not create an active goal', async (t) => {
+  const { createHistoryTracker } = await import('./handover.mjs');
+  for (const afterHuman of [false, true]) await t.test(afterHuman ? 'stop followed by a human question' : 'stop', async (t) => {
+    const history = createHistoryTracker({ threshold: () => 0 });
+    t.after(() => history.flush());
+    const h = host(t, { prompt: async (_request, target) => {
+      target.session.log.push({ type: 'turn/start', time: 3000 },
+        { type: 'turn/end', time: 4000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+      if (afterHuman) target.session.log.push(userEvent('目前如何？', 5000));
+      target.status = 'idle';
+    } });
+    const source = h.agent('session-original');
+    writeFileSync(h.aliases.file, '{"links":{}}');
+    h.goalsByAgent.set(source, { id: 'G1', revision: 1, phase: 'active', objective: 'continue work' });
+    const result = await h.request({ sessionId: source.id, origin: 'auto' }, { allowed: agent => !history.observe(agent)?.userStopped });
+    const target = h.agents.get(result.to);
+    assert.equal(h.goalsByAgent.get(target), undefined, 'the stopped successor must not get a new active goal');
+    assert.equal(h.goalsByAgent.get(source).phase, 'paused');
+    assert.equal(h.aliases.successor(source.id), target.id);
+    assert.equal(result.status, 'handed_over');
+    assert.equal(result.steps.successorGoal, 'user_stopped');
+    assert.equal(result.checks.goal, 'skipped:user_stopped');
+    assert.match(readFileSync(result.briefPath, 'utf8'), /continue work/);
+    assert.equal(history.observe(target).userStopped, afterHuman ? undefined : true);
+  });
 });

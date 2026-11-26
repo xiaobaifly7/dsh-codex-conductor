@@ -1406,7 +1406,7 @@ test('auto resume watcher: an instance loaded while the old scan is still unwind
   assert.equal(f.calls.filter(([op]) => op === 'list').length, 2);
 });
 
-function autoWakeFixture(t, enabled = true, retired) {
+function autoWakeFixture(t, enabled = true, retired, allowed) {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const bus = new EventEmitter();
   const cleanups = [], wakes = [], warnings = [], infos = [], messages = [];
@@ -1444,7 +1444,7 @@ function autoWakeFixture(t, enabled = true, retired) {
   };
   const dispose = () => { for (const cleanup of cleanups.splice(0)) cleanup(); };
   t.after(dispose);
-  registerAutoWake({ ctx, enabled, ...(retired ? { retired } : {}) });
+  registerAutoWake({ ctx, enabled, ...(retired ? { retired } : {}), ...(allowed ? { allowed } : {}) });
   return { agent, inbox, agents, services, bus, session, wakes, warnings, infos, messages, notice, event, idle, endTurn, dispose,
     tick: ms => t.mock.timers.tick(ms) };
 }
@@ -1890,4 +1890,32 @@ test('auto resume: a goal the user stopped is not rearmed; a cut-off turn after 
   assert.deepEqual(result.sessions.map(entry => entry.basis.goalStoppedByUser ?? false), [true, true, false]);
   assert.deepEqual(f.messages.map(({ id }) => id), ['session-cut-off']);
   assert.deepEqual(f.resumes, [{ agent: f.agents.get('session-resumed-by-user'), value: { id: 'goal-1', revision: 7 } }]);
+});
+
+
+test('auto wake: pre-stop notifications stay in inbox after a human question, while a newly dispatched job wakes', async t => {
+  const { createHistoryTracker } = await import('./handover.mjs');
+  const tracker = createHistoryTracker({ threshold: () => 0 });
+  const allowed = (agent, message) => {
+    const id = /^background job (\S+)/.exec(message.content[0].text)[1];
+    const job = f.services.jobs.list().find(job => job.id === id);
+    return tracker.allowsAutomatic(agent, job?.startedAt);
+  };
+  const f = autoWakeFixture(t, true, undefined, allowed);
+  f.event({ type: 'turn/end', time: 2000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  f.event({ type: 'user/message', time: 3000, data: { source: { kind: 'user' }, content: [{ type: 'text', text: '现在怎么样' }] } });
+  const old = f.notice({ job: { startedAt: 1000 } });
+  f.endTurn();
+  f.tick(6000);
+  assert.deepEqual(f.wakes, []);
+  assert.deepEqual(f.inbox.nextStep, [old]);
+  f.notice({ job: { startedAt: 4000 } });
+  f.endTurn();
+  f.tick(1000);
+  assert.equal(f.wakes.length, 1);
+  // Another user stop after scheduling must cancel the wake at fire time as well.
+  f.endTurn();
+  f.event({ type: 'turn/end', time: 5000, data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  f.tick(6000);
+  assert.equal(f.wakes.length, 1);
 });

@@ -108,6 +108,18 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 - `verify_previous`：`codex_run` / `codex_continue` 可带一个已结束任务的 job_id，在派这一单的同时只读核验它（与 `codex_verify` 派出的核验完全相同：归属、`verification_of`、只读、不加写锁），结果由完成通知送达。这一单可写、且它的 scope（没写 scope 时为任务目录）与被核验任务的 scope 或产物互相包含时拒绝，提示先核验；`/mnt` 下路径不分大小写。核验因运行数上限等原因没派出时，这一单照常派出，结果里说明，之后再用 `codex_verify`。
 - 写任务起步：scope 整体遍历超过 5 秒时，记下最慢的那一项（单项超过 5 秒或用光 20 秒预算的规则不变）。
 
+### 0.9.211：普通追问不解除停止前任务的自动唤醒限制
+
+11-27 的 f9886d30 会话中，用户 00:16:43 点停止，00:16:55 只追问状态，停止前派出的任务却在 00:18:00 完成后叫醒会话；随后一单核验在 00:18:01 派出，用户 00:18:02 再次停止，核验结束又在 00:19:57 叫醒会话。具体任务使用最后一次用户停止时间 `lastUserStopAt` 作为截止线，普通人工消息不清除它：只有能匹配到任务、且派发时间严格晚于这次停止的任务才可自动唤醒；无法匹配或缺少派发时间的通知按停止前任务处理。
+
+被拦的完成通知持久保存在 `stateDirectory/held-notices.json`，到用户下次发话时一并交给模型；步骤被拒、插件重载或宿主重启都不会丢失。具体任务完成通知及其阻塞 inbox 唤醒、自动核验、失败接替、自动代答和通知转交都按来源与 `lastUserStopAt` 检查，不能用停止后新建的子任务或转交通知绕过限制。
+
+自动交接与 `turn-stopping` 时的派单/收尾提醒属于会话级动作，沿用 0.9.209 的 `userStopped` 判定：用户停止后先不自动推进，普通人工消息（包括“继续”）即可恢复这些动作，但不会解除停止前具体任务的截止线。
+
+自动交接投递交接单后、建立继任目标前，再检查原会话与继任在本次交接期间的用户停止；即使随后又问了状态也有效。原会话被停就按现有逻辑撤回，且不恢复它的目标；继任被停则保留已收到的交接单和链接，不新建或恢复继任目标，避免撤销用户正在查看的会话。交接前任务的转交通知按整条交接链的停止边界与原始派单时间比较，前任或中间会话的停止不会被新继任绕过；被拦结果留在最终继任，等它下一次人工回合。
+
+自动续接和交接摘要使用独立的 `via`，保留停止截止时间；消息来源中只有操作员使用的 `codex-conductor` via 会清除它，显式恢复或新建 Goal 也会清除。操作员 `send-request` 仍可推进会话，后台任务结果仍可查询。重启或意外中断后的恢复保持原有行为，不额外阻止停止后由用户发起、随后被中断的合法回合续接。
+
 ### 0.9.210：解压原文可读，只在压缩仍降不下地板时交接
 
 bili `decompress` 把大块原文写入临时文件后，规划端可直接 read / grep，不必另派任务。11-26 的 session-92c2e37b 已解压 b2 的 99891 字符，却被原料守卫拒绝，摘要遗漏的细节因此取不回。现在只放行 bili 默认导出：按 bili 0.1.216 的 `os.tmpdir()` 和块/范围 ID 加 UUID 命名规则，核对真实路径、文件名及普通文件类型；不放行其他临时文件或整个临时目录，穿越和链接不能越出边界，其他原料与 Gemini 正文规则照旧。
@@ -776,6 +788,18 @@ If verification has already ended when the review is saved, `codex_review` retur
 - `codex_continue` with `answers` (answering blocking questions) still resumes by default; `fresh: true` starts a new thread with the answers in the brief. Measured: most of those threads are above the threshold too (10 of 11 after the 2026-11-17 changes, median about 154k tokens), so flipping that default would roughly double the input saved on continuations; the owner decides.
 - `verify_previous`: `codex_run` / `codex_continue` can name a finished job to verify alongside the new unit (exactly the verification `codex_verify` starts: owner, `verification_of`, read-only, no write lock), with the result delivered by the completion notice. It is refused when the new unit is writable and its scope (the task directory without a scope) contains or is contained by the verified job's scope or products; paths under `/mnt` compare case-insensitively. If the verification cannot start (for example `maxRunningJobs`), the new unit still runs and the result says to use `codex_verify` later.
 - Write-job startup: when a scoped walk takes over 5 s in total, its slowest entry is remembered (the per-entry 5 s and 20 s budget rules are unchanged).
+
+### 0.9.211: Ordinary follow-up questions keep the stop boundary for earlier jobs
+
+In session f9886d30 on 11-27, the user stopped at 00:16:43 and only asked for status at 00:16:55, but a pre-stop job woke the session at 00:18:00. A verification dispatched at 00:18:01 then preceded another stop at 00:18:02 and woke the session at 00:19:57. Concrete tasks use the last user-stop timestamp, `lastUserStopAt`, as their cutoff; ordinary human input does not clear it. Only a matched job dispatched strictly after that stop may wake automatically. Unmatched notices or missing dispatch times are treated as pre-stop work.
+
+Held completion notices are persisted in `stateDirectory/held-notices.json` and accompany the next human message, surviving rejected steps, plugin reloads and host restarts. Concrete task completions and their blocked-inbox wakes, automatic verification, failure fallback, auto-answer, and notice forwarding check provenance against `lastUserStopAt`; a fresh child job or forwarded notice cannot bypass that cutoff.
+
+Automatic hand-over and dispatch/finish reminders at `turn-stopping` are session-level actions. They retain 0.9.209's `userStopped` behavior: a user stop holds them, and ordinary human input, including “继续” (“continue”), restores them without clearing the cutoff for pre-stop tasks.
+
+After delivering an automatic hand-over prompt and before creating the successor goal, recheck both sessions for user stops during that hand-over, even if followed by a status question. A predecessor stop rolls back the hand-over without restoring its goal. A successor stop preserves the delivered brief and link but creates or resumes no successor goal, avoiding reversal of the session the user is viewing. Forwarded task notices compare original dispatch time against stop boundaries across the full hand-over chain, including intermediate predecessors; held results accompany the final successor’s next human turn.
+
+Automatic recovery and hand-over summaries use separate `via` values and retain the stop cutoff. Among message sources, only the operator's `codex-conductor` via clears it; explicit Goal resume/create also clears it. Operator `send-request` remains available, and background results remain queryable. Recovery after a restart or accidental interruption keeps its existing behavior, without an extra stop gate on legitimate interrupted human turns initiated after the stop.
 
 ### 0.9.210: Read decompressed originals and hand over only after compression fails to lower the floor
 

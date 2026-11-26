@@ -659,7 +659,7 @@ const messageText = (e) => (Array.isArray(e.data?.content) ? e.data.content : []
 // 用户本人最近一条消息的文字：不算插件代发、看门狗补发和其他来源（技能说明、记忆召回）的消息。
 export function lastUserText(log) {
   const user = log.findLast(e => e.type === 'user/message' && e.data?.source?.kind === 'user' &&
-    e.data.source.via !== 'codex-conductor' && !AUTOMATIC_TEXTS.has(messageText(e).trim()));
+    !e.data.source.via?.startsWith('codex-conductor') && !AUTOMATIC_TEXTS.has(messageText(e).trim()));
   return user ? messageText(user) : '';
 }
 // dsh-agy-link 模型目录里的模型名：每个模型本身，加上「模型-档位」；读不到时返回 null，不拦。
@@ -690,7 +690,7 @@ export function hasUserReply(log, job, owner, autoMessage) {
   // autoResume submits its restart notice with the user source; nobody answered anything.
   // 插件自己代发的续接、看门狗补发的“继续”都不是用户回复（宿主提问的自动代答 kind 是 user-question-reply，本来就不算）。
   const user = log.findLastIndex(e => e.type === 'user/message' && e.data?.source?.kind === 'user' &&
-    e.data.source.via !== 'codex-conductor' && !(autoMessage && text(e) === autoMessage) && !AUTOMATIC_TEXTS.has(text(e).trim()));
+    !e.data.source.via?.startsWith('codex-conductor') && !(autoMessage && text(e) === autoMessage) && !AUTOMATIC_TEXTS.has(text(e).trim()));
   if (user < 0) return false;
   const replyAt = log[user].at ?? log[user].time;
   const review = job.verification;
@@ -1675,6 +1675,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     '用户明确要求派活时仍可派。用户输入 /conductor off 后恢复只做规划。';
   const history = createHistoryTracker({ directory: stateDirectory,
     threshold: () => cfg.handoverSuggestMessages ?? 0, contextThreshold: () => cfg.handoverContextTokens ?? 0 });
+  const automaticJobAllowed = (agent, job) => history.allowsAutomatic(agent,
+    dispatchTimes.get(job?.job_id) ?? (Number.isFinite(job?.started_at) ? job.started_at * 1000 : undefined));
+  const backgroundStartedAt = (agent, job) => {
+    const runner = job?.kind === 'codex' && /^Codex ([^\s·]+)/.exec(job.label ?? '')?.[1];
+    // A reattached monitor is new, but its runner was dispatched at the original registration.
+    const registered = runner && agent.session?.log?.find(event => event.type === 'job/registered' &&
+      event.data?.kind === 'codex' && event.data.owner === agent.id &&
+      /^Codex ([^\s·]+)/.exec(event.data.label ?? '')?.[1] === runner);
+    return dispatchTimes.get(runner) ?? (registered ? registered.time : job?.startedAt);
+  };
+  const noticeAllowed = (agent, message) => {
+    if (history.observe(agent)?.lastUserStopAt === undefined) return true;
+    const id = /^background job (\S+)(?:\s|$)/.exec(messageText({ data: message }))?.[1];
+    let job;
+    try { job = id && ctx.get?.('jobs')?.list?.(agent.id)?.find(job => job.id === id && job.owner === agent.id); }
+    catch (error) { ctx.logger?.warn?.(`[codex-conductor] 无法对应任务通知，按停止前任务暂存：${error.message}`); }
+    return history.allowsAutomatic(agent, backgroundStartedAt(agent, job));
+  };
   const parkedFile = stateDirectory && path.join(stateDirectory, 'parked-reviews.json');
   const parkedEvaluations = hostParkedReviews.get(parkedFile) ?? new Map();
   if (parkedFile) hostParkedReviews.set(parkedFile, parkedEvaluations);
@@ -2017,10 +2035,12 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     return view(next);
   }
-  const autoAnswer = registerAutoAnswer({ ctx, settings: cfg.autoAnswer, directory: stateDirectory });
+  const autoAnswer = registerAutoAnswer({ ctx, settings: cfg.autoAnswer, directory: stateDirectory,
+    allowed: (agent, askedAt) => history.allowsAutomatic(agent, askedAt) });
   // 工作区（侧栏分组）、目标和会话都是可选的宿主服务，取不到时相应步骤降级。
   const workspaces = () => ctx.get?.('workspaceRegistry');
   const autoHandover = createAutoHandover({ directory: stateDirectory, settings: () => cfg.autoHandover, aliases, logger: ctx.logger,
+    allowed: (agent) => !history.observe(agent)?.userStopped,
     goals: () => ctx.get?.('goals'), agentOf: (id) => ctx.get?.('agents')?.get?.(id), workspaces,
     runningJobs: async (owner) => {
       const page = await conductor.list({ owner, also_owners: aliases.predecessors(owner), status: 'running', limit: 1 });
@@ -2207,6 +2227,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   const verificationState = hostVerifications.get(jobService) ?? { starts: new Map(), automatic: new Map() };
   if (jobService) hostVerifications.set(jobService, verificationState);
   const { starts: verificationStarts, automatic: autoVerifications } = verificationState;
+  const dispatchTimes = verificationState.dispatchTimes ??= new Map();
+  const rememberDispatch = (id, at) => {
+    if (id && Number.isFinite(at)) dispatchTimes.set(id, Math.min(dispatchTimes.get(id) ?? Infinity, at));
+  };
   const automaticCandidate = (job) => job.job_id && job.context?.owner && job.context.write === true &&
     !job.context.verification_of && (job.execution_status ?? job.status) === 'completed' &&
     (job.verification_status == null || job.verification_status === 'unreviewed') && job.report_status !== 'invalid';
@@ -2245,6 +2269,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (cfg.autoVerify === 'off' || disposed) return value;
     const id = value.job_id;
     if (!eligibleForAutoVerification(value)) return value;
+    const owner = lastSuccessor(aliases, value.context.owner) ?? value.context.owner;
+    const ownerAgent = exec?.agent?.id === owner ? exec.agent : ctx.get?.('agents')?.get?.(owner);
+    // Catch-up cannot infer a stop boundary from an unloaded owner's ID alone.
+    if (!Array.isArray(ownerAgent?.session?.log) || !automaticJobAllowed(ownerAgent, source ?? value)) return value;
     let pending = autoVerifications.get(id);
     if (catchup && pending) {
       const receipt = await pending;
@@ -2273,7 +2301,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             return catchup ? undefined : skipped('已有后续轮次');
           }
           owner = lastSuccessor(aliases, current.context.owner) ?? current.context.owner;
-          const agent = exec?.agent?.id === owner ? exec.agent : ctx.get?.('agents')?.get?.(owner) ?? { id: owner };
+          const agent = exec?.agent?.id === owner ? exec.agent : ctx.get?.('agents')?.get?.(owner);
+          if (!Array.isArray(agent?.session?.log) || !automaticJobAllowed(agent, current)) return;
           const result = await verifyTool.execute({ job_id: id, wait_seconds: 0 }, { agent, [automaticVerification]: current });
           if (result.existing_verification) return catchup ? undefined : skipped(`已存在核验 ${result.job_id}（${result.status}）`);
           if (!result.job_id || unknownState(result)) return skipped(result.error ?? result.error_kind ?? result.status, 'error');
@@ -2417,7 +2446,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const { job_id: parent, context, task_options: options, sandbox } = source;
     if (disposed || !cfg.gemini?.command || cfg.geminiFallback === false || source.status !== 'failed' ||
         source.fallback_safe !== true || jobEngine(source) !== 'codex' || !parent || !context?.owner ||
-        !owns(exec?.agent?.id, context.owner)) return;
+        !owns(exec?.agent?.id, context.owner) || !automaticJobAllowed(exec.agent, source)) return;
     if (fallbacks.has(parent)) return fallbacks.get(parent);
     const attempt = (async () => {
       try {
@@ -2430,7 +2459,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           engine: 'gemini', task, cwd: source.cwd, write: context.write, acceptance: context.acceptance,
           must_verify: context.must_verify, scope: source.scope_paths ?? source.scope ?? [],
           writable_roots: options?.writable_roots ?? [], host_access: sandbox === 'danger-full-access', wait_seconds: 0,
-        }, { agent }, continuation, context.task, context.verification_of, undefined, undefined, { parent: source, fallbackOf: parent });
+        }, { agent }, continuation, context.task, context.verification_of, undefined, undefined, { parent: source, fallbackOf: parent, automaticSource: source });
         if (!child.job_id || unknownState(child)) throw new Error(child.error ?? child.error_kind ?? child.status);
         if (child.error_kind === 'worker_start_failed') {
           return { receipt: { job_id: child.job_id, engine: 'gemini', status: child.status },
@@ -2544,6 +2573,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (++bridgeErrors < 3) continue;
           throw new Error(value.error);
         }
+        rememberDispatch(jobId, value.started_at * 1000);
         return publish(await finish(value, exec));
       }
     } catch (error) {
@@ -2663,6 +2693,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
 
   function notifyOnDone(value, exec, finish) {
     if (value.status !== 'running' || !value.job_id) return value;
+    rememberDispatch(value.job_id, value.started_at * 1000);
     const id = background(value.job_id, exec, finish)?.id;
     if (id === undefined) return value;
     const outputCall = `job_output(${JSON.stringify({ job_id: id })})`;
@@ -3254,6 +3285,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           if (!args.acceptance.length) throw reject(`${tool}: ${previous.job_id} 的验收项已全部作为不可补回的历史记录结案，无需派单。`);
         }
       }
+      if (guard.automaticSource && !automaticJobAllowed(exec.agent, guard.automaticSource)) {
+        throw new Error('用户已停止这项任务，不自动派出核验或接替；需要时由规划端按用户要求明确派单。');
+      }
+      const dispatchedAt = Date.now();
       started = await conductor.start(args, cwd, undefined, {
         owner: owner ?? null, task: originalTask, acceptance: args.acceptance, write: args.write,
         ...(args.must_verify?.length ? { must_verify: [...new Set(args.must_verify)] } : {}),
@@ -3270,6 +3305,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (predispatch.length) countCloseout(owner, 'predispatch_warnings', predispatch.length);
         if (args.expect_blocked?.length) countCloseout(owner, 'expect_blocked_items', args.expect_blocked.length);
       }
+      rememberDispatch(started.job_id, dispatchedAt);
       guard.onStarted?.(started);
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
     } finally {
@@ -3684,7 +3720,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
     }, exec, undefined, undefined, source.job_id, undefined,
-    cfg.verificationReuse ? { verification_scope: verificationScope(source, args, excluded) } : undefined, { onStarted });
+    cfg.verificationReuse ? { verification_scope: verificationScope(source, args, excluded) } : undefined, { onStarted, ...(exec[automaticVerification] ? { automaticSource: source } : {}) });
   }
 
   // codex_status 的等待部分：解析线程号、核对归属后等这一单。stop 只撤销这一次观察，任务照常跑。
@@ -3907,6 +3943,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (!entry || value.context?.owner !== owner || unknownState(value) ||
             !['running', 'completed', 'failed', 'cancelled'].includes(value.status)) continue;
         if (agents.get(owner) !== agent) return;
+        rememberDispatch(value.job_id, value.started_at * 1000);
         if (!liveBackground(value.job_id, exec, true)) background(value.job_id, exec, finishStatus, entry.label);
       }
       offset = history.next_offset ?? null;
@@ -4722,7 +4759,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   ctx.on('agent/created', ({ agent }) => recoverAgent(agent));
   for (const agent of ctx.get?.('agents')?.list?.() ?? []) recoverAgent(agent);
   // 已交接出去的会话不再被任务通知唤醒，由后继会话查询这些任务。
-  registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox, retired: (id) => Boolean(aliases.successor(id)) });
+  registerAutoWake({ ctx, enabled: cfg.autoWakeBlockedInbox, allowed: noticeAllowed, retired: (id) => Boolean(aliases.successor(id)) });
   // 会话回到空闲时按 autoHandover 判定是否提醒、询问或自动交接。
   ctx.on('agent/status', ({ agent, status }) => {
     if (status !== 'idle') return;
@@ -4748,45 +4785,96 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   });
   // 交接出去的会话收到 Codex 任务结束通知时转给继任会话，前任这一回合不调用模型就结束。
   ctx.on('agent/pre-step', async (step, next) => {
-    let forwarded;
+    let forwarded, chain;
     try {
       forwarded = await forwardRetiredNotices({ agent: step.agent, messages: step.messages, aliases, jobs: ctx.get?.('jobs'),
+        allowed: async (target, job) => {
+          if (!chain) {
+            const owners = [];
+            for (const id of aliases.owners(target.id)) {
+              let owner = id === step.agent.id ? step.agent : id === target.id ? target : ctx.get?.('agents')?.get?.(id);
+              if (!Array.isArray(owner?.session?.log)) {
+                try {
+                  const session = await ctx.get?.('sessionQuery')?.readSession?.(id);
+                  owner = { id, session: { log: session?.events } };
+                } catch { return false; }
+              }
+              // Missing predecessor history cannot prove the task postdates its stop; retain the notice.
+              if (!Array.isArray(owner?.session?.log)) return false;
+              owners.push(owner);
+            }
+            chain = owners;
+          }
+          // Recheck live logs after all reads; a user may stop the successor while a predecessor is loading.
+          const startedAt = backgroundStartedAt(step.agent, job);
+          return chain.every(owner => history.allowsAutomatic(owner, startedAt));
+        },
+        hold: (agent, message) => holdNotices(agent.id, [message]),
         resolve: async (id) => ctx.get?.('agents')?.get?.(id) ?? (await ctx.get?.('sessionController')?.resolveAgent?.(id))?.agent });
     } catch (error) { ctx.logger?.warn?.(`[codex-conductor] 转交任务通知失败：${error?.message ?? error}`); }
     if (forwarded) ctx.logger?.info?.(`[codex-conductor] 会话 ${step.agent?.id} 的 ${forwarded.forwarded} 条任务通知已转给 ${forwarded.successor}` +
       `${forwarded.delivered ? '' : '（继任会话不可用，未送达）'}。`);
     return forwarded?.reject ? { kind: 'reject' } : next();
   });
-  // 用户点了停止、还没再发话：只带后台任务完成通知的步骤不调用模型，免得会话被通知叫醒接着干（11-20 到 11-25 有 12 次）。
-  // 通知先存着，用户下次发话时随那一步一起交给模型，任务结果不丢。
-  const heldNotices = new Map();
+  // Reject consumes the host's claimed inbox messages, so retain notices until a human turn enters.
+  const heldFile = stateDirectory && path.join(stateDirectory, 'held-notices.json');
+  const heldNotices = new Map((() => {
+    try { return Object.entries(JSON.parse(readFileSync(heldFile, 'utf8'))); }
+    catch (error) {
+      if (heldFile && error.code !== 'ENOENT') ctx.logger?.warn?.(`[codex-conductor] 读取暂存通知失败：${error.message}`);
+      return [];
+    }
+  })());
+  const saveHeldNotices = () => {
+    if (!heldFile) return;
+    try { writeJsonAtomic(heldFile, Object.fromEntries(heldNotices)); }
+    catch (error) { ctx.logger?.warn?.(`[codex-conductor] 保存暂存通知失败，通知仍在内存中：${error.message}`); }
+  };
+  const holdNotices = (id, messages) => {
+    const prior = heldNotices.get(id) ?? [];
+    heldNotices.set(id, [...new Map([...prior, ...messages].map(message => [message.id, message])).values()]);
+    saveHeldNotices();
+  };
   ctx.on('agent/pre-step', async (step, next) => {
     const id = step.agent?.id;
-    try {
-      const messages = step.messages ?? [];
-      if (messages.length && messages.every((m) => m?.source?.kind === 'tool-jobs') && history.observe(step.agent)?.userStopped) {
-        heldNotices.set(id, [...(heldNotices.get(id) ?? []), ...messages]);
-        ctx.logger?.info?.(`[codex-conductor] 会话 ${id} 已被用户停止，${messages.length} 条任务通知先存着、不叫醒会话；用户下次发话时一并交给模型。`);
+    const messages = step.messages ?? [];
+    const pending = heldNotices.get(id);
+    if (pending?.length) {
+      const delivered = new Set((step.agent?.session?.log ?? []).filter(event => event.type === 'user/message').map(event => event.data?.id));
+      const remaining = pending.filter(message => !delivered.has(message.id));
+      if (remaining.length !== pending.length) {
+        if (remaining.length) heldNotices.set(id, remaining);
+        else heldNotices.delete(id);
+        saveHeldNotices();
+      }
+    }
+    const human = messages.some(m => m?.source?.kind === 'user' && !m.source.via);
+    const notices = messages.filter(m => m?.source?.kind === 'tool-jobs');
+    const held = human ? [] : notices.filter(message => !noticeAllowed(step.agent, message));
+    if (held.length) {
+      holdNotices(id, held);
+      if (held.length === messages.length) {
+        ctx.logger?.info?.(`[codex-conductor] 会话 ${id} 的 ${held.length} 条停止前任务通知先存着，不自动开轮。`);
         return { kind: 'reject' };
       }
-    } catch {}
+    }
     const decision = await next();
-    try {
-      const held = heldNotices.get(id);
-      if (held?.length && decision?.kind === 'enter' && Array.isArray(decision.messages) &&
-          (step.messages ?? []).some((m) => m?.source?.kind === 'user' && !m.source.via)) {
-        heldNotices.delete(id);
-        return { ...decision, messages: [...decision.messages, ...held] };
-      }
-    } catch {}
-    return decision;
+    if (decision?.kind !== 'enter' || !Array.isArray(decision.messages)) return decision;
+    const heldIds = new Set(held.map(message => message.id));
+    const entered = decision.messages.filter(message => !heldIds.has(message.id));
+    const waiting = heldNotices.get(id);
+    if (human && waiting?.length) {
+      // Keep the durable copy until the host actually logs delivery, even if an outer hook rejects or the user aborts.
+      return { ...decision, messages: [...entered, ...waiting.filter(message => !entered.some(item => item.id === message.id))] };
+    }
+    return held.length ? { ...decision, messages: entered } : decision;
   });
 
   // 防虚报：每个回合最多提醒一次，提醒会让这一回合继续，由它补调用或更正说法
   const nudged = new Set();
   ctx.on('agent/turn-stopping', ({ agent, turn }) => {
-    try { history.observe(agent); } catch {}
     try {
+      if (history.observe(agent)?.userStopped) return;
       if (summarizing.has(agent?.id) || !inWorkspace(agent?.session?.header?.cwd, cfg.roots) || liveBackground(undefined, { agent })) return;
       const key = `${agent.id}:${turn}`;
       if (nudged.has(key)) return;
@@ -5063,6 +5151,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       retired: (id) => Boolean(aliases.successor(id)),
       archived: (id) => Boolean(ctx.get?.('workspaceRegistry')?.archivedSessionIds?.includes?.(id)) });
     registerHandoverRequests({ ctx: resumeCtx, directory: stateDirectory, aliases, since: closeoutFrom,
+      allowed: (agent) => !history.observe(agent)?.userStopped,
       sessionJobs: (owner) => sessionJobs(owner), pendingOf: (jobs) => pendingCloseout(jobs, closeoutFrom, reworkFrom),
       disableAutoContinue: cfg.autoHandover.disableAutoContinue,
       // 交接时通过宿主设置服务关掉旧会话在 dsh-client-auto-continue 里的自动继续；没装该插件时什么都不做。

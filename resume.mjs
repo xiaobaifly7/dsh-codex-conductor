@@ -183,7 +183,7 @@ async function resumeSession(ctx, sessionId, message, { send = false, queue = fa
     const queued = agent.status === 'running';
     reload?.claim();
     // via 标出这是插件代发的消息（续接、send-request），不当作用户回复。
-    agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user', via: 'codex-conductor' } });
+    agent.followup({ id: randomUUID(), role: 'user', content: [{ type: 'text', text: message }], source: { kind: 'user', via: automatic || reload ? 'codex-conductor-auto-resume' : 'codex-conductor' } });
     return result(send ? 'sent' : 'resumed', queued ? 'message_queued' : 'message_submitted', method);
   } catch (error) {
     // Host errors may quote the submitted text; never publish them for the send entry.
@@ -566,7 +566,7 @@ export function registerResumeRequests({ ctx, directory, autoResume, retired, ar
   return check;
 }
 
-export function registerAutoWake({ ctx, enabled = true, retired = () => false }) {
+export function registerAutoWake({ ctx, enabled = true, retired = () => false, allowed = () => true }) {
   if (!enabled) return;
   const batches = new Map();
   const delays = [1000, 5000];
@@ -577,7 +577,7 @@ export function registerAutoWake({ ctx, enabled = true, retired = () => false })
     batches.delete(id);
   };
   const pendingNotices = (agent, batch) => agent.inbox?.hasPending &&
-    [...agent.inbox.nextStep, ...agent.inbox.nextTurn].some(message => batch.notices.has(message.id));
+    [...agent.inbox.nextStep, ...agent.inbox.nextTurn].some(message => batch.notices.has(message.id) && allowed(agent, message));
   const schedule = (agent, batch) => {
     if (stopped || !batch.blocked || batch.timer || agent.status !== 'idle') return;
     if (ctx.get?.('agents')?.get(agent.id) !== agent || !pendingNotices(agent, batch)) {
@@ -613,7 +613,7 @@ export function registerAutoWake({ ctx, enabled = true, retired = () => false })
   // tool-jobs emits this only after inserting its notice; a settled job alone may have been awaited.
   listen('agent/inbox/inserted', ({ agent, message }) => {
     if (message.source?.kind !== 'tool-jobs' || message.source.form !== 'notice' ||
-        ctx.get?.('agents')?.get(agent.id) !== agent || retired(agent.id)) return;
+        ctx.get?.('agents')?.get(agent.id) !== agent || retired(agent.id) || !allowed(agent, message)) return;
     const text = message.content?.find(block => block.type === 'text')?.text;
     const id = /^background job (\S+)(?:\s|$)/.exec(text ?? '')?.[1];
     const job = id && ctx.get?.('jobs')?.list(agent.id).find(job => job.id === id && job.owner === agent.id &&
