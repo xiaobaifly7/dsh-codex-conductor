@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.209` 用户点了停止、还没再发话的会话不再被自动交接（自动交接会在新会话里恢复目标接着干）；提醒、询问和面板同意过的交接照常。依据：11-26 排查用户停止后会话又跑起来的所有路径，自动交接在会话转为空闲时判定，只看用户 30 分钟内有没有发过消息，不看用户刚点了停止。
+
 `0.9.208` 对话 worktree 的合并被核验记为 needs_changes 的写入单挡住时，回执点名这些单并说明怎么处理：在原线程用 codex_continue 修正后重新核验，或者已由后续单修正的，对原单记 accepted_deviations 并写明由哪一单修正。以前只说“还有写入单没核验通过”，规划端改派新单补完后不回头处理原单，合并一直卡住（11-26 d70d85ff 14:35 起 7 个提交没合回 F:\渗透）。合并条件本身不变。
 
 `0.9.207` Google 在提交阶段拦下提示词时（“The prompt could not be submitted. The prompt contains sensitive words that violate Google's … policy”），这段固定提示会作为 Gemini 的最终回复回来。以前它被记成 schema_invalid（回复不是 JSON），规划端于是把同一个会被拦的提示词原样再派一次（11-26 d70d85ff 连续两单）。现在它和 “blocked by Gemini's filters” 一样记为 model_refused，回执按拒绝处理：不原样重派。
@@ -313,6 +315,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.209` A session the user stopped and has not written to since is no longer handed over automatically (a hand-over resumes the goal in the successor and carries on); reminders, the question and panel-approved hand-overs are unchanged. Basis: an 11-26 review of every path that restarts a stopped session found that automatic hand-over, decided when a session turns idle, checked only whether the user wrote in the last 30 minutes, not whether they had just pressed stop.
 
 `0.9.208` When writes booked needs_changes hold back a conversation worktree's merge, the receipt names them and says what clears each: fix it on its own thread with codex_continue and verify again, or, when a later job already fixed it, book the original accepted_deviations naming that job. It used to say only that writes were not yet verified; the planner fixed things in new jobs, never came back to the originals, and the merge stayed blocked (d70d85ff on 11-26: 7 commits unmerged since 14:35). The merge condition is unchanged.
 

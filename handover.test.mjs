@@ -662,6 +662,26 @@ test('auto hand-over decisions honour mode, idleness, links, cooldown, the start
   assert.equal(step({ lastHumanAt: now - 31 * 60_000 }, { mode: 'auto' }).act, 'auto');
   assert.equal(step({ lastHumanAt: now - 10 * 60_000 }).act, 'ask');
   assert.equal(step({ lastHumanAt: now - 10 * 60_000 }, { mode: 'auto', quietMinutes: 0 }).act, 'auto');
+  // 用户点了停止、还没再发话：auto 不交接，提醒照常；询问不受影响；面板同意过的照常执行。
+  assert.deepEqual(step({ userStopped: true }, { mode: 'auto' }), { remind: true, act: null });
+  assert.equal(step({ userStopped: true }).act, 'ask');
+  assert.equal(step({ userStopped: true, record: { approved: { origin: 'panel' } } }, { mode: 'auto' }).act, 'auto');
+});
+
+test('a session the user stopped is not handed over automatically until the stop is lifted', async (t) => {
+  const { createAutoHandover, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
+  const h = host(t);
+  const agent = h.agent('session-A');
+  const submitted = [];
+  const auto = createAutoHandover({ directory: h.root, settings: () => ({ ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' }), aliases: h.aliases,
+    uptime: () => 3_600_000, submit: (request) => submitted.push(request) });
+  const suggestion = { sessionId: agent.id, messages: 20, threshold: 10, suggest: true };
+  writeFileSync(h.aliases.file, JSON.stringify({ links: {} }));
+  const held = await auto.observe(agent, { ...suggestion, userStopped: true });
+  assert.deepEqual([held.act, held.blocked], [null, undefined], 'held only by the stop, not by another condition');
+  assert.deepEqual(submitted, []);
+  assert.equal((await auto.observe(agent, suggestion)).act, 'auto');
+  assert.equal(submitted.length, 1);
 });
 
 test('the depth limit blocks automatic hand-over, appears in state and the panel, and leaves manual hand-over available', async (t) => {
