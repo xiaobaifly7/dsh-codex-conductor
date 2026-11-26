@@ -112,7 +112,9 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 bili `decompress` 把大块原文写入临时文件后，规划端可直接 read / grep，不必另派任务。11-26 的 session-92c2e37b 已解压 b2 的 99891 字符，却被原料守卫拒绝，摘要遗漏的细节因此取不回。现在只放行 bili 默认导出：按 bili 0.1.216 的 `os.tmpdir()` 和块/范围 ID 加 UUID 命名规则，核对真实路径、文件名及普通文件类型；不放行其他临时文件或整个临时目录，穿越和链接不能越出边界，其他原料与 Gemini 正文规则照旧。
 
-上下文地板交接仍取最近 20 次请求的 `inputTokens + cacheReadTokens` 最小值、使用原来的 `handoverContextTokens`（线上 190000），但还须在这个窗口内有压缩信号。成功的 `compress` 回执、无错误的宿主 `compaction/end` 都计入；bili 发送前强制压缩不会写工具事件，因此相邻请求输入总量下降也计作上下文收缩。信号归入压缩后的下一次请求，随它滑出窗口。紧急截断工具输出或工具定义、提示词等其他输入变化也可能造成下降：本规则将它们同样计作收缩，不能据此反推一定执行过 compress。此前完全没压缩过、连续 20 次处于 19 万到 bili 提醒线之间也会提前交接，与用户“只在压缩失效时交接”的规则相反。用户停止、quietMinutes、冷却及其他交接条件不变。
+上下文地板交接仍取最近 20 次请求的 `inputTokens + cacheReadTokens` 最小值、使用原来的 `handoverContextTokens`（线上 190000），但还须在这个窗口内有压缩信号。仅计入模型 `compress` 的成功回执和成功的原生 `compaction/end`。信号归入压缩后的下一次请求，随它滑出窗口。此前完全没压缩过、连续 20 次处于 19 万到 bili 提醒线之间也会提前交接，与用户“只在压缩失效时交接”的规则相反。用户停止、quietMinutes、冷却及其他交接条件不变。
+
+已知限制：bili 发送前强制压缩不写宿主事件，仅有这类压缩的窗口不算压缩过；需等窗口中出现模型 `compress` 成功回执或原生 `compaction/end` 成功事件，且仍满足地板条件，才按地板交接。历史会话 5fa5f0e9 在 2026-11-21 02:41:37、02:49:56 UTC 两次强制压缩附近，有 3 个窗口因此晚几次请求才判定可按地板交接。
 
 ### 0.9.209：用户叫停的会话不再被自动交接
 
@@ -503,7 +505,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `actionableReceipts` | `true` | 收尾、复核参数和待答问题出错时，附上本会话可确认的任务和条目编号以及提交骨架。 |
 | `verificationReuse` | `true` | 跳过全部条目均未满足且无产出的受阻任务。同一任务的文件版本与核验范围均可确认未变时复用已有核验。 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
-| `handoverContextTokens` | `0` | 最近 20 次请求的窗口内有成功压缩或输入收缩信号、且上下文（输入加缓存命中 token）都不低于此值时也标记“建议交接”，`autoHandover` 照常处理；继任会话不必先涨满消息阈值。用于压缩后仍降不下来的会话，它们的消息数可能还不多；子代理会话不计；0 关闭 |
+| `handoverContextTokens` | `0` | 最近 20 次请求的窗口内有模型 `compress` 成功回执或原生 `compaction/end` 成功事件（bili 发送前强制压缩不写宿主事件，不计入）、且上下文（输入加缓存命中 token）都不低于此值时也标记“建议交接”，`autoHandover` 照常处理；继任会话不必先涨满消息阈值。用于压缩后仍降不下来的会话，它们的消息数可能还不多；子代理会话不计；0 关闭 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
 | `continueFreshAboveTokens` | `100000` | 不带 answers 的续接，原线程上次请求超过此输入 token 时开新线程；0 总是沿用原线程 |
 | `closeoutEvidence` | `independent` | 结案时自标未满足的条目记成满足所需的依据：`independent` 独立依据，`planner` 规划端自己的非照抄证据，`off` 不查 |
@@ -779,7 +781,9 @@ If verification has already ended when the review is saved, `codex_review` retur
 
 Planners can read or grep large originals exported by bili `decompress` directly. In the 11-26 session-92c2e37b test, b2's 99891 characters were exported successfully but refused as raw material, leaving details omitted from the summary inaccessible. The exception follows bili 0.1.216's default export contract: the real path must name a regular file directly inside the real `os.tmpdir()` directory, with bili's block/range ID plus UUID filename. Other temporary files, directory-wide reads, escaping traversal or links, other raw material and Gemini prose retain their existing restrictions.
 
-Context-floor hand-over still takes the minimum `inputTokens + cacheReadTokens` over the last 20 requests and keeps `handoverContextTokens` unchanged (190000 in production), but now also requires a compression signal within that window: a successful `compress` receipt, an error-free native `compaction/end`, or a decrease between adjacent request input totals. The last signal covers bili preflight compression, which emits no session tool event. A signal belongs to the first request measured after it and ages out with that request. Emergency tool-output truncation or other changes to tools or prompts can also lower input and count as contraction; a decrease does not prove a compress operation occurred. Previously 20 requests above 190000 could trigger a hand-over before bili even suggested compression, contrary to the owner's compression-failure-only rule. User-stop, quietMinutes, cooldown and other hand-over conditions are unchanged.
+Context-floor hand-over still takes the minimum `inputTokens + cacheReadTokens` over the last 20 requests and keeps `handoverContextTokens` unchanged (190000 in production), but now also requires a compression signal within that window: only a successful receipt from a model `compress` call or a successful native `compaction/end` event counts. A signal belongs to the first request measured after it and ages out with that request. Previously 20 requests above 190000 could trigger a hand-over before bili even suggested compression, contrary to the owner's compression-failure-only rule. User-stop, quietMinutes, cooldown and other hand-over conditions are unchanged.
+
+Known limitation: bili preflight forced compression emits no host event, so a window containing only that kind of compression is not considered compressed. Context-floor hand-over must wait for a successful model `compress` receipt or a successful native `compaction/end` event within the window, with the floor condition still met. In historical session 5fa5f0e9, near the forced compressions at 2026-11-21 02:41:37 and 02:49:56 UTC, this delayed eligibility by a few requests in 3 windows.
 
 ### 0.9.209: A session the user stopped is not handed over automatically
 
@@ -1023,7 +1027,7 @@ Plugin settings `timeoutSeconds`, `idleTimeoutSeconds` and `retries` map to runn
 | `actionableReceipts` | `true` | Include owned job and item IDs and submission templates in closeout, review and answer errors. |
 | `verificationReuse` | `true` | Skip blocked jobs that report no met criteria and have no products. Reuse verification when the same job's observable file version and verification scope match. |
 | `handoverSuggestMessages` | `5000` | Flag a session for hand-over once it has more messages than this; 0 switches it off, together with `autoHandover`'s reminders, questions and automatic hand-overs. It is also `autoHandover`'s threshold |
-| `handoverContextTokens` | `0` | Also flag a session only when its last 20 requests include successful compression or input-contraction evidence and each carried at least this many context tokens (input plus cache reads); `autoHandover` acts on it as usual, and a successor need not first grow by the message threshold. Meant for sessions that compression can no longer shrink, which may still have few messages; subagent sessions are not counted; 0 switches it off |
+| `handoverContextTokens` | `0` | Also flag a session only when its last 20 requests include a successful model `compress` receipt or a successful native `compaction/end` event (bili preflight forced compression emits no host event and does not count) and each carried at least this many context tokens (input plus cache reads); `autoHandover` acts on it as usual, and a successor need not first grow by the message threshold. Meant for sessions that compression can no longer shrink, which may still have few messages; subagent sessions are not counted; 0 switches it off |
 | `acceptanceWarnAbove` | `8` | One reminder line on a new-work dispatch with more acceptance items than this (never blocks); 0 = off |
 | `continueFreshAboveTokens` | `100000` | A continuation without answers starts a fresh thread when the parent thread's last request exceeded this many input tokens; 0 = always resume |
 | `closeoutEvidence` | `independent` | What supports recording a criterion the report marked unmet as met when closing: `independent` sources, `planner` own non-copied evidence, `off` no check |

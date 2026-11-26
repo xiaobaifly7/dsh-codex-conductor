@@ -1257,13 +1257,13 @@ const compressionEvents = (text = '[Compressed m00001–m00020 → 1 block(s), ~
   { type: 'tool/result', data: { message: { toolCallId: 'compress-1', isError, content: [{ type: 'text', text }] } } },
 ];
 
-test('context handover requires compression or shrink in the 20-request floor window', async (t) => {
+test('context handover requires successful compression in the 20-request floor window', async (t) => {
   const { createHistoryTracker } = await import('./handover.mjs');
   const tracker = createHistoryTracker({ directory: dir(t), threshold: () => 0, contextThreshold: () => 190_000 });
   const log = Array.from({ length: 20 }, largeContextRequest);
   const agent = { id: 'session-A', session: { log } };
   assert.equal(tracker.observe(agent).floor, 200_000);
-  assert.equal(tracker.observe(agent).contextFull, false, 'steady high usage alone is not a compression or shrink signal');
+  assert.equal(tracker.observe(agent).contextFull, false, 'steady high usage alone proves no compression');
   log.push(...compressionEvents());
   assert.equal(tracker.observe(agent).contextFull, false, 'wait for usage measured after the fold');
   log.push(largeContextRequest());
@@ -1318,17 +1318,33 @@ test('successful native compaction permits context handover while message-count 
   assert.equal(observed.suggest, true, 'message threshold still works without compression');
 });
 
-test('a strict input-plus-cache drop enables context handover without compression events', async (t) => {
-  const { createHistoryTracker } = await import('./handover.mjs');
+test('an input-plus-cache drop without compression does not enable context handover', async (t) => {
+  const { createHistoryTracker, autoHandoverStep, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
   const tracker = createHistoryTracker({ directory: dir(t), threshold: () => 0, contextThreshold: () => 190_000 });
   const log = Array.from({ length: 20 }, largeContextRequest);
   const agent = { id: 'session-A', session: { log } };
   assert.equal(tracker.observe(agent).contextFull, false);
   log.push({ type: 'assistant/message', data: { usage: { inputTokens: 10_001, cacheReadTokens: 189_998 } } });
-  assert.equal(tracker.observe(agent).floor, 199_999);
-  assert.equal(tracker.observe(agent).contextFull, true, 'even a one-token total drop is a shrink signal');
+  const observed = tracker.observe(agent);
+  assert.equal(observed.floor, 199_999);
+  assert.equal(autoHandoverStep({ ...observed, settings: { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' },
+    idle: true, now: Date.parse('2026-11-26T12:00:00Z'), uptimeMs: 3_600_000 }).act, null);
+  assert.equal(observed.contextFull, false, 'a one-token drop is not evidence of compression');
   assert.equal(createHistoryTracker({ threshold: () => 0, contextThreshold: () => 190_000 })
-    .observe({ ...agent, session: { log: [...log] } }).contextFull, true, 'full-history replay matches incremental observation');
+    .observe({ ...agent, session: { log: [...log] } }).contextFull, false, 'full-history replay matches incremental observation');
+});
+
+test('a one-token input drop after failed compress does not enable context handover', async (t) => {
+  const { createHistoryTracker, autoHandoverStep, AUTO_HANDOVER_DEFAULTS } = await import('./handover.mjs');
+  const tracker = createHistoryTracker({ directory: dir(t), threshold: () => 0, contextThreshold: () => 190_000 });
+  const log = [...Array.from({ length: 20 }, largeContextRequest),
+    ...compressionEvents('[Compression FAILED: Nothing compressed.]', { isError: true }),
+    { type: 'assistant/message', data: { usage: { inputTokens: 9_999, cacheReadTokens: 190_000 } } }];
+  const observed = tracker.observe({ id: 'session-A', session: { log } });
+  assert.equal(observed.floor, 199_999);
+  assert.equal(autoHandoverStep({ ...observed, settings: { ...AUTO_HANDOVER_DEFAULTS, mode: 'auto' },
+    idle: true, now: Date.parse('2026-11-26T12:00:00Z'), uptimeMs: 3_600_000 }).act, null);
+  assert.equal(observed.contextFull, false);
 });
 
 test('monotonic input-plus-cache growth past 190000 does not enable context handover', async (t) => {
@@ -1342,16 +1358,15 @@ test('monotonic input-plus-cache growth past 190000 does not enable context hand
   assert.equal(tracker.observe(agent).contextFull, false, 'moving input into cache with the same total is not shrinking');
 });
 
-test('a usage shrink signal stops enabling context handover after leaving the 20-request window', async (t) => {
+test('an input drop does not refresh compression after it leaves the 20-request window', async (t) => {
   const { createHistoryTracker } = await import('./handover.mjs');
   const tracker = createHistoryTracker({ directory: dir(t), threshold: () => 0, contextThreshold: () => 190_000 });
-  const log = [{ type: 'assistant/message', data: { usage: { inputTokens: 10_001, cacheReadTokens: 190_000 } } },
-    ...Array.from({ length: 20 }, largeContextRequest)];
+  const log = [largeContextRequest(), ...compressionEvents(), ...Array.from({ length: 20 }, largeContextRequest)];
   const agent = { id: 'session-A', session: { log } };
-  assert.equal(tracker.observe(agent).contextFull, true, 'the shrink is attached to the first request in this window');
-  log.push(largeContextRequest());
-  assert.equal(tracker.observe(agent).floor, 200_000);
-  assert.equal(tracker.observe(agent).contextFull, false, 'equal usages do not refresh an expired shrink signal');
+  assert.equal(tracker.observe(agent).contextFull, true, 'the first request in the window follows successful compression');
+  log.push({ type: 'assistant/message', data: { usage: { inputTokens: 9_999, cacheReadTokens: 190_000 } } });
+  assert.equal(tracker.observe(agent).floor, 199_999);
+  assert.equal(tracker.observe(agent).contextFull, false, 'an input drop cannot refresh expired compression evidence');
 });
 
 test('the old session writes a hand-over summary in a tool-less turn after its goal is paused and before any successor exists', async (t) => {

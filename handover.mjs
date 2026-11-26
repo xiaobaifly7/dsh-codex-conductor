@@ -1129,7 +1129,7 @@ export function registerHandoverRequests({ ctx, directory, ...deps }) {
 // 会话历史越长每步越慢；这里只标记“建议交接”，提醒、询问和自动交接由 createAutoHandover 按配置决定。
 // 会话日志只追加，按日志数组累计，每次只数新增事件。
 const MESSAGE_TYPES = new Set(['assistant/message', 'tool/result', 'user/message', 'system/message', 'developer/message']);
-// 上下文地板：最近 FLOOR_WINDOW 次请求的最小上下文（输入 + 缓存命中 token），且窗口内有压缩成功或输入收缩信号。
+// 上下文地板：最近 FLOOR_WINDOW 次请求的最小上下文（输入 + 缓存命中 token），且窗口内有压缩成功信号。
 const FLOOR_WINDOW = 20;
 const promptTokens = (event) => {
   const usage = event?.type === 'assistant/message' ? event.data?.usage : undefined;
@@ -1158,9 +1158,9 @@ export function createHistoryTracker({ directory, threshold, contextThreshold = 
       } else if (event?.type === 'compaction/end' && event.data && !event.data.error) entry.compressed = true;
       const tokens = promptTokens(event);
       if (tokens) {
-        // 输入下降兼容无宿主事件的 bili preflight 压缩，也可能来自紧急截断等变化；信号随下降后的请求滑出窗口。
+        // 成功压缩后的请求随信号滑出窗口；bili preflight 无宿主事件，不能从输入下降推断压缩。
         entry.prompts = [...entry.prompts.slice(1 - FLOOR_WINDOW), { tokens,
-          compressed: entry.compressed === true || tokens < entry.prompts.at(-1)?.tokens }];
+          compressed: entry.compressed === true }];
         entry.compressed = false;
       }
       // 自动交接据此避开用户正在对话的时候：最后一条人工消息的时间，以及当前回合里是否有人工消息。
