@@ -37,7 +37,7 @@ const { writeJsonAtomic, createAliases, registerHandoverRequests, createHistoryT
 const { registerAutoAnswer, normalizeAutoAnswer, AUTO_ANSWER_DEFAULTS } = await import(new URL(`./autoanswer.mjs${reloadQuery}`, import.meta.url));
 const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnlyCommand, decide, knownTool, createProductReads, PRODUCT_DENY_HINT } =
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
-const { repoFor, within, relocate, relocateText, openWorktree, mergeWorktree, worktreeStatus, checkoutDirty, pathKey } =
+const { repoFor, within, relocate, relocateText, openWorktree, mergeWorktree, worktreeStatus, closeWorktree, checkoutDirty, pathKey } =
   await import(new URL(`./worktree.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
@@ -4557,16 +4557,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
   if (cfg.worktree.repos.length) ctx.tools.register({
     name: 'codex_worktree',
-    description: `本对话的 git worktree（仓库：${cfg.worktree.repos.join('、')}）。新对话的写入单在独立 worktree 执行，核验通过后合并回原分支。` +
-      'status 查看本对话的 worktree、未合并提交和上次合并结果；merge 在冲突解决或原目录处理好后重试合并。',
+    description: `本对话的 git worktree（仓库：${cfg.worktree.repos.join('、')}）。新对话在这些仓库里的写入单自动放进本对话专用的 worktree，核验通过后自动合并回原分支，平时不用调用。` +
+      'status 查看本对话的 worktree、未合并的提交和上次合并结果；merge 在冲突解决或原目录处理好之后重试合并（闸门照旧：没有在跑的单、写入单都已核验通过）；' +
+      'close 在本对话的工作全部结束时收尾：先合并，再拆资料链接、删除 worktree 和已合并的分支。放弃本对话的改动只能由用户决定，不在这里做。',
     presentCall: (a) => ({ card: 'generic', kind: a?.action === 'status' ? 'read' : 'execute', title: `本对话的 worktree · ${a?.action ?? 'status'}` }),
     parameters: { type: 'object', additionalProperties: false, properties: {
-      action: { type: 'string', enum: ['status', 'merge'] },
+      action: { type: 'string', enum: ['status', 'merge', 'close'] },
       repo: { type: 'string', description: '只处理这个仓库的 worktree；省略时处理本对话全部的。' },
     }, required: ['action'] },
     output: DATA_OUTPUT,
     async execute(args, exec) {
-      if (!['status', 'merge'].includes(args.action)) throw new Error('codex_worktree: action 只支持 status 或 merge');
       const owner = exec?.agent?.id;
       if (!owner || !worktreesFile) throw new Error('codex_worktree: 需要当前会话 ID 和插件状态目录');
       const all = readWorktrees();
@@ -4584,7 +4584,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           continue;
         }
         const merged = await mergeConversation(owner, found, exec?.signal);
-        items.push({ repo: entry.repo, action: 'merge', ...(merged.result ?? {}), note: merged.line || '没有需要合并的提交。' });
+        if (args.action === 'merge' || !merged.result || !['merged', 'nothing'].includes(merged.result.status)) {
+          items.push({ repo: entry.repo, action: 'merge', ...(merged.result ?? {}), note: merged.line || '没有需要合并的提交。' });
+          continue;
+        }
+        const closed = await withRepoLock(entry.repo, () => closeWorktree(entry)).catch(error => ({ status: 'error', message: error.message }));
+        if (closed.status === 'closed') saveWorktree(found.key, { ...entry, status: 'closed' });
+        items.push({ repo: entry.repo, action: 'close', merge: merged.line || '没有需要合并的提交。', ...closed });
       }
       return { status: 'ok', worktrees: items };
     },

@@ -1,6 +1,6 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -1169,9 +1169,9 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     const merged = (await merge(() => job({ status: 'completed', verification_status: 'verified' }))).worktrees[0];
     assert.equal(merged.status, 'merged');
     assert.equal(readFileSync(path.join(root, 'src', 'a.txt'), 'utf8'), 'changed in the worktree\n');
-    assert.deepEqual(h.tools.codex_worktree.parameters.properties.action.enum, ['status', 'merge']);
-    await assert.rejects(h.tools.codex_worktree.execute({ action: 'close' }, as('session-0a0a0a0a-1')), /status.*merge/);
-    assert.equal(existsSync(wt), true);
+    const closed = (await harness({ config, listed: () => job({ status: 'completed', verification_status: 'verified' }) })
+      .tools.codex_worktree.execute({ action: 'close' }, as('session-0a0a0a0a-1'))).worktrees[0];
+    assert.deepEqual([closed.action, closed.status], ['close', 'closed']);
     assert.equal(harness({ config: {} }).tools.codex_worktree, undefined);
   } finally {
     rmSync(base, { recursive: true, force: true });

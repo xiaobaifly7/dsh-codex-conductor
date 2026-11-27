@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { mergeWorktree, openWorktree, relocate, relocateText, repoFor, worktreeStatus } from './worktree.mjs';
+import { closeWorktree, mergeWorktree, openWorktree, relocate, relocateText, repoFor, worktreeStatus } from './worktree.mjs';
 
 const tmp = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-worktree-test-')));
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -37,7 +37,7 @@ test('paths and task text move from the repository into the worktree, and nothin
   assert.equal(relocate(path.join(tmp, 'elsewhere'), root, path.join(tmp, 'w')), path.join(tmp, 'elsewhere'));
 });
 
-test('a conversation worktree shares ignored material, merges back after a trial merge, and retains its shared material after merging', async () => {
+test('a conversation worktree shares ignored material, merges back after a trial merge, and closes without touching the material', async () => {
   const root = repo('flow');
   const first = await openWorktree({ repo: root, owner: 'session-aaaa1111-0000', maxUntracked: 10 });
   assert.equal(first.branch, 'conv/aaaa1111');
@@ -94,10 +94,12 @@ test('a conversation worktree shares ignored material, merges back after a trial
   assert.equal(readFileSync(path.join(root, 'src', 'a.txt'), 'utf8'), 'one\nTWO zwei\n');
   assert.equal(readFileSync(path.join(root, 'notes.md'), 'utf8'), 'unrelated, untracked\n');
 
-  // Nothing left to merge; the worktree and shared material remain available.
+  // Nothing left to merge; close drops the links (never the material), the worktree and the merged branch.
   assert.equal((await mergeWorktree({ repo: root, ...first })).status, 'nothing');
   assert.deepEqual((await worktreeStatus({ repo: root, ...first })), { exists: true, dirty: 0, ahead: 0, merging: false });
-  assert.equal(existsSync(first.path), true);
+  const closed = await closeWorktree({ repo: root, ...first });
+  assert.deepEqual([closed.status, closed.branch_deleted], ['closed', true]);
+  assert.equal(existsSync(first.path), false);
   assert.equal(readFileSync(path.join(root, 'vm', 'disk.vhdx'), 'utf8'), 'shared material\n');
   assert.equal(readFileSync(path.join(root, 'vm', 'out.log'), 'utf8'), 'from the worktree\n');
   assert.ok(lstatSync(path.join(second.path, 'vm')).isSymbolicLink());
@@ -118,4 +120,31 @@ test('a main checkout full of untracked files, a detached HEAD or another branch
   git(root, 'checkout', '-q', 'main');
   writeFileSync(path.join(opened.path, 'src', 'b.txt'), 'uncommitted\n');
   assert.deepEqual((await mergeWorktree({ repo: root, ...opened })).reason, 'worktree_dirty');
+  assert.equal((await closeWorktree({ repo: root, ...opened })).reason, 'worktree_dirty');
+});
+
+test('closing moves output only the worktree holds back into the main checkout, and stops rather than overwrite a different copy', async () => {
+  const root = repo('keep');
+  const opened = await openWorktree({ repo: root, owner: 'session-eeee5555-0', maxUntracked: 10 });
+  // git worktree remove deletes ignored files with the worktree; these exist only there.
+  writeFileSync(path.join(opened.path, 'src', 'scan.bin'), 'scan output\n');
+  mkdirSync(path.join(opened.path, 'src', 'dump'));
+  writeFileSync(path.join(opened.path, 'src', 'dump', 'one.bin'), 'dump\n');
+  const closed = await closeWorktree({ repo: root, ...opened });
+  assert.deepEqual([closed.status, closed.moved_back], ['closed', 2]);
+  assert.equal(readFileSync(path.join(root, 'src', 'scan.bin'), 'utf8'), 'scan output\n');
+  assert.equal(readFileSync(path.join(root, 'src', 'dump', 'one.bin'), 'utf8'), 'dump\n');
+  assert.equal(readFileSync(path.join(root, 'src', 'blob.bin'), 'utf8'), 'ignored file\n', 'the untouched hard link is the same file');
+
+  // A tool that rewrites the hard-linked file by replacing it leaves two different copies: keep both, close nothing.
+  const other = await openWorktree({ repo: root, owner: 'session-ffff6666-0', maxUntracked: 10 });
+  assert.ok(lstatSync(path.join(other.path, 'src', 'dump')).isSymbolicLink(), 'a directory ignored by a file rule is linked whole');
+  rmSync(path.join(other.path, 'src', 'blob.bin'));
+  writeFileSync(path.join(other.path, 'src', 'blob.bin'), 'rewritten in the worktree\n');
+  const blocked = await closeWorktree({ repo: root, ...other });
+  assert.deepEqual([blocked.status, blocked.reason, blocked.files], ['blocked', 'ignored_clash', ['src/blob.bin']]);
+  assert.equal(readFileSync(path.join(other.path, 'src', 'blob.bin'), 'utf8'), 'rewritten in the worktree\n');
+  assert.equal(readFileSync(path.join(root, 'src', 'blob.bin'), 'utf8'), 'ignored file\n');
+  rmSync(path.join(other.path, 'src', 'blob.bin'));
+  assert.equal((await closeWorktree({ repo: root, ...other })).status, 'closed');
 });

@@ -299,7 +299,7 @@ Gemini 的工作目录和报告 Schema 需要位于 Windows 本地驱动器。�
 | `codex_runtime` | 查看源码与实际加载版本；明确请求立即重载或等任务空闲后重载，收到真实加载标记才确认生效；`action=doctor` 检查 Python、Codex、登录文件和路由；WSL 额外检查 bash，Windows 原生模式预检私有 Codex 沙箱。两种模式均不调用模型 |
 | `gemini_write` | 配置 `gemini` 后才注册；读取素材并交给本机 agy 的 Gemini 写单个教程或文档文件，读回统计字数并列出范围外改动 |
 | `codex_model` | 配置 `gemini` 后才注册；用户在某个对话里要求换执行模型时，规划端用它为本对话（含交接出去的会话）的 Gemini 执行和续接指定模型（如 `gemini-4-carbon-high`），`forceModel` 下也生效；核验不受影响。用户最近一条亲自发的消息里要写出系列名和档位（如「carbon high」），否则拒绝；`default` 恢复默认。配置了 `gemini.modelCatalog` 时只接受模型目录里的模型。`codex_summary` 第一行显示本对话当前的执行模型。设置存在状态目录的 `session-models.json` |
-| `codex_worktree` | 配置 `worktree.repos` 后才注册。平时不用调用：新对话在这些仓库里的写入单自动放进本对话专用的 worktree，核验通过后自动合并（见「对话 worktree」）。`status` 查看本对话的 worktree、未合并的提交和上次合并结果；`merge` 在冲突解决或原目录处理好后重试合并。记录存在状态目录的 `session-worktrees.json` |
+| `codex_worktree` | 配置 `worktree.repos` 后才注册。平时不用调用：新对话在这些仓库里的写入单自动放进本对话专用的 worktree，核验通过后自动合并（见「对话 worktree」）。`status` 查看本对话的 worktree、未合并的提交和上次合并结果；`merge` 在冲突解决或原目录处理好后重试合并；`close` 在本对话收尾时先合并，再拆资料链接、删除 worktree 和已合并的分支。记录存在状态目录的 `session-worktrees.json` |
 
 ### 任务生命周期
 
@@ -637,6 +637,7 @@ worktree:
 - 被 `.gitignore` 忽略的资料不进 worktree：忽略的目录用目录联接（junction）、忽略的单个文件用硬链接接进来，与原目录共用、不复制。WSL 里的 git 把联接看成符号链接，`vm/` 这种目录规则不忽略它，插件因此把建的联接列进本 worktree 自己的排除文件（git 目录下的 `conversation-links.exclude`），runner 让 WSL 里的 git（含执行器自己跑的 git）都读它，联接不会被提交。所以先把工具、虚拟机磁盘、数据库、依赖和大件产出写进 `.gitignore`，再把要协作的代码和笔记提交进 git。
 - 写入单成功后，runner 在 worktree 里自动提交。Codex 在 WSL 里核验时，runner 设好 `GIT_DIR` 和 `GIT_WORK_TREE`，WSL 的 git 才认得 Windows 建的 worktree。
 - 本对话在这个 worktree 里没有在跑的单、完成的写入单都记为 verified 或 accepted_deviations 后，`codex_review` 结案时自动合并回原分支：先用 `git merge-tree` 试合并；有冲突就把冲突放进本对话的 worktree，派单解决后再核验、再合并，原目录不动；原目录不在原分支、暂存区有改动，或有与这次合并重叠的未提交文件时不合并，回执说明怎么处理。合并留下一个真正的合并提交（用试合并得到的树建好，原目录快进过去，同样不覆盖本地改动），合并后 worktree 快进到最新。
+- 收尾用 `codex_worktree action=close`：先合并，再把只在 worktree 里的被忽略文件（扫描结果、日志等，`git worktree remove` 会连它们一起删）移回原目录同一位置，再拆链接、`git worktree remove`（不加 `--force`）、`git branch -d`。原目录同一位置已有另一份时不覆盖，收尾停下并列出这些文件（`ignored_clash`）。只因文件规则（如 `*.bin`）被忽略的目录整个接成联接。插件从不运行 `git worktree prune`，也不替用户放弃改动。
 
 ## 单独使用 runner
 
@@ -1000,6 +1001,7 @@ worktree:
 - Material ignored by `.gitignore` is not copied: ignored directories are linked in with directory junctions and ignored single files with hard links, shared with the main checkout. git in WSL sees a junction as a symlink, which a directory rule such as `vm/` does not ignore, so the plugin lists its junctions in the worktree's own exclude file (`conversation-links.exclude` in its git directory) and the runner has git in WSL, the executors' included, read it; the junctions are never committed. So put tools, VM disks, databases, dependencies and bulky output in `.gitignore` first, and commit the code and notes you work on together.
 - After a write job completes, the runner commits in the worktree. When Codex verifies from WSL, the runner sets `GIT_DIR` and `GIT_WORK_TREE`, because WSL git cannot follow a worktree that Windows git created.
 - Once the conversation has no running job in the worktree and its completed write jobs are recorded verified or accepted_deviations, closing a `codex_review` merges back automatically. It trial-merges with `git merge-tree` first. A conflict goes into the conversation's worktree to be resolved by a job, verified and merged again, leaving the main checkout untouched. The merge does not happen while the main checkout is on another branch, has staged changes, or has uncommitted files that overlap the merge; the receipt says what to do. The merge leaves a real merge commit, built from the trial tree and fast-forwarded to in the main checkout, which still refuses to overwrite local changes; the worktree fast-forwards afterwards.
+- `codex_worktree action=close` finishes: merge, move ignored files that exist only in the worktree (scan output, logs; `git worktree remove` deletes them) back to the same place in the main checkout, remove the links, `git worktree remove` (no `--force`), `git branch -d`. When the main checkout already holds a different copy there, nothing is overwritten and close stops with the list (`ignored_clash`). A directory ignored only by a file rule (such as `*.bin`) is linked whole. The plugin never runs `git worktree prune` and never discards changes for the user.
 
 ### Task lifecycle
 
