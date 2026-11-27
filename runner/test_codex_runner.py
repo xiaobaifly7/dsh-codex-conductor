@@ -6961,6 +6961,16 @@ class RunnerTests(unittest.TestCase):
         result = self.control("list")
         self.assertEqual(result["jobs"][0]["context"].get("routing"), {"worktree_path": str(root)})
 
+    def test_job_list_preserves_committed_change_evidence_for_terminal_writes(self):
+        commit = "a" * 40
+        for status in ("completed", "failed", "cancelled"):
+            self.stored_job("committed-" + status, {"status": status, "worktree_commit": commit},
+                            context={**self.sample_context(), "write": True})
+        result = self.control("list")
+        for job in result["jobs"]:
+            with self.subTest(status=job["status"]):
+                self.assertEqual(job.get("worktree_commit"), commit)
+
     def test_worktree_activity_propagates_permission_errors_when_resolving_locations(self):
         import codex_runner
 

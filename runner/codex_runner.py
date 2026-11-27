@@ -4280,7 +4280,7 @@ def list_jobs(args):
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
-              "last_error_kind", "retry_at")
+              "last_error_kind", "retry_at", "worktree_commit")
     page = [{**{k: j.get(k) for k in fields if k != "thread_id" or "conversation_id" not in j},
              "context": {"owner": j["context"].get("owner"),
                          **({"write": j["context"]["write"]} if "write" in j["context"] else {}),

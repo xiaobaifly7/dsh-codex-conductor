@@ -1149,7 +1149,8 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     writeFileSync(path.join(wt, 'src', 'a.txt'), 'changed in the worktree\n');
     git(wt, 'add', '-A');
     git(wt, 'commit', '-q', '-m', 'job work');
-    const job = (extra) => ({ jobs: [{ job_id: 'W-1', cwd: wt, context: { owner: 'session-0a0a0a0a-1', write: true }, ...extra }], total: 1, next_offset: null });
+    const job = (extra) => ({ jobs: [{ job_id: 'W-1', cwd: wt, started_at: Date.now() / 1000,
+      context: { owner: 'session-0a0a0a0a-1', write: true }, ...extra }], total: 1, next_offset: null });
     const merge = (listed) => harness({ config, listed }).tools.codex_worktree.execute({ action: 'merge' }, as('session-0a0a0a0a-1'));
     assert.match((await merge(() => job({ status: 'running' }))).worktrees[0].note, /还有单在跑（W-1）/);
     assert.match((await merge(() => job({ status: 'completed', verification_status: 'unreviewed' }))).worktrees[0].note, /没核验通过（W-1）/);

@@ -4637,9 +4637,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
               : `本对话之前在原目录写过东西，原目录还有 ${dirty.modified} 处未提交的改动、${dirty.untracked} 处未纳入 git 的文件；` +
                 '提交干净后，本对话下一张写入单自动换到 worktree' };
           } else {
+            const created_at = new Date().toISOString();
             const opened = await openWorktree({ repo, root: cfg.worktree.root, owner, maxUntracked: cfg.worktree.maxUntracked })
               .catch(error => ({ shared: `开 worktree 失败：${error.message}` }));
-            entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened };
+            entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened, created_at };
           }
         }
         if (reopening && entry.status !== 'open') throw new Error(`已关闭的 worktree 无法重开：${entry.reason}；未启动写入单`);
@@ -4684,11 +4685,20 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   // 合并闸门按 worktree 查全部会话；外会话的写入也必须核验通过。
   async function mergeGate(owner, entry, signal) {
-    let mine;
+    let since;
     try {
-      const jobs = [];
+      // Old entries have only a mutable `at`; the Git marker belongs to this worktree incarnation.
+      const marker = entry.created_at === undefined ? lstatSync(path.join(entry.path, '.git')) : undefined;
+      since = marker ? (marker.birthtimeMs > 0 ? marker.birthtimeMs : marker.mtimeMs) / 1000 : Date.parse(entry.created_at) / 1000;
+      if (!Number.isFinite(since)) throw new Error('创建时间无效');
+    } catch (error) {
+      return `查不到 worktree ${entry.path} 的创建时间（${error.message}），暂不合并；核对 worktree 登记后用 codex_worktree action=merge 重试。`;
+    }
+    const jobs = [], mine = [], invalid = [];
+    try {
+      const started_between = [since, Date.now() / 1000 + 86_400];
       for (let offset = 0; offset !== null;) {
-        const page = await conductor.list({ limit: 100, offset }, signal);
+        const page = await conductor.list({ limit: 100, offset, started_between }, signal);
         if (!page || (page.status && page.status !== 'completed') || page.error || !Array.isArray(page.jobs) ||
             !Object.hasOwn(page, 'next_offset')) throw new Error('派单查询不完整');
         const next = page.next_offset;
@@ -4696,26 +4706,34 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         jobs.push(...page.jobs);
         offset = next;
       }
-      mine = jobs.filter(job => {
-        const locations = dispatchLocations({ ...job, writable_roots: job.task_options?.writable_roots }, job.cwd);
-        return !job.context?.verification_of && (job.context?.write === true
-          ? touchesWorktree({ path: entry.path }, locations)
-          : owns(owner, job.context?.owner) && within(job.cwd, entry.path));
-      });
     } catch {
       return '查不到完整的全局派单记录，暂不合并；稍后用 codex_worktree action=merge 重试。';
     }
+    for (const job of jobs) {
+      if (Number.isFinite(job.started_at) && job.started_at < since) continue;
+      if (job.context?.verification_of || (job.context?.write !== true && !owns(owner, job.context?.owner))) continue;
+      if (['failed', 'cancelled'].includes(job.status) && !job.worktree_commit && job.execution_status !== 'running') continue;
+      try {
+        if (!Number.isFinite(job.started_at)) throw new Error('缺少登记时间 started_at');
+        const locations = dispatchLocations({ ...job, writable_roots: job.task_options?.writable_roots }, job.cwd);
+        if (job.context?.write === true
+          ? touchesWorktree({ path: entry.path }, locations)
+          : within(job.cwd, entry.path)) mine.push(job);
+      } catch (error) { invalid.push(`${job.job_id ?? '缺少任务号'}：${error.message}`); }
+    }
+    if (invalid.length) return `这些任务的登记或路径信息不完整，暂不合并：${invalid.join('；')}。` +
+      '到任务所属会话用 codex_status 核对并补全该任务记录后，用 codex_worktree action=merge 重试。';
     const running = mine.filter(job => job.status === 'running' || (job.context?.write === true &&
       (job.execution_status === 'running' || !['completed', 'failed', 'cancelled'].includes(job.status)))).map(job => job.job_id);
     if (running.length) return `本对话 worktree 里还有单在跑（${running.join('、')}）或状态未确认，到任务所属会话用 codex_status 查询，等结束并核验通过后用 codex_worktree action=merge 重试。`;
-    const open = mine.filter(job => job.context?.write === true &&
+    const open = mine.filter(job => job.context?.write === true && (job.status === 'completed' || job.worktree_commit) &&
       !['verified', 'accepted_deviations'].includes(job.verification_status));
     const ids = (status) => open.filter(job => (job.verification_status === 'needs_changes') === status).map(job => job.job_id);
     const [flagged, waiting] = [ids(true), ids(false)];
     // 11-26 d70d85ff：几单记了 needs_changes 后改派新单补，原单一直挡着合并，规划端看不出要做什么。
     return [
       waiting.length && `本对话 worktree 里还有写入单没核验通过（${waiting.join('、')}），到任务所属会话逐单用 codex_verify 核验并用 codex_review 记录结论；` +
-        '失败或取消的单先用 codex_continue 修正；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，写明修复单和核验依据。处理后用 codex_worktree action=merge 重试。',
+        '失败或取消但已有提交的单核对已有改动即可，不要求重试原请求；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，写明修复单和核验依据。处理后用 codex_worktree action=merge 重试。',
       flagged.length && `这些写入单核验记为 needs_changes，挡着合并回 ${entry.base_branch}：${flagged.join('、')}。` +
         '逐单处理：到任务所属会话在原线程用 codex_continue 修正后重新核验；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，' +
         '写明由哪一单修正和那一单的核验依据。处理完才会自动合并。',

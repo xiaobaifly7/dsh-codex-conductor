@@ -26,7 +26,8 @@ async function fixture({ age = 25 * HOUR } = {}) {
   git(repo, 'add', '-A');
   git(repo, 'commit', '-qm', 'base');
   const owner = `session-${String(sequence).padStart(8, '0')}-0000`;
-  const entry = { status: 'open', repo, ...await openWorktree({ repo, owner }), at: new Date(Date.now() - age).toISOString() };
+  const entry = { status: 'open', repo, ...await openWorktree({ repo, owner }),
+    created_at: new Date(Date.now() - age).toISOString(), at: new Date(Date.now() - age).toISOString() };
   const key = `${owner}::${repo.replace(/\\/g, '/').toLowerCase()}`;
   const file = path.join(stateDir, 'session-worktrees.json');
   const save = value => writeFileSync(file, JSON.stringify({ [key]: value }));
@@ -34,7 +35,8 @@ async function fixture({ age = 25 * HOUR } = {}) {
   const current = () => JSON.parse(readFileSync(file, 'utf8'))[key];
   const caller = { agent: { id: owner, session: { header: { cwd: repo }, log: [] } } };
   const oldJob = { job_id: 'old', status: 'completed', cwd: entry.path, context: { owner, write: true },
-    verification_status: 'verified', finished_at: (Date.now() - age) / 1000, updated_at: (Date.now() - age) / 1000 };
+    verification_status: 'verified', started_at: Date.parse(entry.created_at) / 1000,
+    finished_at: (Date.now() - age) / 1000, updated_at: (Date.now() - age) / 1000 };
   function harness({ jobs = [oldJob], listed, activity, starting, initial = true } = {}) {
     const tools = {}, handlers = {}, injections = [], calls = [], starts = [];
     const run = async (_cfg, argv, options = {}) => {
@@ -208,7 +210,8 @@ test('checks are throttled across reloads without turning the check timestamp in
   const activity = f.current().last_activity_at;
   f.save({ ...f.current(), last_activity_at: new Date(Date.now() - 25 * HOUR).toISOString(),
     last_cleanup: { ...checked, at: new Date(Date.now() - 31 * 60_000).toISOString() } });
-  const aged = f.harness({ jobs: [{ ...f.oldJob, finished_at: (Date.now() - 25 * HOUR) / 1000, updated_at: (Date.now() - 25 * HOUR) / 1000 }] });
+  const aged = f.harness({ jobs: [{ ...f.oldJob, started_at: (Date.now() - 25 * HOUR) / 1000,
+    finished_at: (Date.now() - 25 * HOUR) / 1000, updated_at: (Date.now() - 25 * HOUR) / 1000 }] });
   await aged.emit('agent/status', { agent: f.caller.agent, status: 'idle' });
   assert.equal(f.current().status, 'closed');
   assert.ok(activity, 'activity is retained separately before saveWorktree refreshes at');
@@ -239,6 +242,8 @@ test('closed conversations reopen for original cwd, old cwd, scope and continuat
     assert.equal(existsSync(cwd), true, via);
     assert.equal(start.payload.context.routing.worktree_repo, f.repo, via);
     assert.equal(f.current().status === 'open' || Object.values(JSON.parse(readFileSync(f.file))).some(e => e.status === 'open'), true);
+    const reopened = Object.values(JSON.parse(readFileSync(f.file))).find(e => e.status === 'open');
+    assert.ok(Date.parse(reopened.created_at) > Date.parse(f.entry.created_at), 'reopening starts a fresh generation');
   }
 });
 
@@ -632,7 +637,8 @@ for (const failure of ['throw', 'missing', 'failed', 'page-two', 'bad-offset', '
       return { jobs: [{ ...f.oldJob, ...(failure === 'bad-roots' ? { task_options: { writable_roots: 'invalid' } } : { scope: [7] }) }], next_offset: null };
     } });
     const receipt = await h.tools.codex_worktree.execute({ action: 'close' }, f.caller);
-    assert.match(receipt.worktrees[0].note, /查不到.*派单记录.*暂不合并.*codex_worktree/s);
+    if (failure === 'bad-roots' || failure === 'bad-scope') assert.match(receipt.worktrees[0].note, /old.*(scope|writable_roots).*codex_status.*codex_worktree/s);
+    else assert.match(receipt.worktrees[0].note, /查不到.*派单记录.*暂不合并.*codex_worktree/s);
     assert.equal(f.current().status, 'open');
     assert.equal(existsSync(f.entry.path), true);
   });
@@ -665,7 +671,8 @@ test('ancestor overlap reserves sibling worktrees without claiming foreign routi
 for (const status of ['failed', 'cancelled']) {
   test(`global merge gate blocks unreviewed foreign ${status} writes`, async () => {
     const f = await fixture();
-    const foreign = { ...f.oldJob, job_id: 'B-PARTIAL', status, verification_status: 'unreviewed', context: { owner: 'foreign', write: true } };
+    const foreign = { ...f.oldJob, job_id: 'B-PARTIAL', status, worktree_commit: 'a'.repeat(40),
+      verification_status: 'unreviewed', context: { owner: 'foreign', write: true } };
     const h = f.harness({ jobs: [f.oldJob, foreign] });
     assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /B-PARTIAL.*codex_/);
     foreign.verification_status = 'accepted_deviations';
@@ -673,7 +680,71 @@ for (const status of ['failed', 'cancelled']) {
   });
 }
 
-test('global merge gate blocks unfinished foreign writes even when previously verified', async () => {
+for (const status of ['failed', 'cancelled']) {
+  test(`merge gate ignores unchanged ${status} and refused writes`, async () => {
+    const f = await fixture();
+    const foreign = { ...f.oldJob, job_id: 'B-NO-CHANGES', status, error_kind: 'model_refused',
+      files_changed_total: 0, verification_status: 'unreviewed', context: { owner: 'foreign', write: true } };
+    const h = f.harness({ jobs: [f.oldJob, foreign] });
+    assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+    writeFileSync(path.join(f.entry.path, 'a.txt'), 'uncommitted failure residue\n');
+    foreign.files_changed_total = 1;
+    assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].reason, 'worktree_dirty');
+  });
+}
+
+test('merge gate ignores prior incarnation jobs before validating their paths', async () => {
+  const f = await fixture({ age: 0 });
+  const before = Date.parse(f.entry.created_at) / 1000 - 1;
+  const h = f.harness({ jobs: [f.oldJob,
+    { ...f.oldJob, job_id: 'OLD-BROKEN', started_at: before, cwd: null, scope: [7], context: { owner: 'foreign', write: true } },
+    { ...f.oldJob, job_id: 'OLD-UNREVIEWED', started_at: before, verification_status: 'needs_changes' }] });
+  assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+  const query = h.calls.find(argv => argv[0] === 'list' && !argv.includes('--owner'));
+  assert.equal(Number(query[query.indexOf('--started-between') + 1]), Date.parse(f.entry.created_at) / 1000);
+});
+
+test('merge gate names current tasks with incomplete paths', async () => {
+  for (const broken of [{ cwd: '' }, { scope: [7] }, { scope_paths: [''] }, { started_at: null },
+    { task_options: { writable_roots: 'invalid' } }, { context: { owner: 'foreign', write: true, routing: { worktree_path: null } } }]) {
+    const f = await fixture();
+    const foreign = { ...f.oldJob, job_id: 'B-BAD-PATH', context: { owner: 'foreign', write: true }, ...broken };
+    const h = f.harness({ jobs: [foreign] });
+    const receipt = await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller);
+    assert.match(receipt.worktrees[0].note, /B-BAD-PATH.*(目录|scope|writable_roots|归属|登记时间)/s);
+    assert.match(receipt.worktrees[0].note, /codex_status.*codex_worktree/s);
+  }
+});
+
+test('merge gate ignores unrelated readonly tasks with incomplete paths', async () => {
+  const f = await fixture();
+  const h = f.harness({ jobs: [{ ...f.oldJob, job_id: 'FOREIGN-READ', cwd: null, scope: [7],
+    context: { owner: 'foreign', write: false } }] });
+  assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+});
+
+test('merge gate uses creation time rather than a later entry update', async () => {
+  const f = await fixture();
+  f.save({ ...f.entry, at: new Date().toISOString() });
+  const h = f.harness({ jobs: [{ ...f.oldJob, verification_status: 'needs_changes' }] });
+  assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /needs_changes/);
+  const query = h.calls.find(argv => argv[0] === 'list' && !argv.includes('--owner'));
+  assert.equal(Number(query[query.indexOf('--started-between') + 1]), Date.parse(f.entry.created_at) / 1000);
+});
+
+test('merge gate derives legacy creation time from the Git marker', async () => {
+  const f = await fixture();
+  const { created_at, ...legacy } = f.entry;
+  f.save({ ...legacy, at: new Date(Date.now() + 60_000).toISOString() });
+  const h = f.harness({ jobs: [{ ...f.oldJob, job_id: 'CURRENT', started_at: Date.now() / 1000,
+    verification_status: 'needs_changes' }] });
+  assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /CURRENT/);
+  const query = h.calls.find(argv => argv[0] === 'list' && !argv.includes('--owner'));
+  assert.ok(query.includes('--started-between'));
+  assert.ok(Number(query[query.indexOf('--started-between') + 1]) > Date.parse(created_at) / 1000);
+});
+
+test('merge gate blocks unfinished foreign writes even when previously verified', async () => {
   const f = await fixture();
   const foreign = { ...f.oldJob, job_id: 'B-UNFINISHED', context: { owner: 'foreign', write: true } };
   const h = f.harness({ jobs: [f.oldJob, foreign] });
