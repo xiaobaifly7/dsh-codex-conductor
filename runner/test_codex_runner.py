@@ -6858,7 +6858,7 @@ class RunnerTests(unittest.TestCase):
         result = self.invoke("--schema", schema.name, mode="relative_schema", env={"FAKE_REPORT": str(report)})
         self.assertEqual(result["status"], "completed", result)
         argv = self.calls()[-1]["argv"]
-        self.assertEqual(argv[argv.index("--output-schema") + 1], str(schema))
+        self.assertEqual(Path(argv[argv.index("--output-schema") + 1]).resolve(), schema.resolve())
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the Linux fake agy")
     def test_non_host_gemini_reports_evidence_unavailable(self):
@@ -6918,9 +6918,10 @@ class RunnerTests(unittest.TestCase):
             with self.subTest(sandbox=sandbox):
                 result = self.invoke("--sandbox", sandbox, prompt="Evidence: {{CONDUCTOR_EVIDENCE_DIR}}")
                 evidence = Path(result["evidence_dir"])
-                self.assertEqual(evidence, Path(result["log_dir"]) / "evidence")
+                # Windows may expand an 8.3 name in the runner's canonical paths.
+                self.assertEqual(evidence.resolve(), (Path(result["log_dir"]) / "evidence").resolve())
                 self.assertTrue(evidence.is_dir())
-                self.assertFalse(evidence.is_relative_to(self.cwd))
+                self.assertFalse(evidence.resolve().is_relative_to(self.cwd.resolve()))
                 received = self.calls()[-1]
                 self.assertIn(str(evidence), received["prompt"])
                 self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", received["prompt"])
@@ -6928,7 +6929,7 @@ class RunnerTests(unittest.TestCase):
                 if sandbox == "read-only":
                     self.assertIn('sandbox_mode="workspace-write"', received["argv"])
                     self.assertIn("sandbox_workspace_write.writable_roots=[]", received["argv"])
-                    self.assertEqual(json.loads(received["prompt"].splitlines()[0].split(": ", 1)[1]), str(self.cwd))
+                    self.assertEqual(Path(json.loads(received["prompt"].splitlines()[0].split(": ", 1)[1])).resolve(), self.cwd.resolve())
                 elif sandbox == "workspace-write":
                     self.assertEqual(received["argv"][received["argv"].index("--add-dir") + 1], str(evidence))
 
@@ -7089,7 +7090,8 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn("evidence_dir_windows", result)
         self.assertIsNone(args.evidence_dir)
         self.assertFalse((run_dir / "evidence").exists())
-        self.assertEqual((args.cwd, args.sandbox), (str(self.cwd), "danger-full-access"))
+        self.assertEqual(Path(args.cwd).resolve(), self.cwd.resolve())
+        self.assertEqual(args.sandbox, "danger-full-access")
         self.assertNotIn("External evidence directory", attempt.call_args.args[1])
         self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", attempt.call_args.args[1])
 
