@@ -3411,7 +3411,7 @@ test('service receipts distinguish retryable errors from the total timeout', () 
   }
   const timeout = nextStep({ ...failed, error_kind: 'timeout', retryable: false });
   assert.match(timeout, /总超时.*不自动重试.*尝试 2 次.*文件改动共 1 个.*确认现状.*不要原样重派/);
-  assert.ok(timeout.endsWith('先核对已有产物，把剩余工作拆成可独立验收的小批次，写明每批的数量或时间预算；长命令自带超时并预留收尾时间。报告有效且满足续接条件时用 codex_continue；报告缺失时，核实已有产物后只为当前这一小批新建任务。'));
+  assert.ok(timeout.endsWith('先核对已有产物，把剩余工作拆成可独立验收的小批次，在任务正文里写明每批的数量或时间预算；长命令自带超时并预留收尾时间。报告有效且满足续接条件时用 codex_continue；报告缺失时，核实已有产物后只为当前这一小批新建任务。'));
   assert.doesNotMatch(timeout, /resume|再派一次/);
 });
 

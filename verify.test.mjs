@@ -103,6 +103,80 @@ test('codex_run validates, stores and prompts for must_verify indices', async ()
 
 const option = (argv, flag) => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined;
 
+test('codex_verify waits for running writers overlapping cwd or monitored paths across sessions', async () => {
+  const cases = [
+    { cwd: '/work/original' },
+    { cwd: '/work/original/docs' },
+    { cwd: '/work' },
+    { cwd: '/work/other', task_options: { writable_roots: ['/work/original/docs'] } },
+    { cwd: '/work/other', scope_paths: ['/work/original/docs'] },
+    { cwd: '/work/other', scope: ['../original/docs'] },
+  ];
+  for (const fields of cases) {
+    const writer = { job_id: 'WRITER-1', status: 'running', sandbox: 'workspace-write',
+      context: { owner: 'another-session', write: true }, ...fields };
+    const h = harness({ listed: () => ({ jobs: [writer], total: 1 }) });
+    const value = await h.verify();
+    assert.equal(h.start(), undefined, JSON.stringify(fields));
+    assert.equal(value.status, 'blocked');
+    assert.deepEqual(value.blocking_jobs, ['WRITER-1']);
+    assert.match(value.next, /WRITER-1.*结束后.*codex_verify/);
+    assert.ok(h.calls.some(({ argv }) => argv[0] === 'list' && !argv.includes('--owner') && !argv.includes('--cwd')));
+  }
+  const source = sourceJob();
+  source.cwd = '/mnt/E/Project';
+  source.scope_paths = ['E:/Shared/docs'];
+  source.files_changed = [{ path: 'E:/Products/report.md' }];
+  source.write_paths = ['E:/Evidence/result.json'];
+  for (const cwd of ['e:\\PROJECT\\src', '/mnt/e/shared/docs', 'e:/products', '/mnt/e/evidence']) {
+    const writer = { job_id: 'WRITER-2', status: 'running', cwd, context: { write: true } };
+    const h = harness({ source, listed: () => ({ jobs: [writer], total: 1 }) });
+    assert.equal((await h.verify()).status, 'blocked', cwd);
+    assert.equal(h.start(), undefined);
+  }
+});
+
+test('codex_verify ignores non-overlapping, read-only and finished jobs', async () => {
+  for (const fields of [
+    { cwd: '/work/original-other' },
+    { context: { write: false }, sandbox: 'danger-full-access' },
+    { context: { write: false }, sandbox: 'workspace-write' },
+    { context: {}, sandbox: 'read-only' },
+    { status: 'completed' },
+  ]) {
+    const job = { job_id: 'OTHER-1', status: 'running', cwd: '/work/original', sandbox: 'workspace-write',
+      context: { owner: exec.agent.id, write: true }, ...fields };
+    const h = harness({ listed: () => ({ jobs: [job], total: 1 }) });
+    await h.verify();
+    assert.ok(h.start(), JSON.stringify(fields));
+  }
+});
+
+test('codex_verify lists all writer pages and names every overlapping job', async () => {
+  const h = harness({ listed: argv => {
+    if (argv.includes('--owner')) return { jobs: [], total: 0 };
+    const offset = Number(option(argv, '--offset'));
+    return { jobs: [{ job_id: `WRITER-${offset}`, status: 'running', cwd: '/work/original', context: { write: true } }],
+      total: 2, next_offset: offset === 0 ? 1 : null };
+  } });
+  const value = await h.verify();
+  assert.equal(h.start(), undefined);
+  assert.deepEqual(value.blocking_jobs, ['WRITER-0', 'WRITER-1']);
+  assert.match(value.next, /WRITER-0.*WRITER-1/);
+});
+
+test('codex_verify still dispatches when the running-writer query fails', async () => {
+  for (const failure of ['throw', 'error', 'invalid']) {
+    const h = harness({ listed: argv => {
+      if (argv.includes('--owner')) return { jobs: [], total: 0 };
+      if (failure === 'throw') throw new Error('runner unavailable');
+      return failure === 'error' ? { error_kind: 'bridge_error', error: 'runner unavailable' } : {};
+    } });
+    await h.verify();
+    assert.ok(h.start(), failure);
+  }
+});
+
 test('Gemini verification leaves the model and effort to agy when unconfigured', async () => {
   const h = harness({ config: { gemini: { command: gemini.command } } });
   await h.verify();

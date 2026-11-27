@@ -273,7 +273,7 @@ test('an instance unloaded by a hot reload leaves automatic verification to the 
   assert.deepEqual(harness.starts.map((start) => start.context.verification_of), ['finished-after-reload']);
 });
 
-test('turning off convergence, historical gaps and verification reuse preserves the baseline runner trace', async t => {
+test('turning off convergence, historical gaps and verification reuse preserves the baseline trace plus writer preflight', async t => {
   const trace = async (plugin, config) => {
     const harness = fixture(t);
     const source = harness.add('source', { thread_id: 'thread', structured: { blockers: [question('missing-input')] } });
@@ -290,12 +290,15 @@ test('turning off convergence, historical gaps and verification reuse preserves 
     });
   };
   const actual = await trace(apply, { convergenceGuard: false, historicalGapReview: false, verificationReuse: false });
+  const writerQuery = ([argv]) => argv[0] === 'list' && !argv.includes('--owner') && argv.includes('--status');
+  assert.equal(actual.filter(writerQuery).length, 1);
+  const baselineTrace = actual.filter(call => !writerQuery(call));
   const baselineEntry = process.env.CONDUCTOR_BASELINE_ENTRY;
   if (baselineEntry) {
     const baseline = await import(pathToFileURL(baselineEntry));
-    assert.deepEqual(actual, await trace(baseline.apply, {}));
+    assert.deepEqual(baselineTrace, await trace(baseline.apply, {}));
   }
-  assert.deepEqual(actual.map(([argv]) => argv[0]), [
+  assert.deepEqual(baselineTrace.map(([argv]) => argv[0]), [
     'repeat-guard', 'start', 'status', 'list', 'list', 'repeat-guard', 'list', 'start',
     'status', 'review', 'status', 'list', 'repeat-guard', 'start',
   ]);
