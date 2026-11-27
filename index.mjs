@@ -495,7 +495,7 @@ export function createConductor(cfg, run = runRunner) {
     const task = args.rerun_after_change ? `${args.task.trim()}\n\n## 规划端说明的变化\n${args.rerun_after_change.trim()}` : args.task;
     const prompt = composePrompt(task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
       ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify,
-      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of) });
+      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of), evidenceAvailable: engine !== 'gemini' || hostAccess === true });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -544,6 +544,7 @@ export function createConductor(cfg, run = runRunner) {
   const products = (owner) => run(cfg, ['products', '--owner', owner, '--limit', '10000'], { timeoutMs: BRIDGE_TIMEOUT_MS });
   const threadSize = (threadId, signal) => query(['thread-size', threadId], signal);
   const verificationVersion = (jobId, signal) => query(['verification-version', jobId], signal);
+  const worktreeActivity = (paths, signal) => query(['worktree-activity', ...paths.flatMap(p => ['--path', p])], signal);
   function repeatGuard(cwd, signal) {
     const argv = ['repeat-guard'];
     if (cwd) {
@@ -559,10 +560,10 @@ export function createConductor(cfg, run = runRunner) {
     { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   const rollback = (jobId, { check = false } = {}, signal) =>
     run(cfg, ['rollback', jobId, ...(check ? ['--check'] : [])], { signal, timeoutMs: BRIDGE_TIMEOUT_MS });
-  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard, verificationVersion };
+  return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard, verificationVersion, worktreeActivity };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [], verification = false } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [], verification = false, evidenceAvailable = true } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     (mustVerify.length ? `\n验收第 ${mustVerify.join('、')} 条必须实测；在 evidence 写清实际运行或观测的结果及可回查的证据位置。` : '') +
@@ -570,13 +571,14 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
-    (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
+    (!verification ? evidenceAvailable ? '- 验收靠命令输出、HTTP 响应或其他观测证明时，把完整原始输出存进 {{CONDUCTOR_EVIDENCE_DIR}}，evidence 写文件路径；终端里看过的不算留证。该项目外证据目录允许写入。\n' : '- 本单是非主机 Gemini 任务，没有证据目录，保持原有权限；无法留存的观测证据如实标 blocked。\n' : '') +
+    (scope.length ? `- ${evidenceAvailable ? '除证据目录外，' : ''}只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
     (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些 Python re 正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
       '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
       '任务或验收标准本身要求查看或修改这些文件时照常处理。\n' : '') +
     (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
       '只做任务需要的事；任务没有点名的虚拟机、文件和网络设置，不要删除、停止、重建或改配置。\n' : '') +
-    (hostAccess && !write && !verification ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
+    (hostAccess && !write && !verification ? '- 这是只读调查：证据目录外不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
     '- 计划步骤、工具或路径不可用时，在原授权内换方法证明同一验收结果。不得扩大写入、主机访问或目标范围。' +
     '在 deviations 写明换了什么、为何等价。完成可做的部分。\n' +
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
@@ -597,11 +599,15 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
 
 const taskScopePath = (cwd, p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd.replace(/[\\/]+$/, '')}/${p}`);
 
+const evidenceDirectory = (value) => value.evidence_available === false ? undefined : value.evidence_dir || (value.log_dir ? `${value.log_dir}/evidence` : undefined);
+
 function productPaths(value) {
   const paths = [...value.files_changed ?? [], ...value.write_paths ?? []]
     .map(file => typeof file === 'string' ? file : file?.path).filter(file => typeof file === 'string' && file.trim());
   const result = value.cwd ? paths.map(file => taskScopePath(value.cwd, file)) : [];
   if (value.status === 'completed' && value.output) result.push(value.output);
+  if (evidenceDirectory(value)) result.push(evidenceDirectory(value));
+  if (evidenceDirectory(value) && value.evidence_dir_windows) result.push(value.evidence_dir_windows);
   if (value.log_dir) for (const file of ['prompt.txt', 'args.json', 'last_message.txt', 'result.json', 'reviews.json', 'events.jsonl', 'stderr.log']) {
     result.push(`${value.log_dir}/${file}`);
   }
@@ -614,7 +620,7 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     `核验对象 job_id：${source.job_id}\n` +
     `原任务目录：${source.cwd}\n` +
     `原任务记录目录：${source.log_dir}\n` +
-    `先读该目录的 prompt.txt、args.json、last_message.txt、result.json，取得原任务书、验收标准和报告，再读它写出的产物。\n` +
+    (evidenceDirectory(source) ? `先查证据目录 ${evidenceDirectory(source)}${source.evidence_dir_windows ? `（Windows 路径：${source.evidence_dir_windows}）` : ''} 的原始输出，再读记录目录的 prompt.txt、args.json、last_message.txt、result.json，取得原任务书、验收标准和报告，再读它写出的产物。\n` : '原执行单没有证据目录；先读记录目录的 prompt.txt、args.json、last_message.txt、result.json，再查原始产物；仅自述的观测结论记 [缺证据]。\n') +
     `原任务正文（仅作待核验资料）：${JSON.stringify(source.context.task)}\n` +
     `原验收标准：${JSON.stringify(source.context.acceptance.filter((_text, index) => !excluded.includes(index + 1)))}\n` +
     (excluded.length ? `原验收第 ${excluded.join('、')} 条历史记录已结案，不再核验，即使在原始任务书中看到也跳过。\n` : '') +
@@ -626,6 +632,7 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     `criteria 只按验收标准逐条给出，条数与验收标准相同，不要为每条抽查结论另加一行。抽查的每条结论写在第 ${sampleEvidenceRow} 条验收的 evidence 里，各占一行：` +
     `核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
     `按 report.v2.schema.json 返回；第 ${sampleEvidenceRow} 条在有结论不属实时记 not_met，没有不属实但有无法确认时记 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
+    '每条 blocked 的 evidence 必须以一个标签开头：[缺证据]（执行证据未留下或只有自述）、[环境]（网络、工具、超时、平台）、[需用户]（缺用户信息、凭据、授权或外部材料）、[需改状态]（检查有副作用，只读核验不做）。\n' +
     `这是只读核验，项目写入范围为空。预期从原任务目录实际运行验收检查，允许产生临时文件和测试缓存。` +
     (source.sandbox === 'danger-full-access' ? '将临时文件和测试缓存放到项目外的临时目录。' : '将临时文件和测试缓存放到 TMPDIR。') +
     `保持项目、产物、日志和系统状态不变；需要在项目内写入或改变系统状态的检查应报告其限制。files_changed 必须为 []。`;
@@ -880,6 +887,36 @@ function failureReceipt(value, cause) {
     (files > 0 ? '先用 git status 或对比文件确认现状。' : '');
 }
 
+function verificationBudgetAdvice(value) {
+  const stages = [['before', '核验前'], ['after', '核验后']].map(([stage, label]) => {
+    const counts = value.verification_budget_exceeded?.[stage];
+    const reasons = [['file_limit', '单文件 1 MiB 上限'], ['total_limit', '累计 32 MiB 上限'], ['path_limit', '256 条目上限']]
+      .filter(([reason]) => counts?.[reason] > 0)
+      .map(([reason, limit]) => `${limit} ${counts[reason]} 条目`);
+    return reasons.length ? `${label}（${reasons.join('、')}）` : '';
+  }).filter(Boolean);
+  return stages.length ? `物理快照超预算：${stages.join('；')}。` +
+    (value.verification_integrity === 'unavailable' ? '回退比较不可用。' : '已改用回退比较。') : '';
+}
+
+function blockedVerificationAdvice(value) {
+  const source = value.context?.verification_of;
+  if (!source) return '';
+  const groups = new Map(['缺证据', '环境', '需用户', '需改状态'].map(label => [label, []]));
+  (value.structured?.criteria ?? value.report?.criteria ?? []).forEach((row, index) => {
+    const label = row.status === 'blocked' && /^\[(缺证据|环境|需用户|需改状态)\]/.exec(String(row.evidence).trimStart())?.[1];
+    if (label) groups.get(label).push(index + 1);
+  });
+  const actions = {
+    缺证据: `在原线程 codex_continue ${source}，让执行端补采完整原始输出存进证据目录（见执行任务书），再对 ${source} codex_verify。`,
+    环境: `稍后对 ${source} 重新 codex_verify，或下一单用 expect_blocked 声明预计受阻项。`,
+    需用户: '按现有授权记 accepted_deviations 并写明原因（可用 owner_only 保留开放项），或者问用户。',
+    需改状态: '按现有授权记 accepted_deviations 并写明原因（可用 owner_only 保留开放项），或者问用户。',
+  };
+  return [...groups].filter(([, rows]) => rows.length)
+    .map(([label, rows]) => `\n[${label}] 第 ${rows.join('、')} 条：${actions[label]}`).join('');
+}
+
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions, lockEngine = false } = {}) {
@@ -909,11 +946,11 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     const names = Array.isArray(value.verification_changed_paths) ? value.verification_changed_paths : [];
     const total = Number.isInteger(value.verification_changed_total) ? value.verification_changed_total : undefined;
     const target = value.context?.verification_of ? `对原任务 ${value.context.verification_of} ` : '';
-    return '主机核验期间受核验范围的 Git 状态、索引或文件内容发生变化，核验失败，勿使用本轮核验结论。' + (names.length
+    return '主机核验期间受核验范围的工作区文件内容或文件集合比对未通过，核验失败，勿使用本轮核验结论。' + (names.length
       ? `变化的文件（相对仓库根目录）：${names.join('、')}${total > names.length ? ` 等 ${total} 个` : ''}。` +
         `若只是检查自己生成的缓存、日志或构建产物，${target}重新派 codex_verify 即可；若是代码改动，先等改动来源（同目录的写任务）结束再核验。`
-      : total === 0 ? '没有可列出的文件内容变化，变的是 Git 的 HEAD、暂存区或被删除的文件（期间有人提交、暂存或删除了文件）；确认改动来源后再核验。'
-        : '请核对仓库改动来源和现状。');
+      : total === 0 ? '没有可列出的脏文件变化；请核对提交前后的受监控文件内容和删除记录，确认改动来源后再核验。'
+        : '请核对仓库改动来源和现状。') + verificationBudgetAdvice(value);
   }
   if (value.status === 'completed' && value.context?.verification_of && value.report_status !== 'invalid') return `对原任务 ${value.context.verification_of} 的独立核验已结束。` +
     (value.verification_integrity === 'concurrent_changes' ? (Array.isArray(value.verification_changed_paths) && value.verification_changed_paths.length
@@ -923,8 +960,9 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
         '，按其他进程（如常驻程序写日志）处理，核验结论照常可用；若验收依赖这些文件，请核对对应证据。'
       : '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。')
       : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
-    (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个文件的内容未比对，请核对对应验收证据。` : '') +
-    `先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录原任务 ${value.context.verification_of}（核验任务本身不复核、不再核验）；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。`;
+    verificationBudgetAdvice(value) +
+    (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个条目的内容未比对，请核对对应验收证据。` : '') +
+    `先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录原任务 ${value.context.verification_of}（核验任务本身不复核、不再核验）；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。` + blockedVerificationAdvice(value);
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers, ownerDecisions })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
     .replace('先用 git status 或对比文件确认现状', '先用 git status 核对文件列表，内容核对交给 codex_verify')
@@ -3080,14 +3118,16 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     let cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
     if (!cwd) throw reject('codex_run: 当前会话没有工作区，请传 cwd');
     let worktreeLine;
+    const reservation = new Set();
+    try {
     // 没配置 worktree 时不多 await 一拍：派单的调用时序和加载时的自动核验补派有先后约束。
-    if (!verificationOf && cfg.worktree.repos.length) {
-      const placed = await conversationWorktree(args, cwd, exec?.agent?.id, exec?.signal);
+    if (cfg.worktree.repos.length) {
+      const placed = await conversationWorktree(args, cwd, exec?.agent?.id, exec?.signal, reservation, originalTask);
+      if (placed) ({ args, cwd, originalTask } = placed);
+      await reserveDispatch(args, cwd, reservation);
       exec?.signal?.throwIfAborted();
       worktreeLine = placed?.line;
       if (placed?.worktree) {
-        ({ args, cwd } = placed);
-        originalTask = relocateText(originalTask, placed.repo, placed.worktree.path);
         // runner 的 routing 只收字符串、数字、布尔和字符串列表，所以拆成三个字段。
         routing = { ...routing, worktree_path: placed.worktree.path, worktree_branch: placed.worktree.branch, worktree_repo: placed.repo };
       }
@@ -3309,6 +3349,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       guard.onStarted?.(started);
       if (cfg.plannerReads === 'products') rememberJob(started, owner);
     } finally {
+      releaseDispatch(reservation);
       dispatching--;
       if (writer) startingWrites.delete(writer);
       if (overrideSlot) hostConvergenceStarts.delete(overrideSlot);
@@ -3350,6 +3391,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const renderedNext = [standingLine, ...predispatch].filter(Boolean).join('\n');
     return { ...shown, ...(shown.rendered && renderedNext ? { next: [shown.next, renderedNext].filter(Boolean).join('\n') } : {}),
       ...(lines.length ? { [key]: [shown[key], ...lines].filter(Boolean).join('\n') } : {}) };
+    } finally { releaseDispatch(reservation); }
   }
 
   const waitSecondsDescription = `未登记 Harness 后台任务时最多等待的秒数，默认 ${cfg.waitSeconds}。` +
@@ -4411,9 +4453,56 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     repoLocks.set(key, next.catch(() => {}));
     return next;
   }
-  async function ownerJobs(owner, signal, pages = 5) {
+  const worktreeReservations = new Map();
+  const worktreeGenerations = new Map();
+  const dispatchLocations = (args, cwd) => [cwd, ...(args.scope ?? []).map(p => taskScopePath(cwd, p))];
+  const touchesWorktree = (entry, locations) => [entry.path, ...(entry.previous_paths ?? [])]
+    .some(root => root && locations.some(p => typeof p === 'string' && within(p, root)));
+  function reserveWorktrees(repo, args, cwd, reservation) {
+    const locations = dispatchLocations(args, cwd);
+    for (const [key, entry] of Object.entries(readWorktrees())) {
+      if (entry.status !== 'open' || pathKey(entry.repo) !== pathKey(repo) || !touchesWorktree(entry, locations) || reservation.has(key)) continue;
+      reservation.add(key);
+      const pending = worktreeReservations.get(key) ?? new Set();
+      pending.add(reservation);
+      worktreeReservations.set(key, pending);
+      worktreeGenerations.set(key, (worktreeGenerations.get(key) ?? 0) + 1);
+      saveWorktree(key, { ...entry, last_activity_at: new Date().toISOString() });
+    }
+  }
+  async function reserveDispatch(args, cwd, reservation) {
+    const locations = dispatchLocations(args, cwd);
+    const repos = new Map(Object.entries(readWorktrees()).filter(([key, entry]) => entry.status === 'open' &&
+      !reservation.has(key) && touchesWorktree(entry, locations)).map(([, entry]) => [pathKey(entry.repo), entry.repo]));
+    for (const repo of repos.values()) await withRepoLock(repo, () => reserveWorktrees(repo, args, cwd, reservation));
+  }
+  function releaseDispatch(reservation) {
+    for (const key of reservation) {
+      const pending = worktreeReservations.get(key);
+      pending?.delete(reservation);
+      if (!pending?.size) worktreeReservations.delete(key);
+    }
+    reservation.clear();
+  }
+  async function queryWorktreeActivity(found, signal) {
+    const generations = new Map(found.map(({ key }) => [key, worktreeGenerations.get(key)]));
+    const value = await conductor.worktreeActivity([...new Set(found.map(({ entry }) => entry.path))], signal);
+    if (value.status !== 'completed' || !Array.isArray(value.worktrees)) throw new Error(value.error || '查不到完整 worktree 活动记录，保留 worktree');
+    return { generations, worktrees: value.worktrees };
+  }
+  function closeActivity(key, entry, scan) {
+    if (worktreeReservations.has(key)) return { status: 'blocked', reason: 'dispatching', note: 'worktree 有派单正在登记，暂不收尾。' };
+    if (worktreeGenerations.get(key) !== scan.generations.get(key)) return { status: 'blocked', reason: 'recent', note: '查询活动期间 worktree 有新派单，暂不收尾。' };
+    const activity = scan.worktrees.find(item => pathKey(item.path) === pathKey(entry.path));
+    if (!activity || !Array.isArray(activity.running) || !Number.isFinite(activity.last_activity_at)) {
+      throw new Error('查不到完整 worktree 活动记录，保留 worktree');
+    }
+    if (activity.running.length) return { status: 'blocked', reason: 'running', jobs: activity.running,
+      note: `本对话 worktree 里还有单在跑（${activity.running.join('、')}），暂不收尾。` };
+  }
+  async function ownerJobs(owner, signal) {
     const jobs = [];
-    for (let offset = 0, page = 0; offset !== null && page < pages; page++) {
+    for (let offset = 0; offset !== null;) {
       const history = await conductor.list({ owner, also_owners: aliases.predecessors(owner), limit: 100, offset }, signal);
       if (!Array.isArray(history.jobs)) return undefined;
       jobs.push(...history.jobs);
@@ -4421,62 +4510,147 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     return jobs;
   }
+  const cleanupChecks = new Map();
+  const CLEANUP_RECHECK_MS = 30 * 60_000;
+  async function cleanupWorktrees(owner) {
+    if (!worktreesFile || !cfg.worktree.repos.length) return;
+    const checkKey = owner ?? '*';
+    if (cleanupChecks.has(checkKey)) return cleanupChecks.get(checkKey);
+    const found = (owner ? openWorktrees(owner) : Object.entries(readWorktrees()).filter(([, entry]) => entry.status === 'open')
+      .map(([key, entry]) => ({ key, entry })))
+      .filter(({ entry }) => !(Date.now() - Date.parse(entry.last_cleanup?.at) < CLEANUP_RECHECK_MS));
+    if (!found.length) return;
+    const check = (async () => {
+      // 扫描所有 jobs 一次；等待 runner 时不占用仓库锁。
+      let scan, scanError;
+      try { scan = await queryWorktreeActivity(found); } catch (error) { scanError = error; }
+      for (const { key, entry: snapshot } of found) await withRepoLock(snapshot.repo, async () => {
+        const entry = readWorktrees()[key];
+        if (entry?.status !== 'open' || Date.now() - Date.parse(entry.last_cleanup?.at) < CLEANUP_RECHECK_MS) return;
+        let activity = Date.parse(entry.last_activity_at ?? entry.at);
+        let result;
+        try {
+          if (scanError) throw scanError;
+          const blocked = closeActivity(key, entry, scan);
+          const runnerActivity = scan.worktrees.find(item => pathKey(item.path) === pathKey(entry.path));
+          activity = Math.max(Number.isFinite(activity) ? activity : 0, Date.parse(entry.last_merge?.at) || 0, (runnerActivity?.last_activity_at ?? 0) * 1000) || NaN;
+          if (blocked) result = { ...blocked, status: 'skipped' };
+          else {
+            const state = await worktreeStatus(entry);
+            const reason = !state.exists ? 'missing' : state.merging ? 'merging' : state.dirty ? 'worktree_dirty'
+              : state.ahead ? 'not_merged' : !Number.isFinite(activity) ? 'activity_unknown'
+                : Date.now() - activity <= 24 * 3_600_000 ? 'recent' : undefined;
+            result = reason ? { status: 'skipped', reason } : await closeWorktree(entry);
+          }
+        } catch (error) { result = { status: 'error', message: error.message }; }
+        saveWorktree(key, { ...entry, ...(Number.isFinite(activity) ? { last_activity_at: new Date(activity).toISOString() } : {}),
+          ...(result.status === 'closed' ? { status: 'closed' } : {}), last_cleanup: { ...result, at: new Date().toISOString() } });
+      });
+    })();
+    cleanupChecks.set(checkKey, check);
+    try { await check; } finally { cleanupChecks.delete(checkKey); }
+  }
+  if (cfg.worktree.repos.length && worktreesFile) {
+    const cleanupWarning = error => ctx.logger?.warn?.(`[codex-conductor] worktree 自动收尾失败：${error.message}`);
+    ctx.inject?.(['appReady'], () => cleanupWorktrees().catch(cleanupWarning));
+    ctx.on('agent/status', async ({ agent, status }) => {
+      if (status === 'idle' && agent?.id) await cleanupWorktrees(agent.id).catch(cleanupWarning);
+    });
+  }
   // 派单前：本对话在配置的仓库里写东西时，换到本对话的 worktree；第一单写入时才建。
-  async function conversationWorktree(args, cwd, owner, signal) {
+  async function conversationWorktree(args, cwd, owner, signal, reservation, originalTask) {
     if (!cfg.worktree.repos.length || !owner || !worktreesFile) return undefined;
-    // 续接、返工的单 cwd 已经在本对话的 worktree 里：不用换路径，但要带上 worktree，runner 才会提交。
-    const inside = openWorktrees(owner).find(({ entry }) => within(cwd, entry.path));
-    if (inside) return { args, cwd, worktree: inside.entry, repo: inside.entry.repo, line: `本单在本对话的 worktree ${inside.entry.path} 里执行。` };
-    const scoped = (args.scope ?? []).filter(p => typeof p === 'string' && /^(?:[A-Za-z]:[\\/]|\/)/.test(p));
-    const repo = repoFor(cfg.worktree.repos, [cwd, ...scoped]);
+    const ids = new Set([owner, ...aliases.predecessors(owner)]);
+    const records = () => Object.entries(readWorktrees()).filter(([key]) => ids.has(key.slice(0, key.indexOf('::')))).map(([, entry]) => entry);
+    const locations = dispatchLocations(args, cwd);
+    if (args.scope) args = { ...args, scope: args.scope.map(p => taskScopePath(cwd, p)) };
+    const previous = records().find(entry => [entry.path, ...(entry.previous_paths ?? [])].some(root => root && locations.some(p => typeof p === 'string' && within(p, root))));
+    const matching = Object.values(readWorktrees()).find(entry => ['open', 'closed'].includes(entry.status) && touchesWorktree(entry, locations));
+    const repo = previous?.repo ?? matching?.repo ?? repoFor(cfg.worktree.repos, locations);
     if (!repo) return undefined;
-    let found = findWorktree(owner, repo);
-    let line;
-    // 留在原目录的对话，写入时隔一阵重新判断：条件满足了（原目录提交干净、未纳入的文件降下来）就换到 worktree（2026-11-26）。
-    const recheck = found?.entry.status === 'shared' && args.write === true &&
-      !(Date.now() - Date.parse(found.entry.at ?? 0) < SHARED_RECHECK_MS);
-    if (!found || recheck) {
-      if (args.write !== true) return undefined;
-      const key = worktreeKey(owner, repo);
-      const jobs = await ownerJobs(owner, signal).catch(() => undefined);
-      if (!jobs && !found) return { line: `本单在原目录 ${repo} 执行：查不到本对话的派单记录，本单先在原目录执行。` };
-      const touches = (job) => [job.cwd, ...(job.scope_paths ?? [])].some(p => typeof p === 'string' && within(p, repo));
-      // 只读过的不算：新对话常先派只读单看代码再动手（0.9.197）。
-      const earlier = jobs?.some(job => job?.context?.write === true && touches(job));
-      const busy = jobs?.some(job => job?.context?.write === true && job.status === 'running' && touches(job));
-      let entry;
-      if (!jobs) entry = found.entry;
-      else if (busy) entry = { status: 'shared', repo, reason: '本对话在原目录还有写入单在跑，它结束后的写入单再换到 worktree' };
-      else {
-        // 之前在原目录写过东西的对话，只有原目录提交干净时才换过去：那时它写的都在 HEAD 里，worktree 看得到。
-        const dirty = earlier ? await checkoutDirty(repo).catch(error => ({ error: error.message })) : undefined;
-        if (dirty) {
-          entry = { status: 'shared', repo, reason: dirty.error ? `查不了原目录状态（${dirty.error}），继续在原目录工作`
-            : `本对话之前在原目录写过东西，原目录还有 ${dirty.modified} 处未提交的改动、${dirty.untracked} 处未纳入 git 的文件；` +
-              '提交干净后，本对话下一张写入单自动换到 worktree' };
-        } else {
-          const opened = await withRepoLock(repo, () => openWorktree({ repo, root: cfg.worktree.root, owner, maxUntracked: cfg.worktree.maxUntracked }))
-            .catch(error => ({ shared: `开 worktree 失败：${error.message}` }));
-          entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened };
+    return withRepoLock(repo, async () => {
+      const selected = (extra = {}) => {
+        reserveWorktrees(repo, args, cwd, reservation);
+        return { args, cwd, originalTask, ...extra };
+      };
+      const all = readWorktrees();
+      const foreign = Object.entries(all).find(([key, entry]) => entry.status === 'open' && pathKey(entry.repo) === pathKey(repo) &&
+        !ids.has(key.slice(0, key.indexOf('::'))) && touchesWorktree(entry, locations));
+      if (foreign) {
+        const entry = foreign[1];
+        for (const oldPath of entry.previous_paths ?? []) {
+          const move = p => relocate(p, oldPath, entry.path);
+          cwd = move(cwd);
+          originalTask = relocateText(originalTask, oldPath, entry.path);
+          args = { ...args, ...(args.cwd ? { cwd: move(args.cwd) } : {}), task: relocateText(args.task, oldPath, entry.path),
+            ...Object.fromEntries(['scope', 'writable_roots', 'required_writes'].filter(key => args[key]).map(key => [key, args[key].map(move)])) };
         }
+        return selected({ worktree: entry, repo, line: `本单在指定的 worktree ${entry.path} 里执行。` });
       }
-      const before = found?.entry;
-      found = { key, entry: saveWorktree(key, entry) };
-      line = entry.status === 'open'
-        ? `${before ? '原目录已满足条件，' : ''}本对话从这一单起在独立的 git worktree 里工作：${entry.path}（分支 ${entry.branch}，基于 ${entry.base_branch}），原目录 ${repo} 不受影响；` +
-          `${entry.links.length} 个忽略的资料目录${entry.hardlinks ? `和 ${entry.hardlinks} 个忽略的文件` : ''}已链接共用。写入单成功后自动提交，本对话的单全部核验通过后自动合并回 ${entry.base_branch}。`
-        : before?.reason === entry.reason ? undefined : `本对话在原目录 ${repo} 工作，不开 worktree：${entry.reason}。`;
-    }
-    const { entry } = found;
-    if (entry.status !== 'open') return line ? { line } : undefined;
-    if (!existsSync(entry.path)) return { line: `本对话的 worktree ${entry.path} 已不存在，本单在原目录执行；用 codex_worktree 查看。` };
-    const move = (p) => relocate(p, repo, entry.path);
-    const rewritten = { ...args, ...(args.cwd ? { cwd: move(args.cwd) } : {}), task: relocateText(args.task, repo, entry.path),
-      ...(args.scope ? { scope: args.scope.map(move) } : {}),
-      ...(args.writable_roots ? { writable_roots: args.writable_roots.map(move) } : {}),
-      ...(args.required_writes ? { required_writes: args.required_writes.map(move) } : {}) };
-    return { args: rewritten, cwd: move(cwd), worktree: entry, repo,
-      line: line ?? `本单在本对话的 worktree ${entry.path} 里执行。` };
+      const oldPaths = [...new Set([...records(), ...Object.values(all).filter(entry => entry.status === 'closed')]
+        .filter(entry => pathKey(entry.repo) === pathKey(repo))
+        .flatMap(entry => [entry.path, ...(entry.previous_paths ?? [])]).filter(Boolean))];
+      for (const oldPath of oldPaths) {
+        const move = p => relocate(p, oldPath, repo);
+        cwd = move(cwd);
+        originalTask = relocateText(originalTask, oldPath, repo);
+        args = { ...args, ...(args.cwd ? { cwd: move(args.cwd) } : {}), task: relocateText(args.task, oldPath, repo),
+          ...Object.fromEntries(['scope', 'writable_roots', 'required_writes'].filter(key => args[key]).map(key => [key, args[key].map(move)])) };
+      }
+      let found = findWorktree(owner, repo);
+      let line;
+      // 留在原目录的对话，写入时隔一阵重新判断：条件满足了（原目录提交干净、未纳入的文件降下来）就换到 worktree（2026-11-26）。
+      const reopening = found?.entry.status === 'closed';
+      const recheck = found?.entry.status === 'shared' && args.write === true &&
+        !(Date.now() - Date.parse(found.entry.at ?? 0) < SHARED_RECHECK_MS);
+      if (!found || recheck || reopening) {
+        if (args.write !== true) return selected();
+        const key = worktreeKey(owner, repo);
+        const jobs = await ownerJobs(owner, signal).catch(() => undefined);
+        if (!jobs && reopening) throw new Error('已关闭的 worktree 无法重开：查不到派单记录，未启动写入单');
+        if (!jobs && !found) return selected({ line: `本单在原目录 ${repo} 执行：查不到本对话的派单记录，本单先在原目录执行。` });
+        const touches = (job) => [job.cwd, ...(job.scope_paths ?? [])].some(p => typeof p === 'string' && within(p, repo));
+        // 只读过的不算：新对话常先派只读单看代码再动手（0.9.197）。
+        const earlier = jobs?.some(job => job?.context?.write === true && touches(job));
+        const busy = jobs?.some(job => job?.context?.write === true && job.status === 'running' && touches(job));
+        let entry;
+        if (!jobs) entry = found.entry;
+        else if (busy) entry = { status: 'shared', repo, reason: '本对话在原目录还有写入单在跑，它结束后的写入单再换到 worktree' };
+        else {
+          // 之前在原目录写过东西的对话，只有原目录提交干净时才换过去：那时它写的都在 HEAD 里，worktree 看得到。
+          const dirty = earlier && !reopening ? await checkoutDirty(repo).catch(error => ({ error: error.message })) : undefined;
+          if (dirty) {
+            entry = { status: 'shared', repo, reason: dirty.error ? `查不了原目录状态（${dirty.error}），继续在原目录工作`
+              : `本对话之前在原目录写过东西，原目录还有 ${dirty.modified} 处未提交的改动、${dirty.untracked} 处未纳入 git 的文件；` +
+                '提交干净后，本对话下一张写入单自动换到 worktree' };
+          } else {
+            const opened = await openWorktree({ repo, root: cfg.worktree.root, owner, maxUntracked: cfg.worktree.maxUntracked })
+              .catch(error => ({ shared: `开 worktree 失败：${error.message}` }));
+            entry = opened.shared ? { status: 'shared', repo, reason: opened.shared } : { status: 'open', repo, ...opened };
+          }
+        }
+        if (reopening && entry.status !== 'open') throw new Error(`已关闭的 worktree 无法重开：${entry.reason}；未启动写入单`);
+        if (found?.entry.path) entry.previous_paths = [...new Set([...(found.entry.previous_paths ?? []), found.entry.path])];
+        const before = found?.entry;
+        found = { key, entry: saveWorktree(key, entry) };
+        line = entry.status === 'open'
+          ? `${before ? '原目录已满足条件，' : ''}本对话从这一单起在独立的 git worktree 里工作：${entry.path}（分支 ${entry.branch}，基于 ${entry.base_branch}），原目录 ${repo} 不受影响；` +
+            `${entry.links.length} 个忽略的资料目录${entry.hardlinks ? `和 ${entry.hardlinks} 个忽略的文件` : ''}已链接共用。写入单成功后自动提交，本对话的单全部核验通过后自动合并回 ${entry.base_branch}。`
+          : before?.reason === entry.reason ? undefined : `本对话在原目录 ${repo} 工作，不开 worktree：${entry.reason}。`;
+      }
+      let { entry } = found;
+      if (entry.status !== 'open') return selected({ line });
+      if (!existsSync(entry.path)) return selected({ line: `本对话的 worktree ${entry.path} 已不存在，本单在原目录执行；用 codex_worktree 查看。` });
+      const move = (p) => relocate(p, repo, entry.path);
+      const rewritten = { ...args, ...(args.cwd ? { cwd: move(args.cwd) } : {}), task: relocateText(args.task, repo, entry.path),
+        ...(args.scope ? { scope: args.scope.map(move) } : {}),
+        ...(args.writable_roots ? { writable_roots: args.writable_roots.map(move) } : {}),
+        ...(args.required_writes ? { required_writes: args.required_writes.map(move) } : {}) };
+      args = rewritten;
+      cwd = move(cwd);
+      originalTask = relocateText(originalTask, repo, entry.path);
+      return selected({ worktree: entry, repo, line: line ?? `本单在本对话的 worktree ${entry.path} 里执行。` });
+    });
   }
   const mergeLine = (entry, result) => {
     const files = (r) => `${r.files.join('、')}${r.count > r.files.length ? ` 等 ${r.count} 个` : ''}`;
@@ -4515,18 +4689,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     ].filter(Boolean).join('') || undefined;
   }
   async function mergeConversation(owner, found, signal) {
-    const waiting = await mergeGate(owner, found.entry, signal);
-    if (waiting) return { line: waiting };
-    const result = await withRepoLock(found.entry.repo, () => mergeWorktree(found.entry)).catch(error => ({ status: 'error', message: error.message }));
-    if (result.status !== 'nothing') saveWorktree(found.key, { ...found.entry, last_merge: { ...result, at: new Date().toISOString() } });
-    return { result, line: mergeLine(found.entry, result) };
+    return withRepoLock(found.entry.repo, async () => {
+      const entry = readWorktrees()[found.key];
+      if (entry?.status !== 'open') return { line: '本对话 worktree 已收尾。' };
+      const waiting = await mergeGate(owner, entry, signal);
+      if (waiting) return { line: waiting };
+      const result = await mergeWorktree(entry).catch(error => ({ status: 'error', message: error.message }));
+      if (result.status !== 'nothing') saveWorktree(found.key, { ...entry, last_merge: { ...result, at: new Date().toISOString() } });
+      return { result, line: mergeLine(entry, result) };
+    });
   }
   // codex_review 记为结案后调用：被审的单在本对话的某个 worktree 里时，满足闸门就合并。
   async function afterReview(owner, source, signal) {
-    if (!cfg.worktree.repos.length || !owner || typeof source.cwd !== 'string') return undefined;
-    const found = openWorktrees(owner).find(({ entry }) => within(source.cwd, entry.path));
-    if (!found) return undefined;
-    return (await mergeConversation(owner, found, signal).catch(error => ({ line: `自动合并出错：${error.message}` }))).line;
+    if (!cfg.worktree.repos.length || !owner) return undefined;
+    const found = typeof source.cwd === 'string' && openWorktrees(owner).find(({ entry }) => within(source.cwd, entry.path));
+    const merged = found && await mergeConversation(owner, found, signal).catch(error => ({ line: `自动合并出错：${error.message}` }));
+    await cleanupWorktrees().catch(error => ctx.logger?.warn?.(`[codex-conductor] worktree 自动收尾失败：${error.message}`));
+    return merged?.line;
   }
   if (cfg.worktree.repos.length) ctx.tools.register({
     name: 'codex_worktree',
@@ -4552,8 +4731,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const { entry } = found;
         if (args.action === 'status' || entry.status !== 'open') {
           items.push({ repo: entry.repo, status: entry.status, ...(entry.reason ? { reason: entry.reason } : {}),
-            ...(entry.status === 'open' ? { path: entry.path, branch: entry.branch, base_branch: entry.base_branch, ...(await worktreeStatus(entry)) } : {}),
-            ...(entry.last_merge ? { last_merge: entry.last_merge } : {}) });
+            ...(entry.status === 'open' ? { path: entry.path, branch: entry.branch, base_branch: entry.base_branch,
+              ...(await worktreeStatus(entry).catch(error => ({ error: error.message }))) } : {}),
+            ...(entry.last_merge ? { last_merge: entry.last_merge } : {}),
+            ...(entry.last_cleanup ? { last_cleanup: entry.last_cleanup } : {}) });
           continue;
         }
         const merged = await mergeConversation(owner, found, exec?.signal);
@@ -4561,8 +4742,18 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
           items.push({ repo: entry.repo, action: 'merge', ...(merged.result ?? {}), note: merged.line || '没有需要合并的提交。' });
           continue;
         }
-        const closed = await withRepoLock(entry.repo, () => closeWorktree(entry)).catch(error => ({ status: 'error', message: error.message }));
-        if (closed.status === 'closed') saveWorktree(found.key, { ...entry, status: 'closed' });
+        const closed = await (async () => {
+          const scan = await queryWorktreeActivity([found], exec?.signal);
+          return withRepoLock(entry.repo, async () => {
+            const current = readWorktrees()[found.key];
+            if (current?.status !== 'open') return { status: 'closed' };
+            const blocked = closeActivity(found.key, current, scan);
+            if (blocked) return blocked;
+            const result = await closeWorktree(current);
+            if (result.status === 'closed') saveWorktree(found.key, { ...current, status: 'closed' });
+            return result;
+          });
+        })().catch(error => ({ status: 'error', message: error.message }));
         items.push({ repo: entry.repo, action: 'close', merge: merged.line || '没有需要合并的提交。', ...closed });
       }
       return { status: 'ok', worktrees: items };

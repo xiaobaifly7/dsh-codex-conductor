@@ -2,7 +2,7 @@
 // 合并沿用 dsh-worktree-space 的做法：先试合并，冲突留在 worktree 里解决，原目录有重叠的未提交改动就不合并。
 // 被 .gitignore 忽略的资料不进 worktree：忽略的目录用目录联接（junction）接进来，忽略的单个文件用硬链接，都与原目录共用。
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { cp, link, rename, rm, rmdir, symlink, unlink } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -68,7 +68,9 @@ const toMount = (p) => {
 export function relocateText(text, repo, worktree) {
   if (typeof text !== 'string' || !text) return text;
   const forward = normalized(repo);
+  const quoted = p => JSON.stringify(normalized(p).replace(/\//g, '\\')).slice(1, -1);
   const variants = [
+    [quoted(repo), quoted(worktree)],
     [forward.replace(/\//g, '\\'), normalized(worktree).replace(/\//g, '\\')],
     [forward, normalized(worktree)],
     [toMount(repo), toMount(worktree)],
@@ -210,8 +212,8 @@ export async function mergeWorktree(entry) {
 
 export async function worktreeStatus(entry) {
   if (!existsSync(entry.path)) return { exists: false };
-  const dirty = entries((await gitRun(entry.path, ['status', '--porcelain', '-z', '--untracked-files=all'])).stdout).length;
-  const ahead = Number((await gitRun(entry.repo, ['rev-list', '--count', `${entry.base_branch}..${entry.branch}`])).stdout.trim()) || 0;
+  const dirty = entries(await git(entry.path, ['status', '--porcelain', '-z', '--untracked-files=all'])).length;
+  const ahead = Number((await git(entry.repo, ['rev-list', '--count', `${entry.base_branch}..${entry.branch}`])).trim());
   const merging = (await gitRun(entry.path, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD'])).code === 0;
   return { exists: true, dirty, ahead, merging };
 }
@@ -225,22 +227,29 @@ async function keepIgnored(entry) {
   const linked = new Set(entry.links ?? []);
   const moves = [];
   const clashes = [];
-  const all = listed.map(item => item.replace(/\/$/, '')).sort();
-  const skip = [...linked];
+  const all = new Set([...linked, ...listed].map(item => item.replace(/\/$/, '')).sort());
+  const skip = [];
   for (const rel of all) {
-    // 联接里的东西本来就在原目录；整个移走的目录，里面的不再单独处理。
-    if (linked.has(rel) || inside(rel, skip)) continue;
+    // 确认仍共享的联接和整个移走的目录，里面不再单独处理。
+    if (inside(rel, skip)) continue;
     const at = path.join(entry.path, ...rel.split('/'));
     const home = path.join(entry.repo, ...rel.split('/'));
     let mine;
     try { mine = lstatSync(at, { bigint: true }); } catch { continue; }
-    if (mine.isSymbolicLink()) continue;
+    if (mine.isSymbolicLink()) {
+      if (!linked.has(rel) || pathKey(realpathSync.native(at)) !== pathKey(realpathSync.native(home))) clashes.push(rel);
+      skip.push(rel);
+      continue;
+    }
     let theirs;
     try { theirs = lstatSync(home, { bigint: true }); } catch { moves.push({ rel, at, home }); skip.push(rel); continue; }
     // 开 worktree 时建的硬链接没被替换过，原目录就是同一份。
     if (mine.isFile() && theirs.isFile() && mine.ino === theirs.ino && mine.dev === theirs.dev) continue;
-    // 两边都是目录、git 也列出了里面的文件时，逐个文件处理；没列出里面的就不知道有什么，按冲突处理。
-    if (mine.isDirectory() && theirs.isDirectory() && all.some(other => other.startsWith(`${rel}/`))) continue;
+    // git 可能只列出整个忽略目录；递归检查同名目录，Set 避免重复处理它也列出的内部项。
+    if (mine.isDirectory() && theirs.isDirectory()) {
+      for (const name of readdirSync(at)) all.add(`${rel}/${name}`);
+      continue;
+    }
     clashes.push(rel);
   }
   if (clashes.length) return { clashes };

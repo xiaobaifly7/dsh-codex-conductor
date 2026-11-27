@@ -855,9 +855,16 @@ def build_command(args, run_dir, thread_id, scratch=None):
                     "-c", "sandbox_workspace_write.network_access=false"]
         for key, value in scratch_env.items():
             cmd += ["-c", f"shell_environment_policy.set.{key}={json.dumps(value, ensure_ascii=False)}"]
-    elif args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
-        cmd += ["-c", "sandbox_workspace_write.writable_roots=" +
-                json.dumps([local_path(p) for p in args.writable_roots], ensure_ascii=False)]
+    if args.sandbox == "workspace-write":
+        roots = [local_path(p) for p in getattr(args, "writable_roots", None) or []]
+        evidence = getattr(args, "evidence_dir", None)
+        if roots:
+            if evidence:
+                roots.append(str(evidence))
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(roots, ensure_ascii=False)]
+        elif evidence:
+            # Parent exec options also apply to resume; add-dir retains roots from user/project configuration.
+            cmd[len(prefix) + 1:len(prefix) + 1] = ["--add-dir", str(evidence)]
     git_env = linked_worktree_git_env(getattr(args, "cwd", None))
     if git_env:
         env.update(git_env)
@@ -1046,6 +1053,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
 def run_process(args, prompt, run_dir, thread_id, repeat_guard=None):
     """Run one provider process to a verdict, including command setup failures. A completed turn determines success."""
     scratch = getattr(args, "verification_scratch", None)
+    if scratch is None and args.sandbox == "read-only" and getattr(args, "engine", None) != "gemini":
+        scratch = getattr(args, "evidence_dir", None)
     gemini = getattr(args, "engine", None) == "gemini"
     id_field = "conversation_id" if gemini else "thread_id"
     fallback_check = getattr(args, "gemini_fallback_check", False)
@@ -2194,33 +2203,6 @@ def verification_changed_names(before, after):
     return sorted(os.fsdecode(name) for name in names)
 
 
-def verification_only_appended(cwd, before, after):
-    """"hash" or "size" when every changed dirty file is a regular file that only grew, with its earlier bytes unchanged
-    when they were hashed ("size": some were too many to hash, so only their growth was checked); otherwise None."""
-    changed = [name for name in before if verification_observations_changed({name: before[name]}, {name: after[name]})]
-    try:
-        top = Path(local_path(os.fsdecode(git(cwd, "rev-parse", "--show-toplevel", deadline=time.monotonic() + 10)).rstrip("\r\n")))
-    except (OSError, ValueError, subprocess.TimeoutExpired):
-        return None
-
-    def appended(name):
-        (old_size, _, old_kind), old_hash = before[name]
-        (new_size, _, new_kind), _ = after[name]
-        if old_kind != new_kind or not stat.S_ISREG(new_kind) or new_size <= old_size:
-            return False
-        if old_hash is None:
-            return True  # shortcut: with more dirty files than are content-hashed only sizes are known; growth is all we check
-        try:
-            with open(top / os.fsdecode(name), "rb") as file:
-                return hashlib.sha256(file.read(old_size)).hexdigest() == old_hash
-        except OSError:
-            return False
-
-    if not all(appended(name) for name in changed):
-        return None
-    return "size" if any(before[name][1] is None for name in changed) else "hash"
-
-
 def stat_fingerprint(info):
     return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
 
@@ -2297,47 +2279,174 @@ def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
     return hashes, unchecked
 
 
-def verification_git_digest(cwd, paths, *, budget=30, strict=False, whole=True):
+def verification_working_files(directory, relative, deadline, *, budget_exceeded=None):
+    """Read physical work files; Git conversions and index entries are not working-file evidence."""
+    working, unchecked = {}, set()
+    remaining = VERIFY_TOTAL_LIMIT
+    if budget_exceeded is None:
+        budget_exceeded = {}
+
+    def exceeded(kind):
+        budget_exceeded[kind] = budget_exceeded.get(kind, 0) + 1
+
+    def content_limit(size):
+        if size > VERIFY_FILE_LIMIT:
+            exceeded("file_limit")
+        if size > remaining:
+            exceeded("total_limit")
+
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    def scan(path):
+        nonlocal remaining
+        if time.monotonic() >= deadline:
+            raise subprocess.TimeoutExpired("verification working files", 0)
+        name = os.fsencode(path.relative_to(directory).as_posix())
+        if name in working or name in unchecked:
+            return
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return
+        except OSError:
+            unchecked.add(name)
+            return
+        if len(working) >= VERIFY_CONTENT_FILES:
+            exceeded("path_limit")
+            unchecked.add(name)
+            return
+        working[name] = ("unchecked", None, info.st_mode)
+        try:
+            if stat.S_ISDIR(info.st_mode):
+                working[name] = ("directory", None, info.st_mode)
+                # A checked-out submodule is a directory boundary, independent of its staged gitlink OID.
+                if path != directory and os.path.lexists(path / ".git"):
+                    return
+                with os.scandir(path) as entries:
+                    names = sorted(entry.name for entry in entries if entry.name != ".git")
+                for child in names:
+                    scan(path / child)
+                with os.scandir(path) as entries:
+                    if names != sorted(entry.name for entry in entries if entry.name != ".git"):
+                        unchecked.add(name)
+                if path.lstat().st_mode != info.st_mode:
+                    unchecked.add(name)
+                return
+            limit = min(remaining, VERIFY_FILE_LIMIT)
+            if stat.S_ISLNK(info.st_mode):
+                content = os.fsencode(os.readlink(path))
+                kind = "link"
+            elif stat.S_ISREG(info.st_mode) and info.st_size <= limit:
+                kind = "content"
+                with os.fdopen(os.open(path, flags), "rb") as file:
+                    opened = os.fstat(file.fileno())
+                    # Windows lstat/fstat can disagree on ctime; retain ctime checks within each source.
+                    if not stat.S_ISREG(opened.st_mode) or identity(info)[:-1] != identity(opened)[:-1] or (
+                            not IS_WIN and info.st_ctime_ns != opened.st_ctime_ns):
+                        unchecked.add(name)
+                        return
+                    content = file.read(limit + 1)
+                    if identity(opened) != identity(os.fstat(file.fileno())):
+                        unchecked.add(name)
+                        return
+            else:
+                if stat.S_ISREG(info.st_mode):
+                    content_limit(info.st_size)
+                unchecked.add(name)
+                return
+            if len(content) > limit:
+                content_limit(len(content))
+                unchecked.add(name)
+                return
+            if identity(info) != identity(path.lstat()):
+                unchecked.add(name)
+                return
+            remaining -= len(content)
+            working[name] = (kind, hashlib.sha256(content).hexdigest(), info.st_mode)
+        except (OSError, ValueError):
+            unchecked.add(name)
+
+    for name in relative:
+        path = directory / name
+        # Do not follow symlink ancestors or expand a submodule when a child is explicitly named.
+        for parent in reversed(path.parents):
+            if parent != directory and parent.is_relative_to(directory) and (
+                    parent.is_symlink() or os.path.lexists(parent / ".git")):
+                path = parent
+                break
+        if ".git" not in path.relative_to(directory).parts:
+            scan(path)
+    if time.monotonic() >= deadline:
+        raise subprocess.TimeoutExpired("verification working files", 0)
+    observations = {name: ((None, None, mode), content) for name, (_, content, mode) in working.items()}
+    return observations, working, unchecked
+
+
+def verification_git_digest(cwd, paths, *, budget=30, strict=False, whole=True, legacy=False, budget_exceeded=None):
     deadline = time.monotonic() + budget
+    directory = Path(cwd)
+    if not strict and not legacy and not os.environ.get("GIT_DIR") and not any(
+            os.path.lexists(parent / ".git") for parent in (directory, *directory.parents)):
+        root = Path(normalized_path(cwd))
+        if any(not Path(normalized_path(path)).is_relative_to(root) for path in paths):
+            return None, None, set()
+        relative = sorted({os.path.relpath(path, directory) for path in paths})
+        hashes, working, unchecked = verification_working_files(directory, relative, deadline, budget_exceeded=budget_exceeded)
+        checksum = hashlib.sha256(repr(sorted(working.items())).encode("utf-8")).digest()
+        return None, (checksum, hashes, working), unchecked
 
     def digest(query):
-        head = query("rev-parse", "--verify", "HEAD")
+        head = query("rev-parse", "--verify", "HEAD") if strict or legacy else b""
+        if not strict and whole:
+            with suppress(ValueError):
+                head = query("rev-parse", "--verify", "HEAD")
         top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
         directory = Path(local_path(top))
         root = Path(normalized_path(str(directory)))
+        if not strict and not legacy and any(not Path(normalized_path(path)).is_relative_to(root) for path in paths):
+            return None, None, set()
         relative = sorted({Path(*Path(path).parts[len(root.parts):]).as_posix()
                            for path in paths if Path(normalized_path(path)).is_relative_to(root)})
         if not relative:
             return None, None, set()
-        tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
-        index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
-                      "HEAD", "--", *relative, at=top)
-        scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
-        # SQLite's -shm is the shared-memory index every reader of a WAL database rewrites; it holds no data. A verifier
-        # that only queried a product database failed on it (d8778b, 2026-11-25).
-        scoped = b"\0".join(entry for entry in scoped.split(b"\0") if not entry.endswith(b"-shm"))
-        if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
-            return None, None, set()
-        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)
-        checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
-        # Whole-repository status only feeds the outside-the-scope warning, so it runs last and may give up: on a /mnt
-        # repository with many untracked files it took 39 s alone and timed the scoped check out with it (2026-11-23).
+        if strict or legacy:
+            tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
+            index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
+                          "HEAD", "--", *relative, at=top)
+            scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
+            # Strict versioning and incomplete physical checks retain the original Git snapshot contract.
+            scoped = b"\0".join(entry for entry in scoped.split(b"\0") if not entry.endswith(b"-shm"))
+            if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
+                return None, None, set()
+            hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)
+            checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
+            return None, (checksum, hashes), unchecked
+        hashes, working, unchecked = verification_working_files(directory, relative, deadline, budget_exceeded=budget_exceeded)
+        checksum = hashlib.sha256(repr(sorted(working.items())).encode("utf-8")).digest()
+        # Whole status is only an outside-scope warning and must not consume the working-file budget.
         status = None
-        if not strict and whole:
-            with suppress(subprocess.TimeoutExpired):
+        if whole:
+            with suppress(OSError, ValueError, subprocess.TimeoutExpired):
                 status = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS, until=deadline - 2)).digest()
-        return status, (checksum, hashes), unchecked
+        return status, (checksum, hashes, working), unchecked
 
     return git_on_tree(cwd, deadline, digest, raise_errors=True)
 
 
-def verification_paths(context, cwd):
+def verification_metadata_unchanged(cwd, before, after):
+    """Only complete physical snapshots prove the same file set, bytes, modes and link targets."""
+    return before[2] == after[2] and all(value[0] != "unchecked" for value in before[2].values())
+
+
+def verification_paths(context, cwd, *, legacy=False):
     source = job_status(context["verification_of"])
     if not source.get("cwd") or tree_key(source["cwd"]) != tree_key(cwd):
         return []
     files = [entry.get("path") if isinstance(entry, dict) else entry
              for entry in (source.get("files_changed") or []) + (source.get("write_paths") or [])]
-    return [scope_path(cwd, path) for path in [*(source.get("scope_paths") or source.get("scope") or []), *files]
+    scope = (source.get("scope_paths") or source.get("scope")) if legacy else (source.get("scope") or source.get("scope_paths"))
+    return [scope_path(cwd, path, resolve=None if legacy else os.path.abspath) for path in [*(scope or []), *files]
             if isinstance(path, str) and path.strip()]
 
 
@@ -2606,6 +2715,8 @@ def parse_final_message(final):
 def execute(args, prompt, run_dir):
     run_dir.mkdir(parents=True, exist_ok=True)
     args.cwd = os.path.realpath(args.cwd)
+    if getattr(args, "schema", None):
+        args.schema = scope_path(args.cwd, args.schema)
     gemini = getattr(args, "engine", None) == "gemini"
     id_field = "conversation_id" if gemini else "thread_id"
     scope_args = [scope_path(args.cwd, s) for s in getattr(args, "scope", None) or []]
@@ -2626,6 +2737,47 @@ def execute(args, prompt, run_dir):
         args.context = context or None
         base["task_options"] = task_options(vars(args))
     verification = context.get("verification_of") and context.get("write") is False
+    evidence_allowed = not gemini or args.sandbox == "danger-full-access"
+    if not verification and not evidence_allowed:
+        base["evidence_available"] = False
+        args.evidence_dir = None
+        prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", "不可用（本单没有证据目录）")
+        prompt += "\n本单是非主机 Gemini 任务，没有证据目录，保持原有权限，不为留证扩大访问范围；无法留存的观测证据如实标 blocked。\n"
+    if not verification and evidence_allowed:
+        evidence = (run_dir / "evidence").resolve()
+        project_root = args.cwd
+        known_git = os.environ.get("GIT_DIR") or any(
+            os.path.lexists(parent / ".git") for parent in (Path(args.cwd), *Path(args.cwd).parents))
+        if known_git:
+            try:
+                project_root = os.fsdecode(git(args.cwd, "rev-parse", "--show-toplevel", deadline=time.monotonic() + 10)).strip()
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                return {**base, "status": "failed", "error_kind": "evidence_directory_unknown",
+                        "error": f"Cannot determine the repository boundary for evidence: {error}", "retryable": False, "attempts": 0}
+        project = Path(normalized_path(local_path(project_root)))
+        evidence_root = Path(normalized_path(str(evidence)))
+        if evidence_root.is_relative_to(project) or project.is_relative_to(evidence_root):
+            temporary = Path(tempfile.gettempdir()).resolve()
+            temporary_root = Path(normalized_path(str(temporary)))
+            if temporary_root.is_relative_to(project):
+                return {**base, "status": "failed", "error_kind": "evidence_directory_overlap",
+                        "error": "Evidence directory must be outside the project directory.", "retryable": False, "attempts": 0}
+            evidence = Path(tempfile.mkdtemp(prefix="codex-runner-evidence-", dir=temporary))
+        evidence.mkdir(parents=True, exist_ok=True)
+        base["evidence_dir"] = str(evidence)
+        args.evidence_dir = evidence
+        if gemini:
+            import agy_runner
+            args.evidence_dir = agy_runner.evidence_path(evidence, windows_agy(args.agy_command))
+            if windows_agy(args.agy_command):
+                base["evidence_dir_windows"] = args.evidence_dir
+        prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", str(args.evidence_dir))
+        prompt += (f"\n\nExternal evidence directory (absolute): {json.dumps(str(args.evidence_dir), ensure_ascii=False)}\n"
+                   "任务需要保存的日志、截图、测试输出等证据写入上述目录。只读任务也允许向该目录留证，"
+                   "项目和其他路径仍遵守原写入约束。\n")
+        if not gemini and args.sandbox == "read-only":
+            prompt = (f"Project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
+                      "当前目录是外部证据目录；先读取项目目录中适用的 AGENTS.md。项目目录只读，项目相对路径以上述项目目录为准。\n\n" + prompt)
     host_verification = verification and args.sandbox == "danger-full-access"
     if not gemini and verification and args.sandbox in ("read-only", "danger-full-access"):
         scratch = (run_dir / "scratch").resolve()
@@ -2643,22 +2795,33 @@ def execute(args, prompt, run_dir):
                   "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
     declared_paths = verification_paths(context, args.cwd) if host_verification else []
     paths = declared_paths or [args.cwd]
+    legacy_paths = (verification_paths(context, args.cwd, legacy=True) or [args.cwd]) if host_verification else []
 
     whole_known_slow = host_verification and WHOLE_TOO_SLOW + tree_key(args.cwd) in too_big_trees()
 
-    def take_snapshot(stage, whole):
+    snapshot_budgets = {}
+
+    def take_snapshot(stage, whole, *, legacy=False):
+        exceeded = {}
         try:
-            digest = verification_git_digest(args.cwd, paths, whole=whole)
+            digest = verification_git_digest(args.cwd, legacy_paths if legacy else paths, whole=whole,
+                                             **({"legacy": True} if legacy else {"budget_exceeded": exceeded}))
         except subprocess.TimeoutExpired:
             return None, f"{stage}_timeout"
         except (OSError, ValueError):
             return None, f"{stage}_git_error"
         except RuntimeError:
             return None, f"{stage}_error"
+        finally:
+            if exceeded:
+                snapshot_budgets[stage] = exceeded
         return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
 
+    # Keep the old baseline even when the first physical snapshot is complete: the second may exceed its budget.
+    before_legacy, before_legacy_reason = take_snapshot("before", False, legacy=True) if host_verification else (None, None)
     before_digest, before_reason = take_snapshot("before", not whole_known_slow) if host_verification else (None, None)
-    if before_digest is not None and before_digest[0] is None and not whole_known_slow:
+    if before_digest is not None and before_digest[0] is None and not whole_known_slow and any(
+            os.path.lexists(parent / ".git") for parent in (Path(args.cwd), *Path(args.cwd).parents)):
         remember_too_big(args.cwd, WHOLE_TOO_SLOW)  # a usable before-digest without a whole status means it timed out
     verification_scope = (context.get("routing") or {}).get("verification_scope") if verification else None
     version_source = job_status(context["verification_of"]) if isinstance(verification_scope, str) else None
@@ -2672,38 +2835,41 @@ def execute(args, prompt, run_dir):
         # Without a whole status from before there is nothing to compare one from after with.
         after_digest, reason = take_snapshot("after", before_digest[0] is not None) if before_digest is not None \
             else (None, before_reason)
-        if reason:
-            result.update(verification_integrity="unavailable", verification_integrity_reason=reason)
+        result["verification_budget_exceeded"] = snapshot_budgets
+        complete = not reason and not before_digest[2] and not after_digest[2]
+        if complete:
+            before_whole, before_scope, _ = before_digest
+            after_whole, after_scope, _ = after_digest
+            scope_changed = not verification_metadata_unchanged(args.cwd, before_scope, after_scope)
+            compared_before, compared_after = before_scope, after_scope
         else:
-            before_whole, before_scope, before_unchecked = before_digest
-            after_whole, after_scope, after_unchecked = after_digest
-            scope_changed = before_scope[0] != after_scope[0] or verification_observations_changed(
-                before_scope[1], after_scope[1])
-            unchecked = before_unchecked | after_unchecked
-            if unchecked:
-                result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
-            changed = verification_changed_names(before_scope[1], after_scope[1]) if scope_changed else []
-            # Same status, tree and index, and the only changes are appends to already-dirty files under a scope directory
-            # that are neither a product nor named in the scope: another process writing there, not the verifier. A
-            # console watcher appending to its log under a "10-audit" scope failed three verifications in a row (2026-11-23).
-            pinned = [normalized_path(path).replace("\\", "/").lower() for path in declared_paths if not os.path.isdir(path)]
-            background = bool(declared_paths) and before_scope[0] == after_scope[0] and bool(changed) and \
-                before_scope[1].keys() == after_scope[1].keys() and not any(
-                    path.endswith("/" + name.lower()) for name in changed for path in pinned) and \
-                verification_only_appended(args.cwd, before_scope[1], after_scope[1])
-            if background:
-                result.update(verification_integrity="concurrent_changes", verification_changed_paths=changed[:20],
-                              verification_changed_total=len(changed), verification_append_check=background)
-            elif scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
-                result.pop("structured", None)
-                # Named so the planner, which cannot read the project, can tell check output from a real edit (2026-11-23).
-                result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
-                              error="Git status, index or file contents changed within the monitored verification paths.",
-                              verification_changed_paths=changed[:20], verification_changed_total=len(changed))
-            elif scope_changed or None not in (before_whole, after_whole) and before_whole != after_whole:
-                result["verification_integrity"] = "concurrent_changes"
-            if None in (before_whole, after_whole):
-                result["verification_outside_scope"] = "unchecked"
+            after_legacy, legacy_reason = take_snapshot("after", False, legacy=True) if before_legacy is not None \
+                else (None, before_legacy_reason)
+            if legacy_reason:
+                result.update(verification_integrity="unavailable", verification_integrity_reason=legacy_reason)
+                return result
+            before_whole = before_digest[0] if before_digest else None
+            after_whole = after_digest[0] if after_digest else None
+            compared_before, compared_after = before_legacy[1], after_legacy[1]
+            scope_changed = compared_before[0] != compared_after[0] or verification_observations_changed(
+                compared_before[1], compared_after[1])
+            unchecked = before_legacy[2] | after_legacy[2]
+            for digest in (before_digest, after_digest):
+                if digest is not None:
+                    unchecked |= digest[2]
+            result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
+            if reason:
+                result["verification_integrity_reason"] = reason
+        if scope_changed:
+            changed = verification_changed_names(compared_before[1], compared_after[1])
+            result.pop("structured", None)
+            result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
+                          error="Monitored working files or their fallback Git snapshot changed during verification.",
+                          verification_changed_paths=changed[:20], verification_changed_total=len(changed))
+        elif complete and None not in (before_whole, after_whole) and before_whole != after_whole:
+            result["verification_integrity"] = "concurrent_changes"
+        if None in (before_whole, after_whole):
+            result["verification_outside_scope"] = "unchecked"
         return result
 
     repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
@@ -2792,7 +2958,12 @@ def execute(args, prompt, run_dir):
         def changes():
             if args.sandbox == "read-only":
                 return {}
-            result = files_changed(args.cwd, before, event_changes, scope, ignore)
+            evidence_roots = [str(base[key]).replace("\\", "/").rstrip("/") for key in
+                              ("evidence_dir", "evidence_dir_windows") if base.get(key)]
+            events = [(path, kind) for path, kind in event_changes if not any(
+                str(path).replace("\\", "/") == root or str(path).replace("\\", "/").startswith(root + "/")
+                for root in evidence_roots)]
+            result = files_changed(args.cwd, before, events, scope, ignore)
             if gemini:
                 result["files_changed_source"] = result["files_changed_source"].replace("codex_events", "gemini_events")
             return result
@@ -2806,6 +2977,7 @@ def execute(args, prompt, run_dir):
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if gemini or args.sandbox != "read-only" else args.resume
         prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
+        (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
         original_prompt = prompt
         thread_id = args.resume
         attempt = 0
@@ -4006,6 +4178,45 @@ def matching_jobs(args, *, page_dates=None):
     return jobs
 
 
+def worktree_activity(paths):
+    """Read registration records once; unfinished registrations reserve their paths without event replay."""
+    roots = [(value, Path(tree_key(value))) for value in paths]
+    items = [{"path": value, "running": [], "last_activity_at": 0} for value, _ in roots]
+    directories = list(job_directories())
+    runs = HOME / "runs"
+    if runs.exists():
+        directories.extend(p for p in runs.iterdir() if p.is_dir() and (p / "write-lock.json").is_file())
+    for directory in directories:
+        task = task_record(directory)
+        if not task or not isinstance(task.get("cwd"), str):
+            raise ValueError(f"Incomplete task registration: {directory.name}")
+        try:
+            result = json.loads((directory / "result.json").read_text("utf-8"))
+        except FileNotFoundError:
+            result = None
+        if result is not None and not isinstance(result, dict):
+            raise ValueError(f"Invalid result: {directory.name}")
+        value = {**task, **(result or {})}
+        cwd = value["cwd"]
+        scopes = value.get("scope_paths") or [scope_path(cwd, item) for item in value.get("scope") or []]
+        locations = [Path(tree_key(item)) for item in [cwd, *scopes]]
+        matching = [index for index, (_, root) in enumerate(roots) if any(p.is_relative_to(root) for p in locations)]
+        if not matching:
+            continue
+        times = job_listing_times(directory)
+        activity = max([v for v in times.values() if isinstance(v, (int, float))] +
+                       [value[k] for k in ("started_at", "finished_at", "updated_at")
+                        if isinstance(value.get(k), (int, float)) and isfinite(value[k])])
+        running = result is None or value.get("status") not in ("completed", "failed", "cancelled") or value.get("execution_status") == "running"
+        for index in matching:
+            items[index]["last_activity_at"] = max(items[index]["last_activity_at"], activity)
+            if running:
+                items[index]["running"].append(directory.name)
+    for item in items:
+        item["running"].sort()
+    return {"status": "completed", "worktrees": items}
+
+
 def list_jobs(args):
     requested = slice(args.offset, args.offset + args.limit)
     filters = ("cwd", "owner", "status", "job_id", "thread_id", "parent_job", "needs_attention",
@@ -4754,6 +4965,8 @@ def main():
     repeat_guard.add_argument("--cwd", default=os.getcwd())
     repeat_guard.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
     repeat_guard.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
+    activity = sub.add_parser("worktree-activity")
+    activity.add_argument("--path", action="append", required=True)
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
     for command in (run, start, status, listing, summary):
@@ -4829,6 +5042,12 @@ def main():
         return
     if args.command == "verification-version":
         emit({"status": "completed", "verification_version": verification_version(job_status(args.job_id))})
+        return
+    if args.command == "worktree-activity":
+        try:
+            emit(worktree_activity(args.path))
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            emit({"status": "failed", "error_kind": "invalid_record", "error": str(error), "retryable": False})
         return
     if args.command == "repeat-guard":
         try:

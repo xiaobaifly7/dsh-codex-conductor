@@ -365,6 +365,43 @@ class AdapterTests(unittest.TestCase):
             self.assertIn("write_file(*)", permissions(sandbox="danger-full-access", context={"write": False})["deny"])
             self.assertIn("write_file(*)", permissions(agy_home=r"D:\pool\acc 1")["deny"])
 
+    def test_read_only_evidence_permission_accepts_windows_unc_without_widening_writes(self):
+        evidence = r"\\wsl.localhost\Ubuntu-24.04\tmp\job\evidence"
+        with tempfile.TemporaryDirectory() as run_dir:
+            for sandbox in ("read-only", "danger-full-access"):
+                with self.subTest(sandbox=sandbox):
+                    command, _ = agy_runner.build_command(args(
+                        r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox=sandbox,
+                        context={"write": False}, evidence_dir=evidence), run_dir, None)
+                    settings = json.loads(command[command.index("--settings") + 1])
+                    permissions = settings["permissions"]
+                    self.assertNotIn("write_file(*)", permissions["allow"])
+                    self.assertEqual(settings["allowNonWorkspaceAccess"], sandbox == "danger-full-access")
+                    if sandbox == "read-only":
+                        self.assertEqual(permissions["allow"], [])
+                        self.assertIn("write_file(*)", permissions["deny"])
+                        self.assertIn("command(*)", permissions["deny"])
+                    else:
+                        self.assertIn("write_file(//wsl.localhost/Ubuntu-24.04/tmp/job/evidence)", permissions["allow"])
+                        self.assertNotIn("write_file(*)", permissions["deny"])
+
+    def test_non_host_evidence_preserves_the_original_permission_boundary(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            command, _ = agy_runner.build_command(args(
+                r"D:\project", agy_command=r"C:\tools\agy.exe", context={"write": False},
+                evidence_dir=r"\\wsl.localhost\Ubuntu-24.04\tmp\evidence"), run_dir, None)
+            settings = json.loads(command[command.index("--settings") + 1])
+            self.assertFalse(settings["allowNonWorkspaceAccess"])
+            self.assertEqual(settings["permissions"]["allow"], [])
+            self.assertIn("write_file(*)", settings["permissions"]["deny"])
+            self.assertIn("command(*)", settings["permissions"]["deny"])
+
+    def test_evidence_path_translates_wsl_native_directory_with_wslpath(self):
+        with mock.patch.object(agy_runner.subprocess, "check_output", return_value="\\\\wsl.localhost\\Ubuntu-24.04\\tmp\\job\\evidence\n") as convert, \
+                mock.patch.object(agy_runner.os, "name", "posix"):
+            self.assertTrue(agy_runner.evidence_path("/tmp/job/evidence", True).startswith("\\\\wsl.localhost"))
+        convert.assert_called_once_with(["wslpath", "-w", "/tmp/job/evidence"], text=True, timeout=10)
+
     def test_host_read_only_jobs_keep_python_caches_out_of_the_project(self):
         with tempfile.TemporaryDirectory() as run_dir:
             def env_of(**overrides):

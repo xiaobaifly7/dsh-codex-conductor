@@ -2740,7 +2740,7 @@ test('composePrompt adds the host-access lines only with host_access, the read-o
   const rw = prompt({ hostAccess: true, write: true });
   assert.match(rw, /只允许改动[\s\S]*沙箱外运行[\s\S]*pwsh\.exe、ssh\.exe、Hyper-V cmdlet[\s\S]*不要删除、停止、重建或改配置。\n[\s\S]*## 最后汇报/);
   assert.doesNotMatch(rw, /只读调查/);
-  assert.match(prompt({ hostAccess: true }), /不要删除、停止、重建或改配置。\n- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n/);
+  assert.match(prompt({ hostAccess: true }), /不要删除、停止、重建或改配置。\n- 这是只读调查：证据目录外不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n/);
 });
 
 test('host_access runs Codex with danger-full-access, and only when allowHostAccess is on', async () => {
@@ -2926,7 +2926,7 @@ test('verification_tree_changed nextStep names the changed files when the runner
   const named = nextStep({ ...job, verification_changed_paths: ['sub/a.txt', 'sub/out.log'], verification_changed_total: 23 });
   assert.match(named, /勿使用本轮核验结论。变化的文件（相对仓库根目录）：sub\/a\.txt、sub\/out\.log 等 23 个。/);
   assert.match(named, /对原任务 SRC 重新派 codex_verify/);
-  assert.match(nextStep({ ...job, verification_changed_paths: [], verification_changed_total: 0 }), /变的是 Git 的 HEAD、暂存区或被删除的文件/);
+  assert.match(nextStep({ ...job, verification_changed_paths: [], verification_changed_total: 0 }), /核对提交前后的受监控文件内容和删除记录/);
   assert.match(nextStep(job), /勿使用本轮核验结论。请核对仓库改动来源和现状。$/);
   const done = { job_id: 'V', status: 'completed', report_status: 'valid', verification_integrity: 'concurrent_changes',
     context: { verification_of: 'SRC', write: false } };

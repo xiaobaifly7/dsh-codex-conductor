@@ -63,6 +63,8 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
     if (argv[0] === 'list' && listed) return listed(argv);
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
     if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
+    if (argv[0] === 'worktree-activity') return { status: 'completed', worktrees: argv.slice(1).filter((_, i) => i % 2 === 1)
+      .map(root => ({ path: root, running: [], last_activity_at: 0 })) };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
   };
@@ -1165,4 +1167,96 @@ test('conversation worktree: a new conversation writes in its own worktree and m
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+
+test('execution prompts retain raw observations outside the project, including read-only jobs', async () => {
+  for (const write of [true, false]) {
+    const h = harness({ config: { defaultHostAccess: true } });
+    await h.tools.codex_run.execute({ task: 'Run the acceptance observation.', acceptance, write }, exec);
+    assert.match(h.payload().prompt, /完整原始输出[\s\S]*\{\{CONDUCTOR_EVIDENCE_DIR\}\}/);
+    assert.match(h.payload().prompt, /evidence 写文件路径/);
+    assert.match(h.payload().prompt, /终端里看过的不算留证/);
+    if (!write) assert.match(h.payload().prompt, /证据目录外/);
+  }
+});
+
+test('verification checks retained evidence first and asks for classified blocked reasons', async () => {
+  const source = { ...sourceJob(), evidence_dir: '/runner/jobs/SOURCE-1/evidence',
+    evidence_dir_windows: '\\\\wsl.localhost\\Ubuntu-24.04\\runner\\jobs\\SOURCE-1\\evidence' };
+  const h = harness({ source });
+  await h.verify();
+  const prompt = h.payload().prompt;
+  assert.match(prompt, /先查证据目录.*\/runner\/jobs\/SOURCE-1\/evidence/);
+  assert.ok(prompt.includes(JSON.stringify(source.evidence_dir)));
+  assert.ok(prompt.includes(`Windows 路径：${source.evidence_dir_windows}`));
+  assert.ok(prompt.includes(JSON.stringify(source.evidence_dir_windows)));
+  for (const label of ['[缺证据]', '[环境]', '[需用户]', '[需改状态]']) assert.ok(prompt.includes(label), label);
+  assert.doesNotMatch(prompt, /\{\{CONDUCTOR_EVIDENCE_DIR\}\}/);
+});
+
+test('verification receipts group only tagged blocked rows and leave their status unchanged', async () => {
+  const rows = [
+    ['[缺证据] output not retained', 'blocked'], ['[环境] timeout', 'blocked'],
+    ['[需用户] missing material', 'blocked'], ['[需改状态] requires deployment', 'blocked'],
+    ['[缺证据] another missing output', 'blocked'], ['unclassified', 'blocked'],
+    ['[环境] measured failure', 'not_met'], ['text [缺证据] is not a prefix', 'blocked'],
+  ].map(([evidence, status], i) => ({ criterion: `criterion ${i + 1}`, evidence, status }));
+  const structured = { ...report(), criteria: rows };
+  const h = harness({ verificationResult: { structured } });
+  const value = await h.verify();
+  for (const receipt of [value, await h.tools.codex_status.execute({ job_id: 'VERIFY-1' }, exec)]) {
+    assert.match(receipt.next, /\[缺证据\] 第 1、5 条.*codex_continue.*SOURCE-1.*证据目录.*codex_verify/);
+    assert.match(receipt.next, /\[环境\] 第 2 条.*codex_verify.*expect_blocked/);
+    assert.match(receipt.next, /\[需用户\] 第 3 条.*accepted_deviations.*owner_only.*用户/);
+    assert.match(receipt.next, /\[需改状态\] 第 4 条.*accepted_deviations.*owner_only.*用户/);
+    assert.doesNotMatch(receipt.next, /第 [678] 条/);
+    assert.deepEqual(receipt.report.criteria, rows);
+  }
+  const plain = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' }, structured: report() });
+  assert.doesNotMatch(plain, /\[缺证据\]|expect_blocked|owner_only/);
+});
+
+test('host verification receipts report recorded physical snapshot budget reasons', async t => {
+  const budget = { before: { file_limit: 2, total_limit: 1, path_limit: 4 }, after: { file_limit: 0, total_limit: 3 } };
+  for (const [name, outcome, notice] of [
+    ['completed', { status: 'completed', verification_integrity: 'unchecked' }, /独立核验已结束/],
+    ['changed', { status: 'failed', error_kind: 'verification_tree_changed' }, /核验失败，勿使用本轮核验结论/],
+    ['unavailable', { status: 'completed', verification_integrity: 'unavailable' }, /Git 状态完整性比对不可用/],
+  ]) await t.test(name, () => {
+    const next = nextStep({ context: { verification_of: 'SOURCE-1', write: false }, sandbox: 'danger-full-access',
+      verification_budget_exceeded: budget, ...outcome });
+    assert.match(next, notice);
+    assert.match(next, /物理快照超预算：核验前（单文件 1 MiB 上限 2 条目、累计 32 MiB 上限 1 条目、256 条目上限 4 条目）；核验后（累计 32 MiB 上限 3 条目）/);
+    assert.match(next, outcome.verification_integrity === 'unavailable' ? /回退比较不可用/ : /已改用回退比较/);
+    assert.doesNotMatch(next, /0 条目/);
+  });
+});
+
+test('host verification receipts do not infer budget overruns from unchecked entries', () => {
+  for (const budget of [undefined, {}, { before: {}, after: { file_limit: 0, total_limit: 0, path_limit: 0 } }]) {
+    const next = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' },
+      verification_integrity: 'unchecked', verification_unchecked_files: 4, verification_budget_exceeded: budget });
+    assert.match(next, /有 4 个条目的内容未比对/);
+    assert.doesNotMatch(next, /物理快照超预算|核验前（|核验后（|回退比较/);
+  }
+  const afterOnly = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' },
+    verification_budget_exceeded: { after: { path_limit: 1 } } });
+  assert.match(afterOnly, /物理快照超预算：核验后（256 条目上限 1 条目）/);
+  assert.doesNotMatch(afterOnly, /核验前（|单文件 1 MiB|累计 32 MiB/);
+});
+
+test('non-host Gemini execution prompts do not promise external evidence access', async () => {
+  const h = harness({ config: { defaultEngine: 'gemini', gemini: { command: gemini.command } } });
+  await h.tools.codex_run.execute({ task: 'Inspect the project.', acceptance, write: false }, exec);
+  assert.match(h.payload().prompt, /没有证据目录/);
+  assert.doesNotMatch(h.payload().prompt, /CONDUCTOR_EVIDENCE_DIR|该项目外证据目录允许写入/);
+});
+
+test('verification does not invent evidence paths for a non-host Gemini source', async () => {
+  const source = { ...sourceJob(), evidence_available: false };
+  const h = harness({ source });
+  await h.verify();
+  assert.match(h.payload().prompt, /原执行单没有证据目录/);
+  assert.doesNotMatch(h.payload().prompt, /先查证据目录|\/SOURCE-1\/evidence|undefined/);
 });

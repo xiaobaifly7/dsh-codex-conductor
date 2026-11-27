@@ -60,8 +60,17 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "literal_newline_report":
         finish('{"summary":"ok","criteria":[{"criterion":"checked","status":"met","evidence":"first\nsecond"}],'
                '"files_changed":[],"deviations":[],"unresolved":[]}')
-    elif mode == "fixture_report":
+    elif mode in ("fixture_report", "relative_schema"):
+        if mode == "relative_schema":
+            json.loads(Path(sys.argv[sys.argv.index("--output-schema") + 1]).read_text("utf-8"))
         finish(Path(os.environ["FAKE_REPORT"]).read_text(encoding="utf-8"))
+    elif mode == "execution_evidence_write":
+        line = next(line for line in prompt.decode("utf-8").splitlines() if line.startswith("External evidence directory (absolute): "))
+        evidence = Path(json.loads(line.split(": ", 1)[1]))
+        target = evidence / "observation.txt"
+        target.write_text("observation\n", encoding="utf-8")
+        say(type="item.completed", item={"type": "file_change", "changes": [{"path": str(target), "kind": "add"}]})
+        finish()
     elif mode == "verification_temp_test":
         status = "blocked"
         if 'sandbox_mode="workspace-write"' in sys.argv:
@@ -242,7 +251,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         sys.exit(1)
     elif mode in ("fallback_event", "fallback_retry_write", "fallback_local_error", "fallback_unreported_file"):
         if mode == "fallback_unreported_file":
-            Path("real-change.txt").write_text("changed")
+            first = prompt.decode("utf-8").splitlines()[0]
+            project = Path(json.loads(first.split(": ", 1)[1])) if first.startswith("Project directory (absolute): ") else Path.cwd()
+            (project / "real-change.txt").write_text("changed")
         if mode == "fallback_event":
             say(type="item.updated", item={"type": "file_change", "changes": [{"path": "rewritten.txt"}]})
         if mode == "fallback_retry_write":
@@ -365,6 +376,12 @@ def alive(pid):
     except ProcessLookupError:
         return False
     return True
+
+
+def task_prompt(prompt):
+    if prompt.startswith("Project directory (absolute): "):
+        prompt = prompt.split("\n\n", 1)[1]
+    return prompt.split("\n\nExternal evidence directory (absolute):", 1)[0].split("\n本单是非主机 Gemini 任务", 1)[0]
 
 
 class RunnerTests(unittest.TestCase):
@@ -566,7 +583,7 @@ class RunnerTests(unittest.TestCase):
         other = self.cwd / "other"
         other.mkdir()
         _, isolated, calls, kills = self.repeat_job("other", self.repeat_step(3), cwd=other)
-        self.assertEqual((isolated["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        self.assertEqual((isolated["repeat_guard"]["standing"], task_prompt(calls[0][1]), kills), ([], "original task", 0))
         _, changed, calls, kills = self.repeat_job("changed", [self.repeat_patch(), *self.repeat_step(3)])
         self.assertIn("## 本目录近期反复失败的步骤", calls[0][1])
         self.assertEqual((changed["repeat_guard"]["standing"], kills), ([], 0))
@@ -686,7 +703,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("runner 拦下了第 3 次运行", second["prompt"])
         self.assertIn("resume", second["argv"])
         job_dir = Path(done["log_dir"])
-        self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), "do it")
+        self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), first["prompt"])
         query = self.control("repeat-guard", "--cwd", str(self.cwd))
         self.assertEqual(query, {"status": "completed", "totals": {"blocked": 1, "seconds_avoided": 60},
                                  "standing": done["repeat_guard"]["standing"], "_changed_at": 0})
@@ -740,7 +757,7 @@ class RunnerTests(unittest.TestCase):
                 done = self.control("status", job["job_id"], "--wait", "30")
                 self.assertEqual(done["status"], "completed")
                 self.assertEqual(done["repeat_guard"], {"blocks": [], "standing": []})
-                self.assertEqual(self.calls()[-1]["prompt"], "do it")
+                self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "do it")
                 query = self.control("repeat-guard", "--cwd", str(self.cwd))
                 self.assertEqual(len(query["standing"]), int(options[0] == "--repeat-guard"))
         self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd))["standing"], [])
@@ -769,7 +786,7 @@ class RunnerTests(unittest.TestCase):
                     event[0] -= 3600
         ledger.write_text(json.dumps(data), "utf-8")
         _, result, calls, kills = self.repeat_job("expired", self.repeat_step(3, None, command="setup3.ps1"), options=options)
-        self.assertEqual((result["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        self.assertEqual((result["repeat_guard"]["standing"], task_prompt(calls[0][1]), kills), ([], "original task", 0))
         self.assertNotEqual(json.loads(ledger.read_text("utf-8")), data)
 
     def test_repeat_guard_fallback_masks_digit_runs_and_requires_completed_timing(self):
@@ -1107,7 +1124,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("resume", second["argv"])
         self.assertIn("thread-1", second["argv"])
         self.assertIn("interrupted", second["prompt"])
-        override = "sandbox_workspace_write.writable_roots=" + json.dumps([str(self.cwd / "extra")])
+        override = "sandbox_workspace_write.writable_roots=" + json.dumps([str(self.cwd / "extra"), r["evidence_dir"]])
         for call in (first, second):
             self.assertEqual(call["argv"].count(override), 1)
             self.assertEqual(call["argv"][call["argv"].index(override) - 1], "-c")
@@ -1128,7 +1145,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(result["attempts"], 2)
                 self.assertEqual(result["usage_scope"], "thread_total")
-                self.assertEqual(self.calls()[-1]["prompt"], "NEW TASK: fix the CSV parser")
+                self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "NEW TASK: fix the CSV parser")
                 self.assertIn("writer-9", self.calls()[-1]["argv"])
 
     def test_writer_resume_preserves_prompt_before_work_events(self):
@@ -1140,7 +1157,7 @@ class RunnerTests(unittest.TestCase):
                                     prompt=prompt, env={"FAKE_STATE": str(self.state)})
                 self.assertEqual(value["status"], "completed")
                 self.assertEqual(value["attempts"], 2)
-                self.assertEqual(self.calls()[-1]["prompt"], prompt)
+                self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), prompt)
                 self.assertIn("resume", self.calls()[-1]["argv"])
 
     def test_active_commands_suspend_idle_timeout_until_the_matching_completion(self):
@@ -1368,7 +1385,7 @@ class RunnerTests(unittest.TestCase):
                     argv = self.calls()[-1]["argv"]
                     overrides = [p for p in argv if p.startswith("sandbox_workspace_write.writable_roots=")]
                     self.assertEqual(len(overrides), 1)
-                    self.assertEqual(json.loads(overrides[0].split("=", 1)[1]), expected)
+                    self.assertEqual(json.loads(overrides[0].split("=", 1)[1]), [*expected, result["evidence_dir"]])
                     self.assertEqual(argv[argv.index(overrides[0]) - 1], "-c")
                     self.assertNotIn("--add-dir", argv)
                     self.assertEqual("resume" in argv, bool(resume))
@@ -1408,7 +1425,7 @@ class RunnerTests(unittest.TestCase):
         r = self.invoke(mode="transient_then_ok")
         self.assertEqual(r["attempts"], 2)
         self.assertNotIn("resume", self.calls()[1]["argv"])
-        self.assertEqual(self.calls()[1]["prompt"], "do it")
+        self.assertEqual(task_prompt(self.calls()[1]["prompt"]), "do it")
 
     def test_reader_retry_after_resume_does_not_claim_thread_total_usage(self):
         r = self.invoke("--resume", "writer-9", mode="transient_then_ok")
@@ -1766,7 +1783,7 @@ class RunnerTests(unittest.TestCase):
     def test_prompt_with_shell_metacharacters_arrives_intact(self):
         prompt = '修复 A&B|C %PATH% "引号" ^caret\n第二行 $(whoami) `tick`'
         self.invoke(prompt=prompt)
-        self.assertEqual(self.calls()[0]["prompt"], prompt)
+        self.assertEqual(task_prompt(self.calls()[0]["prompt"]), prompt)
         self.assertEqual(self.calls()[0]["argv"][-1], "-")
 
     def test_full_access_runs_as_a_writer(self):
@@ -1795,7 +1812,7 @@ class RunnerTests(unittest.TestCase):
             self.wait_for(waiting_for_lock, timeout=60)
             waiting = self.control("status", second["job_id"])
             self.assertEqual((waiting["status"], waiting["phase"], waiting["attempt"]), ("running", "lock_wait", 0))
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             self.assertEqual(self.control("status", first["job_id"])["status"], "running")
             second_dir = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / second["job_id"]
             self.assertFalse((second_dir / "codex.pid").exists())
@@ -1804,7 +1821,7 @@ class RunnerTests(unittest.TestCase):
             self.wait_for(lambda: (self.state / "ready-1").exists())
             (self.state / "release-1").touch()
             self.assertEqual(self.control("status", second["job_id"], "--wait", "30")["status"], "completed")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two"])
         finally:
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
@@ -1840,10 +1857,10 @@ class RunnerTests(unittest.TestCase):
             os.kill(stopped, signal.SIGCONT)
             stopped = None
             self.wait_for(lambda: (self.state / "ready-1").exists())
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two"])
             (self.state / "release-1").touch()
             self.wait_for(lambda: (self.state / "ready-2").exists())
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two", "three"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two", "three"])
             (self.state / "release-2").touch()
             self.assertEqual(self.control("status", later, "--wait", "10")["status"], "completed")
         finally:
@@ -2094,7 +2111,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((result.get("status"), result.get("error_kind"), result.get("attempts")), ("failed", "lock_timeout", 0), result)
             self.assertTrue(result["retryable"])
             self.assertEqual(result["phase"], "lock_wait")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             self.assertEqual(self.control("status", first["job_id"])["status"], "running")
             (self.state / "release-0").touch()
             self.assertEqual(self.control("status", first["job_id"], "--wait", "10")["status"], "completed")
@@ -2202,12 +2219,12 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(cancelled["phase"], "lock_wait")
             self.wait_for(lambda: not alive(worker_pid))
             self.assertEqual(self.control("status", first["job_id"])["status"], "running")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             (self.state / "release-0").touch()
             self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
             self.assertEqual(self.control("status", second["job_id"])["status"], "cancelled")
             self.assertFalse((second_dir / "codex.pid").exists())
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
         finally:
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
@@ -2227,13 +2244,13 @@ class RunnerTests(unittest.TestCase):
                                  command="start", mode="gated_ok", prompt="two")
             jobs.append(second["job_id"])
             self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             (self.state / "release-0").touch()
             self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
             self.wait_for(lambda: (self.state / "ready-1").exists())
             (self.state / "release-1").touch()
             self.assertEqual(self.control("status", second["job_id"], "--wait", "20")["status"], "completed")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two"])
         finally:
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
@@ -3493,7 +3510,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({key: result["task_options"][key] for key in ("engine", "model", "effort", "agy_home")},
                          {"engine": "gemini", "model": "gemini-test", "effort": "high", "agy_home": str(home)})
         received = json.loads(call.read_text("utf-8"))
-        self.assertEqual((received["prompt"], received["proxy"]), (prompt, "http://unused.invalid:8080"))
+        self.assertEqual((task_prompt(received["prompt"]), received["proxy"]), (prompt, "http://unused.invalid:8080"))
         self.assertEqual(received["home"], [os.path.realpath(home)] * 2)
         self.assertIn("gemini-test", received["argv"])
         self.assertFalse(set(("codex-a", "codex-b", "exec", "--ephemeral")) & set(received["argv"]))
@@ -3681,12 +3698,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((result["status"], result["attempts"], result["conversation_id"]), ("completed", 2, "conv-2"))
         # The second attempt is a new conversation, pinned to nothing, with the original task and a note in front.
         self.assertEqual(calls[1][1:], (None, None))
-        self.assertTrue(calls[1][0].startswith("上一个 agy 账号在任务中途额度用完") and calls[1][0].endswith("原任务"))
+        self.assertTrue(calls[1][0].startswith("上一个 agy 账号在任务中途额度用完") and task_prompt(calls[1][0]).endswith("原任务"))
         self.assertEqual(result["task_options"]["agy_home"], r"D:\pool\b")
         self.assertEqual(len(switches), 1)
         # Nothing was delivered: the original task goes as it was.
         _, calls, _ = self.account_switch_run([("quota", False), ("ok", False)])
-        self.assertEqual(calls[1][0], "原任务")
+        self.assertEqual(task_prompt(calls[1][0]), "原任务")
 
     def test_gemini_account_switch_skips_continuations_and_refused_leases_and_stops_after_three(self):
         result, calls, switches = self.account_switch_run([("quota", True)], "--resume", "conv-0", "--agy-home", r"D:\pool\a")
@@ -3898,10 +3915,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.control("cancel", child)["status"], "cancelled")
         self.assertEqual(submit(context), {"job_id": child, "status": "cancelled", "deduplicated": True})
 
+    @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_gemini_fallback_check_requires_complete_snapshots_and_preserves_retry_evidence(self):
         self.assertNotIn("fallback_safe", self.invoke(mode="refused_turn"))
         checked = ("--gemini-fallback-check", "--sandbox", "workspace-write", "--no-diff")
-        (self.cwd / ".git").mkdir()
+        subprocess.run(["git", "init", "-q", str(self.cwd)], check=True, capture_output=True)
         cases = (
             ("refused_turn", (), True),
             ("fallback_event", ("--ignore", ".*"), False),
@@ -3989,7 +4007,13 @@ class RunnerTests(unittest.TestCase):
         for mode, expected in (("refused_turn", True), ("fallback_unreported_file", False)):
             with self.subTest(mode=mode):
                 result = self.invoke(*checked, mode=mode, env=env)
-                self.assertIs(result["fallback_safe"], expected)
+                evidence = Path(result["evidence_dir"])
+                try:
+                    self.assertFalse(evidence.is_relative_to(self.cwd))
+                    self.assertTrue(evidence.is_dir())
+                    self.assertIs(result["fallback_safe"], expected)
+                finally:
+                    shutil.rmtree(evidence)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_error_classification_from_stderr_and_events(self):
@@ -5261,7 +5285,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("review_status", result)
                 self.assertNotIn("review_summary", result)
                 call = self.calls()[-1]
-                self.assertEqual(call["prompt"], "only this prompt reaches Codex")
+                self.assertEqual(task_prompt(call["prompt"]), "only this prompt reaches Codex")
                 self.assertNotIn(context["task"], call["argv"])
                 self.assertEqual(result["sandbox"], "danger-full-access")
 
@@ -5900,7 +5924,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(len(waits), 1)
-        self.assertEqual(self.calls()[-1]["prompt"], "a new resume task")
+        self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "a new resume task")
         events = [json.loads(s) for s in (jd / "events.jsonl").read_text().splitlines()]
         phases = [e for e in events if e["type"] == "runner.phase"]
         self.assertEqual([e["phase"] for e in phases], ["router_check", "retry_wait", "router_check", "codex_running", "finalizing"])
@@ -6493,7 +6517,7 @@ class RunnerTests(unittest.TestCase):
         done = self.control("status", job["job_id"], "--wait", "30")
         self.assertEqual(done["status"], "completed", done)
         self.assertEqual(done["structured"], report)
-        self.assertEqual(self.calls()[-1]["prompt"], "do \ufffd it")
+        self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "do \ufffd it")
 
     def test_worker_saves_a_result_when_finalization_fails(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -6790,6 +6814,118 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(list(online.iterdir()), [])
 
+    def test_evidence_stays_outside_git_top_when_cwd_is_a_subdirectory(self):
+        root, project, git = self.git_repo("evidence-top")
+        result = self.invoke("--cwd", str(project), "--sandbox", "workspace-write", "--no-diff",
+                             mode="execution_evidence_write", env={"CODEX_RUNNER_HOME": str(root / ".runner")})
+        evidence = Path(result["evidence_dir"])
+        try:
+            self.assertEqual(result["status"], "completed", result)
+            self.assertFalse(evidence.is_relative_to(root))
+            git("add", "-A")
+            self.assertNotIn("observation.txt", git("ls-files"))
+        finally:
+            if not evidence.is_relative_to(root):
+                shutil.rmtree(evidence)
+
+    @unittest.skipIf(os.name == "nt", "native Windows rejects --use-user-config")
+    def test_evidence_appends_without_overriding_implicit_user_writable_roots(self):
+        home = Path(self.tmp.name) / "user-config"
+        home.mkdir()
+        config = home / "config.toml"
+        config.write_text('sandbox_workspace_write.writable_roots = ["/tmp/existing-root"]\n', "utf-8")
+        for resume in ([], ["--resume", "writer-9"]):
+            result = self.invoke("--sandbox", "workspace-write", "--use-user-config", *resume,
+                                 env={"CODEX_HOME": str(home)})
+            self.assertEqual(result["status"], "completed", result)
+            argv = self.calls()[-1]["argv"]
+            self.assertFalse(any(x.startswith("sandbox_workspace_write.writable_roots=") for x in argv))
+            self.assertIn("--add-dir", argv)
+            self.assertEqual(argv[argv.index("--add-dir") + 1], result["evidence_dir"])
+            if resume:
+                self.assertLess(argv.index("--add-dir"), argv.index("resume"))
+            self.assertEqual(config.read_text("utf-8"), 'sandbox_workspace_write.writable_roots = ["/tmp/existing-root"]\n')
+
+    def test_read_only_evidence_cwd_keeps_relative_schema_resolvable(self):
+        schema = self.cwd / "result.schema.json"
+        shutil.copyfile(RUNNER.parents[1] / "report.v2.schema.json", schema)
+        report = self.cwd / "report.json"
+        report.write_text(json.dumps(self.sample_report()), "utf-8")
+        result = self.invoke("--schema", schema.name, mode="relative_schema", env={"FAKE_REPORT": str(report)})
+        self.assertEqual(result["status"], "completed", result)
+        argv = self.calls()[-1]["argv"]
+        self.assertEqual(argv[argv.index("--output-schema") + 1], str(schema))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the Linux fake agy")
+    def test_non_host_gemini_reports_evidence_unavailable(self):
+        argv, env, call = self.fake_gemini()
+        result = self.invoke(*argv, env=env, prompt="Evidence: {{CONDUCTOR_EVIDENCE_DIR}}")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertIs(result["evidence_available"], False)
+        self.assertNotIn("evidence_dir", result)
+        prompt = json.loads(call.read_text("utf-8"))["prompt"]
+        self.assertIn("没有证据目录", prompt)
+        self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", prompt)
+
+    def test_worktree_activity_scans_all_records_once_without_event_replay(self):
+        import codex_runner
+        root = self.cwd / "tree"
+        root.mkdir()
+        for i in range(1001):
+            self.stored_job(f"unrelated-{i}", {"status": "completed"}, cwd=str(self.cwd / "elsewhere"))
+        self.stored_job("late-running", None, cwd=str(root / "sub"))
+        self.stored_job("scope-pending", None, cwd=str(self.cwd), scope=["tree/target"])
+        self.stored_job("ended", {"status": "completed", "updated_at": 1234567890}, cwd=str(root))
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        with mock.patch.object(codex_runner, "HOME", home), \
+                mock.patch.object(codex_runner, "job_status", side_effect=AssertionError("must not replay events")), \
+                mock.patch.object(codex_runner, "job_directories", wraps=codex_runner.job_directories) as scan:
+            result = codex_runner.worktree_activity([str(root), str(self.cwd / "unused")])
+        self.assertEqual(scan.call_count, 1)
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(set(result["worktrees"][0]["running"]), {"late-running", "scope-pending"})
+        self.assertGreaterEqual(result["worktrees"][0]["last_activity_at"], 1234567890)
+        self.assertEqual(result["worktrees"][1]["running"], [])
+        self.assertEqual(self.control("worktree-activity", "--path", str(root))["worktrees"][0]["running"],
+                         result["worktrees"][0]["running"])
+
+    def test_non_git_evidence_does_not_require_a_git_executable(self):
+        result = self.invoke("--no-diff", mode="execution_evidence_write", env={"PATH": ""})
+        self.assertEqual(result["status"], "completed", result)
+        evidence = Path(result["evidence_dir"])
+        self.assertFalse(evidence.is_relative_to(self.cwd))
+        self.assertEqual((evidence / "observation.txt").read_text("utf-8"), "observation\n")
+
+    def test_evidence_requires_a_proven_repository_boundary(self):
+        import codex_runner
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        root, project, _ = self.git_repo("evidence-boundary-failure")
+        errors = [ValueError("fatal: not a git repository: broken gitdir"),
+                  ValueError("permission denied"), subprocess.TimeoutExpired("git", 10)]
+        for error in errors:
+            with self.subTest(error=str(error)), mock.patch.object(codex_runner, "git", side_effect=error), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(codex_runner, "build_command", side_effect=AssertionError("must fail before execution")):
+                args = parser.parse_args(["--cwd", str(project)])
+                result = codex_runner.execute(args, "observe", root / ".runner" / "job")
+                self.assertEqual(result["error_kind"], "evidence_directory_unknown")
+        self.assertFalse((root / ".runner" / "job" / "evidence").exists())
+        self.assertEqual(self.calls(), [])
+
+    def test_worktree_activity_keeps_registered_runs_unknown_jobs_and_invalid_records(self):
+        home = Path(self.env["CODEX_RUNNER_HOME"])
+        registered = home / "runs" / "registered"
+        registered.mkdir(parents=True)
+        (registered / "write-lock.json").write_text(json.dumps({"cwd": str(self.cwd), "scope": ["file"]}), "utf-8")
+        self.stored_job("unknown", {"status": "unknown"}, cwd=str(self.cwd))
+        result = self.control("worktree-activity", "--path", str(self.cwd))
+        self.assertEqual(result["worktrees"][0]["running"], ["registered", "unknown"])
+        broken = home / "jobs" / "broken"
+        broken.mkdir()
+        (broken / "args.json").write_text("{}", "utf-8")
+        self.assertEqual(self.control("worktree-activity", "--path", str(self.cwd))["status"], "failed")
+
     def git_repo(self, name, commit=True):
         """A repository whose sub/ is the task directory; the fake's repo_edit changes three files there."""
         root = Path(self.tmp.name).resolve() / name
@@ -6807,6 +6943,47 @@ class RunnerTests(unittest.TestCase):
             git("add", "-A")
             git("commit", "-q", "-m", "base")
         return root, sub, git
+
+    def test_execution_evidence_is_external_and_replaces_prompt_placeholder(self):
+        for sandbox in ("read-only", "workspace-write", "danger-full-access"):
+            with self.subTest(sandbox=sandbox):
+                result = self.invoke("--sandbox", sandbox, prompt="Evidence: {{CONDUCTOR_EVIDENCE_DIR}}")
+                evidence = Path(result["evidence_dir"])
+                self.assertEqual(evidence, Path(result["log_dir"]) / "evidence")
+                self.assertTrue(evidence.is_dir())
+                self.assertFalse(evidence.is_relative_to(self.cwd))
+                received = self.calls()[-1]
+                self.assertIn(str(evidence), received["prompt"])
+                self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", received["prompt"])
+                self.assertEqual((Path(result["log_dir"]) / "prompt.txt").read_text("utf-8"), received["prompt"])
+                if sandbox == "read-only":
+                    self.assertIn('sandbox_mode="workspace-write"', received["argv"])
+                    self.assertIn("sandbox_workspace_write.writable_roots=[]", received["argv"])
+                    self.assertEqual(json.loads(received["prompt"].splitlines()[0].split(": ", 1)[1]), str(self.cwd))
+                elif sandbox == "workspace-write":
+                    self.assertEqual(received["argv"][received["argv"].index("--add-dir") + 1], str(evidence))
+
+    def test_evidence_writes_do_not_count_as_project_changes_or_scope_violations(self):
+        for sandbox in ("read-only", "workspace-write", "danger-full-access"):
+            with self.subTest(sandbox=sandbox):
+                result = self.invoke("--sandbox", sandbox, "--scope", "a.txt", mode="execution_evidence_write")
+                self.assertEqual(result["status"], "completed", result)
+                self.assertEqual((Path(result["evidence_dir"]) / "observation.txt").read_text("utf-8"), "observation\n")
+                self.assertEqual(result.get("files_changed", []), [])
+                self.assertEqual(result.get("out_of_scope", []), [])
+                self.assertEqual(list(self.cwd.iterdir()), [])
+
+    def test_evidence_directory_cannot_overlap_project(self):
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd)])
+        with mock.patch.object(codex_runner.tempfile, "gettempdir", return_value=str(self.cwd)):
+            result = codex_runner.execute(args, "survey", self.cwd / "job")
+        self.assertEqual(result["error_kind"], "evidence_directory_overlap")
+        self.assertFalse((self.cwd / "job" / "evidence").exists())
+        self.assertEqual(self.calls(), [])
 
     def test_verification_runs_temp_file_suite_with_project_outside_write_roots(self):
         (self.cwd / "temp_check.py").write_text(textwrap.dedent("""
@@ -6850,6 +7027,545 @@ class RunnerTests(unittest.TestCase):
         (project / "hidden.log").write_bytes(b"ignored evidence\n")
         self.assertIsNone(self.control("verification-version", "SOURCE")["verification_version"])
 
+    def test_verification_budget_counts_overlapping_scope_entries_once(self):
+        import codex_runner
+
+        (self.cwd / "late.txt").write_bytes(b"x")
+        counts = {}
+        with mock.patch.object(codex_runner, "VERIFY_CONTENT_FILES", 1):
+            _, _, unchecked = codex_runner.verification_working_files(
+                self.cwd, [".", "late.txt"], time.monotonic() + 10, budget_exceeded=counts)
+        self.assertEqual(unchecked, {b"late.txt"})
+        self.assertEqual(counts, {"path_limit": 1})
+        (self.cwd / "late.txt").unlink()
+        counts = {}
+        with mock.patch.object(codex_runner, "VERIFY_CONTENT_FILES", 1):
+            _, _, unchecked = codex_runner.verification_working_files(
+                self.cwd, [".", "late.txt"], time.monotonic() + 10, budget_exceeded=counts)
+        self.assertEqual(unchecked, set())
+        self.assertEqual(counts, {})
+
+    def test_windows_snapshot_compares_ctime_within_each_stat_source(self):
+        import codex_runner
+
+        target = self.cwd / "a.txt"
+        target.write_bytes(b"original")
+        real_fstat = os.fstat
+        for changed in (False, True):
+            calls = 0
+            def fstat(fd):
+                nonlocal calls
+                calls += 1
+                info = real_fstat(fd)
+                fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+                values = {key: getattr(info, key) for key in fields}
+                values["st_ctime_ns"] += 1000 + (int(changed) if calls > 1 else 0)
+                return SimpleNamespace(**values)
+            with self.subTest(changed=changed), mock.patch.object(codex_runner, "IS_WIN", True), \
+                    mock.patch.object(os, "fstat", side_effect=fstat):
+                _, working, unchecked = codex_runner.verification_working_files(
+                    self.cwd, ["a.txt"], time.monotonic() + 10)
+                self.assertEqual(unchecked, {b"a.txt"} if changed else set())
+                self.assertEqual(working[b"a.txt"][0], "unchecked" if changed else "content")
+
+    def test_verification_metadata_does_not_equate_unreadable_files(self):
+        import codex_runner
+
+        scope = (b"checksum", {}, {b"unreadable.txt": ("unchecked", None, None)})
+        self.assertFalse(codex_runner.verification_metadata_unchanged(str(self.cwd), scope, scope))
+
+    @unittest.skipUnless(shutil.which("git") and os.name != "nt", "needs POSIX modes and git")
+    def test_host_verification_rejects_actual_mode_bytes_and_link_changes(self):
+        for operation in ("chmod", "dirty_chmod", "crlf_and_index_mode", "same_stat", "symlink"):
+            with self.subTest(operation=operation):
+                _, project, git = self.git_repo("verification-physical-" + operation)
+                git("config", "core.filemode", "true")
+                target = project / "a.txt"
+                target.chmod(0o644)
+                if operation == "dirty_chmod":
+                    target.write_bytes(b"already dirty\n")
+                if operation == "crlf_and_index_mode":
+                    git("config", "core.autocrlf", "true")
+                if operation == "symlink":
+                    target.unlink()
+                    target.symlink_to("first-target")
+                    git("add", "-A")
+                    git("commit", "-qm", "record link")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+                def edit():
+                    if operation in ("chmod", "dirty_chmod"):
+                        target.chmod(0o755)
+                    elif operation == "crlf_and_index_mode":
+                        target.write_bytes(b"original\r\n")
+                        git("update-index", "--chmod=+x", "sub/a.txt")
+                    elif operation == "same_stat":
+                        info = target.stat()
+                        target.write_bytes(b"rewritten")
+                        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+                    else:
+                        target.unlink()
+                        target.symlink_to("other-target")
+                        git("add", "-A")
+                        git("commit", "-qm", "change link")
+                try:
+                    result = self.execute_host_verification(project, Path(self.tmp.name) / (operation + "-run"), edit)
+                    self.assertEqual((result["status"], result.get("error_kind")),
+                                     ("failed", "verification_tree_changed"), result)
+                    self.assertEqual(result["verification_changed_paths"], ["sub/a.txt"])
+                    self.assertNotIn("structured", result)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_accepts_raw_bytes_despite_git_conversions(self):
+        import codex_runner
+
+        real_git = codex_runner.git
+        def physical_only(cwd, *argv, **options):
+            self.assertNotIn("cat-file", argv)
+            return real_git(cwd, *argv, **options)
+        for operation in ("autocrlf_lf", "lossy_filter", "index_mode", "touch", "same_bytes", "first_commit"):
+            with self.subTest(operation=operation):
+                root, project, git = self.git_repo("verification-conversion-" + operation, commit=operation != "first_commit")
+                target = project / "a.txt"
+                if operation == "autocrlf_lf":
+                    git("config", "core.autocrlf", "true")
+                    target.write_bytes(b"already changed\n")
+                elif operation == "lossy_filter":
+                    git("config", "filter.strip.clean", "sed 's/ *$//'")
+                    git("config", "filter.strip.smudge", "cat")
+                    (root / ".gitattributes").write_bytes(b"*.txt filter=strip\n")
+                    git("add", ".gitattributes")
+                    git("commit", "-qm", "filter")
+                    target.write_bytes(b"already changed  \n")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                def edit():
+                    if operation == "index_mode":
+                        git("update-index", "--chmod=+x", "sub/a.txt")
+                    elif operation == "touch":
+                        info = target.stat()
+                        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+                    elif operation == "same_bytes":
+                        target.write_bytes(target.read_bytes())
+                    else:
+                        git("add", "-A")
+                        git("commit", "-qm", "record existing bytes")
+                try:
+                    with mock.patch.object(codex_runner, "git", side_effect=physical_only):
+                        result = self.execute_host_verification(project, Path(self.tmp.name) / (operation + "-run"), edit)
+                    self.assertEqual(result["status"], "completed", result)
+                    self.assertNotIn(result.get("verification_integrity"), ("unchecked", "unavailable"), result)
+                    self.assertIn("structured", result)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git") and os.name != "nt", "needs symlinks and git")
+    def test_host_verification_accepts_symlink_placeholder_add_and_commit(self):
+        _, project, git = self.git_repo("verification-placeholder")
+        target = project / "a.txt"
+        target.unlink()
+        target.symlink_to("original-target")
+        git("add", "-A")
+        git("commit", "-qm", "link")
+        git("config", "core.symlinks", "false")
+        target.unlink()
+        git("checkout", "--", "sub/a.txt")
+        self.assertFalse(target.is_symlink())
+        target.write_bytes(b"changed-target")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
+        def edit():
+            git("add", "-A")
+            git("commit", "-qm", "record placeholder")
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "placeholder-run", edit)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertIn("structured", result)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_observes_submodule_directory_not_gitlink_or_contents(self):
+        import codex_runner
+
+        source_root, _, source_git = self.git_repo("verification-submodule-source")
+        first = source_git("rev-parse", "HEAD").strip()
+        source_git("commit", "--allow-empty", "-qm", "second")
+        _, project, git = self.git_repo("verification-submodule")
+        git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(source_root), "sub/module")
+        git("commit", "-qam", "module")
+        module = project / "module"
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        strict_before = codex_runner.verification_git_digest(str(project), [str(project)], strict=True)[1]
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "gitlink-run",
+            lambda: git("update-index", "--cacheinfo", "160000," + first + ",sub/module"))
+        self.assertEqual(result["status"], "completed", result)
+        strict_after = codex_runner.verification_git_digest(str(project), [str(project)], strict=True)[1]
+        self.assertEqual(len(strict_before), 2)
+        self.assertNotEqual(strict_before[0], strict_after[0])
+        internal = module / "sub" / "a.txt"
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "submodule-inside-run",
+                                                lambda: internal.write_bytes(b"submodule-owned change\n"))
+        self.assertEqual(result["status"], "completed", result)
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "submodule-delete-run",
+                                                lambda: shutil.rmtree(module))
+        self.assertEqual((result["status"], result.get("error_kind")), ("failed", "verification_tree_changed"), result)
+        self.assertEqual(result["verification_changed_paths"], ["sub/module"])
+
+    @unittest.skipUnless(shutil.which("git") and os.name != "nt", "needs symlinks and git")
+    def test_host_verification_checks_symlink_ancestors_without_following_them(self):
+        _, project, _ = self.git_repo("verification-link-parent")
+        for name in ("first", "other"):
+            (project / name).mkdir()
+            (project / name / "same.txt").write_bytes(b"same bytes\n")
+        link = project / "alias"
+        link.symlink_to("first", target_is_directory=True)
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["alias/same.txt"])
+        def edit():
+            link.unlink()
+            link.symlink_to("other", target_is_directory=True)
+        result = self.execute_host_verification(project, Path(self.tmp.name) / "link-parent-run", edit)
+        self.assertEqual((result["status"], result.get("error_kind")), ("failed", "verification_tree_changed"), result)
+        self.assertEqual(result["verification_changed_paths"], ["sub/alias"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_checks_ignored_file_add_delete_and_rewrite(self):
+        for operation in ("add", "delete", "rewrite"):
+            with self.subTest(operation=operation):
+                _, project, _ = self.git_repo("verification-ignored-" + operation)
+                target = project / "hidden.log"
+                if operation != "add":
+                    target.write_bytes(b"original ignored bytes\n")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                def edit():
+                    if operation == "delete":
+                        target.unlink()
+                    else:
+                        target.write_bytes(b"new ignored bytes\n")
+                try:
+                    result = self.execute_host_verification(project, Path(self.tmp.name) / (operation + "-run"), edit)
+                    self.assertEqual((result["status"], result.get("error_kind")),
+                                     ("failed", "verification_tree_changed"), result)
+                    self.assertEqual(result["verification_changed_paths"], ["sub/hidden.log"])
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    def test_host_verification_nongit_keeps_results_when_physical_snapshot_is_incomplete(self):
+        import codex_runner
+
+        operations = ["unchanged", "touch", "same_bytes", "crlf", "same_stat", "add", "delete",
+                      "file_budget", "total_budget", "path_budget", "unreadable"]
+        if os.name != "nt":
+            operations += ["chmod", "link"]
+        for operation in operations:
+            with self.subTest(operation=operation):
+                project = self.cwd / operation
+                project.mkdir()
+                target = project / "a.txt"
+                target.write_bytes(b"original\n")
+                target.chmod(0o644)
+                if operation == "link":
+                    target.unlink()
+                    target.symlink_to("first-target")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                def edit():
+                    if operation == "touch":
+                        info = target.stat()
+                        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+                    elif operation == "same_bytes":
+                        target.write_bytes(target.read_bytes())
+                    elif operation == "crlf":
+                        target.write_bytes(b"original\r\n")
+                    elif operation == "same_stat":
+                        info = target.stat()
+                        target.write_bytes(b"rewritten")
+                        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+                    elif operation == "add":
+                        (project / "new.txt").write_bytes(b"added\n")
+                    elif operation == "delete":
+                        target.unlink()
+                    elif operation == "chmod":
+                        target.chmod(0o755)
+                    elif operation == "link":
+                        target.unlink()
+                        target.symlink_to("other-target")
+                real_open = os.open
+                def unreadable(path, *args, **kwargs):
+                    if os.fspath(path) == str(target):
+                        raise PermissionError("unreadable monitored file")
+                    return real_open(path, *args, **kwargs)
+                overrides = {"file_budget": mock.patch.object(codex_runner, "VERIFY_FILE_LIMIT", 1),
+                             "total_budget": mock.patch.object(codex_runner, "VERIFY_TOTAL_LIMIT", 1),
+                             "path_budget": mock.patch.object(codex_runner, "VERIFY_CONTENT_FILES", 1),
+                             "unreadable": mock.patch.object(os, "open", side_effect=unreadable)}
+                try:
+                    with overrides.get(operation, nullcontext()):
+                        result = self.execute_host_verification(project, Path(self.tmp.name) / (operation + "-run"), edit)
+                    if operation in ("unchanged", "touch", "same_bytes"):
+                        self.assertEqual(result["status"], "completed", result)
+                        self.assertNotIn(result.get("verification_integrity"), ("unchecked", "unavailable"), result)
+                        self.assertIn("structured", result)
+                    elif operation in overrides:
+                        self.assertEqual((result["status"], result.get("verification_integrity")),
+                                         ("completed", "unavailable"), result)
+                        self.assertIn("structured", result)
+                        self.assertNotIn("error_kind", result)
+                    else:
+                        self.assertEqual((result["status"], result.get("error_kind")),
+                                         ("failed", "verification_tree_changed"), result)
+                        self.assertNotIn("structured", result)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_keeps_unchanged_git_results_when_physical_snapshot_is_incomplete(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-unproven")
+        target = project / "a.txt"
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        real_open = os.open
+        def unreadable(path, *args, **kwargs):
+            if os.fspath(path) == str(target):
+                raise PermissionError("unreadable monitored file")
+            return real_open(path, *args, **kwargs)
+        for reason, override in (("file-budget", mock.patch.object(codex_runner, "VERIFY_FILE_LIMIT", 1)),
+                                 ("total-budget", mock.patch.object(codex_runner, "VERIFY_TOTAL_LIMIT", 1)),
+                                 ("path-budget", mock.patch.object(codex_runner, "VERIFY_CONTENT_FILES", 1)),
+                                 ("read-error", mock.patch.object(os, "open", side_effect=unreadable))):
+            with self.subTest(reason=reason), override:
+                result = self.execute_host_verification(project, Path(self.tmp.name) / reason)
+                self.assertEqual((result["status"], result.get("verification_integrity")),
+                                 ("completed", "unchecked"), result)
+                self.assertGreater(result["verification_unchecked_files"], 0, result)
+                self.assertIn("structured", result)
+                self.assertNotIn("error_kind", result)
+                if reason == "read-error":
+                    self.assertEqual(result["verification_budget_exceeded"], {})
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_real_snapshot_budgets_keep_legacy_checks(self):
+        import codex_runner
+
+        self.assertEqual((codex_runner.VERIFY_FILE_LIMIT, codex_runner.VERIFY_TOTAL_LIMIT,
+                          codex_runner.VERIFY_CONTENT_FILES), (1024 * 1024, 32 * 1024 * 1024, 256))
+        for budget in ("file", "total", "paths"):
+            with self.subTest(budget=budget):
+                _, project, git = self.git_repo("verification-real-budget-" + budget)
+                count, size = {"file": (1, 1024 * 1024 + 1), "total": (33, 1024 * 1024),
+                               "paths": (257, 1)}[budget]
+                for number in range(count):
+                    (project / f"z{number:03}.bin").write_bytes(b"x" * size)
+                git("add", "-A")
+                git("commit", "-qm", "clean budget fixtures")
+                target = project / "a.txt"
+                target.write_bytes(b"before")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+
+                def edit():
+                    info = target.stat()
+                    target.write_bytes(b"change")
+                    os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+                    self.assertEqual((target.stat().st_size, target.stat().st_mtime_ns),
+                                     (info.st_size, info.st_mtime_ns))
+
+                try:
+                    for operation in ("unchanged", "changed"):
+                        with self.subTest(operation=operation):
+                            result = self.execute_host_verification(
+                                project, Path(self.tmp.name) / (budget + "-" + operation),
+                                edit if operation == "changed" else None)
+                            self.assertEqual(result.get("verification_integrity"), "unchecked", result)
+                            self.assertGreater(result["verification_unchecked_files"], 0, result)
+                            reason = {"file": "file_limit", "total": "total_limit", "paths": "path_limit"}[budget]
+                            self.assertEqual(set(result["verification_budget_exceeded"]), {"before", "after"})
+                            for counts in result["verification_budget_exceeded"].values():
+                                self.assertEqual(set(counts), {reason})
+                                self.assertGreater(counts[reason], 0)
+                            if operation == "unchanged":
+                                self.assertEqual(result["status"], "completed", result)
+                                self.assertIn("structured", result)
+                                self.assertNotIn("error_kind", result)
+                            else:
+                                self.assertEqual((result["status"], result.get("error_kind")),
+                                                 ("failed", "verification_tree_changed"), result)
+                                self.assertEqual(result["verification_changed_paths"], ["sub/a.txt"])
+                                self.assertNotIn("structured", result)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_budget_fallback_detects_dirty_changes(self):
+        import codex_runner
+
+        for budget in ("paths", "file", "total", "large_stat"):
+            with self.subTest(budget=budget):
+                _, project, _ = self.git_repo("verification-fallback-dirty-" + budget)
+                target = project / "a.txt"
+                target.write_bytes(b"before" if budget != "large_stat" else b"x" * 16)
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                def edit():
+                    info = target.stat()
+                    if budget == "large_stat":
+                        target.write_bytes(b"y" * 16)
+                        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+                    else:
+                        target.write_bytes(b"change")
+                        os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+                        self.assertEqual((target.stat().st_size, target.stat().st_mtime_ns),
+                                         (info.st_size, info.st_mtime_ns))
+                attribute = {"paths": "VERIFY_CONTENT_FILES", "file": "VERIFY_FILE_LIMIT",
+                             "total": "VERIFY_TOTAL_LIMIT", "large_stat": "VERIFY_FILE_LIMIT"}[budget]
+                try:
+                    with mock.patch.object(codex_runner, attribute, 2 if budget == "paths" else 8):
+                        result = self.execute_host_verification(project, Path(self.tmp.name) / (budget + "-run"), edit)
+                    self.assertEqual((result["status"], result.get("error_kind"), result.get("verification_integrity")),
+                                     ("failed", "verification_tree_changed", "unchecked"), result)
+                    self.assertEqual(result["verification_changed_paths"], ["sub/a.txt"])
+                    self.assertNotIn("structured", result)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_budget_fallback_rejects_git_only_moves(self):
+        import codex_runner
+
+        for budget in ("paths", "file", "total"):
+            for operation in ("stage", "commit", "reset"):
+                with self.subTest(budget=budget, operation=operation):
+                    _, project, git = self.git_repo("verification-fallback-" + budget + "-" + operation)
+                    (project / "a.txt").write_bytes(b"before")
+                    if operation == "reset":
+                        git("add", "-A")
+                    self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                    def edit():
+                        if operation == "reset":
+                            git("reset", "-q", "HEAD")
+                        else:
+                            git("add", "-A")
+                            if operation == "commit":
+                                git("commit", "-qm", "record existing bytes")
+                    attribute = {"paths": "VERIFY_CONTENT_FILES", "file": "VERIFY_FILE_LIMIT",
+                                 "total": "VERIFY_TOTAL_LIMIT"}[budget]
+                    try:
+                        with mock.patch.object(codex_runner, attribute, 2 if budget == "paths" else 8):
+                            result = self.execute_host_verification(project, Path(self.tmp.name) / (budget + operation), edit)
+                        self.assertEqual((result["status"], result.get("error_kind"), result.get("verification_integrity")),
+                                         ("failed", "verification_tree_changed", "unchecked"), result)
+                        self.assertEqual((project / "a.txt").read_bytes(), b"before")
+                        self.assertNotIn("structured", result)
+                    finally:
+                        shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git") and os.name != "nt", "needs git and symlinks")
+    def test_host_verification_budget_fallback_preserves_legacy_symlink_scope_resolution(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-legacy-symlink-scope")
+        target = project / "a.txt"
+        target.write_bytes(b"before")
+        (project / "alias").symlink_to(project, target_is_directory=True)
+        large = project / "large.bin"
+        large.write_bytes(b"x" * 16)
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project),
+                        scope=["alias/a.txt", "large.bin"], scope_paths=[str(target), str(large)])
+        def edit():
+            info = target.stat()
+            target.write_bytes(b"change")
+            os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns))
+        with mock.patch.object(codex_runner, "VERIFY_FILE_LIMIT", 8):
+            result = self.execute_host_verification(project, Path(self.tmp.name) / "legacy-symlink-run", edit)
+        self.assertEqual((result["status"], result.get("error_kind"), result.get("verification_integrity")),
+                         ("failed", "verification_tree_changed", "unchecked"), result)
+        self.assertEqual(result["verification_changed_paths"], ["sub/a.txt"])
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_budget_switch_compares_the_same_legacy_baseline(self):
+        import codex_runner
+
+        for incomplete_before in (False, True):
+            for add_file in (False, True):
+                with self.subTest(incomplete_before=incomplete_before, add_file=add_file):
+                    _, project, _ = self.git_repo(f"verification-switch-{incomplete_before}-{add_file}")
+                    self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                    def edit():
+                        codex_runner.VERIFY_CONTENT_FILES = 10 if incomplete_before else 2
+                        if add_file:
+                            (project / "new.txt").write_bytes(b"new\n")
+                    try:
+                        with mock.patch.object(codex_runner, "VERIFY_CONTENT_FILES", 2 if incomplete_before else 10):
+                            result = self.execute_host_verification(project, Path(self.tmp.name) / "switch-run", edit)
+                        self.assertEqual(result.get("verification_integrity"), "unchecked", result)
+                        if add_file:
+                            self.assertEqual((result["status"], result.get("error_kind")),
+                                             ("failed", "verification_tree_changed"), result)
+                            self.assertEqual(result["verification_changed_paths"], ["sub/new.txt"])
+                            self.assertNotIn("structured", result)
+                        else:
+                            self.assertEqual(result["status"], "completed", result)
+                            self.assertIn("structured", result)
+                            self.assertNotIn("error_kind", result)
+                    finally:
+                        shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_accepts_commit_and_index_moves_without_worktree_edits(self):
+        for operation in ("stage", "commit", "commit_crlf", "amend", "reset"):
+            with self.subTest(operation=operation):
+                _, project, git = self.git_repo("verification-metadata-" + operation)
+                if operation == "commit_crlf":
+                    git("config", "core.autocrlf", "true")
+                newline = b"\r\n" if operation == "commit_crlf" else b"\n"
+                (project / "a.txt").write_bytes(b"already dirty" + newline)
+                (project / "new.txt").write_bytes(b"already present" + newline)
+                if operation == "reset":
+                    git("add", "-A")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                def edit():
+                    if operation == "amend":
+                        git("commit", "--amend", "-qm", "only the commit message changes")
+                    elif operation == "reset":
+                        git("reset", "-q", "HEAD")
+                    else:
+                        git("add", "-A")
+                        if operation in ("commit", "commit_crlf"):
+                            git("commit", "-qm", "record existing bytes")
+                try:
+                    result = self.execute_host_verification(project, Path(self.tmp.name) / (operation + "-run"), edit)
+                    self.assertEqual(result["status"], "completed", result)
+                    self.assertNotEqual(result.get("verification_integrity"), "unavailable", result)
+                    self.assertIn("structured", result)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_still_rejects_content_changes_across_a_commit(self):
+        for operation in ("edit_then_commit", "commit_then_edit", "clean_edit_then_commit", "delete_then_commit", "add_then_commit"):
+            with self.subTest(operation=operation):
+                _, project, git = self.git_repo("verification-real-" + operation)
+                if operation not in ("clean_edit_then_commit", "add_then_commit"):
+                    (project / "a.txt").write_bytes(b"already dirty\n")
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project),
+                                scope=["."] if operation == "add_then_commit" else ["a.txt"])
+                def edit():
+                    if operation == "commit_then_edit":
+                        git("add", "-A")
+                        git("commit", "-qm", "record existing bytes")
+                    if operation == "delete_then_commit":
+                        (project / "a.txt").unlink()
+                    elif operation == "add_then_commit":
+                        (project / "new-report.md").write_bytes(b"newly observed product\n")
+                    else:
+                        (project / "a.txt").write_bytes(b"actual verifier edit\n")
+                    if operation != "commit_then_edit":
+                        git("add", "-A")
+                        git("commit", "-qm", "record changed bytes")
+                try:
+                    result = self.execute_host_verification(project, Path(self.tmp.name) / (operation + "-run"), edit)
+                    self.assertEqual((result["status"], result.get("error_kind")), ("failed", "verification_tree_changed"))
+                    self.assertNotIn("structured", result)
+                    if operation == "add_then_commit":
+                        self.assertEqual((result["verification_changed_paths"], result["verification_changed_total"]),
+                                         (["sub/new-report.md"], 1))
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
+
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_host_verification_fails_if_git_status_changes(self):
         _, project, git = self.git_repo("verification")
@@ -6886,16 +7602,20 @@ class RunnerTests(unittest.TestCase):
                     (writer / "stderr.log").touch()
                 result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
                                      mode="repo_edit", prompt=prompt)
-                self.assertEqual((result["status"], result.get("verification_integrity")),
-                                 ("completed", "concurrent_changes"), result)
+                if kind == "running":
+                    self.assertEqual((result["status"], result.get("error_kind")),
+                                     ("failed", "verification_tree_changed"), result)
+                else:
+                    self.assertEqual((result["status"], result.get("verification_integrity")),
+                                     ("completed", "concurrent_changes"), result)
                 shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_host_verification_only_warns_when_an_already_dirty_file_under_a_scope_directory_changes(self):
+    def test_host_verification_rejects_appends_and_rewrites_under_a_scope_directory(self):
         prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
         for mode, scope, product, expected in (
-                ("log_append", ["logs"], "a.txt", ("completed", "concurrent_changes")),
+                ("log_append", ["logs"], "a.txt", ("failed", None)),
                 ("log_append", ["logs/watch.out"], "a.txt", ("failed", None)),
                 ("log_append", ["logs"], "logs/watch.out", ("failed", None)),
                 ("log_new_file", ["logs"], "a.txt", ("failed", None)),
@@ -6912,9 +7632,7 @@ class RunnerTests(unittest.TestCase):
                     self.assertEqual((result["status"], result.get("verification_integrity")), expected, result)
                     if result["status"] == "failed":
                         self.assertEqual(result["error_kind"], "verification_tree_changed")
-                    else:
-                        self.assertEqual((result["verification_changed_paths"], result["verification_append_check"]),
-                                         (["sub/logs/watch.out"], "hash"))
+                    self.assertNotIn("verification_append_check", result)
                 finally:
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
@@ -6969,10 +7687,10 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(codex_runner.linked_worktree_git_env(str(worktree)), {})
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_host_verification_ignores_the_sqlite_index_a_reader_rewrites(self):
+    def test_host_verification_rejects_sqlite_working_file_changes(self):
         prompt = json.dumps({"prompt": "Run a host check", "context": {"owner": "S1", "task": "Verify the source",
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
-        for mode, expected in (("sqlite_read", ("completed", None)), ("sqlite_write", ("failed", ["sub/data.db"]))):
+        for mode, expected in (("sqlite_read", ("failed", ["sub/data.db-shm"])), ("sqlite_write", ("failed", ["sub/data.db"]))):
             with self.subTest(mode=mode):
                 _, project, _ = self.git_repo(f"verification-{mode}")
                 (project / "data.db").write_bytes(b"rows\n")
@@ -7070,7 +7788,7 @@ class RunnerTests(unittest.TestCase):
                     shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_host_verification_detects_large_dirty_file_change(self):
+    def test_host_verification_rejects_large_dirty_file_beyond_content_budget(self):
         _, project, _ = self.git_repo("verification-large")
         target = project / "a.txt"
         target.write_bytes(b"x" * (2 * 1024 * 1024))
@@ -7081,9 +7799,10 @@ class RunnerTests(unittest.TestCase):
                              mode="verification_overwrite_large", prompt=prompt)
         self.assertEqual((result["status"], result.get("error_kind"), target.stat().st_size),
                          ("failed", "verification_tree_changed", 2 * 1024 * 1024))
+        self.assertEqual(result["verification_changed_paths"], ["sub/a.txt"])
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_host_verification_accepts_unchanged_large_dirty_file(self):
+    def test_host_verification_accepts_unchanged_large_file_beyond_content_budget(self):
         _, project, _ = self.git_repo("verification-large-unchanged")
         (project / "a.txt").write_bytes(b"x" * (2 * 1024 * 1024))
         self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["a.txt"])
@@ -7091,7 +7810,8 @@ class RunnerTests(unittest.TestCase):
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
         result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access", prompt=prompt)
         self.assertEqual((result["status"], result.get("verification_integrity"),
-                          result.get("verification_unchecked_files")), ("completed", None, None))
+                          result.get("verification_unchecked_files")), ("completed", "unchecked", 1))
+        self.assertNotIn("error_kind", result)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_host_verification_compares_dirty_files_beyond_total_content_budget(self):
@@ -7107,11 +7827,11 @@ class RunnerTests(unittest.TestCase):
             target.write_bytes(b"efgh")
             os.utime(target, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
             after = codex_runner.verification_git_digest(str(project), [str(project)])
-        self.assertEqual(before[2] | after[2], set())
-        self.assertEqual(before[1][0], after[1][0])
-        self.assertTrue(codex_runner.verification_observations_changed(before[1][1], after[1][1]))
+        self.assertEqual(before[2] | after[2], {b"sub/gone.txt"})
+        self.assertFalse(codex_runner.verification_metadata_unchanged(str(project), before[1], after[1]))
 
     def test_host_verification_saves_unavailable_reason(self):
+        (self.cwd / ".git").mkdir()  # Broken Git evidence must be reported as unavailable.
         self.stored_job("SOURCE", {"status": "completed"})
         prompt = json.dumps({"prompt": "Verify the task", "context": {"owner": "S1", "task": "Verify the source",
             "acceptance": ["run the check"], "write": False, "verification_of": "SOURCE"}})
@@ -7120,11 +7840,13 @@ class RunnerTests(unittest.TestCase):
         saved = json.loads((Path(result["log_dir"]) / "result.json").read_text(encoding="utf-8"))
         self.assertEqual((saved["status"], saved.get("verification_integrity"), saved.get("verification_integrity_reason")),
                          ("completed", "unavailable", "before_git_error"))
+        self.assertNotIn("error_kind", saved)
 
     def execute_host_verification(self, project, run_dir, edit=None):
         import codex_runner
 
-        args = SimpleNamespace(cwd=str(project), sandbox="danger-full-access", resume=None, schema=True,
+        args = SimpleNamespace(cwd=str(project), sandbox="danger-full-access", resume=None,
+                               schema=str(RUNNER.parents[1] / "report.v2.schema.json"),
                                repeat_guard="off", context={"write": False, "verification_of": "SOURCE"})
 
         def attempt(*args):
@@ -7141,7 +7863,7 @@ class RunnerTests(unittest.TestCase):
         return json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_host_verification_ignores_budget_shift_after_transient_read_failure(self):
+    def test_host_verification_accepts_budget_shift_after_transient_read_failure(self):
         _, project, _ = self.git_repo("verification-budget-shift")
         self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
         content = b"x" * (1024 * 1024)
@@ -7160,7 +7882,8 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(os, "open", side_effect=open_with_transient_failure):
             result = self.execute_host_verification(project, Path(self.tmp.name) / "budget-shift-run")
         self.assertEqual((result["status"], result.get("error_kind"), result.get("verification_integrity"),
-                          result.get("verification_unchecked_files")), ("completed", None, "unchecked", 1))
+                          result.get("verification_unchecked_files")), ("completed", None, "unchecked", 3))
+        self.assertIn("structured", result)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_host_verification_detects_small_content_change_with_unchanged_stat(self):
@@ -7180,23 +7903,54 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((result["status"], result.get("error_kind")), ("failed", "verification_tree_changed"))
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
-    def test_host_verification_preserves_result_when_snapshot_threads_fail(self):
+    def test_host_verification_keeps_structured_results_when_snapshot_raises(self):
         import codex_runner
 
         _, project, _ = self.git_repo("verification-thread-failure")
         self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
-        for number in range(codex_runner.VERIFY_CONTENT_FILES + 1):
-            (project / f"f{number:03}").write_bytes(b"x")
+        original = codex_runner.verification_working_files
         for stage in ("before", "after"):
-            outcomes = [RuntimeError("injected thread startup failure")]
-            if stage == "after":
-                outcomes.insert(0, codex_runner.ThreadPoolExecutor(max_workers=2))
+            calls = 0
+            def snapshot(*args, **kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == (1 if stage == "before" else 2):
+                    raise RuntimeError("injected snapshot failure")
+                return original(*args, **kwargs)
             with self.subTest(stage=stage), \
-                    mock.patch.object(codex_runner, "ThreadPoolExecutor", side_effect=outcomes):
+                    mock.patch.object(codex_runner, "verification_working_files", side_effect=snapshot):
                 result = self.execute_host_verification(project, Path(self.tmp.name) / f"thread-failure-{stage}")
                 self.assertEqual((result["status"], result.get("verification_integrity"),
-                                  result.get("verification_integrity_reason"), result.get("structured")),
-                                 ("completed", "unavailable", f"{stage}_error", self.sample_report()))
+                                  result.get("verification_integrity_reason")),
+                                 ("completed", "unchecked", f"{stage}_error"))
+                self.assertEqual(result["structured"], self.sample_report())
+                self.assertNotIn("error_kind", result)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_host_verification_keeps_results_when_legacy_snapshot_raises(self):
+        import codex_runner
+
+        _, project, _ = self.git_repo("verification-legacy-failure")
+        self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+        original = codex_runner.verification_git_digest
+        for stage in ("before", "after"):
+            calls = 0
+            def snapshot(*args, **kwargs):
+                nonlocal calls
+                if kwargs.get("legacy"):
+                    calls += 1
+                    if calls == (1 if stage == "before" else 2):
+                        raise OSError("injected legacy Git query failure")
+                return original(*args, **kwargs)
+            with self.subTest(stage=stage), \
+                    mock.patch.object(codex_runner, "VERIFY_FILE_LIMIT", 1), \
+                    mock.patch.object(codex_runner, "verification_git_digest", side_effect=snapshot):
+                result = self.execute_host_verification(project, Path(self.tmp.name) / ("legacy-failure-" + stage))
+                self.assertEqual((result["status"], result.get("verification_integrity"),
+                                  result.get("verification_integrity_reason")),
+                                 ("completed", "unavailable", f"{stage}_git_error"), result)
+                self.assertEqual(result["structured"], self.sample_report())
+                self.assertNotIn("error_kind", result)
 
     @unittest.skipUnless(hasattr(os, "mkfifo") and shutil.which("git"), "needs POSIX FIFOs and git")
     def test_review_r2_host_verification_does_not_wait_on_fifo_replacing_dirty_file(self):
@@ -7273,7 +8027,7 @@ class RunnerTests(unittest.TestCase):
                     result = self.invoke("--context-json", "--cwd", str(project), "--sandbox", "danger-full-access",
                                          mode="verification_sibling" if kind == "sibling" else "verification_overwrite",
                                          prompt=prompt)
-                    if kind in ("sibling", "overlapping-writer"):
+                    if kind == "sibling":
                         self.assertEqual((result["status"], result.get("verification_integrity")),
                                          ("completed", "concurrent_changes"))
                     else:
