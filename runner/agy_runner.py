@@ -104,7 +104,6 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         command = str(Path(args.cwd, command).resolve())
 
     settings = {"modelProvider": "", "useG1Credits": False, "toolPermission": "request-review"}
-    evidence = getattr(args, "evidence_dir", None)
     readonly = args.sandbox == "read-only" or (getattr(args, "context", None) or {}).get("write") is False
     flags = ["--input-format", "stream-json", "--output-format", "stream-json",
              "--disable-slash-commands"]
@@ -139,12 +138,9 @@ def build_command(args, run_dir, conversation_id, scratch=None):
         # drop the blanket deny: every other write, the project's included, still asks, which headless agy auto-denies
         # ("auto-denied", measured on agy 1.5.14) and the runner reports as permission_denied, as before.
         own = f"write_file({home.replace(chr(92), '/')}/.gemini/antigravity-cli)" if host and home else None
-        allowed_writes = [f"write_file({str(evidence).replace(chr(92), '/')})"] if host and evidence else []
-        if own:
-            allowed_writes.append(own)
         settings.update(allowNonWorkspaceAccess=host, enableTerminalSandbox=not host, permissions={
-            "allow": [*([*HOST_COMMANDS, "read_file(*)"] if host else []), *allowed_writes], "ask": [],
-            "deny": [*([] if allowed_writes else ["write_file(*)"]), *([] if host else ["command(*)", "unsandboxed(*)"]),
+            "allow": [*HOST_COMMANDS, "read_file(*)", *([own] if own else [])] if host else [], "ask": [],
+            "deny": [*([] if own else ["write_file(*)"]), *([] if host else ["command(*)", "unsandboxed(*)"]),
                      "mcp(*)", "read_url(*)", "execute_url(*)"],
         })
     else:

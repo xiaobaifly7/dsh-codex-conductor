@@ -365,36 +365,45 @@ class AdapterTests(unittest.TestCase):
             self.assertIn("write_file(*)", permissions(sandbox="danger-full-access", context={"write": False})["deny"])
             self.assertIn("write_file(*)", permissions(agy_home=r"D:\pool\acc 1")["deny"])
 
-    def test_read_only_evidence_permission_accepts_windows_unc_without_widening_writes(self):
-        evidence = r"\\wsl.localhost\Ubuntu-24.04\tmp\job\evidence"
+    def test_read_only_evidence_preserves_main_permissions_without_agy_home(self):
         with tempfile.TemporaryDirectory() as run_dir:
             for sandbox in ("read-only", "danger-full-access"):
-                with self.subTest(sandbox=sandbox):
-                    command, _ = agy_runner.build_command(args(
-                        r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox=sandbox,
-                        context={"write": False}, evidence_dir=evidence), run_dir, None)
-                    settings = json.loads(command[command.index("--settings") + 1])
-                    permissions = settings["permissions"]
-                    self.assertNotIn("write_file(*)", permissions["allow"])
-                    self.assertEqual(settings["allowNonWorkspaceAccess"], sandbox == "danger-full-access")
-                    if sandbox == "read-only":
-                        self.assertEqual(permissions["allow"], [])
-                        self.assertIn("write_file(*)", permissions["deny"])
-                        self.assertIn("command(*)", permissions["deny"])
-                    else:
-                        self.assertIn("write_file(//wsl.localhost/Ubuntu-24.04/tmp/job/evidence)", permissions["allow"])
-                        self.assertNotIn("write_file(*)", permissions["deny"])
+                for evidence in (None, r"\\wsl.localhost\Ubuntu-24.04\tmp\job\evidence"):
+                    with self.subTest(sandbox=sandbox, evidence=evidence):
+                        command, _ = agy_runner.build_command(args(
+                            r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox=sandbox,
+                            context={"write": False}, evidence_dir=evidence), run_dir, None)
+                        settings = json.loads(command[command.index("--settings") + 1])
+                        expected = {
+                            "allow": ["command(*)", "unsandboxed(*)", "read_file(*)"] if sandbox == "danger-full-access" else [],
+                            "ask": [],
+                            "deny": ["write_file(*)", "mcp(*)", "read_url(*)", "execute_url(*)"] if sandbox == "danger-full-access"
+                            else ["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "read_url(*)", "execute_url(*)"],
+                        }
+                        self.assertEqual(settings["permissions"]["deny"], expected["deny"])
+                        self.assertEqual(settings["permissions"], expected)
+                        self.assertEqual(settings["allowNonWorkspaceAccess"], sandbox == "danger-full-access")
+                        self.assertEqual(settings["enableTerminalSandbox"], sandbox != "danger-full-access")
 
-    def test_non_host_evidence_preserves_the_original_permission_boundary(self):
+    def test_read_only_evidence_preserves_main_permissions_with_agy_home(self):
         with tempfile.TemporaryDirectory() as run_dir:
-            command, _ = agy_runner.build_command(args(
-                r"D:\project", agy_command=r"C:\tools\agy.exe", context={"write": False},
-                evidence_dir=r"\\wsl.localhost\Ubuntu-24.04\tmp\evidence"), run_dir, None)
-            settings = json.loads(command[command.index("--settings") + 1])
-            self.assertFalse(settings["allowNonWorkspaceAccess"])
-            self.assertEqual(settings["permissions"]["allow"], [])
-            self.assertIn("write_file(*)", settings["permissions"]["deny"])
-            self.assertIn("command(*)", settings["permissions"]["deny"])
+            for sandbox in ("read-only", "danger-full-access"):
+                for evidence in (None, r"\\wsl.localhost\Ubuntu-24.04\tmp\job\evidence"):
+                    with self.subTest(sandbox=sandbox, evidence=evidence):
+                        command, _ = agy_runner.build_command(args(
+                            r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox=sandbox,
+                            context={"write": False}, agy_home=r"D:\pool\acc 1", evidence_dir=evidence), run_dir, None)
+                        settings = json.loads(command[command.index("--settings") + 1])
+                        expected = {
+                            "allow": ["command(*)", "unsandboxed(*)", "read_file(*)",
+                                      "write_file(D:/pool/acc 1/.gemini/antigravity-cli)"] if sandbox == "danger-full-access" else [],
+                            "ask": [],
+                            "deny": ["mcp(*)", "read_url(*)", "execute_url(*)"] if sandbox == "danger-full-access"
+                            else ["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "read_url(*)", "execute_url(*)"],
+                        }
+                        self.assertEqual(settings["permissions"], expected)
+                        self.assertEqual(settings["allowNonWorkspaceAccess"], sandbox == "danger-full-access")
+                        self.assertEqual(settings["enableTerminalSandbox"], sandbox != "danger-full-access")
 
     def test_evidence_path_translates_wsl_native_directory_with_wslpath(self):
         with mock.patch.object(agy_runner.subprocess, "check_output", return_value="\\\\wsl.localhost\\Ubuntu-24.04\\tmp\\job\\evidence\n") as convert, \

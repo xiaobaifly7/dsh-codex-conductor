@@ -381,7 +381,7 @@ def alive(pid):
 def task_prompt(prompt):
     if prompt.startswith("Project directory (absolute): "):
         prompt = prompt.split("\n\n", 1)[1]
-    return prompt.split("\n\nExternal evidence directory (absolute):", 1)[0].split("\n本单是非主机 Gemini 任务", 1)[0]
+    return prompt.split("\n\nExternal evidence directory (absolute):", 1)[0].split("\n本单是只读或非主机 Gemini 任务", 1)[0]
 
 
 class RunnerTests(unittest.TestCase):
@@ -6937,6 +6937,131 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result.get("files_changed", []), [])
                 self.assertEqual(result.get("out_of_scope", []), [])
                 self.assertEqual(list(self.cwd.iterdir()), [])
+
+    def execute_evidence_event(self, name, event, *, resolve_error=False):
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "workspace-write", "--no-diff",
+                                  "--scope", "allowed.txt", "--repeat-guard", "off"])
+        run_dir = Path(self.tmp.name) / "events" / name
+
+        def attempt(*unused):
+            path = event(Path(args.evidence_dir))
+            return {"completed": True, "failed": False, "thread_id": "thread-1", "file_changes": [(path, "add")],
+                    "last_text": "done", "usage": {}, "commands": [], "forced_exit": False}
+
+        realpath = os.path.realpath
+        def resolve(path, *a, **kw):
+            if resolve_error and kw.get("strict") and os.fspath(path).endswith("observation.txt"):
+                raise PermissionError("event path cannot be resolved")
+            return realpath(path, *a, **kw)
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "router_reachable", return_value=True), \
+                mock.patch.object(codex_runner, "snapshot_before", return_value=(None, None)), \
+                mock.patch.object(codex_runner, "run_attempt", side_effect=attempt), \
+                mock.patch.object(codex_runner.os.path, "realpath", side_effect=resolve):
+            result = codex_runner.execute(args, "Check the task", run_dir)
+            codex_runner.write_result(run_dir, result)
+        saved = json.loads((run_dir / "result.json").read_text("utf-8"))
+        saved["out_of_scope"] = codex_runner.out_of_scope_paths(saved)
+        return saved
+
+    def test_evidence_event_parent_traversal_remains_a_scope_violation(self):
+        for index, suffix in enumerate(("/../victim.txt", "/./../victim.txt", "\\..\\victim.txt")):
+            with self.subTest(suffix=suffix):
+                def event(evidence):
+                    (evidence.parent / "victim.txt").write_text("outside evidence")
+                    return str(evidence) + suffix
+                result = self.execute_evidence_event(f"escape-{index}", event)
+                self.assertEqual(result["files_changed_total"], 1, result)
+                self.assertTrue(result["out_of_scope"], result)
+
+    def test_evidence_event_normalization_failure_keeps_the_change(self):
+        def event(evidence):
+            target = evidence / "observation.txt"
+            target.write_text("observation")
+            return str(target)
+        result = self.execute_evidence_event("resolve-error", event, resolve_error=True)
+        self.assertEqual(result["files_changed_total"], 1, result)
+        self.assertTrue(result["out_of_scope"], result)
+
+    def test_evidence_event_resolves_directory_links_before_filtering(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "victim.txt").write_text("outside evidence")
+        def event(evidence):
+            link = evidence / "redirect"
+            if os.name == "nt":
+                subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(outside)],
+                               check=True, capture_output=True)
+            else:
+                link.symlink_to(outside, target_is_directory=True)
+            return str(link / "victim.txt")
+        result = self.execute_evidence_event("link", event)
+        self.assertEqual(result["files_changed_total"], 1, result)
+        self.assertTrue(result["out_of_scope"], result)
+
+    def test_evidence_event_equivalent_paths_are_filtered(self):
+        for spelling in ("dots", "backslashes", *(["case"] if os.name == "nt" else [])):
+            with self.subTest(spelling=spelling):
+                def event(evidence):
+                    (evidence / "nested").mkdir()
+                    (evidence / "observation.txt").write_text("observation")
+                    path = str(evidence) + "/nested/.././observation.txt"
+                    if spelling == "case":
+                        path = path.upper()
+                    elif spelling == "backslashes":
+                        path = path.replace("/", "\\")
+                    return path
+                result = self.execute_evidence_event(spelling, event)
+                self.assertEqual(result["files_changed_total"], 0, result)
+
+    @unittest.skipIf(os.name == "nt", "WSL maps its Windows evidence alias back to the native path")
+    def test_evidence_windows_alias_uses_the_canonical_native_path(self):
+        import codex_runner
+
+        evidence = Path(self.tmp.name) / "evidence"
+        evidence.mkdir()
+        (evidence / "nested").mkdir()
+        (evidence / "observation.txt").write_text("observation")
+        (evidence.parent / "victim.txt").write_text("outside evidence")
+        share = r"\\wsl.localhost\Ubuntu"
+        alias = share + str(evidence).replace("/", "\\")
+        self.assertTrue(codex_runner.evidence_event_path(str(self.cwd), share.upper() + str(evidence).replace("/", "\\") + r"\nested\..\observation.txt", str(evidence), alias))
+        self.assertFalse(codex_runner.evidence_event_path(str(self.cwd), alias + r"\..\victim.txt", str(evidence), alias))
+        different_case = evidence.with_name("EVIDENCE")
+        different_case.mkdir()
+        (different_case / "observation.txt").write_text("outside evidence")
+        self.assertFalse(codex_runner.evidence_event_path(str(self.cwd), share + str(different_case).replace("/", "\\") + r"\observation.txt", str(evidence), alias))
+        external = Path(self.tmp.name) / "external"
+        (external / "child").mkdir(parents=True)
+        (external / "victim.txt").write_text("outside evidence")
+        (evidence / "victim.txt").write_text("different file inside evidence")
+        (evidence / "redirect").symlink_to(external / "child", target_is_directory=True)
+        self.assertFalse(codex_runner.evidence_event_path(str(self.cwd), alias + r"\redirect\..\victim.txt", str(evidence), alias))
+
+    def test_gemini_read_only_execution_has_no_external_evidence_directory(self):
+        import codex_runner
+
+        for sandbox in ("read-only", "danger-full-access"):
+            with self.subTest(sandbox=sandbox):
+                parser = codex_runner.Parser()
+                codex_runner.add_task_arguments(parser)
+                args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--sandbox", sandbox])
+                args.context = {"write": False}
+                verdict = {"completed": True, "failed": False, "thread_id": "conversation-1", "file_changes": [],
+                           "last_text": "done", "usage": {}, "commands": [], "forced_exit": False}
+                with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "run_attempt", return_value=verdict) as attempt:
+                    result = codex_runner.execute(args, "Evidence: {{CONDUCTOR_EVIDENCE_DIR}}", Path(self.tmp.name) / sandbox)
+                self.assertEqual(result["status"], "completed", result)
+                self.assertIs(result.get("evidence_available"), False)
+                self.assertNotIn("evidence_dir", result)
+                self.assertIsNone(args.evidence_dir)
+                self.assertNotIn("External evidence directory", attempt.call_args.args[1])
 
     def test_evidence_directory_cannot_overlap_project(self):
         import codex_runner

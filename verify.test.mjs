@@ -1225,11 +1225,13 @@ test('verification receipts group only tagged blocked rows and leave their statu
   assert.doesNotMatch(plain, /\[缺证据\]|expect_blocked|owner_only/);
 });
 
-test('non-host Gemini execution prompts do not promise external evidence access', async () => {
-  const h = harness({ config: { defaultEngine: 'gemini', gemini: { command: gemini.command } } });
-  await h.tools.codex_run.execute({ task: 'Inspect the project.', acceptance, write: false }, exec);
-  assert.match(h.payload().prompt, /没有证据目录/);
-  assert.doesNotMatch(h.payload().prompt, /CONDUCTOR_EVIDENCE_DIR|该项目外证据目录允许写入/);
+test('Gemini read-only execution prompts do not promise external evidence access', async () => {
+  for (const defaultHostAccess of [false, true]) {
+    const h = harness({ config: { defaultEngine: 'gemini', defaultHostAccess, gemini: { command: gemini.command } } });
+    await h.tools.codex_run.execute({ task: 'Inspect the project.', acceptance, write: false }, exec);
+    assert.match(h.payload().prompt, /没有证据目录/);
+    assert.doesNotMatch(h.payload().prompt, /CONDUCTOR_EVIDENCE_DIR|该项目外证据目录允许写入/);
+  }
 });
 
 test('verification does not invent evidence paths for a non-host Gemini source', async () => {

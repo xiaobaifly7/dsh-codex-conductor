@@ -21,6 +21,7 @@ import http.client
 import glob
 import json
 from math import isfinite
+import ntpath
 import os
 import queue
 import random
@@ -2031,6 +2032,27 @@ def ignore_patterns(ignore):
     return patterns, warnings
 
 
+def evidence_event_path(cwd, path, root, windows_root=None):
+    if not root:
+        return False
+    try:
+        path = local_path(os.fspath(path))
+        if not IS_WIN:
+            path = path.replace("\\", "/")
+            if windows_root:
+                share = ntpath.splitdrive(windows_root)[0].replace("\\", "/")
+                if share.lower().startswith(("//wsl.localhost/", "//wsl$/")) and (
+                        path.lower() == share.lower() or path.lower().startswith(share.lower() + "/")):
+                    # WSL aliases share '/', preserving Linux path case and '..' through directory links.
+                    path = "/" + path[len(share):].lstrip("/")
+        candidate = normalized_path(os.path.realpath(os.path.join(cwd, path), strict=True))
+        directory = normalized_path(os.path.realpath(root, strict=True))
+        return os.path.commonpath([candidate, directory]) == directory
+    except (OSError, ValueError, TypeError):
+        # An unresolved event remains a modification; never hide it as evidence.
+        return False
+
+
 def files_changed(root, before, event_changes, scope=None, ignore=None):
     """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool.
     Paths matching an ignore regex (files other processes keep writing) are dropped before the 300-entry cap."""
@@ -2637,12 +2659,12 @@ def execute(args, prompt, run_dir):
         args.context = context or None
         base["task_options"] = task_options(vars(args))
     verification = context.get("verification_of") and context.get("write") is False
-    evidence_allowed = not gemini or args.sandbox == "danger-full-access"
+    evidence_allowed = not gemini or (args.sandbox == "danger-full-access" and writer(args.sandbox, context))
     if not verification and not evidence_allowed:
         base["evidence_available"] = False
         args.evidence_dir = None
         prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", "不可用（本单没有证据目录）")
-        prompt += "\n本单是非主机 Gemini 任务，没有证据目录，保持原有权限，不为留证扩大访问范围；无法留存的观测证据如实标 blocked。\n"
+        prompt += "\n本单是只读或非主机 Gemini 任务，没有证据目录，保持原有权限，不为留证扩大访问范围；无法留存的观测证据如实标 blocked。\n"
     if not verification and evidence_allowed:
         evidence = (run_dir / "evidence").resolve()
         project_root = args.cwd
@@ -2844,11 +2866,8 @@ def execute(args, prompt, run_dir):
         def changes():
             if args.sandbox == "read-only":
                 return {}
-            evidence_roots = [str(base[key]).replace("\\", "/").rstrip("/") for key in
-                              ("evidence_dir", "evidence_dir_windows") if base.get(key)]
-            events = [(path, kind) for path, kind in event_changes if not any(
-                str(path).replace("\\", "/") == root or str(path).replace("\\", "/").startswith(root + "/")
-                for root in evidence_roots)]
+            events = [(path, kind) for path, kind in event_changes if not evidence_event_path(
+                args.cwd, path, base.get("evidence_dir"), base.get("evidence_dir_windows"))]
             result = files_changed(args.cwd, before, events, scope, ignore)
             if gemini:
                 result["files_changed_source"] = result["files_changed_source"].replace("codex_events", "gemini_events")

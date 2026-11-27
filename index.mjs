@@ -495,7 +495,7 @@ export function createConductor(cfg, run = runRunner) {
     const task = args.rerun_after_change ? `${args.task.trim()}\n\n## 规划端说明的变化\n${args.rerun_after_change.trim()}` : args.task;
     const prompt = composePrompt(task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
       ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify,
-      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of), evidenceAvailable: engine !== 'gemini' || hostAccess === true });
+      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of), evidenceAvailable: engine !== 'gemini' || (hostAccess === true && args.write === true) });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -570,7 +570,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
-    (!verification ? evidenceAvailable ? '- 验收靠命令输出、HTTP 响应或其他观测证明时，把完整原始输出存进 {{CONDUCTOR_EVIDENCE_DIR}}，evidence 写文件路径；终端里看过的不算留证。该项目外证据目录允许写入。\n' : '- 本单是非主机 Gemini 任务，没有证据目录，保持原有权限；无法留存的观测证据如实标 blocked。\n' : '') +
+    (!verification ? evidenceAvailable ? '- 验收靠命令输出、HTTP 响应或其他观测证明时，把完整原始输出存进 {{CONDUCTOR_EVIDENCE_DIR}}，evidence 写文件路径；终端里看过的不算留证。该项目外证据目录允许写入。\n' : '- 本单是只读或非主机 Gemini 任务，没有证据目录，保持原有权限；无法留存的观测证据如实标 blocked。\n' : '') +
     (scope.length ? `- ${evidenceAvailable ? '除证据目录外，' : ''}只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
     (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些 Python re 正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
       '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
