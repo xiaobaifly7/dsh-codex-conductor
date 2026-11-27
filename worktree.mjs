@@ -2,8 +2,8 @@
 // 合并沿用 dsh-worktree-space 的做法：先试合并，冲突留在 worktree 里解决，原目录有重叠的未提交改动就不合并。
 // 被 .gitignore 忽略的资料不进 worktree：忽略的目录用目录联接（junction）接进来，忽略的单个文件用硬链接，都与原目录共用。
 import { execFile } from 'node:child_process';
-import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { cp, link, rename, rm, rmdir, symlink, unlink } from 'node:fs/promises';
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
+import { link, symlink } from 'node:fs/promises';
 import path from 'node:path';
 
 const GIT_TIMEOUT_MS = 120_000;
@@ -38,37 +38,13 @@ function normalized(p) {
   let s = String(p).replace(/\\/g, '/');
   const mount = /^\/mnt\/([A-Za-z])(\/.*)?$/.exec(s);
   if (mount) s = `${mount[1]}:${mount[2] ?? '/'}`;
-  s = (/^[A-Za-z]:|^\/\//.test(s) ? path.win32 : path.posix).normalize(s).replace(/\\/g, '/');
-  if (/^[A-Za-z]:\/$/.test(s)) return s;
   return s.length > 1 ? s.replace(/\/+$/, '') : s;
 }
-function resolved(p) {
-  if (typeof p !== 'string' || !p.trim()) throw new Error('无法规范化空路径');
-  let local = p.replace(/\\/g, '/');
-  if (process.platform === 'win32') {
-    local = local.replace(/^\/mnt\/([A-Za-z])(\/.*)?$/, (_, drive, tail) => `${drive}:${tail ?? '/'}`);
-    // POSIX-only paths belong to the WSL runner, not the current Windows drive.
-    if (local.startsWith('/') && !local.startsWith('//')) return normalized(local);
-  } else local = local.replace(/^([A-Za-z]):(?=\/|$)/, (_, drive) => `/mnt/${drive.toLowerCase()}`);
-  try { return normalized(realpathSync.native(local)); }
-  catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    try { lstatSync(local); }
-    catch (missing) {
-      if (missing.code !== 'ENOENT') throw missing;
-      const parent = path.dirname(local);
-      return parent === local ? normalized(local) : normalized(path.join(resolved(parent), path.basename(local)));
-    }
-    throw error;
-  }
-}
-export const pathKey = (p, real = true) => (real ? resolved(p) : normalized(p)).toLowerCase();
-const contains = (a, r) => a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
+export const pathKey = (p) => normalized(p).toLowerCase();
 export const within = (p, root) => {
-  // Keep declared containment when an in-tree junction points outside the worktree.
-  const paths = [pathKey(p, false), pathKey(p)];
-  const roots = [pathKey(root, false), pathKey(root)];
-  return paths.some(a => roots.some(r => contains(a, r)));
+  const a = pathKey(p);
+  const r = pathKey(root);
+  return a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
 };
 
 export function repoFor(repos, paths) {
@@ -77,13 +53,9 @@ export function repoFor(repos, paths) {
 
 // 把原仓库下的路径换到 worktree 下，其余路径原样返回。
 export function relocate(p, repo, worktree) {
-  if (typeof p !== 'string') return p;
-  const sources = [normalized(p), resolved(p)], roots = [normalized(repo), resolved(repo)];
-  for (const source of sources) for (const root of roots) {
-    if (contains(pathKey(source, false), pathKey(root, false)))
-      return path.join(worktree, ...source.slice(root.length).split('/').filter(Boolean));
-  }
-  return p;
+  if (typeof p !== 'string' || !within(p, repo)) return p;
+  const rest = normalized(p).slice(normalized(repo).length).split('/').filter(Boolean);
+  return path.join(worktree, ...rest);
 }
 
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -96,9 +68,7 @@ const toMount = (p) => {
 export function relocateText(text, repo, worktree) {
   if (typeof text !== 'string' || !text) return text;
   const forward = normalized(repo);
-  const quoted = p => JSON.stringify(normalized(p).replace(/\//g, '\\')).slice(1, -1);
   const variants = [
-    [quoted(repo), quoted(worktree)],
     [forward.replace(/\//g, '\\'), normalized(worktree).replace(/\//g, '\\')],
     [forward, normalized(worktree)],
     [toMount(repo), toMount(worktree)],
@@ -115,7 +85,7 @@ export function ownerTag(owner) {
   return match ? match[1].toLowerCase() : String(owner).replace(/[^A-Za-z0-9]+/g, '-').slice(0, 16).toLowerCase() || 'conversation';
 }
 
-// 忽略的目录建联接、忽略的单个文件建硬链接，与原目录共用，不复制。返回建好的联接（相对路径），收尾时据此拆除。
+// 忽略的目录建联接、忽略的单个文件建硬链接，与原目录共用，不复制。返回建好的联接（相对路径）。
 async function linkIgnored(top, worktree) {
   const all = entries(await git(top, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory']));
   // 只因文件规则（如 *.bin）被忽略的目录，git 会把目录和里面的文件都列出来；整个目录接成联接，里面的不再单独硬链接。
@@ -240,58 +210,10 @@ export async function mergeWorktree(entry) {
 
 export async function worktreeStatus(entry) {
   if (!existsSync(entry.path)) return { exists: false };
-  const dirty = entries(await git(entry.path, ['status', '--porcelain', '-z', '--untracked-files=all'])).length;
-  const branchAhead = Number((await git(entry.repo, ['rev-list', '--count', `${entry.base_branch}..${entry.branch}`])).trim());
-  const headAhead = Number((await git(entry.path, ['rev-list', '--count', `${entry.base_branch}..HEAD`])).trim());
-  const ahead = Math.max(branchAhead, headAhead);
+  const dirty = entries((await gitRun(entry.path, ['status', '--porcelain', '-z', '--untracked-files=all'])).stdout).length;
+  const ahead = Number((await gitRun(entry.repo, ['rev-list', '--count', `${entry.base_branch}..${entry.branch}`])).stdout.trim()) || 0;
   const merging = (await gitRun(entry.path, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD'])).code === 0;
   return { exists: true, dirty, ahead, merging };
-}
-
-// 收尾：先拆联接（rmdir 对联接只删链接本身；对真目录只会删空目录），再 git worktree remove（不加 --force），最后 branch -d。
-// 不跑 git worktree prune：在 Windows 上 prune 会把 WSL 那边建的 worktree 登记一起删掉。
-// git worktree remove 会把 worktree 里被忽略的文件一起删掉（实测）。对话在 worktree 里新产出的忽略文件（扫描结果、日志等）
-// 收尾前移回原目录同一位置；原目录那里已有另一份时不覆盖，整个收尾停下来交给用户。
-async function keepIgnored(entry) {
-  const listed = entries(await git(entry.path, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'], { timeout: 600_000 }));
-  const linked = new Set(entry.links ?? []);
-  const moves = [];
-  const clashes = [];
-  const all = new Set([...linked, ...listed].map(item => item.replace(/\/$/, '')).sort());
-  const skip = [];
-  for (const rel of all) {
-    // 确认仍共享的联接和整个移走的目录，里面不再单独处理。
-    if (inside(rel, skip)) continue;
-    const at = path.join(entry.path, ...rel.split('/'));
-    const home = path.join(entry.repo, ...rel.split('/'));
-    let mine;
-    try { mine = lstatSync(at, { bigint: true }); } catch { continue; }
-    if (mine.isSymbolicLink()) {
-      if (!linked.has(rel) || pathKey(realpathSync.native(at)) !== pathKey(realpathSync.native(home))) clashes.push(rel);
-      skip.push(rel);
-      continue;
-    }
-    let theirs;
-    try { theirs = lstatSync(home, { bigint: true }); } catch { moves.push({ rel, at, home }); skip.push(rel); continue; }
-    // 开 worktree 时建的硬链接没被替换过，原目录就是同一份。
-    if (mine.isFile() && theirs.isFile() && mine.ino === theirs.ino && mine.dev === theirs.dev) continue;
-    // git 可能只列出整个忽略目录；递归检查同名目录，Set 避免重复处理它也列出的内部项。
-    if (mine.isDirectory() && theirs.isDirectory()) {
-      for (const name of readdirSync(at)) all.add(`${rel}/${name}`);
-      continue;
-    }
-    clashes.push(rel);
-  }
-  if (clashes.length) return { clashes };
-  for (const { at, home } of moves) {
-    mkdirSync(path.dirname(home), { recursive: true });
-    await rename(at, home).catch(async (error) => {
-      if (error.code !== 'EXDEV') throw error;
-      await cp(at, home, { recursive: true, errorOnExist: true, force: false });
-      await rm(at, { recursive: true, force: true });
-    });
-  }
-  return { moved: moves.map(item => item.rel) };
 }
 
 // 原目录有没有未提交的改动或未纳入 git 的文件；都没有时返回 undefined。
@@ -300,30 +222,4 @@ export async function checkoutDirty(repo) {
     .filter(line => /^.. /.test(line));
   const untracked = lines.filter(line => line.startsWith('?? ')).length;
   return lines.length ? { modified: lines.length - untracked, untracked } : undefined;
-}
-
-export async function closeWorktree(entry) {
-  const state = await worktreeStatus(entry);
-  if (state.exists && (state.dirty || state.merging)) return { status: 'blocked', reason: 'worktree_dirty', ...state };
-  if (state.exists && state.ahead) return { status: 'blocked', reason: 'not_merged', ...state };
-  let kept = {};
-  if (state.exists) {
-    const { clashes, moved } = await keepIgnored(entry);
-    if (clashes) {
-      return { status: 'blocked', reason: 'ignored_clash', count: clashes.length, files: clashes.slice(0, 20),
-        note: '这些被忽略的文件 worktree 里和原目录里各有一份且不是同一份，收尾会删掉 worktree 那份，所以没有收尾；请用户决定留哪份后再 close。' };
-    }
-    if (moved.length) kept = { moved_back: moved.length, moved_examples: moved.slice(0, 10) };
-    for (const rel of entry.links ?? []) {
-      const at = path.join(entry.path, ...rel.split('/'));
-      let info;
-      try { info = lstatSync(at); } catch { continue; }
-      if (!info.isSymbolicLink()) continue;
-      await unlink(at).catch(() => rmdir(at));
-    }
-    const removed = await gitRun(entry.repo, ['worktree', 'remove', entry.path]);
-    if (removed.code) return { status: 'error', message: `git worktree remove 失败：${removed.stderr}` };
-  }
-  const deleted = await gitRun(entry.repo, ['branch', '-d', entry.branch]);
-  return { status: 'closed', ...kept, branch_deleted: deleted.code === 0, ...(deleted.code ? { branch_note: deleted.stderr } : {}) };
 }

@@ -40,7 +40,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs planner.test.mjs verify.test.mjs guard.test.mjs gemini.test.mjs safeguards.test.mjs closeout.test.mjs convergence.test.mjs handover.test.mjs autoanswer.test.mjs worktree.test.mjs worktree-cleanup.test.mjs && (python3 runner/test_codex_runner.py || python runner/test_codex_runner.py) && (python3 runner/test_agy_runner.py || python runner/test_agy_runner.py)"
+    "test": "node --test test.mjs workflow.test.mjs runtime.test.mjs panel.test.mjs client-panel.test.mjs resume.test.mjs planner.test.mjs verify.test.mjs guard.test.mjs gemini.test.mjs safeguards.test.mjs closeout.test.mjs convergence.test.mjs handover.test.mjs autoanswer.test.mjs worktree.test.mjs && (python3 runner/test_codex_runner.py || python runner/test_codex_runner.py) && (python3 runner/test_agy_runner.py || python runner/test_agy_runner.py)"
   },
   "keywords": ["dsh", "dsh-plugin", "deepseek-harness", "codex", "wsl"],
   "license": "MIT",

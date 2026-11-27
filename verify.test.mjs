@@ -1,6 +1,6 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -63,8 +63,6 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
     if (argv[0] === 'list' && listed) return listed(argv);
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
     if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
-    if (argv[0] === 'worktree-activity') return { status: 'completed', worktrees: argv.slice(1).filter((_, i) => i % 2 === 1)
-      .map(root => ({ path: root, running: [], last_activity_at: 0 })) };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
   };
@@ -1111,6 +1109,17 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     assert.equal(option(rework.start().argv, '--cwd'), path.join(wt, 'src'));
     assert.equal(rework.payload().context.routing.worktree_path, wt);
 
+    const original = sourceJob();
+    original.cwd = root;
+    original.context = { ...original.context, owner: 'session-0a0a0a0a-1', task: `Read ${path.join(root, 'src', 'a.txt')} and report findings.` };
+    original.scope = ['src']; original.scope_paths = [path.join(root, 'src')];
+    original.files_changed = []; original.write_paths = [];
+    const originalVerification = harness({ config, source: original });
+    await originalVerification.verify({}, as('session-0a0a0a0a-1'));
+    assert.equal(option(originalVerification.start().argv, '--cwd'), root, 'verify the original checkout, not a later worktree');
+    assert.ok(originalVerification.payload().context.task.includes(JSON.stringify(original.context.task)));
+    assert.equal(originalVerification.payload().context.task.includes(JSON.stringify(original.context.task.replace(root, wt))), false);
+
     // A conversation that already wrote in the main checkout stays there; a read-only first job opens nothing.
     const old = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: base,
       scope_paths: [path.join(root, 'src')], context: { owner: 'session-0b0b0b0b-1', write: true } }], total: 1 }) });
@@ -1149,8 +1158,7 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     writeFileSync(path.join(wt, 'src', 'a.txt'), 'changed in the worktree\n');
     git(wt, 'add', '-A');
     git(wt, 'commit', '-q', '-m', 'job work');
-    const job = (extra) => ({ jobs: [{ job_id: 'W-1', cwd: wt, started_at: Date.now() / 1000,
-      context: { owner: 'session-0a0a0a0a-1', write: true }, ...extra }], total: 1, next_offset: null });
+    const job = (extra) => ({ jobs: [{ job_id: 'W-1', cwd: wt, context: { owner: 'session-0a0a0a0a-1', write: true }, ...extra }], total: 1 });
     const merge = (listed) => harness({ config, listed }).tools.codex_worktree.execute({ action: 'merge' }, as('session-0a0a0a0a-1'));
     assert.match((await merge(() => job({ status: 'running' }))).worktrees[0].note, /还有单在跑（W-1）/);
     assert.match((await merge(() => job({ status: 'completed', verification_status: 'unreviewed' }))).worktrees[0].note, /没核验通过（W-1）/);
@@ -1161,15 +1169,14 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     const merged = (await merge(() => job({ status: 'completed', verification_status: 'verified' }))).worktrees[0];
     assert.equal(merged.status, 'merged');
     assert.equal(readFileSync(path.join(root, 'src', 'a.txt'), 'utf8'), 'changed in the worktree\n');
-    const closed = (await harness({ config, listed: () => job({ status: 'completed', verification_status: 'verified' }) })
-      .tools.codex_worktree.execute({ action: 'close' }, as('session-0a0a0a0a-1'))).worktrees[0];
-    assert.deepEqual([closed.action, closed.status], ['close', 'closed']);
+    assert.deepEqual(h.tools.codex_worktree.parameters.properties.action.enum, ['status', 'merge']);
+    await assert.rejects(h.tools.codex_worktree.execute({ action: 'close' }, as('session-0a0a0a0a-1')), /status.*merge/);
+    assert.equal(existsSync(wt), true);
     assert.equal(harness({ config: {} }).tools.codex_worktree, undefined);
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
 });
-
 
 test('execution prompts retain raw observations outside the project, including read-only jobs', async () => {
   for (const write of [true, false]) {
@@ -1216,35 +1223,6 @@ test('verification receipts group only tagged blocked rows and leave their statu
   }
   const plain = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' }, structured: report() });
   assert.doesNotMatch(plain, /\[缺证据\]|expect_blocked|owner_only/);
-});
-
-test('host verification receipts report recorded physical snapshot budget reasons', async t => {
-  const budget = { before: { file_limit: 2, total_limit: 1, path_limit: 4 }, after: { file_limit: 0, total_limit: 3 } };
-  for (const [name, outcome, notice] of [
-    ['completed', { status: 'completed', verification_integrity: 'unchecked' }, /独立核验已结束/],
-    ['changed', { status: 'failed', error_kind: 'verification_tree_changed' }, /核验失败，勿使用本轮核验结论/],
-    ['unavailable', { status: 'completed', verification_integrity: 'unavailable' }, /Git 状态完整性比对不可用/],
-  ]) await t.test(name, () => {
-    const next = nextStep({ context: { verification_of: 'SOURCE-1', write: false }, sandbox: 'danger-full-access',
-      verification_budget_exceeded: budget, ...outcome });
-    assert.match(next, notice);
-    assert.match(next, /物理快照超预算：核验前（单文件 1 MiB 上限 2 条目、累计 32 MiB 上限 1 条目、256 条目上限 4 条目）；核验后（累计 32 MiB 上限 3 条目）/);
-    assert.match(next, outcome.verification_integrity === 'unavailable' ? /回退比较不可用/ : /已改用回退比较/);
-    assert.doesNotMatch(next, /0 条目/);
-  });
-});
-
-test('host verification receipts do not infer budget overruns from unchecked entries', () => {
-  for (const budget of [undefined, {}, { before: {}, after: { file_limit: 0, total_limit: 0, path_limit: 0 } }]) {
-    const next = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' },
-      verification_integrity: 'unchecked', verification_unchecked_files: 4, verification_budget_exceeded: budget });
-    assert.match(next, /有 4 个条目的内容未比对/);
-    assert.doesNotMatch(next, /物理快照超预算|核验前（|核验后（|回退比较/);
-  }
-  const afterOnly = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' },
-    verification_budget_exceeded: { after: { path_limit: 1 } } });
-  assert.match(afterOnly, /物理快照超预算：核验后（256 条目上限 1 条目）/);
-  assert.doesNotMatch(afterOnly, /核验前（|单文件 1 MiB|累计 32 MiB/);
 });
 
 test('non-host Gemini execution prompts do not promise external evidence access', async () => {

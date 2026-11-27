@@ -2203,6 +2203,33 @@ def verification_changed_names(before, after):
     return sorted(os.fsdecode(name) for name in names)
 
 
+def verification_only_appended(cwd, before, after):
+    """"hash" or "size" when every changed dirty file is a regular file that only grew, with its earlier bytes unchanged
+    when they were hashed ("size": some were too many to hash, so only their growth was checked); otherwise None."""
+    changed = [name for name in before if verification_observations_changed({name: before[name]}, {name: after[name]})]
+    try:
+        top = Path(local_path(os.fsdecode(git(cwd, "rev-parse", "--show-toplevel", deadline=time.monotonic() + 10)).rstrip("\r\n")))
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+    def appended(name):
+        (old_size, _, old_kind), old_hash = before[name]
+        (new_size, _, new_kind), _ = after[name]
+        if old_kind != new_kind or not stat.S_ISREG(new_kind) or new_size <= old_size:
+            return False
+        if old_hash is None:
+            return True  # shortcut: with more dirty files than are content-hashed only sizes are known; growth is all we check
+        try:
+            with open(top / os.fsdecode(name), "rb") as file:
+                return hashlib.sha256(file.read(old_size)).hexdigest() == old_hash
+        except OSError:
+            return False
+
+    if not all(appended(name) for name in changed):
+        return None
+    return "size" if any(before[name][1] is None for name in changed) else "hash"
+
+
 def stat_fingerprint(info):
     return info.st_size, info.st_mtime_ns, stat.S_IFMT(info.st_mode)
 
@@ -2279,186 +2306,47 @@ def dirty_file_hashes(directory, status, deadline, *, stat_fallback=False):
     return hashes, unchecked
 
 
-def verification_working_files(directory, relative, deadline, *, budget_exceeded=None):
-    """Read physical work files; Git conversions and index entries are not working-file evidence."""
-    working, unchecked = {}, set()
-    remaining = VERIFY_TOTAL_LIMIT
-    if budget_exceeded is None:
-        budget_exceeded = {}
-
-    def exceeded(kind):
-        budget_exceeded[kind] = budget_exceeded.get(kind, 0) + 1
-
-    def content_limit(size):
-        if size > VERIFY_FILE_LIMIT:
-            exceeded("file_limit")
-        if size > remaining:
-            exceeded("total_limit")
-
-    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    def identity(info, *, cross_api=False):
-        mode = info.st_mode & ~0o111 if IS_WIN and cross_api else info.st_mode
-        return (info.st_dev, info.st_ino, mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
-
-    def is_link(info):
-        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
-
-    def scan(path):
-        nonlocal remaining
-        if time.monotonic() >= deadline:
-            raise subprocess.TimeoutExpired("verification working files", 0)
-        name = os.fsencode(path.relative_to(directory).as_posix())
-        if name in working or name in unchecked:
-            return
-        try:
-            info = path.lstat()
-        except FileNotFoundError:
-            return
-        except OSError:
-            unchecked.add(name)
-            return
-        if len(working) >= VERIFY_CONTENT_FILES:
-            exceeded("path_limit")
-            unchecked.add(name)
-            return
-        working[name] = ("unchecked", None, info.st_mode)
-        try:
-            if stat.S_ISDIR(info.st_mode) and not is_link(info):
-                working[name] = ("directory", None, info.st_mode)
-                # A checked-out submodule is a directory boundary, independent of its staged gitlink OID.
-                if path != directory and os.path.lexists(path / ".git"):
-                    return
-                with os.scandir(path) as entries:
-                    names = sorted(entry.name for entry in entries if entry.name != ".git")
-                for child in names:
-                    scan(path / child)
-                with os.scandir(path) as entries:
-                    if names != sorted(entry.name for entry in entries if entry.name != ".git"):
-                        unchecked.add(name)
-                if path.lstat().st_mode != info.st_mode:
-                    unchecked.add(name)
-                return
-            limit = min(remaining, VERIFY_FILE_LIMIT)
-            if is_link(info):
-                content = os.fsencode(os.readlink(path))
-                kind = "link"
-            elif stat.S_ISREG(info.st_mode) and info.st_size <= limit:
-                kind = "content"
-                with os.fdopen(os.open(path, flags), "rb") as file:
-                    opened = os.fstat(file.fileno())
-                    # Windows lstat adds .exe execute bits and can disagree on ctime; same-source checks stay exact.
-                    if not stat.S_ISREG(opened.st_mode) or identity(info, cross_api=True)[:-1] != identity(opened, cross_api=True)[:-1] or (
-                            not IS_WIN and info.st_ctime_ns != opened.st_ctime_ns):
-                        unchecked.add(name)
-                        return
-                    content = file.read(limit + 1)
-                    if identity(opened) != identity(os.fstat(file.fileno())):
-                        unchecked.add(name)
-                        return
-            else:
-                if stat.S_ISREG(info.st_mode):
-                    content_limit(info.st_size)
-                unchecked.add(name)
-                return
-            if len(content) > limit:
-                content_limit(len(content))
-                unchecked.add(name)
-                return
-            if identity(info) != identity(path.lstat()):
-                unchecked.add(name)
-                return
-            remaining -= len(content)
-            working[name] = (kind, hashlib.sha256(content).hexdigest(), info.st_mode)
-        except (OSError, ValueError):
-            unchecked.add(name)
-
-    for name in relative:
-        path = directory / name
-        # Do not follow symlink ancestors or expand a submodule when a child is explicitly named.
-        for parent in reversed(path.parents):
-            if parent == directory or not parent.is_relative_to(directory):
-                continue
-            try:
-                boundary = is_link(parent.lstat()) or os.path.lexists(parent / ".git")
-            except FileNotFoundError:
-                continue
-            except OSError:
-                boundary = True
-            if boundary:
-                path = parent
-                break
-        if ".git" not in path.relative_to(directory).parts:
-            scan(path)
-    if time.monotonic() >= deadline:
-        raise subprocess.TimeoutExpired("verification working files", 0)
-    observations = {name: ((None, None, mode), content) for name, (_, content, mode) in working.items()}
-    return observations, working, unchecked
-
-
-def verification_git_digest(cwd, paths, *, budget=30, strict=False, whole=True, legacy=False, budget_exceeded=None):
+def verification_git_digest(cwd, paths, *, budget=30, strict=False, whole=True):
     deadline = time.monotonic() + budget
-    directory = Path(cwd)
-    if not strict and not legacy and not os.environ.get("GIT_DIR") and not any(
-            os.path.lexists(parent / ".git") for parent in (directory, *directory.parents)):
-        root = Path(normalized_path(cwd))
-        if any(not Path(normalized_path(path)).is_relative_to(root) for path in paths):
-            return None, None, set()
-        relative = sorted({os.path.relpath(path, directory) for path in paths})
-        hashes, working, unchecked = verification_working_files(directory, relative, deadline, budget_exceeded=budget_exceeded)
-        checksum = hashlib.sha256(repr(sorted(working.items())).encode("utf-8")).digest()
-        return None, (checksum, hashes, working), unchecked
 
     def digest(query):
-        head = query("rev-parse", "--verify", "HEAD") if strict or legacy else b""
-        if not strict and whole:
-            with suppress(ValueError):
-                head = query("rev-parse", "--verify", "HEAD")
+        head = query("rev-parse", "--verify", "HEAD")
         top = os.fsdecode(query("rev-parse", "--show-toplevel").rstrip(b"\r\n"))
         directory = Path(local_path(top))
         root = Path(normalized_path(str(directory)))
-        if not strict and not legacy and any(not Path(normalized_path(path)).is_relative_to(root) for path in paths):
-            return None, None, set()
         relative = sorted({Path(*Path(path).parts[len(root.parts):]).as_posix()
                            for path in paths if Path(normalized_path(path)).is_relative_to(root)})
         if not relative:
             return None, None, set()
-        if strict or legacy:
-            tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
-            index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
-                          "HEAD", "--", *relative, at=top)
-            scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
-            # Strict versioning and incomplete physical checks retain the original Git snapshot contract.
-            scoped = b"\0".join(entry for entry in scoped.split(b"\0") if not entry.endswith(b"-shm"))
-            if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
-                return None, None, set()
-            hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)
-            checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
-            return None, (checksum, hashes), unchecked
-        hashes, working, unchecked = verification_working_files(directory, relative, deadline, budget_exceeded=budget_exceeded)
-        checksum = hashlib.sha256(repr(sorted(working.items())).encode("utf-8")).digest()
-        # Whole status is only an outside-scope warning and must not consume the working-file budget.
+        tree = query("--literal-pathspecs", "ls-tree", "-rz", "HEAD", "--", *relative, at=top)
+        index = query("--literal-pathspecs", "diff", "--cached", "--raw", "-z", "--no-abbrev", "--no-renames",
+                      "HEAD", "--", *relative, at=top)
+        scoped = query("--literal-pathspecs", *GIT_DIRTY_STATUS, "--", *relative, at=top)
+        # SQLite's -shm is the shared-memory index every reader of a WAL database rewrites; it holds no data. A verifier
+        # that only queried a product database failed on it (d8778b, 2026-11-25).
+        scoped = b"\0".join(entry for entry in scoped.split(b"\0") if not entry.endswith(b"-shm"))
+        if strict and query("--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", *relative, at=top):
+            return None, None, set()
+        hashes, unchecked = dirty_file_hashes(directory, scoped, deadline, stat_fallback=not strict)
+        checksum = hashlib.sha256(tree + b"\0" + index + b"\0" + scoped).digest()
+        # Whole-repository status only feeds the outside-the-scope warning, so it runs last and may give up: on a /mnt
+        # repository with many untracked files it took 39 s alone and timed the scoped check out with it (2026-11-23).
         status = None
-        if whole:
-            with suppress(OSError, ValueError, subprocess.TimeoutExpired):
+        if not strict and whole:
+            with suppress(subprocess.TimeoutExpired):
                 status = hashlib.sha256(head + b"\0" + query(*GIT_DIRTY_STATUS, until=deadline - 2)).digest()
-        return status, (checksum, hashes, working), unchecked
+        return status, (checksum, hashes), unchecked
 
     return git_on_tree(cwd, deadline, digest, raise_errors=True)
 
 
-def verification_metadata_unchanged(cwd, before, after):
-    """Only complete physical snapshots prove the same file set, bytes, modes and link targets."""
-    return before[2] == after[2] and all(value[0] != "unchecked" for value in before[2].values())
-
-
-def verification_paths(context, cwd, *, legacy=False):
+def verification_paths(context, cwd):
     source = job_status(context["verification_of"])
     if not source.get("cwd") or tree_key(source["cwd"]) != tree_key(cwd):
         return []
     files = [entry.get("path") if isinstance(entry, dict) else entry
              for entry in (source.get("files_changed") or []) + (source.get("write_paths") or [])]
-    scope = (source.get("scope_paths") or source.get("scope")) if legacy else (source.get("scope") or source.get("scope_paths"))
-    return [scope_path(cwd, path, resolve=None if legacy else os.path.abspath) for path in [*(scope or []), *files]
+    return [scope_path(cwd, path) for path in [*(source.get("scope_paths") or source.get("scope") or []), *files]
             if isinstance(path, str) and path.strip()]
 
 
@@ -2807,33 +2695,22 @@ def execute(args, prompt, run_dir):
                   "临时文件和测试缓存写入 TMPDIR。\n\n" + prompt)
     declared_paths = verification_paths(context, args.cwd) if host_verification else []
     paths = declared_paths or [args.cwd]
-    legacy_paths = (verification_paths(context, args.cwd, legacy=True) or [args.cwd]) if host_verification else []
 
     whole_known_slow = host_verification and WHOLE_TOO_SLOW + tree_key(args.cwd) in too_big_trees()
 
-    snapshot_budgets = {}
-
-    def take_snapshot(stage, whole, *, legacy=False):
-        exceeded = {}
+    def take_snapshot(stage, whole):
         try:
-            digest = verification_git_digest(args.cwd, legacy_paths if legacy else paths, whole=whole,
-                                             **({"legacy": True} if legacy else {"budget_exceeded": exceeded}))
+            digest = verification_git_digest(args.cwd, paths, whole=whole)
         except subprocess.TimeoutExpired:
             return None, f"{stage}_timeout"
         except (OSError, ValueError):
             return None, f"{stage}_git_error"
         except RuntimeError:
             return None, f"{stage}_error"
-        finally:
-            if exceeded:
-                snapshot_budgets[stage] = exceeded
         return (None, f"{stage}_no_scope") if digest[1] is None else (digest, None)
 
-    # Keep the old baseline even when the first physical snapshot is complete: the second may exceed its budget.
-    before_legacy, before_legacy_reason = take_snapshot("before", False, legacy=True) if host_verification else (None, None)
     before_digest, before_reason = take_snapshot("before", not whole_known_slow) if host_verification else (None, None)
-    if before_digest is not None and before_digest[0] is None and not whole_known_slow and any(
-            os.path.lexists(parent / ".git") for parent in (Path(args.cwd), *Path(args.cwd).parents)):
+    if before_digest is not None and before_digest[0] is None and not whole_known_slow:
         remember_too_big(args.cwd, WHOLE_TOO_SLOW)  # a usable before-digest without a whole status means it timed out
     verification_scope = (context.get("routing") or {}).get("verification_scope") if verification else None
     version_source = job_status(context["verification_of"]) if isinstance(verification_scope, str) else None
@@ -2847,41 +2724,38 @@ def execute(args, prompt, run_dir):
         # Without a whole status from before there is nothing to compare one from after with.
         after_digest, reason = take_snapshot("after", before_digest[0] is not None) if before_digest is not None \
             else (None, before_reason)
-        result["verification_budget_exceeded"] = snapshot_budgets
-        complete = not reason and not before_digest[2] and not after_digest[2]
-        if complete:
-            before_whole, before_scope, _ = before_digest
-            after_whole, after_scope, _ = after_digest
-            scope_changed = not verification_metadata_unchanged(args.cwd, before_scope, after_scope)
-            compared_before, compared_after = before_scope, after_scope
+        if reason:
+            result.update(verification_integrity="unavailable", verification_integrity_reason=reason)
         else:
-            after_legacy, legacy_reason = take_snapshot("after", False, legacy=True) if before_legacy is not None \
-                else (None, before_legacy_reason)
-            if legacy_reason:
-                result.update(verification_integrity="unavailable", verification_integrity_reason=legacy_reason)
-                return result
-            before_whole = before_digest[0] if before_digest else None
-            after_whole = after_digest[0] if after_digest else None
-            compared_before, compared_after = before_legacy[1], after_legacy[1]
-            scope_changed = compared_before[0] != compared_after[0] or verification_observations_changed(
-                compared_before[1], compared_after[1])
-            unchecked = before_legacy[2] | after_legacy[2]
-            for digest in (before_digest, after_digest):
-                if digest is not None:
-                    unchecked |= digest[2]
-            result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
-            if reason:
-                result["verification_integrity_reason"] = reason
-        if scope_changed:
-            changed = verification_changed_names(compared_before[1], compared_after[1])
-            result.pop("structured", None)
-            result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
-                          error="Monitored working files or their fallback Git snapshot changed during verification.",
-                          verification_changed_paths=changed[:20], verification_changed_total=len(changed))
-        elif complete and None not in (before_whole, after_whole) and before_whole != after_whole:
-            result["verification_integrity"] = "concurrent_changes"
-        if None in (before_whole, after_whole):
-            result["verification_outside_scope"] = "unchecked"
+            before_whole, before_scope, before_unchecked = before_digest
+            after_whole, after_scope, after_unchecked = after_digest
+            scope_changed = before_scope[0] != after_scope[0] or verification_observations_changed(
+                before_scope[1], after_scope[1])
+            unchecked = before_unchecked | after_unchecked
+            if unchecked:
+                result.update(verification_integrity="unchecked", verification_unchecked_files=len(unchecked))
+            changed = verification_changed_names(before_scope[1], after_scope[1]) if scope_changed else []
+            # Same status, tree and index, and the only changes are appends to already-dirty files under a scope directory
+            # that are neither a product nor named in the scope: another process writing there, not the verifier. A
+            # console watcher appending to its log under a "10-audit" scope failed three verifications in a row (2026-11-23).
+            pinned = [normalized_path(path).replace("\\", "/").lower() for path in declared_paths if not os.path.isdir(path)]
+            background = bool(declared_paths) and before_scope[0] == after_scope[0] and bool(changed) and \
+                before_scope[1].keys() == after_scope[1].keys() and not any(
+                    path.endswith("/" + name.lower()) for name in changed for path in pinned) and \
+                verification_only_appended(args.cwd, before_scope[1], after_scope[1])
+            if background:
+                result.update(verification_integrity="concurrent_changes", verification_changed_paths=changed[:20],
+                              verification_changed_total=len(changed), verification_append_check=background)
+            elif scope_changed and (declared_paths or not concurrent_writer_in_scope(paths, run_dir, started)):
+                result.pop("structured", None)
+                # Named so the planner, which cannot read the project, can tell check output from a real edit (2026-11-23).
+                result.update(status="failed", error_kind="verification_tree_changed", retryable=False,
+                              error="Git status, index or file contents changed within the monitored verification paths.",
+                              verification_changed_paths=changed[:20], verification_changed_total=len(changed))
+            elif scope_changed or None not in (before_whole, after_whole) and before_whole != after_whole:
+                result["verification_integrity"] = "concurrent_changes"
+            if None in (before_whole, after_whole):
+                result["verification_outside_scope"] = "unchecked"
         return result
 
     repeat_guard = RepeatGuard(args.cwd, vars(args), run_dir)
@@ -4059,40 +3933,6 @@ def save_listing(job_id, signature, value, details):
                 os.unlink(tmp)
 
 
-def invalid_job_listing(job_dir, error):
-    value, context = {}, {}
-    # Dropping invalid path overrides could make a corrupt job appear unrelated to a worktree.
-    for filename in ("args.json", "result.json"):
-        try:
-            record = json.loads((job_dir / filename).read_text("utf-8"))
-        except (OSError, ValueError):
-            continue
-        if not isinstance(record, dict):
-            continue
-        for key in ("cwd", "scope", "scope_paths"):
-            if key in record:
-                value[key] = record[key]
-        if filename == "args.json" and "writable_roots" in record:
-            value["task_options"] = {"writable_roots": record["writable_roots"]}
-        if filename == "result.json" and "task_options" in record:
-            value["task_options"] = record["task_options"]
-        raw_context = record.get("context")
-        if isinstance(raw_context, dict):
-            if isinstance(raw_context.get("owner"), str):
-                context["owner"] = raw_context["owner"]
-            if isinstance(raw_context.get("write"), bool):
-                context["write"] = raw_context["write"]
-            routing = raw_context.get("routing")
-            if isinstance(routing, dict) and "worktree_path" in routing:
-                context["routing"] = {"worktree_path": routing["worktree_path"]}
-            elif "routing" in raw_context and not isinstance(routing, dict):
-                context["routing"] = {"worktree_path": None}
-    value.update(job_listing_times(job_dir))
-    value.update(status="failed", error_kind="invalid_record", error=str(error), retryable=False,
-                 context=context or None, verification_status="invalid", verification=None)
-    return {**value, **review_summary(value), "blocking": blocking_summary(value)}
-
-
 def matching_jobs(args, *, page_dates=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
@@ -4128,172 +3968,100 @@ def matching_jobs(args, *, page_dates=None):
     added = False
     directories = job_directories(args.job_id if not args.owner else None) if page_dates is None else page_dates
     for job_dir in directories:
-        try:
-            args_file, result_file = job_dir / "args.json", job_dir / "result.json"
-            started_at = None
-            if started_between is not None:
-                try:
-                    started_at = args_file.stat().st_mtime
-                except FileNotFoundError as error:
-                    raise ValueError("Missing args.json; cannot determine registration time") from error
-                if not started_between[0] <= started_at <= started_between[1]:
-                    continue
-            task = None
-            if prefilter:
-                fields = cached.get(job_dir.name)
-                if not (isinstance(fields, list) and len(fields) == 3):
-                    fields = None
-                    with suppress(OSError, ValueError, TypeError):
-                        task = task_record(job_dir)
-                        if task:  # args.json not written yet: leave the decision to the full record below
-                            fields = cached[job_dir.name] = job_filter_fields(task)
-                            added = True
-                if fields is not None:
-                    owner, verification_of, task_hash = fields
-                    if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}},
-                                            job_dir.name, task_hash=task_hash, check_cwd=False):
-                        continue
-            # Only terminal jobs publish result.json.
-            finished = result_file.exists()
-            if args.status == "running" and finished:
+        args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+        started_at = None
+        if started_between is not None:
+            try:
+                started_at = args_file.stat().st_mtime
+            except FileNotFoundError:
                 continue
-            # A finished job's record and status are reused while its directory is unchanged: recomputing them took
-            # ~2 ms per job, and a 2,000-job handover chain is listed whole several times per dispatch (2026-11-24).
-            # The signature is taken before the files are read, so a change made meanwhile is recomputed next time.
-            signature = None
-            if finished:
-                with suppress(OSError):
-                    signature = job_signature(job_dir)
-            listing = load_listing(job_dir.name, signature) if signature is not None else None
-            if listing is not None:
-                value, record = {**listing[0], "_details": listing[1]}, None
-                if not matches_metadata(value, job_dir.name):
+            if not started_between[0] <= started_at <= started_between[1]:
+                continue
+        task = None
+        if prefilter:
+            fields = cached.get(job_dir.name)
+            if not (isinstance(fields, list) and len(fields) == 3):
+                fields = None
+                with suppress(OSError, ValueError, TypeError):
+                    task = task_record(job_dir)
+                    if task:  # args.json not written yet: leave the decision to the full record below
+                        fields = cached[job_dir.name] = job_filter_fields(task)
+                        added = True
+            if fields is not None:
+                owner, verification_of, task_hash = fields
+                if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}},
+                                        job_dir.name, task_hash=task_hash, check_cwd=False):
                     continue
-            else:
+        # Only terminal jobs publish result.json.
+        finished = result_file.exists()
+        if args.status == "running" and finished:
+            continue
+        # A finished job's record and status are reused while its directory is unchanged: recomputing them took
+        # ~2 ms per job, and a 2,000-job handover chain is listed whole several times per dispatch (2026-11-24).
+        # The signature is taken before the files are read, so a change made meanwhile is recomputed next time.
+        signature = None
+        if finished:
+            with suppress(OSError):
+                signature = job_signature(job_dir)
+        listing = load_listing(job_dir.name, signature) if signature is not None else None
+        if listing is not None:
+            value, record = {**listing[0], "_details": listing[1]}, None
+            if not matches_metadata(value, job_dir.name):
+                continue
+        else:
+            try:
+                task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
+                result = json.loads(result_file.read_text("utf-8")) if finished else None
+                value = {**task, **(result if result is not None else {})}
+                record = {"task": task, "result": result}
+            except (OSError, ValueError, TypeError):
+                value, record = {}, None
+            if not matches_metadata(value, job_dir.name):
+                continue
+            if record is not None:
                 try:
-                    task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
-                    result = json.loads(result_file.read_text("utf-8")) if finished else None
-                    value = {**task, **(result if result is not None else {})}
-                    record = {"task": task, "result": result}
+                    record["metadata"] = job_metadata(job_dir, task=record["task"],
+                                                     finished_at=result_file.stat().st_mtime if result_file.exists() else None,
+                                                     thread_id=value.get("thread_id"),
+                                                     conversation_id=value.get("conversation_id"), resolve=resolve)
+                    value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
                 except (OSError, ValueError, TypeError):
-                    value, record = {}, None
-                if not matches_metadata(value, job_dir.name):
-                    continue
-                if record is not None:
-                    try:
-                        record["metadata"] = job_metadata(job_dir, task=record["task"],
-                                                         finished_at=result_file.stat().st_mtime if result_file.exists() else None,
-                                                         thread_id=value.get("thread_id"),
-                                                         conversation_id=value.get("conversation_id"), resolve=resolve)
-                        value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
-                    except (OSError, ValueError, TypeError):
-                        record = None
-                        value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
-                        value["_details"] = dict(value)
-                        if not matches_metadata(value, job_dir.name):
-                            continue
-                if signature is not None and record is not None and record["result"] is not None:
-                    value["_details"] = job_status(job_dir.name, record, lost_after=getattr(args, "lost_after", LOST_AFTER))
-                    save_listing(job_dir.name, signature, value, value["_details"])
-            context = value.get("context") or {}
-            parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
-                      context.get("routing", {}).get("parent_job_id"))
-            if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
+                    record = None
+                    value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
+                    value["_details"] = dict(value)
+                    if not matches_metadata(value, job_dir.name):
+                        continue
+            if signature is not None and record is not None and record["result"] is not None:
+                value["_details"] = job_status(job_dir.name, record, lost_after=getattr(args, "lost_after", LOST_AFTER))
+                save_listing(job_dir.name, signature, value, value["_details"])
+        context = value.get("context") or {}
+        parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
+                  context.get("routing", {}).get("parent_job_id"))
+        if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
+            continue
+        if getattr(args, "parent_job", None) and parent != args.parent_job:
+            continue
+        value.update(job_id=job_dir.name, _record=record)
+        if args.status or needs_attention:
+            value = job_details(value, args)
+        if args.status and value["execution_status"] != args.status:
+            continue
+        verification = value.get("verification_status", "unreviewed")
+        attention = verification in ("needs_changes", "invalid") or (
+            verification == "unreviewed" and value.get("review_status") == "needs_attention")
+        if needs_attention and not attention:
+            continue
+        if scope_conflicts:
+            blocking = value["blocking"]
+            if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
                 continue
-            if getattr(args, "parent_job", None) and parent != args.parent_job:
-                continue
-            value.update(job_id=job_dir.name, _record=record)
-            if args.status or needs_attention:
-                value = job_details(value, args)
-            if args.status and value["execution_status"] != args.status:
-                continue
-            verification = value.get("verification_status", "unreviewed")
-            attention = verification in ("needs_changes", "invalid") or (
-                verification == "unreviewed" and value.get("review_status") == "needs_attention")
-            if needs_attention and not attention:
-                continue
-            if scope_conflicts:
-                blocking = value["blocking"]
-                if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
-                    continue
-            dates = (page_dates[job_dir] if page_dates is not None else
-                     signature_times(job_dir, signature) if signature is not None else job_listing_times(job_dir, started_at))
-            jobs.append({**value, "parent_job_id": parent, **dates})
-        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError) as error:
-            if getattr(args, "command", None) != "list":
-                raise
-            invalid = invalid_job_listing(job_dir, error)
-            jobs.append({**invalid, "_details": invalid})
+        dates = (page_dates[job_dir] if page_dates is not None else
+                 signature_times(job_dir, signature) if signature is not None else job_listing_times(job_dir, started_at))
+        jobs.append({**value, "parent_job_id": parent, **dates})
     if added:
         save_job_filter_cache(cached)
     jobs.sort(key=job_listing_order, reverse=True)
     return jobs
-
-
-def worktree_activity(paths):
-    """Read registration records once; unfinished registrations reserve their paths without event replay."""
-    def resolve_location(path):
-        try:
-            return os.path.realpath(path, strict=True)
-        except FileNotFoundError:
-            parent, name = os.path.split(path)
-            if not name:
-                raise
-            return os.path.join(resolve_location(parent), name)
-
-    roots = [(value, {Path(tree_key(value, resolve=resolve)) for resolve in (resolve_location, os.path.abspath)})
-             for value in paths]
-    items = [{"path": value, "running": [], "last_activity_at": 0} for value, _ in roots]
-    directories = list(job_directories())
-    runs = HOME / "runs"
-    if runs.exists():
-        directories.extend(p for p in runs.iterdir() if p.is_dir() and (p / "write-lock.json").is_file())
-    for directory in directories:
-        task = task_record(directory)
-        if not task or not isinstance(task.get("cwd"), str):
-            raise ValueError(f"Incomplete task registration: {directory.name}")
-        try:
-            result = json.loads((directory / "result.json").read_text("utf-8"))
-        except FileNotFoundError:
-            result = None
-        if result is not None and not isinstance(result, dict):
-            raise ValueError(f"Invalid result: {directory.name}")
-        value = {**task, **(result or {})}
-        cwd = value["cwd"]
-        if not isinstance(cwd, str) or not cwd.strip():
-            raise ValueError(f"Invalid cwd: {directory.name}")
-        locations = [cwd]
-        routing = (task.get("context") or {}).get("routing") or {}
-        if "worktree_path" in routing:
-            bound = routing["worktree_path"]
-            if not isinstance(bound, str) or not bound.strip():
-                raise ValueError(f"Invalid worktree_path: {directory.name}")
-            locations.append(bound)
-        for field in ("scope", "scope_paths", "writable_roots"):
-            declared = task.get(field) if field == "writable_roots" else value.get(field)
-            if declared is None:
-                continue
-            if not isinstance(declared, list) or any(not isinstance(item, str) or not item.strip() for item in declared):
-                raise ValueError(f"Invalid {field}: {directory.name}")
-            locations.extend(scope_path(cwd, item, resolve=os.path.abspath) for item in declared)
-        locations = {Path(tree_key(item, resolve=resolve)) for item in locations
-                     for resolve in (resolve_location, os.path.abspath)}
-        matching = [index for index, (_, root_paths) in enumerate(roots)
-                    if any(p.is_relative_to(root) or root.is_relative_to(p) for p in locations for root in root_paths)]
-        if not matching:
-            continue
-        times = job_listing_times(directory)
-        activity = max([v for v in times.values() if isinstance(v, (int, float))] +
-                       [value[k] for k in ("started_at", "finished_at", "updated_at")
-                        if isinstance(value.get(k), (int, float)) and isfinite(value[k])])
-        running = result is None or value.get("status") not in ("completed", "failed", "cancelled") or value.get("execution_status") == "running"
-        for index in matching:
-            items[index]["last_activity_at"] = max(items[index]["last_activity_at"], activity)
-            if running:
-                items[index]["running"].append(directory.name)
-    for item in items:
-        item["running"].sort()
-    return {"status": "completed", "worktrees": items}
 
 
 def list_jobs(args):
@@ -4310,45 +4078,31 @@ def list_jobs(args):
         ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
         total = len(ordered)
         page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
+    page = [job_details(j, args) for j in page]
+    predispatch = None
+    if args.owner and getattr(args, "thread_id", None) and args.offset == 0 and page:
+        report = page[0].get("structured")
+        acceptance = (page[0].get("context") or {}).get("acceptance")
+        if (isinstance(acceptance, list) and valid_report(report) and
+                any(blocker["kind"] == "environment" for blocker in report.get("blockers", []))):
+            predispatch = {"acceptance": acceptance, "criteria": [
+                {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]]}
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
-              "last_error_kind", "retry_at", "worktree_commit")
-    predispatch = None
-
-    def serialize(job):
-        nonlocal predispatch
-        try:
-            j = job_details(job, args)
-            if j.get("error_kind") == "invalid_record":
-                return invalid_job_listing(job_directory(j["job_id"]), j["error"])
-            if j.get("context") is not None:
-                task_context(j["context"])
-            if job is page[0] and args.owner and getattr(args, "thread_id", None) and args.offset == 0:
-                report = j.get("structured")
-                context = j.get("context")
-                acceptance = context.get("acceptance") if isinstance(context, dict) else None
-                if (isinstance(acceptance, list) and valid_report(report) and
-                        any(blocker["kind"] == "environment" for blocker in report.get("blockers", []))):
-                    predispatch = {"acceptance": acceptance, "criteria": [
-                        {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]]}
-            return {**{k: j.get(k) for k in fields if k != "thread_id" or "conversation_id" not in j},
-                 "context": {"owner": j["context"].get("owner"),
-                             **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
-                             "task": j["context"]["task"].strip().splitlines()[0][:160],
-                             **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
-                             **({"routing": {"worktree_path": j["context"]["routing"]["worktree_path"]}}
-                                if "worktree_path" in (j["context"].get("routing") or {}) else {}),
-                             **{key: j["context"][key] for key in ("verification_of", "fallback_of") if key in j["context"]}}
-                 if j.get("context") else None,
-                 **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
-                 **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
-                 **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
-                                      "verification_version", "verification_scope") if k in j},
-                 **({"verification_error": j["verification_error"]} if "verification_error" in j else {})}
-        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError) as error:
-            return invalid_job_listing(job_directory(job["job_id"]), error)
-    page = [serialize(j) for j in page]
+              "last_error_kind", "retry_at")
+    page = [{**{k: j.get(k) for k in fields if k != "thread_id" or "conversation_id" not in j},
+             "context": {"owner": j["context"].get("owner"),
+                         **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
+                         "task": j["context"]["task"].strip().splitlines()[0][:160],
+                         **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
+                         **{key: j["context"][key] for key in ("verification_of", "fallback_of") if key in j["context"]}}
+             if j.get("context") else None,
+             **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
+             **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
+             **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
+                                  "verification_version", "verification_scope") if k in j},
+             **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     if predispatch is not None:
         page[0]["predispatch"] = predispatch
@@ -5058,8 +4812,6 @@ def main():
     repeat_guard.add_argument("--cwd", default=os.getcwd())
     repeat_guard.add_argument("--repeat-failures", type=positive_int, default=REPEAT_FAILURES)
     repeat_guard.add_argument("--repeat-window-hours", type=positive_float, default=REPEAT_WINDOW_HOURS)
-    activity = sub.add_parser("worktree-activity")
-    activity.add_argument("--path", action="append", required=True)
     listing = sub.add_parser("list")
     summary = sub.add_parser("summary")
     for command in (run, start, status, listing, summary):
@@ -5135,12 +4887,6 @@ def main():
         return
     if args.command == "verification-version":
         emit({"status": "completed", "verification_version": verification_version(job_status(args.job_id))})
-        return
-    if args.command == "worktree-activity":
-        try:
-            emit(worktree_activity(args.path))
-        except (OSError, ValueError, TypeError, KeyError) as error:
-            emit({"status": "failed", "error_kind": "invalid_record", "error": str(error), "retryable": False})
         return
     if args.command == "repeat-guard":
         try:
