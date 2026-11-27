@@ -1,7 +1,7 @@
 import test, { after } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync, unlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -716,10 +716,83 @@ test('merge gate names current tasks with incomplete paths', async () => {
   }
 });
 
-test('merge gate ignores unrelated readonly tasks with incomplete paths', async () => {
+test('merge gate names foreign readonly tasks with incomplete paths', async () => {
   const f = await fixture();
   const h = f.harness({ jobs: [{ ...f.oldJob, job_id: 'FOREIGN-READ', cwd: null, scope: [7],
     context: { owner: 'foreign', write: false } }] });
+  assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /FOREIGN-READ.*目录/s);
+});
+
+for (const alias of ['dot', 'dotdot', 'junction', 'case-and-separators']) {
+  test(`cleanup reservation recognizes equivalent cwd via ${alias}`, async () => {
+    const f = await fixture();
+    let location = alias === 'dot' ? `${path.dirname(f.entry.path)}/./${path.basename(f.entry.path)}`
+      : alias === 'dotdot' ? `${f.entry.path}/../${path.basename(f.entry.path)}`
+        : f.entry.path.replace(/\\/g, '/').toUpperCase();
+    if (alias === 'junction') {
+      location = path.join(path.dirname(f.entry.path), 'alias');
+      symlinkSync(f.entry.path, location, 'junction');
+    }
+    let entered, release;
+    const ready = new Promise(resolve => { entered = resolve; });
+    const gate = new Promise(resolve => { release = resolve; });
+    const h = f.harness({ starting: async () => { entered(); await gate; throw new Error('start failed'); } });
+    const dispatch = h.write({ cwd: location }).catch(error => error);
+    await Promise.race([ready, dispatch.then(error => { throw error; })]);
+    try {
+      await h.load();
+      assert.equal(f.current().status, 'open');
+      assert.equal(f.current().last_cleanup.reason, 'dispatching');
+    } finally { release(); await dispatch; }
+  });
+}
+
+test('cleanup matches canonical activity paths before deciding a worktree is idle', async () => {
+  const f = await fixture();
+  const h = f.harness({ activity: () => ({ status: 'completed', worktrees: [{
+    path: `${path.dirname(f.entry.path)}/./${path.basename(f.entry.path)}`, running: [],
+    last_activity_at: f.oldJob.finished_at }] }) });
+  await h.load();
+  assert.equal(f.current().status, 'closed');
+});
+
+test('dispatch reuses a worktree whose persisted repository key uses a junction alias', async () => {
+  const f = await fixture();
+  const alias = path.join(path.dirname(f.repo), 'repo-alias');
+  symlinkSync(f.repo, alias, 'junction');
+  const oldKey = `${f.owner}::${alias.replace(/\\/g, '/').toLowerCase()}`;
+  writeFileSync(f.file, JSON.stringify({ [oldKey]: { ...f.entry, repo: alias } }));
+  const h = f.harness();
+  await h.write({ cwd: alias });
+  assert.equal(h.starts[0].argv[h.starts[0].argv.indexOf('--cwd') + 1], f.entry.path);
+  assert.deepEqual(Object.keys(JSON.parse(readFileSync(f.file))), [oldKey]);
+});
+
+test('automatic cleanup preserves unmerged detached HEAD commits', async () => {
+  const f = await fixture();
+  git(f.entry.path, 'checkout', '-q', '--detach');
+  writeFileSync(path.join(f.entry.path, 'a.txt'), 'detached change\n');
+  git(f.entry.path, 'commit', '-am', 'detached change');
+  await f.harness().load();
+  assert.equal(f.current().status, 'open');
+  assert.equal(f.current().last_cleanup.reason, 'not_merged');
+});
+
+test('merge gate names invalid records and missing critical fields before owner filtering', async () => {
+  for (const broken of [{ error_kind: 'invalid_record', context: null, error: 'broken args.json' },
+    { context: null, cwd: null }, { context: { owner: 'foreign' } }, { status: null }, { job_id: '' }]) {
+    const f = await fixture();
+    const bad = { ...f.oldJob, job_id: 'CORRUPT', ...broken };
+    const h = f.harness({ jobs: [bad] });
+    assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note,
+      /(?:CORRUPT|缺少任务号).*(invalid_record|context|目录|status|任务号).*codex_status/s);
+    bad.started_at = Date.parse(f.entry.created_at) / 1000 - 1;
+    assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+  }
+  const f = await fixture();
+  const unrelated = { ...f.oldJob, job_id: 'UNRELATED', error_kind: 'invalid_record', cwd: f.repo,
+    scope: [], scope_paths: [], task_options: { writable_roots: [] } };
+  const h = f.harness({ jobs: [unrelated] });
   assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
 });
 

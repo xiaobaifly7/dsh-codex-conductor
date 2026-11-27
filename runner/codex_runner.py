@@ -2296,7 +2296,9 @@ def verification_working_files(directory, relative, deadline, *, budget_exceeded
             exceeded("total_limit")
 
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
-    identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    def identity(info, *, cross_api=False):
+        mode = info.st_mode & ~0o111 if IS_WIN and cross_api else info.st_mode
+        return (info.st_dev, info.st_ino, mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
     def is_link(info):
         return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
@@ -2344,8 +2346,8 @@ def verification_working_files(directory, relative, deadline, *, budget_exceeded
                 kind = "content"
                 with os.fdopen(os.open(path, flags), "rb") as file:
                     opened = os.fstat(file.fileno())
-                    # Windows lstat/fstat can disagree on ctime; retain ctime checks within each source.
-                    if not stat.S_ISREG(opened.st_mode) or identity(info)[:-1] != identity(opened)[:-1] or (
+                    # Windows lstat adds .exe execute bits and can disagree on ctime; same-source checks stay exact.
+                    if not stat.S_ISREG(opened.st_mode) or identity(info, cross_api=True)[:-1] != identity(opened, cross_api=True)[:-1] or (
                             not IS_WIN and info.st_ctime_ns != opened.st_ctime_ns):
                         unchecked.add(name)
                         return
@@ -4057,6 +4059,40 @@ def save_listing(job_id, signature, value, details):
                 os.unlink(tmp)
 
 
+def invalid_job_listing(job_dir, error):
+    value, context = {}, {}
+    # Dropping invalid path overrides could make a corrupt job appear unrelated to a worktree.
+    for filename in ("args.json", "result.json"):
+        try:
+            record = json.loads((job_dir / filename).read_text("utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        for key in ("cwd", "scope", "scope_paths"):
+            if key in record:
+                value[key] = record[key]
+        if filename == "args.json" and "writable_roots" in record:
+            value["task_options"] = {"writable_roots": record["writable_roots"]}
+        if filename == "result.json" and "task_options" in record:
+            value["task_options"] = record["task_options"]
+        raw_context = record.get("context")
+        if isinstance(raw_context, dict):
+            if isinstance(raw_context.get("owner"), str):
+                context["owner"] = raw_context["owner"]
+            if isinstance(raw_context.get("write"), bool):
+                context["write"] = raw_context["write"]
+            routing = raw_context.get("routing")
+            if isinstance(routing, dict) and "worktree_path" in routing:
+                context["routing"] = {"worktree_path": routing["worktree_path"]}
+            elif "routing" in raw_context and not isinstance(routing, dict):
+                context["routing"] = {"worktree_path": None}
+    value.update(job_listing_times(job_dir))
+    value.update(status="failed", error_kind="invalid_record", error=str(error), retryable=False,
+                 context=context or None, verification_status="invalid", verification=None)
+    return {**value, **review_summary(value), "blocking": blocking_summary(value)}
+
+
 def matching_jobs(args, *, page_dates=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
@@ -4092,96 +4128,102 @@ def matching_jobs(args, *, page_dates=None):
     added = False
     directories = job_directories(args.job_id if not args.owner else None) if page_dates is None else page_dates
     for job_dir in directories:
-        args_file, result_file = job_dir / "args.json", job_dir / "result.json"
-        started_at = None
-        if started_between is not None:
-            try:
-                started_at = args_file.stat().st_mtime
-            except FileNotFoundError:
-                continue
-            if not started_between[0] <= started_at <= started_between[1]:
-                continue
-        task = None
-        if prefilter:
-            fields = cached.get(job_dir.name)
-            if not (isinstance(fields, list) and len(fields) == 3):
-                fields = None
-                with suppress(OSError, ValueError, TypeError):
-                    task = task_record(job_dir)
-                    if task:  # args.json not written yet: leave the decision to the full record below
-                        fields = cached[job_dir.name] = job_filter_fields(task)
-                        added = True
-            if fields is not None:
-                owner, verification_of, task_hash = fields
-                if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}},
-                                        job_dir.name, task_hash=task_hash, check_cwd=False):
-                    continue
-        # Only terminal jobs publish result.json.
-        finished = result_file.exists()
-        if args.status == "running" and finished:
-            continue
-        # A finished job's record and status are reused while its directory is unchanged: recomputing them took
-        # ~2 ms per job, and a 2,000-job handover chain is listed whole several times per dispatch (2026-11-24).
-        # The signature is taken before the files are read, so a change made meanwhile is recomputed next time.
-        signature = None
-        if finished:
-            with suppress(OSError):
-                signature = job_signature(job_dir)
-        listing = load_listing(job_dir.name, signature) if signature is not None else None
-        if listing is not None:
-            value, record = {**listing[0], "_details": listing[1]}, None
-            if not matches_metadata(value, job_dir.name):
-                continue
-        else:
-            try:
-                task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
-                result = json.loads(result_file.read_text("utf-8")) if finished else None
-                value = {**task, **(result if result is not None else {})}
-                record = {"task": task, "result": result}
-            except (OSError, ValueError, TypeError):
-                value, record = {}, None
-            if not matches_metadata(value, job_dir.name):
-                continue
-            if record is not None:
+        try:
+            args_file, result_file = job_dir / "args.json", job_dir / "result.json"
+            started_at = None
+            if started_between is not None:
                 try:
-                    record["metadata"] = job_metadata(job_dir, task=record["task"],
-                                                     finished_at=result_file.stat().st_mtime if result_file.exists() else None,
-                                                     thread_id=value.get("thread_id"),
-                                                     conversation_id=value.get("conversation_id"), resolve=resolve)
-                    value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
-                except (OSError, ValueError, TypeError):
-                    record = None
-                    value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
-                    value["_details"] = dict(value)
-                    if not matches_metadata(value, job_dir.name):
+                    started_at = args_file.stat().st_mtime
+                except FileNotFoundError as error:
+                    raise ValueError("Missing args.json; cannot determine registration time") from error
+                if not started_between[0] <= started_at <= started_between[1]:
+                    continue
+            task = None
+            if prefilter:
+                fields = cached.get(job_dir.name)
+                if not (isinstance(fields, list) and len(fields) == 3):
+                    fields = None
+                    with suppress(OSError, ValueError, TypeError):
+                        task = task_record(job_dir)
+                        if task:  # args.json not written yet: leave the decision to the full record below
+                            fields = cached[job_dir.name] = job_filter_fields(task)
+                            added = True
+                if fields is not None:
+                    owner, verification_of, task_hash = fields
+                    if not matches_metadata({"context": {"owner": owner, "verification_of": verification_of}},
+                                            job_dir.name, task_hash=task_hash, check_cwd=False):
                         continue
-            if signature is not None and record is not None and record["result"] is not None:
-                value["_details"] = job_status(job_dir.name, record, lost_after=getattr(args, "lost_after", LOST_AFTER))
-                save_listing(job_dir.name, signature, value, value["_details"])
-        context = value.get("context") or {}
-        parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
-                  context.get("routing", {}).get("parent_job_id"))
-        if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
-            continue
-        if getattr(args, "parent_job", None) and parent != args.parent_job:
-            continue
-        value.update(job_id=job_dir.name, _record=record)
-        if args.status or needs_attention:
-            value = job_details(value, args)
-        if args.status and value["execution_status"] != args.status:
-            continue
-        verification = value.get("verification_status", "unreviewed")
-        attention = verification in ("needs_changes", "invalid") or (
-            verification == "unreviewed" and value.get("review_status") == "needs_attention")
-        if needs_attention and not attention:
-            continue
-        if scope_conflicts:
-            blocking = value["blocking"]
-            if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
+            # Only terminal jobs publish result.json.
+            finished = result_file.exists()
+            if args.status == "running" and finished:
                 continue
-        dates = (page_dates[job_dir] if page_dates is not None else
-                 signature_times(job_dir, signature) if signature is not None else job_listing_times(job_dir, started_at))
-        jobs.append({**value, "parent_job_id": parent, **dates})
+            # A finished job's record and status are reused while its directory is unchanged: recomputing them took
+            # ~2 ms per job, and a 2,000-job handover chain is listed whole several times per dispatch (2026-11-24).
+            # The signature is taken before the files are read, so a change made meanwhile is recomputed next time.
+            signature = None
+            if finished:
+                with suppress(OSError):
+                    signature = job_signature(job_dir)
+            listing = load_listing(job_dir.name, signature) if signature is not None else None
+            if listing is not None:
+                value, record = {**listing[0], "_details": listing[1]}, None
+                if not matches_metadata(value, job_dir.name):
+                    continue
+            else:
+                try:
+                    task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
+                    result = json.loads(result_file.read_text("utf-8")) if finished else None
+                    value = {**task, **(result if result is not None else {})}
+                    record = {"task": task, "result": result}
+                except (OSError, ValueError, TypeError):
+                    value, record = {}, None
+                if not matches_metadata(value, job_dir.name):
+                    continue
+                if record is not None:
+                    try:
+                        record["metadata"] = job_metadata(job_dir, task=record["task"],
+                                                         finished_at=result_file.stat().st_mtime if result_file.exists() else None,
+                                                         thread_id=value.get("thread_id"),
+                                                         conversation_id=value.get("conversation_id"), resolve=resolve)
+                        value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
+                    except (OSError, ValueError, TypeError):
+                        record = None
+                        value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
+                        value["_details"] = dict(value)
+                        if not matches_metadata(value, job_dir.name):
+                            continue
+                if signature is not None and record is not None and record["result"] is not None:
+                    value["_details"] = job_status(job_dir.name, record, lost_after=getattr(args, "lost_after", LOST_AFTER))
+                    save_listing(job_dir.name, signature, value, value["_details"])
+            context = value.get("context") or {}
+            parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
+                      context.get("routing", {}).get("parent_job_id"))
+            if getattr(args, "thread_id", None) and value.get("thread_id") != args.thread_id:
+                continue
+            if getattr(args, "parent_job", None) and parent != args.parent_job:
+                continue
+            value.update(job_id=job_dir.name, _record=record)
+            if args.status or needs_attention:
+                value = job_details(value, args)
+            if args.status and value["execution_status"] != args.status:
+                continue
+            verification = value.get("verification_status", "unreviewed")
+            attention = verification in ("needs_changes", "invalid") or (
+                verification == "unreviewed" and value.get("review_status") == "needs_attention")
+            if needs_attention and not attention:
+                continue
+            if scope_conflicts:
+                blocking = value["blocking"]
+                if blocking["next_action"] != "ask_user" or not any(b["kind"] == "task_conflict" for b in blocking["blockers"]):
+                    continue
+            dates = (page_dates[job_dir] if page_dates is not None else
+                     signature_times(job_dir, signature) if signature is not None else job_listing_times(job_dir, started_at))
+            jobs.append({**value, "parent_job_id": parent, **dates})
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError) as error:
+            if getattr(args, "command", None) != "list":
+                raise
+            invalid = invalid_job_listing(job_dir, error)
+            jobs.append({**invalid, "_details": invalid})
     if added:
         save_job_filter_cache(cached)
     jobs.sort(key=job_listing_order, reverse=True)
@@ -4268,33 +4310,45 @@ def list_jobs(args):
         ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
         total = len(ordered)
         page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
-    page = [job_details(j, args) for j in page]
-    predispatch = None
-    if args.owner and getattr(args, "thread_id", None) and args.offset == 0 and page:
-        report = page[0].get("structured")
-        acceptance = (page[0].get("context") or {}).get("acceptance")
-        if (isinstance(acceptance, list) and valid_report(report) and
-                any(blocker["kind"] == "environment" for blocker in report.get("blockers", []))):
-            predispatch = {"acceptance": acceptance, "criteria": [
-                {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]]}
     fields = ("job_id", "cwd", "scope", "scope_paths", "thread_id", "parent_job_id", "sandbox", "task_options", "status", "error_kind", "duration_s",
               "started_at", "finished_at", "updated_at", "execution_status", "report_status", "review_status",
               "criteria_counts", "blocking", "verification_status", "verification", "phase", "attempt",
               "last_error_kind", "retry_at", "worktree_commit")
-    page = [{**{k: j.get(k) for k in fields if k != "thread_id" or "conversation_id" not in j},
-             "context": {"owner": j["context"].get("owner"),
-                         **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
-                         "task": j["context"]["task"].strip().splitlines()[0][:160],
-                         **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
-                         **({"routing": {"worktree_path": j["context"]["routing"]["worktree_path"]}}
-                            if "worktree_path" in (j["context"].get("routing") or {}) else {}),
-                         **{key: j["context"][key] for key in ("verification_of", "fallback_of") if key in j["context"]}}
-             if j.get("context") else None,
-             **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
-             **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
-             **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
-                                  "verification_version", "verification_scope") if k in j},
-             **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
+    predispatch = None
+
+    def serialize(job):
+        nonlocal predispatch
+        try:
+            j = job_details(job, args)
+            if j.get("error_kind") == "invalid_record":
+                return invalid_job_listing(job_directory(j["job_id"]), j["error"])
+            if j.get("context") is not None:
+                task_context(j["context"])
+            if job is page[0] and args.owner and getattr(args, "thread_id", None) and args.offset == 0:
+                report = j.get("structured")
+                context = j.get("context")
+                acceptance = context.get("acceptance") if isinstance(context, dict) else None
+                if (isinstance(acceptance, list) and valid_report(report) and
+                        any(blocker["kind"] == "environment" for blocker in report.get("blockers", []))):
+                    predispatch = {"acceptance": acceptance, "criteria": [
+                        {"criterion": row["criterion"], "status": row["status"]} for row in report["criteria"]]}
+            return {**{k: j.get(k) for k in fields if k != "thread_id" or "conversation_id" not in j},
+                 "context": {"owner": j["context"].get("owner"),
+                             **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
+                             "task": j["context"]["task"].strip().splitlines()[0][:160],
+                             **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
+                             **({"routing": {"worktree_path": j["context"]["routing"]["worktree_path"]}}
+                                if "worktree_path" in (j["context"].get("routing") or {}) else {}),
+                             **{key: j["context"][key] for key in ("verification_of", "fallback_of") if key in j["context"]}}
+                 if j.get("context") else None,
+                 **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
+                 **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
+                 **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
+                                      "verification_version", "verification_scope") if k in j},
+                 **({"verification_error": j["verification_error"]} if "verification_error" in j else {})}
+        except (OSError, ValueError, TypeError, AttributeError, KeyError, IndexError) as error:
+            return invalid_job_listing(job_directory(job["job_id"]), error)
+    page = [serialize(j) for j in page]
     next_offset = args.offset + len(page)
     if predispatch is not None:
         page[0]["predispatch"] = predispatch

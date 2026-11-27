@@ -4429,6 +4429,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     for (const id of [owner, ...aliases.predecessors(owner)]) {
       const key = worktreeKey(id, repo);
       if (all[key]) return { key, entry: all[key] };
+      const previous = Object.entries(all).find(([saved, entry]) => saved.startsWith(`${id}::`) && pathKey(entry.repo) === pathKey(repo));
+      if (previous) return { key: previous[0], entry: previous[1] };
     }
     return undefined;
   }
@@ -4710,16 +4712,32 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       return '查不到完整的全局派单记录，暂不合并；稍后用 codex_worktree action=merge 重试。';
     }
     for (const job of jobs) {
-      if (Number.isFinite(job.started_at) && job.started_at < since) continue;
-      if (job.context?.verification_of || (job.context?.write !== true && !owns(owner, job.context?.owner))) continue;
-      if (['failed', 'cancelled'].includes(job.status) && !job.worktree_commit && job.execution_status !== 'running') continue;
+      if (Number.isFinite(job?.started_at) && job.started_at < since) continue;
       try {
+        if (!job || typeof job !== 'object') throw new Error('任务记录不是对象');
+        if (typeof job.job_id !== 'string' || !job.job_id.trim()) throw new Error('缺少任务号 job_id');
         if (!Number.isFinite(job.started_at)) throw new Error('缺少登记时间 started_at');
+        if (job.task_options != null && (typeof job.task_options !== 'object' || Array.isArray(job.task_options)))
+          throw new Error('task_options 路径记录无效');
         const locations = dispatchLocations({ ...job, writable_roots: job.task_options?.writable_roots }, job.cwd);
+        const related = touchesWorktree({ path: entry.path }, locations);
+        const problem = job.error_kind === 'invalid_record' ? `invalid_record：${job.error ?? '任务记录损坏'}`
+          : !job.context || typeof job.context.owner !== 'string' || !job.context.owner.trim() || typeof job.context.write !== 'boolean'
+            ? '缺少有效 context.owner/context.write'
+            : typeof job.status !== 'string' || !job.status ? '缺少有效 status' : undefined;
+        if (problem) {
+          const completePaths = job.context && typeof job.context === 'object' && !Array.isArray(job.context) &&
+            Array.isArray(job.scope) && Array.isArray(job.scope_paths) &&
+            Array.isArray(job.task_options?.writable_roots);
+          if (!related && completePaths) continue;
+          throw new Error(problem);
+        }
+        if (job.context.verification_of || (job.context.write !== true && !owns(owner, job.context.owner))) continue;
+        if (['failed', 'cancelled'].includes(job.status) && !job.worktree_commit && job.execution_status !== 'running') continue;
         if (job.context?.write === true
-          ? touchesWorktree({ path: entry.path }, locations)
+          ? related
           : within(job.cwd, entry.path)) mine.push(job);
-      } catch (error) { invalid.push(`${job.job_id ?? '缺少任务号'}：${error.message}`); }
+      } catch (error) { invalid.push(`${job?.job_id || '缺少任务号'}：${error.message}`); }
     }
     if (invalid.length) return `这些任务的登记或路径信息不完整，暂不合并：${invalid.join('；')}。` +
       '到任务所属会话用 codex_status 核对并补全该任务记录后，用 codex_worktree action=merge 重试。';

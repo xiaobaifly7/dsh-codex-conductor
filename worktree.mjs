@@ -38,13 +38,37 @@ function normalized(p) {
   let s = String(p).replace(/\\/g, '/');
   const mount = /^\/mnt\/([A-Za-z])(\/.*)?$/.exec(s);
   if (mount) s = `${mount[1]}:${mount[2] ?? '/'}`;
+  s = (/^[A-Za-z]:|^\/\//.test(s) ? path.win32 : path.posix).normalize(s).replace(/\\/g, '/');
+  if (/^[A-Za-z]:\/$/.test(s)) return s;
   return s.length > 1 ? s.replace(/\/+$/, '') : s;
 }
-export const pathKey = (p) => normalized(p).toLowerCase();
+function resolved(p) {
+  if (typeof p !== 'string' || !p.trim()) throw new Error('无法规范化空路径');
+  let local = p.replace(/\\/g, '/');
+  if (process.platform === 'win32') {
+    local = local.replace(/^\/mnt\/([A-Za-z])(\/.*)?$/, (_, drive, tail) => `${drive}:${tail ?? '/'}`);
+    // POSIX-only paths belong to the WSL runner, not the current Windows drive.
+    if (local.startsWith('/') && !local.startsWith('//')) return normalized(local);
+  } else local = local.replace(/^([A-Za-z]):(?=\/|$)/, (_, drive) => `/mnt/${drive.toLowerCase()}`);
+  try { return normalized(realpathSync.native(local)); }
+  catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    try { lstatSync(local); }
+    catch (missing) {
+      if (missing.code !== 'ENOENT') throw missing;
+      const parent = path.dirname(local);
+      return parent === local ? normalized(local) : normalized(path.join(resolved(parent), path.basename(local)));
+    }
+    throw error;
+  }
+}
+export const pathKey = (p, real = true) => (real ? resolved(p) : normalized(p)).toLowerCase();
+const contains = (a, r) => a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
 export const within = (p, root) => {
-  const a = pathKey(p);
-  const r = pathKey(root);
-  return a === r || a.startsWith(r.endsWith('/') ? r : `${r}/`);
+  // Keep declared containment when an in-tree junction points outside the worktree.
+  const paths = [pathKey(p, false), pathKey(p)];
+  const roots = [pathKey(root, false), pathKey(root)];
+  return paths.some(a => roots.some(r => contains(a, r)));
 };
 
 export function repoFor(repos, paths) {
@@ -53,9 +77,13 @@ export function repoFor(repos, paths) {
 
 // 把原仓库下的路径换到 worktree 下，其余路径原样返回。
 export function relocate(p, repo, worktree) {
-  if (typeof p !== 'string' || !within(p, repo)) return p;
-  const rest = normalized(p).slice(normalized(repo).length).split('/').filter(Boolean);
-  return path.join(worktree, ...rest);
+  if (typeof p !== 'string') return p;
+  const sources = [normalized(p), resolved(p)], roots = [normalized(repo), resolved(repo)];
+  for (const source of sources) for (const root of roots) {
+    if (contains(pathKey(source, false), pathKey(root, false)))
+      return path.join(worktree, ...source.slice(root.length).split('/').filter(Boolean));
+  }
+  return p;
 }
 
 const escape = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -213,7 +241,9 @@ export async function mergeWorktree(entry) {
 export async function worktreeStatus(entry) {
   if (!existsSync(entry.path)) return { exists: false };
   const dirty = entries(await git(entry.path, ['status', '--porcelain', '-z', '--untracked-files=all'])).length;
-  const ahead = Number((await git(entry.repo, ['rev-list', '--count', `${entry.base_branch}..${entry.branch}`])).trim());
+  const branchAhead = Number((await git(entry.repo, ['rev-list', '--count', `${entry.base_branch}..${entry.branch}`])).trim());
+  const headAhead = Number((await git(entry.path, ['rev-list', '--count', `${entry.base_branch}..HEAD`])).trim());
+  const ahead = Math.max(branchAhead, headAhead);
   const merging = (await gitRun(entry.path, ['rev-parse', '--quiet', '--verify', 'MERGE_HEAD'])).code === 0;
   return { exists: true, dirty, ahead, merging };
 }

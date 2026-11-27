@@ -5487,6 +5487,79 @@ class RunnerTests(unittest.TestCase):
         for extra in (("--limit", "5001"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
+    def test_list_isolates_invalid_records_and_preserves_complete_pages(self):
+        valid = {**self.sample_context(), "routing": {"worktree_path": str(self.cwd)}}
+        broken = ["bad-context", {**valid, "task": 42}, {**valid, "task": " \n "},
+                  {**valid, "routing": 42}, {**valid, "continuation": []}, {**valid, "routing": None}]
+        started = {}
+        for i, context in enumerate(broken):
+            job = self.stored_job(f"broken-{i}", {"status": "completed", "context": context,
+                                                       "started_at": -999},
+                                  context=valid, scope=["src"], writable_roots=[str(self.cwd)])
+            os.utime(job / "args.json", (1700000000 + i, 1700000000 + i))
+            started[job.name] = (job / "args.json").stat().st_mtime
+        job = self.stored_job("broken-args", {"status": "completed"},
+                              context={**valid, "task": []}, scope=["src"], writable_roots=[str(self.cwd)])
+        started[job.name] = (job / "args.json").stat().st_mtime
+        self.stored_job("normal", {"status": "completed", "structured": self.sample_report()}, context=valid)
+        expected = {*started, "normal"}
+        for filters in ((), ("--started-between", "0", str(time.time() + 60))):
+            with self.subTest(filters=filters):
+                whole = self.control("list", *filters)
+                self.assertEqual(whole["status"], "completed", whole)
+                self.assertEqual({j["job_id"] for j in whole["jobs"]}, expected)
+                for row in whole["jobs"]:
+                    if row["job_id"] == "normal":
+                        self.assertEqual(row["status"], "completed")
+                        continue
+                    self.assertEqual(row["error_kind"], "invalid_record", row)
+                    self.assertEqual(row["execution_status"], "unknown")
+                    self.assertTrue(row["error"], row)
+                    self.assertEqual(row["started_at"], started[row["job_id"]])
+                    self.assertEqual(row["cwd"], str(self.cwd))
+                    self.assertEqual(row["scope"], ["src"])
+                    self.assertEqual(row["context"]["owner"], "owner-a")
+                    self.assertIs(row["context"]["write"], True)
+                    self.assertEqual(row["context"]["routing"]["worktree_path"],
+                                     None if row["job_id"] in {"broken-3", "broken-5"} else str(self.cwd))
+                    self.assertEqual(row["task_options"]["writable_roots"], [str(self.cwd)])
+                seen, offset = [], 0
+                while offset is not None:
+                    page = self.control("list", *filters, "--limit", "2", "--offset", str(offset))
+                    self.assertEqual(page["status"], "completed", page)
+                    self.assertEqual(page["total"], len(expected))
+                    seen.extend(j["job_id"] for j in page["jobs"])
+                    offset = page["next_offset"]
+                    self.assertEqual(page["eof"], offset is None)
+                self.assertEqual(len(seen), len(expected))
+                self.assertEqual(set(seen), expected)
+
+    def test_invalid_list_rows_preserve_untrusted_path_overrides(self):
+        overrides = [{"cwd": None}, {"scope": [7]}, {"scope_paths": [""]},
+                     {"task_options": {"writable_roots": "invalid"}}]
+        for i, paths in enumerate(overrides):
+            self.stored_job(f"bad-path-{i}", {"status": "completed", "context": "broken", **paths},
+                            context=self.sample_context(), scope=[], scope_paths=[], writable_roots=[])
+        result = self.control("list")
+        self.assertEqual(result["status"], "completed", result)
+        for row in result["jobs"]:
+            paths = overrides[int(row["job_id"].rsplit("-", 1)[1])]
+            with self.subTest(paths=paths):
+                self.assertEqual(row["error_kind"], "invalid_record")
+                for key, value in paths.items():
+                    self.assertEqual(row.get(key), value)
+
+    def test_time_filtered_list_retains_missing_registration_records(self):
+        job = self.stored_job("missing-registration", {"status": "completed"}, context=self.sample_context())
+        (job / "args.json").unlink()
+        result = self.control("list", "--started-between", str(time.time() - 60), str(time.time() + 60))
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(len(result["jobs"]), 1)
+        self.assertEqual(result["jobs"][0]["job_id"], "missing-registration")
+        self.assertEqual(result["jobs"][0]["error_kind"], "invalid_record")
+        self.assertIsNone(result["jobs"][0]["started_at"])
+        self.assertIn("args.json", result["jobs"][0]["error"])
+
     def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
         for job_id, owner in (("mine", "owner-b"), ("predecessor", "owner-a"), ("unrelated", "owner-c")):
             self.stored_job(job_id, {"status": "completed", "structured": self.sample_report()}, context=self.sample_context(owner))
@@ -5620,9 +5693,12 @@ class RunnerTests(unittest.TestCase):
 
         window = ("list", "--needs-attention", "--started-between", "1000", "2000")
         first = self.control(*window, "--limit", "1")
-        self.assertEqual(first["total"], 3)
-        self.assertEqual([j["job_id"] for j in first["jobs"]], ["last"])
-        self.assertEqual([j["job_id"] for j in self.control(*window)["jobs"]], ["last", "middle", "first"])
+        # Unknown registration times must stay visible; merge callers cannot prove these jobs predate a worktree.
+        self.assertEqual(first["total"], 4)
+        self.assertEqual([j["job_id"] for j in first["jobs"]], ["unknown"])
+        self.assertEqual(first["jobs"][0]["error_kind"], "invalid_record")
+        self.assertIsNone(first["jobs"][0]["started_at"])
+        self.assertEqual([j["job_id"] for j in self.control(*window)["jobs"]], ["unknown", "last", "middle", "first"])
         self.assertEqual(self.control("list", "--needs-attention")["total"], 6)
         for bounds in (("nan", "2000"), ("2001", "2000")):
             self.assertEqual(self.control("list", "--started-between", *bounds)["error_kind"], "bad_arguments")
@@ -6868,6 +6944,18 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("没有证据目录", prompt)
         self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", prompt)
 
+    def test_worktree_activity_normalizes_cwd_aliases(self):
+        root = self.cwd / "tree"
+        root.mkdir()
+        aliases = [str(root / "."), str(root) + os.sep + ".", str(root / "child" / "..")]
+        if os.name == "nt":
+            aliases.extend([str(root).upper(), str(root).replace("\\", "/") + "/./"])
+        for i, alias in enumerate(aliases):
+            self.stored_job(f"alias-{i}", None, cwd=alias)
+        result = self.control("worktree-activity", "--path", str(root))
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["worktrees"][0]["running"], [f"alias-{i}" for i in range(len(aliases))])
+
     def test_worktree_activity_scans_all_records_once_without_event_replay(self):
         import codex_runner
         root = self.cwd / "tree"
@@ -7156,6 +7244,50 @@ class RunnerTests(unittest.TestCase):
                     self.cwd, ["a.txt"], time.monotonic() + 10)
                 self.assertEqual(unchecked, {b"a.txt"} if changed else set())
                 self.assertEqual(working[b"a.txt"][0], "unchecked" if changed else "content")
+
+    @unittest.skipUnless(os.name == "nt", "needs native Windows lstat/fstat")
+    def test_windows_snapshot_reads_exe_with_different_stat_modes(self):
+        import hashlib
+        import codex_runner
+
+        target = self.cwd / "tool.exe"
+        target.write_bytes(b"executable payload")
+        hashes, working, unchecked = codex_runner.verification_working_files(
+            self.cwd, ["tool.exe"], time.monotonic() + 10)
+        self.assertEqual(unchecked, set())
+        self.assertEqual(working[b"tool.exe"],
+                         ("content", hashlib.sha256(b"executable payload").hexdigest(), target.lstat().st_mode))
+        self.assertTrue(hashes)
+
+    def test_windows_snapshot_keeps_same_source_mode_changes_unchecked(self):
+        import codex_runner
+
+        target = self.cwd / "tool.exe"
+        target.write_bytes(b"payload")
+        fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        for source, field, mask in (("lstat", "st_mode", stat.S_IWUSR), ("fstat", "st_mode", stat.S_IWUSR),
+                                    ("lstat", "st_mode", stat.S_IXUSR), ("fstat", "st_mode", stat.S_IXUSR),
+                                    ("lstat", "st_ino", 1), ("fstat", "st_ino", 1)):
+            calls = 0
+            original = Path.lstat if source == "lstat" else os.fstat
+            def changed(*args, **kwargs):
+                nonlocal calls
+                info = original(*args, **kwargs)
+                if source == "lstat" and args[0] != target:
+                    return info
+                calls += 1
+                values = {key: getattr(info, key) for key in fields}
+                if calls > 1:
+                    values[field] ^= mask
+                return SimpleNamespace(**values)
+            owner = Path if source == "lstat" else os
+            with self.subTest(source=source, field=field, mask=mask), mock.patch.object(codex_runner, "IS_WIN", True), \
+                    mock.patch.object(owner, source, changed):
+                _, working, unchecked = codex_runner.verification_working_files(
+                    self.cwd, ["tool.exe"], time.monotonic() + 10)
+                self.assertEqual(unchecked, {b"tool.exe"})
+                self.assertEqual(working[b"tool.exe"][0], "unchecked")
+                self.assertGreaterEqual(calls, 2)
 
     def test_snapshot_records_reparse_points_before_directory_or_child_scope(self):
         import codex_runner

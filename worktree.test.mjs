@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { closeWorktree, mergeWorktree, openWorktree as openConversationWorktree, relocate, relocateText, repoFor, worktreeStatus } from './worktree.mjs';
+import { closeWorktree, mergeWorktree, openWorktree as openConversationWorktree, pathKey, within, relocate, relocateText, repoFor, worktreeStatus } from './worktree.mjs';
 
 const tmp = realpathSync(mkdtempSync(path.join(tmpdir(), 'conductor-worktree-test-')));
 after(() => rmSync(tmp, { recursive: true, force: true }));
@@ -250,4 +250,53 @@ test('status and close fail before removal when the branch cannot be queried', a
   await assert.rejects(worktreeStatus(entry), /git rev-list/);
   await assert.rejects(closeWorktree(entry), /git rev-list/);
   assert.equal(existsSync(opened.path), true);
+});
+
+test('comparison keys resolve dot segments and directory aliases without losing declared containment', () => {
+  const root = repo('canonical-paths');
+  const alias = path.join(path.dirname(root), 'alias');
+  symlinkSync(root, alias, 'junction');
+  const dotted = `${path.dirname(root)}/./${path.basename(root)}`;
+  assert.equal(pathKey(dotted), pathKey(root));
+  assert.equal(pathKey(`${root}/../repo`), pathKey(root));
+  assert.equal(pathKey(alias), pathKey(root));
+  if (process.platform === 'win32') assert.equal(pathKey(`/mnt/${path.parse(root).root[0]}`), pathKey(path.parse(root).root));
+  assert.equal(pathKey(path.join(alias, 'future', 'result.txt')), pathKey(path.join(root, 'future', 'result.txt')));
+  assert.equal(within(alias, root), true);
+  assert.equal(relocate(path.join(alias, 'src', 'a.txt'), root, path.join(tmp, 'destination')),
+    path.join(tmp, 'destination', 'src', 'a.txt'));
+  assert.equal(within(path.join(root, 'vm'), root), true);
+});
+
+test('comparison failures propagate instead of silently trusting lexical paths', t => {
+  const original = realpathSync.native;
+  t.mock.method(realpathSync, 'native', value => {
+    if (String(value).includes('unreadable-path')) throw Object.assign(new Error('denied'), { code: 'EACCES' });
+    return original(value);
+  });
+  assert.throws(() => pathKey(path.join(tmp, 'unreadable-path')), /denied/);
+});
+
+test('comparison keys reject an existing junction with an unreadable target', () => {
+  const target = path.join(tmp, 'vanishing-target');
+  const alias = path.join(tmp, 'broken-junction');
+  mkdirSync(target);
+  symlinkSync(target, alias, 'junction');
+  rmSync(target, { recursive: true });
+  assert.equal(lstatSync(alias).isSymbolicLink(), true);
+  assert.throws(() => pathKey(alias), error => error.code === 'ENOENT');
+});
+
+test('closing retains detached HEAD commits that the registered branch does not contain', async () => {
+  const root = repo('detached-commit');
+  const opened = await openWorktree({ repo: root, owner: 'session-11223344-0' });
+  git(opened.path, 'checkout', '-q', '--detach');
+  writeFileSync(path.join(opened.path, 'src', 'a.txt'), 'detached work\n');
+  commitAll(opened.path, 'detached work');
+  const head = git(opened.path, 'rev-parse', 'HEAD').trim();
+  assert.equal((await closeWorktree({ repo: root, ...opened })).reason, 'not_merged');
+  assert.equal(existsSync(opened.path), true);
+  assert.equal(git(opened.path, 'rev-parse', 'HEAD').trim(), head);
+  git(root, 'merge', '--ff-only', head);
+  assert.equal((await closeWorktree({ repo: root, ...opened })).status, 'closed');
 });
