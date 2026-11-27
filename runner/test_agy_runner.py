@@ -411,6 +411,17 @@ class AdapterTests(unittest.TestCase):
             self.assertTrue(agy_runner.evidence_path("/tmp/job/evidence", True).startswith("\\\\wsl.localhost"))
         convert.assert_called_once_with(["wslpath", "-w", "/tmp/job/evidence"], text=True, timeout=10)
 
+    def test_evidence_path_returns_none_when_wslpath_fails_or_returns_empty_output(self):
+        for label, error in [
+            ("missing", FileNotFoundError("wslpath")),
+            ("nonzero", subprocess.CalledProcessError(1, ["wslpath"])),
+            ("timeout", subprocess.TimeoutExpired(["wslpath"], 10)),
+            ("empty", None),
+        ]:
+            with self.subTest(case=label), mock.patch.object(agy_runner.os, "name", "posix"), \
+                    mock.patch.object(agy_runner.subprocess, "check_output", side_effect=error, return_value=""):
+                self.assertIsNone(agy_runner.evidence_path("/tmp/job/evidence", True))
+
     def test_host_read_only_jobs_keep_python_caches_out_of_the_project(self):
         with tempfile.TemporaryDirectory() as run_dir:
             def env_of(**overrides):

@@ -381,7 +381,7 @@ def alive(pid):
 def task_prompt(prompt):
     if prompt.startswith("Project directory (absolute): "):
         prompt = prompt.split("\n\n", 1)[1]
-    return prompt.split("\n\nExternal evidence directory (absolute):", 1)[0].split("\n本单是只读或非主机 Gemini 任务", 1)[0]
+    return prompt.split("\n\nExternal evidence directory (absolute):", 1)[0].split("\n本单没有证据目录", 1)[0]
 
 
 class RunnerTests(unittest.TestCase):
@@ -3865,10 +3865,14 @@ class RunnerTests(unittest.TestCase):
 
         with mock.patch.object(codex_runner, "HOME", runner_home), \
                 mock.patch.object(agy_runner, "build_command", side_effect=fake_build), \
+                mock.patch.object(agy_runner, "evidence_path", return_value=None) as evidence_path, \
                 mock.patch.object(agy_runner, "cancel", side_effect=confirm):
             result = codex_runner.execute(args, "retry after cleanup", run_dir)
             with codex_runner.acquire_write_lock(str(self.cwd)):
                 self.assertEqual(result["status"], "completed")
+                self.assertIs(result.get("evidence_available"), False)
+                self.assertNotIn("evidence_dir", result)
+        evidence_path.assert_called_once_with((run_dir / "evidence").resolve(), True)
         self.assertEqual(launches, [None, "agy-conversation-1"])
         self.assertEqual(confirmations, [(1, "gemini_running"), (1, "cleanup_wait"), (2, "gemini_running")])
 
@@ -7062,6 +7066,32 @@ class RunnerTests(unittest.TestCase):
                 self.assertNotIn("evidence_dir", result)
                 self.assertIsNone(args.evidence_dir)
                 self.assertNotIn("External evidence directory", attempt.call_args.args[1])
+
+    def test_gemini_writer_continues_without_evidence_when_conversion_is_unavailable(self):
+        import agy_runner
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", r"C:\test\agy.exe",
+                                  "--sandbox", "danger-full-access", "--no-diff", "--repeat-guard", "off"])
+        args.context = {"write": True}
+        run_dir = Path(self.tmp.name) / "unavailable-evidence"
+        verdict = {"completed": True, "failed": False, "thread_id": "conversation-1", "file_changes": [],
+                   "last_text": "done", "usage": {}, "commands": [], "forced_exit": False}
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(agy_runner, "evidence_path", return_value=None), \
+                mock.patch.object(codex_runner, "run_attempt", return_value=verdict) as attempt:
+            result = codex_runner.execute(args, "Evidence: {{CONDUCTOR_EVIDENCE_DIR}}", run_dir)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertIs(result.get("evidence_available"), False)
+        self.assertNotIn("evidence_dir", result)
+        self.assertNotIn("evidence_dir_windows", result)
+        self.assertIsNone(args.evidence_dir)
+        self.assertFalse((run_dir / "evidence").exists())
+        self.assertEqual((args.cwd, args.sandbox), (str(self.cwd), "danger-full-access"))
+        self.assertNotIn("External evidence directory", attempt.call_args.args[1])
+        self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", attempt.call_args.args[1])
 
     def test_evidence_directory_cannot_overlap_project(self):
         import codex_runner

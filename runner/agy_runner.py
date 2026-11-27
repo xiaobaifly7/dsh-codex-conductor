@@ -67,7 +67,10 @@ def _windows_path(path):
 
 def evidence_path(path, windows):
     if windows and os.name != "nt":
-        return subprocess.check_output(["wslpath", "-w", os.fspath(path)], text=True, timeout=10).strip()
+        try:
+            return subprocess.check_output(["wslpath", "-w", os.fspath(path)], text=True, timeout=10).strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
     return os.fspath(path)
 
 

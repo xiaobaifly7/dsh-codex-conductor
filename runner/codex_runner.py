@@ -2660,11 +2660,6 @@ def execute(args, prompt, run_dir):
         base["task_options"] = task_options(vars(args))
     verification = context.get("verification_of") and context.get("write") is False
     evidence_allowed = not gemini or (args.sandbox == "danger-full-access" and writer(args.sandbox, context))
-    if not verification and not evidence_allowed:
-        base["evidence_available"] = False
-        args.evidence_dir = None
-        prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", "不可用（本单没有证据目录）")
-        prompt += "\n本单是只读或非主机 Gemini 任务，没有证据目录，保持原有权限，不为留证扩大访问范围；无法留存的观测证据如实标 blocked。\n"
     if not verification and evidence_allowed:
         evidence = (run_dir / "evidence").resolve()
         project_root = args.cwd
@@ -2685,21 +2680,28 @@ def execute(args, prompt, run_dir):
                 return {**base, "status": "failed", "error_kind": "evidence_directory_overlap",
                         "error": "Evidence directory must be outside the project directory.", "retryable": False, "attempts": 0}
             evidence = Path(tempfile.mkdtemp(prefix="codex-runner-evidence-", dir=temporary))
-        evidence.mkdir(parents=True, exist_ok=True)
-        base["evidence_dir"] = str(evidence)
         args.evidence_dir = evidence
         if gemini:
             import agy_runner
             args.evidence_dir = agy_runner.evidence_path(evidence, windows_agy(args.agy_command))
-            if windows_agy(args.agy_command):
+        evidence_allowed = args.evidence_dir is not None
+        if evidence_allowed:
+            evidence.mkdir(parents=True, exist_ok=True)
+            base["evidence_dir"] = str(evidence)
+            if gemini and windows_agy(args.agy_command):
                 base["evidence_dir_windows"] = args.evidence_dir
-        prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", str(args.evidence_dir))
-        prompt += (f"\n\nExternal evidence directory (absolute): {json.dumps(str(args.evidence_dir), ensure_ascii=False)}\n"
-                   "任务需要保存的日志、截图、测试输出等证据写入上述目录。只读任务也允许向该目录留证，"
-                   "项目和其他路径仍遵守原写入约束。\n")
-        if not gemini and args.sandbox == "read-only":
-            prompt = (f"Project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
-                      "当前目录是外部证据目录；先读取项目目录中适用的 AGENTS.md。项目目录只读，项目相对路径以上述项目目录为准。\n\n" + prompt)
+            prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", str(args.evidence_dir))
+            prompt += (f"\n\nExternal evidence directory (absolute): {json.dumps(str(args.evidence_dir), ensure_ascii=False)}\n"
+                       "任务需要保存的日志、截图、测试输出等证据写入上述目录。只读任务也允许向该目录留证，"
+                       "项目和其他路径仍遵守原写入约束。\n")
+            if not gemini and args.sandbox == "read-only":
+                prompt = (f"Project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
+                          "当前目录是外部证据目录；先读取项目目录中适用的 AGENTS.md。项目目录只读，项目相对路径以上述项目目录为准。\n\n" + prompt)
+    if not verification and not evidence_allowed:
+        base["evidence_available"] = False
+        args.evidence_dir = None
+        prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", "不可用（本单没有证据目录）")
+        prompt += "\n本单没有证据目录，保持原有权限，不为留证扩大访问范围；无法留存的观测证据如实标 blocked。\n"
     host_verification = verification and args.sandbox == "danger-full-access"
     if not gemini and verification and args.sandbox in ("read-only", "danger-full-access"):
         scratch = (run_dir / "scratch").resolve()
