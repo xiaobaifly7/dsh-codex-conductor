@@ -39,12 +39,20 @@ async function fixture({ age = 25 * HOUR } = {}) {
     const tools = {}, handlers = {}, injections = [], calls = [], starts = [];
     const run = async (_cfg, argv, options = {}) => {
       calls.push(argv);
-      if (argv[0] === 'list') return listed ? listed(argv) : { jobs: argv.includes('--parent-job') ? [] : jobs, next_offset: null };
+      if (argv[0] === 'list') {
+        if (listed) return listed(argv);
+        const owners = argv.flatMap((arg, i) => ['--owner', '--also-owner'].includes(arg) ? [argv[i + 1]] : []);
+        const matching = argv.includes('--parent-job') ? [] : jobs.filter(job => !owners.length || owners.includes(job.context?.owner));
+        const offset = Number(argv[argv.indexOf('--offset') + 1]);
+        const limit = Number(argv[argv.indexOf('--limit') + 1]);
+        const next = offset + limit;
+        return { status: 'completed', jobs: matching.slice(offset, next), next_offset: next < matching.length ? next : null };
+      }
       if (argv[0] === 'worktree-activity') {
         if (activity) return activity(argv);
         return { status: 'completed', worktrees: argv.slice(1).filter((_, i) => i % 2 === 1).map(root => {
-          const mine = jobs.filter(job => [job.cwd, ...(job.scope_paths ?? [])].some(p => typeof p === 'string' &&
-            within(p, root)));
+          const mine = jobs.filter(job => [job.cwd, ...(job.scope ?? []), ...(job.scope_paths ?? []), ...(job.task_options?.writable_roots ?? [])]
+            .some(p => typeof p === 'string' && (within(path.resolve(job.cwd, p), root) || within(root, path.resolve(job.cwd, p)))));
           return { path: root, running: mine.filter(job => ['pending', 'running'].includes(job.status) || job.execution_status === 'running').map(job => job.job_id),
             last_activity_at: Math.max(0, ...mine.flatMap(job => [job.started_at, job.finished_at, job.updated_at].filter(Number.isFinite))) };
         }) };
@@ -445,10 +453,7 @@ test('manual close rechecks foreign activity after its asynchronous scan', { tim
   let release, entered;
   const gate = new Promise(resolve => { release = resolve; });
   const ready = new Promise(resolve => { entered = resolve; });
-  const h = f.harness({ listed: async argv => {
-    if (!argv.includes('--owner')) { entered(); await gate; }
-    return { jobs: [f.oldJob], next_offset: null };
-  }, activity: async () => {
+  const h = f.harness({ activity: async () => {
     entered(); await gate;
     return { status: 'completed', worktrees: [{ path: f.entry.path, running: [], last_activity_at: f.oldJob.finished_at }] };
   } });
@@ -532,10 +537,7 @@ test('foreign readonly dispatch queued behind close normalizes the freshly close
       } catch (error) { foreignDispatch.reject(error); }
     });
   };
-  h = f.harness({ listed: argv => {
-    if (!argv.includes('--owner')) schedule();
-    return { jobs: [f.oldJob], next_offset: null };
-  }, activity: () => {
+  h = f.harness({ activity: () => {
     schedule();
     return { status: 'completed', worktrees: [{ path: f.entry.path, running: [], last_activity_at: f.oldJob.finished_at }] };
   } });
@@ -544,4 +546,173 @@ test('foreign readonly dispatch queued behind close normalizes the freshly close
   assert.equal(h.starts[0].argv[h.starts[0].argv.indexOf('--cwd') + 1], f.repo);
   assert.ok(h.starts[0].payload.context.task.includes(`${f.repo}/a.txt`));
   assert.equal(h.starts[0].payload.context.task.includes(f.entry.path), false);
+});
+
+for (const field of ['cwd', 'scope', 'writable_roots', 'required_writes']) {
+  for (const relation of field === 'cwd' || field === 'scope' ? ['ancestor'] : ['equal', 'inside', 'ancestor']) {
+    test(`dispatch reservation covers ${field} ${relation} before registration`, { timeout: 10000 }, async () => {
+      const f = await fixture();
+      let entered, release;
+      const ready = new Promise(resolve => { entered = resolve; });
+      const gate = new Promise(resolve => { release = resolve; });
+      const h = f.harness({ starting: async () => { entered(); await gate; throw new Error('start failed'); } });
+      const location = relation === 'ancestor' ? path.dirname(f.entry.path)
+        : relation === 'inside' ? path.join(f.entry.path, 'sub') : f.entry.path;
+      if (relation === 'inside') mkdirSync(location);
+      const foreign = { agent: { id: 'session-foreign-0000', session: { header: { cwd: f.repo }, log: [] } } };
+      const dispatch = h.tools.codex_run.execute({ task: 'Update a.txt.', acceptance: ['a.txt is updated'], write: true,
+        cwd: field === 'cwd' ? location : f.repo,
+        ...(field === 'cwd' ? {} : { [field]: [path.relative(f.repo, location)] }) }, foreign).catch(error => error);
+      await Promise.race([ready, dispatch.then(result => { throw result instanceof Error ? result : new Error('start not reached'); })]);
+      try {
+        await h.load();
+        assert.equal(f.current().status, 'open');
+        assert.equal(f.current().last_cleanup.reason, 'dispatching');
+        const close = await h.tools.codex_worktree.execute({ action: 'close' }, f.caller);
+        assert.equal(close.worktrees[0].reason, 'dispatching');
+        assert.equal(existsSync(f.entry.path), true);
+      } finally { release(); await dispatch; }
+      assert.equal((await h.tools.codex_worktree.execute({ action: 'close' }, f.caller)).worktrees[0].status, 'closed');
+    });
+  }
+}
+
+for (const field of ['cwd', 'scope', 'scope_paths', 'task_options.writable_roots', 'context.routing.worktree_path']) {
+  for (const [relation, state] of [['equal', 'running'], ['inside', 'unreviewed'], ['ancestor', 'needs_changes']]) {
+    test(`global merge gate blocks foreign ${state} via ${field} ${relation}`, async () => {
+      const f = await fixture({ age: 0 });
+      writeFileSync(path.join(f.entry.path, 'a.txt'), 'foreign edit\n');
+      git(f.entry.path, 'commit', '-am', 'foreign edit');
+      const head = git(f.repo, 'rev-parse', 'HEAD');
+      const location = relation === 'ancestor' ? path.dirname(f.entry.path)
+        : relation === 'inside' ? path.join(f.entry.path, 'sub') : f.entry.path;
+      const foreign = { ...f.oldJob, job_id: 'B-WRITE', cwd: field === 'cwd' ? location : f.repo,
+        status: state === 'running' ? 'running' : 'completed', verification_status: state === 'running' ? 'unreviewed' : state,
+        context: { owner: 'session-foreign-0000', write: true,
+          ...(field === 'context.routing.worktree_path' ? { routing: { worktree_path: location } } : {}) },
+        ...(field === 'cwd' || field === 'context.routing.worktree_path' ? {} : field === 'task_options.writable_roots'
+          ? { task_options: { writable_roots: [path.relative(f.repo, location)] } }
+          : { [field]: [path.relative(f.repo, location)] }) };
+      const h = f.harness({ jobs: [f.oldJob, foreign] });
+      const receipt = await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller);
+      assert.match(receipt.worktrees[0].note, /B-WRITE/);
+      assert.match(receipt.worktrees[0].note, state === 'needs_changes' ? /needs_changes.*codex_continue.*codex_review/s : /codex_/);
+      assert.equal(git(f.repo, 'rev-parse', 'HEAD'), head);
+      assert.equal(f.current().status, 'open');
+      assert.ok(h.calls.some(argv => argv[0] === 'list' && !argv.includes('--owner')));
+      foreign.status = 'completed'; foreign.verification_status = 'verified';
+      assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'merged');
+    });
+  }
+}
+
+test('global merge gate scans every page before merging foreign writes', async () => {
+  const f = await fixture();
+  const jobs = Array.from({ length: 100 }, (_, i) => ({ ...f.oldJob, job_id: `A-${i}` }));
+  jobs.push({ ...f.oldJob, job_id: 'B-PAGE-2', verification_status: 'needs_changes', context: { owner: 'foreign', write: true } });
+  const h = f.harness({ jobs });
+  const receipt = await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller);
+  assert.match(receipt.worktrees[0].note, /B-PAGE-2/);
+  assert.deepEqual(h.calls.filter(argv => argv[0] === 'list' && !argv.includes('--owner'))
+    .map(argv => Number(argv[argv.indexOf('--offset') + 1])), [0, 100]);
+});
+
+for (const failure of ['throw', 'missing', 'failed', 'page-two', 'bad-offset', 'missing-next', 'bad-roots', 'bad-scope']) {
+  test(`global merge gate keeps blocked on ${failure} query`, async () => {
+    const f = await fixture();
+    const h = f.harness({ listed: argv => {
+      if (argv.includes('--owner')) return { jobs: [f.oldJob], next_offset: null };
+      const offset = Number(argv[argv.indexOf('--offset') + 1]);
+      if (failure === 'throw') throw new Error('offline');
+      if (failure === 'missing') return undefined;
+      if (failure === 'failed') return { status: 'failed', jobs: [], next_offset: null, error: 'offline' };
+      if (failure === 'page-two') return offset === 0 ? { jobs: [f.oldJob], next_offset: 100 } : { error: 'page unavailable' };
+      if (failure === 'bad-offset') return { jobs: [f.oldJob], next_offset: 0 };
+      if (failure === 'missing-next') return { jobs: [f.oldJob] };
+      return { jobs: [{ ...f.oldJob, ...(failure === 'bad-roots' ? { task_options: { writable_roots: 'invalid' } } : { scope: [7] }) }], next_offset: null };
+    } });
+    const receipt = await h.tools.codex_worktree.execute({ action: 'close' }, f.caller);
+    assert.match(receipt.worktrees[0].note, /查不到.*派单记录.*暂不合并.*codex_worktree/s);
+    assert.equal(f.current().status, 'open');
+    assert.equal(existsSync(f.entry.path), true);
+  });
+}
+
+test('ancestor overlap reserves sibling worktrees without claiming foreign routing', { timeout: 10000 }, async () => {
+  const f = await fixture();
+  const secondOwner = 'session-bbbbbbbb-0000';
+  const second = { ...f.entry, ...await openWorktree({ repo: f.repo, owner: secondOwner }) };
+  writeFileSync(f.file, JSON.stringify({ [f.key]: f.entry, [`${secondOwner}::${f.repo.replace(/\\/g, '/').toLowerCase()}`]: second }));
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = f.harness({ starting: async () => { entered(); await gate; throw new Error('start failed'); } });
+  const cwd = path.dirname(f.repo);
+  const foreign = { agent: { id: 'session-foreign-0000', session: { header: { cwd }, log: [] } } };
+  const dispatch = h.tools.codex_run.execute({ task: 'Update parent files.', acceptance: ['parent files updated'], write: true, cwd }, foreign).catch(error => error);
+  await ready;
+  try {
+    assert.equal(h.starts[0].payload.context.routing?.worktree_path, undefined);
+    assert.equal(h.starts[0].argv[h.starts[0].argv.indexOf('--cwd') + 1], cwd);
+    await h.load();
+    for (const entry of Object.values(JSON.parse(readFileSync(f.file)))) {
+      assert.equal(entry.status, 'open');
+      assert.equal(entry.last_cleanup.reason, 'dispatching');
+    }
+  } finally { release(); await dispatch; }
+});
+
+for (const status of ['failed', 'cancelled']) {
+  test(`global merge gate blocks unreviewed foreign ${status} writes`, async () => {
+    const f = await fixture();
+    const foreign = { ...f.oldJob, job_id: 'B-PARTIAL', status, verification_status: 'unreviewed', context: { owner: 'foreign', write: true } };
+    const h = f.harness({ jobs: [f.oldJob, foreign] });
+    assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /B-PARTIAL.*codex_/);
+    foreign.verification_status = 'accepted_deviations';
+    assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+  });
+}
+
+test('global merge gate blocks unfinished foreign writes even when previously verified', async () => {
+  const f = await fixture();
+  const foreign = { ...f.oldJob, job_id: 'B-UNFINISHED', context: { owner: 'foreign', write: true } };
+  const h = f.harness({ jobs: [f.oldJob, foreign] });
+  for (const status of ['unknown', 'pending', 'running', 'execution-running']) {
+    foreign.status = status === 'execution-running' ? 'completed' : status;
+    foreign.execution_status = status === 'execution-running' ? 'running' : undefined;
+    assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /B-UNFINISHED.*codex_status/);
+  }
+});
+
+test('global merge gate preserves owner readonly and verification contract', async () => {
+  const f = await fixture();
+  const readonly = { ...f.oldJob, job_id: 'READ', status: 'running', context: { owner: 'foreign', write: false } };
+  const h = f.harness({ jobs: [f.oldJob, readonly] });
+  assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+  readonly.context.owner = f.owner;
+  assert.match((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].note, /还有单在跑（READ）/);
+  readonly.context.verification_of = 'old';
+  assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'nothing');
+});
+
+test('merge waits for a foreign dispatch reservation before runner registration', { timeout: 10000 }, async () => {
+  const f = await fixture();
+  writeFileSync(path.join(f.entry.path, 'a.txt'), 'partial foreign edit\n');
+  git(f.entry.path, 'commit', '-am', 'partial foreign edit');
+  const head = git(f.repo, 'rev-parse', 'HEAD');
+  let entered, release;
+  const ready = new Promise(resolve => { entered = resolve; });
+  const gate = new Promise(resolve => { release = resolve; });
+  const h = f.harness({ starting: async () => { entered(); await gate; throw new Error('start failed'); } });
+  const foreign = { agent: { id: 'session-foreign-0000', session: { header: { cwd: f.entry.path }, log: [] } } };
+  const dispatch = h.tools.codex_run.execute({ task: 'Finish partial edit.', acceptance: ['partial edit finished'], write: true }, foreign).catch(error => error);
+  await ready;
+  try {
+    const receipt = await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller);
+    assert.equal(receipt.worktrees[0].status, 'blocked');
+    assert.equal(receipt.worktrees[0].reason, 'dispatching');
+    assert.match(receipt.worktrees[0].note, /派单.*登记.*codex_worktree/);
+    assert.equal(git(f.repo, 'rev-parse', 'HEAD'), head);
+  } finally { release(); await dispatch; }
+  assert.equal((await h.tools.codex_worktree.execute({ action: 'merge' }, f.caller)).worktrees[0].status, 'merged');
 });

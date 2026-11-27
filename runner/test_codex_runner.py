@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import statistics
+import stat
 import subprocess
 import sys
 import tempfile
@@ -6885,7 +6886,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(set(result["worktrees"][0]["running"]), {"late-running", "scope-pending"})
         self.assertGreaterEqual(result["worktrees"][0]["last_activity_at"], 1234567890)
-        self.assertEqual(result["worktrees"][1]["running"], [])
+        self.assertEqual(result["worktrees"][1]["running"], ["scope-pending"])
         self.assertEqual(self.control("worktree-activity", "--path", str(root))["worktrees"][0]["running"],
                          result["worktrees"][0]["running"])
 
@@ -6912,6 +6913,84 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["error_kind"], "evidence_directory_unknown")
         self.assertFalse((root / ".runner" / "job" / "evidence").exists())
         self.assertEqual(self.calls(), [])
+
+    def test_worktree_activity_blocks_writable_roots_and_ancestor_locations(self):
+        root = self.cwd / "trees" / "active"
+        root.mkdir(parents=True)
+        outside = self.cwd / "elsewhere"
+        outside.mkdir()
+        cases = {
+            "extra-root": {"cwd": str(outside), "writable_roots": [str(root)]},
+            "relative-root": {"cwd": str(outside), "writable_roots": ["../trees/active"]},
+            "root-parent": {"cwd": str(outside), "writable_roots": [str(root.parent)]},
+            "scope-parent": {"cwd": str(outside), "scope": [str(root.parent)]},
+            "resolved-parent": {"cwd": str(outside), "scope_paths": [str(root.parent)]},
+            "cwd-parent": {"cwd": str(root.parent)},
+            "routed-root": {"cwd": str(outside), "context": {**self.sample_context(), "write": True,
+                            "routing": {"worktree_path": str(root)}}},
+            "sibling": {"cwd": str(self.cwd / "trees" / "active-other")},
+        }
+        for job, metadata in cases.items():
+            self.stored_job(job, None, **metadata)
+        result = self.control("worktree-activity", "--path", str(root))
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["worktrees"][0]["running"], sorted(set(cases) - {"sibling"}))
+
+    @unittest.skipUnless(os.name == "nt", "needs Windows junctions")
+    def test_worktree_activity_keeps_lexical_paths_through_shared_junctions(self):
+        root = self.cwd / "tree"
+        root.mkdir()
+        shared = self.cwd / "shared"
+        shared.mkdir()
+        link = root / "material"
+        subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(shared)],
+                       check=True, capture_output=True)
+        for field in ("cwd", "scope", "writable_roots"):
+            self.stored_job("through-" + field, None,
+                            cwd=str(link) if field == "cwd" else str(self.cwd / "elsewhere"),
+                            **({} if field == "cwd" else {field: [str(link)]}))
+        result = self.control("worktree-activity", "--path", str(root))
+        self.assertEqual(result["status"], "completed", result)
+        self.assertEqual(result["worktrees"][0]["running"], ["through-cwd", "through-scope", "through-writable_roots"])
+
+    def test_job_list_preserves_worktree_binding_for_global_merge_checks(self):
+        root = self.cwd / "tree"
+        context = {**self.sample_context(), "write": True,
+                   "routing": {"worktree_path": str(root), "convergence_task": "not needed by the merge gate"}}
+        self.stored_job("routed-write", {"status": "completed"}, context=context)
+        result = self.control("list")
+        self.assertEqual(result["jobs"][0]["context"].get("routing"), {"worktree_path": str(root)})
+
+    def test_worktree_activity_propagates_permission_errors_when_resolving_locations(self):
+        import codex_runner
+
+        root = self.cwd / "tree"
+        root.mkdir()
+        alias = self.cwd / "outside-alias"
+        self.stored_job("alias-writer", None, cwd=str(self.cwd / "elsewhere"), writable_roots=[str(alias)])
+        realpath = os.path.realpath
+        def resolve(path, *, strict=False):
+            if os.path.normcase(os.fspath(path)) == os.path.normcase(str(alias)):
+                if strict:
+                    raise PermissionError("cannot resolve worktree alias")
+                return os.path.abspath(path)
+            return realpath(path, strict=strict)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(os.path, "realpath", side_effect=resolve):
+            with self.assertRaises(PermissionError):
+                codex_runner.worktree_activity([str(root)])
+
+    def test_worktree_activity_rejects_unreadable_or_invalid_write_locations(self):
+        root = self.cwd / "tree"
+        for field in ("scope", "scope_paths", "writable_roots"):
+            for invalid in ("not-a-list", [None], [""]):
+                with self.subTest(field=field, invalid=invalid):
+                    job = self.stored_job("bad-locations", None, cwd=str(self.cwd / "elsewhere"), **{field: invalid})
+                    try:
+                        result = self.control("worktree-activity", "--path", str(root))
+                        self.assertEqual(result["status"], "failed", result)
+                    finally:
+                        shutil.rmtree(job)
 
     def test_worktree_activity_keeps_registered_runs_unknown_jobs_and_invalid_records(self):
         home = Path(self.env["CODEX_RUNNER_HOME"])
@@ -7067,6 +7146,73 @@ class RunnerTests(unittest.TestCase):
                     self.cwd, ["a.txt"], time.monotonic() + 10)
                 self.assertEqual(unchecked, {b"a.txt"} if changed else set())
                 self.assertEqual(working[b"a.txt"][0], "unchecked" if changed else "content")
+
+    def test_snapshot_records_reparse_points_before_directory_or_child_scope(self):
+        import codex_runner
+
+        point = self.cwd / "material"
+        point.mkdir()
+        (point / "payload.txt").write_bytes(b"data")
+        fields = ("st_dev", "st_ino", "st_mode", "st_size", "st_mtime_ns", "st_ctime_ns")
+        info = SimpleNamespace(**{key: getattr(point.lstat(), key) for key in fields},
+                               st_file_attributes=0x400, st_reparse_tag=0)
+        real_lstat = Path.lstat
+        def lstat(path, *args, **kwargs):
+            return info if path == point else real_lstat(path, *args, **kwargs)
+        for scope in ("material", "material/payload.txt"):
+            for readable in (False, True):
+                with self.subTest(scope=scope, readable=readable), \
+                        mock.patch.object(Path, "lstat", lstat), \
+                        mock.patch.object(os, "readlink", return_value="first-target",
+                                          side_effect=None if readable else PermissionError("unreadable reparse target")):
+                    _, working, unchecked = codex_runner.verification_working_files(
+                        self.cwd, [scope], time.monotonic() + 10)
+                    self.assertEqual(set(working), {b"material"})
+                    self.assertEqual(working[b"material"][0], "link" if readable else "unchecked")
+                    self.assertEqual(unchecked, set() if readable else {b"material"})
+
+    @unittest.skipUnless(os.name == "nt", "needs Windows junctions")
+    def test_host_verification_records_ignored_junction_targets(self):
+        for operation in ("change", "unreadable"):
+            with self.subTest(operation=operation):
+                _, project, git = self.git_repo("junction-" + operation)
+                targets = [Path(self.tmp.name) / (operation + "-target-" + str(i)) for i in range(2)]
+                for target in targets:
+                    (target / ".git").mkdir(parents=True)
+                    (target / "data.txt").write_text("same bytes", "utf-8")
+                junction = project / "material"
+                git("config", "core.symlinks", "false")
+                (project.parent / ".gitignore").write_text("sub/material/\n", "utf-8")
+                def point(target):
+                    subprocess.run(["cmd.exe", "/d", "/c", "mklink", "/J", str(junction), str(target)],
+                                   check=True, capture_output=True)
+                point(targets[0])
+                self.assertEqual(junction.lstat().st_reparse_tag, stat.IO_REPARSE_TAG_MOUNT_POINT)
+                self.assertIn("sub/material/", git("ls-files", "--others", "--ignored", "--exclude-standard", "--directory"))
+                self.stored_job("SOURCE", {"status": "completed"}, cwd=str(project), scope=["."])
+                def edit():
+                    junction.rmdir()
+                    point(targets[1])
+                real_readlink = os.readlink
+                def unreadable(path, *args, **kwargs):
+                    if os.fspath(path) == str(junction):
+                        raise PermissionError("junction target unavailable")
+                    return real_readlink(path, *args, **kwargs)
+                try:
+                    with mock.patch("os.readlink", side_effect=unreadable) if operation == "unreadable" else nullcontext():
+                        result = self.execute_host_verification(
+                            project, Path(self.tmp.name) / ("junction-run-" + operation),
+                            edit if operation == "change" else None)
+                    if operation == "change":
+                        self.assertEqual((result["status"], result.get("error_kind")),
+                                         ("failed", "verification_tree_changed"), result)
+                        self.assertIn("sub/material", result["verification_changed_paths"])
+                    else:
+                        self.assertEqual((result["status"], result.get("verification_integrity")),
+                                         ("completed", "unchecked"), result)
+                        self.assertGreater(result["verification_unchecked_files"], 0)
+                finally:
+                    shutil.rmtree(Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / "SOURCE")
 
     def test_verification_metadata_does_not_equate_unreadable_files(self):
         import codex_runner

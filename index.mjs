@@ -4455,9 +4455,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
   const worktreeReservations = new Map();
   const worktreeGenerations = new Map();
-  const dispatchLocations = (args, cwd) => [cwd, ...(args.scope ?? []).map(p => taskScopePath(cwd, p))];
-  const touchesWorktree = (entry, locations) => [entry.path, ...(entry.previous_paths ?? [])]
+  const dispatchLocations = (args, cwd) => {
+    if (typeof cwd !== 'string' || !cwd.trim()) throw new Error('查不到任务目录，保留 worktree');
+    const bound = args.context?.routing?.worktree_path;
+    if (bound !== undefined && (typeof bound !== 'string' || !bound.trim())) throw new Error('查不到任务 worktree 归属，保留 worktree');
+    return [cwd, ...(bound === undefined ? [] : [taskScopePath(cwd, bound)]),
+      ...['scope', 'scope_paths', 'writable_roots', 'required_writes'].flatMap(key => {
+      const paths = args[key] ?? [];
+      if (!Array.isArray(paths) || paths.some(p => typeof p !== 'string' || !p.trim())) throw new Error(`查不到完整 ${key} 路径，保留 worktree`);
+      return paths.map(p => taskScopePath(cwd, p));
+    })];
+  };
+  const belongsToWorktree = (entry, locations) => [entry.path, ...(entry.previous_paths ?? [])]
     .some(root => root && locations.some(p => typeof p === 'string' && within(p, root)));
+  const touchesWorktree = (entry, locations) => [entry.path, ...(entry.previous_paths ?? [])]
+    .some(root => root && locations.some(p => typeof p === 'string' && (within(p, root) || within(root, p))));
   function reserveWorktrees(repo, args, cwd, reservation) {
     const locations = dispatchLocations(args, cwd);
     for (const [key, entry] of Object.entries(readWorktrees())) {
@@ -4563,9 +4575,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     const ids = new Set([owner, ...aliases.predecessors(owner)]);
     const records = () => Object.entries(readWorktrees()).filter(([key]) => ids.has(key.slice(0, key.indexOf('::')))).map(([, entry]) => entry);
     const locations = dispatchLocations(args, cwd);
-    if (args.scope) args = { ...args, scope: args.scope.map(p => taskScopePath(cwd, p)) };
-    const previous = records().find(entry => [entry.path, ...(entry.previous_paths ?? [])].some(root => root && locations.some(p => typeof p === 'string' && within(p, root))));
-    const matching = Object.values(readWorktrees()).find(entry => ['open', 'closed'].includes(entry.status) && touchesWorktree(entry, locations));
+    args = { ...args, ...Object.fromEntries(['scope', 'writable_roots', 'required_writes'].filter(key => args[key])
+      .map(key => [key, args[key].map(p => taskScopePath(cwd, p))])) };
+    const previous = records().find(entry => belongsToWorktree(entry, locations));
+    const matching = Object.values(readWorktrees()).find(entry => ['open', 'closed'].includes(entry.status) && belongsToWorktree(entry, locations));
     const repo = previous?.repo ?? matching?.repo ?? repoFor(cfg.worktree.repos, locations);
     if (!repo) return undefined;
     return withRepoLock(repo, async () => {
@@ -4575,7 +4588,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       };
       const all = readWorktrees();
       const foreign = Object.entries(all).find(([key, entry]) => entry.status === 'open' && pathKey(entry.repo) === pathKey(repo) &&
-        !ids.has(key.slice(0, key.indexOf('::'))) && touchesWorktree(entry, locations));
+        !ids.has(key.slice(0, key.indexOf('::'))) && belongsToWorktree(entry, locations));
       if (foreign) {
         const entry = foreign[1];
         for (const oldPath of entry.previous_paths ?? []) {
@@ -4669,22 +4682,42 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       default: return `合并没有完成：${result.message}`;
     }
   };
-  // 合并闸门：本对话在这个 worktree 里没有在跑的单，完成的写入单都已记为 verified 或 accepted_deviations。
+  // 合并闸门按 worktree 查全部会话；外会话的写入也必须核验通过。
   async function mergeGate(owner, entry, signal) {
-    const jobs = await ownerJobs(owner, signal);
-    if (!jobs) return '查不到本对话的派单记录，暂不合并；稍后用 codex_worktree action=merge 重试。';
-    const mine = jobs.filter(job => typeof job.cwd === 'string' && within(job.cwd, entry.path) && !job.context?.verification_of);
-    const running = mine.filter(job => job.status === 'running').map(job => job.job_id);
-    if (running.length) return `本对话 worktree 里还有单在跑（${running.join('、')}），全部核验通过后自动合并。`;
-    const open = mine.filter(job => job.context?.write === true && job.status === 'completed' &&
+    let mine;
+    try {
+      const jobs = [];
+      for (let offset = 0; offset !== null;) {
+        const page = await conductor.list({ limit: 100, offset }, signal);
+        if (!page || (page.status && page.status !== 'completed') || page.error || !Array.isArray(page.jobs) ||
+            !Object.hasOwn(page, 'next_offset')) throw new Error('派单查询不完整');
+        const next = page.next_offset;
+        if (next !== null && (!Number.isInteger(next) || next <= offset || !page.jobs.length)) throw new Error('派单分页不完整');
+        jobs.push(...page.jobs);
+        offset = next;
+      }
+      mine = jobs.filter(job => {
+        const locations = dispatchLocations({ ...job, writable_roots: job.task_options?.writable_roots }, job.cwd);
+        return !job.context?.verification_of && (job.context?.write === true
+          ? touchesWorktree({ path: entry.path }, locations)
+          : owns(owner, job.context?.owner) && within(job.cwd, entry.path));
+      });
+    } catch {
+      return '查不到完整的全局派单记录，暂不合并；稍后用 codex_worktree action=merge 重试。';
+    }
+    const running = mine.filter(job => job.status === 'running' || (job.context?.write === true &&
+      (job.execution_status === 'running' || !['completed', 'failed', 'cancelled'].includes(job.status)))).map(job => job.job_id);
+    if (running.length) return `本对话 worktree 里还有单在跑（${running.join('、')}）或状态未确认，到任务所属会话用 codex_status 查询，等结束并核验通过后用 codex_worktree action=merge 重试。`;
+    const open = mine.filter(job => job.context?.write === true &&
       !['verified', 'accepted_deviations'].includes(job.verification_status));
     const ids = (status) => open.filter(job => (job.verification_status === 'needs_changes') === status).map(job => job.job_id);
     const [flagged, waiting] = [ids(true), ids(false)];
     // 11-26 d70d85ff：几单记了 needs_changes 后改派新单补，原单一直挡着合并，规划端看不出要做什么。
     return [
-      waiting.length && `本对话 worktree 里还有写入单没核验通过（${waiting.join('、')}），全部通过后自动合并。`,
+      waiting.length && `本对话 worktree 里还有写入单没核验通过（${waiting.join('、')}），到任务所属会话逐单用 codex_verify 核验并用 codex_review 记录结论；` +
+        '失败或取消的单先用 codex_continue 修正；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，写明修复单和核验依据。处理后用 codex_worktree action=merge 重试。',
       flagged.length && `这些写入单核验记为 needs_changes，挡着合并回 ${entry.base_branch}：${flagged.join('、')}。` +
-        '逐单处理：在原线程用 codex_continue 修正后重新核验；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，' +
+        '逐单处理：到任务所属会话在原线程用 codex_continue 修正后重新核验；已由后续单修正的，对原单用 codex_review 记 accepted_deviations，' +
         '写明由哪一单修正和那一单的核验依据。处理完才会自动合并。',
     ].filter(Boolean).join('') || undefined;
   }
@@ -4692,6 +4725,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return withRepoLock(found.entry.repo, async () => {
       const entry = readWorktrees()[found.key];
       if (entry?.status !== 'open') return { line: '本对话 worktree 已收尾。' };
+      if (worktreeReservations.has(found.key)) return { result: { status: 'blocked', reason: 'dispatching' },
+        line: 'worktree 有派单正在登记，暂不合并；等派单结束并核验通过后用 codex_worktree action=merge 重试。' };
       const waiting = await mergeGate(owner, entry, signal);
       if (waiting) return { line: waiting };
       const result = await mergeWorktree(entry).catch(error => ({ status: 'error', message: error.message }));

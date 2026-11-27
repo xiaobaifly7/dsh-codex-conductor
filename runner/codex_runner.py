@@ -2298,6 +2298,9 @@ def verification_working_files(directory, relative, deadline, *, budget_exceeded
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
     identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
+    def is_link(info):
+        return stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
     def scan(path):
         nonlocal remaining
         if time.monotonic() >= deadline:
@@ -2318,7 +2321,7 @@ def verification_working_files(directory, relative, deadline, *, budget_exceeded
             return
         working[name] = ("unchecked", None, info.st_mode)
         try:
-            if stat.S_ISDIR(info.st_mode):
+            if stat.S_ISDIR(info.st_mode) and not is_link(info):
                 working[name] = ("directory", None, info.st_mode)
                 # A checked-out submodule is a directory boundary, independent of its staged gitlink OID.
                 if path != directory and os.path.lexists(path / ".git"):
@@ -2334,7 +2337,7 @@ def verification_working_files(directory, relative, deadline, *, budget_exceeded
                     unchecked.add(name)
                 return
             limit = min(remaining, VERIFY_FILE_LIMIT)
-            if stat.S_ISLNK(info.st_mode):
+            if is_link(info):
                 content = os.fsencode(os.readlink(path))
                 kind = "link"
             elif stat.S_ISREG(info.st_mode) and info.st_size <= limit:
@@ -2371,8 +2374,15 @@ def verification_working_files(directory, relative, deadline, *, budget_exceeded
         path = directory / name
         # Do not follow symlink ancestors or expand a submodule when a child is explicitly named.
         for parent in reversed(path.parents):
-            if parent != directory and parent.is_relative_to(directory) and (
-                    parent.is_symlink() or os.path.lexists(parent / ".git")):
+            if parent == directory or not parent.is_relative_to(directory):
+                continue
+            try:
+                boundary = is_link(parent.lstat()) or os.path.lexists(parent / ".git")
+            except FileNotFoundError:
+                continue
+            except OSError:
+                boundary = True
+            if boundary:
                 path = parent
                 break
         if ".git" not in path.relative_to(directory).parts:
@@ -4180,7 +4190,17 @@ def matching_jobs(args, *, page_dates=None):
 
 def worktree_activity(paths):
     """Read registration records once; unfinished registrations reserve their paths without event replay."""
-    roots = [(value, Path(tree_key(value))) for value in paths]
+    def resolve_location(path):
+        try:
+            return os.path.realpath(path, strict=True)
+        except FileNotFoundError:
+            parent, name = os.path.split(path)
+            if not name:
+                raise
+            return os.path.join(resolve_location(parent), name)
+
+    roots = [(value, {Path(tree_key(value, resolve=resolve)) for resolve in (resolve_location, os.path.abspath)})
+             for value in paths]
     items = [{"path": value, "running": [], "last_activity_at": 0} for value, _ in roots]
     directories = list(job_directories())
     runs = HOME / "runs"
@@ -4198,9 +4218,26 @@ def worktree_activity(paths):
             raise ValueError(f"Invalid result: {directory.name}")
         value = {**task, **(result or {})}
         cwd = value["cwd"]
-        scopes = value.get("scope_paths") or [scope_path(cwd, item) for item in value.get("scope") or []]
-        locations = [Path(tree_key(item)) for item in [cwd, *scopes]]
-        matching = [index for index, (_, root) in enumerate(roots) if any(p.is_relative_to(root) for p in locations)]
+        if not isinstance(cwd, str) or not cwd.strip():
+            raise ValueError(f"Invalid cwd: {directory.name}")
+        locations = [cwd]
+        routing = (task.get("context") or {}).get("routing") or {}
+        if "worktree_path" in routing:
+            bound = routing["worktree_path"]
+            if not isinstance(bound, str) or not bound.strip():
+                raise ValueError(f"Invalid worktree_path: {directory.name}")
+            locations.append(bound)
+        for field in ("scope", "scope_paths", "writable_roots"):
+            declared = task.get(field) if field == "writable_roots" else value.get(field)
+            if declared is None:
+                continue
+            if not isinstance(declared, list) or any(not isinstance(item, str) or not item.strip() for item in declared):
+                raise ValueError(f"Invalid {field}: {directory.name}")
+            locations.extend(scope_path(cwd, item, resolve=os.path.abspath) for item in declared)
+        locations = {Path(tree_key(item, resolve=resolve)) for item in locations
+                     for resolve in (resolve_location, os.path.abspath)}
+        matching = [index for index, (_, root_paths) in enumerate(roots)
+                    if any(p.is_relative_to(root) or root.is_relative_to(p) for p in locations for root in root_paths)]
         if not matching:
             continue
         times = job_listing_times(directory)
@@ -4249,6 +4286,8 @@ def list_jobs(args):
                          **({"write": j["context"]["write"]} if "write" in j["context"] else {}),
                          "task": j["context"]["task"].strip().splitlines()[0][:160],
                          **({"dispatcher": j["context"]["dispatcher"]} if "dispatcher" in j["context"] else {}),
+                         **({"routing": {"worktree_path": j["context"]["routing"]["worktree_path"]}}
+                            if "worktree_path" in (j["context"].get("routing") or {}) else {}),
                          **{key: j["context"][key] for key in ("verification_of", "fallback_of") if key in j["context"]}}
              if j.get("context") else None,
              **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
