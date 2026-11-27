@@ -1109,6 +1109,17 @@ test('conversation worktree: a new conversation writes in its own worktree and m
     assert.equal(option(rework.start().argv, '--cwd'), path.join(wt, 'src'));
     assert.equal(rework.payload().context.routing.worktree_path, wt);
 
+    const original = sourceJob();
+    original.cwd = root;
+    original.context = { ...original.context, owner: 'session-0a0a0a0a-1', task: `Read ${path.join(root, 'src', 'a.txt')} and report findings.` };
+    original.scope = ['src']; original.scope_paths = [path.join(root, 'src')];
+    original.files_changed = []; original.write_paths = [];
+    const originalVerification = harness({ config, source: original });
+    await originalVerification.verify({}, as('session-0a0a0a0a-1'));
+    assert.equal(option(originalVerification.start().argv, '--cwd'), root, 'verify the original checkout, not a later worktree');
+    assert.ok(originalVerification.payload().context.task.includes(JSON.stringify(original.context.task)));
+    assert.equal(originalVerification.payload().context.task.includes(JSON.stringify(original.context.task.replace(root, wt))), false);
+
     // A conversation that already wrote in the main checkout stays there; a read-only first job opens nothing.
     const old = harness({ config, listed: () => ({ jobs: [{ job_id: 'OLD-1', status: 'completed', cwd: base,
       scope_paths: [path.join(root, 'src')], context: { owner: 'session-0b0b0b0b-1', write: true } }], total: 1 }) });
@@ -1165,4 +1176,68 @@ test('conversation worktree: a new conversation writes in its own worktree and m
   } finally {
     rmSync(base, { recursive: true, force: true });
   }
+});
+
+test('execution prompts retain raw observations outside the project, including read-only jobs', async () => {
+  for (const write of [true, false]) {
+    const h = harness({ config: { defaultHostAccess: true } });
+    await h.tools.codex_run.execute({ task: 'Run the acceptance observation.', acceptance, write }, exec);
+    assert.match(h.payload().prompt, /完整原始输出[\s\S]*\{\{CONDUCTOR_EVIDENCE_DIR\}\}/);
+    assert.match(h.payload().prompt, /evidence 写文件路径/);
+    assert.match(h.payload().prompt, /终端里看过的不算留证/);
+    if (!write) assert.match(h.payload().prompt, /证据目录外/);
+  }
+});
+
+test('verification checks retained evidence first and asks for classified blocked reasons', async () => {
+  const source = { ...sourceJob(), evidence_dir: '/runner/jobs/SOURCE-1/evidence',
+    evidence_dir_windows: '\\\\wsl.localhost\\Ubuntu-24.04\\runner\\jobs\\SOURCE-1\\evidence' };
+  const h = harness({ source });
+  await h.verify();
+  const prompt = h.payload().prompt;
+  assert.match(prompt, /先查证据目录.*\/runner\/jobs\/SOURCE-1\/evidence/);
+  assert.ok(prompt.includes(JSON.stringify(source.evidence_dir)));
+  assert.ok(prompt.includes(`Windows 路径：${source.evidence_dir_windows}`));
+  assert.ok(prompt.includes(JSON.stringify(source.evidence_dir_windows)));
+  for (const label of ['[缺证据]', '[环境]', '[需用户]', '[需改状态]']) assert.ok(prompt.includes(label), label);
+  assert.doesNotMatch(prompt, /\{\{CONDUCTOR_EVIDENCE_DIR\}\}/);
+});
+
+test('verification receipts group only tagged blocked rows and leave their status unchanged', async () => {
+  const rows = [
+    ['[缺证据] output not retained', 'blocked'], ['[环境] timeout', 'blocked'],
+    ['[需用户] missing material', 'blocked'], ['[需改状态] requires deployment', 'blocked'],
+    ['[缺证据] another missing output', 'blocked'], ['unclassified', 'blocked'],
+    ['[环境] measured failure', 'not_met'], ['text [缺证据] is not a prefix', 'blocked'],
+  ].map(([evidence, status], i) => ({ criterion: `criterion ${i + 1}`, evidence, status }));
+  const structured = { ...report(), criteria: rows };
+  const h = harness({ verificationResult: { structured } });
+  const value = await h.verify();
+  for (const receipt of [value, await h.tools.codex_status.execute({ job_id: 'VERIFY-1' }, exec)]) {
+    assert.match(receipt.next, /\[缺证据\] 第 1、5 条.*codex_continue.*SOURCE-1.*证据目录.*codex_verify/);
+    assert.match(receipt.next, /\[环境\] 第 2 条.*codex_verify.*expect_blocked/);
+    assert.match(receipt.next, /\[需用户\] 第 3 条.*accepted_deviations.*owner_only.*用户/);
+    assert.match(receipt.next, /\[需改状态\] 第 4 条.*accepted_deviations.*owner_only.*用户/);
+    assert.doesNotMatch(receipt.next, /第 [678] 条/);
+    assert.deepEqual(receipt.report.criteria, rows);
+  }
+  const plain = nextStep({ status: 'completed', context: { verification_of: 'SOURCE-1' }, structured: report() });
+  assert.doesNotMatch(plain, /\[缺证据\]|expect_blocked|owner_only/);
+});
+
+test('Gemini read-only execution prompts do not promise external evidence access', async () => {
+  for (const defaultHostAccess of [false, true]) {
+    const h = harness({ config: { defaultEngine: 'gemini', defaultHostAccess, gemini: { command: gemini.command } } });
+    await h.tools.codex_run.execute({ task: 'Inspect the project.', acceptance, write: false }, exec);
+    assert.match(h.payload().prompt, /没有证据目录/);
+    assert.doesNotMatch(h.payload().prompt, /CONDUCTOR_EVIDENCE_DIR|该项目外证据目录允许写入/);
+  }
+});
+
+test('verification does not invent evidence paths for a non-host Gemini source', async () => {
+  const source = { ...sourceJob(), evidence_available: false };
+  const h = harness({ source });
+  await h.verify();
+  assert.match(h.payload().prompt, /原执行单没有证据目录/);
+  assert.doesNotMatch(h.payload().prompt, /先查证据目录|\/SOURCE-1\/evidence|undefined/);
 });

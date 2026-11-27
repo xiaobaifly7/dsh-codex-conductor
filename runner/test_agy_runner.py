@@ -365,6 +365,63 @@ class AdapterTests(unittest.TestCase):
             self.assertIn("write_file(*)", permissions(sandbox="danger-full-access", context={"write": False})["deny"])
             self.assertIn("write_file(*)", permissions(agy_home=r"D:\pool\acc 1")["deny"])
 
+    def test_read_only_evidence_preserves_main_permissions_without_agy_home(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            for sandbox in ("read-only", "danger-full-access"):
+                for evidence in (None, r"\\wsl.localhost\Ubuntu-24.04\tmp\job\evidence"):
+                    with self.subTest(sandbox=sandbox, evidence=evidence):
+                        command, _ = agy_runner.build_command(args(
+                            r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox=sandbox,
+                            context={"write": False}, evidence_dir=evidence), run_dir, None)
+                        settings = json.loads(command[command.index("--settings") + 1])
+                        expected = {
+                            "allow": ["command(*)", "unsandboxed(*)", "read_file(*)"] if sandbox == "danger-full-access" else [],
+                            "ask": [],
+                            "deny": ["write_file(*)", "mcp(*)", "read_url(*)", "execute_url(*)"] if sandbox == "danger-full-access"
+                            else ["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "read_url(*)", "execute_url(*)"],
+                        }
+                        self.assertEqual(settings["permissions"]["deny"], expected["deny"])
+                        self.assertEqual(settings["permissions"], expected)
+                        self.assertEqual(settings["allowNonWorkspaceAccess"], sandbox == "danger-full-access")
+                        self.assertEqual(settings["enableTerminalSandbox"], sandbox != "danger-full-access")
+
+    def test_read_only_evidence_preserves_main_permissions_with_agy_home(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            for sandbox in ("read-only", "danger-full-access"):
+                for evidence in (None, r"\\wsl.localhost\Ubuntu-24.04\tmp\job\evidence"):
+                    with self.subTest(sandbox=sandbox, evidence=evidence):
+                        command, _ = agy_runner.build_command(args(
+                            r"D:\local project", agy_command=r"C:\tools\agy.exe", sandbox=sandbox,
+                            context={"write": False}, agy_home=r"D:\pool\acc 1", evidence_dir=evidence), run_dir, None)
+                        settings = json.loads(command[command.index("--settings") + 1])
+                        expected = {
+                            "allow": ["command(*)", "unsandboxed(*)", "read_file(*)",
+                                      "write_file(D:/pool/acc 1/.gemini/antigravity-cli)"] if sandbox == "danger-full-access" else [],
+                            "ask": [],
+                            "deny": ["mcp(*)", "read_url(*)", "execute_url(*)"] if sandbox == "danger-full-access"
+                            else ["write_file(*)", "command(*)", "unsandboxed(*)", "mcp(*)", "read_url(*)", "execute_url(*)"],
+                        }
+                        self.assertEqual(settings["permissions"], expected)
+                        self.assertEqual(settings["allowNonWorkspaceAccess"], sandbox == "danger-full-access")
+                        self.assertEqual(settings["enableTerminalSandbox"], sandbox != "danger-full-access")
+
+    def test_evidence_path_translates_wsl_native_directory_with_wslpath(self):
+        with mock.patch.object(agy_runner.subprocess, "check_output", return_value="\\\\wsl.localhost\\Ubuntu-24.04\\tmp\\job\\evidence\n") as convert, \
+                mock.patch.object(agy_runner.os, "name", "posix"):
+            self.assertTrue(agy_runner.evidence_path("/tmp/job/evidence", True).startswith("\\\\wsl.localhost"))
+        convert.assert_called_once_with(["wslpath", "-w", "/tmp/job/evidence"], text=True, timeout=10)
+
+    def test_evidence_path_returns_none_when_wslpath_fails_or_returns_empty_output(self):
+        for label, error in [
+            ("missing", FileNotFoundError("wslpath")),
+            ("nonzero", subprocess.CalledProcessError(1, ["wslpath"])),
+            ("timeout", subprocess.TimeoutExpired(["wslpath"], 10)),
+            ("empty", None),
+        ]:
+            with self.subTest(case=label), mock.patch.object(agy_runner.os, "name", "posix"), \
+                    mock.patch.object(agy_runner.subprocess, "check_output", side_effect=error, return_value=""):
+                self.assertIsNone(agy_runner.evidence_path("/tmp/job/evidence", True))
+
     def test_host_read_only_jobs_keep_python_caches_out_of_the_project(self):
         with tempfile.TemporaryDirectory() as run_dir:
             def env_of(**overrides):

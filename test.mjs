@@ -2740,7 +2740,7 @@ test('composePrompt adds the host-access lines only with host_access, the read-o
   const rw = prompt({ hostAccess: true, write: true });
   assert.match(rw, /只允许改动[\s\S]*沙箱外运行[\s\S]*pwsh\.exe、ssh\.exe、Hyper-V cmdlet[\s\S]*不要删除、停止、重建或改配置。\n[\s\S]*## 最后汇报/);
   assert.doesNotMatch(rw, /只读调查/);
-  assert.match(prompt({ hostAccess: true }), /不要删除、停止、重建或改配置。\n- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n/);
+  assert.match(prompt({ hostAccess: true }), /不要删除、停止、重建或改配置。\n- 这是只读调查：证据目录外不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n/);
 });
 
 test('host_access runs Codex with danger-full-access, and only when allowHostAccess is on', async () => {
@@ -3411,6 +3411,7 @@ test('service receipts distinguish retryable errors from the total timeout', () 
   }
   const timeout = nextStep({ ...failed, error_kind: 'timeout', retryable: false });
   assert.match(timeout, /总超时.*不自动重试.*尝试 2 次.*文件改动共 1 个.*确认现状.*不要原样重派/);
+  assert.ok(timeout.endsWith('先核对已有产物，把剩余工作拆成可独立验收的小批次，写明每批的数量或时间预算；长命令自带超时并预留收尾时间。报告有效且满足续接条件时用 codex_continue；报告缺失时，核实已有产物后只为当前这一小批新建任务。'));
   assert.doesNotMatch(timeout, /resume|再派一次/);
 });
 

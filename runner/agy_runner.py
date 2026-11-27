@@ -65,6 +65,15 @@ def _windows_path(path):
     raise ValueError(f"agy requires a local Windows drive path: {path}")
 
 
+def evidence_path(path, windows):
+    if windows and os.name != "nt":
+        try:
+            return subprocess.check_output(["wslpath", "-w", os.fspath(path)], text=True, timeout=10).strip() or None
+        except (OSError, subprocess.SubprocessError):
+            return None
+    return os.fspath(path)
+
+
 def _path_from_cwd(path, cwd, windows):
     path = os.fspath(path)
     _reject_unc(path)

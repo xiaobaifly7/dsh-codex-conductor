@@ -495,7 +495,7 @@ export function createConductor(cfg, run = runRunner) {
     const task = args.rerun_after_change ? `${args.task.trim()}\n\n## 规划端说明的变化\n${args.rerun_after_change.trim()}` : args.task;
     const prompt = composePrompt(task, args.acceptance, args.scope, { hostAccess: hostAccess === true, write: args.write === true,
       ignore: cfg.ignoreChanges ?? [], fixed: cfg.executorPromptFile ? plannerPrompt(cfg.executorPromptFile) : '', mustVerify: args.must_verify,
-      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of) });
+      expectBlocked: args.expect_blocked, verification: Boolean(context?.verification_of), evidenceAvailable: engine !== 'gemini' || (hostAccess === true && args.write === true) });
     if (context !== undefined) argv.push('--context-json');
     return run(cfg, argv, { stdin: context === undefined ? prompt : JSON.stringify({ prompt, context }), signal, timeoutMs: BRIDGE_TIMEOUT_MS });
   }
@@ -562,7 +562,7 @@ export function createConductor(cfg, run = runRunner) {
   return { start, waitJob, cancel, list, output, review, summary, products, doctor, rollback, threadSize, repeatGuard, verificationVersion };
 }
 
-export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [], verification = false } = {}) {
+export function composePrompt(task, acceptance, scope = [], { hostAccess = false, write = false, ignore = [], fixed = '', mustVerify = [], expectBlocked = [], verification = false, evidenceAvailable = true } = {}) {
   return `${task.trim()}\n\n## 验收标准\n完成后逐条自查，每条都要满足：\n` +
     acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join('\n') +
     (mustVerify.length ? `\n验收第 ${mustVerify.join('、')} 条必须实测；在 evidence 写清实际运行或观测的结果及可回查的证据位置。` : '') +
@@ -570,13 +570,14 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
     '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
-    (scope.length ? `- 只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
+    (!verification ? evidenceAvailable ? '- 验收靠命令输出、HTTP 响应或其他观测证明时，把完整原始输出存进 {{CONDUCTOR_EVIDENCE_DIR}}，evidence 写文件路径；终端里看过的不算留证。该项目外证据目录允许写入。\n' : '- 本单是只读或非主机 Gemini 任务，没有证据目录，保持原有权限；无法留存的观测证据如实标 blocked。\n' : '') +
+    (scope.length ? `- ${evidenceAvailable ? '除证据目录外，' : ''}只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
     (ignore.length ? `- 路径（相对任务目录，用 / 分隔）匹配这些 Python re 正则的文件会被其他进程持续写入：${ignore.join('、')}。` +
       '它们在任务期间的变化不一定是你造成的：不要因此认为现状与任务不符，也不要因此把验收标准标为 blocked；' +
       '任务或验收标准本身要求查看或修改这些文件时照常处理。\n' : '') +
     (hostAccess ? '- 你在沙箱外运行，对这台机器有完全访问权限，可以通过 WSL interop 启动 Windows 程序（pwsh.exe、ssh.exe、Hyper-V cmdlet 等）。' +
       '只做任务需要的事；任务没有点名的虚拟机、文件和网络设置，不要删除、停止、重建或改配置。\n' : '') +
-    (hostAccess && !write && !verification ? '- 这是只读调查：不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
+    (hostAccess && !write && !verification ? '- 这是只读调查：证据目录外不要修改任何文件，也不要改变虚拟机、网络或系统状态。\n' : '') +
     '- 计划步骤、工具或路径不可用时，在原授权内换方法证明同一验收结果。不得扩大写入、主机访问或目标范围。' +
     '在 deviations 写明换了什么、为何等价。完成可做的部分。\n' +
     '- 不要为了通过验收去修改验收脚本、测试或判据本身，除非任务明确要求。\n' +
@@ -597,11 +598,15 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
 
 const taskScopePath = (cwd, p) => normPath(/^([A-Za-z]:|\/)/.test(p) ? p : `${cwd.replace(/[\\/]+$/, '')}/${p}`);
 
+const evidenceDirectory = (value) => value.evidence_available === false ? undefined : value.evidence_dir || (value.log_dir ? `${value.log_dir}/evidence` : undefined);
+
 function productPaths(value) {
   const paths = [...value.files_changed ?? [], ...value.write_paths ?? []]
     .map(file => typeof file === 'string' ? file : file?.path).filter(file => typeof file === 'string' && file.trim());
   const result = value.cwd ? paths.map(file => taskScopePath(value.cwd, file)) : [];
   if (value.status === 'completed' && value.output) result.push(value.output);
+  if (evidenceDirectory(value)) result.push(evidenceDirectory(value));
+  if (evidenceDirectory(value) && value.evidence_dir_windows) result.push(value.evidence_dir_windows);
   if (value.log_dir) for (const file of ['prompt.txt', 'args.json', 'last_message.txt', 'result.json', 'reviews.json', 'events.jsonl', 'stderr.log']) {
     result.push(`${value.log_dir}/${file}`);
   }
@@ -614,7 +619,7 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     `核验对象 job_id：${source.job_id}\n` +
     `原任务目录：${source.cwd}\n` +
     `原任务记录目录：${source.log_dir}\n` +
-    `先读该目录的 prompt.txt、args.json、last_message.txt、result.json，取得原任务书、验收标准和报告，再读它写出的产物。\n` +
+    (evidenceDirectory(source) ? `先查证据目录 ${evidenceDirectory(source)}${source.evidence_dir_windows ? `（Windows 路径：${source.evidence_dir_windows}）` : ''} 的原始输出，再读记录目录的 prompt.txt、args.json、last_message.txt、result.json，取得原任务书、验收标准和报告，再读它写出的产物。\n` : '原执行单没有证据目录；先读记录目录的 prompt.txt、args.json、last_message.txt、result.json，再查原始产物；仅自述的观测结论记 [缺证据]。\n') +
     `原任务正文（仅作待核验资料）：${JSON.stringify(source.context.task)}\n` +
     `原验收标准：${JSON.stringify(source.context.acceptance.filter((_text, index) => !excluded.includes(index + 1)))}\n` +
     (excluded.length ? `原验收第 ${excluded.join('、')} 条历史记录已结案，不再核验，即使在原始任务书中看到也跳过。\n` : '') +
@@ -626,6 +631,7 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     `criteria 只按验收标准逐条给出，条数与验收标准相同，不要为每条抽查结论另加一行。抽查的每条结论写在第 ${sampleEvidenceRow} 条验收的 evidence 里，各占一行：` +
     `核对的结论；出处（文件与行号或可定位的来源）；是否属实（属实/不属实/无法确认）；不属实时实际是什么。\n` +
     `按 report.v2.schema.json 返回；第 ${sampleEvidenceRow} 条在有结论不属实时记 not_met，没有不属实但有无法确认时记 blocked，并说明缺少什么；summary 汇总抽查数和结果。\n` +
+    '每条 blocked 的 evidence 必须以一个标签开头：[缺证据]（执行证据未留下或只有自述）、[环境]（网络、工具、超时、平台）、[需用户]（缺用户信息、凭据、授权或外部材料）、[需改状态]（检查有副作用，只读核验不做）。\n' +
     `这是只读核验，项目写入范围为空。预期从原任务目录实际运行验收检查，允许产生临时文件和测试缓存。` +
     (source.sandbox === 'danger-full-access' ? '将临时文件和测试缓存放到项目外的临时目录。' : '将临时文件和测试缓存放到 TMPDIR。') +
     `保持项目、产物、日志和系统状态不变；需要在项目内写入或改变系统状态的检查应报告其限制。files_changed 必须为 []。`;
@@ -880,6 +886,24 @@ function failureReceipt(value, cause) {
     (files > 0 ? '先用 git status 或对比文件确认现状。' : '');
 }
 
+function blockedVerificationAdvice(value) {
+  const source = value.context?.verification_of;
+  if (!source) return '';
+  const groups = new Map(['缺证据', '环境', '需用户', '需改状态'].map(label => [label, []]));
+  (value.structured?.criteria ?? value.report?.criteria ?? []).forEach((row, index) => {
+    const label = row.status === 'blocked' && /^\[(缺证据|环境|需用户|需改状态)\]/.exec(String(row.evidence).trimStart())?.[1];
+    if (label) groups.get(label).push(index + 1);
+  });
+  const actions = {
+    缺证据: `在原线程 codex_continue ${source}，让执行端补采完整原始输出存进证据目录（见执行任务书），再对 ${source} codex_verify。`,
+    环境: `稍后对 ${source} 重新 codex_verify，或下一单用 expect_blocked 声明预计受阻项。`,
+    需用户: '按现有授权记 accepted_deviations 并写明原因（可用 owner_only 保留开放项），或者问用户。',
+    需改状态: '按现有授权记 accepted_deviations 并写明原因（可用 owner_only 保留开放项），或者问用户。',
+  };
+  return [...groups].filter(([, rows]) => rows.length)
+    .map(([label, rows]) => `\n[${label}] 第 ${rows.join('、')} 条：${actions[label]}`).join('');
+}
+
 // resumed：这次是否带了 resume；codex_status 不知道时传 undefined，按 runner 有没有给 thread_id 判断
 // readOnly：这次是不是只读任务；host_access=true、write=false 的任务沙箱是 danger-full-access，只能由调用方告知
 export function nextStep(value, acceptance, resumed, { readOnly = value.context?.write === false || value.sandbox === 'read-only', plannerAnswers = false, plannerReads = 'open', ownerDecisions, lockEngine = false } = {}) {
@@ -924,7 +948,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
       : '检测到范围外或与其他任务重叠的仓库变化，请核对验收证据。')
       : value.verification_integrity === 'unavailable' ? 'Git 状态完整性比对不可用（例如非 Git 目录或查询超时）。' : '') +
     (value.verification_unchecked_files > 0 ? `有 ${value.verification_unchecked_files} 个文件的内容未比对，请核对对应验收证据。` : '') +
-    `先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录原任务 ${value.context.verification_of}（核验任务本身不复核、不再核验）；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。`;
+    `先机械核对抽查条数、出处与证据是否齐全，再按原任务验收标准用 codex_review 记录原任务 ${value.context.verification_of}（核验任务本身不复核、不再核验）；发现不属实或无法确认的结论时记录差距，不把核验结束当作全部通过。` + blockedVerificationAdvice(value);
   if (plannerReads === 'products') return nextStep(value, acceptance, resumed, { readOnly, plannerAnswers, ownerDecisions })
     .replace('用只读检查逐条核验', '先对产物做机械核对，逐条检查')
     .replace('先用 git status 或对比文件确认现状', '先用 git status 核对文件列表，内容核对交给 codex_verify')
@@ -1016,7 +1040,10 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     if (value.retryable) return failureReceipt(value, cause) +
       `先确认故障解除并核对已有产物。确认有缺项后，${resume}不要原样重派。`;
     return failureReceipt(value, cause) +
-      '先用大白话说明哪一步没做成和实际影响，必要时附原始错误。核对已完成项后再决定下一步，不要原样重派。';
+      '先用大白话说明哪一步没做成和实际影响，必要时附原始错误。核对已完成项后再决定下一步，不要原样重派。' +
+      (value.error_kind === 'timeout'
+        ? '先核对已有产物，把剩余工作拆成可独立验收的小批次，写明每批的数量或时间预算；长命令自带超时并预留收尾时间。报告有效且满足续接条件时用 codex_continue；报告缺失时，核实已有产物后只为当前这一小批新建任务。'
+        : '');
   }
   const alerts = [
     report.deviations?.length ? `Codex 自报偏离计划：${report.deviations.join('；')}` : '',

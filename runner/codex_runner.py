@@ -21,6 +21,7 @@ import http.client
 import glob
 import json
 from math import isfinite
+import ntpath
 import os
 import queue
 import random
@@ -855,9 +856,16 @@ def build_command(args, run_dir, thread_id, scratch=None):
                     "-c", "sandbox_workspace_write.network_access=false"]
         for key, value in scratch_env.items():
             cmd += ["-c", f"shell_environment_policy.set.{key}={json.dumps(value, ensure_ascii=False)}"]
-    elif args.sandbox == "workspace-write" and getattr(args, "writable_roots", None):
-        cmd += ["-c", "sandbox_workspace_write.writable_roots=" +
-                json.dumps([local_path(p) for p in args.writable_roots], ensure_ascii=False)]
+    if args.sandbox == "workspace-write":
+        roots = [local_path(p) for p in getattr(args, "writable_roots", None) or []]
+        evidence = getattr(args, "evidence_dir", None)
+        if roots:
+            if evidence:
+                roots.append(str(evidence))
+            cmd += ["-c", "sandbox_workspace_write.writable_roots=" + json.dumps(roots, ensure_ascii=False)]
+        elif evidence:
+            # Parent exec options also apply to resume; add-dir retains roots from user/project configuration.
+            cmd[len(prefix) + 1:len(prefix) + 1] = ["--add-dir", str(evidence)]
     git_env = linked_worktree_git_env(getattr(args, "cwd", None))
     if git_env:
         env.update(git_env)
@@ -1046,6 +1054,8 @@ def run_attempt(args, prompt, run_dir, thread_id, repeat_guard=None):
 def run_process(args, prompt, run_dir, thread_id, repeat_guard=None):
     """Run one provider process to a verdict, including command setup failures. A completed turn determines success."""
     scratch = getattr(args, "verification_scratch", None)
+    if scratch is None and args.sandbox == "read-only" and getattr(args, "engine", None) != "gemini":
+        scratch = getattr(args, "evidence_dir", None)
     gemini = getattr(args, "engine", None) == "gemini"
     id_field = "conversation_id" if gemini else "thread_id"
     fallback_check = getattr(args, "gemini_fallback_check", False)
@@ -2022,6 +2032,27 @@ def ignore_patterns(ignore):
     return patterns, warnings
 
 
+def evidence_event_path(cwd, path, root, windows_root=None):
+    if not root:
+        return False
+    try:
+        path = local_path(os.fspath(path))
+        if not IS_WIN:
+            path = path.replace("\\", "/")
+            if windows_root:
+                share = ntpath.splitdrive(windows_root)[0].replace("\\", "/")
+                if share.lower().startswith(("//wsl.localhost/", "//wsl$/")) and (
+                        path.lower() == share.lower() or path.lower().startswith(share.lower() + "/")):
+                    # WSL aliases share '/', preserving Linux path case and '..' through directory links.
+                    path = "/" + path[len(share):].lstrip("/")
+        candidate = normalized_path(os.path.realpath(os.path.join(cwd, path), strict=True))
+        directory = normalized_path(os.path.realpath(root, strict=True))
+        return os.path.commonpath([candidate, directory]) == directory
+    except (OSError, ValueError, TypeError):
+        # An unresolved event remains a modification; never hide it as evidence.
+        return False
+
+
 def files_changed(root, before, event_changes, scope=None, ignore=None):
     """What a writer touched: a snapshot diff catches shell writes too; events only cover Codex's patch tool.
     Paths matching an ignore regex (files other processes keep writing) are dropped before the 300-entry cap."""
@@ -2606,6 +2637,8 @@ def parse_final_message(final):
 def execute(args, prompt, run_dir):
     run_dir.mkdir(parents=True, exist_ok=True)
     args.cwd = os.path.realpath(args.cwd)
+    if getattr(args, "schema", None):
+        args.schema = scope_path(args.cwd, args.schema)
     gemini = getattr(args, "engine", None) == "gemini"
     id_field = "conversation_id" if gemini else "thread_id"
     scope_args = [scope_path(args.cwd, s) for s in getattr(args, "scope", None) or []]
@@ -2626,6 +2659,49 @@ def execute(args, prompt, run_dir):
         args.context = context or None
         base["task_options"] = task_options(vars(args))
     verification = context.get("verification_of") and context.get("write") is False
+    evidence_allowed = not gemini or (args.sandbox == "danger-full-access" and writer(args.sandbox, context))
+    if not verification and evidence_allowed:
+        evidence = (run_dir / "evidence").resolve()
+        project_root = args.cwd
+        known_git = os.environ.get("GIT_DIR") or any(
+            os.path.lexists(parent / ".git") for parent in (Path(args.cwd), *Path(args.cwd).parents))
+        if known_git:
+            try:
+                project_root = os.fsdecode(git(args.cwd, "rev-parse", "--show-toplevel", deadline=time.monotonic() + 10)).strip()
+            except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+                return {**base, "status": "failed", "error_kind": "evidence_directory_unknown",
+                        "error": f"Cannot determine the repository boundary for evidence: {error}", "retryable": False, "attempts": 0}
+        project = Path(normalized_path(local_path(project_root)))
+        evidence_root = Path(normalized_path(str(evidence)))
+        if evidence_root.is_relative_to(project) or project.is_relative_to(evidence_root):
+            temporary = Path(tempfile.gettempdir()).resolve()
+            temporary_root = Path(normalized_path(str(temporary)))
+            if temporary_root.is_relative_to(project):
+                return {**base, "status": "failed", "error_kind": "evidence_directory_overlap",
+                        "error": "Evidence directory must be outside the project directory.", "retryable": False, "attempts": 0}
+            evidence = Path(tempfile.mkdtemp(prefix="codex-runner-evidence-", dir=temporary))
+        args.evidence_dir = evidence
+        if gemini:
+            import agy_runner
+            args.evidence_dir = agy_runner.evidence_path(evidence, windows_agy(args.agy_command))
+        evidence_allowed = args.evidence_dir is not None
+        if evidence_allowed:
+            evidence.mkdir(parents=True, exist_ok=True)
+            base["evidence_dir"] = str(evidence)
+            if gemini and windows_agy(args.agy_command):
+                base["evidence_dir_windows"] = args.evidence_dir
+            prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", str(args.evidence_dir))
+            prompt += (f"\n\nExternal evidence directory (absolute): {json.dumps(str(args.evidence_dir), ensure_ascii=False)}\n"
+                       "任务需要保存的日志、截图、测试输出等证据写入上述目录。只读任务也允许向该目录留证，"
+                       "项目和其他路径仍遵守原写入约束。\n")
+            if not gemini and args.sandbox == "read-only":
+                prompt = (f"Project directory (absolute): {json.dumps(args.cwd, ensure_ascii=False)}\n"
+                          "当前目录是外部证据目录；先读取项目目录中适用的 AGENTS.md。项目目录只读，项目相对路径以上述项目目录为准。\n\n" + prompt)
+    if not verification and not evidence_allowed:
+        base["evidence_available"] = False
+        args.evidence_dir = None
+        prompt = prompt.replace("{{CONDUCTOR_EVIDENCE_DIR}}", "不可用（本单没有证据目录）")
+        prompt += "\n本单没有证据目录，保持原有权限，不为留证扩大访问范围；无法留存的观测证据如实标 blocked。\n"
     host_verification = verification and args.sandbox == "danger-full-access"
     if not gemini and verification and args.sandbox in ("read-only", "danger-full-access"):
         scratch = (run_dir / "scratch").resolve()
@@ -2792,7 +2868,9 @@ def execute(args, prompt, run_dir):
         def changes():
             if args.sandbox == "read-only":
                 return {}
-            result = files_changed(args.cwd, before, event_changes, scope, ignore)
+            events = [(path, kind) for path, kind in event_changes if not evidence_event_path(
+                args.cwd, path, base.get("evidence_dir"), base.get("evidence_dir_windows"))]
+            result = files_changed(args.cwd, before, events, scope, ignore)
             if gemini:
                 result["files_changed_source"] = result["files_changed_source"].replace("codex_events", "gemini_events")
             return result
@@ -2806,6 +2884,7 @@ def execute(args, prompt, run_dir):
         # Read-only runs are --ephemeral, so only a writer thread they resumed can be resumed again.
         resumable = lambda tid: tid if gemini or args.sandbox != "read-only" else args.resume
         prompt = repeat_guard.prepare_prompt(prompt, getattr(args, "allow_rerun", False))
+        (run_dir / "prompt.txt").write_text(prompt, encoding="utf-8")
         original_prompt = prompt
         thread_id = args.resume
         attempt = 0

@@ -60,8 +60,17 @@ FAKE_CODEX = textwrap.dedent(r"""
     elif mode == "literal_newline_report":
         finish('{"summary":"ok","criteria":[{"criterion":"checked","status":"met","evidence":"first\nsecond"}],'
                '"files_changed":[],"deviations":[],"unresolved":[]}')
-    elif mode == "fixture_report":
+    elif mode in ("fixture_report", "relative_schema"):
+        if mode == "relative_schema":
+            json.loads(Path(sys.argv[sys.argv.index("--output-schema") + 1]).read_text("utf-8"))
         finish(Path(os.environ["FAKE_REPORT"]).read_text(encoding="utf-8"))
+    elif mode == "execution_evidence_write":
+        line = next(line for line in prompt.decode("utf-8").splitlines() if line.startswith("External evidence directory (absolute): "))
+        evidence = Path(json.loads(line.split(": ", 1)[1]))
+        target = evidence / "observation.txt"
+        target.write_text("observation\n", encoding="utf-8")
+        say(type="item.completed", item={"type": "file_change", "changes": [{"path": str(target), "kind": "add"}]})
+        finish()
     elif mode == "verification_temp_test":
         status = "blocked"
         if 'sandbox_mode="workspace-write"' in sys.argv:
@@ -242,7 +251,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         sys.exit(1)
     elif mode in ("fallback_event", "fallback_retry_write", "fallback_local_error", "fallback_unreported_file"):
         if mode == "fallback_unreported_file":
-            Path("real-change.txt").write_text("changed")
+            first = prompt.decode("utf-8").splitlines()[0]
+            project = Path(json.loads(first.split(": ", 1)[1])) if first.startswith("Project directory (absolute): ") else Path.cwd()
+            (project / "real-change.txt").write_text("changed")
         if mode == "fallback_event":
             say(type="item.updated", item={"type": "file_change", "changes": [{"path": "rewritten.txt"}]})
         if mode == "fallback_retry_write":
@@ -365,6 +376,12 @@ def alive(pid):
     except ProcessLookupError:
         return False
     return True
+
+
+def task_prompt(prompt):
+    if prompt.startswith("Project directory (absolute): "):
+        prompt = prompt.split("\n\n", 1)[1]
+    return prompt.split("\n\nExternal evidence directory (absolute):", 1)[0].split("\n本单没有证据目录", 1)[0]
 
 
 class RunnerTests(unittest.TestCase):
@@ -566,7 +583,7 @@ class RunnerTests(unittest.TestCase):
         other = self.cwd / "other"
         other.mkdir()
         _, isolated, calls, kills = self.repeat_job("other", self.repeat_step(3), cwd=other)
-        self.assertEqual((isolated["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        self.assertEqual((isolated["repeat_guard"]["standing"], task_prompt(calls[0][1]), kills), ([], "original task", 0))
         _, changed, calls, kills = self.repeat_job("changed", [self.repeat_patch(), *self.repeat_step(3)])
         self.assertIn("## 本目录近期反复失败的步骤", calls[0][1])
         self.assertEqual((changed["repeat_guard"]["standing"], kills), ([], 0))
@@ -686,7 +703,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("runner 拦下了第 3 次运行", second["prompt"])
         self.assertIn("resume", second["argv"])
         job_dir = Path(done["log_dir"])
-        self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), "do it")
+        self.assertEqual((job_dir / "prompt.txt").read_text("utf-8"), first["prompt"])
         query = self.control("repeat-guard", "--cwd", str(self.cwd))
         self.assertEqual(query, {"status": "completed", "totals": {"blocked": 1, "seconds_avoided": 60},
                                  "standing": done["repeat_guard"]["standing"], "_changed_at": 0})
@@ -740,7 +757,7 @@ class RunnerTests(unittest.TestCase):
                 done = self.control("status", job["job_id"], "--wait", "30")
                 self.assertEqual(done["status"], "completed")
                 self.assertEqual(done["repeat_guard"], {"blocks": [], "standing": []})
-                self.assertEqual(self.calls()[-1]["prompt"], "do it")
+                self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "do it")
                 query = self.control("repeat-guard", "--cwd", str(self.cwd))
                 self.assertEqual(len(query["standing"]), int(options[0] == "--repeat-guard"))
         self.assertEqual(self.control("repeat-guard", "--cwd", str(self.cwd))["standing"], [])
@@ -769,7 +786,7 @@ class RunnerTests(unittest.TestCase):
                     event[0] -= 3600
         ledger.write_text(json.dumps(data), "utf-8")
         _, result, calls, kills = self.repeat_job("expired", self.repeat_step(3, None, command="setup3.ps1"), options=options)
-        self.assertEqual((result["repeat_guard"]["standing"], calls[0][1], kills), ([], "original task", 0))
+        self.assertEqual((result["repeat_guard"]["standing"], task_prompt(calls[0][1]), kills), ([], "original task", 0))
         self.assertNotEqual(json.loads(ledger.read_text("utf-8")), data)
 
     def test_repeat_guard_fallback_masks_digit_runs_and_requires_completed_timing(self):
@@ -1107,7 +1124,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("resume", second["argv"])
         self.assertIn("thread-1", second["argv"])
         self.assertIn("interrupted", second["prompt"])
-        override = "sandbox_workspace_write.writable_roots=" + json.dumps([str(self.cwd / "extra")])
+        override = "sandbox_workspace_write.writable_roots=" + json.dumps([str(self.cwd / "extra"), r["evidence_dir"]])
         for call in (first, second):
             self.assertEqual(call["argv"].count(override), 1)
             self.assertEqual(call["argv"][call["argv"].index(override) - 1], "-c")
@@ -1128,7 +1145,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(result["status"], "completed")
                 self.assertEqual(result["attempts"], 2)
                 self.assertEqual(result["usage_scope"], "thread_total")
-                self.assertEqual(self.calls()[-1]["prompt"], "NEW TASK: fix the CSV parser")
+                self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "NEW TASK: fix the CSV parser")
                 self.assertIn("writer-9", self.calls()[-1]["argv"])
 
     def test_writer_resume_preserves_prompt_before_work_events(self):
@@ -1140,7 +1157,7 @@ class RunnerTests(unittest.TestCase):
                                     prompt=prompt, env={"FAKE_STATE": str(self.state)})
                 self.assertEqual(value["status"], "completed")
                 self.assertEqual(value["attempts"], 2)
-                self.assertEqual(self.calls()[-1]["prompt"], prompt)
+                self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), prompt)
                 self.assertIn("resume", self.calls()[-1]["argv"])
 
     def test_active_commands_suspend_idle_timeout_until_the_matching_completion(self):
@@ -1368,7 +1385,7 @@ class RunnerTests(unittest.TestCase):
                     argv = self.calls()[-1]["argv"]
                     overrides = [p for p in argv if p.startswith("sandbox_workspace_write.writable_roots=")]
                     self.assertEqual(len(overrides), 1)
-                    self.assertEqual(json.loads(overrides[0].split("=", 1)[1]), expected)
+                    self.assertEqual(json.loads(overrides[0].split("=", 1)[1]), [*expected, result["evidence_dir"]])
                     self.assertEqual(argv[argv.index(overrides[0]) - 1], "-c")
                     self.assertNotIn("--add-dir", argv)
                     self.assertEqual("resume" in argv, bool(resume))
@@ -1408,7 +1425,7 @@ class RunnerTests(unittest.TestCase):
         r = self.invoke(mode="transient_then_ok")
         self.assertEqual(r["attempts"], 2)
         self.assertNotIn("resume", self.calls()[1]["argv"])
-        self.assertEqual(self.calls()[1]["prompt"], "do it")
+        self.assertEqual(task_prompt(self.calls()[1]["prompt"]), "do it")
 
     def test_reader_retry_after_resume_does_not_claim_thread_total_usage(self):
         r = self.invoke("--resume", "writer-9", mode="transient_then_ok")
@@ -1766,7 +1783,7 @@ class RunnerTests(unittest.TestCase):
     def test_prompt_with_shell_metacharacters_arrives_intact(self):
         prompt = '修复 A&B|C %PATH% "引号" ^caret\n第二行 $(whoami) `tick`'
         self.invoke(prompt=prompt)
-        self.assertEqual(self.calls()[0]["prompt"], prompt)
+        self.assertEqual(task_prompt(self.calls()[0]["prompt"]), prompt)
         self.assertEqual(self.calls()[0]["argv"][-1], "-")
 
     def test_full_access_runs_as_a_writer(self):
@@ -1795,7 +1812,7 @@ class RunnerTests(unittest.TestCase):
             self.wait_for(waiting_for_lock, timeout=60)
             waiting = self.control("status", second["job_id"])
             self.assertEqual((waiting["status"], waiting["phase"], waiting["attempt"]), ("running", "lock_wait", 0))
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             self.assertEqual(self.control("status", first["job_id"])["status"], "running")
             second_dir = Path(self.env["CODEX_RUNNER_HOME"]) / "jobs" / second["job_id"]
             self.assertFalse((second_dir / "codex.pid").exists())
@@ -1804,7 +1821,7 @@ class RunnerTests(unittest.TestCase):
             self.wait_for(lambda: (self.state / "ready-1").exists())
             (self.state / "release-1").touch()
             self.assertEqual(self.control("status", second["job_id"], "--wait", "30")["status"], "completed")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two"])
         finally:
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
@@ -1840,10 +1857,10 @@ class RunnerTests(unittest.TestCase):
             os.kill(stopped, signal.SIGCONT)
             stopped = None
             self.wait_for(lambda: (self.state / "ready-1").exists())
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two"])
             (self.state / "release-1").touch()
             self.wait_for(lambda: (self.state / "ready-2").exists())
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two", "three"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two", "three"])
             (self.state / "release-2").touch()
             self.assertEqual(self.control("status", later, "--wait", "10")["status"], "completed")
         finally:
@@ -2094,7 +2111,7 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual((result.get("status"), result.get("error_kind"), result.get("attempts")), ("failed", "lock_timeout", 0), result)
             self.assertTrue(result["retryable"])
             self.assertEqual(result["phase"], "lock_wait")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             self.assertEqual(self.control("status", first["job_id"])["status"], "running")
             (self.state / "release-0").touch()
             self.assertEqual(self.control("status", first["job_id"], "--wait", "10")["status"], "completed")
@@ -2202,12 +2219,12 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(cancelled["phase"], "lock_wait")
             self.wait_for(lambda: not alive(worker_pid))
             self.assertEqual(self.control("status", first["job_id"])["status"], "running")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             (self.state / "release-0").touch()
             self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
             self.assertEqual(self.control("status", second["job_id"])["status"], "cancelled")
             self.assertFalse((second_dir / "codex.pid").exists())
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
         finally:
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
@@ -2227,13 +2244,13 @@ class RunnerTests(unittest.TestCase):
                                  command="start", mode="gated_ok", prompt="two")
             jobs.append(second["job_id"])
             self.wait_for(lambda: self.control("status", second["job_id"]).get("phase") == "lock_wait")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one"])
             (self.state / "release-0").touch()
             self.assertEqual(self.control("status", first["job_id"], "--wait", "20")["status"], "completed")
             self.wait_for(lambda: (self.state / "ready-1").exists())
             (self.state / "release-1").touch()
             self.assertEqual(self.control("status", second["job_id"], "--wait", "20")["status"], "completed")
-            self.assertEqual([call["prompt"] for call in self.calls()], ["one", "two"])
+            self.assertEqual([task_prompt(call["prompt"]) for call in self.calls()], ["one", "two"])
         finally:
             for job_id in reversed(jobs):
                 self.control("cancel", job_id)
@@ -3493,7 +3510,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual({key: result["task_options"][key] for key in ("engine", "model", "effort", "agy_home")},
                          {"engine": "gemini", "model": "gemini-test", "effort": "high", "agy_home": str(home)})
         received = json.loads(call.read_text("utf-8"))
-        self.assertEqual((received["prompt"], received["proxy"]), (prompt, "http://unused.invalid:8080"))
+        self.assertEqual((task_prompt(received["prompt"]), received["proxy"]), (prompt, "http://unused.invalid:8080"))
         self.assertEqual(received["home"], [os.path.realpath(home)] * 2)
         self.assertIn("gemini-test", received["argv"])
         self.assertFalse(set(("codex-a", "codex-b", "exec", "--ephemeral")) & set(received["argv"]))
@@ -3681,12 +3698,12 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((result["status"], result["attempts"], result["conversation_id"]), ("completed", 2, "conv-2"))
         # The second attempt is a new conversation, pinned to nothing, with the original task and a note in front.
         self.assertEqual(calls[1][1:], (None, None))
-        self.assertTrue(calls[1][0].startswith("上一个 agy 账号在任务中途额度用完") and calls[1][0].endswith("原任务"))
+        self.assertTrue(calls[1][0].startswith("上一个 agy 账号在任务中途额度用完") and task_prompt(calls[1][0]).endswith("原任务"))
         self.assertEqual(result["task_options"]["agy_home"], r"D:\pool\b")
         self.assertEqual(len(switches), 1)
         # Nothing was delivered: the original task goes as it was.
         _, calls, _ = self.account_switch_run([("quota", False), ("ok", False)])
-        self.assertEqual(calls[1][0], "原任务")
+        self.assertEqual(task_prompt(calls[1][0]), "原任务")
 
     def test_gemini_account_switch_skips_continuations_and_refused_leases_and_stops_after_three(self):
         result, calls, switches = self.account_switch_run([("quota", True)], "--resume", "conv-0", "--agy-home", r"D:\pool\a")
@@ -3848,10 +3865,14 @@ class RunnerTests(unittest.TestCase):
 
         with mock.patch.object(codex_runner, "HOME", runner_home), \
                 mock.patch.object(agy_runner, "build_command", side_effect=fake_build), \
+                mock.patch.object(agy_runner, "evidence_path", return_value=None) as evidence_path, \
                 mock.patch.object(agy_runner, "cancel", side_effect=confirm):
             result = codex_runner.execute(args, "retry after cleanup", run_dir)
             with codex_runner.acquire_write_lock(str(self.cwd)):
                 self.assertEqual(result["status"], "completed")
+                self.assertIs(result.get("evidence_available"), False)
+                self.assertNotIn("evidence_dir", result)
+        evidence_path.assert_called_once_with((run_dir / "evidence").resolve(), True)
         self.assertEqual(launches, [None, "agy-conversation-1"])
         self.assertEqual(confirmations, [(1, "gemini_running"), (1, "cleanup_wait"), (2, "gemini_running")])
 
@@ -3898,10 +3919,11 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(self.control("cancel", child)["status"], "cancelled")
         self.assertEqual(submit(context), {"job_id": child, "status": "cancelled", "deduplicated": True})
 
+    @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_gemini_fallback_check_requires_complete_snapshots_and_preserves_retry_evidence(self):
         self.assertNotIn("fallback_safe", self.invoke(mode="refused_turn"))
         checked = ("--gemini-fallback-check", "--sandbox", "workspace-write", "--no-diff")
-        (self.cwd / ".git").mkdir()
+        subprocess.run(["git", "init", "-q", str(self.cwd)], check=True, capture_output=True)
         cases = (
             ("refused_turn", (), True),
             ("fallback_event", ("--ignore", ".*"), False),
@@ -3989,7 +4011,13 @@ class RunnerTests(unittest.TestCase):
         for mode, expected in (("refused_turn", True), ("fallback_unreported_file", False)):
             with self.subTest(mode=mode):
                 result = self.invoke(*checked, mode=mode, env=env)
-                self.assertIs(result["fallback_safe"], expected)
+                evidence = Path(result["evidence_dir"])
+                try:
+                    self.assertFalse(evidence.is_relative_to(self.cwd))
+                    self.assertTrue(evidence.is_dir())
+                    self.assertIs(result["fallback_safe"], expected)
+                finally:
+                    shutil.rmtree(evidence)
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "uses the native Linux fake agy")
     def test_gemini_error_classification_from_stderr_and_events(self):
@@ -5261,7 +5289,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertIn("review_status", result)
                 self.assertNotIn("review_summary", result)
                 call = self.calls()[-1]
-                self.assertEqual(call["prompt"], "only this prompt reaches Codex")
+                self.assertEqual(task_prompt(call["prompt"]), "only this prompt reaches Codex")
                 self.assertNotIn(context["task"], call["argv"])
                 self.assertEqual(result["sandbox"], "danger-full-access")
 
@@ -5900,7 +5928,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["attempts"], 2)
         self.assertEqual(len(waits), 1)
-        self.assertEqual(self.calls()[-1]["prompt"], "a new resume task")
+        self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "a new resume task")
         events = [json.loads(s) for s in (jd / "events.jsonl").read_text().splitlines()]
         phases = [e for e in events if e["type"] == "runner.phase"]
         self.assertEqual([e["phase"] for e in phases], ["router_check", "retry_wait", "router_check", "codex_running", "finalizing"])
@@ -6493,7 +6521,7 @@ class RunnerTests(unittest.TestCase):
         done = self.control("status", job["job_id"], "--wait", "30")
         self.assertEqual(done["status"], "completed", done)
         self.assertEqual(done["structured"], report)
-        self.assertEqual(self.calls()[-1]["prompt"], "do \ufffd it")
+        self.assertEqual(task_prompt(self.calls()[-1]["prompt"]), "do \ufffd it")
 
     def test_worker_saves_a_result_when_finalization_fails(self):
         sys.path.insert(0, str(RUNNER.parent))
@@ -6790,6 +6818,83 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(list(online.iterdir()), [])
 
+    def test_evidence_stays_outside_git_top_when_cwd_is_a_subdirectory(self):
+        root, project, git = self.git_repo("evidence-top")
+        result = self.invoke("--cwd", str(project), "--sandbox", "workspace-write", "--no-diff",
+                             mode="execution_evidence_write", env={"CODEX_RUNNER_HOME": str(root / ".runner")})
+        evidence = Path(result["evidence_dir"])
+        try:
+            self.assertEqual(result["status"], "completed", result)
+            self.assertFalse(evidence.is_relative_to(root))
+            git("add", "-A")
+            self.assertNotIn("observation.txt", git("ls-files"))
+        finally:
+            if not evidence.is_relative_to(root):
+                shutil.rmtree(evidence)
+
+    @unittest.skipIf(os.name == "nt", "native Windows rejects --use-user-config")
+    def test_evidence_appends_without_overriding_implicit_user_writable_roots(self):
+        home = Path(self.tmp.name) / "user-config"
+        home.mkdir()
+        config = home / "config.toml"
+        config.write_text('sandbox_workspace_write.writable_roots = ["/tmp/existing-root"]\n', "utf-8")
+        for resume in ([], ["--resume", "writer-9"]):
+            result = self.invoke("--sandbox", "workspace-write", "--use-user-config", *resume,
+                                 env={"CODEX_HOME": str(home)})
+            self.assertEqual(result["status"], "completed", result)
+            argv = self.calls()[-1]["argv"]
+            self.assertFalse(any(x.startswith("sandbox_workspace_write.writable_roots=") for x in argv))
+            self.assertIn("--add-dir", argv)
+            self.assertEqual(argv[argv.index("--add-dir") + 1], result["evidence_dir"])
+            if resume:
+                self.assertLess(argv.index("--add-dir"), argv.index("resume"))
+            self.assertEqual(config.read_text("utf-8"), 'sandbox_workspace_write.writable_roots = ["/tmp/existing-root"]\n')
+
+    def test_read_only_evidence_cwd_keeps_relative_schema_resolvable(self):
+        schema = self.cwd / "result.schema.json"
+        shutil.copyfile(RUNNER.parents[1] / "report.v2.schema.json", schema)
+        report = self.cwd / "report.json"
+        report.write_text(json.dumps(self.sample_report()), "utf-8")
+        result = self.invoke("--schema", schema.name, mode="relative_schema", env={"FAKE_REPORT": str(report)})
+        self.assertEqual(result["status"], "completed", result)
+        argv = self.calls()[-1]["argv"]
+        self.assertEqual(Path(argv[argv.index("--output-schema") + 1]).resolve(), schema.resolve())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "uses the Linux fake agy")
+    def test_non_host_gemini_reports_evidence_unavailable(self):
+        argv, env, call = self.fake_gemini()
+        result = self.invoke(*argv, env=env, prompt="Evidence: {{CONDUCTOR_EVIDENCE_DIR}}")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertIs(result["evidence_available"], False)
+        self.assertNotIn("evidence_dir", result)
+        prompt = json.loads(call.read_text("utf-8"))["prompt"]
+        self.assertIn("没有证据目录", prompt)
+        self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", prompt)
+
+    def test_non_git_evidence_does_not_require_a_git_executable(self):
+        result = self.invoke("--no-diff", mode="execution_evidence_write", env={"PATH": ""})
+        self.assertEqual(result["status"], "completed", result)
+        evidence = Path(result["evidence_dir"])
+        self.assertFalse(evidence.is_relative_to(self.cwd))
+        self.assertEqual((evidence / "observation.txt").read_text("utf-8"), "observation\n")
+
+    def test_evidence_requires_a_proven_repository_boundary(self):
+        import codex_runner
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        root, project, _ = self.git_repo("evidence-boundary-failure")
+        errors = [ValueError("fatal: not a git repository: broken gitdir"),
+                  ValueError("permission denied"), subprocess.TimeoutExpired("git", 10)]
+        for error in errors:
+            with self.subTest(error=str(error)), mock.patch.object(codex_runner, "git", side_effect=error), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(codex_runner, "build_command", side_effect=AssertionError("must fail before execution")):
+                args = parser.parse_args(["--cwd", str(project)])
+                result = codex_runner.execute(args, "observe", root / ".runner" / "job")
+                self.assertEqual(result["error_kind"], "evidence_directory_unknown")
+        self.assertFalse((root / ".runner" / "job" / "evidence").exists())
+        self.assertEqual(self.calls(), [])
+
     def git_repo(self, name, commit=True):
         """A repository whose sub/ is the task directory; the fake's repo_edit changes three files there."""
         root = Path(self.tmp.name).resolve() / name
@@ -6807,6 +6912,200 @@ class RunnerTests(unittest.TestCase):
             git("add", "-A")
             git("commit", "-q", "-m", "base")
         return root, sub, git
+
+    def test_execution_evidence_is_external_and_replaces_prompt_placeholder(self):
+        for sandbox in ("read-only", "workspace-write", "danger-full-access"):
+            with self.subTest(sandbox=sandbox):
+                result = self.invoke("--sandbox", sandbox, prompt="Evidence: {{CONDUCTOR_EVIDENCE_DIR}}")
+                evidence = Path(result["evidence_dir"])
+                # Windows may expand an 8.3 name in the runner's canonical paths.
+                self.assertEqual(evidence.resolve(), (Path(result["log_dir"]) / "evidence").resolve())
+                self.assertTrue(evidence.is_dir())
+                self.assertFalse(evidence.resolve().is_relative_to(self.cwd.resolve()))
+                received = self.calls()[-1]
+                self.assertIn(str(evidence), received["prompt"])
+                self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", received["prompt"])
+                self.assertEqual((Path(result["log_dir"]) / "prompt.txt").read_text("utf-8"), received["prompt"])
+                if sandbox == "read-only":
+                    self.assertIn('sandbox_mode="workspace-write"', received["argv"])
+                    self.assertIn("sandbox_workspace_write.writable_roots=[]", received["argv"])
+                    self.assertEqual(Path(json.loads(received["prompt"].splitlines()[0].split(": ", 1)[1])).resolve(), self.cwd.resolve())
+                elif sandbox == "workspace-write":
+                    self.assertEqual(received["argv"][received["argv"].index("--add-dir") + 1], str(evidence))
+
+    def test_evidence_writes_do_not_count_as_project_changes_or_scope_violations(self):
+        for sandbox in ("read-only", "workspace-write", "danger-full-access"):
+            with self.subTest(sandbox=sandbox):
+                result = self.invoke("--sandbox", sandbox, "--scope", "a.txt", mode="execution_evidence_write")
+                self.assertEqual(result["status"], "completed", result)
+                self.assertEqual((Path(result["evidence_dir"]) / "observation.txt").read_text("utf-8"), "observation\n")
+                self.assertEqual(result.get("files_changed", []), [])
+                self.assertEqual(result.get("out_of_scope", []), [])
+                self.assertEqual(list(self.cwd.iterdir()), [])
+
+    def execute_evidence_event(self, name, event, *, resolve_error=False):
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--sandbox", "workspace-write", "--no-diff",
+                                  "--scope", "allowed.txt", "--repeat-guard", "off"])
+        run_dir = Path(self.tmp.name) / "events" / name
+
+        def attempt(*unused):
+            path = event(Path(args.evidence_dir))
+            return {"completed": True, "failed": False, "thread_id": "thread-1", "file_changes": [(path, "add")],
+                    "last_text": "done", "usage": {}, "commands": [], "forced_exit": False}
+
+        realpath = os.path.realpath
+        def resolve(path, *a, **kw):
+            if resolve_error and kw.get("strict") and os.fspath(path).endswith("observation.txt"):
+                raise PermissionError("event path cannot be resolved")
+            return realpath(path, *a, **kw)
+
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(codex_runner, "router_reachable", return_value=True), \
+                mock.patch.object(codex_runner, "snapshot_before", return_value=(None, None)), \
+                mock.patch.object(codex_runner, "run_attempt", side_effect=attempt), \
+                mock.patch.object(codex_runner.os.path, "realpath", side_effect=resolve):
+            result = codex_runner.execute(args, "Check the task", run_dir)
+            codex_runner.write_result(run_dir, result)
+        saved = json.loads((run_dir / "result.json").read_text("utf-8"))
+        saved["out_of_scope"] = codex_runner.out_of_scope_paths(saved)
+        return saved
+
+    def test_evidence_event_parent_traversal_remains_a_scope_violation(self):
+        for index, suffix in enumerate(("/../victim.txt", "/./../victim.txt", "\\..\\victim.txt")):
+            with self.subTest(suffix=suffix):
+                def event(evidence):
+                    (evidence.parent / "victim.txt").write_text("outside evidence")
+                    return str(evidence) + suffix
+                result = self.execute_evidence_event(f"escape-{index}", event)
+                self.assertEqual(result["files_changed_total"], 1, result)
+                self.assertTrue(result["out_of_scope"], result)
+
+    def test_evidence_event_normalization_failure_keeps_the_change(self):
+        def event(evidence):
+            target = evidence / "observation.txt"
+            target.write_text("observation")
+            return str(target)
+        result = self.execute_evidence_event("resolve-error", event, resolve_error=True)
+        self.assertEqual(result["files_changed_total"], 1, result)
+        self.assertTrue(result["out_of_scope"], result)
+
+    def test_evidence_event_resolves_directory_links_before_filtering(self):
+        outside = Path(self.tmp.name) / "outside"
+        outside.mkdir()
+        (outside / "victim.txt").write_text("outside evidence")
+        def event(evidence):
+            link = evidence / "redirect"
+            if os.name == "nt":
+                subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(link), str(outside)],
+                               check=True, capture_output=True)
+            else:
+                link.symlink_to(outside, target_is_directory=True)
+            return str(link / "victim.txt")
+        result = self.execute_evidence_event("link", event)
+        self.assertEqual(result["files_changed_total"], 1, result)
+        self.assertTrue(result["out_of_scope"], result)
+
+    def test_evidence_event_equivalent_paths_are_filtered(self):
+        for spelling in ("dots", "backslashes", *(["case"] if os.name == "nt" else [])):
+            with self.subTest(spelling=spelling):
+                def event(evidence):
+                    (evidence / "nested").mkdir()
+                    (evidence / "observation.txt").write_text("observation")
+                    path = str(evidence) + "/nested/.././observation.txt"
+                    if spelling == "case":
+                        path = path.upper()
+                    elif spelling == "backslashes":
+                        path = path.replace("/", "\\")
+                    return path
+                result = self.execute_evidence_event(spelling, event)
+                self.assertEqual(result["files_changed_total"], 0, result)
+
+    @unittest.skipIf(os.name == "nt", "WSL maps its Windows evidence alias back to the native path")
+    def test_evidence_windows_alias_uses_the_canonical_native_path(self):
+        import codex_runner
+
+        evidence = Path(self.tmp.name) / "evidence"
+        evidence.mkdir()
+        (evidence / "nested").mkdir()
+        (evidence / "observation.txt").write_text("observation")
+        (evidence.parent / "victim.txt").write_text("outside evidence")
+        share = r"\\wsl.localhost\Ubuntu"
+        alias = share + str(evidence).replace("/", "\\")
+        self.assertTrue(codex_runner.evidence_event_path(str(self.cwd), share.upper() + str(evidence).replace("/", "\\") + r"\nested\..\observation.txt", str(evidence), alias))
+        self.assertFalse(codex_runner.evidence_event_path(str(self.cwd), alias + r"\..\victim.txt", str(evidence), alias))
+        different_case = evidence.with_name("EVIDENCE")
+        different_case.mkdir()
+        (different_case / "observation.txt").write_text("outside evidence")
+        self.assertFalse(codex_runner.evidence_event_path(str(self.cwd), share + str(different_case).replace("/", "\\") + r"\observation.txt", str(evidence), alias))
+        external = Path(self.tmp.name) / "external"
+        (external / "child").mkdir(parents=True)
+        (external / "victim.txt").write_text("outside evidence")
+        (evidence / "victim.txt").write_text("different file inside evidence")
+        (evidence / "redirect").symlink_to(external / "child", target_is_directory=True)
+        self.assertFalse(codex_runner.evidence_event_path(str(self.cwd), alias + r"\redirect\..\victim.txt", str(evidence), alias))
+
+    def test_gemini_read_only_execution_has_no_external_evidence_directory(self):
+        import codex_runner
+
+        for sandbox in ("read-only", "danger-full-access"):
+            with self.subTest(sandbox=sandbox):
+                parser = codex_runner.Parser()
+                codex_runner.add_task_arguments(parser)
+                args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--sandbox", sandbox])
+                args.context = {"write": False}
+                verdict = {"completed": True, "failed": False, "thread_id": "conversation-1", "file_changes": [],
+                           "last_text": "done", "usage": {}, "commands": [], "forced_exit": False}
+                with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                        mock.patch.object(codex_runner, "run_attempt", return_value=verdict) as attempt:
+                    result = codex_runner.execute(args, "Evidence: {{CONDUCTOR_EVIDENCE_DIR}}", Path(self.tmp.name) / sandbox)
+                self.assertEqual(result["status"], "completed", result)
+                self.assertIs(result.get("evidence_available"), False)
+                self.assertNotIn("evidence_dir", result)
+                self.assertIsNone(args.evidence_dir)
+                self.assertNotIn("External evidence directory", attempt.call_args.args[1])
+
+    def test_gemini_writer_continues_without_evidence_when_conversion_is_unavailable(self):
+        import agy_runner
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd), "--engine", "gemini", "--agy-command", r"C:\test\agy.exe",
+                                  "--sandbox", "danger-full-access", "--no-diff", "--repeat-guard", "off"])
+        args.context = {"write": True}
+        run_dir = Path(self.tmp.name) / "unavailable-evidence"
+        verdict = {"completed": True, "failed": False, "thread_id": "conversation-1", "file_changes": [],
+                   "last_text": "done", "usage": {}, "commands": [], "forced_exit": False}
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(agy_runner, "evidence_path", return_value=None), \
+                mock.patch.object(codex_runner, "run_attempt", return_value=verdict) as attempt:
+            result = codex_runner.execute(args, "Evidence: {{CONDUCTOR_EVIDENCE_DIR}}", run_dir)
+        self.assertEqual(result["status"], "completed", result)
+        self.assertIs(result.get("evidence_available"), False)
+        self.assertNotIn("evidence_dir", result)
+        self.assertNotIn("evidence_dir_windows", result)
+        self.assertIsNone(args.evidence_dir)
+        self.assertFalse((run_dir / "evidence").exists())
+        self.assertEqual(Path(args.cwd).resolve(), self.cwd.resolve())
+        self.assertEqual(args.sandbox, "danger-full-access")
+        self.assertNotIn("External evidence directory", attempt.call_args.args[1])
+        self.assertNotIn("{{CONDUCTOR_EVIDENCE_DIR}}", attempt.call_args.args[1])
+
+    def test_evidence_directory_cannot_overlap_project(self):
+        import codex_runner
+
+        parser = codex_runner.Parser()
+        codex_runner.add_task_arguments(parser)
+        args = parser.parse_args(["--cwd", str(self.cwd)])
+        with mock.patch.object(codex_runner.tempfile, "gettempdir", return_value=str(self.cwd)):
+            result = codex_runner.execute(args, "survey", self.cwd / "job")
+        self.assertEqual(result["error_kind"], "evidence_directory_overlap")
+        self.assertFalse((self.cwd / "job" / "evidence").exists())
+        self.assertEqual(self.calls(), [])
 
     def test_verification_runs_temp_file_suite_with_project_outside_write_roots(self):
         (self.cwd / "temp_check.py").write_text(textwrap.dedent("""
@@ -7124,7 +7423,8 @@ class RunnerTests(unittest.TestCase):
     def execute_host_verification(self, project, run_dir, edit=None):
         import codex_runner
 
-        args = SimpleNamespace(cwd=str(project), sandbox="danger-full-access", resume=None, schema=True,
+        args = SimpleNamespace(cwd=str(project), sandbox="danger-full-access", resume=None,
+                               schema=str(RUNNER.parents[1] / "report.v2.schema.json"),
                                repeat_guard="off", context={"write": False, "verification_of": "SOURCE"})
 
         def attempt(*args):
