@@ -1042,7 +1042,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
     return failureReceipt(value, cause) +
       '先用大白话说明哪一步没做成和实际影响，必要时附原始错误。核对已完成项后再决定下一步，不要原样重派。' +
       (value.error_kind === 'timeout'
-        ? '先核对已有产物，把剩余工作拆成可独立验收的小批次，写明每批的数量或时间预算；长命令自带超时并预留收尾时间。报告有效且满足续接条件时用 codex_continue；报告缺失时，核实已有产物后只为当前这一小批新建任务。'
+        ? '先核对已有产物，把剩余工作拆成可独立验收的小批次，在任务正文里写明每批的数量或时间预算；长命令自带超时并预留收尾时间。报告有效且满足续接条件时用 codex_continue；报告缺失时，核实已有产物后只为当前这一小批新建任务。'
         : '');
   }
   const alerts = [
@@ -3512,6 +3512,33 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   ctx.tools.register(runTool);
 
+  async function verificationWriters(source, signal) {
+    const monitored = [source.cwd, ...(source.scope_paths ?? source.scope ?? []),
+      ...[...source.files_changed ?? [], ...source.write_paths ?? []].map(file => typeof file === 'string' ? file : file?.path)]
+      .filter(p => typeof p === 'string' && p.trim()).map(p => taskScopePath(source.cwd, p));
+    const writers = new Set();
+    try {
+      for (let offset = 0; offset !== null;) {
+        const page = await conductor.list({ status: 'running', limit: 100, offset }, signal);
+        signal?.throwIfAborted();
+        if (page.error || page.error_kind || !Array.isArray(page.jobs)) throw new Error(page.error ?? page.error_kind ?? '任务列表不可用');
+        for (const job of page.jobs) {
+          if ((job.execution_status ?? job.status) !== 'running' || job.context?.write === false || job.sandbox === 'read-only' ||
+              !(job.context?.write === true || ['workspace-write', 'danger-full-access'].includes(job.sandbox)) || !job.cwd) continue;
+          const paths = [job.cwd, ...(job.scope_paths ?? job.scope ?? []), ...(job.task_options?.writable_roots ?? job.writable_roots ?? [])]
+            .map(p => taskScopePath(job.cwd, p));
+          if (paths.some(p => monitored.some(root => within(p, root) || within(root, p)))) writers.add(job.job_id);
+        }
+        offset = page.next_offset ?? null;
+      }
+    } catch (error) {
+      signal?.throwIfAborted();
+      ctx.logger?.warn?.(`[codex-conductor] 核验前写任务查询失败，已放行：${error?.message ?? error}`);
+      return [];
+    }
+    return [...writers];
+  }
+
   async function* verificationJobs(owner, automatic, signal, target) {
     const filters = target && cfg.verificationReuse
       ? { owner, also_owners: aliases.predecessors(owner), verification_of: target }
@@ -3684,6 +3711,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         if (existing) {
           receipt.resolve({ value: existing, existing: true });
           return reuseVerification(id, existing);
+        }
+        const writers = await verificationWriters(source, exec?.signal);
+        if (writers.length) {
+          const next = `写任务 ${writers.join('、')} 的路径与核验目录或监控路径重叠，未启动核验。等它们结束后再调用 codex_verify ${id}。`;
+          const value = { status: 'blocked', error_kind: 'verification_writes_running', blocking_jobs: writers, error: next, next };
+          receipt.resolve({ value });
+          return value;
         }
         return await dispatchVerification(source, args, exec, started => {
           receipt.resolve({ value: started });
