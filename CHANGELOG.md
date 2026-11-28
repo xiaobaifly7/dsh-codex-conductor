@@ -2,7 +2,7 @@
 
 [English](#english)
 
-`0.9.215` 执行、续接和核验提示要求等待 30–60 秒、回查输出 `yield_time_ms` 至少 30000。缺证据且原单、产物未变时返回旧核验；未声明范围或产物路径时监控 cwd，已有 Git 版本变化或子孙续接及关联线程出现后续执行时重核，变化查询失败或不完整时放行，调用方取消仍中止。`new_evidence` 补证据、`force: true` 强制重核。核验身份沿续接保留，Codex 核验及续接统一应用 `verifyServiceTier`，未配置、留空或纯空白显式使用 `default`。凭据修改动作支持中文正反语序及跨行，不误匹配设备等普通名词，裸凭据名词与 token 脱敏检查仍放行；四套线上档位及自定义风险正则待部署时同步更新，本次未改配置。
+`0.9.215` 执行、续接和核验提示要求等待 30–60 秒、回查输出 `yield_time_ms` 至少 30000。缺证据且原单、产物未变时返回旧核验；未声明范围或产物路径时监控 cwd，已有 Git 版本变化或子孙续接及关联线程出现后续执行时重核，变化查询失败或不完整时放行，调用方取消仍中止。`new_evidence` 补证据、`force: true` 强制重核。核验身份沿续接保留，Codex 核验及续接统一应用 `verifyServiceTier`，未配置、留空或纯空白显式使用 `default`。凭据动作补齐更新、设定、生成、新建、创建、轮换及英文 update/generate/create/passphrase，支持中英文正反语序、逗号及跨行；动作间距上限 40 字，单字动作在凭据前上限 12 字，以句末标点及分号截断；设备、设置页、字段计数和 token 脱敏检查仍放行，同句逗号内无关动作与凭据可能保守暂缓；四套线上档位及自定义风险正则待部署时同步更新，本次未改配置。
 
 `0.9.214` 独立核验派发前如有路径重叠的运行中写任务则等待并列出任务号；只读任务、路径不重叠或查询失败均放行。核验运行中新增写入仍按原有核验逻辑处理；超时提示明确要求将数量或时间预算写在任务正文中。
 
@@ -326,7 +326,7 @@
 
 ## English
 
-`0.9.215` Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms >= 30000`. Insufficient-evidence checks reuse unchanged results; unscoped tasks monitor cwd, changed known Git versions and descendant rounds or associated threads permit rechecking. Failed or incomplete change queries permit verification, while caller cancellation aborts. `new_evidence` and `force: true` allow rechecking. Verification identity survives continuation; all Codex verification rounds use `verifyServiceTier`, explicitly defaulting to `default` for absent, empty or whitespace-only values. Credential-changing actions support reversed Chinese word order and multiline instructions without treating device nouns or token-redaction checks as risky. Four live tier and custom risk-pattern overrides require deployment updates; runtime configuration remains unchanged.
+`0.9.215` Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms >= 30000`. Insufficient-evidence checks reuse unchanged results; unscoped tasks monitor cwd, changed known Git versions and descendant rounds or associated threads permit rechecking. Failed or incomplete change queries permit verification, while caller cancellation aborts. `new_evidence` and `force: true` allow rechecking. Verification identity survives continuation; all Codex verification rounds use `verifyServiceTier`, explicitly defaulting to `default` for absent, empty or whitespace-only values. Credential actions cover updates, generation, creation, rotation and passphrases in either Chinese or English word order, across commas and newlines with bounded gaps (40 characters, 12 after single Chinese verbs) and sentence punctuation or semicolon boundaries. Device nouns, settings-page inspections, password-field counts and token-redaction checks remain allowed; unrelated actions and credentials within one comma-separated sentence may conservatively defer. Four live tier and custom risk-pattern overrides require deployment updates; runtime configuration remains unchanged.
 
 `0.9.214` Before dispatch, independent verification waits for running write jobs with overlapping paths and lists their job IDs; read-only jobs, non-overlapping paths and query failures do not block it. Writes started during verification retain existing verification handling. Timeout guidance explicitly requires quantity or time budgets in the task body.
 

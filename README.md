@@ -78,7 +78,7 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 ### 0.9.115 自动代答宿主提问
 
-默认高风险正则包括修改凭据的动作（如“设 Samba 测试口令”“把口令改成指定值”、`rotate password`），支持同一分句内跨行，不跨逗号、句号等分句边界。单独的密码、口令、凭据、密钥或 token，以及“设备使用哪种密码算法”仍不触发。已有 `autoAnswer.riskyPattern` 会覆盖默认值，部署时须同步补上动作匹配；`whenRisky: defer` 沿用“这一步先不做，记为待确认”的处理。
+默认高风险正则包括修改、更新、设定、生成、新建、创建、轮换凭据的动作，支持中英文正反语序（如“改一下密码”“把密码改一下”“设一个口令”、`password reset`、`rotate the passphrase`）。动作与凭据之间最多 40 字；单字“改、设”在凭据前最多允许 12 字修饰，兼容 Samba 连接名。允许跨逗号和换行，以句号、问号、感叹号、分号截断。单独凭据名词、token 脱敏、设备密码算法、设置页提示和密码字段计数不触发。逗号同句内的无关动作与凭据可能保守地触发暂缓，例如“设置界面主题，检查口令说明”。已有 `autoAnswer.riskyPattern` 会覆盖默认值，部署时须同步补上动作匹配；`whenRisky: defer` 沿用“这一步先不做，记为待确认”的处理。
 
 宿主的 `ask_user_question` 等满 10 分钟后，conductor 会逐题选择有推荐标记的选项，找不到标记时选首项。多选题会选中所有带推荐标记的项，自由文本题使用配置的说明。答案会附上代答说明。热重载保留原提出时间，宿主恢复的待答提问也按原时间计时，已超时的再给用户 30 秒。
 
@@ -86,7 +86,7 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 本机记录在 `%LOCALAPPDATA%\dsh-codex-conductor\auto-answer-history.jsonl`，保留最近 300 行，仅保存提问和所选标签的短摘要与判断依据。已恢复提问的人工接管标记保存在同目录的 `auto-answer-manual.json`。
 
-默认高风险正则（不区分大小写）为 `删除|清空|不可恢复|不可逆|覆盖|格式化|卸载|重置|drop |truncate|rm -rf|force.?push|付款|支付|购买|转账|充值|密码|密钥|口令|凭据|token|secret|发布到|上线到生产|生产环境|对外发送|发邮件|真实目标|授权范围`。
+默认高风险正则不区分大小写，保留删除、支付、发布等既有风险分支，并加入上述凭据动作；完整表达式见 [autoanswer.mjs](autoanswer.mjs) 的 `AUTO_ANSWER_DEFAULTS.riskyPattern` 和 `CREDENTIAL_ACTION_PATTERN`。
 
 ### 0.9.114：自标未满足的验收项结案要有独立依据
 
@@ -695,7 +695,7 @@ python3 runner/test_codex_runner.py
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-The candidate version is `0.9.215`. Credential-changing actions before or after Chinese credential nouns, including multiline instructions within one clause, are risky by default; ordinary device/password-algorithm questions remain allowed; bare credential nouns and token-redaction checks are not. Existing custom `autoAnswer.riskyPattern` overrides require the same action patterns; `whenRisky: defer` retains its skip-and-confirm behavior. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The candidate version is `0.9.215`. Credential-changing actions in either Chinese or English word order cover updates, generation, creation and rotation, including passphrases. The gap is bounded to 40 characters (12 after single Chinese verbs), allowing commas and newlines while stopping at sentence punctuation or semicolons. Bare nouns, token-redaction checks, device/password-algorithm questions, settings-page inspections and password-field counts remain allowed. Unrelated actions and credentials within one comma-separated sentence may conservatively defer. Existing custom `autoAnswer.riskyPattern` overrides require the same action patterns; `whenRisky: defer` retains its skip-and-confirm behavior. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 

@@ -9,11 +9,21 @@ const HISTORY_LIMIT = 300;
 const RECOMMENDED = /recommended|推荐/i;
 // 用户不在时代答高风险提问：优先选这类「先不做」的选项。
 const DEFERRING = /跳过|暂不|先不|稍后|以后再|不执行|不要|保留|保持现状|取消|skip|later|defer|cancel|keep/i;
-const PRIVATE = /密码|密钥|口令|凭据|token|secret|passw[o]rd|credentials?|bearer|api[ _-]?key|PRIVATE KEY-----|\b(?:sk-|gh[pousr]_)[\w-]{12,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+/i;
+const PRIVATE = /密码|密钥|口令|凭据|token|secret|passw[o]rd|passphrases?|credentials?|bearer|api[ _-]?key|PRIVATE KEY-----|\b(?:sk-|gh[pousr]_)[\w-]{12,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+/i;
 const PENDING = Symbol.for('dsh-codex-conductor.auto-answer.pending');
 
-// 跨行允许参数说明，但不把其他句子或分句中的凭据名词当成修改对象。
-export const CREDENTIAL_ACTION_PATTERN = String.raw`(?:修改|设置|重置|更换|(?:改|设)(?=\s|[a-z0-9]|(?:新)?(?:密码|口令|凭据|凭证|密钥)))[^。！？!?；;，,.]*(?:密码|口令|凭据|凭证|密钥)|(?:密码|口令|凭据|凭证|密钥)\s*(?:修改|设置|重置|更换|改成|改为|换成|换为)|\b(?:change|set|reset|rotate)\b[^。！？!?；;，,.]*\b(?:passwords?|credentials?|secrets?)\b`;
+// 允许逗号和换行，限定动作与凭据间距；“设置页”和“设备”等名词不算动作。
+const CREDENTIAL_NOUN = '(?:密码|口令|凭据|凭证|密钥)';
+const CREDENTIAL_CHANGE = '(?:修改|设置(?!页)|重置|更换|更新|设定|生成|新建|创建|轮换)';
+const SHORT_CREDENTIAL_CHANGE = '(?:改|设(?![备计施置定]))';
+const CREDENTIAL_GAP = String.raw`[^。！？!?；;.]{0,40}`;
+const ENGLISH_CREDENTIAL = String.raw`\b(?:passwords?|passphrases?|credentials?|secrets?)\b`;
+const ENGLISH_CREDENTIAL_CHANGE = String.raw`\b(?:change|set|reset|rotate|update|generate|create)\b`;
+export const CREDENTIAL_ACTION_PATTERN = `${CREDENTIAL_CHANGE}${CREDENTIAL_GAP}${CREDENTIAL_NOUN}|` +
+  `${SHORT_CREDENTIAL_CHANGE}[^。！？!?；;.]{0,12}${CREDENTIAL_NOUN}|` +
+  `${CREDENTIAL_NOUN}${CREDENTIAL_GAP}(?:${CREDENTIAL_CHANGE}|${SHORT_CREDENTIAL_CHANGE}|换成|换为)|` +
+  `${ENGLISH_CREDENTIAL_CHANGE}${CREDENTIAL_GAP}${ENGLISH_CREDENTIAL}|` +
+  `${ENGLISH_CREDENTIAL}${CREDENTIAL_GAP}${ENGLISH_CREDENTIAL_CHANGE}`;
 
 export const AUTO_ANSWER_DEFAULTS = {
   enabled: true,

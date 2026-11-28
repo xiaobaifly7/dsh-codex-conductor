@@ -21,7 +21,7 @@ const question = (options = [choice('方案 A'), choice('方案 B')], fields = {
 });
 const humanAnswer = { answers: [{ id: 'choice', selected: ['方案 B'] }] };
 const flush = () => new Promise(setImmediate);
-const credentialActionYaml = String.raw`'|(?:修改|设置|重置|更换|(?:改|设)(?=\s|[a-z0-9]|(?:新)?(?:密码|口令|凭据|凭证|密钥)))[^。！？!?；;，,.]*(?:密码|口令|凭据|凭证|密钥)|(?:密码|口令|凭据|凭证|密钥)\s*(?:修改|设置|重置|更换|改成|改为|换成|换为)|\b(?:change|set|reset|rotate)\b[^。！？!?；;，,.]*\b(?:passwords?|credentials?|secrets?)\b'`;
+const credentialActionYaml = String.raw`'|(?:修改|设置(?!页)|重置|更换|更新|设定|生成|新建|创建|轮换)[^。！？!?；;.]{0,40}(?:密码|口令|凭据|凭证|密钥)|(?:改|设(?![备计施置定]))[^。！？!?；;.]{0,12}(?:密码|口令|凭据|凭证|密钥)|(?:密码|口令|凭据|凭证|密钥)[^。！？!?；;.]{0,40}(?:(?:修改|设置(?!页)|重置|更换|更新|设定|生成|新建|创建|轮换)|(?:改|设(?![备计施置定]))|换成|换为)|\b(?:change|set|reset|rotate|update|generate|create)\b[^。！？!?；;.]{0,40}\b(?:passwords?|passphrases?|credentials?|secrets?)\b|\b(?:passwords?|passphrases?|credentials?|secrets?)\b[^。！？!?；;.]{0,40}\b(?:change|set|reset|rotate|update|generate|create)\b'`;
 
 function host(t, options = {}) {
   const { directory = fixtureDirectory(t), settings = {}, serviceAvailable = true, allowSubagents = false, allowed } = options;
@@ -239,6 +239,36 @@ test('review credential actions defer instead of immediately executing the recom
     ['reset-after-noun', '密码重置为指定值', true],
     ['replace-key', '密钥换成新值', true],
     ['new-key', '设置新密钥', true],
+    ['update-password', '更新密码', true],
+    ['update-credential', '更新一下凭据', true],
+    ['change-modifier-before', '改一下密码', true],
+    ['change-modifier-after', '把密码改一下', true],
+    ['set-one-passphrase', '设一个口令', true],
+    ['set-defined-key', '设定新密钥', true],
+    ['generate-key-configuration', '生成新密钥并写入配置', true],
+    ['new-key-action', '新建 SSH 密钥', true],
+    ['create-key-action', '创建新的 SSH 密钥', true],
+    ['rotate-ssh-key', '轮换 SSH 密钥', true],
+    ['comma-samba', '设置 Samba 共享，口令由你生成', true],
+    ['ascii-comma-samba', '设置 Samba 共享,口令由你生成', true],
+    ['comma-forward-samba', '设置 Samba 共享，口令使用指定值', true],
+    ['english-update', 'update the password', true],
+    ['english-noun-first-reset', 'password reset', true],
+    ['english-passphrase', 'rotate the passphrase', true],
+    ['english-generate', 'generate a new passphrase', true],
+    ['english-create', 'create a new credential', true],
+    ['english-noun-first-update', 'password update', true],
+    ['settings-page-inspection', '看看设置页里有没有密码强度提示', false],
+    ['credential-field-count', '统计日志里出现密码字段的次数', false],
+    ['long-action-40', '更新' + '甲'.repeat(40) + '密码', true],
+    ['long-action-41', '更新' + '甲'.repeat(41) + '密码', false],
+    ['reverse-action-40', '凭据' + '甲'.repeat(40) + '更新', true],
+    ['reverse-action-41', '凭据' + '甲'.repeat(41) + '更新', false],
+    ['short-action-12', '设' + '甲'.repeat(12) + '口令', true],
+    ['short-action-13', '设' + '甲'.repeat(13) + '口令', false],
+    ['english-action-40', 'update' + ' '.repeat(40) + 'password', true],
+    ['english-action-41', 'update' + ' '.repeat(41) + 'password', false],
+
     ['multiline', '请设置 Samba 连接参数：\n口令由你生成，可以现在执行吗？', true],
     ['multiline-reverse', '把口令\n改成指定值', true],
     ['english-change', 'change password', true],
@@ -253,10 +283,13 @@ test('review credential actions defer instead of immediately executing the recom
     ['design-noun', '这个设计使用哪种密钥算法？', false],
     ['facility-noun', '设施采用哪种凭证格式？', false],
     ['unrelated-sentence', '设置界面主题。检查口令说明', false],
-    ['unrelated-clause', '设置界面主题，检查口令说明', false],
+    ['comma-conservative-chinese', '设置界面主题，检查口令说明', true],
     ['english-unrelated-sentence', 'set the theme.\nInspect the password format', false],
-    ['english-unrelated-clause', 'set the theme, then inspect the secret format', false],
+    ['comma-conservative-english', 'set the theme, then inspect the secret format', true],
   ];
+  for (const boundary of ['。', '.', '？', '?', '！', '!', '；', ';']) {
+    cases.push([`sentence-boundary-${boundary}`, `更新连接参数${boundary}口令检查`, false]);
+  }
   for (const [mode, settings] of [
     ['default', { whenRisky: 'defer' }],
     ['deployment-addon', { whenRisky: 'defer', riskyPattern: addon.slice(1) }],
@@ -273,8 +306,9 @@ test('review credential actions defer instead of immediately executing the recom
         if (risky) assert.match(answer.custom, /不执行这一步/);
         await flush();
         assert.equal(panel.snapshot().recent[0].reason, risky ? 'deferred_risky' : 'marked_recommended', text);
-        assert.equal(JSON.parse(readFileSync(h.file, 'utf8')).reason,
-          risky ? 'deferred_risky' : 'marked_recommended', text);
+        const history = JSON.parse(readFileSync(h.file, 'utf8'));
+        assert.equal(history.reason, risky ? 'deferred_risky' : 'marked_recommended', text);
+        if (/passphrase/.test(text)) assert.equal(history.question, '[敏感内容已隐藏]');
       });
     }
   }
