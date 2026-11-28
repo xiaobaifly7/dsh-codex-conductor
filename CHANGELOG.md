@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.215` 执行、续接和核验提示要求等待 30–60 秒、回查输出 `yield_time_ms` 至少 30000。缺证据且原单、产物未变时返回旧核验；未声明范围或产物路径时监控 cwd，已有 Git 版本变化或子孙续接及关联线程出现后续执行时重核，变化查询失败或不完整时放行，调用方取消仍中止。`new_evidence` 补证据、`force: true` 强制重核。核验身份沿续接保留，Codex 核验及续接统一应用 `verifyServiceTier`，未配置、留空或纯空白显式使用 `default`。已通过核验在复用、must_verify 结案及未完成项销账前，也要求证据版本和后续轮次未变；不可读子单标记列表 incomplete，无法确认时重核。所有 resume 模式保留核验身份与档位。凭据动作补齐更新、生成、轮换、renew/revoke/regenerate、换一个及 API token/access key，支持中英文正反语序、逗号、跨行和标识符内点号，保持 40 字/单字前 12 字的间距限制。同一问题字段拼接判断；defer 只答暂缓说明，selected 恒为空。裸词、脱敏、设备、设置页、统计及只读元数据查询仍放行，查看并修改仍拦截；逗号同句可能保守暂缓；四套线上档位及自定义风险正则待部署时同步更新，本次未改配置。
+
 `0.9.214` 独立核验派发前如有路径重叠的运行中写任务则等待并列出任务号；只读任务、路径不重叠或查询失败均放行。核验运行中新增写入仍按原有核验逻辑处理；超时提示明确要求将数量或时间预算写在任务正文中。
 
 `0.9.213` 执行单在整个仓库之外保存完整原始观测证据，按 Windows/WSL 提供可用路径，保留额外可写根；证据事件按规范化后的真实路径排除，无法解析时保留修改记录；Gemini 只读及非主机单沿用原权限，不分配项目外证据目录；Windows 证据路径转换不可用时退回无项目外证据目录继续执行；独立核验优先回查证据，blocked 条目按缺证据、环境、需用户、需改状态给出处理提示。worktree 保留既有建立、状态查询、按会话核验后合并和手动关闭，不加入自动清理；主机核验沿用 0.9.211 的 Git 比较。总超时提示要求先核对产物、按数量或时间预算拆小批；仅在报告有效且满足条件时续接，缺报告时核实产物后只为当前小批新建任务。
@@ -323,6 +325,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.215` Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms >= 30000`. Insufficient-evidence checks reuse unchanged results; unscoped tasks monitor cwd, changed known Git versions and descendant rounds or associated threads permit rechecking. Failed or incomplete change queries permit verification, while caller cancellation aborts. `new_evidence` and `force: true` allow rechecking. Verification identity survives continuation; all Codex verification rounds use `verifyServiceTier`, explicitly defaulting to `default` for absent, empty or whitespace-only values. Passed verifications also require unchanged evidence and later rounds before reuse, must_verify closeout or debt removal; unreadable children mark listings incomplete, and unknown changes require a fresh check. Every resume mode retains verification identity and tier. Passed verifications also require unchanged evidence and later rounds before reuse, must_verify closeout or debt removal; unreadable children mark listings incomplete, and unknown changes require a fresh check. Every resume mode retains verification identity and tier. Credential actions cover renewal, revocation, regeneration, API tokens and access keys in either word order, across commas, newlines and identifier dots with bounded gaps (40 characters, 12 after single Chinese verbs). Fields within one question are joined; defer always returns no selected options, only a deferral message. Metadata/history reads remain allowed, while reads combined with updates stay risky; unrelated actions and credentials within one comma-separated sentence may conservatively defer. Four live tier and custom risk-pattern overrides require deployment updates; runtime configuration remains unchanged.
 
 `0.9.214` Before dispatch, independent verification waits for running write jobs with overlapping paths and lists their job IDs; read-only jobs, non-overlapping paths and query failures do not block it. Writes started during verification retain existing verification handling. Timeout guidance explicitly requires quantity or time budgets in the task body.
 

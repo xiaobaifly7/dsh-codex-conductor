@@ -44,6 +44,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
   const final = () => ({ job_id: 'VERIFY-1', status: 'completed', cwd: source.cwd,
     log_dir: '/runner/jobs/VERIFY-1', sandbox: source.sandbox === 'danger-full-access' ? source.sandbox : 'read-only',
     context: payload.context, structured: report(payload.context.acceptance), files_changed: [],
+    started_at: (source.finished_at ?? 20) + 1, verification_version: 'tree-1', verification_evidence_version: 'evidence-1',
     ...verificationResult });
   const run = async (_config, argv, options = {}) => {
     calls.push({ argv, ...options });
@@ -62,6 +63,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
     }
     if (argv[0] === 'list' && listed) return listed(argv);
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
+    if (argv[0] === 'verification-version') return { status: 'completed', verification_version: 'tree-1', evidence_version: 'evidence-1' };
     if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
@@ -533,7 +535,7 @@ function backgroundJobs() {
 test('codex_verify exposes engine selection and sample/wait bounds', () => {
   const { parameters } = harness().tools.codex_verify;
   assert.deepEqual(parameters.required, ['job_id']);
-  assert.deepEqual(Object.keys(parameters.properties).sort(), ['engine', 'focus', 'job_id', 'samples', 'wait_seconds']);
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ['engine', 'focus', 'force', 'job_id', 'new_evidence', 'samples', 'wait_seconds']);
   assert.deepEqual(parameters.properties.engine.enum, ['codex', 'gemini']);
   assert.equal(parameters.properties.job_id.type, 'string');
   assert.equal(parameters.properties.focus.type, 'string');
@@ -561,6 +563,8 @@ test('dispatch descriptions keep waiting on the current runner job and accept th
 for (const [field, values] of [
   ['job_id', [undefined, null, '', ' ', '../SOURCE-1', 'SOURCE/1', 'SOURCE 1', 1]],
   ['focus', [null, 1, {}, []]],
+  ['force', [null, 1, 'true', {}, []]],
+  ['new_evidence', [null, 1, '', ' ', {}, []]],
   ['samples', [null, 0, -1, 31, 1.5, '8', NaN, Infinity]],
   ['wait_seconds', [null, -1, 0.5, '0', NaN, Infinity]],
 ]) test(`codex_verify rejects invalid ${field} before any runner call`, async () => {
@@ -660,7 +664,7 @@ test('verification inherits original cwd and model options, never original write
     assert.equal(flag('--cwd'), source.cwd);
     assert.equal(flag('--model'), source.task_options.model);
     assert.equal(flag('--effort'), 'medium');
-    assert.equal(flag('--service-tier'), source.task_options.service_tier);
+    assert.equal(flag('--service-tier'), 'default');
     assert.ok(argv.includes('--use-user-config'));
     if (sandbox === 'danger-full-access') assert.equal(flag('--sandbox'), sandbox);
     else assert.equal(argv.includes('--sandbox'), false);
@@ -679,12 +683,13 @@ test('verification inherits original cwd and model options, never original write
   }
 });
 
-test('original false user-config and explicit empty model/tier do not use current defaults', async () => {
+test('original false user-config and empty model do not use current defaults; verification tier stays standard', async () => {
   const source = sourceJob();
   Object.assign(source.task_options, { use_user_config: false, model: null, service_tier: '' });
   const h = harness({ source });
   await h.verify();
-  for (const flag of ['--use-user-config', '--model', '--service-tier']) assert.equal(h.start().argv.includes(flag), false, flag);
+  for (const flag of ['--use-user-config', '--model']) assert.equal(h.start().argv.includes(flag), false, flag);
+  assert.equal(option(h.start().argv, '--service-tier'), 'default');
 });
 
 test('verification uses readOnlyEffort when set and the original effort otherwise', async () => {
@@ -702,7 +707,8 @@ test('unspecified original model options keep Codex defaults instead of changed 
     source.task_options = options;
     const h = harness({ source, config: { readOnlyEffort: '' } });
     await h.verify();
-    for (const flag of ['--use-user-config', '--model', '--service-tier', '--effort']) {
+    assert.equal(option(h.start().argv, '--service-tier'), 'default');
+    for (const flag of ['--use-user-config', '--model', '--effort']) {
       assert.equal(h.start().argv.includes(flag), false, flag);
     }
   }
@@ -1314,4 +1320,99 @@ test('verification does not invent evidence paths for a non-host Gemini source',
   await h.verify();
   assert.match(h.payload().prompt, /原执行单没有证据目录/);
   assert.doesNotMatch(h.payload().prompt, /先查证据目录|\/SOURCE-1\/evidence|undefined/);
+});
+
+
+test('run, resumed/fresh continuation and verification prompts include the bounded wait rule', async () => {
+  const waitRule = /等待[\s\S]*30–60 秒[\s\S]*yield_time_ms 至少 30000[\s\S]*不要隔几秒/;
+  for (const mode of ['run', 'resume', 'fresh', 'verify']) {
+    const source = sourceJob();
+    source.structured.criteria[0].status = 'not_met';
+    const h = harness({ source });
+    if (mode === 'run') await h.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false }, exec);
+    else if (mode === 'verify') await h.verify();
+    else await h.tools.codex_continue.execute({ job_id: source.job_id, fresh: mode === 'fresh' }, exec);
+    assert.match(h.payload().prompt, waitRule, mode);
+  }
+});
+
+
+test('Codex verification explicitly defaults to the standard tier instead of inheriting acceleration', async () => {
+  for (const engine of ['codex', 'gemini']) {
+    for (const tier of ['fast', 'priority']) {
+      for (const override of [{}, { verifyServiceTier: '' }]) {
+        const source = sourceJob();
+        source.engine = engine;
+        source.task_options.service_tier = tier;
+        const h = harness({ source, config: { verifyEngine: 'codex', serviceTier: tier, ...override } });
+        await h.verify();
+        assert.equal(option(h.start().argv, '--service-tier'), 'default', JSON.stringify({ engine, tier, override }));
+      }
+    }
+  }
+});
+
+
+test('review 6: continuing a Codex verification keeps its standard tier and verification identity', async () => {
+  for (const config of [{}, { lockEngine: true, defaultEngine: 'gemini', gemini }]) {
+    const source = sourceJob();
+    source.context.verification_of = 'ROOT';
+    source.context.write = false;
+    source.scope = source.scope_paths = [];
+    source.task_options.writable_roots = [];
+    source.task_options.service_tier = 'default';
+    source.structured.criteria[0].status = 'not_met';
+    const h = harness({ source, config: { verifyEngine: 'codex', serviceTier: 'priority', ...config } });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, fresh: false }, exec);
+    assert.equal(option(h.start().argv, '--engine'), undefined);
+    assert.equal(option(h.start().argv, '--service-tier'), 'default');
+    assert.equal(h.payload().context.verification_of, 'ROOT');
+  }
+});
+
+test('review 6: a Gemini verification continued on Codex applies the verification tier', async () => {
+  for (const [verifyServiceTier, expected] of [[undefined, 'default'], ['', 'default'], ['priority', 'priority']]) {
+    const source = sourceJob();
+    source.engine = 'gemini';
+    source.conversation_id = source.thread_id;
+    delete source.thread_id;
+    source.context.verification_of = 'ROOT';
+    source.context.fallback_of = 'FAILED-VERIFY';
+    source.context.write = false;
+    source.scope = source.scope_paths = [];
+    source.task_options = { engine: 'gemini', model: gemini.model, writable_roots: [] };
+    source.structured.criteria[0].status = 'not_met';
+    const h = harness({ source, config: { gemini, verifyEngine: 'codex', serviceTier: 'fast',
+      ...(verifyServiceTier !== undefined ? { verifyServiceTier } : {}) } });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, engine: 'codex', fresh: true }, exec);
+    assert.equal(option(h.start().argv, '--service-tier'), expected);
+    assert.equal(h.payload().context.verification_of, 'ROOT');
+  }
+});
+
+test('review 6: whitespace verification tier explicitly uses default', async () => {
+  const h = harness({ config: { verifyEngine: 'codex', verifyServiceTier: '   ', serviceTier: 'priority' } });
+  await h.verify();
+  assert.equal(option(h.start().argv, '--service-tier'), 'default');
+});
+
+test('review final 6: codex_run resume preserves verification identity for every fresh mode and tier', async t => {
+  for (const serviceTier of ['fast', 'priority']) {
+    for (const fresh of [undefined, false, true]) {
+      for (const verifyServiceTier of [undefined, 'default', 'priority']) {
+        await t.test(JSON.stringify({ serviceTier, fresh, verifyServiceTier }), async () => {
+          const source = sourceJob();
+          source.context.verification_of = 'ROOT';
+          source.context.write = false;
+          const h = harness({ source, config: { serviceTier, verifyServiceTier, verifyEngine: 'codex',
+            closeoutGuard: false, convergenceGuard: false, continueFreshAboveTokens: 0 },
+          listed: argv => ({ jobs: argv.includes('--thread-id') ? [source] : [], total: argv.includes('--thread-id') ? 1 : 0 }) });
+          await h.tools.codex_run.execute({ task: '再次核对原始核验记录', acceptance, write: false,
+            resume: source.thread_id, ...(fresh !== undefined ? { fresh } : {}) }, exec);
+          assert.equal(option(h.start().argv, '--service-tier'), verifyServiceTier ?? 'default');
+          assert.equal(h.payload().context.verification_of, 'ROOT');
+        });
+      }
+    }
+  }
 });

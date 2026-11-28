@@ -2393,6 +2393,89 @@ def verification_version(source):
     return None
 
 
+def verification_evidence_snapshot(source):
+    """Version and latest change time from one bounded metadata snapshot, including missing evidence."""
+    deadline = time.monotonic() + 3
+    try:
+        cwd = source.get("cwd")
+        job_dir = source.get("log_dir") or source.get("job_dir")
+        if not job_dir and source.get("job_id"):
+            job_dir = job_directory(source["job_id"])
+        if not cwd or not job_dir:
+            return None, None
+        job_dir = Path(scope_path(cwd, str(job_dir)))
+        info = job_dir.stat()
+        observed = {str(job_dir): (info.st_size, info.st_mtime_ns, info.st_mode, info.st_ctime_ns, info.st_ino)}
+        report = source.get("structured") or {}
+        files = [entry.get("path") if isinstance(entry, dict) else entry for entry in
+                 [*(source.get("files_changed") or []), *(source.get("write_paths") or []),
+                  *(report.get("files_changed") or [])]]
+        records = {str(job_dir / name) for name in ("args.json", "result.json", "prompt.txt", "write-lock.json",
+                                                         "last_message.txt", "events.jsonl", "stderr.log")}
+        paths = [*(source.get("scope_paths") or source.get("scope") or []), *files, source.get("output")]
+        cwd_root = runner_home = None
+        if not any(isinstance(path, str) and path.strip() for path in paths):
+            cwd_root = scope_path(cwd, ".")
+            runner_home = tree_key(str(HOME))
+            # shortcut: projects inside runner HOME stay unknown; split state exclusions if this layout is needed.
+            if not os.path.isdir(cwd_root) or Path(normalized_path(cwd_root)).is_relative_to(Path(runner_home)):
+                return None, None
+            paths.append(cwd_root)
+        paths.extend([source.get("evidence_dir") or str(job_dir / "evidence"), *sorted(records)])
+        missing, existing, missing_parent_times = {}, set(), []
+        for path in paths:
+            if time.monotonic() >= deadline:
+                return None, None
+            if not isinstance(path, str) or not path.strip():
+                continue
+            path = scope_path(cwd, path)
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                if path == cwd_root:
+                    return None, None
+                missing[path] = None
+                if path in records:
+                    continue
+                # A missing product has no timestamp; its nearest existing parent records a later deletion.
+                parent = Path(path).parent
+                while True:
+                    if time.monotonic() >= deadline:
+                        return None, None
+                    try:
+                        info = parent.stat()
+                        missing_parent_times.append(max(info.st_mtime_ns, info.st_ctime_ns))
+                        break
+                    except FileNotFoundError:
+                        if parent == parent.parent:
+                            return None, None
+                        parent = parent.parent
+            else:
+                existing.add(path)
+        for path in sorted(existing):
+            if time.monotonic() >= deadline:
+                return None, None
+            # New verification logs and review ledgers are not project evidence; source records are scanned separately.
+            exclusions = {"exclude_tree": runner_home} if path == cwd_root else {}
+            entries = snapshot(path, budget=deadline - time.monotonic(), scope=[path], strict=True, **exclusions)
+            if entries is None:
+                return None, None
+            observed.update({os.path.normpath(os.path.join(path, name)): value for name, value in entries.items()})
+        if time.monotonic() >= deadline or any(stat.S_ISLNK(info[2]) for info in observed.values()):
+            return None, None
+        updated_at = max([max(info[1], info[3]) for info in observed.values()] + missing_parent_times) / 1e9
+        entries = {**missing, **observed}
+        entries.pop(str(job_dir), None)  # Review bookkeeping is not execution evidence.
+        version = hashlib.sha256(repr(sorted(entries.items())).encode("utf-8")).hexdigest()
+        return (version, updated_at) if time.monotonic() < deadline else (None, None)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return None, None
+
+
+def verification_evidence_version(source):
+    return verification_evidence_snapshot(source)[0]
+
+
 def concurrent_writer_in_scope(paths, run_dir, started):
     roots = [Path(tree_key(path)) for path in paths]
     runs = HOME / "runs"
@@ -2739,10 +2822,14 @@ def execute(args, prompt, run_dir):
     verification_scope = (context.get("routing") or {}).get("verification_scope") if verification else None
     version_source = job_status(context["verification_of"]) if isinstance(verification_scope, str) else None
     before_version = verification_version(version_source) if version_source else None
+    before_evidence_version = verification_evidence_version(version_source) if version_source else None
 
     def finish(result):
         if before_version and result["status"] == "completed" and before_version == verification_version(version_source):
             result.update(verification_version=before_version, verification_scope=verification_scope)
+        if (before_evidence_version and result["status"] == "completed"
+                and before_evidence_version == verification_evidence_version(version_source)):
+            result.update(verification_evidence_version=before_evidence_version, verification_scope=verification_scope)
         if not host_verification:
             return result
         # Without a whole status from before there is nothing to compare one from after with.
@@ -3954,7 +4041,7 @@ def save_listing(job_id, signature, value, details):
                 os.unlink(tmp)
 
 
-def matching_jobs(args, *, page_dates=None):
+def matching_jobs(args, *, page_dates=None, incomplete=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
     needs_attention = args.needs_attention or scope_conflicts
@@ -3979,6 +4066,18 @@ def matching_jobs(args, *, page_dates=None):
             return False
         return not (check_cwd and args.cwd) or bool(value.get("cwd") and
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
+
+    def note_incomplete(value, job_id):
+        if incomplete is None or not value or not matches_metadata(value, job_id):
+            return
+        context = value.get("context") or {}
+        parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
+                  context.get("routing", {}).get("parent_job_id"))
+        if getattr(args, "parent_job", None) and parent != args.parent_job:
+            return
+        if getattr(args, "thread_id", None) and (value.get("thread_id") or value.get("resume")) != args.thread_id:
+            return
+        incomplete.append(job_id)
 
     jobs = []
     # Owner, verification and task filters come from args.json alone: skip non-matching jobs from the cache
@@ -4033,9 +4132,12 @@ def matching_jobs(args, *, page_dates=None):
             try:
                 task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
                 result = json.loads(result_file.read_text("utf-8")) if finished else None
+                if finished and not isinstance(result, dict):
+                    raise ValueError("result.json must be an object")
                 value = {**task, **(result if result is not None else {})}
                 record = {"task": task, "result": result}
             except (OSError, ValueError, TypeError):
+                note_incomplete(task, job_dir.name)
                 value, record = {}, None
             if not matches_metadata(value, job_dir.name):
                 continue
@@ -4047,6 +4149,7 @@ def matching_jobs(args, *, page_dates=None):
                                                      conversation_id=value.get("conversation_id"), resolve=resolve)
                     value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
                 except (OSError, ValueError, TypeError):
+                    note_incomplete(value, job_dir.name)
                     record = None
                     value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
                     value["_details"] = dict(value)
@@ -4062,6 +4165,8 @@ def matching_jobs(args, *, page_dates=None):
             continue
         if getattr(args, "parent_job", None) and parent != args.parent_job:
             continue
+        if value.get("_details", {}).get("error_kind") == "invalid_record":
+            note_incomplete(value, job_dir.name)
         value.update(job_id=job_dir.name, _record=record)
         if args.status or needs_attention:
             value = job_details(value, args)
@@ -4086,11 +4191,12 @@ def matching_jobs(args, *, page_dates=None):
 
 
 def list_jobs(args):
+    incomplete = []
     requested = slice(args.offset, args.offset + args.limit)
     filters = ("cwd", "owner", "status", "job_id", "thread_id", "parent_job", "needs_attention",
                "scope_conflicts", "started_between", "verification_of", "task_key")
     if any(getattr(args, key, None) for key in filters):
-        jobs = matching_jobs(args)
+        jobs = matching_jobs(args, incomplete=incomplete)
         total = len(jobs)
         page = jobs[requested]
     else:
@@ -4098,8 +4204,9 @@ def list_jobs(args):
         dates = {p: job_listing_times(p) for p in job_directories()}
         ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
         total = len(ordered)
-        page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
+        page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]}, incomplete=incomplete)
     page = [job_details(j, args) for j in page]
+    incomplete.extend(j["job_id"] for j in page if j.get("error_kind") == "invalid_record")
     predispatch = None
     if args.owner and getattr(args, "thread_id", None) and args.offset == 0 and page:
         report = page[0].get("structured")
@@ -4122,13 +4229,14 @@ def list_jobs(args):
              **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
              **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
              **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
-                                  "verification_version", "verification_scope") if k in j},
+                                  "verification_version", "verification_evidence_version", "verification_scope") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     if predispatch is not None:
         page[0]["predispatch"] = predispatch
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
-            "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
+            "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total,
+            **({"incomplete": True} if incomplete else {})}
 
 
 def query_resolver():
@@ -4907,7 +5015,10 @@ def main():
             emit({"status": "completed", "thread_id": args.thread_id, "last_input_tokens": thread_last_input_tokens(args.thread_id)})
         return
     if args.command == "verification-version":
-        emit({"status": "completed", "verification_version": verification_version(job_status(args.job_id))})
+        source = job_status(args.job_id)
+        evidence_version, evidence_updated_at = verification_evidence_snapshot(source)
+        emit({"status": "completed", "verification_version": verification_version(source),
+              "evidence_version": evidence_version, "evidence_updated_at": evidence_updated_at})
         return
     if args.command == "repeat-guard":
         try:

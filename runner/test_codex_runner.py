@@ -91,6 +91,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         finish(json.dumps({"summary": status, "criteria": [
             {"criterion": "run the check", "status": status, "evidence": status}
         ], "files_changed": [], "deviations": [], "unresolved": []}))
+    elif mode == "verification_evidence_change":
+        Path(os.environ["FAKE_EVIDENCE_TARGET"]).write_text("changed during verification\n", encoding="utf-8")
+        finish()
     elif mode == "repeat_guard_start":
         if "resume" not in sys.argv:
             say(type="item.started", item={"id": "step", "type": "command_execution",
@@ -5490,6 +5493,73 @@ class RunnerTests(unittest.TestCase):
         for extra in (("--limit", "5001"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
+    def test_list_marks_corrupt_child_results_incomplete(self):
+        context = {**self.sample_context(), "continuation": {
+            "parent_job_id": "source", "answers": [], "resolution": "collect more evidence"}}
+        child = self.stored_job("child", {"status": "completed"}, context=context)
+        for payload in ("not json", "[]", "null", '"broken"'):
+            with self.subTest(payload=payload):
+                (child / "result.json").write_text(payload, "utf-8")
+                result = self.control("list", "--owner", "owner-a", "--parent-job", "source")
+                self.assertIs(result.get("incomplete"), True)
+                self.assertEqual(result["jobs"], [])
+                self.assertEqual(result["total"], 0)
+                self.assertTrue(result["eof"])
+                self.assertIsNone(result["next_offset"])
+
+    def test_list_marks_unreadable_child_results_incomplete(self):
+        import codex_runner
+
+        context = {**self.sample_context(), "fallback_of": "source"}
+        child = self.stored_job("child", {"status": "completed"}, context=context)
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
+                               parent_job="source", needs_attention=False, offset=0, limit=20)
+        read_text = Path.read_text
+        def read(path, *a, **kw):
+            if path == child / "result.json":
+                raise PermissionError("result is unreadable")
+            return read_text(path, *a, **kw)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(Path, "read_text", read):
+            result = codex_runner.list_jobs(args)
+        self.assertIs(result.get("incomplete"), True)
+        self.assertEqual(result["jobs"], [])
+
+    def test_list_marks_child_summary_failures_incomplete(self):
+        import codex_runner
+
+        self.stored_job("child", {"status": "completed"}, context={**self.sample_context(),
+                        "routing": {"parent_job_id": "source"}})
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
+                               parent_job="source", needs_attention=False, offset=0, limit=20)
+        for method in ("job_metadata", "verification_summary"):
+            with self.subTest(method=method), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(codex_runner, method, side_effect=ValueError("damaged summary")):
+                result = codex_runner.list_jobs(args)
+                self.assertIs(result.get("incomplete"), True)
+
+    def test_list_incomplete_respects_filters_and_pagination(self):
+        done = {"status": "completed", "structured": self.sample_report()}
+        self.stored_job("good", done, context={**self.sample_context(), "fallback_of": "source"})
+        bad = self.stored_job("bad", done, context={**self.sample_context(), "fallback_of": "other"})
+        (bad / "result.json").write_text("not json", "utf-8")
+        query = ("list", "--owner", "owner-a", "--parent-job", "source", "--limit", "1")
+        complete = self.control(*query)
+        self.assertFalse(complete.get("incomplete", False))
+        self.assertEqual([job["job_id"] for job in complete["jobs"]], ["good"])
+        self.assertFalse(self.control("list", "--owner", "other").get("incomplete", False))
+        self.assertFalse(self.control("list", "--cwd", str(self.cwd / "elsewhere")).get("incomplete", False))
+        # An unreadable matching child still matters when the requested page is empty.
+        child = self.stored_job("child", done, context={**self.sample_context(), "fallback_of": "source"})
+        (child / "result.json").write_text("not json", "utf-8")
+        page = self.control(*query, "--offset", "1")
+        self.assertIs(page.get("incomplete"), True)
+        self.assertEqual(page["jobs"], [])
+        self.assertEqual(page["total"], 1)
+        self.assertTrue(page["eof"])
+        self.assertIsNone(page["next_offset"])
+
     def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
         for job_id, owner in (("mine", "owner-b"), ("predecessor", "owner-a"), ("unrelated", "owner-c")):
             self.stored_job(job_id, {"status": "completed", "structured": self.sample_report()}, context=self.sample_context(owner))
@@ -7131,6 +7201,318 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["sandbox"], "read-only")
         self.assertIn("--ephemeral", self.calls()[0]["argv"])
         self.assertEqual(sorted(entry.name for entry in self.cwd.iterdir()), ["temp_check.py"])
+
+    def test_verification_evidence_version_without_git_or_evidence_is_saved_and_listed(self):
+        source = self.stored_job("SOURCE", {"status": "completed", "output": "missing-output.txt"},
+                                 scope=["missing-scope"])
+        version = self.control("verification-version", "SOURCE")
+        self.assertIsNone(version["verification_version"])
+        self.assertRegex(version["evidence_version"], r"^[a-f0-9]{64}$")
+        self.assertEqual(self.control("verification-version", "SOURCE"), version)
+        self.assertFalse((source / "evidence").exists())
+        context = {"owner": "S1", "task": "Verify missing evidence", "acceptance": ["check evidence"],
+                   "write": False, "verification_of": "SOURCE", "routing": {"verification_scope": "scope"}}
+        job = self.invoke("--context-json", "--sandbox", "read-only", command="start",
+                          prompt=json.dumps({"prompt": "Check evidence", "context": context}))
+        result = self.control("status", job["job_id"], "--wait", "30")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertLessEqual(version["evidence_updated_at"], result["started_at"])
+        self.assertNotIn("verification_version", result)
+        self.assertEqual(result["verification_evidence_version"], version["evidence_version"])
+        self.assertEqual(result["verification_scope"], "scope")
+        saved = json.loads((Path(result["log_dir"]) / "result.json").read_text("utf-8"))
+        self.assertEqual(saved["verification_evidence_version"], version["evidence_version"])
+        listed = self.control("list", "--verification-of", "SOURCE")["jobs"]
+        self.assertEqual(listed[0]["verification_evidence_version"], version["evidence_version"])
+        context.pop("routing")
+        unmarked = self.invoke("--context-json", "--sandbox", "read-only",
+                               prompt=json.dumps({"prompt": "Check evidence", "context": context}))
+        self.assertNotIn("verification_evidence_version", unmarked)
+
+    def test_verification_evidence_version_tracks_products_and_nested_evidence_metadata(self):
+        source = self.stored_job("SOURCE", {"status": "completed", "files_changed": [{"path": "changed.txt"}],
+            "write_paths": ["written.txt"], "structured": {"files_changed": ["reported.txt"]}, "output": "output.txt"},
+            scope=["declared"])
+        (self.cwd / "declared").mkdir()
+        (source / "evidence" / "nested").mkdir(parents=True)
+        version = self.control("verification-version", "SOURCE")["evidence_version"]
+        self.assertIsNotNone(version)
+        for path in [*(self.cwd / name for name in ("declared/new.txt", "changed.txt", "written.txt", "reported.txt", "output.txt")),
+                     source / "evidence" / "nested" / "observation.txt"]:
+            for action in ("add", "modify", "delete"):
+                with self.subTest(path=path, action=action):
+                    if action == "delete":
+                        path.unlink()
+                    else:
+                        path.write_text(action, "utf-8")
+                    changed = self.control("verification-version", "SOURCE")["evidence_version"]
+                    self.assertIsNotNone(changed)
+                    self.assertNotEqual(changed, version)
+                    version = changed
+        outside = self.cwd / "unrelated.txt"
+        outside.write_text("outside declared paths", "utf-8")
+        self.assertEqual(self.control("verification-version", "SOURCE")["evidence_version"], version)
+        external = Path(self.tmp.name) / "external-evidence"
+        external.mkdir()
+        result_file = source / "result.json"
+        result_file.write_text(json.dumps({"status": "completed", "evidence_dir": str(external)}), "utf-8")
+        version = self.control("verification-version", "SOURCE")["evidence_version"]
+        (external / "observation.txt").write_text("external evidence", "utf-8")
+        self.assertNotEqual(self.control("verification-version", "SOURCE")["evidence_version"], version)
+
+    def test_verification_evidence_version_tracks_source_records(self):
+        source = self.stored_job("SOURCE", {"status": "completed"})
+        version = self.control("verification-version", "SOURCE")["evidence_version"]
+        self.assertIsNotNone(version)
+        for name in ("args.json", "result.json", "prompt.txt", "last_message.txt", "events.jsonl", "stderr.log"):
+            with self.subTest(name=name):
+                path = source / name
+                with path.open("a", encoding="utf-8") as file:
+                    file.write(" \n")
+                changed = self.control("verification-version", "SOURCE")["evidence_version"]
+                self.assertIsNotNone(changed)
+                self.assertNotEqual(changed, version)
+                version = changed
+        (source / "reviews.json").write_text("[]", "utf-8")
+        self.assertEqual(self.control("verification-version", "SOURCE")["evidence_version"], version)
+
+    def test_verification_evidence_version_does_not_save_a_changed_version(self):
+        source = self.stored_job("SOURCE", {"status": "completed", "output": "output.txt"})
+        (source / "evidence").mkdir()
+        prompt = json.dumps({"prompt": "Check evidence", "context": {"owner": "S1", "task": "Verify evidence",
+            "acceptance": ["check evidence"], "write": False, "verification_of": "SOURCE",
+            "routing": {"verification_scope": "scope"}}})
+        for target in (self.cwd / "output.txt", source / "evidence" / "observation.txt", source / "prompt.txt"):
+            with self.subTest(target=target):
+                before = self.control("verification-version", "SOURCE")["evidence_version"]
+                result = self.invoke("--context-json", "--sandbox", "read-only", prompt=prompt,
+                                     mode="verification_evidence_change", env={"FAKE_EVIDENCE_TARGET": str(target)})
+                self.assertEqual(result["status"], "completed", result)
+                self.assertNotIn("verification_evidence_version", result)
+                self.assertNotEqual(self.control("verification-version", "SOURCE")["evidence_version"], before)
+
+    def test_verification_evidence_snapshot_unscoped_read_only_job_tracks_cwd(self):
+        source_dir = self.stored_job("SOURCE", {"status": "completed"}, sandbox="read-only",
+                                     context={**self.sample_context(), "write": False})
+        report = self.cwd / "report.md"
+        report.write_text("original report", "utf-8")
+        before = self.control("verification-version", "SOURCE")
+        self.assertIsNone(before["verification_version"])
+        self.assertIsNotNone(before["evidence_version"])
+        self.assertEqual(self.control("verification-version", "SOURCE"), before)
+        added = self.cwd / "additional.md"
+        for action in ("modify", "add", "delete"):
+            with self.subTest(action=action):
+                if action == "modify":
+                    report.write_text("updated project report", "utf-8")
+                elif action == "add":
+                    added.write_text("new evidence", "utf-8")
+                else:
+                    report.unlink()
+                after = self.control("verification-version", "SOURCE")
+                self.assertIsNotNone(after["evidence_version"])
+                self.assertNotEqual(after["evidence_version"], before["evidence_version"])
+                before = after
+        self.assertFalse((source_dir / "evidence").exists())
+
+    def test_verification_evidence_snapshot_unscoped_cwd_incomplete_is_unknown(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"}, sandbox="read-only")
+        report = self.cwd / "report.md"
+        report.write_text("original report", "utf-8")
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir), "context": {"write": False}}
+        real_snapshot = codex_runner.snapshot
+        root = os.path.normcase(os.path.realpath(self.cwd))
+        for failure in (None, PermissionError("unreadable cwd"), TimeoutError("cwd timed out")):
+            with self.subTest(failure=failure):
+                def incomplete(path, **kwargs):
+                    if os.path.normcase(os.path.realpath(path)) == root:
+                        if failure is not None:
+                            raise failure
+                        return None
+                    return real_snapshot(path, **kwargs)
+
+                with mock.patch.object(codex_runner, "snapshot", side_effect=incomplete):
+                    self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+        real_lstat = os.lstat
+
+        def vanished(path, *args, **kwargs):
+            if os.path.normcase(os.fspath(path)) == root:
+                raise FileNotFoundError(path)
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner.os, "lstat", side_effect=vanished):
+            self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+        source["cwd"] = str(self.cwd / "missing-project")
+        self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+
+    def test_verification_evidence_snapshot_unscoped_cwd_scan_budget_is_unknown(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"}, sandbox="read-only")
+        report = self.cwd / "report.md"
+        report.write_text("original report", "utf-8")
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir)}
+        target = os.path.normcase(os.path.realpath(report))
+        real_stat = os.stat
+        clock = [0]
+
+        def slow_stat(path, *args, **kwargs):
+            if kwargs.get("follow_symlinks") is False and os.path.normcase(os.fspath(path)) == target:
+                clock[0] += 4
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(codex_runner.os, "stat", side_effect=slow_stat):
+            self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+
+    def test_verification_evidence_snapshot_unscoped_cwd_excludes_runner_bookkeeping(self):
+        import codex_runner
+
+        for relative in ("runner", ".local/state/codex-runner"):
+            with self.subTest(home=relative):
+                project = self.cwd / relative.replace("/", "-")
+                home = project / relative
+                source_dir = home / "jobs" / "SOURCE"
+                evidence = source_dir / "evidence"
+                evidence.mkdir(parents=True)
+                (source_dir / "args.json").write_text("{}", "utf-8")
+                proof = evidence / "proof.txt"
+                proof.write_text("original proof", "utf-8")
+                report = project / "report.md"
+                report.write_text("original report", "utf-8")
+                source = {"cwd": str(project), "log_dir": str(source_dir), "context": {"write": False}}
+                with mock.patch.object(codex_runner, "HOME", home):
+                    before = codex_runner.verification_evidence_version(source)
+                    self.assertIsNotNone(before)
+                    verification = home / "jobs" / "VERIFY"
+                    verification.mkdir()
+                    (verification / "events.jsonl").write_text("new verification log", "utf-8")
+                    (source_dir / "reviews.json").write_text("[]", "utf-8")
+                    (home / "job-filter-cache.json").write_text("{}", "utf-8")
+                    self.assertEqual(codex_runner.verification_evidence_version(source), before)
+                    proof.write_text("updated source evidence", "utf-8")
+                    after = codex_runner.verification_evidence_version(source)
+                    self.assertIsNotNone(after)
+                    self.assertNotEqual(after, before)
+                    report.write_text("updated project report", "utf-8")
+                    self.assertNotEqual(codex_runner.verification_evidence_version(source), after)
+
+    def test_verification_evidence_version_unreadable_or_timed_out_is_unknown(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir)}
+        with mock.patch.object(codex_runner, "snapshot", return_value=None) as snapshot:
+            self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+        self.assertGreater(snapshot.call_args.kwargs["budget"], 0)
+        self.assertLessEqual(snapshot.call_args.kwargs["budget"], 3)
+        with mock.patch.object(codex_runner, "snapshot", side_effect=PermissionError("unreadable")):
+            self.assertIsNone(codex_runner.verification_evidence_version(source))
+        with mock.patch.object(codex_runner.time, "monotonic", side_effect=[0, 4]), \
+                mock.patch.object(codex_runner, "snapshot") as snapshot:
+            self.assertIsNone(codex_runner.verification_evidence_version(source))
+        snapshot.assert_not_called()
+
+    def test_verification_evidence_snapshot_with_nested_symlink_is_unknown(self):
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        evidence = source_dir / "evidence" / "nested"
+        evidence.mkdir(parents=True)
+        target = self.cwd / "product.txt"
+        target.write_text("original product", "utf-8")
+        try:
+            (evidence / "proof.txt").symlink_to(target)
+        except OSError as error:
+            if os.name == "nt" and error.winerror == 1314:
+                self.skipTest("Windows symlink privilege unavailable")
+            raise
+        result = self.control("verification-version", "SOURCE")
+        self.assertIsNone(result["evidence_version"])
+        self.assertIsNone(result["evidence_updated_at"])
+
+    def test_verification_evidence_snapshot_reports_latest_metadata_time_in_one_pass(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        evidence = source_dir / "evidence" / "nested"
+        evidence.mkdir(parents=True)
+        proof = evidence / "proof.txt"
+        proof.write_text("evidence", "utf-8")
+        future = time.time_ns() + 100_000_000_000
+        os.utime(proof, ns=(future, future))
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir)}
+        with mock.patch.object(codex_runner, "snapshot", wraps=codex_runner.snapshot) as snapshot:
+            version, updated_at = codex_runner.verification_evidence_snapshot(source)
+        self.assertIsNotNone(version)
+        self.assertEqual(updated_at, future / 1e9)
+        roots = [call.args[0] for call in snapshot.call_args_list]
+        self.assertEqual(len(roots), len(set(roots)))
+        # Windows temporary paths may use an 8.3 alias; the runner canonicalizes it.
+        self.assertEqual(set(roots), {str(self.cwd.resolve()), *(str((source_dir / name).resolve())
+                                     for name in ("args.json", "result.json", "evidence"))})
+        os.utime(proof, ns=(0, 0))
+        expected = max(max(path.stat().st_mtime_ns, path.stat().st_ctime_ns) for path in
+                       [self.cwd, source_dir, source_dir / "args.json", source_dir / "result.json",
+                        source_dir / "evidence", evidence, proof]) / 1e9
+        self.assertEqual(codex_runner.verification_evidence_snapshot(source)[1], expected)
+
+    def test_verification_evidence_snapshot_missing_product_time_ignores_neighbor_jobs(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir), "output": "missing/nested/output.txt"}
+        before = codex_runner.verification_evidence_snapshot(source)
+        self.assertIsNotNone(before[0])
+        self.assertLessEqual(before[1], time.time())
+        (source_dir.parent / "NEIGHBOR").mkdir()
+        future = time.time_ns() + 100_000_000_000
+        os.utime(source_dir.parent, ns=(future, future))
+        self.assertEqual(codex_runner.verification_evidence_snapshot(source), before)
+        os.utime(self.cwd, ns=(future, future))
+        after = codex_runner.verification_evidence_snapshot(source)
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[1], future / 1e9)
+
+    def test_verification_evidence_snapshot_windows_cross_drive_paths_have_absolute_keys(self):
+        import hashlib
+        import ntpath
+        from pathlib import PureWindowsPath
+        import codex_runner
+
+        source = {"cwd": r"E:\project", "scope": ["src"], "job_dir": r"D:\runner\jobs\SOURCE",
+                  "evidence_dir": r"F:\evidence", "output": r"E:\project\missing.txt"}
+        info = SimpleNamespace(st_size=1, st_mtime_ns=2_000_000_000, st_mode=0o100644,
+                               st_ctime_ns=3_000_000_000, st_ino=4)
+        fingerprint = (info.st_size, info.st_mtime_ns, info.st_mode, info.st_ctime_ns, info.st_ino)
+        expected = {source["output"]: None}
+
+        def lstat(path):
+            if path == source["output"]:
+                raise FileNotFoundError(path)
+            return info
+
+        def snapshot(root, *, budget, scope, strict):
+            self.assertEqual(scope, [root])
+            self.assertGreater(budget, 0)
+            self.assertLessEqual(budget, 3)
+            self.assertTrue(strict)
+            expected[root] = fingerprint
+            entries = {".": fingerprint}
+            if root == source["evidence_dir"]:
+                entries[r"nested\proof.txt"] = fingerprint
+                expected[ntpath.join(root, r"nested\proof.txt")] = fingerprint
+            return entries
+
+        with mock.patch.object(codex_runner, "Path", PureWindowsPath), \
+                mock.patch.object(PureWindowsPath, "stat", return_value=info, create=True), \
+                mock.patch.object(codex_runner, "os", SimpleNamespace(path=ntpath, lstat=lstat)), \
+                mock.patch.object(codex_runner, "scope_path", side_effect=lambda cwd, path: ntpath.normpath(ntpath.join(cwd, path))), \
+                mock.patch.object(codex_runner, "snapshot", side_effect=snapshot):
+            version, updated_at = codex_runner.verification_evidence_snapshot(source)
+        expected.pop(source["job_dir"], None)
+        self.assertEqual(version, hashlib.sha256(repr(sorted(expected.items())).encode("utf-8")).hexdigest())
+        self.assertEqual(updated_at, 3)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_verification_version_tracks_stable_scoped_git_bytes(self):

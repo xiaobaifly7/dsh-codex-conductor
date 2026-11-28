@@ -87,8 +87,8 @@ const DEFAULTS = {
   // 只读任务的推理强度，留空与 effort 相同
   readOnlyEffort: '',
   serviceTier: '',
-  // Codex 核验单的 service tier（如 fast），留空同 serviceTier
-  verifyServiceTier: '',
+  // Codex 核验单默认标准档，不继承原单、通用档位或 Codex 用户配置。
+  verifyServiceTier: 'default',
   waitSeconds: 0,
   autoWakeBlockedInbox: true,
   // delaySeconds > 0：宿主启动后等这么久再续接，只补那些到时仍没有新回合的会话（让 auto-continue 先扫）；0 立即续接
@@ -469,7 +469,8 @@ export function createConductor(cfg, run = runRunner) {
       const effort = args.effort ?? (context?.verification_of ? undefined : defaultEffort(cfg, args.write));
       if (effort) argv.push('--effort', effort);
       const model = args.model ?? cfg.model;
-      const serviceTier = args.service_tier ?? cfg.serviceTier;
+      const serviceTier = context?.verification_of ? cfg.verifyServiceTier?.trim() || 'default'
+        : args.service_tier ?? cfg.serviceTier;
       if (cfg.modelAB?.enabled && args.model === undefined && !args.resume && context && !context.continuation && !context.verification_of) {
         argv.push('--model-ab', JSON.stringify([cfg.modelAB.models, cfg.modelAB.share]));
       } else if (model) argv.push('--model', model);
@@ -569,6 +570,7 @@ export function composePrompt(task, acceptance, scope = [], { hostAccess = false
     expectBlocked.map(index => `\n第 ${index} 条预计在本环境受阻：不要在这一条上花时间，直接标 blocked，blockers 写 environment 并说明原因。`).join('') +
     '\n\n## 执行约束\n' +
     '- 只做上面任务和验收标准要求的事，不扩大范围，不顺手重构或修改无关文件。\n' +
+    '- 等待长命令、构建、测试或后台任务时，一次给足 30–60 秒；回查输出的 yield_time_ms 至少 30000，不要隔几秒反复回查。\n' +
     '- 脚本可能触及禁止的访问或状态变更时，先只读检查。副作用无法确认、会越出授权或破坏数据时，停该步。\n' +
     (!verification ? evidenceAvailable ? '- 验收靠命令输出、HTTP 响应或其他观测证明时，把完整原始输出存进 {{CONDUCTOR_EVIDENCE_DIR}}，evidence 写文件路径；终端里看过的不算留证。该项目外证据目录允许写入。\n' : '- 本单是只读或非主机 Gemini 任务，没有证据目录，保持原有权限；无法留存的观测证据如实标 blocked。\n' : '') +
     (scope.length ? `- ${evidenceAvailable ? '除证据目录外，' : ''}只允许改动这些路径：${scope.join('、')}；其他文件一律不要动。\n` : '') +
@@ -613,7 +615,7 @@ function productPaths(value) {
   return result;
 }
 
-function verificationTask(source, { focus = '', samples = 8 } = {}, required = [], excluded = []) {
+function verificationTask(source, { focus = '', samples = 8, new_evidence = '' } = {}, required = [], excluded = []) {
   const sampleEvidenceRow = required.length + 3;
   return `你是独立核验员。这是新线程，不续接原作者的思路，也不把原报告当作事实。\n` +
     `核验对象 job_id：${source.job_id}\n` +
@@ -625,6 +627,7 @@ function verificationTask(source, { focus = '', samples = 8 } = {}, required = [
     (excluded.length ? `原验收第 ${excluded.join('、')} 条历史记录已结案，不再核验，即使在原始任务书中看到也跳过。\n` : '') +
     `已记录的产物路径：${JSON.stringify(productPaths(source))}\n` +
     `重点：${focus || '优先核对关键结论、数字和引用。'}\n` +
+    (new_evidence ? `调用方补充的新证据（须独立核实）：${new_evidence.trim()}\n` : '') +
     (required.length ? `先核对必验的原验收第 ${required.map(item => item.index).join('、')} 条，再抽查其余结论。逐条运行允许的只读检查或回查原始运行记录；evidence 写观测结果和可定位的来源，只有自报或静态推断时记 blocked。\n` : '') +
     `独立抽查 ${samples} 条带出处的结论；不足 ${samples} 条则全部核对，并说明实际条数。不要只复述原报告。\n` +
     `逐条回到原始出处，检查原文、上下文、数字与计算；找不到出处、出处不支持结论时明确说无法确认，不要猜测。\n` +
@@ -1557,6 +1560,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const targetId = full.context?.verification_of;
       if (targetId) {
         const target = targetId === source.job_id ? source : await lookup(status(targetId));
+        if (!target || !await verificationUnchanged(target, full, signal)) continue;
+        // 后续轮次的核验映射回原单时，原单的证据和其他续接也必须仍然有效。
+        if (targetId !== source.job_id && !await verificationUnchanged(source,
+          { ...full, verification_evidence_version: undefined }, signal)) continue;
         acceptance.forEach((item, i) => {
           const targetKey = verificationItemKey(item);
           if (!targetKey) return;
@@ -2022,6 +2029,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const full = await status(job.job_id);
         const acceptance = full.context?.acceptance;
         if (full.error_kind || !Array.isArray(acceptance) || !validReport(full.structured)) continue;
+        const original = await status(target);
+        if (unknownState(original) || !await verificationUnchanged(original, full, signal)) continue;
         const met = new Set(acceptance.flatMap((text, i) => {
           const key = verificationItemKey(text);
           return key && reportRowOf(acceptance, full.structured.criteria, i + 1)?.status === 'met' ? [key] : [];
@@ -2266,26 +2275,57 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     !(cfg.autoVerifySkipQuestions && awaitingAnswers(value));
   const autoVerifyWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 补派自动核验失败：${error?.message ?? error}`);
 
-  async function hasLaterRound(source) {
-    const id = source.job_id;
+  async function hasLaterRound(source, after = -Infinity, signal) {
     const owner = lastSuccessor(aliases, source.context?.owner) ?? source.context?.owner;
     const list = async filters => {
-      const page = await conductor.list(cfg.verificationReuse ? { owner, also_owners: aliases.predecessors(owner), ...filters } : filters);
-      if (page.error_kind || !Array.isArray(page.jobs)) {
-        throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
+      const jobs = [];
+      for (let offset = 0; offset !== null;) {
+        const page = await conductor.list({ ...(cfg.verificationReuse ? { owner, also_owners: aliases.predecessors(owner) } : {}),
+          ...filters, limit: 100, offset }, signal);
+        signal?.throwIfAborted();
+        if (page.incomplete || page.error_kind || !Array.isArray(page.jobs)) {
+          throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
+        }
+        jobs.push(...page.jobs.filter(job => !cfg.verificationReuse || owns(owner, job.context?.owner)));
+        offset = page.next_offset ?? null;
       }
-      return cfg.verificationReuse ? { ...page, jobs: page.jobs.filter(job => owns(owner, job.context?.owner)) } : page;
+      return jobs;
     };
-    const children = await list({ parent_job: id, limit: 1 });
-    if (children.jobs.some(job => job.parent_job_id === id || job.context?.continuation?.parent_job_id === id)) return true;
-    if (!source.thread_id || !Number.isFinite(source.started_at)) return false;
-    for (let offset = 0; offset !== null;) {
-      const page = await list({ thread_id: source.thread_id, limit: 100, offset });
-      if (page.jobs.some(job => !job.context?.verification_of && job.job_id !== id &&
-          job.thread_id === source.thread_id && job.started_at > source.started_at)) return true;
-      offset = page.next_offset ?? null;
+    const rounds = [source], seen = new Set([source.job_id]), threads = new Set();
+    for (const round of rounds) {
+      const related = await list({ parent_job: round.job_id });
+      if (round.thread_id && !threads.has(round.thread_id)) {
+        threads.add(round.thread_id);
+        related.push(...await list({ thread_id: round.thread_id }));
+      }
+      for (const job of related) {
+        if (!job.job_id || seen.has(job.job_id) || job.context?.verification_of) continue;
+        const child = parentOf(job) === round.job_id;
+        if (!child && (!round.thread_id || job.thread_id !== round.thread_id || job.started_at <= source.started_at)) continue;
+        if (!Number.isFinite(job.started_at) || (!child && !Number.isFinite(source.started_at)) ||
+            job.started_at > after || job.finished_at > after) return true;
+        seen.add(job.job_id);
+        rounds.push(job);
+      }
     }
     return false;
+  }
+
+  async function verificationUnchanged(source, previous, signal) {
+    if (!Number.isFinite(source.started_at)) return false;
+    try {
+      const versions = await conductor.verificationVersion(source.job_id, signal);
+      signal?.throwIfAborted();
+      if (previous.verification_version && previous.verification_version !== versions.verification_version) return false;
+      const unchanged = previous.verification_evidence_version
+        ? versions.evidence_version === previous.verification_evidence_version
+        : Number.isFinite(versions.evidence_updated_at) && versions.evidence_updated_at <= previous.started_at;
+      return Boolean(versions.evidence_version && unchanged && Number.isFinite(previous.started_at) &&
+        !await hasLaterRound(source, previous.started_at, signal));
+    } catch {
+      signal?.throwIfAborted();
+      return false;
+    }
   }
 
   // 热重载后，旧实例里等任务结果的循环还在。它若自己派核验或接替，就按过时的配置派单：2026-11-22 配置改回 Neon Medium 后，
@@ -3047,6 +3087,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing, guard = {}) {
+    verificationOf ??= guard.parent?.context?.verification_of;
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
@@ -3475,13 +3516,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, args, exec, 'codex_run');
       // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
       let thread = null;
-      const threadLookedUp = args.resume && (cfg.modelAB.enabled || args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0);
-      if (threadLookedUp) {
+      if (args.resume) {
         try { thread = await runThread(args, exec); } catch { exec?.signal?.throwIfAborted(); }
       }
       if (thread && thread.parent_thread_id !== args.resume) args = { ...args, resume: thread.parent_thread_id };
-      const parent = thread?.parent_job_id && (thread.mode === 'fresh' || cfg.modelAB.enabled)
-        ? await previousJob(thread.parent_job_id, exec) : undefined;
+      const parent = thread?.parent_job_id ? await previousJob(thread.parent_job_id, exec) : undefined;
       let fresh;
       if (thread?.mode === 'fresh') {
         if (!parent) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
@@ -3571,22 +3610,38 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   };
   async function verificationReuseCheck(source, args, owner, automatic, signal) {
     const scope = verificationScope(source, args, historicalIndexes(source));
-    let completed;
+    let completed, latest;
     for await (const job of verificationJobs(owner, automatic, signal, source.job_id)) {
       const status = job.execution_status ?? job.status;
-      if (automatic || status === 'running') return { job_id: job.job_id, status };
+      if (status === 'running') return { job_id: job.job_id, status };
+      if (!latest) latest = job;
+      if (automatic) {
+        if (status !== 'completed' || await verificationUnchanged(source, job, signal)) return { job_id: job.job_id, status };
+        return;
+      }
       if (!completed && status === 'completed' && job.report_status === 'valid' && job.verification_version && job.verification_scope === scope) completed = job;
     }
-    if (completed) {
-      const { verification_version } = await conductor.verificationVersion(source.job_id, signal).catch(() => ({}));
-      signal?.throwIfAborted();
-      if (verification_version === completed.verification_version) {
-        throw Object.assign(new Error(`codex_verify: ${source.job_id} 的文件及核验范围未变，复用核验 ${completed.job_id}。` +
-          `用 codex_status ${JSON.stringify({ job_id: completed.job_id })} 取回核验报告，再对 ${source.job_id} 提交 codex_review。`),
-        { code: 'VERIFICATION_UNNEEDED' });
+    if (args.force || args.new_evidence) return;
+    if (latest && (latest.execution_status ?? latest.status) === 'completed') {
+      const previous = withReport(await conductor.waitJob(latest.job_id, 0, signal));
+      const missing = /缺证据|证据不足|缺少.*证据|无法确认|不能确认|insufficient evidence|cannot (?:confirm|verify)|unverifiable/i;
+      if (validReport(previous.report) && previous.report.criteria.some(item => item.status === 'blocked' &&
+          (missing.test(item.evidence) || missing.test(previous.report.summary)))) {
+        if (await verificationUnchanged(source, previous, signal)) {
+          return { ...previous, evidence_unchanged: true,
+            next: `原任务 ${source.job_id} 没有新执行、续接或产物证据，返回上次核验 ${previous.job_id} 的结论，不再派单。` +
+              '请补证据（new_evidence）、交所有者裁决，或显式传 force: true 强制重核。' };
+        }
+        return;
       }
     }
+    if (completed && await verificationUnchanged(source, completed, signal)) {
+      throw Object.assign(new Error(`codex_verify: ${source.job_id} 的文件及核验范围未变，证据及后续轮次也未变，复用核验 ${completed.job_id}。` +
+        `用 codex_status ${JSON.stringify({ job_id: completed.job_id })} 取回核验报告，再对 ${source.job_id} 提交 codex_review；确需重核可传 force: true。`),
+      { code: 'VERIFICATION_UNNEEDED' });
+    }
   }
+
   async function runningVerificationRefusal(args, exec, tool, chain, resumeThread) {
     const { signal, agent: { id: owner } } = exec;
     const warn = (error) => {
@@ -3663,13 +3718,15 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     name: 'codex_verify',
     description: '独立核验本会话一个已结束的任务：新会话、只读，沿用原目录和主机访问。配置了 Gemini 时默认换另一引擎。核验只做一层，核验任务本身不能再核验。' +
       engineGuidance(cfg) +
-      (cfg.verificationReuse ? '没有可核验产出的受阻任务不派核验。文件和核验范围都未变时复用上一份核验。' : '') +
+      (cfg.verificationReuse ? '没有可核验产出的受阻任务不派核验。缺证据且原单和产物未变时直接返回上次结论；有新证据传 new_evidence，强制重核传 force: true。文件和核验范围都未变时复用上一份核验。' : '') +
       '回到出处抽查产物中的结论；结束后用 codex_review 记录原任务的验收。' + WAIT_GUIDANCE,
     presentCall: (a) => ({ card: 'generic', kind: 'execute', title: `独立核验 Codex ${a?.job_id ?? ''}` }),
     parameters: { type: 'object', properties: {
       job_id: { type: 'string', description: '本会话已结束的 runner job_id。' },
       engine: engineParameter,
       focus: { type: 'string', description: '可选，重点核对什么。' },
+      new_evidence: { type: 'string', description: '补充的新证据或其可回查路径；提供后重新核验。' },
+      force: { type: 'boolean', description: '显式强制重核已结束的核验；仍复用运行中的核验。' },
       samples: { type: 'integer', minimum: 1, maximum: 30, description: '默认抽查 8 条，最多 30 条。' },
       wait_seconds: { type: 'integer', minimum: 0, description: waitSecondsDescription },
     }, required: ['job_id'] },
@@ -3678,6 +3735,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       checkEngine(args?.engine);
       if (typeof args?.job_id !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(args.job_id)) throw new Error('codex_verify: job_id 无效；请用 codex_jobs 找回 runner 任务编号');
       if (args.focus !== undefined && typeof args.focus !== 'string') throw new Error('codex_verify: focus 必须是字符串');
+      if (args.force !== undefined && typeof args.force !== 'boolean') throw new Error('codex_verify: force 必须是布尔值');
+      if (args.new_evidence !== undefined && (typeof args.new_evidence !== 'string' || !args.new_evidence.trim())) throw new Error('codex_verify: new_evidence 必须是非空字符串');
       if (args.samples !== undefined && (!Number.isInteger(args.samples) || args.samples < 1 || args.samples > 30)) throw new Error('codex_verify: samples 必须是 1–30 的整数');
       if (args.wait_seconds !== undefined && (!Number.isInteger(args.wait_seconds) || args.wait_seconds < 0)) throw new Error('codex_verify: wait_seconds 必须是非负整数');
       const owner = exec?.agent?.id;
@@ -3699,7 +3758,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const { value, error, existing } = await pending;
         exec?.signal?.throwIfAborted();
         if (error) throw error;
-        if (existing && value.status !== 'running' && !automatic) return verifyTool.execute(args, exec);
+        if (existing && value.status !== 'running' && !automatic && (!value.evidence_unchanged || args.force || args.new_evidence)) return verifyTool.execute(args, exec);
         return reuseVerification(id, value);
       }
       const receipt = Promise.withResolvers();
@@ -3777,7 +3836,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       ...(engine === 'codex' ? {
         effort: cfg.readOnlyEffort || (same ? options.effort : cfg.effort) || undefined,
         model: cfg.modelAB.enabled || !same ? cfg.model : options.model ?? '',
-        service_tier: cfg.verifyServiceTier || (same ? options.service_tier ?? '' : cfg.serviceTier),
       } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
     }, exec, undefined, undefined, source.job_id, undefined,
@@ -4156,7 +4214,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         }
         const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, plan.args, exec, 'codex_continue');
         const sourceEngine = jobEngine(source);
-        const engine = cfg.lockEngine ? runEngine({}, cfg) : args.engine ?? sourceEngine;
+        const engine = source.context.verification_of && cfg.verifyEngine ? args.engine ?? sourceEngine
+          : cfg.lockEngine ? runEngine({}, cfg) : args.engine ?? sourceEngine;
         plan.args.engine = engine;
         if (engine !== sourceEngine) {
           for (const key of ['resume', 'conversation_id', 'agy_home', 'model', 'service_tier', 'effort', 'use_user_config']) delete plan.args[key];

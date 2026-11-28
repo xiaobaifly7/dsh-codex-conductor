@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-候选版本为 `0.9.132-gemini.0`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
+候选版本为 `0.9.215`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 0.9.66：规划端只读产物与独立核验
 
@@ -31,6 +31,8 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 核验报告的 blocked evidence 使用 `[缺证据]`、`[环境]`、`[需用户]`、`[需改状态]` 分类；回执据此提示补证据、重核验或按已有授权处理，验收状态仍由原有 `codex_review` 规则决定。
 
 规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录和主机访问。未启用 modelAB 时沿用原模型，启用时使用配置的默认模型。全程只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后用 `codex_review` 记录原任务的验收。同一版本已完成验收、产物未变且没有新证据时，不再追加核验；`codex_review` 只记录验收，不另派调查。Gemini 正文的核对见下文，不能用旧素材任务的 `codex_verify` 替代。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
+
+缺证据或无法确认的核验，在原单记录、声明范围、产物及证据均未变化、且此后没有执行或续接时，直接返回上次报告，不再派整单核验。补充证据用 `new_evidence: "证据内容或可回查路径"`；需要显式重核用 `force: true`。产物或已有 Git 版本变化后照常派单；没有声明范围或产物路径时监控原项目目录。已通过的核验在复用、作为 must_verify 独立依据或销掉未完成项前，也同时检查证据版本和后续轮次。续接检查沿子孙轮次及其关联线程继续查询；不可读子单的列表标记 incomplete。变化或续接查询失败、不完整时不采信旧结论，放行重新核验，调用方取消仍中止。仅修改 `focus` 或抽查数量不算补证据。执行、续接和核验提示都要求等待 30–60 秒，回查输出的 `yield_time_ms` 至少为 `30000`。
 
 核验可以实际运行原项目的检查。沙箱核验在每单的暂存目录启动，提示核验员先读项目的 `AGENTS.md`，再切到项目目录运行检查。只有暂存目录可写，测试临时文件和缓存使用其中的 `TMPDIR`。主机访问核验沿用原有权限，临时文件仍在项目外。runner 在核验前后比较受核验范围的 Git 状态、提交、索引和已改动或未跟踪文件的内容。未指定范围或产物时，以原任务目录为范围，此时只有范围重叠的并行写任务才算并行变更。范围内变化会使核验失败，范围外变化会出提示。无法读取的内容、单文件超过 1 MiB 或单次比对超过 32 MiB 的部分会标注未比对，非 Git 目录或查询超时会注明比对不可用。
 
@@ -76,13 +78,15 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 ### 0.9.115 自动代答宿主提问
 
+默认高风险正则识别中英文凭据修改、更新、生成、轮换、renew/revoke/regenerate 等动作及密码、密钥、API token、access key 等对象，支持正反语序。动作与凭据之间最多 40 字；单字“改、设”在凭据前最多允许 12 字修饰，兼容 Samba 连接名。允许跨逗号和换行；句号、问号、感叹号、分号截断，英文点号仅在后跟空白或结尾时截断，IP、域名、账号内点号保留。同一问题的 header、question、detail、选项标签和说明先用换行拼接判断，不跨问题拼接。单独凭据名词、token 脱敏、设备密码算法、设置页、字段计数和只读元数据查询不触发；“查看并更新密码”仍触发。逗号同句内的无关动作与凭据可能保守暂缓。已有 `autoAnswer.riskyPattern` 会覆盖默认值，部署时须同步补上动作匹配；`whenRisky: defer` 命中后只返回暂缓说明，`selected` 恒为空，不按选项文字猜哪个是“不做”。
+
 宿主的 `ask_user_question` 等满 10 分钟后，conductor 会逐题选择有推荐标记的选项，找不到标记时选首项。多选题会选中所有带推荐标记的项，自由文本题使用配置的说明。答案会附上代答说明。热重载保留原提出时间，宿主恢复的待答提问也按原时间计时，已超时的再给用户 30 秒。
 
 题目或任一选项触发高风险正则时，整批由用户回答；设 `whenRisky: defer` 时改为超时后对触发的那几问答「先不做」（见上表），其余照常选推荐项，记录原因为 `deferred_risky` / `deferred_owner_only`。排除会话、按设置排除的子代理会话、宿主权限审批和计划审核、conductor 的交接确认都留给用户。宿主提供提问服务时，“Codex 指挥 → 自动代答”会显示待答提问和最近 10 条记录。可以现在按推荐提交，或为某条提问取消代答。宿主能恢复的提问会保留人工接管选择。
 
 本机记录在 `%LOCALAPPDATA%\dsh-codex-conductor\auto-answer-history.jsonl`，保留最近 300 行，仅保存提问和所选标签的短摘要与判断依据。已恢复提问的人工接管标记保存在同目录的 `auto-answer-manual.json`。
 
-默认高风险正则（不区分大小写）为 `删除|清空|不可恢复|不可逆|覆盖|格式化|卸载|重置|drop |truncate|rm -rf|force.?push|付款|支付|购买|转账|充值|密码|密钥|口令|凭据|token|secret|发布到|上线到生产|生产环境|对外发送|发邮件|真实目标|授权范围`。
+默认高风险正则不区分大小写，保留删除、支付、发布等既有风险分支，并加入上述凭据动作；完整表达式见 [autoanswer.mjs](autoanswer.mjs) 的 `AUTO_ANSWER_DEFAULTS.riskyPattern` 和 `CREDENTIAL_ACTION_PATTERN`。
 
 ### 0.9.114：自标未满足的验收项结案要有独立依据
 
@@ -274,7 +278,7 @@ bili `decompress` 把大块原文写入临时文件后，规划端可直接 read
 | `lockEngine` | `false` | `true` 时新任务、续接和核验一律用 `defaultEngine`，规划端传的 `engine` 不生效；续接另一引擎的任务时附上轮交接开新会话，锁定 Gemini 时 `codex_run` 不接受 `resume` |
 | `crossEngineVerify` | `true` | 已配置 Gemini 时用另一引擎独立只读核验，`codex_verify` 的显式引擎优先 |
 | `verifyEngine` | 空 | `codex` 或 `gemini`：核验单一律用这个引擎，`lockEngine` 时也生效，规划端传的 `engine` 不生效；Codex 额度用完时核验改派 Gemini。留空按 `lockEngine` / `crossEngineVerify` |
-| `verifyServiceTier` | 空 | Codex 核验单的 service tier，例如 `fast`；留空同 `serviceTier` |
+| `verifyServiceTier` | `default` | Codex 核验及其续接的 service tier；未配置、留空或仅空白时显式使用标准档，不继承原单、`serviceTier` 或 Codex 用户配置；显式值仍优先 |
 | `geminiFallback` | `true` | Codex 因模型或上游问题失败且 runner 确认无写入时，启动关联的 Gemini 任务 |
 | `maxGeminiRunningJobs` | `2` | 同时运行的 Gemini 任务上限；超出的任务排队（`phase: engine_wait`）直到有名额，最多等 `lockTimeoutSeconds`，`null` 表示不设单独上限 |
 
@@ -519,7 +523,7 @@ dsh plugin --profile <profile> add github:xiaobaifly7/dsh-codex-conductor
 | `historicalGapReview` | `true` | 允许逐条记录无法补回的历史记录。填写 `historical_gap` 和 `accepted`，保留未满足状态。必验、安全、权限及数据完整性项按原复核规则处理。 |
 | `dispatchConsistency` | `true` | 用 `required_writes` 和可确定的书面交付路径查派单读写及 scope 矛盾。 |
 | `actionableReceipts` | `true` | 收尾、复核参数和待答问题出错时，附上本会话可确认的任务和条目编号以及提交骨架。 |
-| `verificationReuse` | `true` | 跳过全部条目均未满足且无产出的受阻任务。同一任务的文件版本与核验范围均可确认未变时复用已有核验。 |
+| `verificationReuse` | `true` | 跳过全部条目均未满足且无产出的受阻任务。同一任务的文件、证据版本、核验范围及后续轮次均可确认未变时复用已有核验。 |
 | `handoverSuggestMessages` | `5000` | 会话消息数超过此值时标记“建议交接”；0 关闭（`autoHandover` 的提醒、询问和自动交接随之关闭）。这也是 `autoHandover` 的触发阈值 |
 | `handoverContextTokens` | `0` | 最近 20 次请求的窗口内有模型 `compress` 成功回执或原生 `compaction/end` 成功事件（bili 发送前强制压缩不写宿主事件，不计入）、且上下文（输入加缓存命中 token）都不低于此值时也标记“建议交接”，`autoHandover` 照常处理；继任会话不必先涨满消息阈值。用于压缩后仍降不下来的会话，它们的消息数可能还不多；子代理会话不计；0 关闭 |
 | `acceptanceWarnAbove` | `8` | 新派活验收标准超过此条数时在回执里提醒（不拦截）；0 关闭 |
@@ -691,7 +695,7 @@ python3 runner/test_codex_runner.py
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-The candidate version is `0.9.132-gemini.0`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The candidate version is `0.9.215`. Credential-changing actions in either Chinese or English word order cover updates, generation, creation, rotation, renewal and revocation, including passphrases, tokens and access keys. The gap is bounded to 40 characters (12 after single Chinese verbs), allowing commas, newlines and dots inside identifiers; periods followed by whitespace or end-of-input, other sentence punctuation and semicolons stop matching. Fields within one question are joined before matching; deferred answers always have an empty selected array with a custom deferral message. Bare nouns, token-redaction checks, device/password-algorithm questions, settings-page inspections, password-field counts and read-only metadata/history queries remain allowed; a query followed by an actual update remains risky. Unrelated actions and credentials within one comma-separated sentence may conservatively defer. Existing custom `autoAnswer.riskyPattern` overrides require the same action patterns; `whenRisky: defer` retains its skip-and-confirm behavior. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 
@@ -716,6 +720,8 @@ Products-only denials briefly explain the reason: delegate investigation to `cod
 Use `codex_verify` for factual checks after mechanically checking product presence, citations and matching numbers: `{"job_id":"original-job-id","focus":"Check figures and citations","samples":8,"wait_seconds":0}`. Sampling defaults to 8 and accepts 1–30; waiting follows `codex_run`. Only finished jobs owned by the current session qualify. Verification starts a fresh read-only thread with the original directory and host access. It uses the original model unless modelAB is enabled, in which case it uses the configured default. It reads the original task, acceptance criteria, products and cited sources, and reports each checked claim, source, truth status and correction through the existing report schema. `context.verification_of` links the jobs in `codex_jobs` and `codex_status`. Record final acceptance of the original job with `codex_review`. Once review is done for the same product version, do not add verification unless the product changes or new evidence appears; `codex_review` records acceptance without starting another investigation. Gemini prose requires the output check described below; verifying an old source-material job with `codex_verify` is no substitute. As with existing `write=false` tasks, host-access mode enforces read-only work through the task instructions rather than an OS sandbox.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [eleven Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+
+Verification that could not confirm findings because of missing evidence returns its previous report without another dispatch when the source records, declared scope, products and evidence are unchanged and no execution or continuation followed. Supply `new_evidence: "evidence or a retrievable path"` or explicitly request `force: true` to recheck. Passed reports are also checked against current evidence versions and descendant executions before reuse, must_verify support or accepted-open debt removal. Changed products or a changed known Git version permit verification. Without declared scopes or product paths, change detection covers the project directory. Follow-up checks traverse descendant rounds and their threads; unreadable child results mark lists incomplete; incomplete or failed queries permit verification without trusting the old report, while caller cancellation still aborts. Changing only `focus` or the sample count does not supply evidence. Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms` of at least `30000`. Codex verification and all continuation paths, including codex_run(resume), explicitly use `service_tier="default"` when `verifyServiceTier` is absent, empty or whitespace-only, instead of inheriting the source job, general plugin tier or Codex user configuration; explicit overrides remain supported.
 
 Verification can run the project's checks. Sandboxed verification starts in writable per-job scratch, reads the project's `AGENTS.md`, and runs checks from the read-only project directory. Temporary and cache files go to `TMPDIR` inside scratch. Host-access verification keeps its original access and also uses project-external scratch for temporary files. The runner compares Git status, committed state, index state and dirty or untracked contents within the verified paths. In the absence of scope and products, it monitors the source job's directory and counts only overlapping writers as concurrent changes. Changes inside the monitored paths fail the check, subject to that concurrency check. The receipt reports changes outside the scope, unavailable comparisons, and files left unchecked because they could not be read or exceeded the 1 MiB per-file or 32 MiB per-snapshot limit.
 
