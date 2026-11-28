@@ -182,6 +182,51 @@ test('whenRisky defer answers risky and owner-only questions with a deferral aft
     ['deferred_owner_only', 'deferred_risky', 'first_option'].sort());
 });
 
+test('default risk matching requires a credential modification action rather than a bare credential noun', () => {
+  const risk = new RegExp(AUTO_ANSWER_DEFAULTS.riskyPattern, 'i');
+  for (const action of ['改', '设', '设置', '修改', '重置', '更换']) {
+    for (const noun of ['密码', '口令', '凭据', '凭证', '密钥']) {
+      const text = `${action} Samba 测试${noun}并做连接测试`;
+      assert.equal(risk.test(text), true, text);
+    }
+  }
+  for (const action of ['change', 'set', 'reset', 'rotate']) {
+    for (const noun of ['password', 'credential', 'secret']) {
+      const text = `${action.toUpperCase()} the Samba test ${noun}`;
+      assert.equal(risk.test(text), true, text);
+    }
+  }
+  for (const text of ['检查日志里的 token 是否已脱敏', 'token', 'password', 'credential', 'secret',
+    '密码', '口令', '凭据', '凭证', '密钥', 'check password settings', 'inspect the secret', 'asset password']) {
+    assert.equal(risk.test(text), false, text);
+  }
+});
+
+test('credential changes defer across question fields while checking token redaction answers normally', async (t) => {
+  const tick = clock(t), h = host(t, { settings: { whenRisky: 'defer' } }), panel = h.load();
+  const risky = [
+    question(undefined, { question: '设 Samba 测试口令并做连接测试' }),
+    question(undefined, { header: '修改 Samba 密码' }),
+    question(undefined, { detail: '更换 Samba 凭证' }),
+    question([choice('SET the Samba test password（推荐）')]),
+    question([choice('连接测试（推荐）', 'rotate the Samba test credentials')]),
+  ].map((q, i) => ({ ...q, id: `credential-${i}` }));
+  const pending = h.open([...risky, question(undefined, {
+    id: 'redaction', question: '检查日志里的 token 是否已脱敏',
+  })]);
+  assert.equal(panel.snapshot().pending[0].reason, 'risky');
+  tick();
+  const { answers } = await pending.result;
+  for (const answer of answers.slice(0, -1)) {
+    assert.deepEqual(answer.selected, []);
+    assert.match(answer.custom, /不执行这一步/);
+  }
+  assert.deepEqual(answers.at(-1).selected, ['方案 A']);
+  await flush();
+  assert.deepEqual(panel.snapshot().recent.map(({ reason }) => reason).sort(),
+    [...Array(risky.length).fill('deferred_risky'), 'first_option'].sort());
+});
+
 test('a custom risk pattern applies to question text and an empty pattern disables risk matching', async (t) => {
   const tick = clock(t);
   const guarded = host(t, { settings: { riskyPattern: '风险示例' } }), guardedPanel = guarded.load();

@@ -2,6 +2,8 @@
 
 [English](#english)
 
+`0.9.215` 执行、续接和核验提示明确等待 30–60 秒、回查输出 `yield_time_ms` 至少 30000。缺证据且原单、产物未变、没有后续执行或续接时返回上一份核验结论，补证据用 `new_evidence`，强制重核用 `force: true`；比较复用现有记录和文件元数据，无需 Git 仓库，无法确认变化时放行。自动代答默认正则将中英文修改凭据动作判为高风险，裸凭据名词和 token 脱敏检查仍放行；现有自定义正则须部署时同步补齐，配置未改。
+
 `0.9.214` 独立核验派发前如有路径重叠的运行中写任务则等待并列出任务号；只读任务、路径不重叠或查询失败均放行。核验运行中新增写入仍按原有核验逻辑处理；超时提示明确要求将数量或时间预算写在任务正文中。
 
 `0.9.213` 执行单在整个仓库之外保存完整原始观测证据，按 Windows/WSL 提供可用路径，保留额外可写根；证据事件按规范化后的真实路径排除，无法解析时保留修改记录；Gemini 只读及非主机单沿用原权限，不分配项目外证据目录；Windows 证据路径转换不可用时退回无项目外证据目录继续执行；独立核验优先回查证据，blocked 条目按缺证据、环境、需用户、需改状态给出处理提示。worktree 保留既有建立、状态查询、按会话核验后合并和手动关闭，不加入自动清理；主机核验沿用 0.9.211 的 Git 比较。总超时提示要求先核对产物、按数量或时间预算拆小批；仅在报告有效且满足条件时续接，缺报告时核实产物后只为当前小批新建任务。
@@ -323,6 +325,8 @@
 `0.9.42` 在派单前无法连接 WSL 时会说明原因，保留原有写入范围和续接检查。
 
 ## English
+
+`0.9.215` Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms >= 30000`. Missing-evidence verification reuses the previous conclusion when source records and products are unchanged and no execution or continuation followed; `new_evidence` and `force: true` allow rechecking. Existing records and file metadata provide change detection outside Git, and unavailable detection permits verification. Default auto-answer matching treats Chinese and English credential-changing actions as risky while bare credential nouns and token-redaction checks remain allowed; custom patterns need the same deployment update. Runtime configuration is unchanged.
 
 `0.9.214` Before dispatch, independent verification waits for running write jobs with overlapping paths and lists their job IDs; read-only jobs, non-overlapping paths and query failures do not block it. Writes started during verification retain existing verification handling. Timeout guidance explicitly requires quantity or time budgets in the task body.
 

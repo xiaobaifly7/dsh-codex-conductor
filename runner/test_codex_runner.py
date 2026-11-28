@@ -91,6 +91,9 @@ FAKE_CODEX = textwrap.dedent(r"""
         finish(json.dumps({"summary": status, "criteria": [
             {"criterion": "run the check", "status": status, "evidence": status}
         ], "files_changed": [], "deviations": [], "unresolved": []}))
+    elif mode == "verification_evidence_change":
+        Path(os.environ["FAKE_EVIDENCE_TARGET"]).write_text("changed during verification\n", encoding="utf-8")
+        finish()
     elif mode == "repeat_guard_start":
         if "resume" not in sys.argv:
             say(type="item.started", item={"id": "step", "type": "command_execution",
@@ -7131,6 +7134,209 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["sandbox"], "read-only")
         self.assertIn("--ephemeral", self.calls()[0]["argv"])
         self.assertEqual(sorted(entry.name for entry in self.cwd.iterdir()), ["temp_check.py"])
+
+    def test_verification_evidence_version_without_git_or_evidence_is_saved_and_listed(self):
+        source = self.stored_job("SOURCE", {"status": "completed", "output": "missing-output.txt"},
+                                 scope=["missing-scope"])
+        version = self.control("verification-version", "SOURCE")
+        self.assertIsNone(version["verification_version"])
+        self.assertRegex(version["evidence_version"], r"^[a-f0-9]{64}$")
+        self.assertEqual(self.control("verification-version", "SOURCE"), version)
+        self.assertFalse((source / "evidence").exists())
+        context = {"owner": "S1", "task": "Verify missing evidence", "acceptance": ["check evidence"],
+                   "write": False, "verification_of": "SOURCE", "routing": {"verification_scope": "scope"}}
+        job = self.invoke("--context-json", "--sandbox", "read-only", command="start",
+                          prompt=json.dumps({"prompt": "Check evidence", "context": context}))
+        result = self.control("status", job["job_id"], "--wait", "30")
+        self.assertEqual(result["status"], "completed", result)
+        self.assertLessEqual(version["evidence_updated_at"], result["started_at"])
+        self.assertNotIn("verification_version", result)
+        self.assertEqual(result["verification_evidence_version"], version["evidence_version"])
+        self.assertEqual(result["verification_scope"], "scope")
+        saved = json.loads((Path(result["log_dir"]) / "result.json").read_text("utf-8"))
+        self.assertEqual(saved["verification_evidence_version"], version["evidence_version"])
+        listed = self.control("list", "--verification-of", "SOURCE")["jobs"]
+        self.assertEqual(listed[0]["verification_evidence_version"], version["evidence_version"])
+        context.pop("routing")
+        unmarked = self.invoke("--context-json", "--sandbox", "read-only",
+                               prompt=json.dumps({"prompt": "Check evidence", "context": context}))
+        self.assertNotIn("verification_evidence_version", unmarked)
+
+    def test_verification_evidence_version_tracks_products_and_nested_evidence_metadata(self):
+        source = self.stored_job("SOURCE", {"status": "completed", "files_changed": [{"path": "changed.txt"}],
+            "write_paths": ["written.txt"], "structured": {"files_changed": ["reported.txt"]}, "output": "output.txt"},
+            scope=["declared"])
+        (self.cwd / "declared").mkdir()
+        (source / "evidence" / "nested").mkdir(parents=True)
+        version = self.control("verification-version", "SOURCE")["evidence_version"]
+        self.assertIsNotNone(version)
+        for path in [*(self.cwd / name for name in ("declared/new.txt", "changed.txt", "written.txt", "reported.txt", "output.txt")),
+                     source / "evidence" / "nested" / "observation.txt"]:
+            for action in ("add", "modify", "delete"):
+                with self.subTest(path=path, action=action):
+                    if action == "delete":
+                        path.unlink()
+                    else:
+                        path.write_text(action, "utf-8")
+                    changed = self.control("verification-version", "SOURCE")["evidence_version"]
+                    self.assertIsNotNone(changed)
+                    self.assertNotEqual(changed, version)
+                    version = changed
+        outside = self.cwd / "unrelated.txt"
+        outside.write_text("outside declared paths", "utf-8")
+        self.assertEqual(self.control("verification-version", "SOURCE")["evidence_version"], version)
+        external = Path(self.tmp.name) / "external-evidence"
+        external.mkdir()
+        result_file = source / "result.json"
+        result_file.write_text(json.dumps({"status": "completed", "evidence_dir": str(external)}), "utf-8")
+        version = self.control("verification-version", "SOURCE")["evidence_version"]
+        (external / "observation.txt").write_text("external evidence", "utf-8")
+        self.assertNotEqual(self.control("verification-version", "SOURCE")["evidence_version"], version)
+
+    def test_verification_evidence_version_tracks_source_records(self):
+        source = self.stored_job("SOURCE", {"status": "completed"})
+        version = self.control("verification-version", "SOURCE")["evidence_version"]
+        self.assertIsNotNone(version)
+        for name in ("args.json", "result.json", "prompt.txt", "last_message.txt", "events.jsonl", "stderr.log"):
+            with self.subTest(name=name):
+                path = source / name
+                with path.open("a", encoding="utf-8") as file:
+                    file.write(" \n")
+                changed = self.control("verification-version", "SOURCE")["evidence_version"]
+                self.assertIsNotNone(changed)
+                self.assertNotEqual(changed, version)
+                version = changed
+        (source / "reviews.json").write_text("[]", "utf-8")
+        self.assertEqual(self.control("verification-version", "SOURCE")["evidence_version"], version)
+
+    def test_verification_evidence_version_does_not_save_a_changed_version(self):
+        source = self.stored_job("SOURCE", {"status": "completed", "output": "output.txt"})
+        (source / "evidence").mkdir()
+        prompt = json.dumps({"prompt": "Check evidence", "context": {"owner": "S1", "task": "Verify evidence",
+            "acceptance": ["check evidence"], "write": False, "verification_of": "SOURCE",
+            "routing": {"verification_scope": "scope"}}})
+        for target in (self.cwd / "output.txt", source / "evidence" / "observation.txt", source / "prompt.txt"):
+            with self.subTest(target=target):
+                before = self.control("verification-version", "SOURCE")["evidence_version"]
+                result = self.invoke("--context-json", "--sandbox", "read-only", prompt=prompt,
+                                     mode="verification_evidence_change", env={"FAKE_EVIDENCE_TARGET": str(target)})
+                self.assertEqual(result["status"], "completed", result)
+                self.assertNotIn("verification_evidence_version", result)
+                self.assertNotEqual(self.control("verification-version", "SOURCE")["evidence_version"], before)
+
+    def test_verification_evidence_version_unreadable_or_timed_out_is_unknown(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir)}
+        with mock.patch.object(codex_runner, "snapshot", return_value=None) as snapshot:
+            self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+        self.assertGreater(snapshot.call_args.kwargs["budget"], 0)
+        self.assertLessEqual(snapshot.call_args.kwargs["budget"], 3)
+        with mock.patch.object(codex_runner, "snapshot", side_effect=PermissionError("unreadable")):
+            self.assertIsNone(codex_runner.verification_evidence_version(source))
+        with mock.patch.object(codex_runner.time, "monotonic", side_effect=[0, 4]), \
+                mock.patch.object(codex_runner, "snapshot") as snapshot:
+            self.assertIsNone(codex_runner.verification_evidence_version(source))
+        snapshot.assert_not_called()
+
+    def test_verification_evidence_snapshot_with_nested_symlink_is_unknown(self):
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        evidence = source_dir / "evidence" / "nested"
+        evidence.mkdir(parents=True)
+        target = self.cwd / "product.txt"
+        target.write_text("original product", "utf-8")
+        try:
+            (evidence / "proof.txt").symlink_to(target)
+        except OSError as error:
+            if os.name == "nt" and error.winerror == 1314:
+                self.skipTest("Windows symlink privilege unavailable")
+            raise
+        result = self.control("verification-version", "SOURCE")
+        self.assertIsNone(result["evidence_version"])
+        self.assertIsNone(result["evidence_updated_at"])
+
+    def test_verification_evidence_snapshot_reports_latest_metadata_time_in_one_pass(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        evidence = source_dir / "evidence" / "nested"
+        evidence.mkdir(parents=True)
+        proof = evidence / "proof.txt"
+        proof.write_text("evidence", "utf-8")
+        future = time.time_ns() + 100_000_000_000
+        os.utime(proof, ns=(future, future))
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir)}
+        with mock.patch.object(codex_runner, "snapshot", wraps=codex_runner.snapshot) as snapshot:
+            version, updated_at = codex_runner.verification_evidence_snapshot(source)
+        self.assertIsNotNone(version)
+        self.assertEqual(updated_at, future / 1e9)
+        roots = [call.args[0] for call in snapshot.call_args_list]
+        self.assertEqual(len(roots), len(set(roots)))
+        self.assertEqual(set(roots), {str(source_dir / "args.json"), str(source_dir / "result.json"),
+                                     str(source_dir / "evidence")})
+        os.utime(proof, ns=(0, 0))
+        expected = max(max(path.stat().st_mtime_ns, path.stat().st_ctime_ns) for path in
+                       [source_dir, source_dir / "args.json", source_dir / "result.json",
+                        source_dir / "evidence", evidence, proof]) / 1e9
+        self.assertEqual(codex_runner.verification_evidence_snapshot(source)[1], expected)
+
+    def test_verification_evidence_snapshot_missing_product_time_ignores_neighbor_jobs(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"})
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir), "output": "missing/nested/output.txt"}
+        before = codex_runner.verification_evidence_snapshot(source)
+        self.assertIsNotNone(before[0])
+        self.assertLessEqual(before[1], time.time())
+        (source_dir.parent / "NEIGHBOR").mkdir()
+        future = time.time_ns() + 100_000_000_000
+        os.utime(source_dir.parent, ns=(future, future))
+        self.assertEqual(codex_runner.verification_evidence_snapshot(source), before)
+        os.utime(self.cwd, ns=(future, future))
+        after = codex_runner.verification_evidence_snapshot(source)
+        self.assertEqual(after[0], before[0])
+        self.assertEqual(after[1], future / 1e9)
+
+    def test_verification_evidence_snapshot_windows_cross_drive_paths_have_absolute_keys(self):
+        import hashlib
+        import ntpath
+        from pathlib import PureWindowsPath
+        import codex_runner
+
+        source = {"cwd": r"E:\project", "scope": ["src"], "job_dir": r"D:\runner\jobs\SOURCE",
+                  "evidence_dir": r"F:\evidence", "output": r"E:\project\missing.txt"}
+        info = SimpleNamespace(st_size=1, st_mtime_ns=2_000_000_000, st_mode=0o100644,
+                               st_ctime_ns=3_000_000_000, st_ino=4)
+        fingerprint = (info.st_size, info.st_mtime_ns, info.st_mode, info.st_ctime_ns, info.st_ino)
+        expected = {source["output"]: None}
+
+        def lstat(path):
+            if path == source["output"]:
+                raise FileNotFoundError(path)
+            return info
+
+        def snapshot(root, *, budget, scope, strict):
+            self.assertEqual(scope, [root])
+            self.assertGreater(budget, 0)
+            self.assertLessEqual(budget, 3)
+            self.assertTrue(strict)
+            expected[root] = fingerprint
+            entries = {".": fingerprint}
+            if root == source["evidence_dir"]:
+                entries[r"nested\proof.txt"] = fingerprint
+                expected[ntpath.join(root, r"nested\proof.txt")] = fingerprint
+            return entries
+
+        with mock.patch.object(codex_runner, "Path", PureWindowsPath), \
+                mock.patch.object(PureWindowsPath, "stat", return_value=info, create=True), \
+                mock.patch.object(codex_runner, "os", SimpleNamespace(path=ntpath, lstat=lstat)), \
+                mock.patch.object(codex_runner, "scope_path", side_effect=lambda cwd, path: ntpath.normpath(ntpath.join(cwd, path))), \
+                mock.patch.object(codex_runner, "snapshot", side_effect=snapshot):
+            version, updated_at = codex_runner.verification_evidence_snapshot(source)
+        expected.pop(source["job_dir"], None)
+        self.assertEqual(version, hashlib.sha256(repr(sorted(expected.items())).encode("utf-8")).hexdigest())
+        self.assertEqual(updated_at, 3)
 
     @unittest.skipUnless(shutil.which("git"), "needs git")
     def test_verification_version_tracks_stable_scoped_git_bytes(self):

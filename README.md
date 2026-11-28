@@ -4,7 +4,7 @@ DeepSeek Harness（DSH）插件：DSH 里的 agent 负责规划和验收，编�
 
 [English](#english)
 
-候选版本为 `0.9.132-gemini.0`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
+候选版本为 `0.9.215`。各版本的改动说明见 [CHANGELOG.md](CHANGELOG.md)。
 
 ### 0.9.66：规划端只读产物与独立核验
 
@@ -31,6 +31,8 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 核验报告的 blocked evidence 使用 `[缺证据]`、`[环境]`、`[需用户]`、`[需改状态]` 分类；回执据此提示补证据、重核验或按已有授权处理，验收状态仍由原有 `codex_review` 规则决定。
 
 规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录和主机访问。未启用 modelAB 时沿用原模型，启用时使用配置的默认模型。全程只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后用 `codex_review` 记录原任务的验收。同一版本已完成验收、产物未变且没有新证据时，不再追加核验；`codex_review` 只记录验收，不另派调查。Gemini 正文的核对见下文，不能用旧素材任务的 `codex_verify` 替代。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
+
+缺证据或无法确认的核验，在原单记录、声明范围、产物及证据均未变化、且此后没有执行或续接时，直接返回上次报告，不再派整单核验。补充证据用 `new_evidence: "证据内容或可回查路径"`；需要显式重核用 `force: true`。产物变化或续接后照常派单；无法确认变化时也不阻挡核验。仅修改 `focus` 或抽查数量不算补证据。执行、续接和核验提示都要求等待 30–60 秒，回查输出的 `yield_time_ms` 至少为 `30000`。
 
 核验可以实际运行原项目的检查。沙箱核验在每单的暂存目录启动，提示核验员先读项目的 `AGENTS.md`，再切到项目目录运行检查。只有暂存目录可写，测试临时文件和缓存使用其中的 `TMPDIR`。主机访问核验沿用原有权限，临时文件仍在项目外。runner 在核验前后比较受核验范围的 Git 状态、提交、索引和已改动或未跟踪文件的内容。未指定范围或产物时，以原任务目录为范围，此时只有范围重叠的并行写任务才算并行变更。范围内变化会使核验失败，范围外变化会出提示。无法读取的内容、单文件超过 1 MiB 或单次比对超过 32 MiB 的部分会标注未比对，非 Git 目录或查询超时会注明比对不可用。
 
@@ -75,6 +77,8 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 结果原子写入后删除已认领的请求，只保留最近一次结果；提交下一份前先核对时间并读取结果。若结果写入失败，认领文件继续留在目录中，重启后不会自动重放；每份请求只尝试一次，`sent` 表示消息已提交，不表示新任务已完成。卸载插件时关闭目录监听。
 
 ### 0.9.115 自动代答宿主提问
+
+默认高风险正则包括修改凭据的动作（如“设 Samba 测试口令”、`rotate password`），单独的密码、口令、凭据、密钥或 token 仍不触发。已有 `autoAnswer.riskyPattern` 会覆盖默认值，部署时须同步补上动作匹配；`whenRisky: defer` 沿用“这一步先不做，记为待确认”的处理。
 
 宿主的 `ask_user_question` 等满 10 分钟后，conductor 会逐题选择有推荐标记的选项，找不到标记时选首项。多选题会选中所有带推荐标记的项，自由文本题使用配置的说明。答案会附上代答说明。热重载保留原提出时间，宿主恢复的待答提问也按原时间计时，已超时的再给用户 30 秒。
 
@@ -691,7 +695,7 @@ python3 runner/test_codex_runner.py
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-The candidate version is `0.9.132-gemini.0`. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The candidate version is `0.9.215`. Credential-changing actions such as setting a Samba password are risky by default; bare credential nouns and token-redaction checks are not. Existing custom `autoAnswer.riskyPattern` overrides require the same action patterns; `whenRisky: defer` retains its skip-and-confirm behavior. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 
@@ -716,6 +720,8 @@ Products-only denials briefly explain the reason: delegate investigation to `cod
 Use `codex_verify` for factual checks after mechanically checking product presence, citations and matching numbers: `{"job_id":"original-job-id","focus":"Check figures and citations","samples":8,"wait_seconds":0}`. Sampling defaults to 8 and accepts 1–30; waiting follows `codex_run`. Only finished jobs owned by the current session qualify. Verification starts a fresh read-only thread with the original directory and host access. It uses the original model unless modelAB is enabled, in which case it uses the configured default. It reads the original task, acceptance criteria, products and cited sources, and reports each checked claim, source, truth status and correction through the existing report schema. `context.verification_of` links the jobs in `codex_jobs` and `codex_status`. Record final acceptance of the original job with `codex_review`. Once review is done for the same product version, do not add verification unless the product changes or new evidence appears; `codex_review` records acceptance without starting another investigation. Gemini prose requires the output check described below; verifying an old source-material job with `codex_verify` is no substitute. As with existing `write=false` tasks, host-access mode enforces read-only work through the task instructions rather than an OS sandbox.
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [eleven Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
+
+Verification that could not confirm findings because of missing evidence returns its previous report without another dispatch when the source records, declared scope, products and evidence are unchanged and no execution or continuation followed. Supply `new_evidence: "evidence or a retrievable path"` or explicitly request `force: true` to recheck. Changed products or later rounds permit verification; unavailable change detection does too. Changing only `focus` or the sample count does not supply evidence. Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms` of at least `30000`.
 
 Verification can run the project's checks. Sandboxed verification starts in writable per-job scratch, reads the project's `AGENTS.md`, and runs checks from the read-only project directory. Temporary and cache files go to `TMPDIR` inside scratch. Host-access verification keeps its original access and also uses project-external scratch for temporary files. The runner compares Git status, committed state, index state and dirty or untracked contents within the verified paths. In the absence of scope and products, it monitors the source job's directory and counts only overlapping writers as concurrent changes. Changes inside the monitored paths fail the check, subject to that concurrency check. The receipt reports changes outside the scope, unavailable comparisons, and files left unchecked because they could not be read or exceeded the 1 MiB per-file or 32 MiB per-snapshot limit.
 

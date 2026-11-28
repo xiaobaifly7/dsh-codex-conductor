@@ -2393,6 +2393,78 @@ def verification_version(source):
     return None
 
 
+def verification_evidence_snapshot(source):
+    """Version and latest change time from one bounded metadata snapshot, including missing evidence."""
+    deadline = time.monotonic() + 3
+    try:
+        cwd = source.get("cwd")
+        job_dir = source.get("log_dir") or source.get("job_dir")
+        if not job_dir and source.get("job_id"):
+            job_dir = job_directory(source["job_id"])
+        if not cwd or not job_dir:
+            return None, None
+        job_dir = Path(scope_path(cwd, str(job_dir)))
+        info = job_dir.stat()
+        observed = {str(job_dir): (info.st_size, info.st_mtime_ns, info.st_mode, info.st_ctime_ns, info.st_ino)}
+        report = source.get("structured") or {}
+        files = [entry.get("path") if isinstance(entry, dict) else entry for entry in
+                 [*(source.get("files_changed") or []), *(source.get("write_paths") or []),
+                  *(report.get("files_changed") or [])]]
+        records = {str(job_dir / name) for name in ("args.json", "result.json", "prompt.txt", "write-lock.json",
+                                                         "last_message.txt", "events.jsonl", "stderr.log")}
+        paths = [*(source.get("scope_paths") or source.get("scope") or []), *files, source.get("output"),
+                 source.get("evidence_dir") or str(job_dir / "evidence"),
+                 *sorted(records)]
+        missing, existing, missing_parent_times = {}, set(), []
+        for path in paths:
+            if time.monotonic() >= deadline:
+                return None, None
+            if not isinstance(path, str) or not path.strip():
+                continue
+            path = scope_path(cwd, path)
+            try:
+                os.lstat(path)
+            except FileNotFoundError:
+                missing[path] = None
+                if path in records:
+                    continue
+                # A missing product has no timestamp; its nearest existing parent records a later deletion.
+                parent = Path(path).parent
+                while True:
+                    if time.monotonic() >= deadline:
+                        return None, None
+                    try:
+                        info = parent.stat()
+                        missing_parent_times.append(max(info.st_mtime_ns, info.st_ctime_ns))
+                        break
+                    except FileNotFoundError:
+                        if parent == parent.parent:
+                            return None, None
+                        parent = parent.parent
+            else:
+                existing.add(path)
+        for path in sorted(existing):
+            if time.monotonic() >= deadline:
+                return None, None
+            entries = snapshot(path, budget=deadline - time.monotonic(), scope=[path], strict=True)
+            if entries is None:
+                return None, None
+            observed.update({os.path.normpath(os.path.join(path, name)): value for name, value in entries.items()})
+        if time.monotonic() >= deadline or any(stat.S_ISLNK(info[2]) for info in observed.values()):
+            return None, None
+        updated_at = max([max(info[1], info[3]) for info in observed.values()] + missing_parent_times) / 1e9
+        entries = {**missing, **observed}
+        entries.pop(str(job_dir), None)  # Review bookkeeping is not execution evidence.
+        version = hashlib.sha256(repr(sorted(entries.items())).encode("utf-8")).hexdigest()
+        return (version, updated_at) if time.monotonic() < deadline else (None, None)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return None, None
+
+
+def verification_evidence_version(source):
+    return verification_evidence_snapshot(source)[0]
+
+
 def concurrent_writer_in_scope(paths, run_dir, started):
     roots = [Path(tree_key(path)) for path in paths]
     runs = HOME / "runs"
@@ -2739,10 +2811,14 @@ def execute(args, prompt, run_dir):
     verification_scope = (context.get("routing") or {}).get("verification_scope") if verification else None
     version_source = job_status(context["verification_of"]) if isinstance(verification_scope, str) else None
     before_version = verification_version(version_source) if version_source else None
+    before_evidence_version = verification_evidence_version(version_source) if version_source else None
 
     def finish(result):
         if before_version and result["status"] == "completed" and before_version == verification_version(version_source):
             result.update(verification_version=before_version, verification_scope=verification_scope)
+        if (before_evidence_version and result["status"] == "completed"
+                and before_evidence_version == verification_evidence_version(version_source)):
+            result.update(verification_evidence_version=before_evidence_version, verification_scope=verification_scope)
         if not host_verification:
             return result
         # Without a whole status from before there is nothing to compare one from after with.
@@ -4122,7 +4198,7 @@ def list_jobs(args):
              **({"final_message_repaired": j["final_message_repaired"]} if j.get("final_message_repaired") else {}),
              **({"last_activity": j.get("last_activity")} if j.get("status") == "running" else {}),
              **{k: j[k] for k in ("conversation_id", "fallback_safe", "diff_status", "diff_files", "rolled_back_at",
-                                  "verification_version", "verification_scope") if k in j},
+                                  "verification_version", "verification_evidence_version", "verification_scope") if k in j},
              **({"verification_error": j["verification_error"]} if "verification_error" in j else {})} for j in page]
     next_offset = args.offset + len(page)
     if predispatch is not None:
@@ -4907,7 +4983,10 @@ def main():
             emit({"status": "completed", "thread_id": args.thread_id, "last_input_tokens": thread_last_input_tokens(args.thread_id)})
         return
     if args.command == "verification-version":
-        emit({"status": "completed", "verification_version": verification_version(job_status(args.job_id))})
+        source = job_status(args.job_id)
+        evidence_version, evidence_updated_at = verification_evidence_snapshot(source)
+        emit({"status": "completed", "verification_version": verification_version(source),
+              "evidence_version": evidence_version, "evidence_updated_at": evidence_updated_at})
         return
     if args.command == "repeat-guard":
         try:

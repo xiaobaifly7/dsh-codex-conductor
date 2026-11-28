@@ -16,7 +16,7 @@ export const AUTO_ANSWER_DEFAULTS = {
   enabled: true,
   afterMinutes: 10,
   freeText: '用户暂时不在。请按你认为最合适、最稳妥的方案继续，并在回复里说明你替用户做了哪些决定。',
-  riskyPattern: '删除|清空|不可恢复|不可逆|覆盖|格式化|卸载|重置|drop |truncate|rm -rf|force.?push|付款|支付|购买|转账|充值|密码|密钥|口令|凭据|token|secret|发布到|上线到生产|生产环境|对外发送|发邮件|真实目标|授权范围',
+  riskyPattern: '删除|清空|不可恢复|不可逆|覆盖|格式化|卸载|重置|drop |truncate|rm -rf|force.?push|付款|支付|购买|转账|充值|(?:改|设|设置|修改|重置|更换).*(?:密码|口令|凭据|凭证|密钥)|\\b(?:change|set|reset|rotate)\\b.*\\b(?:passwords?|credentials?|secrets?)\\b|发布到|上线到生产|生产环境|对外发送|发邮件|真实目标|授权范围',
   subagents: true,
   excludeSessions: [],
   // wait：高风险和只能由用户决定的提问留给用户；defer：超时后答「这一步先不做，记为待确认，继续其他工作」，会话不卡住。

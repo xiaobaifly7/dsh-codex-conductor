@@ -533,7 +533,7 @@ function backgroundJobs() {
 test('codex_verify exposes engine selection and sample/wait bounds', () => {
   const { parameters } = harness().tools.codex_verify;
   assert.deepEqual(parameters.required, ['job_id']);
-  assert.deepEqual(Object.keys(parameters.properties).sort(), ['engine', 'focus', 'job_id', 'samples', 'wait_seconds']);
+  assert.deepEqual(Object.keys(parameters.properties).sort(), ['engine', 'focus', 'force', 'job_id', 'new_evidence', 'samples', 'wait_seconds']);
   assert.deepEqual(parameters.properties.engine.enum, ['codex', 'gemini']);
   assert.equal(parameters.properties.job_id.type, 'string');
   assert.equal(parameters.properties.focus.type, 'string');
@@ -561,6 +561,8 @@ test('dispatch descriptions keep waiting on the current runner job and accept th
 for (const [field, values] of [
   ['job_id', [undefined, null, '', ' ', '../SOURCE-1', 'SOURCE/1', 'SOURCE 1', 1]],
   ['focus', [null, 1, {}, []]],
+  ['force', [null, 1, 'true', {}, []]],
+  ['new_evidence', [null, 1, '', ' ', {}, []]],
   ['samples', [null, 0, -1, 31, 1.5, '8', NaN, Infinity]],
   ['wait_seconds', [null, -1, 0.5, '0', NaN, Infinity]],
 ]) test(`codex_verify rejects invalid ${field} before any runner call`, async () => {
@@ -1314,4 +1316,18 @@ test('verification does not invent evidence paths for a non-host Gemini source',
   await h.verify();
   assert.match(h.payload().prompt, /原执行单没有证据目录/);
   assert.doesNotMatch(h.payload().prompt, /先查证据目录|\/SOURCE-1\/evidence|undefined/);
+});
+
+
+test('run, resumed/fresh continuation and verification prompts include the bounded wait rule', async () => {
+  const waitRule = /等待[\s\S]*30–60 秒[\s\S]*yield_time_ms 至少 30000[\s\S]*不要隔几秒/;
+  for (const mode of ['run', 'resume', 'fresh', 'verify']) {
+    const source = sourceJob();
+    source.structured.criteria[0].status = 'not_met';
+    const h = harness({ source });
+    if (mode === 'run') await h.tools.codex_run.execute({ task: 'Inspect the project layout.', acceptance, write: false }, exec);
+    else if (mode === 'verify') await h.verify();
+    else await h.tools.codex_continue.execute({ job_id: source.job_id, fresh: mode === 'fresh' }, exec);
+    assert.match(h.payload().prompt, waitRule, mode);
+  }
 });
