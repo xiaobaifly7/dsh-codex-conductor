@@ -2,7 +2,7 @@
 
 [English](#english)
 
-`0.9.215` 执行、续接和核验提示明确等待 30–60 秒、回查输出 `yield_time_ms` 至少 30000。缺证据且原单、产物未变、没有后续执行或续接时返回上一份核验结论，补证据用 `new_evidence`，强制重核用 `force: true`；比较复用现有记录和文件元数据，无需 Git 仓库，无法确认变化时放行。自动代答默认正则将中英文修改凭据动作判为高风险，裸凭据名词和 token 脱敏检查仍放行；现有自定义正则须部署时同步补齐，配置未改。
+`0.9.215` Codex 核验单的 `verifyServiceTier` 未配置或留空时显式使用 `default`，不再继承原单或通用加速档；四套线上 `verifyServiceTier: fast` 待部署时改为 `default`。执行、续接和核验提示明确等待 30–60 秒、回查输出 `yield_time_ms` 至少 30000。缺证据且原单、产物未变、没有后续执行或续接时返回上一份核验结论，补证据用 `new_evidence`，强制重核用 `force: true`；比较复用现有记录和文件元数据，无需 Git 仓库，无法确认变化时放行。自动代答默认正则将中英文修改凭据动作判为高风险，裸凭据名词和 token 脱敏检查仍放行；现有自定义正则须部署时同步补齐，配置未改。
 
 `0.9.214` 独立核验派发前如有路径重叠的运行中写任务则等待并列出任务号；只读任务、路径不重叠或查询失败均放行。核验运行中新增写入仍按原有核验逻辑处理；超时提示明确要求将数量或时间预算写在任务正文中。
 
@@ -326,7 +326,7 @@
 
 ## English
 
-`0.9.215` Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms >= 30000`. Missing-evidence verification reuses the previous conclusion when source records and products are unchanged and no execution or continuation followed; `new_evidence` and `force: true` allow rechecking. Existing records and file metadata provide change detection outside Git, and unavailable detection permits verification. Default auto-answer matching treats Chinese and English credential-changing actions as risky while bare credential nouns and token-redaction checks remain allowed; custom patterns need the same deployment update. Runtime configuration is unchanged.
+`0.9.215` Codex verification explicitly defaults to the standard service tier when `verifyServiceTier` is absent or empty, without inheriting source or general acceleration tiers; four live `verifyServiceTier: fast` overrides must change to `default` during deployment. Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms >= 30000`. Missing-evidence verification reuses the previous conclusion when source records and products are unchanged and no execution or continuation followed; `new_evidence` and `force: true` allow rechecking. Existing records and file metadata provide change detection outside Git, and unavailable detection permits verification. Default auto-answer matching treats Chinese and English credential-changing actions as risky while bare credential nouns and token-redaction checks remain allowed; custom patterns need the same deployment update. Runtime configuration is unchanged.
 
 `0.9.214` Before dispatch, independent verification waits for running write jobs with overlapping paths and lists their job IDs; read-only jobs, non-overlapping paths and query failures do not block it. Writes started during verification retain existing verification handling. Timeout guidance explicitly requires quantity or time budgets in the task body.
 

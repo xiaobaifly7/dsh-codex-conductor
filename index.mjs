@@ -87,8 +87,8 @@ const DEFAULTS = {
   // 只读任务的推理强度，留空与 effort 相同
   readOnlyEffort: '',
   serviceTier: '',
-  // Codex 核验单的 service tier（如 fast），留空同 serviceTier
-  verifyServiceTier: '',
+  // Codex 核验单默认标准档，不继承原单、通用档位或 Codex 用户配置。
+  verifyServiceTier: 'default',
   waitSeconds: 0,
   autoWakeBlockedInbox: true,
   // delaySeconds > 0：宿主启动后等这么久再续接，只补那些到时仍没有新回合的会话（让 auto-continue 先扫）；0 立即续接
@@ -3806,7 +3806,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       ...(engine === 'codex' ? {
         effort: cfg.readOnlyEffort || (same ? options.effort : cfg.effort) || undefined,
         model: cfg.modelAB.enabled || !same ? cfg.model : options.model ?? '',
-        service_tier: cfg.verifyServiceTier || (same ? options.service_tier ?? '' : cfg.serviceTier),
+        service_tier: cfg.verifyServiceTier || 'default',
       } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
     }, exec, undefined, undefined, source.job_id, undefined,

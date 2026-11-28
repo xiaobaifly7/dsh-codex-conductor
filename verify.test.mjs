@@ -662,7 +662,7 @@ test('verification inherits original cwd and model options, never original write
     assert.equal(flag('--cwd'), source.cwd);
     assert.equal(flag('--model'), source.task_options.model);
     assert.equal(flag('--effort'), 'medium');
-    assert.equal(flag('--service-tier'), source.task_options.service_tier);
+    assert.equal(flag('--service-tier'), 'default');
     assert.ok(argv.includes('--use-user-config'));
     if (sandbox === 'danger-full-access') assert.equal(flag('--sandbox'), sandbox);
     else assert.equal(argv.includes('--sandbox'), false);
@@ -681,12 +681,13 @@ test('verification inherits original cwd and model options, never original write
   }
 });
 
-test('original false user-config and explicit empty model/tier do not use current defaults', async () => {
+test('original false user-config and empty model do not use current defaults; verification tier stays standard', async () => {
   const source = sourceJob();
   Object.assign(source.task_options, { use_user_config: false, model: null, service_tier: '' });
   const h = harness({ source });
   await h.verify();
-  for (const flag of ['--use-user-config', '--model', '--service-tier']) assert.equal(h.start().argv.includes(flag), false, flag);
+  for (const flag of ['--use-user-config', '--model']) assert.equal(h.start().argv.includes(flag), false, flag);
+  assert.equal(option(h.start().argv, '--service-tier'), 'default');
 });
 
 test('verification uses readOnlyEffort when set and the original effort otherwise', async () => {
@@ -704,7 +705,8 @@ test('unspecified original model options keep Codex defaults instead of changed 
     source.task_options = options;
     const h = harness({ source, config: { readOnlyEffort: '' } });
     await h.verify();
-    for (const flag of ['--use-user-config', '--model', '--service-tier', '--effort']) {
+    assert.equal(option(h.start().argv, '--service-tier'), 'default');
+    for (const flag of ['--use-user-config', '--model', '--effort']) {
       assert.equal(h.start().argv.includes(flag), false, flag);
     }
   }
@@ -1329,5 +1331,21 @@ test('run, resumed/fresh continuation and verification prompts include the bound
     else if (mode === 'verify') await h.verify();
     else await h.tools.codex_continue.execute({ job_id: source.job_id, fresh: mode === 'fresh' }, exec);
     assert.match(h.payload().prompt, waitRule, mode);
+  }
+});
+
+
+test('Codex verification explicitly defaults to the standard tier instead of inheriting acceleration', async () => {
+  for (const engine of ['codex', 'gemini']) {
+    for (const tier of ['fast', 'priority']) {
+      for (const override of [{}, { verifyServiceTier: '' }]) {
+        const source = sourceJob();
+        source.engine = engine;
+        source.task_options.service_tier = tier;
+        const h = harness({ source, config: { verifyEngine: 'codex', serviceTier: tier, ...override } });
+        await h.verify();
+        assert.equal(option(h.start().argv, '--service-tier'), 'default', JSON.stringify({ engine, tier, override }));
+      }
+    }
   }
 });
