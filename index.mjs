@@ -3527,7 +3527,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
               !(job.context?.write === true || ['workspace-write', 'danger-full-access'].includes(job.sandbox)) || !job.cwd) continue;
           const paths = [job.cwd, ...(job.scope_paths ?? job.scope ?? []), ...(job.task_options?.writable_roots ?? job.writable_roots ?? [])]
             .map(p => taskScopePath(job.cwd, p));
-          if (paths.some(p => monitored.some(root => within(p, root) || within(root, p)))) writers.add(job.job_id);
+          if (paths.some(p => monitored.some(root => under(p, root) || under(root, p)))) writers.add(job.job_id);
         }
         offset = page.next_offset ?? null;
       }

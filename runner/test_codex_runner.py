@@ -7249,6 +7249,86 @@ class RunnerTests(unittest.TestCase):
         resolved = self.invoke(*args, mode="write_file", prompt=prompt)
         self.assertEqual(len(in_tree("rev-list", "--parents", "-n", "1", resolved["worktree_commit"]).split()), 3)
 
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_worktree_auto_commit_retries_only_index_lock_file_exists(self):
+        import codex_runner
+        errors = {
+            "recovers": "fatal: Unable to create 'C:/repo/.git/index.lock': File exists.\n\nAnother git process seems to be running.",
+            "exhausted": "fatal: Unable to create 'C:\\repo\\.git\\index.lock': File exists.",
+            "permission": "fatal: Unable to create 'C:/repo/.git/index.lock': Permission denied",
+            "other_lock": "fatal: Unable to create 'C:/repo/.git/HEAD.lock': File exists.",
+            "hook": "hook failed: index.lock File exists",
+        }
+        real_git = codex_runner.git
+        for command in ("add", "commit"):
+            for outcome, error in errors.items():
+                with self.subTest(command=command, outcome=outcome):
+                    root, sub, git = self.git_repo(f"retry-{command}-{outcome}")
+                    (sub / "a.txt").write_bytes(b"updated\n")
+                    before = git("rev-parse", "HEAD").strip()
+                    attempts, sleeps = [], []
+
+                    def injected(cwd, *argv, **kwargs):
+                        operation = "commit" if "commit" in argv else argv[0]
+                        if operation == command:
+                            attempts.append(argv)
+                            if outcome != "recovers" or len(attempts) <= 2:
+                                raise ValueError(error)
+                        return real_git(cwd, *argv, **kwargs)
+
+                    result = {"status": "completed", "final_message": "original report"}
+                    with mock.patch.object(codex_runner, "git", side_effect=injected), \
+                            mock.patch.object(codex_runner.shutil, "which", return_value=None), \
+                            mock.patch.object(codex_runner.time, "sleep", side_effect=sleeps.append):
+                        codex_runner.commit_worktree({"routing": {"worktree_path": str(root)}},
+                                                     root / "job", result)
+                    self.assertEqual(result["status"], "completed")
+                    self.assertEqual(result["final_message"], "original report")
+                    if outcome == "recovers":
+                        self.assertNotIn("worktree_commit_error", result)
+                        self.assertEqual(result["worktree_commit"], git("rev-parse", "HEAD").strip())
+                        self.assertNotEqual(result["worktree_commit"], before)
+                        self.assertEqual(git("show", "HEAD:sub/a.txt"), "updated\n")
+                        self.assertEqual(git("status", "--porcelain"), "")
+                        self.assertEqual(len(attempts), 3)
+                        self.assertEqual(len(sleeps), 2)
+                    else:
+                        self.assertEqual(result["worktree_commit_error"], error[:300])
+                        self.assertNotIn("worktree_commit", result)
+                        self.assertEqual(git("rev-parse", "HEAD").strip(), before)
+                        self.assertEqual(len(attempts), 6 if outcome == "exhausted" else 1)
+                        self.assertEqual(len(sleeps), 5 if outcome == "exhausted" else 0)
+                    self.assertTrue(all(1 <= delay <= 2 for delay in sleeps))
+                    self.assertLessEqual(sum(sleeps), 10)
+                    if outcome == "exhausted":
+                        self.assertEqual(sum(sleeps), 10)
+
+    @unittest.skipUnless(shutil.which("git"), "needs git")
+    def test_worktree_auto_commit_shares_index_lock_wait_budget(self):
+        import codex_runner
+        root, sub, git = self.git_repo("shared-lock-budget")
+        (sub / "a.txt").write_bytes(b"updated\n")
+        real_git = codex_runner.git
+        attempts, sleeps = {"add": 0, "commit": 0}, []
+        error = "fatal: Unable to create '/repo/.git/index.lock': File exists."
+
+        def injected(cwd, *argv, **kwargs):
+            operation = "commit" if "commit" in argv else argv[0]
+            if operation in attempts:
+                attempts[operation] += 1
+                if operation == "commit" or attempts[operation] <= 2:
+                    raise ValueError(error)
+            return real_git(cwd, *argv, **kwargs)
+
+        result = {}
+        with mock.patch.object(codex_runner, "git", side_effect=injected), \
+                mock.patch.object(codex_runner.shutil, "which", return_value=None), \
+                mock.patch.object(codex_runner.time, "sleep", side_effect=sleeps.append):
+            codex_runner.commit_worktree({"routing": {"worktree_path": str(root)}}, root / "job", result)
+        self.assertEqual(result, {"worktree_commit_error": error})
+        self.assertEqual(attempts, {"add": 3, "commit": 4})
+        self.assertEqual(sum(sleeps), 10)
+
     def test_wsl_git_variables_follow_a_worktree_that_windows_git_created(self):
         import codex_runner
         worktree = Path(self.tmp.name).resolve() / "wt-from-windows"

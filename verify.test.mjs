@@ -136,6 +136,38 @@ test('codex_verify waits for running writers overlapping cwd or monitored paths 
   }
 });
 
+test('codex_verify distinguishes Linux path case before checking running writers', async (t) => {
+  for (const [name, sourceFields, writerFields] of [
+    ['cwd descendant', { cwd: '/work/Original' }, { cwd: '/work/original/src' }],
+    ['cwd ancestor', { cwd: '/work/original/src' }, { cwd: '/work/Original' }],
+    ['scope_paths', { scope_paths: ['/shared/Docs'] }, { cwd: '/shared/docs' }],
+    ['files_changed', { files_changed: [{ path: '/products/Report.md' }] }, { cwd: '/products/report.md' }],
+    ['write_paths', { write_paths: ['/evidence/Result.json'] }, { cwd: '/evidence/result.json' }],
+    ['writer scope', {}, { cwd: '/other', scope: ['/work/Original'] }],
+    ['writer writable_roots', {}, { cwd: '/other', task_options: { writable_roots: ['/work/Original'] } }],
+    ['non-drive mount', { cwd: '/mnt/storage/Original' }, { cwd: '/mnt/storage/original' }],
+  ]) await t.test(name, async () => {
+    const writer = { job_id: 'WRITER-CASE', status: 'running', cwd: '/elsewhere', context: { write: true }, ...writerFields };
+    const h = harness({ source: { ...sourceJob(), ...sourceFields }, listed: () => ({ jobs: [writer], total: 1 }) });
+    const value = await h.verify();
+    assert.notEqual(value.status, 'blocked');
+    assert.ok(h.start());
+  });
+});
+
+test('codex_verify keeps Windows drive, UNC and drive mount overlaps case insensitive', async () => {
+  for (const [cwd, writerCwd] of [
+    ['C:/Project', 'c:/PROJECT/src'],
+    ['//SERVER/Share/Project', '//server/share/PROJECT/src'],
+    ['/mnt/E/Project', '/mnt/e/PROJECT/src'],
+  ]) {
+    const writer = { job_id: 'WRITER-CASE', status: 'running', cwd: writerCwd, context: { write: true } };
+    const h = harness({ source: { ...sourceJob(), cwd }, listed: () => ({ jobs: [writer], total: 1 }) });
+    assert.equal((await h.verify()).status, 'blocked', cwd);
+    assert.equal(h.start(), undefined);
+  }
+});
+
 test('codex_verify ignores non-overlapping, read-only and finished jobs', async () => {
   for (const fields of [
     { cwd: '/work/original-other' },
