@@ -2142,8 +2142,21 @@ def commit_worktree(context, run_dir, result):
     if not isinstance(worktree, str) or not worktree.strip():
         return
     title = " ".join(str((context or {}).get("task") or "").split())[:72]
+    lock_retries = 5  # add and commit share ten seconds of lock waiting, including a Windows git fallback.
 
     def commit(query):
+        def write(*argv):
+            nonlocal lock_retries
+            while True:
+                try:
+                    return query(*argv)
+                except ValueError as error:
+                    if not lock_retries or not re.search(
+                            r"(?m)^fatal: Unable to create '[^\r\n]*[/\\]index\.lock': File exists\.?(?:\r?$)", str(error)):
+                        raise
+                    lock_retries -= 1
+                    time.sleep(2)
+
         top = Path(local_path(os.fsdecode(query("rev-parse", "--show-toplevel")).strip()))
         try:
             query("rev-parse", "--quiet", "--verify", "MERGE_HEAD")
@@ -2156,7 +2169,7 @@ def commit_worktree(context, run_dir, result):
             if marked:
                 return {"worktree_commit_error": "conflict markers remain in " + ", ".join(marked[:10])}
         # shortcut: stages everything in the worktree, so leftovers of an earlier failed job ride along; per-job staging if that bites.
-        query("add", "-A")
+        write("add", "-A")
         if not merging and not query("diff", "--cached", "--name-only", "-z"):
             return {}
         try:
@@ -2164,7 +2177,7 @@ def commit_worktree(context, run_dir, result):
         except ValueError:
             named = False
         identity = () if named else ("-c", "user.name=codex-conductor", "-c", "user.email=codex-conductor@localhost")
-        query(*identity, "commit", "-q", "--no-edit", *(() if merging else ("-m", f"{run_dir.name}: {title}" if title else run_dir.name)))
+        write(*identity, "commit", "-q", "--no-edit", *(() if merging else ("-m", f"{run_dir.name}: {title}" if title else run_dir.name)))
         return {"worktree_commit": os.fsdecode(query("rev-parse", "HEAD")).strip()}
 
     try:
