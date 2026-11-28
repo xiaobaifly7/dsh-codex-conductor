@@ -44,6 +44,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
   const final = () => ({ job_id: 'VERIFY-1', status: 'completed', cwd: source.cwd,
     log_dir: '/runner/jobs/VERIFY-1', sandbox: source.sandbox === 'danger-full-access' ? source.sandbox : 'read-only',
     context: payload.context, structured: report(payload.context.acceptance), files_changed: [],
+    started_at: (source.finished_at ?? 20) + 1, verification_version: 'tree-1', verification_evidence_version: 'evidence-1',
     ...verificationResult });
   const run = async (_config, argv, options = {}) => {
     calls.push({ argv, ...options });
@@ -62,6 +63,7 @@ function harness({ source = sourceJob(), config = {}, running = false, jobs, ver
     }
     if (argv[0] === 'list' && listed) return listed(argv);
     if (argv[0] === 'list') return { jobs: payload ? [final()] : [], total: payload ? 1 : 0 };
+    if (argv[0] === 'verification-version') return { status: 'completed', verification_version: 'tree-1', evidence_version: 'evidence-1' };
     if (argv[0] === 'review') return { verification_status: JSON.parse(options.stdin).status };
     if (argv[0] === 'products') return { status: 'completed', owner: argv[2], paths: [] };
     throw new Error(`Unexpected runner call: ${argv.join(' ')}`);
@@ -1392,4 +1394,25 @@ test('review 6: whitespace verification tier explicitly uses default', async () 
   const h = harness({ config: { verifyEngine: 'codex', verifyServiceTier: '   ', serviceTier: 'priority' } });
   await h.verify();
   assert.equal(option(h.start().argv, '--service-tier'), 'default');
+});
+
+test('review final 6: codex_run resume preserves verification identity for every fresh mode and tier', async t => {
+  for (const serviceTier of ['fast', 'priority']) {
+    for (const fresh of [undefined, false, true]) {
+      for (const verifyServiceTier of [undefined, 'default', 'priority']) {
+        await t.test(JSON.stringify({ serviceTier, fresh, verifyServiceTier }), async () => {
+          const source = sourceJob();
+          source.context.verification_of = 'ROOT';
+          source.context.write = false;
+          const h = harness({ source, config: { serviceTier, verifyServiceTier, verifyEngine: 'codex',
+            closeoutGuard: false, convergenceGuard: false, continueFreshAboveTokens: 0 },
+          listed: argv => ({ jobs: argv.includes('--thread-id') ? [source] : [], total: argv.includes('--thread-id') ? 1 : 0 }) });
+          await h.tools.codex_run.execute({ task: '再次核对原始核验记录', acceptance, write: false,
+            resume: source.thread_id, ...(fresh !== undefined ? { fresh } : {}) }, exec);
+          assert.equal(option(h.start().argv, '--service-tier'), verifyServiceTier ?? 'default');
+          assert.equal(h.payload().context.verification_of, 'ROOT');
+        });
+      }
+    }
+  }
 });

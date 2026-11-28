@@ -7,23 +7,21 @@ const MINUTE = 60_000;
 const RELOAD_GRACE = 30_000;
 const HISTORY_LIMIT = 300;
 const RECOMMENDED = /recommended|推荐/i;
-// 用户不在时代答高风险提问：优先选这类「先不做」的选项。
-const DEFERRING = /跳过|暂不|先不|稍后|以后再|不执行|不要|保留|保持现状|取消|skip|later|defer|cancel|keep/i;
 const PRIVATE = /密码|密钥|口令|凭据|token|secret|passw[o]rd|passphrases?|credentials?|bearer|api[ _-]?key|PRIVATE KEY-----|\b(?:sk-|gh[pousr]_)[\w-]{12,}|\beyJ[\w-]+\.[\w-]+\.[\w-]+/i;
 const PENDING = Symbol.for('dsh-codex-conductor.auto-answer.pending');
 
-// 允许逗号和换行，限定动作与凭据间距；“设置页”和“设备”等名词不算动作。
-const CREDENTIAL_NOUN = '(?:密码|口令|凭据|凭证|密钥)';
-const CREDENTIAL_CHANGE = '(?:修改|设置(?!页)|重置|更换|更新|设定|生成|新建|创建|轮换)';
+// 允许逗号、换行和标识符内点号；点后空白或结尾才算句末。
+const CREDENTIAL_SPAN = String.raw`(?:(?![。！？!?；;]|\.(?:\s|$))[\s\S])`;
+const CREDENTIAL_GAP = `${CREDENTIAL_SPAN}{0,40}`;
+const ENGLISH_CREDENTIAL = String.raw`(?<![a-z0-9])(?:passwords?|passphrases?|credentials?|secrets?|tokens?|api[ _-]?(?:tokens?|keys?)|access[ _-]?keys?|(?:ssh[ _-]?(?:private[ _-]?)?|private[ _-])keys?)(?![a-z0-9])`;
+const CREDENTIAL_NOUN = `(?:密码|口令|凭据|凭证|密钥|${ENGLISH_CREDENTIAL})`;
+// 元数据里的“更新时间 / 创建时间 / update history”等不是变更动作，其他动作仍逐一判断。
+const ENGLISH_CREDENTIAL_CHANGE = String.raw`\b(?:change|set|reset|rotate|update|generate|create|renew|revoke|regenerate)\b(?!\s+(?:history|times?|timestamps?|dates?|records?)\b)`;
+const CREDENTIAL_CHANGE = `(?:修改|设置(?!页|是否)|重置|更换|更新(?!时间|历史|记录)|设定|生成|新建|创建(?!时间|日期)|轮换|替换|${ENGLISH_CREDENTIAL_CHANGE})`;
 const SHORT_CREDENTIAL_CHANGE = '(?:改|设(?![备计施置定]))';
-const CREDENTIAL_GAP = String.raw`[^。！？!?；;.]{0,40}`;
-const ENGLISH_CREDENTIAL = String.raw`\b(?:passwords?|passphrases?|credentials?|secrets?)\b`;
-const ENGLISH_CREDENTIAL_CHANGE = String.raw`\b(?:change|set|reset|rotate|update|generate|create)\b`;
 export const CREDENTIAL_ACTION_PATTERN = `${CREDENTIAL_CHANGE}${CREDENTIAL_GAP}${CREDENTIAL_NOUN}|` +
-  `${SHORT_CREDENTIAL_CHANGE}[^。！？!?；;.]{0,12}${CREDENTIAL_NOUN}|` +
-  `${CREDENTIAL_NOUN}${CREDENTIAL_GAP}(?:${CREDENTIAL_CHANGE}|${SHORT_CREDENTIAL_CHANGE}|换成|换为)|` +
-  `${ENGLISH_CREDENTIAL_CHANGE}${CREDENTIAL_GAP}${ENGLISH_CREDENTIAL}|` +
-  `${ENGLISH_CREDENTIAL}${CREDENTIAL_GAP}${ENGLISH_CREDENTIAL_CHANGE}`;
+  `${SHORT_CREDENTIAL_CHANGE}${CREDENTIAL_SPAN}{0,12}${CREDENTIAL_NOUN}|` +
+  `${CREDENTIAL_NOUN}${CREDENTIAL_GAP}(?:${CREDENTIAL_CHANGE}|${SHORT_CREDENTIAL_CHANGE}|换成|换为|换一个)`;
 
 export const AUTO_ANSWER_DEFAULTS = {
   enabled: true,
@@ -75,8 +73,7 @@ function recommendation(question, freeText, notice) {
 }
 
 function deferral(question, notice) {
-  const option = (question.options ?? []).find((o) => DEFERRING.test(o.label) || DEFERRING.test(o.description ?? ''));
-  return { answer: { id: question.id, selected: option ? [option.label] : [], custom: notice }, reason: 'deferred' };
+  return { answer: { id: question.id, selected: [], custom: notice }, reason: 'deferred' };
 }
 
 const deferNotice = (afterMinutes) => '（用户超过 ' + afterMinutes + ' 分钟未回答。这一问涉及高风险或只能由用户决定的操作' +
@@ -139,8 +136,8 @@ export function registerAutoAnswer({ ctx, settings, directory, now = Date.now, a
       clearTimeout(item.timer);
       if (pending.get(item.id) === item) pending.delete(item.id);
     }
-    const risky = (q) => Boolean(risk) && [q.question, q.header, q.detail,
-      ...(q.options ?? []).flatMap((o) => [o.label, o.description])].some((value) => value && risk.test(value));
+    const risky = (q) => Boolean(risk) && risk.test([q.header, q.question, q.detail,
+      ...(q.options ?? []).flatMap((o) => [o.label, o.description])].filter(Boolean).join('\n'));
     function block(item, immediate = false) {
       if (!immediate && !allowed(item.agent, item.askedAt)) return 'user_stopped';
       if (item.questions.some(q => q.question?.startsWith('[owner_only]'))) return 'owner_only';

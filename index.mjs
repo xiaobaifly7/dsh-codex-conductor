@@ -1560,6 +1560,10 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const targetId = full.context?.verification_of;
       if (targetId) {
         const target = targetId === source.job_id ? source : await lookup(status(targetId));
+        if (!target || !await verificationUnchanged(target, full, signal)) continue;
+        // 后续轮次的核验映射回原单时，原单的证据和其他续接也必须仍然有效。
+        if (targetId !== source.job_id && !await verificationUnchanged(source,
+          { ...full, verification_evidence_version: undefined }, signal)) continue;
         acceptance.forEach((item, i) => {
           const targetKey = verificationItemKey(item);
           if (!targetKey) return;
@@ -2025,6 +2029,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const full = await status(job.job_id);
         const acceptance = full.context?.acceptance;
         if (full.error_kind || !Array.isArray(acceptance) || !validReport(full.structured)) continue;
+        const original = await status(target);
+        if (unknownState(original) || !await verificationUnchanged(original, full, signal)) continue;
         const met = new Set(acceptance.flatMap((text, i) => {
           const key = verificationItemKey(text);
           return key && reportRowOf(acceptance, full.structured.criteria, i + 1)?.status === 'met' ? [key] : [];
@@ -2277,7 +2283,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         const page = await conductor.list({ ...(cfg.verificationReuse ? { owner, also_owners: aliases.predecessors(owner) } : {}),
           ...filters, limit: 100, offset }, signal);
         signal?.throwIfAborted();
-        if (page.error_kind || !Array.isArray(page.jobs)) {
+        if (page.incomplete || page.error_kind || !Array.isArray(page.jobs)) {
           throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
         }
         jobs.push(...page.jobs.filter(job => !cfg.verificationReuse || owns(owner, job.context?.owner)));
@@ -2295,7 +2301,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       for (const job of related) {
         if (!job.job_id || seen.has(job.job_id) || job.context?.verification_of) continue;
         const child = parentOf(job) === round.job_id;
-        if (!child && (job.thread_id !== round.thread_id || job.started_at <= source.started_at)) continue;
+        if (!child && (!round.thread_id || job.thread_id !== round.thread_id || job.started_at <= source.started_at)) continue;
         if (!Number.isFinite(job.started_at) || (!child && !Number.isFinite(source.started_at)) ||
             job.started_at > after || job.finished_at > after) return true;
         seen.add(job.job_id);
@@ -2303,6 +2309,23 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       }
     }
     return false;
+  }
+
+  async function verificationUnchanged(source, previous, signal) {
+    if (!Number.isFinite(source.started_at)) return false;
+    try {
+      const versions = await conductor.verificationVersion(source.job_id, signal);
+      signal?.throwIfAborted();
+      if (previous.verification_version && previous.verification_version !== versions.verification_version) return false;
+      const unchanged = previous.verification_evidence_version
+        ? versions.evidence_version === previous.verification_evidence_version
+        : Number.isFinite(versions.evidence_updated_at) && versions.evidence_updated_at <= previous.started_at;
+      return Boolean(versions.evidence_version && unchanged && Number.isFinite(previous.started_at) &&
+        !await hasLaterRound(source, previous.started_at, signal));
+    } catch {
+      signal?.throwIfAborted();
+      return false;
+    }
   }
 
   // 热重载后，旧实例里等任务结果的循环还在。它若自己派核验或接替，就按过时的配置派单：2026-11-22 配置改回 Neon Medium 后，
@@ -3493,13 +3516,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, args, exec, 'codex_run');
       // resume 的线程若已被开新线程的续接接替，改接最新的线程；再按大小决定是否开新线程。查询失败时照旧沿用原线程。
       let thread = null;
-      const threadLookedUp = args.resume && (cfg.modelAB.enabled || args.fresh !== undefined || (cfg.continueFreshAboveTokens ?? 0) > 0);
-      if (threadLookedUp) {
+      if (args.resume) {
         try { thread = await runThread(args, exec); } catch { exec?.signal?.throwIfAborted(); }
       }
       if (thread && thread.parent_thread_id !== args.resume) args = { ...args, resume: thread.parent_thread_id };
-      const parent = thread?.parent_job_id && (thread.mode === 'fresh' || cfg.modelAB.enabled)
-        ? await previousJob(thread.parent_job_id, exec) : undefined;
+      const parent = thread?.parent_job_id ? await previousJob(thread.parent_job_id, exec) : undefined;
       let fresh;
       if (thread?.mode === 'fresh') {
         if (!parent) Object.assign(thread, { mode: 'resume', reason: 'parent_unreadable' });
@@ -3594,45 +3615,33 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const status = job.execution_status ?? job.status;
       if (status === 'running') return { job_id: job.job_id, status };
       if (!latest) latest = job;
-      if (automatic) return { job_id: job.job_id, status };
+      if (automatic) {
+        if (status !== 'completed' || await verificationUnchanged(source, job, signal)) return { job_id: job.job_id, status };
+        return;
+      }
       if (!completed && status === 'completed' && job.report_status === 'valid' && job.verification_version && job.verification_scope === scope) completed = job;
     }
     if (args.force || args.new_evidence) return;
-    let versions;
     if (latest && (latest.execution_status ?? latest.status) === 'completed') {
       const previous = withReport(await conductor.waitJob(latest.job_id, 0, signal));
       const missing = /缺证据|证据不足|缺少.*证据|无法确认|不能确认|insufficient evidence|cannot (?:confirm|verify)|unverifiable/i;
       if (validReport(previous.report) && previous.report.criteria.some(item => item.status === 'blocked' &&
           (missing.test(item.evidence) || missing.test(previous.report.summary)))) {
-        try {
-          versions = await conductor.verificationVersion(source.job_id, signal);
-          signal?.throwIfAborted();
-          if (previous.verification_version && previous.verification_version !== versions.verification_version) return;
-          const unchanged = previous.verification_evidence_version
-            ? versions.evidence_version === previous.verification_evidence_version
-            : Number.isFinite(versions.evidence_updated_at) && versions.evidence_updated_at <= previous.started_at;
-          if (versions.evidence_version && unchanged && Number.isFinite(previous.started_at) &&
-              !await hasLaterRound(source, previous.started_at, signal)) {
-            return { ...previous, evidence_unchanged: true,
-              next: `原任务 ${source.job_id} 没有新执行、续接或产物证据，返回上次核验 ${previous.job_id} 的结论，不再派单。` +
-                '请补证据（new_evidence）、交所有者裁决，或显式传 force: true 强制重核。' };
-          }
-        } catch {
-          signal?.throwIfAborted();
+        if (await verificationUnchanged(source, previous, signal)) {
+          return { ...previous, evidence_unchanged: true,
+            next: `原任务 ${source.job_id} 没有新执行、续接或产物证据，返回上次核验 ${previous.job_id} 的结论，不再派单。` +
+              '请补证据（new_evidence）、交所有者裁决，或显式传 force: true 强制重核。' };
         }
         return;
       }
     }
-    if (completed) {
-      const { verification_version } = versions ?? await conductor.verificationVersion(source.job_id, signal).catch(() => ({}));
-      signal?.throwIfAborted();
-      if (verification_version === completed.verification_version) {
-        throw Object.assign(new Error(`codex_verify: ${source.job_id} 的文件及核验范围未变，复用核验 ${completed.job_id}。` +
-          `用 codex_status ${JSON.stringify({ job_id: completed.job_id })} 取回核验报告，再对 ${source.job_id} 提交 codex_review；确需重核可传 force: true。`),
-        { code: 'VERIFICATION_UNNEEDED' });
-      }
+    if (completed && await verificationUnchanged(source, completed, signal)) {
+      throw Object.assign(new Error(`codex_verify: ${source.job_id} 的文件及核验范围未变，证据及后续轮次也未变，复用核验 ${completed.job_id}。` +
+        `用 codex_status ${JSON.stringify({ job_id: completed.job_id })} 取回核验报告，再对 ${source.job_id} 提交 codex_review；确需重核可传 force: true。`),
+      { code: 'VERIFICATION_UNNEEDED' });
     }
   }
+
   async function runningVerificationRefusal(args, exec, tool, chain, resumeThread) {
     const { signal, agent: { id: owner } } = exec;
     const warn = (error) => {

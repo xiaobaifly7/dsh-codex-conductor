@@ -5493,6 +5493,73 @@ class RunnerTests(unittest.TestCase):
         for extra in (("--limit", "5001"), ("--offset", "-1")):
             self.assertEqual(self.control("list", *extra)["error_kind"], "bad_arguments")
 
+    def test_list_marks_corrupt_child_results_incomplete(self):
+        context = {**self.sample_context(), "continuation": {
+            "parent_job_id": "source", "answers": [], "resolution": "collect more evidence"}}
+        child = self.stored_job("child", {"status": "completed"}, context=context)
+        for payload in ("not json", "[]", "null", '"broken"'):
+            with self.subTest(payload=payload):
+                (child / "result.json").write_text(payload, "utf-8")
+                result = self.control("list", "--owner", "owner-a", "--parent-job", "source")
+                self.assertIs(result.get("incomplete"), True)
+                self.assertEqual(result["jobs"], [])
+                self.assertEqual(result["total"], 0)
+                self.assertTrue(result["eof"])
+                self.assertIsNone(result["next_offset"])
+
+    def test_list_marks_unreadable_child_results_incomplete(self):
+        import codex_runner
+
+        context = {**self.sample_context(), "fallback_of": "source"}
+        child = self.stored_job("child", {"status": "completed"}, context=context)
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
+                               parent_job="source", needs_attention=False, offset=0, limit=20)
+        read_text = Path.read_text
+        def read(path, *a, **kw):
+            if path == child / "result.json":
+                raise PermissionError("result is unreadable")
+            return read_text(path, *a, **kw)
+        with mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                mock.patch.object(Path, "read_text", read):
+            result = codex_runner.list_jobs(args)
+        self.assertIs(result.get("incomplete"), True)
+        self.assertEqual(result["jobs"], [])
+
+    def test_list_marks_child_summary_failures_incomplete(self):
+        import codex_runner
+
+        self.stored_job("child", {"status": "completed"}, context={**self.sample_context(),
+                        "routing": {"parent_job_id": "source"}})
+        args = SimpleNamespace(command="list", owner="owner-a", cwd=None, job_id=None, status=None,
+                               parent_job="source", needs_attention=False, offset=0, limit=20)
+        for method in ("job_metadata", "verification_summary"):
+            with self.subTest(method=method), \
+                    mock.patch.object(codex_runner, "HOME", Path(self.env["CODEX_RUNNER_HOME"])), \
+                    mock.patch.object(codex_runner, method, side_effect=ValueError("damaged summary")):
+                result = codex_runner.list_jobs(args)
+                self.assertIs(result.get("incomplete"), True)
+
+    def test_list_incomplete_respects_filters_and_pagination(self):
+        done = {"status": "completed", "structured": self.sample_report()}
+        self.stored_job("good", done, context={**self.sample_context(), "fallback_of": "source"})
+        bad = self.stored_job("bad", done, context={**self.sample_context(), "fallback_of": "other"})
+        (bad / "result.json").write_text("not json", "utf-8")
+        query = ("list", "--owner", "owner-a", "--parent-job", "source", "--limit", "1")
+        complete = self.control(*query)
+        self.assertFalse(complete.get("incomplete", False))
+        self.assertEqual([job["job_id"] for job in complete["jobs"]], ["good"])
+        self.assertFalse(self.control("list", "--owner", "other").get("incomplete", False))
+        self.assertFalse(self.control("list", "--cwd", str(self.cwd / "elsewhere")).get("incomplete", False))
+        # An unreadable matching child still matters when the requested page is empty.
+        child = self.stored_job("child", done, context={**self.sample_context(), "fallback_of": "source"})
+        (child / "result.json").write_text("not json", "utf-8")
+        page = self.control(*query, "--offset", "1")
+        self.assertIs(page.get("incomplete"), True)
+        self.assertEqual(page["jobs"], [])
+        self.assertEqual(page["total"], 1)
+        self.assertTrue(page["eof"])
+        self.assertIsNone(page["next_offset"])
+
     def test_list_and_summary_also_owner_adds_handed_over_sessions(self):
         for job_id, owner in (("mine", "owner-b"), ("predecessor", "owner-a"), ("unrelated", "owner-c")):
             self.stored_job(job_id, {"status": "completed", "structured": self.sample_report()}, context=self.sample_context(owner))

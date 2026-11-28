@@ -1269,6 +1269,25 @@ test('Test-PsSyntax.ps1 reports parse results and exit codes', { skip: pwshMissi
 });
 
 // 用假的 runner 和假的 jobs 服务装上插件；后台循环的 `status --wait 20` 由测试逐个应答
+const fixtureVerificationMetadata = {
+  verification_version: 'a'.repeat(64), verification_evidence_version: 'b'.repeat(64),
+};
+const fixtureVerificationSnapshot = {
+  status: 'completed', verification_version: fixtureVerificationMetadata.verification_version,
+  evidence_version: fixtureVerificationMetadata.verification_evidence_version,
+};
+
+function filterFixtureList(argv, value) {
+  if (!Array.isArray(value?.jobs)) return value;
+  const filter = flag => argv.includes(flag) ? argv[argv.indexOf(flag) + 1] : undefined;
+  const parent = filter('--parent-job'), thread = filter('--thread-id');
+  if (!parent && !thread) return value;
+  const jobs = value.jobs.filter(job =>
+    (!parent || (job.parent_job_id ?? job.context?.continuation?.parent_job_id ?? job.context?.routing?.parent_job_id) === parent) &&
+    (!thread || job.thread_id === thread));
+  return { ...value, jobs, total: jobs.length === value.jobs.length ? value.total ?? jobs.length : jobs.length };
+}
+
 function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGemini, plugin = apply, services = {} } = {}) {
   const tools = {};
   const handlers = {};
@@ -1281,7 +1300,7 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
   let closed = false;
   // finals：runner 已写下结果的任务，单次 status 查询返回它；cancelResult：cancel 的返回
   const finals = {};
-  const { startResult, cancelResult, listResult, outputResult, reviewResult, statusResult, summaryResult, productsResult, threadSizeResult, repeatGuardResult, ...pluginConfig } = config;
+  const { startResult, cancelResult, listResult, outputResult, reviewResult, statusResult, summaryResult, productsResult, threadSizeResult, repeatGuardResult, verificationVersionResult, ...pluginConfig } = config;
   const run = (_cfg, argv, options = {}) => {
     calls.push(argv);
     requests.push({ argv, ...options });
@@ -1289,6 +1308,9 @@ function harness({ config = {}, jobs, agents, sessionQuery, get = true, launchGe
     if (closed) return Promise.reject(new Error('harness closed'));
     if (argv[0] === 'repeat-guard') return Promise.resolve((typeof repeatGuardResult === 'function' ? repeatGuardResult(argv) : repeatGuardResult) ??
       { status: 'completed', totals: { blocked: 0, seconds_avoided: 0 }, standing: [] });
+    if (argv[0] === 'verification-version') return Promise.resolve(typeof verificationVersionResult === 'function'
+      ? verificationVersionResult(argv) : verificationVersionResult ??
+        { status: 'completed', verification_version: null, evidence_version: null, evidence_updated_at: null });
     if (argv[0] === 'start') return Promise.resolve((typeof startResult === 'function' ? startResult(argv, options) : startResult) ??
       { job_id: `J${++n}`, status: 'running' });
     if (argv[0] === 'list') return Promise.resolve((typeof listResult === 'function' ? listResult(argv) : listResult) ?? { jobs: [], total: 0 });
@@ -1792,7 +1814,12 @@ test('codex_run directs an unanswered latest task to codex_continue', async () =
   const h = harness({ config: { listResult: { jobs: [{ job_id: source.job_id, blocking: source.blocking }] } } });
   const exec = { agent: agentAt('/work/current') };
   await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id }, exec), /PARENT.*待决定.*codex_continue/);
-  assert.deepEqual(h.calls, [['list', '--limit', '100', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD']]);
+  assert.deepEqual(h.calls, [
+    ['list', '--limit', '1', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD'],
+    ['list', '--limit', '1', '--offset', '0', '--owner', 'S1', '--parent-job', 'PARENT'],
+    ['status', 'PARENT', '--wait', '0'],
+    ['list', '--limit', '100', '--offset', '0', '--owner', 'S1', '--thread-id', 'THREAD'],
+  ]);
 });
 
 test('plannerAnswers still requires codex_continue when resuming the latest ask_user task', async () => {
@@ -1802,7 +1829,9 @@ test('plannerAnswers still requires codex_continue when resuming the latest ask_
     await assert.rejects(h.tools.codex_run.execute({ ...RUN, resume: source.thread_id },
       { agent: agentAt('/work/current', log) }), /PARENT.*未启动 Codex.*codex_continue.*answers/);
   }
-  assert.ok(h.calls.every(argv => argv[0] === 'list' && argv.includes('--thread-id')));
+  assert.ok(h.calls.every(argv => (argv[0] === 'list' && (argv.includes('--thread-id') || argv.includes('--parent-job'))) ||
+    (argv[0] === 'status' && argv[1] === 'PARENT' && argv[3] === '0')));
+  assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 0);
 });
 
 test('a new write task cannot widen an overlapping pending scope before a real user reply', async () => {
@@ -1962,7 +1991,7 @@ test('plannerAnswers lets both resume paths pass older unanswered tasks on the s
       { type: 'user/message', time: 12_000, data: { source: { kind: 'tool-jobs' } } }];
     assert.equal((await h.tools[tool].execute(args, { agent: agentAt('/work/current', log) })).job_id, 'NEXT');
     assert.equal(h.calls.filter(argv => argv[0] === 'start').length, 1);
-    assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, 2);
+    assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, tool === 'codex_run' ? 3 : 2);
     const start = h.calls.find(argv => argv[0] === 'start');
     assert.equal(start[start.indexOf('--resume') + 1], parent.thread_id);
   }
@@ -5083,7 +5112,8 @@ test('a WSL bridge failure explains why preflight stopped without starting Codex
       assert.doesNotMatch(error.message, /PRIVATE BRIDGE TRACE/);
       return true;
     });
-    assert.deepEqual(h.calls.map(argv => argv[0]), ['list']);
+    assert.deepEqual(h.calls.map(argv => argv[0]), args.resume ? ['list', 'list'] : ['list']);
+    assert.ok(h.calls.every(argv => argv[0] === 'list'));
   }
 });
 
@@ -6773,7 +6803,7 @@ test('resume verification preflight tracks the continuation chain and current st
   });
   await t.test('a verification ending after the running list is released on the same dispatch', async () => {
     const { h, verification } = setup({ statusResult(argv) {
-      if (argv[1] === 'PARENT') verification.execution_status = 'completed';
+      if (argv[1] === 'CHECK') verification.execution_status = 'completed';
     } });
     assert.equal((await resume(h)).job_id, 'CHILD');
     assert.ok(h.calls.some(argv => argv[0] === 'status' && argv[1] === 'CHECK'));
@@ -6785,14 +6815,15 @@ test('codex_review finds independent support in a later verification, a later ro
   const parent = { ...workflowSource('implementation'), finished_at: now + 100, started_at: now + 50 };
   parent.structured.blockers = [];
   const review = { job_id: 'PARENT', status: 'verified', criteria: [{ index: 1, status: 'met', evidence: '我自己看过了' }] };
-  const verifyJob = (status) => ({ job_id: 'V1', status: 'completed', execution_status: 'completed', finished_at: now + 200, started_at: now + 150,
+  const verifyJob = (status) => ({ ...fixtureVerificationMetadata, job_id: 'V1', status: 'completed', execution_status: 'completed', finished_at: now + 200, started_at: now + 150,
     context: { owner: 'S1', verification_of: 'PARENT', task: '核验', acceptance: ['读取原任务书', '原验收第 1 条（原报告标 blocked）：CSV 解析测试通过——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。'], write: false },
     structured: { summary: 's', criteria: [{ criterion: '读取原任务书', status: 'met', evidence: 'x' }, { criterion: '原验收第 1 条', status, evidence: 'y' }],
       files_changed: [], deviations: [], unresolved: [], blockers: [] } });
   const statsFile = path.join(localAppData, 'dsh-codex-conductor', 'closeout-stats.json');
   const stats = () => { try { return JSON.parse(readFileSync(statsFile, 'utf8')).total; } catch { return {}; } };
   const run = async ({ jobs = [], finals = {}, log = [], config = {}, args = review } = {}) => {
-    const h = harness({ config: { plannerAnswers: true, listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
+    const h = harness({ config: { plannerAnswers: true, verificationVersionResult: fixtureVerificationSnapshot,
+      listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
       reviewResult: { ...parent, verification_status: args.status, verification: { time: now + 101 } }, ...config } });
     h.finals.PARENT = parent;
     Object.assign(h.finals, finals);
@@ -6836,12 +6867,13 @@ test('codex_review maps report rows to items before counting support, and extra 
   parent.structured.blockers = [];
   const item = (head, text) => `${head}：${text}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
   const row = (criterion, status) => ({ criterion, status, evidence: 'e' });
-  const verifyJob = (id, of, acceptance, criteria) => ({ job_id: id, status: 'completed', execution_status: 'completed', finished_at: now + 200, started_at: now + 150,
+  const verifyJob = (id, of, acceptance, criteria) => ({ ...fixtureVerificationMetadata, job_id: id, status: 'completed', execution_status: 'completed', finished_at: now + 200, started_at: now + 150,
     context: { owner: 'S1', verification_of: of, task: '核验', acceptance, write: false },
     structured: { summary: 's', criteria, files_changed: [], deviations: [], unresolved: [], blockers: [] } });
   const listed = (id, of) => ({ job_id: id, execution_status: 'completed', finished_at: now + 200, started_at: now + 150, context: { owner: 'S1', verification_of: of } });
   const run = async (source, args, jobs = [], finals = {}) => {
-    const h = harness({ config: { plannerAnswers: true, listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
+    const h = harness({ config: { plannerAnswers: true, verificationVersionResult: fixtureVerificationSnapshot,
+      listResult: (argv) => argv.includes('--started-between') ? { jobs, total: jobs.length } : { jobs: [], total: 0 },
       reviewResult: { ...source, verification_status: args.status } } });
     h.finals[source.job_id] = source;
     Object.assign(h.finals, finals);
@@ -7013,11 +7045,18 @@ function acceptedFixtureHarness(t) {
   const source = acceptedFixture();
   const cutoff = path.join(state, 'accept-open-evidence-since.json');
   writeFileSync(cutoff, JSON.stringify({ since: source.finished_at - 1 }));
-  const make = (config, options) => {
+  const make = (config = {}, options) => {
     const previous = process.env.LOCALAPPDATA;
     process.env.LOCALAPPDATA = root;
     try {
-      const h = harness({ ...options, config });
+      const h = harness({ ...options, config: {
+        verificationVersionResult: ([, id]) => h.finals[id]
+          ? { ...fixtureVerificationSnapshot, evidence_updated_at: h.finals[id].finished_at }
+          : { status: 'failed', error_kind: 'not_found' },
+        ...config,
+        listResult: async argv => filterFixtureList(argv, await (typeof config.listResult === 'function'
+          ? config.listResult(argv) : config.listResult) ?? { jobs: [], total: 0 }),
+      } });
       h.finals[source.job_id] = source;
       return h;
     } finally { process.env.LOCALAPPDATA = previous; }
@@ -7207,17 +7246,19 @@ test('predispatch warns only for the unchanged same-index environment block and 
   const repeat = { status: 'completed', standing: [], _changed_at: source.finished_at - 1 };
   const h = setup({ repeatGuardResult: () => repeat, listResult: argv => {
     if (!argv.includes('--thread-id')) return { jobs: [] };
-    const { job_id, cwd, finished_at, context, structured } = source;
-    return { jobs: [{ job_id, cwd, finished_at, ...(structured.blockers[0].kind === 'environment'
+    const { job_id, cwd, thread_id, started_at, finished_at, context, structured } = source;
+    return { jobs: [{ job_id, cwd, thread_id, started_at, finished_at, context: { owner: context.owner }, ...(structured.blockers[0].kind === 'environment'
       ? { predispatch: { acceptance: context.acceptance, criteria: structured.criteria } } : {}) }] };
   } });
   const run = (acceptance, extra = {}) => h.tools.codex_run.execute({ ...RUN, cwd: source.cwd,
     resume: source.thread_id, acceptance, ...extra }, exec);
   const environment = /第 1 条在本环境上一轮已受阻且之后无改动/;
   assert.match((await run([first, second])).next, environment);
-  assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, 1);
-  assert.equal(h.calls.some(argv => argv[0] === 'thread-size' || argv.includes('--parent-job') ||
-    (argv[0] === 'status' && argv[1] === source.job_id)), false);
+  assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--thread-id')).length, 3);
+  assert.equal(h.calls.filter(argv => argv[0] === 'list' && argv.includes('--parent-job')).length, 1);
+  assert.deepEqual(h.calls.filter(argv => argv[0] === 'status' && argv[1] === source.job_id),
+    [['status', source.job_id, '--wait', '0']]);
+  assert.equal(h.calls.some(argv => argv[0] === 'thread-size'), false);
   assert.doesNotMatch((await run(['新的验收内容', second])).next, environment);
   assert.doesNotMatch((await run([second, first])).next, /上一轮已受阻/);
   assert.doesNotMatch((await run([first, second], { cwd: '/different' })).next, environment);
@@ -7251,6 +7292,7 @@ test('later verification follows criterion text for met and open support', async
   const later = finishedRound(source, 'LATER', [b, a], [resultRow(b, 'blocked')], source.finished_at, { parent_job_id: source.job_id });
   const check = finishedRound(source, 'CHECK', [], [], later.finished_at);
   check.context.verification_of = later.job_id;
+  Object.assign(check, fixtureVerificationMetadata);
   const h = make({ plannerAnswers: true, listResult: { jobs: [later, check] }, reviewResult: source });
   Object.assign(h.finals, { LATER: later, CHECK: check });
   const met = verifiedReview(source);
@@ -7302,6 +7344,7 @@ test('later verification cannot support a must_verify item with ambiguous text',
   const item = `原验收第 2 条（必须实测）：${text}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
   const check = finishedRound(source, 'CHECK', [item], [resultRow(item, 'met')], later.finished_at);
   check.context.verification_of = later.job_id;
+  Object.assign(check, fixtureVerificationMetadata);
   const h = make({ plannerAnswers: true, closeoutEvidence: 'off', acceptOpenEvidence: 'off',
     listResult: { jobs: [later, check] }, reviewResult: source });
   Object.assign(h.finals, { LATER: later, CHECK: check });
@@ -7324,6 +7367,7 @@ test('later verification gives no support when the source repeats the text in an
   const item = `原验收第 2 条（必须实测）：${text}——独立核实现在是否满足：满足记 met，不满足记 not_met，无法核实记 blocked，evidence 写出处。`;
   const check = finishedRound(source, 'CHECK', [item], [resultRow(item, 'met')], later.finished_at);
   check.context.verification_of = later.job_id;
+  Object.assign(check, fixtureVerificationMetadata);
   const h = make({ plannerAnswers: true, closeoutEvidence: 'off', acceptOpenEvidence: 'off',
     listResult: { jobs: [later, check] }, reviewResult: source });
   Object.assign(h.finals, { LATER: later, CHECK: check });
@@ -7355,6 +7399,7 @@ test('later verification maps unmatched report rows by text across rounds', asyn
     resultRow(b, 'blocked'), resultRow(a, 'not_met')], source.finished_at, { parent_job_id: source.job_id });
   const check = finishedRound(source, 'CHECK', [], [], later.finished_at);
   check.context.verification_of = later.job_id;
+  Object.assign(check, fixtureVerificationMetadata);
   const h = make({ plannerAnswers: true, listResult: { jobs: [later, check] }, reviewResult: source });
   Object.assign(h.finals, { LATER: later, CHECK: check });
   const submit = (row, text) => {
@@ -7408,14 +7453,18 @@ test('release A: strict and relaxed distinguish verification, later rounds and r
   const listed = runnerFixture('runner-list-row-c0874f');
   const later = { ...listed, job_id: 'LATER', parent_job_id: id, started_at: finished_at + 1, finished_at: finished_at + 2 };
   const items = source.context.acceptance.slice(0, 4).map((text, i) => `原验收第 ${i + 1} 条（原报告标 blocked）：${text}`);
-  const v = { ...later, job_id: 'VERIFY', parent_job_id: null, context: { owner: 'S1', verification_of: 'LATER' } };
+  const v = { ...later, ...fixtureVerificationMetadata, job_id: 'VERIFY', parent_job_id: null,
+    started_at: later.finished_at + 1, finished_at: later.finished_at + 2,
+    context: { owner: 'S1', verification_of: 'LATER' } };
   const full = (acceptance, criteria, context = {}) => ({ ...source, context: { ...source.context, ...context, acceptance },
     structured: { ...source.structured, criteria } });
   const run = ({ jobs = [], config = {}, log = [], reportRows = items } = {}) => {
     const h = make({ ownerDecisions: 'owner', plannerAnswers: true, closeoutEvidence: 'off', listResult: { jobs: [listed, ...jobs] },
       reviewResult: { ...source, verification: { ...source.verification, time: source.verification.time + 1 } }, ...config });
-    h.finals.LATER = full(source.context.acceptance, source.structured.criteria);
-    h.finals.VERIFY = full(items, reportRows.map(criterion => ({ criterion, status: 'blocked', evidence: '仍未实现' })), v.context);
+    h.finals.LATER = { ...full(source.context.acceptance, source.structured.criteria),
+      job_id: later.job_id, started_at: later.started_at, finished_at: later.finished_at };
+    h.finals.VERIFY = { ...full(items, reportRows.map(criterion => ({ criterion, status: 'blocked', evidence: '仍未实现' })), v.context),
+      ...fixtureVerificationMetadata, job_id: v.job_id, started_at: v.started_at, finished_at: v.finished_at };
     return h.tools.codex_review.execute(review, { agent: agentAt('/work/current', log) });
   };
   await assert.rejects(run({ jobs: [later] }), ({ message }) =>
@@ -7537,6 +7586,7 @@ async function openLedgerFixture(t, acceptance) {
     const item = `原验收第 ${i} 条（原报告标 blocked）：${target.context.acceptance[i - 1]}`;
     const check = finishedRound(source, jobId, [item], [resultRow(item, 'met')], Math.max(target.finished_at, at));
     check.context.verification_of = target.job_id;
+    Object.assign(check, fixtureVerificationMetadata);
     add(check);
     return check;
   };
@@ -7825,7 +7875,7 @@ test('rework 5: update_goal preserves object and JSON string argument forms', as
 });
 
 const autoSource = (id) => ({ ...workflowSource('implementation'), job_id: id, log_dir: `/logs/${id}`,
-  verification_status: 'unreviewed', finished_at: Date.now() / 1000 });
+  verification_status: 'unreviewed', started_at: Date.now() / 1000 - 1, finished_at: Date.now() / 1000 });
 const queryStatus = (h, job_id, agent = agentAt('/work/original')) =>
   h.tools.codex_status.execute({ job_id, wait_seconds: 0 }, { agent });
 
@@ -7864,8 +7914,14 @@ function autoVerifyFixture(t) {
       const { context } = JSON.parse(stdin);
       starts.push(context);
       const job_id = `CHECK-${starts.length}`;
+      const original = runner[context.verification_of];
+      const started_at = original.finished_at + 1;
       await startBarrier;
-      return runner[job_id] = { job_id, status: 'completed', execution_status: 'completed', context };
+      return runner[job_id] = { ...fixtureVerificationMetadata, job_id, status: 'completed', execution_status: 'completed',
+        started_at, finished_at: started_at + 1, report_status: 'valid', context,
+        structured: { summary: '独立核验仍受环境阻塞', files_changed: [], deviations: [], unresolved: [],
+          criteria: context.acceptance.map(criterion => resultRow(criterion, 'blocked')),
+          blockers: [{ id: 'environment', kind: 'environment', message: '测试环境仍不可用', question: '', resolution: '' }] } };
     }, ...config }, { agents: { get: (id) => ({ ...agentAt('/work/original'), id }) }, ...options });
     Object.assign(h.finals, runner);
     return h;
@@ -7895,6 +7951,7 @@ function parkedReviewFixture(t) {
   const v = finishedRound(source, 'VERIFY', items, items.map(item => resultRow(item, 'blocked')), source.finished_at,
     { status: 'running', execution_status: 'running', finished_at: null });
   v.context = { ...v.context, verification_of: id, write: false };
+  Object.assign(v, fixtureVerificationMetadata);
   const rows = [source, v];
   const writes = [];
   const load = (config = {}, options) => {
@@ -8083,7 +8140,12 @@ test('parked evaluation respects a newer manual review written during support lo
     let manual;
     const h = f.load({
       statusResult: ([, id]) => id === f.id ? structuredClone(f.source) : undefined,
-      listResult: async () => { await manual?.(); return { jobs: f.rows }; },
+      listResult: async () => {
+        const submit = manual;
+        manual = undefined;
+        await submit?.();
+        return { jobs: f.rows };
+      },
     });
     assert.equal((await f.submit(h)).status, 'parked');
     const at = f.parked()[0].at;
@@ -8544,9 +8606,13 @@ test('release C: capacity and an earlier completed verification skip automatic d
   assert.ok(!capped.calls.some(argv => argv[0] === 'start'));
   assert.equal(JSON.parse(readFileSync(path.join(state, 'closeout-stats.json'), 'utf8')).total.auto_verify_skipped, 1);
 
-  const old = { job_id: 'OLD-CHECK', execution_status: 'completed', context: { owner: 'S1', verification_of: 'CHECKED' } };
+  const checked = autoSource('CHECKED');
+  const item = `原验收第 1 条（原报告标 blocked）：${checked.context.acceptance[0]}`;
+  const old = finishedRound(checked, 'OLD-CHECK', [item], [resultRow(item, 'blocked')], checked.finished_at,
+    fixtureVerificationMetadata);
+  old.context.verification_of = checked.job_id;
   const h = make({ autoVerify: 'flagged', listResult: argv => argv.includes('--status') ? { jobs: [] } : { jobs: [old] } });
-  h.finals.CHECKED = autoSource('CHECKED');
+  Object.assign(h.finals, { CHECKED: checked, 'OLD-CHECK': old });
   assert.deepEqual((await queryStatus(h, 'CHECKED')).auto_verify, { skipped: '已存在核验 OLD-CHECK（completed）' });
   assert.equal((await h.tools.codex_verify.execute({ job_id: 'CHECKED' }, { agent: agentAt('/work') })).job_id, 'J1');
 

@@ -21,7 +21,7 @@ const question = (options = [choice('方案 A'), choice('方案 B')], fields = {
 });
 const humanAnswer = { answers: [{ id: 'choice', selected: ['方案 B'] }] };
 const flush = () => new Promise(setImmediate);
-const credentialActionYaml = String.raw`'|(?:修改|设置(?!页)|重置|更换|更新|设定|生成|新建|创建|轮换)[^。！？!?；;.]{0,40}(?:密码|口令|凭据|凭证|密钥)|(?:改|设(?![备计施置定]))[^。！？!?；;.]{0,12}(?:密码|口令|凭据|凭证|密钥)|(?:密码|口令|凭据|凭证|密钥)[^。！？!?；;.]{0,40}(?:(?:修改|设置(?!页)|重置|更换|更新|设定|生成|新建|创建|轮换)|(?:改|设(?![备计施置定]))|换成|换为)|\b(?:change|set|reset|rotate|update|generate|create)\b[^。！？!?；;.]{0,40}\b(?:passwords?|passphrases?|credentials?|secrets?)\b|\b(?:passwords?|passphrases?|credentials?|secrets?)\b[^。！？!?；;.]{0,40}\b(?:change|set|reset|rotate|update|generate|create)\b'`;
+const credentialActionYaml = String.raw`'|(?:修改|设置(?!页|是否)|重置|更换|更新(?!时间|历史|记录)|设定|生成|新建|创建(?!时间|日期)|轮换|替换|\b(?:change|set|reset|rotate|update|generate|create|renew|revoke|regenerate)\b(?!\s+(?:history|times?|timestamps?|dates?|records?)\b))(?:(?![。！？!?；;]|\.(?:\s|$))[\s\S]){0,40}(?:密码|口令|凭据|凭证|密钥|(?<![a-z0-9])(?:passwords?|passphrases?|credentials?|secrets?|tokens?|api[ _-]?(?:tokens?|keys?)|access[ _-]?keys?|(?:ssh[ _-]?(?:private[ _-]?)?|private[ _-])keys?)(?![a-z0-9]))|(?:改|设(?![备计施置定]))(?:(?![。！？!?；;]|\.(?:\s|$))[\s\S]){0,12}(?:密码|口令|凭据|凭证|密钥|(?<![a-z0-9])(?:passwords?|passphrases?|credentials?|secrets?|tokens?|api[ _-]?(?:tokens?|keys?)|access[ _-]?keys?|(?:ssh[ _-]?(?:private[ _-]?)?|private[ _-])keys?)(?![a-z0-9]))|(?:密码|口令|凭据|凭证|密钥|(?<![a-z0-9])(?:passwords?|passphrases?|credentials?|secrets?|tokens?|api[ _-]?(?:tokens?|keys?)|access[ _-]?keys?|(?:ssh[ _-]?(?:private[ _-]?)?|private[ _-])keys?)(?![a-z0-9]))(?:(?![。！？!?；;]|\.(?:\s|$))[\s\S]){0,40}(?:(?:修改|设置(?!页|是否)|重置|更换|更新(?!时间|历史|记录)|设定|生成|新建|创建(?!时间|日期)|轮换|替换|\b(?:change|set|reset|rotate|update|generate|create|renew|revoke|regenerate)\b(?!\s+(?:history|times?|timestamps?|dates?|records?)\b))|(?:改|设(?![备计施置定]))|换成|换为|换一个)'`;
 
 function host(t, options = {}) {
   const { directory = fixtureDirectory(t), settings = {}, serviceAvailable = true, allowSubagents = false, allowed } = options;
@@ -174,7 +174,7 @@ test('whenRisky defer answers risky and owner-only questions with a deferral aft
   tick();
   const answered = await batch.result;
   assert.deepEqual(answered.answers[0].selected, ['方案 A']);
-  assert.deepEqual(answered.answers[1].selected, ['先不删，保留']);
+  assert.deepEqual(answered.answers[1].selected, []);
   assert.match(answered.answers[1].custom, /不执行这一步/);
   const ownerOnly = (await owner.result).answers[0];
   assert.deepEqual([ownerOnly.selected, /不执行这一步/.test(ownerOnly.custom)], [[], true]);
@@ -258,6 +258,40 @@ test('review credential actions defer instead of immediately executing the recom
     ['english-generate', 'generate a new passphrase', true],
     ['english-create', 'create a new credential', true],
     ['english-noun-first-update', 'password update', true],
+    ['samba-dotted-account', '修改 Samba 账号 svc.backup 的密码，可以吗？', true],
+    ['samba-ip', '修改 192.168.1.10 上的 Samba 口令，可以吗？', true],
+    ['ssh-dotted-host', '轮换 ssh.example.com 上的 SSH 密钥，可以吗？', true],
+    ['db-dotted-account', 'change the svc.backup password?', true],
+    ['db-dotted-host', 'change the DB server db.example.com password?', true],
+    ['ssh-private-key', 'Generate a new SSH private key for the service account?', true],
+    ['service-api-token', 'Rotate the service account API token?', true],
+    ['chinese-api-token', '轮换服务账号的 API token，可以吗？', true],
+    ['mixed-ssh-key', '创建新的 SSH key 并写入配置，可以吗？', true],
+    ['db-env-password', 'set DB_PASSWORD to a random value?', true],
+    ['samba-replace', '把 Samba 密码替换为随机值，可以吗？', true],
+    ['db-change-another', '把 DB 密码换一个，可以吗？', true],
+    ['service-renew-secret', 'renew the service account secret?', true],
+    ['service-revoke-token', 'revoke the service account API token?', true],
+    ['service-regenerate-key', 'regenerate the service account access key?', true],
+    ['service-renew-key', 'renew the service account access key?', true],
+    ['service-revoke-secret', 'revoke the service account secret?', true],
+    ['service-regenerate-token', 'regenerate the service account API token?', true],
+    ['service-token-first', 'API token rotation: rotate it now?', true],
+    ['service-key-first', 'access key: regenerate it now?', true],
+    ['english-readonly-metadata', 'Show the password update history?', false],
+    ['ssh-readonly-metadata', '只读查询 SSH 密钥的创建时间，可以吗？', false],
+    ['db-readonly-metadata', '只读查询 DB 密码的更新时间，不做任何变更，可以吗？', false],
+    ['samba-readonly-settings', '只读检查 Samba 的密码设置是否合规，可以吗？', false],
+    ['read-and-update-password', '查看并更新密码', true],
+    ['readonly-then-update', '只读查询 SSH 密钥的创建时间，然后更新密钥', true],
+    ['english-history-then-update', 'Show the password update history, then update the password?', true],
+    ['english-history-then-revoke', 'Show the password update history, then revoke the access key?', true],
+    ['token-rotation', 'rotate token', true],
+    ['bare-api-token', 'API token', false],
+    ['bare-access-key', 'access key', false],
+    ['api-token-redaction', '检查日志里的 API token 是否已脱敏', false],
+    ['access-key-statistics', '统计日志里出现 access key 字段的次数', false],
+    ['dotted-identifier-not-sentence', '更新连接参数.口令检查', true],
     ['settings-page-inspection', '看看设置页里有没有密码强度提示', false],
     ['credential-field-count', '统计日志里出现密码字段的次数', false],
     ['long-action-40', '更新' + '甲'.repeat(40) + '密码', true],
@@ -288,7 +322,7 @@ test('review credential actions defer instead of immediately executing the recom
     ['comma-conservative-english', 'set the theme, then inspect the secret format', true],
   ];
   for (const boundary of ['。', '.', '？', '?', '！', '!', '；', ';']) {
-    cases.push([`sentence-boundary-${boundary}`, `更新连接参数${boundary}口令检查`, false]);
+    cases.push([`sentence-boundary-${boundary}`, `更新连接参数${boundary === '.' ? '. ' : boundary}口令检查`, false]);
   }
   for (const [mode, settings] of [
     ['default', { whenRisky: 'defer' }],
@@ -302,7 +336,7 @@ test('review credential actions defer instead of immediately executing the recom
         ], { question: text })]);
         tick();
         const { answers: [answer] } = await pending.result;
-        assert.deepEqual(answer.selected, risky ? ['先不做'] : ['是，立即执行（推荐）'], text);
+        assert.deepEqual(answer.selected, risky ? [] : ['是，立即执行（推荐）'], text);
         if (risky) assert.match(answer.custom, /不执行这一步/);
         await flush();
         assert.equal(panel.snapshot().recent[0].reason, risky ? 'deferred_risky' : 'marked_recommended', text);
@@ -312,6 +346,49 @@ test('review credential actions defer instead of immediately executing the recom
       });
     }
   }
+});
+
+test('third-round split credential fields defer without selecting even a keep-labelled option', async (t) => {
+  const cases = [
+    ['header-question', { header: 'Samba 口令', question: '由你生成随机值并写入配置，可以现在执行吗？' }],
+    ['original-split-header', { header: '密码', question: '是否修改 Samba 账号？' }],
+    ['question-detail', { question: 'Samba 口令', detail: '由你生成随机值并写入配置，可以现在执行吗？' }],
+    ['header-detail', { header: 'SSH 密钥', question: '下一步', detail: '由你轮换并写入配置' }],
+    ['question-option-label', { question: 'Samba 口令', options: [choice('生成随机值并写入配置（推荐）'), choice('先不做')] }],
+    ['question-option-description', { question: 'Samba 口令', options: [choice('继续（推荐）', '生成随机值并写入配置'), choice('先不做')] }],
+    ['option-label-description', { question: '下一步', options: [choice('Samba 口令（推荐）', '生成随机值并写入配置'), choice('先不做')] }],
+    ['unsafe-keep-label', { question: '是否更新 Samba 密码？', options: [choice('保留 Samba 账号并更新密码（推荐）'), choice('先不做')] }],
+    ['unsafe-keep-description', { question: '是否更新 Samba 密码？', options: [choice('是，立即执行（推荐）', '保留用户名，立即设置新口令'), choice('先不做')] }],
+    ['multi-select', { multiSelect: true, question: '是否更新 Samba 密码？', options: [choice('保留 Samba 账号并更新密码（推荐）'), choice('先不做（推荐）')] }],
+  ];
+  for (const [mode, riskyPattern] of [['default', AUTO_ANSWER_DEFAULTS.riskyPattern], ['deployment-addon', credentialActionYaml.slice(2, -1)]]) {
+    for (const [name, fields] of cases) {
+      await t.test(`${mode}/${name}`, async (t) => {
+        const tick = clock(t), h = host(t, { settings: { whenRisky: 'defer', riskyPattern } }), panel = h.load();
+        const pending = h.open([question([choice('是，立即执行（推荐）'), choice('先不做')], fields)]);
+        assert.equal(panel.snapshot().pending[0].reason, 'risky');
+        tick();
+        const { answers: [answer] } = await pending.result;
+        assert.deepEqual(answer.selected, []);
+        assert.match(answer.custom, /不执行这一步/);
+        assert.doesNotMatch(answer.custom, /已自动选择推荐项/);
+        await flush();
+        assert.equal(panel.snapshot().recent[0].reason, 'deferred_risky');
+        assert.deepEqual(panel.snapshot().recent[0].selected, []);
+      });
+    }
+  }
+});
+
+test('credential fields are joined within one question and never across questions', async (t) => {
+  const tick = clock(t), h = host(t, { settings: { whenRisky: 'defer' } }), panel = h.load();
+  const pending = h.open([
+    question(undefined, { id: 'noun', question: 'Samba 口令' }),
+    question(undefined, { id: 'action', question: '生成随机值' }),
+  ]);
+  assert.equal(panel.snapshot().pending[0].reason, null);
+  tick();
+  assert.deepEqual((await pending.result).answers.map(a => a.selected), [['方案 A'], ['方案 A']]);
 });
 
 test('a custom risk pattern applies to question text and an empty pattern disables risk matching', async (t) => {

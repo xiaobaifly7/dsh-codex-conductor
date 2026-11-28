@@ -544,3 +544,125 @@ test('review 5: incomplete lineage lookup permits a fresh verification', async t
   }));
   assert.notEqual((await tools.codex_verify.execute({ job_id: 'source' }, caller())).job_id, first.job_id);
 });
+
+test('review final 1: passed verification is reused only while evidence and later rounds remain unchanged', async t => {
+  for (const change of ['external-evidence', 'rework', 'unknown-evidence', 'lineage-failure', 'incomplete-lineage']) {
+    await t.test(change, async t => {
+      const h = fixture(t);
+      h.add('source', { thread_id: 'source-thread', files_changed: [{ path: 'docs/report.md' }] });
+      const tools = h.load();
+      const first = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+      if (change === 'external-evidence') h.setEvidenceVersion('external-evidence-2');
+      if (change === 'unknown-evidence') h.setEvidenceVersion(null);
+      if (change === 'rework') {
+        await tools.codex_review.execute({ job_id: 'source', status: 'needs_changes',
+          criteria: acceptance.map((_, i) => ({ index: i + 1, status: 'not_met', evidence: '新观测与报告不符，需要返工' })) }, caller());
+        await tools.codex_continue.execute({ job_id: 'source', resolution: '重新采集原始证据并核实结论' }, caller());
+      }
+      const current = change.endsWith('lineage') || change === 'lineage-failure'
+        ? h.load({}, (ctx, cfg, run) => apply(ctx, cfg, async (c, argv, options) => {
+          if (argv.includes('--parent-job')) {
+            if (change === 'lineage-failure') throw new Error('runner query timeout');
+            return { jobs: [], total: 0, incomplete: true };
+          }
+          return run(c, argv, options);
+        })) : tools;
+      const second = await current.codex_verify.execute({ job_id: 'source' }, caller());
+      assert.notEqual(second.job_id, first.job_id);
+      assert.equal(h.starts.length, change === 'rework' ? 3 : 2);
+    });
+  }
+});
+
+test('review final 1: stale passed evidence cannot satisfy must_verify closeout', async t => {
+  for (const change of ['external-evidence', 'rework', 'unknown-evidence', 'query-failure']) {
+    await t.test(change, async t => {
+      const h = fixture(t);
+      h.add('source', { thread_id: 'source-thread', context: { must_verify: [1] },
+        structured: { criteria: acceptance.map(criterion => ({ criterion, status: 'met', evidence: '原始报告自检' })) } });
+      const tools = h.load();
+      const first = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+      if (change === 'external-evidence') h.setEvidenceVersion('external-evidence-2');
+      if (change === 'unknown-evidence') h.setEvidenceVersion(null);
+      if (change === 'rework') {
+        await tools.codex_review.execute({ job_id: 'source', status: 'needs_changes', criteria: [
+          { index: 1, status: 'not_met', evidence: '需重新采集' }, { index: 2, status: 'met', evidence: '输出存在' },
+        ] }, caller());
+        await tools.codex_continue.execute({ job_id: 'source', resolution: '补采观测' }, caller());
+      }
+      const current = change === 'query-failure'
+        ? h.load({}, (ctx, cfg, run) => apply(ctx, cfg, async (c, argv, options) => {
+          if (argv[0] === 'verification-version') throw new Error('runner query timeout');
+          return run(c, argv, options);
+        })) : tools;
+      const review = { job_id: 'source', status: 'verified', criteria: acceptance.map((_, i) => ({
+        index: i + 1, status: 'met', evidence: `独立核验 ${first.job_id} 已核实`,
+      })) };
+      await assert.rejects(current.codex_review.execute(review, caller()), /必须实测|codex_verify/);
+      assert.equal(h.records.get('source').verification_status, change === 'rework' ? 'needs_changes' : 'unreviewed');
+      if (change !== 'query-failure') {
+        const fresh = await tools.codex_verify.execute({ job_id: 'source', force: true }, caller());
+        if (change !== 'unknown-evidence') {
+          review.criteria[0].evidence = `新核验 ${fresh.job_id} 已核实`;
+          assert.equal((await tools.codex_review.execute(review, caller())).verification_status, 'verified');
+        }
+      }
+    });
+  }
+});
+
+test('review final 7: an incomplete continuation list permits verification after an insufficient report', async t => {
+  const h = fixture(t);
+  insufficientVerification(h);
+  const first = await h.load().codex_verify.execute({ job_id: 'source' }, caller());
+  markEvidenceMissing(h, first.job_id);
+  const tools = h.load({}, (ctx, cfg, run) => apply(ctx, cfg, async (c, argv, options) => {
+    if (argv.includes('--parent-job')) return { jobs: [], total: 0, incomplete: true };
+    return run(c, argv, options);
+  }));
+  assert.notEqual((await tools.codex_verify.execute({ job_id: 'source' }, caller())).job_id, first.job_id);
+  assert.equal(h.starts.length, 2);
+});
+
+test('review final 1: automatic catch-up does not reuse a passed report after evidence changes', async t => {
+  const h = fixture(t);
+  h.add('source', { thread_id: 'source-thread', files_changed: [{ path: 'docs/report.md' }] });
+  const first = await h.load().codex_verify.execute({ job_id: 'source' }, caller());
+  h.setEvidenceVersion('external-evidence-2');
+  const result = await h.load({ autoVerify: 'flagged' }).codex_status.execute({ job_id: 'source' }, caller());
+  assert.notEqual(result.auto_verify.job_id, first.job_id);
+  assert.equal(h.starts.length, 2);
+});
+
+test('review final 1: missing source execution metadata cannot prove an old verification current', async t => {
+  for (const missingEvidence of [false, true]) {
+    const h = fixture(t);
+    h.add('source', { thread_id: 'source-thread', files_changed: [{ path: 'docs/report.md' }] });
+    const tools = h.load();
+    const first = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+    if (missingEvidence) markEvidenceMissing(h, first.job_id);
+    Object.assign(h.records.get('source'), { thread_id: null, started_at: null });
+    assert.notEqual((await tools.codex_verify.execute({ job_id: 'source' }, caller())).job_id, first.job_id);
+    assert.equal(h.starts.length, 2);
+  }
+});
+
+test('review final 1: verification of a child cannot certify the root after a newer sibling round', async t => {
+  for (const newerSibling of [false, true]) {
+    await t.test(newerSibling ? 'new-sibling' : 'unchanged-lineage', async t => {
+      const h = fixture(t);
+      const met = acceptance.map(criterion => ({ criterion, status: 'met', evidence: '本轮核对' }));
+      h.add('source', { thread_id: 'root-thread', context: { must_verify: [1] }, structured: { criteria: met } });
+      h.add('child', { thread_id: 'child-thread', context: { must_verify: [1], continuation: { parent_job_id: 'source' } },
+        structured: { criteria: met } });
+      const tools = h.load();
+      await tools.codex_verify.execute({ job_id: 'child' }, caller());
+      if (newerSibling) h.add('sibling', { context: { continuation: { parent_job_id: 'source' } }, structured: { criteria: met } });
+      const review = tools.codex_review.execute({ job_id: 'source', status: 'verified', criteria: acceptance.map((_, i) => ({
+        index: i + 1, status: 'met', evidence: '后续轮次的独立核验已核实',
+      })) }, caller());
+      if (newerSibling) await assert.rejects(review, /must_verify.*独立实测依据/);
+      else assert.equal((await review).verification_status, 'verified');
+    });
+  }
+});

@@ -4041,7 +4041,7 @@ def save_listing(job_id, signature, value, details):
                 os.unlink(tmp)
 
 
-def matching_jobs(args, *, page_dates=None):
+def matching_jobs(args, *, page_dates=None, incomplete=None):
     scope_conflicts = getattr(args, "scope_conflicts", False)
     started_between = getattr(args, "started_between", None)
     needs_attention = args.needs_attention or scope_conflicts
@@ -4066,6 +4066,18 @@ def matching_jobs(args, *, page_dates=None):
             return False
         return not (check_cwd and args.cwd) or bool(value.get("cwd") and
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
+
+    def note_incomplete(value, job_id):
+        if incomplete is None or not value or not matches_metadata(value, job_id):
+            return
+        context = value.get("context") or {}
+        parent = (context.get("fallback_of") or context.get("continuation", {}).get("parent_job_id") or
+                  context.get("routing", {}).get("parent_job_id"))
+        if getattr(args, "parent_job", None) and parent != args.parent_job:
+            return
+        if getattr(args, "thread_id", None) and (value.get("thread_id") or value.get("resume")) != args.thread_id:
+            return
+        incomplete.append(job_id)
 
     jobs = []
     # Owner, verification and task filters come from args.json alone: skip non-matching jobs from the cache
@@ -4120,9 +4132,12 @@ def matching_jobs(args, *, page_dates=None):
             try:
                 task = task_record(job_dir) if task is None else task  # reuse the prefilter's read
                 result = json.loads(result_file.read_text("utf-8")) if finished else None
+                if finished and not isinstance(result, dict):
+                    raise ValueError("result.json must be an object")
                 value = {**task, **(result if result is not None else {})}
                 record = {"task": task, "result": result}
             except (OSError, ValueError, TypeError):
+                note_incomplete(task, job_dir.name)
                 value, record = {}, None
             if not matches_metadata(value, job_dir.name):
                 continue
@@ -4134,6 +4149,7 @@ def matching_jobs(args, *, page_dates=None):
                                                      conversation_id=value.get("conversation_id"), resolve=resolve)
                     value = {**record["metadata"], **(record["result"] if record["result"] is not None else {})}
                 except (OSError, ValueError, TypeError):
+                    note_incomplete(value, job_dir.name)
                     record = None
                     value = job_status(job_dir.name, lost_after=getattr(args, "lost_after", LOST_AFTER))
                     value["_details"] = dict(value)
@@ -4149,6 +4165,8 @@ def matching_jobs(args, *, page_dates=None):
             continue
         if getattr(args, "parent_job", None) and parent != args.parent_job:
             continue
+        if value.get("_details", {}).get("error_kind") == "invalid_record":
+            note_incomplete(value, job_dir.name)
         value.update(job_id=job_dir.name, _record=record)
         if args.status or needs_attention:
             value = job_details(value, args)
@@ -4173,11 +4191,12 @@ def matching_jobs(args, *, page_dates=None):
 
 
 def list_jobs(args):
+    incomplete = []
     requested = slice(args.offset, args.offset + args.limit)
     filters = ("cwd", "owner", "status", "job_id", "thread_id", "parent_job", "needs_attention",
                "scope_conflicts", "started_between", "verification_of", "task_key")
     if any(getattr(args, key, None) for key in filters):
-        jobs = matching_jobs(args)
+        jobs = matching_jobs(args, incomplete=incomplete)
         total = len(jobs)
         page = jobs[requested]
     else:
@@ -4185,8 +4204,9 @@ def list_jobs(args):
         dates = {p: job_listing_times(p) for p in job_directories()}
         ordered = sorted(dates, key=lambda p: job_listing_order(dates[p]), reverse=True)
         total = len(ordered)
-        page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]})
+        page = matching_jobs(args, page_dates={p: dates[p] for p in ordered[requested]}, incomplete=incomplete)
     page = [job_details(j, args) for j in page]
+    incomplete.extend(j["job_id"] for j in page if j.get("error_kind") == "invalid_record")
     predispatch = None
     if args.owner and getattr(args, "thread_id", None) and args.offset == 0 and page:
         report = page[0].get("structured")
@@ -4215,7 +4235,8 @@ def list_jobs(args):
     if predispatch is not None:
         page[0]["predispatch"] = predispatch
     return {"status": "completed", "jobs": page, "total": total, "offset": args.offset, "limit": args.limit,
-            "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total}
+            "next_offset": next_offset if next_offset < total else None, "eof": next_offset >= total,
+            **({"incomplete": True} if incomplete else {})}
 
 
 def query_resolver():
