@@ -32,7 +32,7 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 规划端先机械核对产物是否存在、是否有出处及数字能否对应。内容真实性用 `codex_verify`，例如 `{"job_id":"原任务编号","focus":"统计数字与引用是否准确","samples":8,"wait_seconds":0}`。`samples` 默认 8，范围 1–30；其余等待规则同 `codex_run`。它只接受本会话已结束的任务，在新线程中沿用原目录和主机访问。未启用 modelAB 时沿用原模型，启用时使用配置的默认模型。全程只读核对任务书、验收、产物及原始出处，按现有报告格式逐条写明结论、出处、是否属实及实际情况。关联保存在 `context.verification_of`，可从 `codex_jobs` / `codex_status` 看到；核验完成后用 `codex_review` 记录原任务的验收。同一版本已完成验收、产物未变且没有新证据时，不再追加核验；`codex_review` 只记录验收，不另派调查。Gemini 正文的核对见下文，不能用旧素材任务的 `codex_verify` 替代。主机访问模式的只读约束与原有 `write=false` 相同，由任务书约束；护栏不是操作系统沙箱。
 
-缺证据或无法确认的核验，在原单记录、声明范围、产物及证据均未变化、且此后没有执行或续接时，直接返回上次报告，不再派整单核验。补充证据用 `new_evidence: "证据内容或可回查路径"`；需要显式重核用 `force: true`。产物变化或续接后照常派单；无法确认变化时也不阻挡核验。仅修改 `focus` 或抽查数量不算补证据。执行、续接和核验提示都要求等待 30–60 秒，回查输出的 `yield_time_ms` 至少为 `30000`。
+缺证据或无法确认的核验，在原单记录、声明范围、产物及证据均未变化、且此后没有执行或续接时，直接返回上次报告，不再派整单核验。补充证据用 `new_evidence: "证据内容或可回查路径"`；需要显式重核用 `force: true`。产物或已有 Git 版本变化后照常派单；没有声明范围或产物路径时监控原项目目录。续接检查沿子孙轮次及其关联线程继续查询。变化或续接查询失败、不完整时放行，调用方取消仍中止。仅修改 `focus` 或抽查数量不算补证据。执行、续接和核验提示都要求等待 30–60 秒，回查输出的 `yield_time_ms` 至少为 `30000`。
 
 核验可以实际运行原项目的检查。沙箱核验在每单的暂存目录启动，提示核验员先读项目的 `AGENTS.md`，再切到项目目录运行检查。只有暂存目录可写，测试临时文件和缓存使用其中的 `TMPDIR`。主机访问核验沿用原有权限，临时文件仍在项目外。runner 在核验前后比较受核验范围的 Git 状态、提交、索引和已改动或未跟踪文件的内容。未指定范围或产物时，以原任务目录为范围，此时只有范围重叠的并行写任务才算并行变更。范围内变化会使核验失败，范围外变化会出提示。无法读取的内容、单文件超过 1 MiB 或单次比对超过 32 MiB 的部分会标注未比对，非 Git 目录或查询超时会注明比对不可用。
 
@@ -78,7 +78,7 @@ bili `decompress` 自动导出的临时原文可直接 read / grep：实际文�
 
 ### 0.9.115 自动代答宿主提问
 
-默认高风险正则包括修改凭据的动作（如“设 Samba 测试口令”、`rotate password`），单独的密码、口令、凭据、密钥或 token 仍不触发。已有 `autoAnswer.riskyPattern` 会覆盖默认值，部署时须同步补上动作匹配；`whenRisky: defer` 沿用“这一步先不做，记为待确认”的处理。
+默认高风险正则包括修改凭据的动作（如“设 Samba 测试口令”“把口令改成指定值”、`rotate password`），支持同一分句内跨行，不跨逗号、句号等分句边界。单独的密码、口令、凭据、密钥或 token，以及“设备使用哪种密码算法”仍不触发。已有 `autoAnswer.riskyPattern` 会覆盖默认值，部署时须同步补上动作匹配；`whenRisky: defer` 沿用“这一步先不做，记为待确认”的处理。
 
 宿主的 `ask_user_question` 等满 10 分钟后，conductor 会逐题选择有推荐标记的选项，找不到标记时选首项。多选题会选中所有带推荐标记的项，自由文本题使用配置的说明。答案会附上代答说明。热重载保留原提出时间，宿主恢复的待答提问也按原时间计时，已超时的再给用户 30 秒。
 
@@ -278,7 +278,7 @@ bili `decompress` 把大块原文写入临时文件后，规划端可直接 read
 | `lockEngine` | `false` | `true` 时新任务、续接和核验一律用 `defaultEngine`，规划端传的 `engine` 不生效；续接另一引擎的任务时附上轮交接开新会话，锁定 Gemini 时 `codex_run` 不接受 `resume` |
 | `crossEngineVerify` | `true` | 已配置 Gemini 时用另一引擎独立只读核验，`codex_verify` 的显式引擎优先 |
 | `verifyEngine` | 空 | `codex` 或 `gemini`：核验单一律用这个引擎，`lockEngine` 时也生效，规划端传的 `engine` 不生效；Codex 额度用完时核验改派 Gemini。留空按 `lockEngine` / `crossEngineVerify` |
-| `verifyServiceTier` | `default` | Codex 核验单的 service tier；未配置或留空显式使用标准档，不继承原单、`serviceTier` 或 Codex 用户配置；显式值仍优先 |
+| `verifyServiceTier` | `default` | Codex 核验及其续接的 service tier；未配置、留空或仅空白时显式使用标准档，不继承原单、`serviceTier` 或 Codex 用户配置；显式值仍优先 |
 | `geminiFallback` | `true` | Codex 因模型或上游问题失败且 runner 确认无写入时，启动关联的 Gemini 任务 |
 | `maxGeminiRunningJobs` | `2` | 同时运行的 Gemini 任务上限；超出的任务排队（`phase: engine_wait`）直到有名额，最多等 `lockTimeoutSeconds`，`null` 表示不设单独上限 |
 
@@ -695,7 +695,7 @@ python3 runner/test_codex_runner.py
 
 Run `python3 tools/model_ab_stats.py --since 20261118 --json` in WSL for the model comparison. Override the default `~/.local/state/codex-runner/jobs` with `--jobs-dir`. Only A/B-marked jobs count. Completion and review shares use job totals, self-reported shares use criterion totals, and final outcomes use threads and their continuation chains. Rework counts rounds after the first job in each group. Median duration uses recorded durations.
 
-The candidate version is `0.9.215`. Credential-changing actions such as setting a Samba password are risky by default; bare credential nouns and token-redaction checks are not. Existing custom `autoAnswer.riskyPattern` overrides require the same action patterns; `whenRisky: defer` retains its skip-and-confirm behavior. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
+The candidate version is `0.9.215`. Credential-changing actions before or after Chinese credential nouns, including multiline instructions within one clause, are risky by default; ordinary device/password-algorithm questions remain allowed; bare credential nouns and token-redaction checks are not. Existing custom `autoAnswer.riskyPattern` overrides require the same action patterns; `whenRisky: defer` retains its skip-and-confirm behavior. Per-version release notes are in [CHANGELOG.md](CHANGELOG.md#english).
 
 ### 0.9.66: Products-only planner reads and independent verification
 
@@ -721,7 +721,7 @@ Use `codex_verify` for factual checks after mechanically checking product presen
 
 A DeepSeek Harness plugin: the DSH agent plans and verifies; Codex CLI in WSL codes. All [eleven Codex tools](#功能) are always registered; `workspaces` only controls the guard. See the [configuration table](#配置) for defaults and parameters.
 
-Verification that could not confirm findings because of missing evidence returns its previous report without another dispatch when the source records, declared scope, products and evidence are unchanged and no execution or continuation followed. Supply `new_evidence: "evidence or a retrievable path"` or explicitly request `force: true` to recheck. Changed products or later rounds permit verification; unavailable change detection does too. Changing only `focus` or the sample count does not supply evidence. Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms` of at least `30000`. Codex verification explicitly uses `service_tier="default"` when `verifyServiceTier` is absent or empty, instead of inheriting the source job, general plugin tier or Codex user configuration; explicit overrides remain supported.
+Verification that could not confirm findings because of missing evidence returns its previous report without another dispatch when the source records, declared scope, products and evidence are unchanged and no execution or continuation followed. Supply `new_evidence: "evidence or a retrievable path"` or explicitly request `force: true` to recheck. Changed products or a changed known Git version permit verification. Without declared scopes or product paths, change detection covers the project directory. Follow-up checks traverse descendant rounds and their threads; incomplete or failed queries permit verification, while caller cancellation still aborts. Changing only `focus` or the sample count does not supply evidence. Run, continuation and verification prompts require 30–60-second waits and output polling with `yield_time_ms` of at least `30000`. Codex verification and its continuations explicitly use `service_tier="default"` when `verifyServiceTier` is absent, empty or whitespace-only, instead of inheriting the source job, general plugin tier or Codex user configuration; explicit overrides remain supported.
 
 Verification can run the project's checks. Sandboxed verification starts in writable per-job scratch, reads the project's `AGENTS.md`, and runs checks from the read-only project directory. Temporary and cache files go to `TMPDIR` inside scratch. Host-access verification keeps its original access and also uses project-external scratch for temporary files. The runner compares Git status, committed state, index state and dirty or untracked contents within the verified paths. In the absence of scope and products, it monitors the source job's directory and counts only overlapping writers as concurrent changes. Changes inside the monitored paths fail the check, subject to that concurrency check. The receipt reports changes outside the scope, unavailable comparisons, and files left unchecked because they could not be read or exceeded the 1 MiB per-file or 32 MiB per-snapshot limit.
 

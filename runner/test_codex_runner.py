@@ -7224,6 +7224,114 @@ class RunnerTests(unittest.TestCase):
                 self.assertNotIn("verification_evidence_version", result)
                 self.assertNotEqual(self.control("verification-version", "SOURCE")["evidence_version"], before)
 
+    def test_verification_evidence_snapshot_unscoped_read_only_job_tracks_cwd(self):
+        source_dir = self.stored_job("SOURCE", {"status": "completed"}, sandbox="read-only",
+                                     context={**self.sample_context(), "write": False})
+        report = self.cwd / "report.md"
+        report.write_text("original report", "utf-8")
+        before = self.control("verification-version", "SOURCE")
+        self.assertIsNone(before["verification_version"])
+        self.assertIsNotNone(before["evidence_version"])
+        self.assertEqual(self.control("verification-version", "SOURCE"), before)
+        added = self.cwd / "additional.md"
+        for action in ("modify", "add", "delete"):
+            with self.subTest(action=action):
+                if action == "modify":
+                    report.write_text("updated project report", "utf-8")
+                elif action == "add":
+                    added.write_text("new evidence", "utf-8")
+                else:
+                    report.unlink()
+                after = self.control("verification-version", "SOURCE")
+                self.assertIsNotNone(after["evidence_version"])
+                self.assertNotEqual(after["evidence_version"], before["evidence_version"])
+                before = after
+        self.assertFalse((source_dir / "evidence").exists())
+
+    def test_verification_evidence_snapshot_unscoped_cwd_incomplete_is_unknown(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"}, sandbox="read-only")
+        report = self.cwd / "report.md"
+        report.write_text("original report", "utf-8")
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir), "context": {"write": False}}
+        real_snapshot = codex_runner.snapshot
+        root = os.path.normcase(os.path.realpath(self.cwd))
+        for failure in (None, PermissionError("unreadable cwd"), TimeoutError("cwd timed out")):
+            with self.subTest(failure=failure):
+                def incomplete(path, **kwargs):
+                    if os.path.normcase(os.path.realpath(path)) == root:
+                        if failure is not None:
+                            raise failure
+                        return None
+                    return real_snapshot(path, **kwargs)
+
+                with mock.patch.object(codex_runner, "snapshot", side_effect=incomplete):
+                    self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+        real_lstat = os.lstat
+
+        def vanished(path, *args, **kwargs):
+            if os.path.normcase(os.fspath(path)) == root:
+                raise FileNotFoundError(path)
+            return real_lstat(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner.os, "lstat", side_effect=vanished):
+            self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+        source["cwd"] = str(self.cwd / "missing-project")
+        self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+
+    def test_verification_evidence_snapshot_unscoped_cwd_scan_budget_is_unknown(self):
+        import codex_runner
+
+        source_dir = self.stored_job("SOURCE", {"status": "completed"}, sandbox="read-only")
+        report = self.cwd / "report.md"
+        report.write_text("original report", "utf-8")
+        source = {"cwd": str(self.cwd), "log_dir": str(source_dir)}
+        target = os.path.normcase(os.path.realpath(report))
+        real_stat = os.stat
+        clock = [0]
+
+        def slow_stat(path, *args, **kwargs):
+            if kwargs.get("follow_symlinks") is False and os.path.normcase(os.fspath(path)) == target:
+                clock[0] += 4
+            return real_stat(path, *args, **kwargs)
+
+        with mock.patch.object(codex_runner.time, "monotonic", side_effect=lambda: clock[0]), \
+                mock.patch.object(codex_runner.os, "stat", side_effect=slow_stat):
+            self.assertEqual(codex_runner.verification_evidence_snapshot(source), (None, None))
+
+    def test_verification_evidence_snapshot_unscoped_cwd_excludes_runner_bookkeeping(self):
+        import codex_runner
+
+        for relative in ("runner", ".local/state/codex-runner"):
+            with self.subTest(home=relative):
+                project = self.cwd / relative.replace("/", "-")
+                home = project / relative
+                source_dir = home / "jobs" / "SOURCE"
+                evidence = source_dir / "evidence"
+                evidence.mkdir(parents=True)
+                (source_dir / "args.json").write_text("{}", "utf-8")
+                proof = evidence / "proof.txt"
+                proof.write_text("original proof", "utf-8")
+                report = project / "report.md"
+                report.write_text("original report", "utf-8")
+                source = {"cwd": str(project), "log_dir": str(source_dir), "context": {"write": False}}
+                with mock.patch.object(codex_runner, "HOME", home):
+                    before = codex_runner.verification_evidence_version(source)
+                    self.assertIsNotNone(before)
+                    verification = home / "jobs" / "VERIFY"
+                    verification.mkdir()
+                    (verification / "events.jsonl").write_text("new verification log", "utf-8")
+                    (source_dir / "reviews.json").write_text("[]", "utf-8")
+                    (home / "job-filter-cache.json").write_text("{}", "utf-8")
+                    self.assertEqual(codex_runner.verification_evidence_version(source), before)
+                    proof.write_text("updated source evidence", "utf-8")
+                    after = codex_runner.verification_evidence_version(source)
+                    self.assertIsNotNone(after)
+                    self.assertNotEqual(after, before)
+                    report.write_text("updated project report", "utf-8")
+                    self.assertNotEqual(codex_runner.verification_evidence_version(source), after)
+
     def test_verification_evidence_version_unreadable_or_timed_out_is_unknown(self):
         import codex_runner
 
@@ -7274,11 +7382,11 @@ class RunnerTests(unittest.TestCase):
         roots = [call.args[0] for call in snapshot.call_args_list]
         self.assertEqual(len(roots), len(set(roots)))
         # Windows temporary paths may use an 8.3 alias; the runner canonicalizes it.
-        self.assertEqual(set(roots), {str((source_dir / name).resolve())
-                                     for name in ("args.json", "result.json", "evidence")})
+        self.assertEqual(set(roots), {str(self.cwd.resolve()), *(str((source_dir / name).resolve())
+                                     for name in ("args.json", "result.json", "evidence"))})
         os.utime(proof, ns=(0, 0))
         expected = max(max(path.stat().st_mtime_ns, path.stat().st_ctime_ns) for path in
-                       [source_dir, source_dir / "args.json", source_dir / "result.json",
+                       [self.cwd, source_dir, source_dir / "args.json", source_dir / "result.json",
                         source_dir / "evidence", evidence, proof]) / 1e9
         self.assertEqual(codex_runner.verification_evidence_snapshot(source)[1], expected)
 

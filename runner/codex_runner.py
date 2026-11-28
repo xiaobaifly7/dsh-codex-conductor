@@ -2412,9 +2412,16 @@ def verification_evidence_snapshot(source):
                   *(report.get("files_changed") or [])]]
         records = {str(job_dir / name) for name in ("args.json", "result.json", "prompt.txt", "write-lock.json",
                                                          "last_message.txt", "events.jsonl", "stderr.log")}
-        paths = [*(source.get("scope_paths") or source.get("scope") or []), *files, source.get("output"),
-                 source.get("evidence_dir") or str(job_dir / "evidence"),
-                 *sorted(records)]
+        paths = [*(source.get("scope_paths") or source.get("scope") or []), *files, source.get("output")]
+        cwd_root = runner_home = None
+        if not any(isinstance(path, str) and path.strip() for path in paths):
+            cwd_root = scope_path(cwd, ".")
+            runner_home = tree_key(str(HOME))
+            # shortcut: projects inside runner HOME stay unknown; split state exclusions if this layout is needed.
+            if not os.path.isdir(cwd_root) or Path(normalized_path(cwd_root)).is_relative_to(Path(runner_home)):
+                return None, None
+            paths.append(cwd_root)
+        paths.extend([source.get("evidence_dir") or str(job_dir / "evidence"), *sorted(records)])
         missing, existing, missing_parent_times = {}, set(), []
         for path in paths:
             if time.monotonic() >= deadline:
@@ -2425,6 +2432,8 @@ def verification_evidence_snapshot(source):
             try:
                 os.lstat(path)
             except FileNotFoundError:
+                if path == cwd_root:
+                    return None, None
                 missing[path] = None
                 if path in records:
                     continue
@@ -2446,7 +2455,9 @@ def verification_evidence_snapshot(source):
         for path in sorted(existing):
             if time.monotonic() >= deadline:
                 return None, None
-            entries = snapshot(path, budget=deadline - time.monotonic(), scope=[path], strict=True)
+            # New verification logs and review ledgers are not project evidence; source records are scanned separately.
+            exclusions = {"exclude_tree": runner_home} if path == cwd_root else {}
+            entries = snapshot(path, budget=deadline - time.monotonic(), scope=[path], strict=True, **exclusions)
             if entries is None:
                 return None, None
             observed.update({os.path.normpath(os.path.join(path, name)): value for name, value in entries.items()})

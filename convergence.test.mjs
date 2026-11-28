@@ -56,7 +56,8 @@ function fixture(t, config = {}) {
         (!pick('--verification-of') || job.context.verification_of === pick('--verification-of')) &&
         (!pick('--status') || job.execution_status === pick('--status')) &&
         (!pick('--task-key') || createHash('sha256').update(job.context.task.trim()).digest('hex') === pick('--task-key')));
-      return { jobs: jobs.slice(0, Number(pick('--limit'))), total: jobs.length };
+      const offset = Number(pick('--offset') ?? 0), end = offset + Number(pick('--limit'));
+      return { jobs: jobs.slice(offset, end), total: jobs.length, next_offset: end < jobs.length ? end : null };
     }
     if (command === 'status') return structuredClone(records.get(id) ?? { status: 'failed', error_kind: 'unknown_job' });
     if (command === 'summary') return { groups: [] };
@@ -460,4 +461,86 @@ test('force still reuses a running verification rather than dispatching a duplic
   assert.equal(result.job_id, first.job_id);
   assert.equal(result.existing_verification, true);
   assert.equal(h.starts.length, 1);
+});
+
+
+test('review 3: a changed Git version invalidates an insufficient report even with unchanged evidence metadata', async t => {
+  const h = fixture(t);
+  h.add('source', { thread_id: 'thread-A', context: { write: false }, scope: [], files_changed: [],
+    structured: { criteria: acceptance.map(criterion => ({ criterion, status: 'met', evidence: 'report.md:1' })) } });
+  const tools = h.load();
+  const first = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+  markEvidenceMissing(h, first.job_id);
+  h.setVersion('tree-2');
+  const result = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+  assert.notEqual(result.job_id, first.job_id);
+  assert.equal(h.starts.length, 2);
+});
+
+test('review 4: a grandchild continuation in a fresh thread invalidates the root verification', async t => {
+  const h = fixture(t);
+  insufficientVerification(h);
+  h.add('child', { thread_id: 'thread-B', context: { continuation: { parent_job_id: 'source' } } });
+  const tools = h.load();
+  const first = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+  markEvidenceMissing(h, first.job_id);
+  h.add('grandchild', { thread_id: 'thread-C', context: { continuation: { parent_job_id: 'child' } } });
+  const result = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+  assert.notEqual(result.job_id, first.job_id);
+  assert.equal(h.starts.length, 2);
+});
+
+test('review 5: failed change lookup permits verification while caller cancellation is preserved', async t => {
+  for (const cancel of [false, true]) {
+    const h = fixture(t);
+    insufficientVerification(h);
+    const first = await h.load().codex_verify.execute({ job_id: 'source' }, caller());
+    markEvidenceMissing(h, first.job_id);
+    const controller = new AbortController();
+    const reason = new Error(cancel ? 'caller cancelled verification' : 'runner query timed out');
+    const tools = h.load({}, (ctx, cfg, run) => apply(ctx, cfg, async (c, argv, options) => {
+      if (argv[0] === 'verification-version') {
+        if (cancel) controller.abort(reason);
+        throw reason;
+      }
+      return run(c, argv, options);
+    }));
+    const pending = tools.codex_verify.execute({ job_id: 'source' }, { ...caller(), signal: controller.signal });
+    if (cancel) {
+      await assert.rejects(pending, error => error === reason);
+      assert.equal(h.starts.length, 1);
+    } else {
+      assert.notEqual((await pending).job_id, first.job_id);
+      assert.equal(h.starts.length, 2);
+    }
+  }
+});
+
+
+test('review 4: descendant threads and paginated child branches are all checked', async t => {
+  const h = fixture(t);
+  insufficientVerification(h);
+  const child = h.add('child', { thread_id: 'thread-B', context: { continuation: { parent_job_id: 'source' } } });
+  for (let i = 0; i < 101; i++) h.add(`sibling-${i}`, { context: { routing: { parent_job_id: 'source' } } });
+  const tools = h.load();
+  const first = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+  markEvidenceMissing(h, first.job_id);
+  const later = h.add('same-child-thread', { thread_id: child.thread_id });
+  const result = await tools.codex_verify.execute({ job_id: 'source' }, caller());
+  assert.notEqual(result.job_id, first.job_id);
+  assert.ok(h.calls.some(([argv]) => argv.includes('--parent-job') && argv.includes('100')));
+  // The later execution is related through the child's thread, without a direct root link.
+  assert.equal(later.context.continuation, undefined);
+});
+
+test('review 5: incomplete lineage lookup permits a fresh verification', async t => {
+  const h = fixture(t);
+  insufficientVerification(h);
+  const first = await h.load().codex_verify.execute({ job_id: 'source' }, caller());
+  markEvidenceMissing(h, first.job_id);
+  const tools = h.load({}, (ctx, cfg, run) => apply(ctx, cfg, async (c, argv, options) => {
+    if (argv.includes('--parent-job')) return { status: 'failed', error_kind: 'bridge_error', error: 'lookup unavailable' };
+    return run(c, argv, options);
+  }));
+  assert.notEqual((await tools.codex_verify.execute({ job_id: 'source' }, caller())).job_id, first.job_id);
 });

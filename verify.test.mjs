@@ -1349,3 +1349,47 @@ test('Codex verification explicitly defaults to the standard tier instead of inh
     }
   }
 });
+
+
+test('review 6: continuing a Codex verification keeps its standard tier and verification identity', async () => {
+  for (const config of [{}, { lockEngine: true, defaultEngine: 'gemini', gemini }]) {
+    const source = sourceJob();
+    source.context.verification_of = 'ROOT';
+    source.context.write = false;
+    source.scope = source.scope_paths = [];
+    source.task_options.writable_roots = [];
+    source.task_options.service_tier = 'default';
+    source.structured.criteria[0].status = 'not_met';
+    const h = harness({ source, config: { verifyEngine: 'codex', serviceTier: 'priority', ...config } });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, fresh: false }, exec);
+    assert.equal(option(h.start().argv, '--engine'), undefined);
+    assert.equal(option(h.start().argv, '--service-tier'), 'default');
+    assert.equal(h.payload().context.verification_of, 'ROOT');
+  }
+});
+
+test('review 6: a Gemini verification continued on Codex applies the verification tier', async () => {
+  for (const [verifyServiceTier, expected] of [[undefined, 'default'], ['', 'default'], ['priority', 'priority']]) {
+    const source = sourceJob();
+    source.engine = 'gemini';
+    source.conversation_id = source.thread_id;
+    delete source.thread_id;
+    source.context.verification_of = 'ROOT';
+    source.context.fallback_of = 'FAILED-VERIFY';
+    source.context.write = false;
+    source.scope = source.scope_paths = [];
+    source.task_options = { engine: 'gemini', model: gemini.model, writable_roots: [] };
+    source.structured.criteria[0].status = 'not_met';
+    const h = harness({ source, config: { gemini, verifyEngine: 'codex', serviceTier: 'fast',
+      ...(verifyServiceTier !== undefined ? { verifyServiceTier } : {}) } });
+    await h.tools.codex_continue.execute({ job_id: source.job_id, engine: 'codex', fresh: true }, exec);
+    assert.equal(option(h.start().argv, '--service-tier'), expected);
+    assert.equal(h.payload().context.verification_of, 'ROOT');
+  }
+});
+
+test('review 6: whitespace verification tier explicitly uses default', async () => {
+  const h = harness({ config: { verifyEngine: 'codex', verifyServiceTier: '   ', serviceTier: 'priority' } });
+  await h.verify();
+  assert.equal(option(h.start().argv, '--service-tier'), 'default');
+});

@@ -469,7 +469,8 @@ export function createConductor(cfg, run = runRunner) {
       const effort = args.effort ?? (context?.verification_of ? undefined : defaultEffort(cfg, args.write));
       if (effort) argv.push('--effort', effort);
       const model = args.model ?? cfg.model;
-      const serviceTier = args.service_tier ?? cfg.serviceTier;
+      const serviceTier = context?.verification_of ? cfg.verifyServiceTier?.trim() || 'default'
+        : args.service_tier ?? cfg.serviceTier;
       if (cfg.modelAB?.enabled && args.model === undefined && !args.resume && context && !context.continuation && !context.verification_of) {
         argv.push('--model-ab', JSON.stringify([cfg.modelAB.models, cfg.modelAB.share]));
       } else if (model) argv.push('--model', model);
@@ -2268,25 +2269,38 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     !(cfg.autoVerifySkipQuestions && awaitingAnswers(value));
   const autoVerifyWarning = (error) => ctx.logger?.warn?.(`[codex-conductor] 补派自动核验失败：${error?.message ?? error}`);
 
-  async function hasLaterRound(source, after = -Infinity) {
-    const id = source.job_id;
+  async function hasLaterRound(source, after = -Infinity, signal) {
     const owner = lastSuccessor(aliases, source.context?.owner) ?? source.context?.owner;
     const list = async filters => {
-      const page = await conductor.list(cfg.verificationReuse ? { owner, also_owners: aliases.predecessors(owner), ...filters } : filters);
-      if (page.error_kind || !Array.isArray(page.jobs)) {
-        throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
+      const jobs = [];
+      for (let offset = 0; offset !== null;) {
+        const page = await conductor.list({ ...(cfg.verificationReuse ? { owner, also_owners: aliases.predecessors(owner) } : {}),
+          ...filters, limit: 100, offset }, signal);
+        signal?.throwIfAborted();
+        if (page.error_kind || !Array.isArray(page.jobs)) {
+          throw new Error(`无法核对后续轮次：${page.error ?? page.error_kind ?? '任务列表不可用'}`);
+        }
+        jobs.push(...page.jobs.filter(job => !cfg.verificationReuse || owns(owner, job.context?.owner)));
+        offset = page.next_offset ?? null;
       }
-      return cfg.verificationReuse ? { ...page, jobs: page.jobs.filter(job => owns(owner, job.context?.owner)) } : page;
+      return jobs;
     };
-    const since = job => !Number.isFinite(job.started_at) || job.started_at > after;
-    const children = await list({ parent_job: id, limit: 1 });
-    if (children.jobs.some(job => since(job) && (job.parent_job_id === id || parentOf(job) === id))) return true;
-    if (!source.thread_id || !Number.isFinite(source.started_at)) return false;
-    for (let offset = 0; offset !== null;) {
-      const page = await list({ thread_id: source.thread_id, limit: 100, offset });
-      if (page.jobs.some(job => !job.context?.verification_of && job.job_id !== id &&
-          job.thread_id === source.thread_id && job.started_at > source.started_at && since(job))) return true;
-      offset = page.next_offset ?? null;
+    const rounds = [source], seen = new Set([source.job_id]), threads = new Set();
+    for (const round of rounds) {
+      const related = await list({ parent_job: round.job_id });
+      if (round.thread_id && !threads.has(round.thread_id)) {
+        threads.add(round.thread_id);
+        related.push(...await list({ thread_id: round.thread_id }));
+      }
+      for (const job of related) {
+        if (!job.job_id || seen.has(job.job_id) || job.context?.verification_of) continue;
+        const child = parentOf(job) === round.job_id;
+        if (!child && (job.thread_id !== round.thread_id || job.started_at <= source.started_at)) continue;
+        if (!Number.isFinite(job.started_at) || (!child && !Number.isFinite(source.started_at)) ||
+            job.started_at > after || job.finished_at > after) return true;
+        seen.add(job.job_id);
+        rounds.push(job);
+      }
     }
     return false;
   }
@@ -3050,6 +3064,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   }
 
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing, guard = {}) {
+    verificationOf ??= guard.parent?.context?.verification_of;
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
     catch (error) { throw continuation ? continuationError(error.message) : error; }
@@ -3589,15 +3604,21 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const missing = /缺证据|证据不足|缺少.*证据|无法确认|不能确认|insufficient evidence|cannot (?:confirm|verify)|unverifiable/i;
       if (validReport(previous.report) && previous.report.criteria.some(item => item.status === 'blocked' &&
           (missing.test(item.evidence) || missing.test(previous.report.summary)))) {
-        versions = await conductor.verificationVersion(source.job_id, signal);
-        const unchanged = previous.verification_evidence_version
-          ? versions.evidence_version === previous.verification_evidence_version
-          : Number.isFinite(versions.evidence_updated_at) && versions.evidence_updated_at <= previous.started_at;
-        if (versions.evidence_version && unchanged && Number.isFinite(previous.started_at) &&
-            !await hasLaterRound(source, previous.started_at)) {
-          return { ...previous, evidence_unchanged: true,
-            next: `原任务 ${source.job_id} 没有新执行、续接或产物证据，返回上次核验 ${previous.job_id} 的结论，不再派单。` +
-              '请补证据（new_evidence）、交所有者裁决，或显式传 force: true 强制重核。' };
+        try {
+          versions = await conductor.verificationVersion(source.job_id, signal);
+          signal?.throwIfAborted();
+          if (previous.verification_version && previous.verification_version !== versions.verification_version) return;
+          const unchanged = previous.verification_evidence_version
+            ? versions.evidence_version === previous.verification_evidence_version
+            : Number.isFinite(versions.evidence_updated_at) && versions.evidence_updated_at <= previous.started_at;
+          if (versions.evidence_version && unchanged && Number.isFinite(previous.started_at) &&
+              !await hasLaterRound(source, previous.started_at, signal)) {
+            return { ...previous, evidence_unchanged: true,
+              next: `原任务 ${source.job_id} 没有新执行、续接或产物证据，返回上次核验 ${previous.job_id} 的结论，不再派单。` +
+                '请补证据（new_evidence）、交所有者裁决，或显式传 force: true 强制重核。' };
+          }
+        } catch {
+          signal?.throwIfAborted();
         }
         return;
       }
@@ -3806,7 +3827,6 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       ...(engine === 'codex' ? {
         effort: cfg.readOnlyEffort || (same ? options.effort : cfg.effort) || undefined,
         model: cfg.modelAB.enabled || !same ? cfg.model : options.model ?? '',
-        service_tier: cfg.verifyServiceTier || 'default',
       } : same ? { model: options.model ?? undefined, effort: options.effort ?? undefined } : {}),
       ...(args.wait_seconds !== undefined ? { wait_seconds: args.wait_seconds } : {}),
     }, exec, undefined, undefined, source.job_id, undefined,
@@ -4185,7 +4205,8 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
         }
         const verifyPrevious = args.verify_previous === undefined ? null : await verifyPreviousCheck(args.verify_previous, plan.args, exec, 'codex_continue');
         const sourceEngine = jobEngine(source);
-        const engine = cfg.lockEngine ? runEngine({}, cfg) : args.engine ?? sourceEngine;
+        const engine = source.context.verification_of && cfg.verifyEngine ? args.engine ?? sourceEngine
+          : cfg.lockEngine ? runEngine({}, cfg) : args.engine ?? sourceEngine;
         plan.args.engine = engine;
         if (engine !== sourceEngine) {
           for (const key of ['resume', 'conversation_id', 'agy_home', 'model', 'service_tier', 'effort', 'use_user_config']) delete plan.args[key];
