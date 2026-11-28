@@ -7273,8 +7273,9 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(updated_at, future / 1e9)
         roots = [call.args[0] for call in snapshot.call_args_list]
         self.assertEqual(len(roots), len(set(roots)))
-        self.assertEqual(set(roots), {str(source_dir / "args.json"), str(source_dir / "result.json"),
-                                     str(source_dir / "evidence")})
+        # Windows temporary paths may use an 8.3 alias; the runner canonicalizes it.
+        self.assertEqual(set(roots), {str((source_dir / name).resolve())
+                                     for name in ("args.json", "result.json", "evidence")})
         os.utime(proof, ns=(0, 0))
         expected = max(max(path.stat().st_mtime_ns, path.stat().st_ctime_ns) for path in
                        [source_dir, source_dir / "args.json", source_dir / "result.json",
