@@ -34,6 +34,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from urllib.parse import urlparse
@@ -2974,7 +2975,7 @@ def execute(args, prompt, run_dir):
             if not can_retry:
                 error = state.get("error") or ""
                 if baseline is not None and (
-                        kind in ("router_down", "model_refused", "upstream_rejected", "transient", "reconnect_timeout") or
+                        kind in ("router_down", "upstream_rejected", "transient", "reconnect_timeout") or
                         (kind == "permanent" and (PROVIDER_PERMANENT.search(error) or "quota" in error.lower()))):
                     base["fallback_safe"] = True
                 runner_event(run_dir, attempt, "finalizing", kind)
@@ -3860,13 +3861,31 @@ def job_listing_order(job):
 
 
 JOB_FILTER_CACHE = "job-filter-cache.json"
+TASK_LIST_PREFIX = re.compile(r"(?:^|(?<=[\r\n\u2028\u2029]))[ \t]*(?:[-*+]|\(?[0-9]+[.):、])[ \t]*")
+JS_WHITESPACE_EXTRA = frozenset("\t\n\v\f\r\ufeff")
+
+
+def normalized_task_identity(text):
+    normalized = unicodedata.normalize("NFKC", "" if text is None else str(text))
+    normalized = TASK_LIST_PREFIX.sub("", normalized)
+    cleaned = "".join(
+        ch for ch in normalized
+        if ch not in JS_WHITESPACE_EXTRA and unicodedata.category(ch)[0] not in ("Z", "P", "S")
+    )
+    return hashlib.sha256(cleaned.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def normalize_task_key(value):
+    if not isinstance(value, str) or not value:
+        return None
+    return value.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", value) else normalized_task_identity(value)
 
 
 def job_filter_fields(task):
     """The args.json fields list filters read. args.json is written once when a job starts, so they never change."""
     context = task.get("context") if isinstance(task.get("context"), dict) else {}
     text = context.get("task", "")
-    task_hash = hashlib.sha256(text.strip().encode("utf-8", "surrogatepass")).hexdigest() if isinstance(text, str) else None
+    task_hash = f"nfkc:{normalized_task_identity(text)}" if isinstance(text, str) else None
     return [context.get("owner"), context.get("verification_of"), task_hash]
 
 
@@ -3963,6 +3982,8 @@ def matching_jobs(args, *, page_dates=None):
     if getattr(args, "command", None) == "list" and not scope_conflicts:
         resolve = query_resolver()[0]
 
+    wanted_task_key = normalize_task_key(getattr(args, "task_key", None))
+
     def matches_metadata(value, job_id, task_hash=None, check_cwd=True):
         context = value.get("context")
         # --also-owner adds predecessor sessions handed over to --owner; it never applies without --owner.
@@ -3973,10 +3994,11 @@ def matching_jobs(args, *, page_dates=None):
         verification_of = getattr(args, "verification_of", None)
         if verification_of and (context or {}).get("verification_of") != verification_of:
             return False
-        task_key = getattr(args, "task_key", None)
-        if task_key and (task_hash or hashlib.sha256(
-                (context or {}).get("task", "").strip().encode("utf-8", "surrogatepass")).hexdigest()) != task_key:
-            return False
+        if wanted_task_key:
+            resolved_hash = task_hash[5:] if isinstance(task_hash, str) and task_hash.startswith("nfkc:") else None
+            raw_task = (context or {}).get("task", "")
+            if (resolved_hash or (normalized_task_identity(raw_task) if isinstance(raw_task, str) else None)) != wanted_task_key:
+                return False
         return not (check_cwd and args.cwd) or bool(value.get("cwd") and
                                     tree_key(args.cwd, resolve=resolve) == tree_key(value["cwd"], resolve=resolve))
 
@@ -3984,7 +4006,7 @@ def matching_jobs(args, *, page_dates=None):
     # Owner, verification and task filters come from args.json alone: skip non-matching jobs from the cache
     # instead of parsing every job's args.json and result.json (thousands of jobs made each query take seconds).
     # cwd is left to the full record: result.json's resolved cwd overrides the one in args.json.
-    prefilter = bool(args.owner or getattr(args, "verification_of", None) or getattr(args, "task_key", None))
+    prefilter = bool(args.owner or getattr(args, "verification_of", None) or wanted_task_key)
     cached = load_job_filter_cache() if prefilter else {}
     added = False
     directories = job_directories(args.job_id if not args.owner else None) if page_dates is None else page_dates
@@ -4001,7 +4023,9 @@ def matching_jobs(args, *, page_dates=None):
         task = None
         if prefilter:
             fields = cached.get(job_dir.name)
-            if not (isinstance(fields, list) and len(fields) == 3):
+            if not (isinstance(fields, list) and len(fields) == 3 and
+                    (not wanted_task_key or fields[2] is None or
+                     (isinstance(fields[2], str) and fields[2].startswith("nfkc:")))):
                 fields = None
                 with suppress(OSError, ValueError, TypeError):
                     task = task_record(job_dir)
@@ -4520,7 +4544,8 @@ def gemini_admission(args):
             result = json.loads((source_dir / "result.json").read_text("utf-8"))
             authorized = (source.get("engine", "codex") == "codex" and owner and
                           (source.get("context") or {}).get("owner") == owner and
-                          result.get("status") == "failed" and result.get("fallback_safe") is True)
+                          result.get("status") == "failed" and result.get("error_kind") != "model_refused" and
+                          result.get("fallback_safe") is True)
         except (OSError, ValueError, AttributeError):
             authorized = False
         if not authorized:

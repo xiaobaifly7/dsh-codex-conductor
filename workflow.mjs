@@ -1,3 +1,5 @@
+const { normalizedTaskIdentity } = await import(new URL(`./task-lint.mjs${new URL(import.meta.url).search}`, import.meta.url));
+
 const object = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 const nonempty = (value) => typeof value === 'string' && value.trim().length > 0;
 const strings = (value) => Array.isArray(value) && value.every((item) => typeof item === 'string');
@@ -10,7 +12,7 @@ export function validBlockers(blockers) {
   return Array.isArray(blockers) && blockers.every((blocker) => object(blocker) &&
     Object.keys(blocker).length === fields.length && fields.every((key) => Object.hasOwn(blocker, key) && typeof blocker[key] === 'string') &&
     nonempty(blocker.id) && nonempty(blocker.message) &&
-    ['user_input', 'task_conflict', 'environment', 'implementation'].includes(blocker.kind) &&
+    ['user_input', 'task_conflict', 'environment', 'implementation', 'model_refused'].includes(blocker.kind) &&
     (!questionKind(blocker) || nonempty(blocker.question))) &&
     new Set(blockers.map((blocker) => blocker.id)).size === blockers.length;
 }
@@ -43,8 +45,12 @@ export function sameCriteria(report, acceptance) {
 }
 
 export function repeatedOutcome(value) {
-  if (!['completed', 'failed'].includes(executionOf(value)) ||
+  if (!object(value) || !['completed', 'failed'].includes(executionOf(value)) ||
       ['verified', 'accepted_deviations', 'invalid'].includes(verificationOf(value))) return;
+  if (value.error_kind === 'model_refused') {
+    const taskKey = nonempty(value.context?.task) ? normalizedTaskIdentity(value.context.task) : undefined;
+    return { criteria: [], blockers: ['model_refused'], ...(taskKey ? { task_key: taskKey } : {}) };
+  }
   const report = reportOf(value);
   const acceptance = value.context?.acceptance;
   if (!validReport(report) || !Array.isArray(acceptance)) return;
@@ -121,11 +127,13 @@ export function writeContradictions(args, cwd, resolve, includes) {
 }
 
 export function withoutVerificationProduct(value) {
+  if (!object(value)) return false;
   const report = reportOf(value);
+  const noChanges = !report?.files_changed?.length && !value.files_changed?.length &&
+    !value.files_changed_total && !value.write_paths?.length && !value.diff_files && !value.output;
+  if (value.error_kind === 'model_refused') return noChanges;
   return validReport(report) && report.criteria.some(item => item.status === 'blocked') &&
-    report.criteria.every(item => item.status !== 'met') && !report.files_changed.length &&
-    !value.files_changed?.length && !value.files_changed_total && !value.write_paths?.length &&
-    !value.diff_files && !value.output &&
+    report.criteria.every(item => item.status !== 'met') && noChanges &&
     (value.context?.write === false || Array.isArray(value.files_changed));
 }
 
@@ -187,6 +195,10 @@ export function prepareContinuation(value, { answers = [], resolution = '' } = {
   }
   if (executionOf(value) === 'cancelled') return refuse('原任务已取消，不能自动恢复；先取得用户对恢复任务的明确指示。');
   if (!['completed', 'failed'].includes(executionOf(value))) return refuse('结果状态未知，先用原 job_id 查询可信结果，不重派。');
+  if (value.error_kind === 'model_refused' ||
+      activeBlockers(blocking.blockers, verificationOf(value)).some((blocker) => blocker.kind === 'model_refused')) {
+    return refuse('原任务已被执行模型拒绝（model_refused，终态），不能自动续跑或原样重派；请删除主观目的交代并重构任务书后另派新单，或交由用户决定。', []);
+  }
   if (!nonempty(value.job_id) || !/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(value.job_id) ||
       !nonempty(context.task) || context.task.trim().length < 10 || !Array.isArray(context.acceptance) ||
       !context.acceptance.length ||

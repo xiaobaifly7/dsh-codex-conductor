@@ -39,6 +39,8 @@ const { wslPath, PS_SYNTAX, normPath, under, inWorkspace, splitCommand, readOnly
   await import(new URL(`./guard.mjs${reloadQuery}`, import.meta.url));
 const { repoFor, within, relocate, relocateText, openWorktree, mergeWorktree, worktreeStatus, closeWorktree, checkoutDirty, pathKey } =
   await import(new URL(`./worktree.mjs${reloadQuery}`, import.meta.url));
+const { lintTaskBrief, lintContinuationDelta, lintGeminiWrite, normalizedTaskIdentity, GEMINI_WRITE_REFUSAL } = await import(new URL(`./task-lint.mjs${reloadQuery}`, import.meta.url));
+const { parseSectionHeaders, verifyOffsets } = await import(new URL(`./offset-calc.mjs${reloadQuery}`, import.meta.url));
 export { PS_SYNTAX, normPath, splitCommand, readOnlyCommand, decide };
 
 const loadedIdentity = runtimeIdentity(import.meta.url);
@@ -130,6 +132,8 @@ const DEFAULTS = {
   convergenceGuard: true,
   historicalGapReview: true,
   dispatchConsistency: true,
+  taskBriefGuard: 'block',
+  redactLiterals: [],
   actionableReceipts: true,
   verificationReuse: true,
   // 受护栏会话的工具放行方式，allowlist 只放行护栏认识的工具和配置的名单。
@@ -1016,7 +1020,7 @@ export function nextStep(value, acceptance, resumed, { readOnly = value.context?
   if (value.status !== 'completed') {
     if (value.error_kind === 'model_refused') {
       return failureReceipt(value, '执行模型拒绝了这单（model_refused，终态）') +
-        '不要原样重派。可回看任务书有无与目标无关的内容、是否写清目的，或把影响告诉用户，由用户决定下一步。';
+        '不要原样重派。可回看任务书有无与目标无关的内容、有无显式目的交代（M1 已自动拦这类），或把影响告诉用户，由用户决定下一步。';
     }
     if (value.error_kind === 'upstream_rejected') {
       return failureReceipt(value, '模型服务拒收请求（upstream_rejected，runner 不自动重试）') +
@@ -1269,6 +1273,7 @@ function settings(config, logger) {
       : key === 'acceptOpenEvidence' ? ['strict', 'relaxed', 'off'].includes(value)
       : key === 'ownerDecisions' ? ['planner', 'owner'].includes(value)
       : key === 'autoVerify' ? ['off', 'flagged'].includes(value)
+      : key === 'taskBriefGuard' ? ['block', 'warn', 'off'].includes(value)
       : ['defaultEngine', 'verifyEngine'].includes(key) ? ENGINE_PARAMETER.enum.includes(value)
       : key === 'effortOverride' ? ['planner', 'raise-only-listed', 'config'].includes(value)
       : ['handoverSuggestMessages', 'handoverContextTokens', 'acceptanceWarnAbove', 'continueFreshAboveTokens'].includes(key) ? Number.isInteger(value) && value >= 0
@@ -2472,7 +2477,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   async function fallbackOnFailure(source, exec) {
     const { job_id: parent, context, task_options: options, sandbox } = source;
     if (disposed || !cfg.gemini?.command || cfg.geminiFallback === false || source.status !== 'failed' ||
-        source.fallback_safe !== true || jobEngine(source) !== 'codex' || !parent || !context?.owner ||
+        source.error_kind === 'model_refused' || source.fallback_safe !== true || jobEngine(source) !== 'codex' || !parent || !context?.owner ||
         !owns(exec?.agent?.id, context.owner) || !automaticJobAllowed(exec.agent, source)) return;
     if (fallbacks.has(parent)) return fallbacks.get(parent);
     const attempt = (async () => {
@@ -2859,7 +2864,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     } catch { exec?.signal?.throwIfAborted(); }
   }
 
-  const taskIdentity = task => createHash('sha256').update(task.trim()).digest('hex');
+  const taskIdentity = task => normalizedTaskIdentity(task);
   const orderedPaths = (cwd, paths) => [...new Set((paths ?? []).map(file => taskScopePath(cwd, file)))].sort();
   function attemptPremises(value) {
     const { context, cwd, sandbox, task_options } = value;
@@ -2890,19 +2895,24 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     if (parent) {
       if (!owns(owner, parent.context?.owner)) return [];
       const latest = parent.context?.verification_of ? await prior(parent) : parent;
-      if (!latest || !repeatedOutcome(latest)) return [latest].filter(Boolean);
+      if (!latest || latest.error_kind === 'model_refused' || !repeatedOutcome(latest)) return [latest].filter(Boolean);
       const earlier = await prior(latest);
       return [latest, earlier].filter(job => job && owns(owner, job.context?.owner) && !job.context.verification_of);
     }
     const filters = { owner, also_owners: aliases.predecessors(owner), cwd, task_key: taskIdentity(task), limit: 100 };
     const page = await conductor.list(filters, signal);
     const title = task.trim().split('\n')[0].slice(0, 160);
+    const titleKey = taskIdentity(title);
+    const targetKey = taskIdentity(task);
+    const trimmedAcceptance = JSON.stringify(acceptance.map(text => text.trim()));
     const matches = [];
     for (const job of page.jobs ?? []) {
-      if (!owns(owner, job.context?.owner) || job.context.verification_of || job.context.task !== title) continue;
+      if (!owns(owner, job.context?.owner) || job.context.verification_of ||
+          (job.context.task !== title && taskIdentity(String(job.context?.task ?? '').split('\n')[0].slice(0, 160)) !== titleKey)) continue;
       const full = await lookup(job.job_id);
-      if (!owns(owner, full.context?.owner) || full.context.task?.trim() !== task.trim() ||
-          JSON.stringify(full.context.acceptance) !== JSON.stringify(acceptance)) continue;
+      if (!owns(owner, full.context?.owner) || typeof full.context?.task !== 'string' ||
+          taskIdentity(full.context.task) !== targetKey || !Array.isArray(full.context.acceptance) ||
+          JSON.stringify(full.context.acceptance.map(text => String(text).trim())) !== trimmedAcceptance) continue;
       matches.push(full);
       if (matches.length === 2) break;
     }
@@ -2912,6 +2922,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
   function convergenceDecision(tool, rounds, candidate, note, answers = []) {
     const [latest, earlier] = rounds;
     if (!latest) return {};
+    if (latest.error_kind === 'model_refused' &&
+        !['verified', 'accepted_deviations'].includes(latest.verification_status ?? latest.verification?.status) &&
+        latest.cwd && candidate.cwd && normPath(latest.cwd) === normPath(candidate.cwd) &&
+        typeof latest.context?.task === 'string' && typeof candidate.context?.task === 'string' &&
+        taskIdentity(latest.context.task) === taskIdentity(candidate.context.task) &&
+        Array.isArray(latest.context.acceptance) && Array.isArray(candidate.context.acceptance) &&
+        JSON.stringify(latest.context.acceptance.map(text => String(text).trim())) ===
+          JSON.stringify(candidate.context.acceptance.map(text => String(text).trim()))) {
+      return {
+        refusal: `${tool}: 上一轮任务 ${latest.job_id} 已被执行模型安全拒绝（model_refused，终态），本单任务书与上一轮无实质差异，已熔断拦截，未启动执行端。` +
+          '请勿原样重派或仅改标点：应删去目的交代、改由本地只读命令取料并重构为通用机制分析子题，或向用户报告受阻范围由用户裁决。',
+      };
+    }
     const premises = attemptPremises(latest);
     if (!premises || premises !== attemptPremises(candidate)) return {};
     if ((latest.execution_status ?? latest.status) === 'running' && latest.context.routing?.convergence_override) {
@@ -3046,6 +3069,13 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     return { args: { ...args, model }, routing: ab ? { ...routing, ab: true, model } : routing };
   }
 
+  const m1BlockCounts = new Map();
+  const formatLintWarn = (hit) => hit.severity === 'warn'
+    ? hit.message
+    : hit.message
+      .replace(/^([^:]+:\s*\[[^\]]+?)拦截\]/, '$1预警]')
+      .replace(/[，；]?\s*未启动执行端([。.]?)$/, '（taskBriefGuard=warn，本次仅预警放行）$1');
+
   async function dispatch(args, exec, continuation, originalTask = args.task, verificationOf, fresh, routing, guard = {}) {
     const reject = message => continuation ? continuationError(message) : new Error(message);
     try { validateRun(verificationOf && args.effort === '' ? { ...args, effort: undefined } : args); }
@@ -3106,6 +3136,26 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     let cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
     if (!cwd) throw reject('codex_run: 当前会话没有工作区，请传 cwd');
+    const lintWarnings = [];
+    if (cfg.taskBriefGuard !== 'off' && !verificationOf) {
+      const m2Ctx = {
+        tool: continuation ? 'codex_continue' : 'codex_run',
+        taskBriefGuard: cfg.taskBriefGuard,
+        redactLiterals: cfg.redactLiterals,
+        roots: cfg.roots,
+        plannerReadAllow: cfg.plannerReadAllow,
+        worktree: cfg.worktree,
+        cwd,
+      };
+      const m2Check = continuation
+        ? lintContinuationDelta({ answers: continuation.answers, resolution: continuation.resolution, rerun_after_change: args.rerun_after_change, acknowledge_risk_warning: true }, m2Ctx)
+        : lintTaskBrief({ ...args, task: originalTask, acknowledge_risk_warning: true }, m2Ctx);
+      const m2Hits = m2Check.hits.filter(hit => hit.rule === 'M2');
+      if (m2Hits.length) {
+        if (cfg.taskBriefGuard === 'block') throw reject(m2Hits.map(hit => hit.message).join('\n'));
+        lintWarnings.push(...m2Hits.map(formatLintWarn));
+      }
+    }
     let worktreeLine;
     // 没配置 worktree 时不多 await 一拍：派单的调用时序和加载时的自动核验补派有先后约束。
     if (!verificationOf && cfg.worktree.repos.length) {
@@ -3124,6 +3174,39 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const conflicts = writeContradictions({ ...args, task: originalTask }, cwd, taskScopePath, under);
       if (conflicts.length) throw reject(`${tool}: ${conflicts.join('；')}。修正任务书后再派，未启动 Codex。`);
       if (args.required_writes?.length) routing = { ...routing, required_writes: args.required_writes };
+    }
+    const m4Warnings = [];
+    if (cfg.taskBriefGuard !== 'off' && !verificationOf) {
+      const ownerKey = exec?.agent?.id ?? '';
+      const previousM1Blocks = ownerKey ? (m1BlockCounts.get(ownerKey) ?? 0) : 0;
+      const lintCtx = {
+        tool,
+        taskBriefGuard: cfg.taskBriefGuard,
+        redactLiterals: cfg.redactLiterals,
+        roots: cfg.roots,
+        plannerReadAllow: cfg.plannerReadAllow,
+        worktree: cfg.worktree,
+        cwd,
+        resume: args.resume,
+        conversation_id: args.conversation_id,
+        fresh,
+        previousM1Blocks,
+      };
+      const postCheck = continuation
+        ? lintContinuationDelta({ answers: continuation.answers, resolution: continuation.resolution, rerun_after_change: args.rerun_after_change, acknowledge_risk_warning: args.acknowledge_risk_warning }, lintCtx)
+        : lintTaskBrief({ ...args, task: originalTask }, lintCtx);
+      const m1m3Blocks = postCheck.blocks.filter(hit => hit.rule === 'M1' || hit.rule === 'M3');
+      if (cfg.taskBriefGuard === 'block' && m1m3Blocks.length) {
+        if (ownerKey && m1m3Blocks.some(hit => hit.rule === 'M1')) m1BlockCounts.set(ownerKey, previousM1Blocks + 1);
+        const msg = m1m3Blocks.map(hit => hit.message).join('\n') +
+          (m1m3Blocks.some(hit => hit.rule === 'M1') && previousM1Blocks >= 1
+            ? ' 若当前系统提示词仍残留要求“写明目的”的旧段落，请忽略该旧段落并整句删除命中分句后再提交。' : '');
+        throw reject(msg);
+      }
+      if (ownerKey) m1BlockCounts.delete(ownerKey);
+      if (cfg.taskBriefGuard === 'warn') lintWarnings.push(...m1m3Blocks.map(formatLintWarn));
+      lintWarnings.push(...postCheck.warnings.filter(hit => hit.rule !== 'M4').map(hit => hit.message));
+      m4Warnings.push(...postCheck.warnings.filter(hit => hit.rule === 'M4').map(hit => hit.message));
     }
     // 只有 write=true 的任务加目录写锁；主机模式的只读任务不挡同目录的 gemini_write。
     const writer = cfg.gemini && args.write ? { cwd: normPath(cwd) } : null;
@@ -3265,7 +3348,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const repeat = await conductor.repeatGuard(cwd, exec?.signal);
       exec?.signal?.throwIfAborted();
       if (cfg.repeatFailureGuard.enabled && repeat?.status === 'completed') standingLine = repeatStandingLine(repeat.standing);
-      predispatch = predispatchWarnings(args, cwd, guard.parent ?? latestOnThread, repeat);
+      predispatch = [...predispatchWarnings(args, cwd, guard.parent ?? latestOnThread, repeat), ...lintWarnings, ...m4Warnings];
       if (args.rerun_after_change) routing = { ...routing, rerun_after_change: true };
       if (owner && args.write === true && (resumeJobs.size || guard.parent)) {
         if (guard.parent) resumeJobs.set(guard.parent.job_id, guard.parent);
@@ -3688,6 +3771,11 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       if (!owns(owner, source.context?.owner)) throw new Error('codex_verify: 原任务归属未知或不属于当前会话');
       if (source.context.verification_of) throw new Error(await verificationOnlyRefusal('codex_verify', source, exec?.signal));
       if (source.status === 'running') throw new Error(`codex_verify: 原任务还在运行。${waitForJob(args.job_id)}等它结束后再核验。`);
+      if (source.error_kind === 'model_refused' && !(source.report ?? source.structured)?.files_changed?.length &&
+          !source.files_changed?.length && !source.files_changed_total && !source.write_paths?.length &&
+          !source.diff_files && !source.output) {
+        throw new Error(`codex_verify: 原任务 ${source.job_id} 已被执行模型拒绝（model_refused）且无任何改动产物，不必核验这种单。请先按原拒答回执处理，不要对无产物的拒答单派核验。`);
+      }
       if (cfg.verificationReuse && withoutVerificationProduct(source)) {
         throw new Error(`codex_verify: 原任务 ${source.job_id} 受阻，未记录改动或可核验结果。先处理原阻塞。`);
       }
@@ -4434,6 +4522,69 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     },
   });
 
+  const INT64_INPUT = { anyOf: [{ type: 'string' }, { type: 'integer' }] };
+  ctx.tools.register({
+    name: 'codex_offset_check',
+    description: '本地只读确定性 64 位整数（BigInt）节表解析与偏移/RIP 相对位移/表项步长验算工具（M6）。' +
+      '接收 readelf -S -W / readelf -S / objdump -h 的节表头原始文本（或结构化节表数组）、目标虚拟地址 target_va（或 section_name + section_offset）、可选 load_bias 与期望文件偏移 expected_file_offset，以及可选的 rip 位移或 table 步长参数，同步返回确定性验算结论（含 NOBITS 与越界拦截），只读不修改任何状态。',
+    presentCall: () => ({ card: 'generic', kind: 'read', title: '本地节表与偏移整数验算' }),
+    parameters: {
+      type: 'object',
+      properties: {
+        section_headers: { type: 'string', description: 'readelf -S -W、readelf -S 或 objdump -h 输出的节表头原始文本。' },
+        sections: {
+          anyOf: [
+            { type: 'string' },
+            { type: 'array', items: { type: 'object', additionalProperties: true } },
+          ],
+          description: '可选：结构化节表数组（每项含 name、type、addr、offset、size）或节表头原始文本。',
+        },
+        arch: { type: 'string', enum: ['x86_64', 'aarch64', 'arm_thumb', 'generic'], description: '目标架构，默认 generic；arm_thumb 会自动剥离指令入口最低位 Thumb 标志 (+1)。' },
+        target_va: { ...INT64_INPUT, description: '待换算的目标虚拟地址（建议传十六进制字符串如 "0x404020"，支持完整 64 位地址）。' },
+        load_bias: { ...INT64_INPUT, description: '可选：程序头运行时加载基址差（target_va - static_va），默认 0。' },
+        section_name: { type: 'string', description: '可选：按节名 + 节内偏移定位（适用于 ET_REL .o 目标文件）。' },
+        section_offset: { ...INT64_INPUT, description: '可选：配合 section_name 使用的节内字节偏移。' },
+        expected_file_offset: { ...INT64_INPUT, description: '可选：待核对的期望文件字节偏移。' },
+        expected_offset: { ...INT64_INPUT, description: '可选：expected_file_offset（或表项期望偏移）的别名。' },
+        rip: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            next_rip: { ...INT64_INPUT, description: '下一条指令地址（RIP 基准）。' },
+            disp32: { ...INT64_INPUT, description: '32 位有符号相对位移（十六进制字符串、十进制整数或小端四字节如 "f5 3f 00 00"）。' },
+            expected_va: { ...INT64_INPUT, description: '可选：期望命中的目标虚拟地址。' },
+          },
+          required: ['next_rip', 'disp32'],
+          description: '可选：RIP 相对寻址闭合验算（next_rip + disp32 === expected_va）。',
+        },
+        table: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            base_offset: { ...INT64_INPUT, description: '表起始偏移。' },
+            stride: { ...INT64_INPUT, description: '表项字节步长（正整数）。' },
+            reserved_entries: { ...INT64_INPUT, description: '可选：表头保留槽位数（如 PLT[0] 填 1，GOT[0..2] 填 3），默认 0。' },
+            index: { ...INT64_INPUT, description: '可选：从 0 开始的目标表项下标。' },
+            expected_offset: { ...INT64_INPUT, description: '可选：期望的表项偏移。' },
+            table_size: { ...INT64_INPUT, description: '可选：表总字节大小（用于越界校验）。' },
+          },
+          required: ['base_offset', 'stride'],
+          description: '可选：线性表项步长与 0-based 下标验算。',
+        },
+      },
+    },
+    output: DATA_OUTPUT,
+    async execute(args = {}) {
+      if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        throw new Error('codex_offset_check: 参数必须是对象');
+      }
+      const rawHeaders = typeof args.section_headers === 'string' ? args.section_headers
+        : typeof args.sections === 'string' ? args.sections : undefined;
+      const sections = rawHeaders !== undefined ? parseSectionHeaders(rawHeaders) : args.sections;
+      return JSON.parse(JSON.stringify(verifyOffsets({ ...args, ...(sections !== undefined ? { sections } : {}) })));
+    },
+  });
+
   // 对话 worktree（worktree.repos）：每个对话每个仓库一条记录，交接出去的会话沿交接链继承。
   // status：open（在 worktree 里工作）、shared（留在原目录，reason 写原因）、closed（已收尾）。
   const worktreesFile = stateDirectory && path.join(stateDirectory, 'session-worktrees.json');
@@ -4721,6 +4872,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
     }
     return (summary ? `${summary}\n` : '') + JSON.stringify(value, null, 2);
   };
+  const recentGeminiWriteRefusals = new Map();
   if (cfg.gemini) ctx.tools.register({
     name: 'gemini_write',
     description: '把教程、文档正文交给本机官方 agy 的 Gemini 写入单个文件，一章一章做；源码改动和素材笔记用 codex_run。' +
@@ -4765,13 +4917,58 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const cwd = taskCwd(args, sessionCwd(exec), cfg.workspaces);
       // 只预检池里还有可用账号；账号由 geminiWrite 每次启动 agy 前向 dsh-agy-link 租用（gemini.accountPool）。
       if (cfg.gemini.accountPool) poolAccount(cfg.gemini.accountPool, cfg.gemini.forceModel ? cfg.gemini.model : args.model ?? cfg.gemini.model);
+      const owner = exec?.agent?.id;
+      const promptKey = typeof args.prompt === 'string' && args.prompt.trim()
+        ? `${owner ?? ''}::${normalizedTaskIdentity(args.prompt)}` : '';
+      if (promptKey && recentGeminiWriteRefusals.has(promptKey)) {
+        throw new Error('gemini_write: 上一次相同写作要求已被执行模型安全拒绝（model_refused，终态），本单 prompt 与上一次无实质差异，已熔断拦截，未启动 Gemini。请勿原样重试或仅改标点：请删除主观目的交代并重构写作要求，或向用户报告受阻情况。');
+      }
+      let geminiLintWarnings = [];
+      if (cfg.taskBriefGuard !== 'off') {
+        const sourceRoots = restrictedReads(exec) && !cfg.roots.includes('*')
+          ? [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] : null;
+        const preloadedSources = [];
+        if (typeof cwd === 'string' && cwd.trim() && Array.isArray(args.sources) && args.sources.length >= 1 && args.sources.length <= 20) {
+          try {
+            const nativeCwd = process.platform === 'win32'
+              ? cwd.replace(/^\/mnt\/([a-z])(?=\/|$)/i, (_m, d) => `${d}:`) : cwd;
+            const resolvedCwd = realpathSync(nativeCwd);
+            let totalBytes = 0;
+            for (const item of args.sources) {
+              if (typeof item !== 'string' || !item.trim()) continue;
+              const nativeItem = process.platform === 'win32'
+                ? item.replace(/^\/mnt\/([a-z])(?=\/|$)/i, (_m, d) => `${d}:`) : item;
+              const candidate = realpathSync(path.resolve(resolvedCwd, nativeItem));
+              if (sourceRoots && !sourceRoots.some((root) => under(normPath(candidate), root))) continue;
+              const info = lstatSync(candidate, { throwIfNoEntry: false });
+              if (!info?.isFile()) continue;
+              totalBytes += info.size;
+              if (totalBytes > 1024 * 1024) break;
+              preloadedSources.push({ path: item, content: readFileSync(candidate, 'utf8') });
+            }
+          } catch {}
+        }
+        const gemLint = lintGeminiWrite(args, preloadedSources, {
+          tool: 'gemini_write',
+          taskBriefGuard: cfg.taskBriefGuard,
+          redactLiterals: cfg.redactLiterals,
+          roots: cfg.roots,
+          plannerReadAllow: cfg.plannerReadAllow,
+          worktree: cfg.worktree,
+          cwd,
+        });
+        if (gemLint.blocked && cfg.taskBriefGuard === 'block') throw new Error(gemLint.message);
+        geminiLintWarnings = [
+          ...(cfg.taskBriefGuard === 'warn' ? gemLint.blocks.map(formatLintWarn) : []),
+          ...gemLint.warnings.map((w) => w.message),
+        ];
+      }
       const gemini = cfg.gemini;
       const key = normPath(cwd);
       const busy = geminiWrites.has(key) ? '同一任务目录的 gemini_write 尚未结束，请先等它结束'
         : [...startingWrites].some((writer) => writer.cwd === key) ? '同一任务目录的可写 Codex 任务正在启动，请先等它结束' : '';
       // 查询与启动之间也占住本实例的入口，避免规划端同时派入另一种写任务。
       if (!busy) geminiWrites.add(key);
-      const owner = exec?.agent?.id;
       const write = (signal, extra = {}) => geminiWrite(gemini, { ...args, cwd,
         ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
         { signal, stateDirectory: cfg.stateDir || undefined, busy,
@@ -4780,6 +4977,19 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
             ? { sourceRoots: [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] } : {}) }, launchGemini)
         .then((value) => {
           if (value.status === 'completed') productReads.addGemini(owner, [value.output]);
+          const isRefused = value.status === 'failed' && !value.write_paths?.length &&
+            !value.before_rollback?.files_changed?.length &&
+            (value.error_kind === 'model_refused' || GEMINI_WRITE_REFUSAL.test(String(value.error ?? '')));
+          if (isRefused) {
+            if (!value.error_kind) value = { ...value, error_kind: 'model_refused' };
+            if (promptKey) {
+              if (recentGeminiWriteRefusals.size >= 50) recentGeminiWriteRefusals.delete(recentGeminiWriteRefusals.keys().next().value);
+              recentGeminiWriteRefusals.set(promptKey, { at: Date.now(), output: value.output });
+            }
+          }
+          if (geminiLintWarnings.length) {
+            value = { ...value, next: [value.next, ...geminiLintWarnings].filter(Boolean).join('\n') };
+          }
           recordGemini({ ...value, ...extra }, owner);
           return value;
         }).finally(() => { if (!busy) geminiWrites.delete(key); });

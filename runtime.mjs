@@ -269,6 +269,8 @@ const settingLabels = { model: 'Codex 模型', effort: '执行时的思考程度
   acceptOpenEvidence: '接受未完成项的依据',
   ownerDecisions: '待所有者事项由谁决定',
   autoVerify: '完成后自动核验',
+  taskBriefGuard: '任务书预检护栏',
+  redactLiterals: '自定义脱敏词列表',
   effortOverride: '单次推理强度覆盖',
   repeatFailureGuard: '重复失败拦截设置',
   plannerReadAllow: '额外允许读取的路径',
@@ -282,7 +284,8 @@ const numericSettings = { lockTimeoutSeconds: (v) => v > 0, maxStorageMb: (v) =>
   acceptanceWarnAbove: (v) => Number.isInteger(v) && v >= 0, continueFreshAboveTokens: (v) => Number.isInteger(v) && v >= 0 };
 // Lists are replaced as a whole; an entry is one line of plain text.
 const listSettings = { allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v)],
-  plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\/|\\\\)[^\r\n]*$/.test(v)] };
+  plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\/|\\\\)[^\r\n]*$/.test(v)],
+  redactLiterals: [200, (v) => v.trim().length > 0 && v.length <= 120 && !/[\r\n\0]/.test(v)] };
 
 export function validatePanelSettings(value, geminiConfigured = false) {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Object.keys(value).length) {
@@ -304,6 +307,7 @@ export function validatePanelSettings(value, geminiConfigured = false) {
     else if (key === 'acceptOpenEvidence') valid = ['strict', 'relaxed', 'off'].includes(v);
     else if (key === 'ownerDecisions') valid = ['planner', 'owner'].includes(v);
     else if (key === 'autoVerify') valid = ['off', 'flagged'].includes(v);
+    else if (key === 'taskBriefGuard') valid = ['block', 'warn', 'off'].includes(v);
     else if (key === 'effortOverride') valid = ['planner', 'raise-only-listed', 'config'].includes(v);
     else if (['jobDiff', 'closeoutGuard', 'crossEngineVerify', 'geminiFallback', 'lockEngine'].includes(key)) valid = typeof v === 'boolean';
     else if (key === 'defaultEngine') valid = v === 'codex' || (v === 'gemini' && geminiConfigured);
@@ -397,7 +401,7 @@ function settingsEdits(profile, changes) {
     }
     const hits = children.filter((line) => line.text.startsWith(fieldPad + key + ':'));
     if (hits.length > 1) throw new Error(`${key} 配置重复，未保存`);
-    if (hits.length && Array.isArray(value)) {
+    if (hits.length && (Array.isArray(value) || Object.hasOwn(listSettings, key))) {
       // shortcut: the whole list is rewritten, so comments inside it are dropped; a flow list must fit on its own line.
       const parent = hits[0];
       const rest = parent.text.slice((fieldPad + key + ':').length);
@@ -408,10 +412,17 @@ function settingsEdits(profile, changes) {
           if (depth < fieldPad.length || (depth === fieldPad.length && !/^-(?:[ \t]|$)/.test(line.text.slice(depth)))) break;
           items.push(line);
         }
-      } else if (!/^[ \t]*\[[^\]]*\][ \t]*(?:#.*)?$/.test(rest)) throw new Error(`不支持 ${key} 的 YAML 写法，未保存`);
+      } else if (!/^[ \t]*\[(?:[^\]"']|"(?:[^"\\]|\\.)*"|'(?:[^']|'')*')*\][ \t]*(?:#.*)?$/.test(rest)) {
+        throw new Error(`不支持 ${key} 的 YAML 写法，未保存`);
+      }
       const end = endOfLine(items.at(-1) ?? parent);
       edits.push([{ start: parent.start, length: end - parent.start, render: () => fresh(key, value, fieldPad).slice(newline.length) }, null]);
-    } else if (hits.length) replace(hits[0], key, fieldPad, value);
+    } else if (hits.length) {
+      if (key === 'taskBriefGuard' && /^[ \t]*(?:#.*)?$/.test(hits[0].text.slice((fieldPad + key + ':').length))) {
+        throw new Error(`不支持 ${key} 的 YAML 写法，未保存`);
+      }
+      replace(hits[0], key, fieldPad, value);
+    }
     else additions += fresh(key, value, fieldPad);
   }
   if (additions) insert(endOfLine(config), additions);

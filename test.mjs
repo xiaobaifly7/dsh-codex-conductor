@@ -63,11 +63,20 @@ test('entry reload queries re-evaluate helper modules', async () => {
         `globalThis[${JSON.stringify(traceKey)}].push('worktree-${version}');\n` +
         'export const repoFor = () => undefined, within = () => false, relocate = (p) => p, relocateText = (t) => t, pathKey = (p) => p, ' +
         'openWorktree = async () => ({}), mergeWorktree = async () => ({}), worktreeStatus = async () => ({}), closeWorktree = async () => ({});\n');
+      writeFileSync(path.join(dir, 'task-lint.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('task-lint-${version}');\n` +
+        'export const lintTaskBrief = () => ({ ok: true, blocked: false, hits: [], blocks: [], warnings: [], message: "" }), ' +
+        'lintContinuationDelta = () => ({ ok: true, blocked: false, hits: [], blocks: [], warnings: [], message: "" }), ' +
+        'lintGeminiWrite = () => ({ ok: true, blocked: false, hits: [], blocks: [], warnings: [], message: "" }), ' +
+        'normalizedTaskIdentity = () => "", GEMINI_WRITE_REFUSAL = /$^/;\n');
+      writeFileSync(path.join(dir, 'offset-calc.mjs'),
+        `globalThis[${JSON.stringify(traceKey)}].push('offset-calc-${version}');\n` +
+        'export const parseSectionHeaders = () => [], verifyOffsets = () => ({ valid: true, failedChecks: [] });\n');
       const entry = pathToFileURL(path.join(dir, 'index.mjs'));
       entry.search = `?reload=${version}`;
       await import(entry.href);
     }
-    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'engines-new', 'engines-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'workflow-new', 'workflow-old', 'worktree-new', 'worktree-old']);
+    assert.deepEqual([...globalThis[traceKey]].sort(), ['autoanswer-new', 'autoanswer-old', 'closeout-new', 'closeout-old', 'engines-new', 'engines-old', 'gemini-new', 'gemini-old', 'guard-new', 'guard-old', 'handover-new', 'handover-old', 'offset-calc-new', 'offset-calc-old', 'panel-new', 'panel-old', 'resume-new', 'resume-old', 'runtime-new', 'runtime-old', 'task-lint-new', 'task-lint-old', 'workflow-new', 'workflow-old', 'worktree-new', 'worktree-old']);
   } finally {
     delete globalThis[traceKey];
     rmSync(dir, { recursive: true, force: true });
@@ -927,13 +936,16 @@ test('guard regressions match Bash semantics using only printed markers and /dev
 });
 
 test('an invalid allowCommands pattern leaves the tools and guard installed', () => {
+  const baselineTools = [];
+  apply({ tools: { register: (t) => baselineTools.push(t), guard: () => {} }, on: () => {} },
+    { workspaces: ['F:\\work\\项目'] });
   const tools = [];
   const guards = [];
   const warnings = [];
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: () => {},
     logger: { warn: (s) => warnings.push(s) } },
   { workspaces: ['F:\\work\\项目'], allowCommands: ['[', '^\\./verify\\.sh --check$'] });
-  assert.equal(tools.length, 11);
+  assert.equal(tools.length, baselineTools.length);
   assert.equal(guards.length, 1);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /allowCommands/);
@@ -1186,14 +1198,14 @@ test('conductor start only starts; waitJob waits with a bounded status call and 
   assert.equal(calls.some(({ argv }) => argv[0] === 'cancel'), false);
 });
 
-test('apply registers eleven tools in order, a guard and the false-dispatch check', () => {
+test('apply registers default tools in order, a guard and the false-dispatch check', () => {
   const tools = [];
   const guards = [];
   const handlers = {};
   apply({ tools: { register: (t) => tools.push(t), guard: (g) => guards.push(g) }, on: (ev, fn) => { handlers[ev] = fn; } },
     { workspaces: ['F:\\work\\项目'] });
   assert.deepEqual(tools.map((t) => t.name), ['codex_run', 'codex_verify', 'codex_status', 'codex_cancel', 'codex_jobs', 'codex_output',
-    'codex_continue', 'codex_review', 'codex_summary', 'codex_watch', 'codex_runtime']);
+    'codex_continue', 'codex_review', 'codex_summary', 'codex_offset_check', 'codex_watch', 'codex_runtime']);
   assert.deepEqual(tools[0].parameters.required, ['task', 'acceptance', 'write']);
   assert.match(tools[0].description, /固定为 JSON[\s\S]*启动不了 Windows 程序/);
   assert.equal(guards.length, 1);
@@ -3385,7 +3397,7 @@ test('a model refusal is terminal even with a thread and changes', async () => {
     attempts: 1, sandbox: 'danger-full-access', thread_id: 'THREAD', files_changed: [{ path: 'a', change: 'modified' }],
     error: 'Reconnecting... 1/5 (refused this request)' };
   const refused = await tools.codex_status.execute({ job_id: 'REFUSED', wait_seconds: 0 });
-  assert.match(refused.next, /模型拒绝了这单.*终态.*尝试 1 次.*文件改动共 1 个.*确认现状.*不要原样重派.*写清目的.*由用户决定/);
+  assert.match(refused.next, /模型拒绝了这单.*终态.*尝试 1 次.*文件改动共 1 个.*确认现状.*不要原样重派.*有无显式目的交代（M1 已自动拦这类）.*由用户决定/);
   assert.doesNotMatch(refused.next, /resume|codex_continue|codex_run|换模型|改写/);
 });
 
@@ -5194,10 +5206,11 @@ function geminiFixture(t, { config = {}, action } = {}) {
 }
 
 test('gemini_write stays unregistered without valid configuration', () => {
+  const baselineToolCount = Object.keys(harness().tools).length;
   for (const gemini of [undefined, null, {}, { command: 42 }, { command: '' }, { command: 'agy.exe' }, { command: 'C:agy.exe' }, 'agy.exe']) {
     const h = harness({ config: { gemini } });
     assert.equal(h.tools.gemini_write, undefined);
-    assert.equal(Object.keys(h.tools).length, 11);
+    assert.equal(Object.keys(h.tools).length, baselineToolCount);
     assert.doesNotMatch(h.guards[0](call('edit')), /gemini_write/);
     assert.equal(h.warnings.length, gemini == null ? 0 : 1);
     if (h.warnings.length) assert.match(h.warnings[0], /gemini/);
