@@ -4972,6 +4972,7 @@ export function apply(ctx, config = {}, run = runRunner, launchGemini = spawn) {
       const write = (signal, extra = {}) => geminiWrite(gemini, { ...args, cwd,
         ...(args.max_chars === undefined && cfg.gemini.defaultMaxChars ? { max_chars: cfg.gemini.defaultMaxChars } : {}) }, conductor,
         { signal, stateDirectory: cfg.stateDir || undefined, busy,
+          taskBriefGuard: cfg.taskBriefGuard, redactLiterals: cfg.redactLiterals,
           // products 模式下规划端不能读原料，也就不能把工作区外的文件当素材发给 Gemini。
           ...(restrictedReads(exec) && !cfg.roots.includes('*')
             ? { sourceRoots: [...cfg.roots, ...cfg.plannerReadAllow.map(normPath)] } : {}) }, launchGemini)

@@ -792,7 +792,11 @@ def replace_user_agents_md(env):
                 temp.unlink(missing_ok=True)
         return
     home.mkdir(parents=True, exist_ok=True)
-    for entry in real.iterdir():
+    try:
+        entries = list(real.iterdir())
+    except FileNotFoundError:
+        entries = ()
+    for entry in entries:
         if entry.name != "AGENTS.md":
             try:
                 (home / entry.name).symlink_to(entry)

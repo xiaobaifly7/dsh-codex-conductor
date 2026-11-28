@@ -179,6 +179,7 @@ window.__ModuleLoader__.load({
     const LISTS = {
       allowTools: [200, (v) => /^[A-Za-z0-9_.:*-]{1,120}$/.test(v), '白名单工具请一行填一个，只用字母、数字和 _ . : * -，最多 200 个。'],
       plannerReadAllow: [50, (v) => v.length <= 500 && /^(?:[A-Za-z]:[\\/]|\\\\|\/)/.test(v), '额外允许读取的路径请一行填一个完整路径，最多 50 个。'],
+      redactLiterals: [200, (v) => v.trim().length > 0 && v.length <= 120 && !/[\r\n\0]/.test(v), '自定义脱敏词请一行填一个，每项不超过 120 个字符且不含空字符，最多 200 个。'],
     };
     const listLines = (value) => Array.isArray(value) ? value
       : String(value ?? '').split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
@@ -208,6 +209,8 @@ window.__ModuleLoader__.load({
           if (!['open', 'products'].includes(value)) throw new Error('请选择规划端的读取范围。');
         } else if (key === 'toolPolicy') {
           if (!['denylist', 'allowlist'].includes(value)) throw new Error('请从列表中选择工具放行方式。');
+        } else if (key === 'taskBriefGuard') {
+          if (!['block', 'warn', 'off'].includes(value)) throw new Error('请从列表中选择任务书预检护栏模式。');
         } else if (NUMBERS[key]) {
           const [check, message] = NUMBERS[key];
           value = raw == null || String(raw).trim() === '' ? null : Number(raw);
@@ -760,6 +763,8 @@ window.__ModuleLoader__.load({
               field('acceptOpenEvidence', '接受未完成项的依据', '保留原报告标出的未完成项时需要什么依据。', [['strict', '未满足须核验或用户确认（默认）'], ['relaxed', '也接受后续轮次仍未完成的结果'], ['off', '不检查']]),
               field('ownerDecisions', '待所有者事项由谁决定', '不可逆数据变更、对外动作、花钱、账号凭据及扩大安全边界由所有者决定。', [['planner', '规划端按常设授权决定（默认）'], ['owner', '沿用原有确认流程']]),
               field('autoVerify', '完成后自动核验', '写任务完成且报告有未完成项或任务有 must_verify 时，自动派出只读核验。', [['flagged', '自动核验（默认）'], ['off', '关闭']]),
+              field('taskBriefGuard', '任务书预检护栏', '派发任务或 Gemini 写作前检查目的交代、未脱敏凭据与悬空指代。',
+                [['block', '拦截（默认）'], ['warn', '仅预警放行'], ['off', '关闭']]),
               field('toolPolicy', '工具放行方式', '决定受护栏会话里规划端能用哪些工具。',
                 [['denylist', '按拒绝名单（默认）'], ['allowlist', '只放行白名单内的工具']]),
               settings.gemini ? field('gemini.model', 'Gemini 模型', 'Gemini 写作和交给 Gemini 执行的任务都用它；填 agy models 列出的完整 ID。') : null,
@@ -809,7 +814,8 @@ window.__ModuleLoader__.load({
               '白名单模式下，未列入白名单的工具在受护栏会话里会被拒绝。') : null,
             h('div', { className: 'dcc-grid dcc-actions' },
               listField('allowTools', '白名单工具', '一行一个工具名；以 * 结尾表示放行这个前缀开头的所有工具。只在白名单模式下生效。'),
-              listField('plannerReadAllow', '额外允许读取的路径', '一行一个完整路径，可以是文件或目录；“规划端只读 Codex 的产物”打开时，这些路径仍可直接读取。')),
+              listField('plannerReadAllow', '额外允许读取的路径', '一行一个完整路径，可以是文件或目录；“规划端只读 Codex 的产物”打开时，这些路径仍可直接读取。'),
+              listField('redactLiterals', '自定义脱敏词列表', '一行一个敏感词（如主机名、账号别名），每项不超过 120 个字符，最多 200 个；预检命中时按任务书预检护栏处理。')),
             settings.seenTools?.length ? h('div', { className: 'dcc-actions' },
               h('small', null, '这些工具在受护栏会话里出现过，白名单模式下会被拒绝：'),
               h('ul', { className: 'dcc-jobs', 'aria-label': '出现过但不在白名单里的工具' }, ...settings.seenTools.map((tool) =>

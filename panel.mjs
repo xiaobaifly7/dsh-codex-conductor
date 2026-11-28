@@ -130,6 +130,8 @@ export function panelSettings(cfg) {
       ['effortOverride', cfg.effortOverride ?? 'planner'],
       ['repeatFailureGuard', cfg.repeatFailureGuard ?? REPEAT_FAILURE_DEFAULTS],
       ['closeoutGuard', cfg.closeoutGuard !== false],
+      ['taskBriefGuard', cfg.taskBriefGuard ?? 'block'],
+      ['redactLiterals', [...(cfg.redactLiterals ?? [])]],
       // 受护栏会话里出现过、白名单模式下不会放行的工具名；只读，不是设置项。
       ['seenTools', [...(cfg.seenTools ?? [])].sort()]]));
 }

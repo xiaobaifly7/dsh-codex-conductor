@@ -4737,6 +4737,7 @@ test('plugin and real runner preserve context, full Unicode output and execution
   const received = path.join(root, 'received.json');
   const { mkdirSync } = await import('node:fs');
   mkdirSync(work);
+  mkdirSync(path.join(root, 'codex'));
   const report = { summary: '跨语言验收🙂', criteria: [{ criterion: '1. self reported', status: 'met', evidence: '中文🙂'.repeat(12000) }],
     files_changed: [], deviations: [], unresolved: [] };
   writeFileSync(reportFile, JSON.stringify(report), 'utf8');
@@ -4748,8 +4749,9 @@ test('plugin and real runner preserve context, full Unicode output and execution
     `{'type': 'item.completed', 'item': {'type': 'agent_message', 'text': report}}, {'type': 'turn.completed', 'usage': {'input_tokens': 1}}]:\n` +
     ` print(json.dumps(event), flush=True)\n`, 'utf8');
   const env = { ...process.env, CODEX_HOME: path.join(root, 'codex'), CODEX_RUNNER_HOME: path.join(root, 'runner'),
-    CODEX_RUNNER_CMD: JSON.stringify([python, '-B', fake]), CODEX_RUNNER_ROUTER_URL: '', PYTHONDONTWRITEBYTECODE: '1',
-    FAKE_REPORT: reportFile, FAKE_RECEIVED: received };
+    CODEX_RUNNER_CMD: JSON.stringify([python, '-B', fake]), CODEX_RUNNER_ROUTER_URL: '',
+    CODEX_RUNNER_AGENTS_MD: '', CODEX_RUNNER_ROUTE_URL: '', CODEX_RUNNER_ROUTE_PROVIDER: '',
+    PYTHONDONTWRITEBYTECODE: '1', FAKE_REPORT: reportFile, FAKE_RECEIVED: received };
   const bridge = (_cfg, argv, options = {}) => runProcess(python, ['-I', '-B', runner, ...argv], { ...options, env });
   const tools = {};
   apply({ tools: { register: (t) => { tools[t.name] = t; }, guard() {} }, on() {} },
